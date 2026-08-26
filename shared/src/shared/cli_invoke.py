@@ -195,6 +195,77 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # wrapper, where a wait in before_invoke is definitionally a cap wait and can
 # be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
+#
+# AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
+# through invoke_with_cap_retry still gets a row, so the next investigator
+# finds an audit ANSWER here rather than an absence and re-derives nothing.
+#
+# Caller                                  Policy / WHY
+# ───────────────────────────────────────────────────────────────────────────
+# scripts/legibility/coder.py             DELIBERATE NON-CALLER — no
+#   (nightly legibility trickle, spawned  cap_wait_sanity_secs, because there
+#    via scripts/legibility/nightly.py)   is no cap WAIT to bound.  Its
+#                                         contract is IMMEDIATE defer/taint,
+#                                         in the shape of evals/runner.py's
+#                                         `cap_exhausted:` marker above: a
+#                                         capped digest is EXCLUDED (labelled
+#                                         CoderCapExhausted, tallied into
+#                                         RunResult.capped, no record
+#                                         fabricated), and a majority-capped
+#                                         storm defers the whole night at
+#                                         exit 0 (coder.is_cap_deferral).
+#                                         Three measured reasons, not an
+#                                         omission:
+#                                         (1) the systemd unit runs `uv run
+#                                             --frozen --project shared python
+#                                             scripts/legibility/nightly.py`;
+#                                             under that interpreter `import
+#                                             orchestrator` resolves to a
+#                                             NAMESPACE package with
+#                                             __file__ is None, so
+#                                             OrchestratorConfig is
+#                                             unreachable — and the unit
+#                                             exports none of the
+#                                             `oauth_token_env` vars named in
+#                                             config/usage-accounts.yaml, so a
+#                                             UsageGate built here would
+#                                             resolve only the single default
+#                                             ~/.claude/.credentials.json
+#                                             credential.  One account: no
+#                                             failover target to wait FOR.
+#                                         (2) with usage_gate=None this
+#                                             function performs NO cap
+#                                             classification at all
+#                                             (classify_invocation runs only
+#                                             in the gated `else` branch), so
+#                                             any cap_wait_sanity_secs
+#                                             documented for it would be
+#                                             inert, and the caller would
+#                                             still have to detect the cap
+#                                             itself.
+#                                         (3) a nightly systemd oneshot must
+#                                             not block on a cap wait across
+#                                             the NEXT night's timer, and its
+#                                             digests are re-derivable — a
+#                                             deferred night simply re-mines
+#                                             tomorrow, so patience buys
+#                                             nothing and costs a missed run.
+#                                         So the trickle detects the cap with
+#                                         the LOOSE defer-gate matcher
+#                                         shared.cap_markers::
+#                                         looks_like_blocking_banner — exactly
+#                                         as its sibling
+#                                         census.py::preflight_headroom does,
+#                                         and per that module's own docstring
+#                                         on skip-guard vs production-detector
+#                                         contracts — and defers.
+#                                         TO CHANGE THIS: making the trickle a
+#                                         real caller requires first giving it
+#                                         an ACCOUNT POOL (a reachable
+#                                         OrchestratorConfig + the
+#                                         oauth_token_env vars in the unit).
+#                                         Until then a row in the bound table
+#                                         above would be decoration.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
