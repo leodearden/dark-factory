@@ -233,8 +233,18 @@ class TestDispatchLegacyPaths:
             'Wake event must be set synchronously even when flip is suppressed'
         )
 
-    async def test_legacy_resolve_level0_no_flip(self, harness: Harness):
-        """Legacy resolve at level 0 → no flip (level gate preserved)."""
+    async def test_legacy_resolve_level0_orphan_flips(self, harness: Harness):
+        """Legacy resolve at level 0, ORPHANED → flips.
+
+        Re-anchored by task 3540 (PRD D8, spec E9). This previously codified
+        the `level >= 1` floor ("no flip at level 0"), whose premise was that
+        every L0 has a live workflow waiting on the synchronous `event.set()`.
+        That is false for a workflow that died between filing its escalation
+        and exiting: its `_escalation_events` entry is already popped, so the
+        wake set nothing and the floor then dropped the re-pend in silence.
+        Liveness, not level, is the discriminator — the live-workflow half is
+        `test_legacy_resolve_level0_active_workflow_no_flip` below.
+        """
         task_id = 'task-6'
         esc = _make_esc(
             task_id=task_id,
@@ -244,21 +254,58 @@ class TestDispatchLegacyPaths:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+
+    async def test_legacy_resolve_level0_active_workflow_no_flip(
+        self, harness: Harness
+    ):
+        """The preserved half of the old level-0 floor.
+
+        A LIVE L0 workflow still owns its own re-pend and must not be raced —
+        and it is still woken synchronously. This is the twin of
+        `test_legacy_resolve_active_workflow_no_flip` above at level 0, which
+        is what makes the level gate's removal safe rather than merely wider.
+        """
+        task_id = 'task-6-live'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,
+            status='resolved',
+            resolved_by='steward',
+            level=0,
+        )
+        harness._escalation_events[task_id] = asyncio.Event()
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert harness._escalation_events[task_id].is_set(), (
+            'Wake event must be set synchronously even when the flip is suppressed'
+        )
 
 
 # ---------------------------------------------------------------------------
-# Pair B — resume level>=1 generalization (D7)
-# Step-3: RED until the resume gate is changed from level==1 to level>=1
+# Pair B — the resume gate.  D7 widened it from level==1 to level>=1; task
+# 3540 (PRD plans/task-escalation-state-graph-prd.md D8, spec E9) removed the
+# level floor entirely and replaced it with claimant liveness.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestResumeLevelGate:
-    """B7 — D7: resume gate must be level>=1, not level==1."""
+    """B7: the resume gate keys on LIVENESS, at every escalation level.
+
+    Retains its original name because it is still the cell that owns the
+    gate's contract — what changed is the discriminator, not the subject.
+    """
 
     async def test_born_at_l2_resume_flips_blocked(self, harness: Harness):
         """(a) Born-at-L2 (level=2, resolution_action='resume', direct resolve,
@@ -286,10 +333,16 @@ class TestResumeLevelGate:
             task_id, 'pending',
         )
 
-    async def test_level0_resume_no_flip(self, harness: Harness):
-        """(b) level=0 direct resume still does NOT flip — level floor preserved.
+    async def test_level0_resume_orphan_flips(self, harness: Harness):
+        """(b) level=0 direct resume, ORPHANED → flips.
 
-        After step-4 changes gate to level>=1, level==0 is still excluded.
+        Re-anchored by task 3540 (PRD D8, spec E9): the level floor this cell
+        used to preserve is gone, replaced by claimant liveness. The same
+        re-anchor applied to the legacy-mapping twin in
+        `TestDispatchLegacyPaths.test_legacy_resolve_level0_orphan_flips`; here
+        the action is EXPLICIT (`resolution_action='resume'`) rather than
+        derived, so the two together show the widening is a property of the
+        resume EFFECT, not of how the action string was arrived at.
         """
         task_id = 'task-l0'
         esc = _make_esc(
@@ -300,11 +353,14 @@ class TestResumeLevelGate:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
 
     async def test_cascade_member_parent_resume_action_flips(self, harness: Harness):
         """(c) Cascade member (level=1, resolved_by='l2-cascade:<id>') whose

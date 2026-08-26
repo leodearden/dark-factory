@@ -14536,39 +14536,66 @@ class Harness:
             return
 
         if effect.workflow_disposition == WORKFLOW_RESUME:
-            # Re-pend the blocked task.  D7: level>=1 gate — covers L1 members
-            # and born-at-L2 orphans alike.
+            # Re-pend the task.  The discrimination is LIVENESS, at every
+            # level (task 3540 / PRD plans/task-escalation-state-graph-prd.md
+            # D8, spec E9).
+            #
+            # What this replaced, and why: a `level >= 1` wrapper (D7) used to
+            # enclose everything below, on the premise that every L0 has a live
+            # workflow already waiting on the synchronous `event.set()` above,
+            # so re-pending an L0 here would only race it.  That premise is
+            # false for exactly the workflows this path exists to rescue: one
+            # that died between filing its escalation and exiting has already
+            # had its `_escalation_events` entry POPPED (the `finally` in
+            # `harness.py::Harness._run_slot`), so the wake sets nothing, and
+            # the level gate then dropped the re-pend in silence — leaving the
+            # row in-progress with nothing heartbeating it and its escalation
+            # now closed.
+            #
+            # A LIVE workflow is still skipped here at every level, by the
+            # `_escalation_events` membership test below — that test is the
+            # local half of the liveness question and is unchanged.  The
+            # store-side claimant oracle inside `_cascade_unblock_member` is
+            # the authoritative half, and is the one that sees a claimant held
+            # by ANOTHER orchestrator, which a process-local dict structurally
+            # cannot.
+            #
+            # Consequence, and intended: the re-block guard is now charged for
+            # orphaned-L0 re-pends too.  Re-pend semantics are unchanged — the
+            # resolution-driven flip still charges the guard — so an L0 that
+            # re-blocks on the same signature repeatedly is damped by exactly
+            # the same budget as an L1.
+            #
             # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
             # fired _resolve_callback for the L2 first, then each member with
             # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
             # NOT in _escalation_events (a live workflow owns its own re-pend).
-            if escalation.level >= 1:
-                is_l2_cascade = (
-                    isinstance(escalation.resolved_by, str)
-                    and escalation.resolved_by.startswith('l2-cascade:')
+            is_l2_cascade = (
+                isinstance(escalation.resolved_by, str)
+                and escalation.resolved_by.startswith('l2-cascade:')
+            )
+            if is_l2_cascade:
+                # Scheduled via _schedule_coro_threadsafe so it works whether
+                # this callback fires on the orchestrator loop or off it (sync
+                # MCP resolve_issue on a FastMCP worker — where a bare
+                # asyncio.create_task raised "no running event loop").
+                self._schedule_coro_threadsafe(
+                    self._cascade_unblock_member(escalation),
+                    label=(
+                        f'cascade-unblock task {escalation.task_id} '
+                        f'(via {escalation.resolved_by})'
+                    ),
                 )
-                if is_l2_cascade:
-                    # Scheduled via _schedule_coro_threadsafe so it works whether
-                    # this callback fires on the orchestrator loop or off it (sync
-                    # MCP resolve_issue on a FastMCP worker — where a bare
-                    # asyncio.create_task raised "no running event loop").
-                    self._schedule_coro_threadsafe(
-                        self._cascade_unblock_member(escalation),
-                        label=(
-                            f'cascade-unblock task {escalation.task_id} '
-                            f'(via {escalation.resolved_by})'
-                        ),
-                    )
-                elif escalation.task_id not in self._escalation_events:
-                    # Fix #1a — direct/orphan re-pend.  A live workflow owns its
-                    # own re-pend (woken by event.set()); only flip when orphaned.
-                    self._schedule_coro_threadsafe(
-                        self._cascade_unblock_member(escalation),
-                        label=(
-                            f'orphan-unblock task {escalation.task_id} '
-                            f'(via {escalation.resolved_by})'
-                        ),
-                    )
+            elif escalation.task_id not in self._escalation_events:
+                # Fix #1a — direct/orphan re-pend.  A live workflow owns its
+                # own re-pend (woken by event.set()); only flip when orphaned.
+                self._schedule_coro_threadsafe(
+                    self._cascade_unblock_member(escalation),
+                    label=(
+                        f'orphan-unblock task {escalation.task_id} '
+                        f'(via {escalation.resolved_by})'
+                    ),
+                )
             return
 
         # restart / park / abandon → teardown + status write.
