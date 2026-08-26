@@ -283,6 +283,28 @@ detail as redundant.\
 FINDING_ID_METADATA_KEY = 'source_finding_id'
 FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
 
+# The OTHER vocabulary — and the distinction an earlier revision of this module
+# collapsed, at the cost of making the whole Stage-1 half of the provenance rule
+# a silent no-op.
+#
+# The two constants ABOVE are TASK METADATA keys: what a task filed from a
+# finding carries in its `metadata=`. The two BELOW are ASSEMBLED FLAGGED-ITEM
+# field names: what `server/recon_report.py::ReconReportState.get_assembled_report`
+# projects onto each flagged item as it hands Stage 1's report to Stage 2. The
+# relay hop and the persistence hop carry the same two values under DIFFERENT
+# names, and the earlier text told Stage 1 to relay them under the metadata
+# spellings — onto a projection that rebuilds each item field-by-field and has
+# no passthrough at all, so those fields were discarded before Stage 2 saw them.
+#
+# Plain string literals for the same reason as above: this module is stdlib-only
+# by design and does not import the server package for a two-token agreement.
+# That agreement is enforced instead by an in-process `get_assembled_report`
+# round-trip in tests/test_finding_provenance_prompt_guidance.py — the same
+# place, and the same discipline, as the `parse_metadata` cross-check that
+# guards the metadata keys.
+FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
+FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
+
 # The negative half of the vocabulary rule, single-sourced per INV-5
 # `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
 # above is: it was briefly written twice — once in the shared recon-report block
@@ -377,14 +399,33 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
     in a docstring goes stale silently (exactly the failure mode that hid the
     Stage-2 escalation-read gap until task 3163).
 
+    THE RELAY CHANNEL, as verified rather than assumed. The relay branch does
+    NOT tell Stage 1 to attach the two values to the flagged item under names of
+    its own choosing — it cannot.
+    ``server/recon_report.py::ReconReportState.get_assembled_report`` rebuilds
+    each flagged item as a fixed projection with no passthrough, and
+    ``add_finding`` accepts no ``**kwargs``, so a field Stage 1 invents is
+    discarded before Stage 2 ever sees it. What DOES survive is that projection,
+    which ``stages/task_knowledge_sync.py::_format_flagged`` json.dumps into
+    Stage 2's context unmodified. So the branch names the projected fields the
+    two ``FLAGGED_ITEM_*`` constants hold, and names ``cite_memory`` — which
+    Stage 1 does hold — as the only way to populate the citation one. The
+    projection's field list is deliberately NOT transcribed here; read it at the
+    source, for the same reason the disallow lists are not restated above.
+
+    An earlier revision of this branch asserted the opposite, that flagged items
+    are free-form objects, which made the entire Stage-1 half inert while every
+    prose-level expectation still read as satisfied. The in-process round-trip
+    in tests/test_finding_provenance_prompt_guidance.py is the guard that now
+    catches that class of claim, and it is why a channel named here must be one
+    the assembler actually emits.
+
     One deliberate DIVERGENCE from ``render_source_completion_section``'s
     relay branch: that one names the tool it is denying ("you do NOT hold
-    submit_task in this stage"), whereas this one does not name it at all. The
-    relay CHANNEL wording is mirrored so the two sections tell Stage 1 the same
-    story about the same channel, but the tool token is withheld — a name
-    surfaced to a model in a negation is still a name surfaced. That is a style
-    choice, not a capability rule (the two sections make opposite calls about
-    the same tool and both are safe); tests/test_finding_provenance_prompt_guidance.py
+    submit_task in this stage"), whereas this one does not name it at all — a
+    name surfaced to a model in a negation is still a name surfaced. That is a
+    style choice, not a capability rule (the two sections make opposite calls
+    about the same tool and both are safe); tests/test_finding_provenance_prompt_guidance.py
     pins the token's absence from this branch, so harmonising the two sections
     means deciding it here and moving that expectation with the edit.
 
@@ -403,23 +444,35 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
     """
     if can_file_tasks:
         capability_clause = (
-            'You hold `submit_task` in this stage, so set both keys yourself, in '
-            'the `metadata=` you pass to `mcp__fused-memory__submit_task` at the '
-            'moment you file the task — not as a later `update_task` repair, which '
-            'leaves a window in which the task exists with no provenance at all.'
+            'You hold `submit_task` in this stage, so set both keys yourself. Both '
+            'values come off the flagged item you are triaging: its '
+            f'`{FLAGGED_ITEM_FINDING_ID_FIELD}` field goes into '
+            f'`metadata.{FINDING_ID_METADATA_KEY}`, and its '
+            f'`{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` field into '
+            f'`metadata.{FINDING_MEMORY_IDS_METADATA_KEY}`. Set them in the '
+            '`metadata=` you pass to `mcp__fused-memory__submit_task` at the moment '
+            'you file the task — not as a later `update_task` repair, which leaves a '
+            'window in which the task exists with no provenance at all. Not every '
+            f'flagged item carries `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` — some '
+            'reach you as re-projections that carry the finding id alone, or '
+            'neither — so when that field is absent or empty, OMIT '
+            f'`{FINDING_MEMORY_IDS_METADATA_KEY}` entirely rather than inventing a '
+            'value for it.'
         )
     else:
         capability_clause = (
             'You cannot file tasks in this stage (task writes are disallowed '
-            'here), so you cannot persist these keys yourself. Relay the finding '
-            'id and its cited memory ids to Stage 2 via the `flag_for_stage2` / '
-            '`flagged_items` channel, carrying them in the `flagged_items` entry '
-            f'under those same two field names — `{FINDING_ID_METADATA_KEY}` and '
-            f'`{FINDING_MEMORY_IDS_METADATA_KEY}` — so Stage 2 can persist them '
-            'unchanged. `flagged_items` entries are free-form objects, so a '
-            'spelling you invent on this hop forks the vocabulary exactly as a '
-            'bespoke metadata key would. A relayed finding id that arrives '
-            'without its memory ids cannot be reconstructed later — carry both.'
+            'here), so Stage 2 persists these keys, not you. Your job is to make '
+            'sure both values reach it, and they travel by different routes. The '
+            f'finding id arrives on its own, as the `{FLAGGED_ITEM_FINDING_ID_FIELD}` '
+            'field of the flagged item assembled from your finding — you do not '
+            'attach it by hand, and a field you add yourself is dropped during '
+            'assembly. The memory ids arrive ONLY if you cite them with '
+            '`mcp__recon-report__cite_memory`, which is what lands them in that '
+            f'same flagged item under `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}`. A '
+            'finding whose memories were never cited reaches Stage 2 with an empty '
+            'list, and its provenance cannot be reconstructed afterwards — so cite '
+            'every memory the finding rests on, at the time you file it.'
         )
     return (
         '## Finding Provenance\n'
