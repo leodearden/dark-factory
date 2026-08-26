@@ -104,12 +104,19 @@ class TestTheFiledEscalation:
             'the series is greppable and dedupe can find it'
         )
 
-    def test_is_born_at_l0_so_it_routes_to_the_steward(self, tmp_path):
-        """The correct ladder entry for an agent-filed alarm: L0 -> steward,
-        who re-escalates if it needs the auto-watcher. Self-assigning a higher
-        level buys no faster attention, only noise."""
+    def test_is_born_at_l1_like_every_sibling_fused_memory_escalator(self, tmp_path):
+        """NOT L0.  The L0 -> steward rule governs an escalation filed by a
+        DISPATCHED AGENT about its own task: `Steward._pick_escalation` reads
+        `get_by_task(self.task_id, status='pending', level=0)`, scoped to the
+        real task that steward was spawned for.  This alarm is filed by a
+        background server process under the synthetic `_ANCHOR_TASK_ID`, which
+        is never dispatched and so never has a steward — an L0 entry here would
+        have no consumer, and would reach the auto-watcher only via the
+        orphan-L0 reaper's `orphan_l0_timeout_secs` promotion.  That is a pure
+        DELAY on a storm escape, so we file where the three siblings file.
+        """
         _emit(tmp_path)
-        assert _filed(tmp_path)[0]['level'] == 0
+        assert _filed(tmp_path)[0]['level'] == 1
 
     def test_the_summary_names_the_project_and_the_streak(self, tmp_path):
         _emit(tmp_path, project_id='reify', streak=12, threshold=10)

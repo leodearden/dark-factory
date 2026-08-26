@@ -231,11 +231,28 @@ def emit_referent_repair_storm_escalation(
                 'flagged_unrepairable / failed totals. Repairs were NOT halted '
                 'and continue while this is open.'
             ),
-            # No explicit `level`: born at L0, routing to the steward. That is
-            # the correct ladder entry for an agent-filed alarm — L1 is the
-            # steward's own re-escalation route, and self-assigning it buys no
-            # faster human attention, only an audit trail showing the queue was
-            # jumped.
+            # BORN AT L1, matching all three sibling fused-memory escalators
+            # (`candidate_key_escalation`, `mem0_update_storm_escalator`,
+            # `scope_violation_escalator`) — NOT at L0.
+            #
+            # The L0-routes-to-the-steward rule governs an escalation filed BY A
+            # DISPATCHED AGENT about its own task; it does not reach here.
+            # `Steward._pick_escalation` reads
+            # `escalation_queue.get_by_task(self.task_id, status='pending',
+            # level=0)` (orchestrator/src/orchestrator/steward.py::Steward),
+            # scoped to the REAL task that steward was spawned for.  This alarm
+            # is filed by a background server process under the synthetic anchor
+            # `_ANCHOR_TASK_ID`, which is never dispatched and therefore never
+            # has a steward — so an L0 entry here has no consumer at all.  It
+            # would be reached only by
+            # `HarnessRunner._reap_orphan_l0_escalations`, which promotes
+            # unclaimed L0s to L1 after `orphan_l0_timeout_secs`.  Filing at L0
+            # would therefore not route the alarm to a steward; it would merely
+            # DELAY it by that timeout before landing exactly where L1 puts it
+            # immediately.  For a storm escape whose whole purpose is that a
+            # regression not be absorbed silently, a built-in delay is the wrong
+            # default.
+            level=1,
         )
         esc_id = queue.submit(esc)
     except Exception:
