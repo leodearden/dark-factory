@@ -10004,18 +10004,28 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
-    def _salvageable_verdict_payload(self, role: AgentRole) -> dict | None:
-        """Return the on-disk verdict payload for *role* iff it is well-formed
-        and self-consistent, else ``None``.
+    def _salvageable_verdict_payload(
+        self, role: AgentRole, envelope: object,
+    ) -> dict | None:
+        """Return *role*'s verdict payload out of *envelope* iff it is
+        well-formed and self-consistent, else ``None``.
 
         Single validation seam shared by BOTH of ``_run_reviewer``'s salvage
         paths — the normal post-invocation gate and the exception guard around
         the ``_invoke`` await (task 3639) — so the two cannot drift apart.
 
+        PURE — takes the caller's already-read *envelope* (one
+        ``artifacts.read_verdict(role.name)`` result) rather than reading the
+        artifact itself.  The normal gate needs the envelope anyway, to tell
+        "no verdict file at all" from "file present but unusable" in its
+        diagnostic; reading it here too meant two stat+read+``json.loads``
+        round-trips per reviewer against a file that could change between them
+        (reviewer_comprehensive amendment, task 3639).
+
         A payload is trusted only when every clause holds:
 
-        * the envelope parses to a dict (``read_verdict`` already returns
-          ``None`` for a missing or corrupt file);
+        * the envelope is a dict (``read_verdict`` already returns ``None``
+          for a missing or corrupt file);
         * its ``'verdict'`` member is itself a dict — an envelope missing the
           payload key entirely is untrusted (defensive extraction);
         * that payload's own ``verdict`` is in ``{PASS, ISSUES_FOUND}``;
@@ -10040,8 +10050,6 @@ class TaskWorkflow:
         exception guard excludes ``TimeoutError`` — the same wall-clock-kill
         exclusion expressed in each path's own vocabulary.
         """
-        assert self.artifacts is not None
-        envelope = self.artifacts.read_verdict(role.name)
         if not isinstance(envelope, dict):
             return None
         payload = envelope.get('verdict')
@@ -10096,11 +10104,41 @@ class TaskWorkflow:
         # Salvage must therefore run here, BEFORE any respawn.
         try:
             result = await self._invoke(role, prompt, self.worktree)
-        except TimeoutError:
-            # Ordered first: TimeoutError IS an Exception subclass and would
-            # otherwise be swallowed below.  Exception-path analogue of the
-            # `result.timed_out` exclusion in the gate — a wall-clock kill can
-            # land mid-write, so its artifact may reflect a partial pass.
+        except (
+            TimeoutError,
+            AllAccountsCappedException,
+            _SessionBudgetExhausted,
+        ):
+            # Ordered first: all three ARE Exception subclasses and would
+            # otherwise be swallowed below.
+            #
+            # TimeoutError — exception-path analogue of the `result.timed_out`
+            # exclusion in the gate: a wall-clock kill can land mid-write, so
+            # its artifact may reflect a partial pass.
+            #
+            # AllAccountsCappedException / SessionBudgetExhausted — HALT-class
+            # control flow, not reviewer failure (reviewer_comprehensive
+            # amendment, task 3639).  Both carry a `RequeueKind.BLOCK`
+            # disposition in `workflow_types.classify_failure`'s table and are
+            # handled by name in `_drive` (workflow.py:3019, :3031).  Reachable
+            # here with a verdict already on disk: `invoke_with_cap_retry` runs
+            # the reviewer on attempt 1 (the agent calls
+            # submit_review_verdict, so the payload IS written), the run then
+            # hits an account cap, and the retry re-enters
+            # `UsageGate.before_invoke` with the session budget now exhausted.
+            # Salvaging that into a PASS/ISSUES_FOUND return would mask the
+            # halt signal, letting the workflow walk past REVIEW and block at
+            # the NEXT `_invoke` instead — attributing the stop to the wrong
+            # phase.  Re-raising restores the pre-task-3639 handling for these
+            # two exactly (`_review`'s retry then its synthesized ERROR); that
+            # retry's own clear_verdict() does drop the artifact, which is the
+            # accepted cost of not masking a halt — a capped/exhausted account
+            # cannot produce a better verdict on the next attempt anyway.
+            #
+            # Deliberately an explicit tuple rather than
+            # `classify_failure(exc).requeue_kind is BLOCK`: `_DEFAULT_BLOCK`
+            # (workflow_types.py:206-213) is itself BLOCK, so that predicate
+            # would re-raise essentially everything and neuter the salvage.
             #
             # asyncio.CancelledError needs no clause of its own: it is a
             # BaseException in 3.13, so `except Exception` excludes it by
@@ -10108,7 +10146,9 @@ class TaskWorkflow:
             # mirroring _invoke's own preserve-and-re-raise contract.
             raise
         except Exception as exc:
-            payload = self._salvageable_verdict_payload(role)
+            payload = self._salvageable_verdict_payload(
+                role, self.artifacts.read_verdict(role.name),
+            )
             if payload is None:
                 # Nothing recoverable — task 3321's no-emit case.  Propagate
                 # so _review's retry + synthesized-ERROR fail-safe is intact.
@@ -10166,11 +10206,14 @@ class TaskWorkflow:
         # Well-formedness AND cross-role self-consistency both live in
         # `_salvageable_verdict_payload`, so this gate and the exception guard
         # around the `_invoke` await validate identically (task 3639).
-        payload = self._salvageable_verdict_payload(role)
-        # The diagnostic below must tell "no verdict file at all" apart from
-        # "file present but unusable", which `payload is None` alone cannot —
-        # hence this direct envelope read alongside the helper's.
+        # ONE read of `verdicts/<role>.json`, consumed by both the gate and the
+        # diagnostic below (which must tell "no verdict file at all" apart from
+        # "file present but unusable", a distinction `payload is None` alone
+        # cannot make).  The helper is a pure validator over this envelope, so
+        # there is no second round-trip and no window for the two reads to
+        # disagree (reviewer_comprehensive amendment, task 3639).
         envelope = self.artifacts.read_verdict(role.name)
+        payload = self._salvageable_verdict_payload(role, envelope)
         if envelope is None and result.success:
             # Observability (reviewer_comprehensive amendment, task 2484):
             # a missing meta-root would make the verdict-tools server

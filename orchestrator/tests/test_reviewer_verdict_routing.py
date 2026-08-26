@@ -40,7 +40,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _workflow_helpers import _make
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.usage_gate import SessionBudgetExhausted
 
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
 from orchestrator.mcp.verdict_tools import _envelope
@@ -476,6 +477,23 @@ def _invoke_writes_then_raises(
     return _side_effect
 
 
+def _blocking_issues(n: int) -> list[dict]:
+    """*n* schema-shaped BLOCKING-severity issues.
+
+    Distinct from ``_suggestion_issues`` because severity is what
+    ``aggregate_reviews()`` partitions on: only a ``'blocking'`` issue lands
+    in ``blocking_issues`` and sets ``has_blocking_issues``, i.e. actually
+    gates the workflow.
+    """
+    return [{
+        'severity': 'blocking',
+        'location': f'src/blocker_{i}.py:{i + 1}',
+        'category': 'bug',
+        'description': f'blocking {i}',
+        'suggested_fix': f'fix {i}',
+    } for i in range(n)]
+
+
 def _suggestion_issues(n: int) -> list[dict]:
     """*n* schema-shaped suggestion-severity issues."""
     return [{
@@ -565,6 +583,34 @@ class TestExceptionPathSalvage:
         )
 
         with pytest.raises(TimeoutError):
+            await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
+
+    @pytest.mark.parametrize('exc', [
+        AllAccountsCappedException(3, 120.0, 'Task 1 [reviewer]'),
+        SessionBudgetExhausted(42.0),
+    ])
+    async def test_halt_class_exception_is_not_salvaged(
+        self, tmp_path: Path, exc: Exception,
+    ):
+        """A HALT-class exception propagates even with a valid verdict on disk.
+
+        ``AllAccountsCappedException`` and ``SessionBudgetExhausted`` are
+        control flow, not reviewer failure: both carry a ``RequeueKind.BLOCK``
+        disposition in ``workflow_types.classify_failure``'s table and are
+        handled by name in ``_drive``.  Reachable with a verdict already
+        written — ``invoke_with_cap_retry`` runs the reviewer on attempt 1,
+        the run hits an account cap, and the retry re-enters
+        ``UsageGate.before_invoke`` with the session budget now exhausted.
+        Returning a salvaged PASS there would mask the halt and mis-attribute
+        the eventual block to the phase AFTER review (reviewer_comprehensive
+        amendment, task 3639).
+        """
+        f = self._setup(tmp_path)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_invoke_writes_then_raises(f, exc),
+        )
+
+        with pytest.raises(type(exc)):
             await f.wf._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff')
 
     async def test_cancellation_is_never_swallowed(self, tmp_path: Path):
@@ -716,3 +762,52 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         assert mirror['summary'].startswith('Reviewer exception:')
         assert f.wf._invoke.call_count == 3  # initial + 2 retries
         assert aggregation.reviewer_errors == ['reviewer_comprehensive']
+
+    @pytest.mark.parametrize('path', ['exception', 'failed_invocation'])
+    async def test_salvaged_blocking_issues_reach_the_gate(
+        self, tmp_path: Path, path: str,
+    ):
+        """A salvaged payload's BLOCKING issues must survive to the GATE.
+
+        The harm this whole change exists to prevent is not "a suggestion
+        count is short" — it is that a reviewer's BLOCKING issues are
+        silently dropped and the workflow proceeds to merge.  The other
+        cases in this class use suggestion-severity issues only, so a
+        regression that filtered severity during salvage (or mirrored the
+        payload without its issues) would pass them while leaving the real
+        gate — ``aggregate_reviews()``'s ``has_blocking_issues`` /
+        ``blocking_issues`` — wide open (reviewer_comprehensive amendment,
+        task 3639).
+
+        Both salvage routes are pinned: the exception path added by this
+        task, and ``b4fe7171d3``'s failed-but-not-timed-out gate.
+        """
+        f = self._setup(tmp_path)
+        issues = _blocking_issues(2) + _suggestion_issues(1)
+        if path == 'exception':
+            side_effect = _invoke_writes_then_raises(
+                f, RuntimeError('transport closed'),
+                verdict='ISSUES_FOUND', issues=issues, summary='Two blockers.',
+            )
+        else:
+            side_effect = _invoke_writes_review_verdict(
+                f, verdict='ISSUES_FOUND', issues=issues, summary='Two blockers.',
+                output='ok', success=False,
+            )
+        f.wf._invoke = AsyncMock(side_effect=side_effect)  # type: ignore[method-assign]
+
+        aggregation = await f.wf._review()
+
+        assert self._mirror(f)['issues'] == issues
+        assert aggregation.has_blocking_issues is True
+        assert [i['description'] for i in aggregation.blocking_issues] == [
+            'blocking 0', 'blocking 1',
+        ]
+        assert all(
+            i['reviewer'] == 'reviewer_comprehensive'
+            for i in aggregation.blocking_issues
+        )
+        assert len(aggregation.suggestions) == 1
+        # No retry burned => clear_verdict() never destroyed the artifact.
+        assert f.wf._invoke.call_count == 1
+        assert aggregation.reviewer_errors == []
