@@ -1141,6 +1141,47 @@ def _within_fleet_deploy_min_interval() -> bool:
     )
 
 
+def _within_fleet_staleness_head_start() -> bool:
+    """Return True iff the FLEET deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    WHAT: True while ``now - (last_fleet_deploy + ORCH_RESTART_MIN_INTERVAL_SECS)
+    < STALENESS_GRACE_SECS`` — i.e. the coordinator's head start is measured
+    from the instant this tier's own min-interval window OPENED, not from the
+    age of the newest watched commit. That comparison is algebraically
+    identical to ``now - last_fleet_deploy < ORCH_RESTART_MIN_INTERVAL_SECS +
+    STALENESS_GRACE_SECS``, so it is expressed as that single summed cap and
+    reuses the one shared gate (_within_min_interval) rather than recomputing
+    a window-open instant inline.
+
+    WHY the anchor moved (task 4754): the old commit-age anchor measured the
+    head start from the COMMIT, which in a repo that ships the watched paths
+    continuously is hours old by the time the 8h window opens. Measured
+    2026-08-25: ZERO watched-path commits in the 30 minutes before ANY of 12
+    dark_factory run boundaries over 08-22..08-25, so the commit-anchored head
+    start inhibited nothing at a boundary — and the 60s-cadence backstop beat
+    the event-driven coordinator 5 times out of 5 across 08-24/25/26.
+
+    Fail-open in BOTH directions, inherited from _within_min_interval rather
+    than re-derived here: a missing/corrupt/unreadable clock makes
+    _read_last_fleet_deploy_epoch return None and this returns False, so the
+    backstop still acts (a missing clock must never disable a backstop
+    forever); and a summed cap of <=0 disables the head start without reading
+    the clock at all.
+
+    When ORCH_RESTART_MIN_INTERVAL_SECS is 0 (cap disabled) the head start
+    degenerates to "STALENESS_GRACE_SECS since the last verified fleet deploy"
+    — the same anchor measured against a zero-length window.
+
+    Both globals are read INSIDE the body (not defaulted at def time) so tests
+    that monkeypatch the module globals still work, mirroring
+    scripts/orchestrator-watchdog.py::_read_last_fleet_deploy_epoch.
+    """
+    return _within_min_interval(
+        ORCH_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS,
+        _read_last_fleet_deploy_epoch,
+    )
+
+
 def _read_last_fm_deploy_epoch() -> float | None:
     """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
 
@@ -1172,6 +1213,56 @@ def _within_fm_deploy_min_interval() -> bool:
     indefinitely.
     """
     return _within_min_interval(FM_RESTART_MIN_INTERVAL_SECS, _read_last_fm_deploy_epoch)
+
+
+def _within_fm_staleness_head_start() -> bool:
+    """Return True iff FM's deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    WHAT: True while ``now - (last_fm_deploy + FM_RESTART_MIN_INTERVAL_SECS) <
+    STALENESS_GRACE_SECS`` — the polite fm coordinator's head start measured
+    from the instant fm's own min-interval window OPENED, not from the age of
+    the newest fm-watched commit. Algebraically identical to ``now -
+    last_fm_deploy < FM_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS``, so
+    it is expressed as that single summed cap and reuses the one shared gate
+    (_within_min_interval) rather than recomputing a window-open instant
+    inline.
+
+    WHY the anchor moved (task 4754): the old commit-age anchor measured the
+    head start from the COMMIT, which in a repo that ships the watched paths
+    continuously is hours old by the time the 8h window opens. Measured
+    2026-08-25: ZERO watched-path commits in the 30 minutes before ANY of 12
+    dark_factory run boundaries over 08-22..08-25, so the commit-anchored head
+    start inhibited nothing at a boundary — and the 60s-cadence backstop beat
+    the event-driven coordinator 5 times out of 5 across 08-24/25/26.
+
+    fm sibling of scripts/orchestrator-watchdog.py::_within_fleet_staleness_head_start,
+    reading fm's OWN clock (FM_DEPLOY_CLOCK_PATH, via _read_last_fm_deploy_epoch)
+    and honoring fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS) — deliberately
+    independent of the orchestrator fleet's, mirroring
+    scripts/orchestrator-watchdog.py::_within_fm_deploy_min_interval and the
+    module comment on FM_DEPLOY_CLOCK_PATH above. The two clocks are NOT
+    collapsed: there is no code path on which either gate reads the other
+    tier's clock, so an orchestrator fleet redeploy never opens or resets fm's
+    head-start window and vice-versa.
+
+    Fail-open in BOTH directions, inherited from _within_min_interval rather
+    than re-derived here: a missing/corrupt/unreadable clock makes
+    _read_last_fm_deploy_epoch return None and this returns False, so the fm
+    backstop still acts (a missing clock must never disable a backstop
+    forever); and a summed cap of <=0 disables the head start without reading
+    the clock at all.
+
+    When FM_RESTART_MIN_INTERVAL_SECS is 0 (cap disabled) the head start
+    degenerates to "STALENESS_GRACE_SECS since the last verified fm deploy" —
+    the same anchor measured against a zero-length window.
+
+    Both globals are read INSIDE the body (not defaulted at def time) so tests
+    that monkeypatch the module globals still work.
+    """
+    return _within_min_interval(
+        FM_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS,
+        _read_last_fm_deploy_epoch,
+    )
 
 
 def _stamp_fm_deploy_clock() -> None:
