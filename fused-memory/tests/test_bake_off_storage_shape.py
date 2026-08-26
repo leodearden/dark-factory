@@ -5201,6 +5201,45 @@ class TestRunBakeOffRegrowthWiring:
         assert report['protocol']['regrowth_probed'] is False
         assert report['protocol']['regrowth_injections_measured'] == 0
 
+    async def test_a_subset_that_retains_no_injection_is_not_published_as_probed(
+        self, monkeypatch,
+    ):
+        """The live and replay paths must decide this from the SAME value.
+
+        `--clusters N` filters the injection slab, so a subset can in
+        principle retain no injected topic.  The live driver used to publish
+        `regrowth_probed: true` for that run, with a block reading
+        `topics_injected: 0, injections_per_topic: 1` — a hard-coded 1
+        describing zero topics — while `_replay_bake_off`, which builds a
+        block only when the post-subset list is non-empty, published
+        `regrowth_probed: false` and a null block for the same run.  Both
+        paths now key on the post-subset list.
+
+        The loader and its cross-validator are doubled because the case's
+        SUBJECT is the driver's predicate, not the committed fixture: the
+        real slab covers every topic by construction (the validator enforces
+        exactly one per topic over the full claim set), so the state under
+        test is unreachable through it.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: [])
+        monkeypatch.setattr(
+            mod, 'cross_validate_regrowth_injections', lambda **k: None,
+        )
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['regrowth'] is None
+        assert report['protocol']['regrowth_probed'] is False
+        assert report['protocol']['regrowth_injections_measured'] == 0
+        # And nothing was seeded or reaped for a pass that measured nothing.
+        assert drops.dropped.isdisjoint(passes)
+        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        }
+
     async def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
         self, monkeypatch,
     ):
@@ -5967,13 +6006,33 @@ class TestGroupedReadCanonicalCreditIsDisclosed:
 class TestReadPathPromote:
 
     def test_promote_defaults_to_false_on_read_path_and_measure_arm(self):
-        """Every existing caller and test must be unchanged by this addition."""
+        """Every existing caller and test must be unchanged by this addition.
+
+        The default is asserted BEHAVIOURALLY — omitting `promote` produces
+        the same result as passing `promote=False` — rather than off
+        `inspect.signature(...).parameters['promote'].default`.  A default
+        declared in the signature and then ignored in the body satisfies the
+        introspective form while breaking every existing caller, which is the
+        property this test is actually for.
+
+        The keyword-only half stays introspective: "cannot be passed
+        positionally" is an API-surface contract with no behavioural shadow to
+        assert, and it is what stops a future positional argument from
+        silently re-pointing an existing call site.
+        """
         import inspect  # noqa: PLC0415
         mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        assert mod.read_path(seeded, hits, 5, pin=True) == mod.read_path(
+            seeded, hits, 5, pin=True, promote=False,
+        )
+        assert _measure(seeded, hits, pin=True) == _measure(
+            seeded, hits, pin=True, promote=False,
+        )
 
         for func in (mod.read_path, mod.measure_arm):
             parameter = inspect.signature(func).parameters['promote']
-            assert parameter.default is False
             assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
     def test_a_full_window_promote_puts_the_canonical_first_and_keeps_k(self):
@@ -6415,6 +6474,40 @@ class TestBuildRegrowthBlock:
             assert list(block['deltas'][mode]) == list(mod.REGROWTH_READ_ARMS)
         assert list(block['stamping_value']) == list(mod.REGROWTH_READ_ARMS)
 
+    def _descriptors(self, injections):
+        mod = _mod()
+        block = mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+            injections=list(injections),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        )
+        return block['topics_injected'], block['injections_per_topic']
+
+    def test_injections_per_topic_is_derived_from_the_slab_not_typed(self):
+        """A hard-coded `1` is a descriptor that can contradict its own table.
+
+        It was literally `1`, so a slab that injected twice per topic — or
+        none at all, which a `--clusters N` subset can produce — still
+        published "1 injection each" beside the count it disagrees with.  The
+        `+1` in this probe's name is the independent variable, so the
+        artifact has to REPORT it rather than assert it.
+        """
+        injections = list(_injections())
+
+        assert self._descriptors(injections) == (20, 1)
+        assert self._descriptors(injections * 2) == (20, 2)
+
+    def test_an_empty_slab_describes_nothing_rather_than_describing_one(self):
+        """`None`, explicitly — the `protocol['replayed_from']` convention.
+
+        Zero topics with "1 injection each" is a sentence about a table that
+        is not there.  Both drivers now decline to build a block at all for
+        an empty post-subset slab, so this is the belt to that suspenders:
+        a caller that builds one anyway gets an honest descriptor.
+        """
+        assert self._descriptors([]) == (0, None)
+
     def test_the_deltas_it_carries_are_the_arithmetic_not_a_restatement(self):
         mod = _mod()
         block = mod.build_regrowth_block(
@@ -6756,11 +6849,17 @@ class TestAbsorptionPhrase:
         # The selected transform paid MORE.
         (-0.10, -0.20, -1, 'costs more than the flat read'),
         (+1.00, +3.13, +1, 'costs more than the flat read'),
-        # The flat read did not pay, the selected transform did.  This is
+        # The flat read GAINED while the selected transform paid.  This is
         # the committed-data case, and the one the `abs()` form got wrong.
+        # Strictly `cost_flat < 0` — a flat read that did not move is the
+        # separate case below, not this one.
         (+0.10, -0.30, -1, 'opposite directions'),
-        (0.0, -0.30, -1, 'opposite directions'),
         (-1.00, +3.13, +1, 'opposite directions'),
+        # The flat read did not move AT ALL while the selected transform
+        # paid.  One arm standing still is not two arms moving in opposite
+        # directions, and the sentence must not say so beside a `0.00` cell.
+        (0.0, -0.30, -1, 'had no cost to absorb'),
+        (0.0, +3.13, +1, 'had no cost to absorb'),
     ])
     def test_the_branch_table(self, flat, selected, cost_sign, expected):
         phrase = _mod()._absorption_phrase(flat, selected, cost_sign=cost_sign)
@@ -6771,6 +6870,7 @@ class TestAbsorptionPhrase:
         (-0.10, +0.30, -1),          # the sign flip
         (+0.0042372881355934, -0.0042372881355934, -1),   # committed data
         (-1.00, +3.13, +1),          # opposite directions
+        (0.0, -0.30, -1),            # flat did not move; selected paid
     ])
     def test_it_names_both_signed_values_wherever_the_two_arms_disagree(
         self, flat, selected, cost_sign,

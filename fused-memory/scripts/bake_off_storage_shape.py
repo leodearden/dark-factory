@@ -2829,6 +2829,13 @@ def _absorption_phrase(flat: Any, selected: Any, *, cost_sign: int) -> str:
     it is necessary and it was not sufficient — the derivation also has to
     be sign-correct.
 
+    Branches on the STRICT sign, not on ``<= 0``, for the same reason: "the
+    two arms moved in opposite directions" is reserved for
+    ``cost_flat < 0 < cost_selected``, and a flat read that did not move at
+    all (``cost_flat == 0``) gets its own sentence.  Folding the two together
+    printed "moved the two arms in opposite directions — the flat read does
+    not move it (0.00) …", a sentence contradicting the cell beside it.
+
     Not symmetric in its two arguments, on purpose: the flat read and the
     selected transform play different roles in the sentence, so a call site
     that transposed them could not be silent.
@@ -2847,7 +2854,15 @@ def _absorption_phrase(flat: Any, selected: Any, *, cost_sign: int) -> str:
         return (f'had nothing to absorb — neither arm paid a cost (the flat '
                 f'read moved {_gap_cell(flat)}, the selected transform '
                 f'{_gap_cell(selected)})')
-    if cost_flat <= 0:  # and cost_selected > 0
+    if cost_flat == 0:  # and cost_selected > 0
+        # SPLIT from the branch below on purpose.  One arm standing still is
+        # not "two arms moving in opposite directions": that sentence, read
+        # beside a `0.00` flat cell, contradicts the number it is describing.
+        return (f'had no cost to absorb — the flat read did not move on this '
+                f'column while the selected transform '
+                f'{_cost_phrase(selected, cost_sign=cost_sign)} '
+                f'({_gap_cell(flat)} against {_gap_cell(selected)})')
+    if cost_flat < 0:  # and cost_selected > 0
         return (f'moved the two arms in opposite directions — the flat read '
                 f'{_cost_phrase(flat, cost_sign=cost_sign)} while the '
                 f'selected transform '
@@ -4002,16 +4017,17 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     """
     import hashlib  # noqa: PLC0415
 
-    repo_root = _PACKAGE_ROOT.parent
     rows: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
-        try:
-            relative = str(path.relative_to(repo_root))
-        except ValueError:
-            relative = path.name
+        # Through :func:`_repo_relative`, like every other call site.  Not
+        # cosmetic: `_check_fixture_digests` compares these rows to the
+        # cache's as a `path -> sha256` MAPPING, and the regrowth block names
+        # the same injection fixture through that helper — so a second
+        # spelling that drifted would surface as an unexplained "cache
+        # carries no digest for <path>" refusal rather than as a diff here.
         rows.append({
-            'path': relative,
+            'path': _repo_relative(path),
             'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
         })
     return rows
@@ -5071,14 +5087,27 @@ def build_regrowth_block(
         mode: regrowth_deltas(baseline, after_by_mode[mode])
         for mode in REGROWTH_MODES
     }
+    per_topic: dict[str, int] = {}
+    for injection in injections:
+        per_topic[injection.topic] = per_topic.get(injection.topic, 0) + 1
+    counts = set(per_topic.values())
     return {
         'shape': REGROWTH_SHAPE,
         'read_arms': list(REGROWTH_READ_ARMS),
         'modes': list(REGROWTH_MODES),
-        'topics_injected': len({i.topic for i in injections}),
+        'topics_injected': len(per_topic),
         # A checkable property of the artifact, not a claim in its prose:
         # the "+1" in the probe's name IS the independent variable.
-        'injections_per_topic': 1,
+        #
+        # DERIVED from the slab this block was built over, never the literal
+        # `1`: a hard-coded 1 beside `topics_injected: 0` is a descriptor
+        # that contradicts the table it heads.  `None` — explicit, the same
+        # convention as `protocol['replayed_from']` — when there is nothing
+        # to describe, or when the slab is not uniform;
+        # `cross_validate_regrowth_injections` forbids the non-uniform case,
+        # so reaching it means a caller skipped validation and the honest
+        # answer is "no single number describes this".
+        'injections_per_topic': counts.pop() if len(counts) == 1 else None,
         'injection_fixture': _repo_relative(fixture_path),
         'baseline': baseline,
         'after': {mode: after_by_mode[mode] for mode in REGROWTH_MODES},
@@ -5178,6 +5207,16 @@ async def run_bake_off(
     # the whole slab would inject re-emissions of claims it never seeded,
     # and every one of them would be scored as a miss.
     injections = [i for i in injections if i.cluster_id in clusters]
+    # ONE predicate for "this run probes regrowth", and it is the POST-SUBSET
+    # injection list — the same value `_replay_bake_off` decides from, so the
+    # two paths cannot disagree about the same run.  `regrowth` alone is not
+    # it: a `--clusters N` subset that retains no injected topic would make
+    # the live path publish `regrowth_probed: true` beside a block describing
+    # zero topics while a replay of that run's own cache published
+    # `regrowth_probed: false` and a null block.  The descriptor exists so a
+    # reader never has to infer coverage from whether a table looks
+    # populated; two paths disagreeing about it defeats that outright.
+    probe_regrowth = bool(injections)
     if distractor_limit is not None:
         distractors = distractors[:distractor_limit]
 
@@ -5210,7 +5249,7 @@ async def run_bake_off(
         )
 
     collections = ephemeral_collections(suffix=project_suffix)
-    if regrowth:
+    if probe_regrowth:
         # Merged into the SAME dict the pre-run sweep and the `finally`
         # teardown both iterate, rather than tracked alongside it: a second
         # collection list is a second thing to forget.
@@ -5300,7 +5339,7 @@ async def run_bake_off(
             # insertion-order noise between the two sides — exactly the
             # difference a delta must not contain.
             capture = dump_fetches_to is not None or (
-                regrowth and shape == REGROWTH_SHAPE
+                probe_regrowth and shape == REGROWTH_SHAPE
             )
             fetched: dict[str, dict[str, list[ScoredHit]]] | None = None
             if capture:
@@ -5314,7 +5353,7 @@ async def run_bake_off(
                 limit=limit, estimator=estimator,
                 guard_threshold=guard_threshold, fetched=fetched,
             ))
-            if regrowth and shape == REGROWTH_SHAPE:
+            if probe_regrowth and shape == REGROWTH_SHAPE:
                 base_records = records
                 # Read back through `fetched_by_shape` rather than the local
                 # `fetched`: `capture` is true whenever this branch is, so the
@@ -5329,7 +5368,7 @@ async def run_bake_off(
 
         # The two injected passes, INSIDE the try so the `finally` below
         # still reaps their collections when one of them raises mid-seed.
-        for mode in REGROWTH_MODES if regrowth else ():
+        for mode in REGROWTH_MODES if probe_regrowth else ():
             key = regrowth_pass_key(mode)
             injected = regrowth_corpus(
                 base_records, injections, claims, clusters, mode=mode,
@@ -5365,7 +5404,7 @@ async def run_bake_off(
     # Pure, and computed before the dump so the cache's fixture list and the
     # protocol block's are decided by the same value.
     regrowth_block: dict[str, Any] | None = None
-    if regrowth:
+    if probe_regrowth:
         regrowth_block = build_regrowth_block(
             baseline=baseline,
             after_by_mode=after_by_mode,
@@ -5424,8 +5463,11 @@ async def run_bake_off(
             'guard_probes_measured': len(probes),
             # Same reason `clusters_measured` is here: a reader holding the
             # artifact must not have to infer the probe's coverage from
-            # whether a table looks populated.
-            'regrowth_probed': bool(regrowth),
+            # whether a table looks populated.  Read off the BLOCK, in the
+            # identical spelling `_replay_bake_off` uses, so the descriptor
+            # and the thing it describes can never disagree — and so a
+            # replayed report is byte-identical to the live one it replays.
+            'regrowth_probed': regrowth_block is not None,
             'regrowth_injections_measured': len(injections),
             'collections': sorted(collections.values()),
             # Explicit `None` rather than an absent key: every measured cell

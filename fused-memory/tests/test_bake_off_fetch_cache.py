@@ -1175,6 +1175,28 @@ class TestReplayFetchesFlag:
                     'queries_measured', 'guard_probes_measured', 'fixtures'):
             assert replayed['protocol'][key] == live['protocol'][key], key
 
+    def test_the_replayed_regrowth_block_and_its_descriptor_agree_with_live(
+        self, tmp_path, monkeypatch,
+    ):
+        """`_replay_bake_off` claims the block "must come out byte-identical
+        to the live one" — asserted here rather than left as a docstring.
+
+        The DESCRIPTOR travels with it.  The two paths once decided
+        `regrowth_probed` from different values (the live one from the
+        `regrowth` flag, the replay from whether a block was built), so a run
+        whose cluster subset retained no injected topic published `true` live
+        and `false` on a replay of its own cache — a contradiction about
+        probe coverage, which is the ONE thing this descriptor exists to
+        state outright.
+        """
+        mod = _mod()
+        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+
+        assert live['regrowth'] is not None
+        assert replayed['regrowth'] == live['regrowth']
+        for key in ('regrowth_probed', 'regrowth_injections_measured'):
+            assert replayed['protocol'][key] == live['protocol'][key], key
+
     def test_the_replayed_report_discloses_that_it_was_replayed(
         self, tmp_path, monkeypatch,
     ):
