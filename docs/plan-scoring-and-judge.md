@@ -955,6 +955,89 @@ got it right:** `scripts/eval_bootstrap_smoke.sh` gates its smoke on
 `planRate` / `meanPQ_all` ("scores a no-plan cell as 0") from `plan_steps > 0`
 because the pipeline's own ranking could not be used.
 
+### Terminal outcome (`terminal_kind`, task 4760)
+
+The three counts above all describe the *quality* axis. This one describes what
+the architect actually *said*, and it exists because `no_plan` never could: it
+answers HOW MANY architect cells emitted no plan and never WHY.
+
+**The closed vocabulary.** `metrics.TERMINAL_KINDS` — resolved by
+`orchestrator/src/orchestrator/evals/metrics.py::resolve_terminal_kind`,
+persisted on `metrics.py::EvalMetrics.terminal_kind`, read back through
+`metrics.py::terminal_kind_of`:
+
+| Value | Meaning |
+|---|---|
+| `planned` | A scorable plan (`judge.is_scorable_plan`) was the terminal statement |
+| `already_done` | `plan_tools::report_task_already_done` — the work already landed |
+| `blocking_dependency` | `plan_tools::report_blocking_dependency` — something else must land first |
+| `false_premise` | `plan_tools::report_false_premise` — the task's premise does not hold |
+| `unactionable` | `plan_tools::report_unactionable_task` — the task cannot be acted on as written |
+| `ready_to_merge` | `plan_tools::report_ready_to_merge` — the branch is already mergeable |
+| `none` | Neither a scorable plan nor any decline artifact — the genuine "could not plan", or an infra failure |
+| `None` (key present, value null) | NOT MEASURED: a non-architect cell |
+| key ABSENT | NOT MEASURED: a cell persisted before this field existed |
+
+`to_dict` is a bare `asdict`, so the live instrument puts the key on **every**
+cell — which is what makes key ABSENCE the one unambiguous legacy signal, the
+same property `judged_without_reference` depends on. The write must never be
+made conditional. The five decline kinds (`metrics.py::DECLINE_KINDS`) are
+single-sourced against the `artifacts.TaskArtifacts.read_*` readers that produce
+them via `metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away
+from the artifacts it names.
+
+**A DECLINE IS NOT A FAILURE.** It is the architect reading the fixture and
+correctly refusing to plan it — the same exit an architect takes on a real task,
+and the workflow treats it as a legitimate terminal state, not an error. So a
+`plan_steps = 0` cell that carries a decline kind is evidence about the
+*fixture*, not about the candidate. **Future scoring work should validate
+declines against ground truth — is the premise in fact false? did the work in
+fact already land? — and never penalise a decline as though it were a failure to
+plan.** Scoring a correct refusal as a zero measures the corpus's staleness and
+reports it as the candidate's incompetence.
+
+**The ordering policy: LAST TERMINAL CALL WINS.** A cell can do both — confirm a
+plan and then decline — so the two claims have to be ordered. Both producers
+already stamp comparable ISO-8601 UTC timestamps
+(`artifacts.py::TaskArtifacts.write_false_premise` and its four siblings stamp
+`reported_at`; `plan_tools.py::_confirm_plan` stamps `_finalized_at` on
+`plan.json`), so the resolver compares them rather than inferring an order.
+Ambiguity — an unparseable or absent stamp, a tie, an unconfirmed plan carrying
+no `_finalized_at` — resolves toward **the decline**, because a decline is an
+explicit statement the architect had to call a tool to make, whereas a plan that
+was never confirmed is one the workflow itself refuses to advance.
+
+*Worked example* — run `e522b1b0`, cell `reify_task_4026`: a confirmed 6-step
+plan, then `report_task_already_done` at a later stamp. It persists
+`plan_steps=6, terminal_kind='already_done'`. **Both facts survive**: the cell is
+in `declined` and NOT in `no_plan`, so a downstream reader can bucket it either
+way and neither reading is destroyed. `declined - no_plan_declined` recovers that
+population exactly.
+
+**planRate is DELIBERATELY unchanged.** `produced_a_plan` is still
+`plan_steps > 0`, `_plan_rate` still reduces the same two numbers, and
+`is_scorable_plan` / `score_plan_structure` / `cap_tainted` / `band_for_cell` are
+untouched — so every campaign artifact already committed stays comparable. The
+split is reported ALONGSIDE it, by
+`report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
+`no_plan_declined`, `terminal_kind_unmeasured`, over the SAME admitted pool `n`)
+and surfaced verbatim by `scripts/run_fable_trial_v2_campaign.py`. **The number
+to read beside `plan_rate` is `no_plan_declined`**: when it equals `no_plan`,
+that candidate emitted no plan *only* where it explicitly refused, which is a
+positive reliability result.
+
+**The provenance.** Tranche 1 recorded `plan_steps = 0` on 47 of 53 architect
+cells and the readout reported it as an ~89% planning failure. All 47 were
+explicit, server-accepted decline calls — none silent, none capped — made after
+a median of 41–98 assistant turns of real investigation. Establishing that took
+manual forensics over `~/.claude/projects/*run-<id>/` transcripts, because the
+decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_worktree`
+`rmtree`s the relocated meta root from `runner.py::run_architect_eval`'s
+`finally`. The runner therefore reads the decline artifacts **inside that
+`finally`, immediately before the cleanup call** — the one site reached by all
+four exits (success, timeout, cap exhaustion, harness error) and the last moment
+the artifacts exist.
+
 ---
 
 ## Sharp edges — read these before starting
