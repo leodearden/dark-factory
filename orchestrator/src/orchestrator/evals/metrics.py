@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
     from shared.cli_invoke import AgentResult
 
+    # TYPE_CHECKING only, deliberately: this module must not gain a RUNTIME
+    # import of orchestrator.artifacts. read_decline_artifacts below reaches
+    # the readers by getattr, so it needs the NAME for the signature and
+    # nothing at import time.
+    from orchestrator.artifacts import TaskArtifacts
     from orchestrator.workflow import TaskWorkflow
 
 logger = logging.getLogger(__name__)
@@ -477,6 +482,52 @@ def resolve_terminal_kind(
         return winner
     finalized_at = _stamp_of(plan, '_finalized_at')
     return 'planned' if finalized_at is not None and finalized_at > winner_at else winner
+
+
+def read_decline_artifacts(
+    artifacts: TaskArtifacts | None,
+) -> dict[str, dict | None]:
+    """Read all five decline artifacts off ``artifacts``, best-effort (task 4760).
+
+    Returns a map whose key set is ALWAYS exactly :data:`DECLINE_KINDS` — a kind
+    the architect did not report reads ``None``, and so does a kind that could
+    not be read. A complete key set means a consumer never has to distinguish
+    "not reported" from "not asked".
+
+    PER-KIND DEGRADATION, following ``runner._verdict_cost_usd``'s precedent: an
+    unreadable field costs exactly ONE field's visibility, never the whole eval
+    cell. Each reader is called inside its own ``try/except Exception`` that
+    logs a warning naming the kind, so a corrupt ``already_done.json`` still
+    lets the other four report. This matters because the SOLE caller is inside
+    ``run_architect_eval``'s ``finally`` block — the only place the artifacts
+    still exist, since the next statement ``rmtree``s the meta root — where a
+    raise would turn an already-scored cell into a lost run.
+
+    ``artifacts is None`` (the harness-error path, where it was never
+    constructed) and an object missing a reader (a legacy or monkeypatched
+    double) both yield the all-``None`` map rather than raising.
+    """
+    out: dict[str, dict | None] = dict.fromkeys(DECLINE_KINDS)
+    if artifacts is None:
+        return out
+    for kind, reader_name in _DECLINE_READERS.items():
+        reader = getattr(artifacts, reader_name, None)
+        if not callable(reader):
+            logger.warning(
+                'decline artifact %s unreadable: %s has no %s()',
+                kind, type(artifacts).__name__, reader_name,
+            )
+            continue
+        try:
+            artifact = reader()
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning(
+                'decline artifact %s unreadable (%s): %s', kind,
+                type(exc).__name__, exc,
+            )
+            continue
+        out[kind] = artifact if isinstance(artifact, dict) else None
+    return out
 
 
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
