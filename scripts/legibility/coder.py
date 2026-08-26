@@ -812,6 +812,7 @@ def _print_summary(result: RunResult, *, matched: int, candidates: int, file) ->
     print(
         f"coder: status={result.status} total={result.total} "
         f"succeeded={result.succeeded} failed={result.failed} "
+        f"capped={result.capped} "
         f"matched={matched} candidates={candidates}",
         file=file,
     )
@@ -831,6 +832,20 @@ def main(argv: list[str] | None = None) -> int:
     and returns 1 (fail-loud), so a driving script (epsilon) can escalate
     and skip the merge. Either way, a one-line status summary is printed
     to stderr.
+
+    THIRD DISPOSITION — the DEFERRAL (task 4736). When that run-level
+    failure is really a capped night (``is_cap_deferral``), the same
+    zero-records/truncate discipline applies but the exit code is 0 and the
+    banner says ``coder: DEFERRED`` rather than ``coder: FAILURE``. An
+    all-accounts-capped night is a normal operating condition, not an
+    incident (Leo's directive; sibling task 4503), and a non-zero exit here
+    made ``check_trickle_liveness.sh`` report a failure for a timer behaving
+    exactly as designed — on 2026-08-24 that became an ERROR-level
+    escalation. The shape deliberately mirrors ``census.main``, which prints
+    ``census: deferred -- stage=... -- <reason>`` and returns 0 for its own
+    headroom defer, so an operator reads the same thing from both legibility
+    CLIs. The one-line summary still reports ``status=failure`` with the
+    true counts: the exit code changes, the tally never lies.
     """
     parser = argparse.ArgumentParser(
         prog="coder",
@@ -890,21 +905,37 @@ def main(argv: list[str] | None = None) -> int:
     candidates = sum(len(r.get("candidates") or []) for r in result.records)
 
     if result.status == "failure":
-        print(
-            f"coder: FAILURE - {result.failed}/{result.total} digests failed "
-            "coding (storm threshold exceeded) -- zero coding records written",
-            file=sys.stderr,
-        )
+        deferred = is_cap_deferral(result)
+        if deferred:
+            print(
+                f"coder: DEFERRED - {result.capped}/{result.total} digests hit "
+                "a usage/auth cap (no headroom) -- zero coding records "
+                "written, nothing fabricated",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"coder: FAILURE - {result.failed}/{result.total} digests failed "
+                "coding (storm threshold exceeded) -- zero coding records written",
+                file=sys.stderr,
+            )
+        # The same per-session loop for BOTH arms, so the cap banner the CLI
+        # actually printed reaches the operator instead of being summarised
+        # away -- the whole point of carrying it this far.
         for session, reason in result.failures:
             print(f"  session={session!r}: {reason}", file=sys.stderr)
         if args.out:
             # Never leave a stale --out from a prior successful run lying
-            # around on a storm: a downstream consumer that reads the file
-            # instead of gating on the exit code must see this run's true
-            # (empty) outcome, not a previous night's records.
+            # around on a storm OR a deferral: a downstream consumer that
+            # reads the file instead of gating on the exit code must see this
+            # run's true (empty) outcome, not a previous night's records.
             Path(args.out).write_text("", encoding="utf-8")
+        # The summary stays honest either way -- status=failure with the true
+        # counts. Exit 0 must not launder the tally: "deferred, nothing coded"
+        # being readable as "coded fine, found nothing" is the never-fabricate
+        # conflation again, at the run level.
         _print_summary(result, matched=matched, candidates=candidates, file=sys.stderr)
-        return 1
+        return 0 if deferred else 1
 
     lines = [json.dumps(record) for record in result.records]
     output = "\n".join(lines)
