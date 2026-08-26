@@ -467,3 +467,185 @@ class TestLivenessForkReblockGuardSemantics:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert _guard_charges(harness) == []
+
+
+# ---------------------------------------------------------------------------
+# step-4 — the INV-3 write-time corroborating read
+# ---------------------------------------------------------------------------
+
+def _wire_two_snapshots(
+    harness: Harness, early: dict, late: dict | None
+) -> list[str]:
+    """``get_task`` returns *early* until the re-block guard's ``update_task``
+    lands, then *late* — and every scheduler call is appended to one ordered log.
+
+    Modelling the skew this way, rather than as a positional ``side_effect``
+    list, keeps the fixture independent of HOW MANY ``get_task`` round-trips the
+    gate path happens to make (today: the infra pre-gate's, then the guard's).
+    The only thing it pins is the thing INV-3 is about — that the snapshot the
+    WRITE is authorised against is read after the last gate step, not before it.
+
+    The returned list is the call-order assertion surface the happy-path case
+    uses to prove the corroborating read is the LAST read before the write.
+    ``get_status`` is deliberately NOT logged: it is the gate's status source
+    and is unchanged by this step.
+    """
+    order: list[str] = []
+    guard_written = False
+
+    async def _get_task(_tid, *args, **kwargs):
+        order.append('get_task')
+        return late if guard_written else early
+
+    async def _update_task(*args, **kwargs):
+        nonlocal guard_written
+        order.append('update_task')
+        guard_written = True
+        return True
+
+    async def _set_task_status(*args, **kwargs):
+        order.append('set_task_status')
+
+    harness.scheduler.get_status = AsyncMock(return_value=early['status'])
+    harness.scheduler.get_task = AsyncMock(side_effect=_get_task)
+    harness.scheduler.update_task = AsyncMock(side_effect=_update_task)
+    harness.scheduler.set_task_status = AsyncMock(side_effect=_set_task_status)
+    return order
+
+
+@pytest.mark.asyncio
+class TestCorroboratingReadBeforeTheWrite:
+    """INV-3: the flip is authorised against a snapshot read immediately
+    before the write, not against the (by then staler) gate snapshot.
+
+    ``_cascade_unblock_member`` is a chain of separate MCP round-trips with no
+    atomic compare-and-set, so the TOCTOU window cannot be CLOSED — only
+    narrowed. Before this step the window spanned
+    ``get_status → guard get_task → guard update_task → set_task_status``:
+    a task could reach a terminal status, or be claimed by a fresh workflow,
+    anywhere inside it and still be flipped back to ``pending``. After it the
+    window is one hop, and status AND claimant liveness are re-derived from a
+    single snapshot rather than two skewed reads.
+    """
+
+    async def test_late_terminal_done_aborts_the_write(
+        self, harness: Harness, caplog
+    ):
+        """The row completed between the gate and the write — never resurrect it.
+
+        A ``pending`` write onto a ``done`` row is the worst outcome on this
+        path: it re-dispatches finished work, and the task's own escalation is
+        already closed, so nothing upstream would notice.
+        """
+        esc = _esc(task_id='3438')
+        _wire_two_snapshots(
+            harness,
+            _row('in-progress', claimant=None, heartbeat=None),
+            _row('done', claimant=None, heartbeat=None),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            'done' in r.getMessage() and r.levelno >= logging.DEBUG
+            for r in caplog.records
+        ), 'Expected a record naming the observed late status'
+
+    async def test_late_terminal_cancelled_aborts_the_write(
+        self, harness: Harness
+    ):
+        """Same rule for the other terminal status — the gate is the allow-list,
+        re-applied, not a hardcoded ``done`` special case."""
+        esc = _esc(task_id='3438')
+        _wire_two_snapshots(
+            harness,
+            _row('in-progress', claimant=None, heartbeat=None),
+            _row('cancelled', claimant=None, heartbeat=None),
+        )
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_late_fresh_claimant_aborts_the_write(
+        self, harness: Harness, caplog
+    ):
+        """A workflow claimed the row between the gate and the write.
+
+        The status is still re-pendable, so the allow-list alone would let the
+        write through — it is the LIVENESS half of the corroboration that has
+        to catch this. Flipping now would race a workflow that has already
+        stamped a claimant and is heartbeating it.
+        """
+        esc = _esc(task_id='3438')
+        _wire_two_snapshots(
+            harness,
+            _row('blocked', claimant=None, heartbeat=None),
+            _row('blocked', claimant=LIVE_CLAIMANT, heartbeat='fresh'),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            'claimant' in r.getMessage() for r in caplog.records
+        ), 'Expected a record naming the claimant that appeared'
+
+    async def test_unreadable_late_row_aborts_the_write(
+        self, harness: Harness, caplog
+    ):
+        """Fail-SAFE, not fail-open: a row we could not read is never re-pended.
+
+        Note this is the OPPOSITE default from ``_resume_repend_liveness``,
+        where an absent row reads as "no live claimant" (so an unreadable row
+        never SUPPRESSES a flip). The asymmetry is deliberate: there, a missing
+        row means missing claimant columns and the conservative reading is
+        "not live"; here, a missing row means no evidence at all that the write
+        is still correct, and the conservative action is to do nothing. The
+        next resolution, sweep or dispatch re-derives it.
+        """
+        esc = _esc(task_id='3438')
+        _wire_two_snapshots(
+            harness, _row('blocked', claimant=None, heartbeat=None), None
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            r.levelno == logging.WARNING for r in caplog.records
+        ), 'An unreadable row must be operator-visible — WARNING, not DEBUG'
+
+    async def test_agreeing_snapshots_flip_and_the_read_is_last(
+        self, harness: Harness
+    ):
+        """[the ordering assertion] Happy path, plus WHERE the read sits.
+
+        Asserting only "it flips" would pass against an implementation that
+        corroborated against the gate's own stale snapshot — which is the bug.
+        So the call-order log is asserted directly: the last two scheduler
+        calls must be ``get_task`` then ``set_task_status``, and the guard's
+        ``update_task`` must already have happened. That makes the
+        corroborating read provably the final read before the write.
+        """
+        esc = _esc(task_id='3438')
+        row = _row('in-progress', claimant=None, heartbeat=None)
+        order = _wire_two_snapshots(harness, row, dict(row))
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+        assert order[-2:] == ['get_task', 'set_task_status'], (
+            f'The corroborating read must be the LAST read before the write; '
+            f'observed call order {order}'
+        )
+        assert 'update_task' in order[:-2], (
+            f"The corroborating read must come AFTER the re-block guard's "
+            f'persist, not before it; observed call order {order}'
+        )
