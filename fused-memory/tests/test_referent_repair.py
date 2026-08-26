@@ -354,14 +354,15 @@ class TestTheEpisodeIdentityParameter:
     degrades to the STRICTER predicate, never a looser one.
     """
 
-    def test_signature_is_keyword_only_and_defaults_to_empty(self):
-        import inspect
-
-        sig = inspect.signature(MemoryService._repair_episode_referents)
-        param = sig.parameters['episode_uuid']
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY
-        assert param.default == ''
-        assert sig.parameters['group_id'].kind is inspect.Parameter.KEYWORD_ONLY
+    @pytest.mark.asyncio
+    async def test_positional_misuse_is_rejected(self, service):
+        """Keyword-only-ness pinned EXECUTABLY, not by reading the signature
+        object: a caller that tries to pass the identity positionally is
+        refused outright rather than silently binding it to ``group_id``."""
+        with pytest.raises(TypeError):
+            await service._repair_episode_referents(
+                _stats(_finding()), 'dark_factory', 'ep-1',
+            )
 
     @pytest.mark.asyncio
     async def test_omitting_it_still_repairs_exactly_as_before(self, service):

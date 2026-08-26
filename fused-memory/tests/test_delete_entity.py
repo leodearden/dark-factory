@@ -757,12 +757,11 @@ class TestCountForeignRelationships:
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.count_foreign_relationships('n-3129', group_id='test')
 
-    def test_episode_uuid_is_keyword_only_and_defaults_to_empty(self):
-        """Keyword-only and defaulted, so the fail-closed strict form is what a
-        caller that forgets to thread the episode identity gets."""
-        import inspect
-        sig = inspect.signature(GraphitiBackend.count_foreign_relationships)
-        param = sig.parameters['episode_uuid']
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY
-        assert param.default == ''
-        assert sig.parameters['group_id'].kind is inspect.Parameter.KEYWORD_ONLY
+    @pytest.mark.asyncio
+    async def test_positional_misuse_is_rejected(self, mock_config, make_backend):
+        """Keyword-only-ness pinned EXECUTABLY, not by reading the signature
+        object: a caller that tries to pass the identity positionally is
+        refused outright rather than silently binding it to ``group_id``."""
+        backend = make_backend(mock_config)
+        with pytest.raises(TypeError):
+            await backend.count_foreign_relationships('n-3129', 'test', 'ep-1')
