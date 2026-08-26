@@ -152,12 +152,24 @@ class CodingResult:
     None and ``reason`` explains why: a CLI invocation error, unparseable
     LLM output, or a schema-invalid assembled record are never partially
     applied and never fabricated into a record.
+
+    ``capped=True`` means the CLI answered with a capacity/auth banner
+    instead of a model turn. It is a strict REFINEMENT of ``ok=False``,
+    never a third success state — ``record`` is still None and the
+    never-fabricate contract is untouched. What it records is a fact about
+    the ACCOUNT, not a judgment about the digest: this digest was never
+    actually coded, so charging it to the coder as a failure of the work is
+    simply wrong. Downstream (``code_digests`` tallies it, ``is_cap_deferral``
+    reads the tally) that distinction is what separates "there was no
+    headroom tonight" from "the coder is broken" — on 2026-08-24 their
+    conflation turned expected weather into an ERROR-level infra page.
     """
 
     ok: bool
     record: dict | None
     reason: str | None = None
     session: str | None = None
+    capped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -512,9 +524,12 @@ def code_digest(
     via codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
-    invocation error, unparseable LLM output, or a schema-invalid assembled
-    record all come back as ``ok=False`` with ``record=None`` and
-    ``reason`` set — never partially applied, never fabricated. A
+    invocation error, a usage/auth CAP, unparseable LLM output, or a
+    schema-invalid assembled record all come back as ``ok=False`` with
+    ``record=None`` and ``reason`` set — never partially applied, never
+    fabricated. The cap case additionally sets ``capped=True``: it is the
+    one cause that says nothing about this digest or this coder, only that
+    the account had no headroom left to look (see ``CoderCapExhausted``). A
     legitimately empty judgment (``{"matches": [], "candidates": []}``)
     that passes schema validation is a genuine ``ok=True`` success: "coded
     fine, found nothing" is never conflated with "coding failed" (codebook
@@ -532,6 +547,14 @@ def code_digest(
 
     try:
         raw = invoke_fn(prompt, model)
+    except CoderCapExhausted as exc:
+        # ORDERED ABOVE the generic arm below, and that ordering is
+        # load-bearing: CoderCapExhausted SUBCLASSES CoderInvocationError, so
+        # reversing these two silently routes every cap into the generic arm
+        # and the label is never applied.
+        return CodingResult(
+            ok=False, record=None, reason=str(exc), session=session, capped=True,
+        )
     except CoderInvocationError as exc:
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
