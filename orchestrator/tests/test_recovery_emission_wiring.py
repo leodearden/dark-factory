@@ -109,6 +109,45 @@ def _report(
     )
 
 
+def _pinned_hold(
+    *,
+    escalations: list[EscalationRef] | None = None,
+    **kw,
+) -> TruthReport:
+    """A pinned, unclaimed strand that STILL classifies LEAVE — `blocked`.
+
+    Every veto assertion in this module used to be anchored on the
+    IN_PROGRESS + no-claimant + ON_MAIN + pinned shape (``_RECOVERY`` row
+    (f)).  Task 3539 moved that shape — and the other three pinned
+    in-progress branch shapes with it — onto
+    :attr:`RecoveryAction.CONVERT_TO_BLOCKED`, because a silent LEAVE left
+    the row churning a dispatchable `in-progress` forever (measured: 39
+    consecutive ``recovery_vetoed`` over 10.5h on task 3717).  Silencing
+    THAT veto is what 3539 is for, so a test still asserting a veto row for
+    it would be asserting the defect.
+
+    The veto machinery itself is untouched and keeps a real population: a
+    `blocked` task carrying a non-merge-remediable pin is absent from
+    ``_RECOVERY`` entirely, falls through to the LEAVE default, and is swept
+    (``_RECONCILE_SWEEP_STATUSES`` is {'in-progress', 'blocked'}) — so it
+    reaches the same chokepoint with the same ``escalation_pinned`` reason.
+    That is the population these tests now ride, and it is also 3539's own
+    POST-conversion resting state, which makes it the shape an operator will
+    actually be looking at when one of these rows fires.
+
+    NOTE the pin category matters: ``_ref``'s default ``needs_human`` is not
+    in ``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES``, so
+    ``_only_merge_remediable`` is False and neither sweep-side blocked
+    upgrade clause (-> MARK_DONE_WITH_PROVENANCE / -> RE_FILE_ESCALATION)
+    fires.  A ``stranded_blocked`` pin here would NOT hold.
+    """
+    return _report(
+        db_status=TaskStatus.BLOCKED,
+        escalations=list(escalations or [_ref('esc-1')]),
+        **kw,
+    )
+
+
 def _live_claimant() -> Claimant:
     return Claimant(
         run_id='run-live', heartbeat_at=_iso(secs_ago=5.0),
@@ -224,16 +263,29 @@ def harness(tmp_path: Path, mock_orch_config):
 
 
 # ---------------------------------------------------------------------------
-# Boundary #9 — row (f): IN_PROGRESS + no claimant + ON_MAIN + open escalation
-# classifies LEAVE.  The MARK_DONE the evidence would otherwise justify is
-# VETOED, and until now that veto was completely silent.
+# Boundary #9 — a pinned, unclaimed strand on landing evidence classifies
+# LEAVE.  The MARK_DONE the evidence would otherwise justify is VETOED, and
+# until task 3535 that veto was completely silent.
+#
+# RE-ANCHORED BY TASK 3539 (sanctioned fixture repair, esc-3539-1).  The
+# boundary was originally stated over ``_RECOVERY`` row (f) — IN_PROGRESS +
+# no claimant + ON_MAIN + open escalation.  3539 remapped that row (and the
+# three sibling pinned in-progress branch shapes) to CONVERT_TO_BLOCKED
+# precisely so this veto STOPS being a silent, forever-churning hold, so the
+# in-progress shape no longer emits a veto row and can no longer carry the
+# boundary.  The contract itself is unchanged and still has a live
+# population: the same facts on a `blocked` task (see ``_pinned_hold``) still
+# fall through to LEAVE with reason ``escalation_pinned`` — and that is the
+# state 3539 CONVERTS the in-progress row into, so this class now describes
+# the veto exactly where an operator will meet it.  What is asserted here is
+# the same veto, moved; no assertion was weakened or deleted.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestBoundary9VetoIsDescribed:
     async def test_pinned_on_main_task_is_left_alone(self, harness):
         """The disposition half: nothing is written, exactly as before."""
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -243,7 +295,7 @@ class TestBoundary9VetoIsDescribed:
         assert harness.scheduler.mark_done.await_count == 0
 
     async def test_pinned_on_main_task_emits_one_vetoed_row(self, harness):
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -256,7 +308,7 @@ class TestBoundary9VetoIsDescribed:
         )
 
     async def test_vetoed_payload_carries_the_full_key_set(self, harness):
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -272,19 +324,22 @@ class TestBoundary9VetoIsDescribed:
         assert data['streak'] == 1
 
     async def test_vetoed_payload_names_the_shape_that_was_classified(self, harness):
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
-        # Exactly _RECOVERY row (f)'s key, rendered: no live claimant, on main,
-        # escalation present, no deploy phase.
+        # The rendered key of the shape that was classified: blocked, no live
+        # claimant, on main, escalation present, no deploy phase.  Absent from
+        # `_RECOVERY` entirely (its only blocked row, (g), keys
+        # has_open_escalation=False), so it reaches LEAVE via the table's
+        # fail-safe default — which is exactly the hold this row describes.
         assert _recovery_rows(harness)[0]['data']['shape'] == (
-            'in-progress|false|on_main|true|-'
+            'blocked|false|on_main|true|-'
         )
 
     async def test_vetoed_payload_names_the_pinning_ids(self, harness):
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-2'), _ref('esc-1')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-2'), _ref('esc-1')]),
         })
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
@@ -298,7 +353,7 @@ class TestBoundary9VetoIsDescribed:
 
     async def test_vetoed_payload_ages_each_pinning_id_by_id(self, harness):
         _bind_reports(harness, {
-            'T1': _report(escalations=[
+            'T1': _pinned_hold(escalations=[
                 _ref('esc-1', age_secs=300.0), _ref('esc-2', age_secs=90.0),
             ]),
         })
@@ -311,7 +366,7 @@ class TestBoundary9VetoIsDescribed:
         assert 60.0 < ages['esc-2'] < 200.0
 
     async def test_vetoed_payload_stamps_an_iso_utc_measured_at(self, harness):
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -325,7 +380,7 @@ class TestBoundary9VetoIsDescribed:
         """The LEAVE chokepoint and the open-escalation early-return both see
         this task in the SAME pass.  Emitting at both would double every
         boundary-#9 row and silently double any consumer's counts."""
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -381,7 +436,7 @@ class TestQuietRepeats:
         harness.config.recovery_emission = RecoveryEmissionConfig(
             veto_streak_threshold=3,
         )
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
         await harness._reconcile_stranded_in_progress(mid_run=False)
@@ -398,7 +453,7 @@ class TestQuietRepeats:
         harness.config.recovery_emission = RecoveryEmissionConfig(
             veto_streak_threshold=3,
         )
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         for _ in range(5):
             await harness._reconcile_stranded_in_progress(mid_run=False)
@@ -410,11 +465,11 @@ class TestQuietRepeats:
         )
 
     async def test_changed_pinning_id_set_re_emits(self, harness):
-        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
         # A different record now holds the task — a genuinely new fact.
-        stub.reports['T1'] = _report(escalations=[_ref('esc-1'), _ref('esc-9')])
+        stub.reports['T1'] = _pinned_hold(escalations=[_ref('esc-1'), _ref('esc-9')])
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
         rows = _recovery_rows(harness)
@@ -427,7 +482,7 @@ class TestQuietRepeats:
     async def test_repeat_sweeps_still_charge_the_streak(self, harness):
         """Quiet does not mean unobserved: the streak keeps climbing so the L1
         detector can fire even while no event row is written."""
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         for _ in range(3):
             await harness._reconcile_stranded_in_progress(mid_run=False)
@@ -505,8 +560,21 @@ class TestStoreUnavailableIsNamed:
 def _matrix_rows() -> dict[str, tuple[TruthReport, RecoveryAction]]:
     """One report per recovery action, each asserted to classify as named."""
     rows = {
+        # Task 3539 re-anchor: the pinned IN_PROGRESS shape this row used to
+        # ride now classifies CONVERT_TO_BLOCKED (see _pinned_hold).  The
+        # LEAVE arm of the matrix moves onto the pinned `blocked` shape, which
+        # is still a genuine hold.
         'leave_pinned': (
-            _report(escalations=[_ref('esc-1')]), RecoveryAction.LEAVE,
+            _pinned_hold(), RecoveryAction.LEAVE,
+        ),
+        # Task 3539's new action, held to the SAME byte-identity contract as
+        # the four it joins: the pinned in-progress strand the table now
+        # converts.  Its applier ships behind `convert_to_blocked_enforce`
+        # (default False), so like every row here it must write identically
+        # with emission on and off.
+        'convert_to_blocked': (
+            _report(escalations=[_ref('esc-1')]),
+            RecoveryAction.CONVERT_TO_BLOCKED,
         ),
         'revert_to_pending': (
             _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
@@ -590,7 +658,7 @@ class TestZeroDispositionChange:
 
     async def test_disabled_emission_writes_no_rows(self, harness):
         harness.config.recovery_emission = RecoveryEmissionConfig(enabled=False)
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -601,7 +669,7 @@ class TestZeroDispositionChange:
     async def test_emission_never_files_against_the_real_task(self, harness):
         """A record on the real task id would be read by every veto predicate —
         an observability signal mutating into a disposition change."""
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
@@ -687,7 +755,7 @@ class TestVetoStreakAlarm:
     async def test_the_first_two_sweeps_file_nothing(self, clocked):
         """Two sweeps is contention, not an incident."""
         harness, clock = clocked
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 2)
 
@@ -695,7 +763,7 @@ class TestVetoStreakAlarm:
 
     async def test_the_threshold_crossing_sweep_files_exactly_one_l1(self, clocked):
         harness, clock = clocked
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 3)
 
@@ -707,7 +775,7 @@ class TestVetoStreakAlarm:
     async def test_further_sweeps_never_file_a_second(self, clocked):
         """Boundary #17, "no storm": a hold that lasts a week is ONE alarm."""
         harness, clock = clocked
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 8)
 
@@ -717,7 +785,7 @@ class TestVetoStreakAlarm:
         """An operator must be able to act on the alarm without a second query."""
         harness, clock = clocked
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1', age_secs=4200.0)]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1', age_secs=4200.0)]),
         })
 
         await _sweeps(harness, clock, 3)
@@ -737,7 +805,7 @@ class TestVetoStreakAlarm:
         hold that filing it merely observed.
         """
         harness, clock = clocked
-        report = _report(escalations=[_ref('esc-1')])
+        report = _pinned_hold(escalations=[_ref('esc-1')])
         _bind_reports(harness, {'T1': report})
 
         await _sweeps(harness, clock, 5)
@@ -758,7 +826,7 @@ class TestVetoStreakAlarm:
         L1 and the event stream disagree about when the hold became an
         incident."""
         harness, clock = clocked
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 3)
 
@@ -772,10 +840,10 @@ class TestVetoStreakAlarm:
         the longest identical run is two — no alarm.
         """
         harness, clock = clocked
-        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 2)
-        stub.reports['T1'] = _report(escalations=[_ref('esc-9')])
+        stub.reports['T1'] = _pinned_hold(escalations=[_ref('esc-9')])
         await _sweeps(harness, clock, 2)
 
         assert _alarms(harness) == []
@@ -787,7 +855,7 @@ class TestVetoStreakAlarm:
         site that ever charged this counter must not be able to page anyone
         seconds after a strand appears."""
         harness, clock = clocked
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 6, interval=1.0)
 
@@ -801,7 +869,7 @@ class TestVetoStreakAlarm:
         harness.config.recovery_emission = RecoveryEmissionConfig(
             veto_streak_threshold=2,
         )
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 1, interval=1600.0)
         assert _alarms(harness) == []
@@ -816,7 +884,7 @@ class TestVetoStreakAlarm:
         harness.config.recovery_emission = RecoveryEmissionConfig(
             streak_escalation_enabled=False,
         )
-        _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
 
         await _sweeps(harness, clock, 5)
 
@@ -833,17 +901,21 @@ class TestVetoStreakAlarmRecovery:
 
     async def test_the_alarm_auto_resolves_when_the_veto_stops(self, clocked):
         harness, clock = clocked
-        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
         await _sweeps(harness, clock, 3)
         assert len(_alarms(harness)) == 1, 'precondition: the alarm did fire'
 
         # The operator resolves the pinning record; the next sweep finds the
-        # task recoverable and acts on it as it always would have.
+        # task recoverable and acts on it as it always would have.  Unpinned,
+        # a `blocked` task on an unmerged branch is the sweep's
+        # RE_FILE_ESCALATION shape (the second blocked-side upgrade clause) —
+        # an ACTION, so no veto is emitted and the alarm must release.  The
+        # backstop's own writes are already disarmed by the fixture's
+        # `stranded_blocked_escalate_enabled = False`, so this sweep leaves no
+        # record of its own to confuse the assertions below.
         stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
             branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
-        )
-        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
-            return_value='reverted',
         )
         await _sweeps(harness, clock, 1)
 
@@ -860,16 +932,16 @@ class TestVetoStreakAlarmRecovery:
     async def test_a_later_recurrence_files_again(self, clocked):
         """The whole point of the resolve half."""
         harness, clock = clocked
-        stub = _bind_reports(harness, {'T1': _report(escalations=[_ref('esc-1')])})
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
         await _sweeps(harness, clock, 3)
-        stub.reports['T1'] = _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None)
-        harness._revert_in_progress_if_no_live_claimant = AsyncMock(
-            return_value='reverted',
+        stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
         )
         await _sweeps(harness, clock, 1)
         assert _alarms(harness) == [], 'precondition: the first alarm resolved'
 
-        stub.reports['T1'] = _report(escalations=[_ref('esc-1')])
+        stub.reports['T1'] = _pinned_hold(escalations=[_ref('esc-1')])
         await _sweeps(harness, clock, 3)
 
         assert len(_alarms(harness)) == 1, (

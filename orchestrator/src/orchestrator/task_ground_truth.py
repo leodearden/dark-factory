@@ -46,6 +46,30 @@ passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
 it). Live-vs-dead filer discrimination becomes REACHABLE when that lands; what
 3563 delivers is that the identity is now expressible at all, and that the
 bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
+
+Task 3539 added :attr:`RecoveryAction.CONVERT_TO_BLOCKED` and the four
+escalation-pinned stranded rows (f)/(i)/(j)/(k) that map to it. It is a
+LEGIBILITY action, NOT a recovery: it stops a churning ``in-progress`` row and
+names the honest status for "pinned, awaiting a human". The converted task
+KEEPS ITS PIN and does not self-heal — its exit is a human or task 3541's
+``classify_pins`` veto collapse.
+
+That "does not self-heal" property is a statement about a pin OUTSIDE
+``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the APPLIER is what makes it
+unconditionally true: a row pinned only by a merge-remediable escalation would
+be picked straight back up by the blocked-arm upgrade clauses on the next
+sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
+and stays pure and config-free — which is exactly why the scoping lives with
+the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
+new row maps to MARK_DONE); only the silent LEAVE that let the row churn
+forever is replaced. Every CONVERT row is keyed ``TaskStatus.IN_PROGRESS``, so
+conversion is structurally one-shot, and the ``pending`` / ``merge-deferred``
+population stays task 4651's under the 2026-08-24 ownership ruling. This
+module stays PURE and config-free: the observe-before-enforce gate lives in the
+applier (``Harness._reconcile_one_stranded``, behind
+``convert_to_blocked_enforce``), never here.
 """
 
 from __future__ import annotations
@@ -122,6 +146,12 @@ class RecoveryAction(enum.StrEnum):
     MARK_DONE_WITH_PROVENANCE = 'mark_done_with_provenance'
     REVERT_TO_PENDING = 'revert_to_pending'
     RE_FILE_ESCALATION = 're_file_escalation'
+    #: Task 3539 — a LEGIBILITY action, not a recovery.  Move a churning,
+    #: escalation-pinned stranded ``in-progress`` row into the honest resting
+    #: status for "pinned, awaiting a human".  It does NOT mean "recovered":
+    #: the converted row keeps its pin.  See the module docstring's task-3539
+    #: paragraph and the CONVERT rows' comment in ``_RECOVERY``.
+    CONVERT_TO_BLOCKED = 'convert_to_blocked'
     LEAVE = 'leave'
 
 
@@ -814,13 +844,68 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # evidence either; same revert-to-pending outcome as (c).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.REVERT_TO_PENDING,
-    # (f) An escalation already open at ANY level (L0/L1/L2 — not just L1)
-    # is the deliberate human/automation-handoff signal — a sweep must never
-    # second-guess it, even with on-main landing evidence (review finding
-    # #1: this used to check level==1 only, so an open L2 slipped through
-    # and still hit row (a)'s auto-flip).
+    # (f)/(i)/(j)/(k) — THE FOUR ESCALATION-PINNED STRANDED ROWS (task 3539).
+    #
+    # An escalation already open at ANY level (L0/L1/L2 — not just L1) is the
+    # deliberate human/automation-handoff signal, and a sweep must never
+    # second-guess it into a mark-done, even with on-main landing evidence
+    # (review finding #1: this used to check level==1 only, so an open L2
+    # slipped through and still hit row (a)'s auto-flip). That veto is
+    # UNCHANGED — none of these rows maps to MARK_DONE_WITH_PROVENANCE.
+    #
+    # What changed is the OTHER half. Row (f) used to map to LEAVE, so the
+    # sweep held SILENTLY and the row churned `in-progress` forever: measured
+    # 39 consecutive `recovery_vetoed` emissions over 10.5h on task 3717,
+    # re-dispatched over and over because `in-progress` is a dispatchable
+    # status. The table now names the honest resting status instead. The
+    # other three branch shapes were never even in the table (they fell
+    # through to the LEAVE default) and churn identically, so all four
+    # convert.
+    #
+    # CONVERT_TO_BLOCKED DOES NOT MEAN "RECOVERED". The converted row arrives
+    # in `blocked` STILL CARRYING ITS PIN; its exit is a human or task 3541's
+    # `classify_pins` veto collapse, never an automatic self-heal from this
+    # table. (Mechanically: `Harness.MERGE_REMEDIABLE_ESC_CATEGORIES` is
+    # {'stranded_blocked'} and `_only_merge_remediable` is an `all(...)`, so a
+    # `task_failure` pin fails both blocked-arm upgrade clauses; and this
+    # table's only BLOCKED row, (g), keys `has_open_escalation=False`.)
+    #
+    # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
+    # every converting row (amendment pass, review finding #3). It holds for a
+    # `task_failure` pin — the measured 3717 population — and NOT for a
+    # `stranded_blocked` one, which `_only_merge_remediable` accepts, so the
+    # next sweep's blocked-arm clauses would move the converted row again
+    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
+    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
+    # at-rest rows reach the conversion; see the scoping clause in
+    # `Harness._reconcile_one_stranded`.
+    #
+    # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
+    # That single fact does two jobs: a converted (`blocked`) task can never
+    # match a CONVERT row again, so conversion is structurally one-shot and
+    # idempotent with no persisted counter; and it keeps this task out of
+    # task 4651's `pending` / `merge-deferred` territory under the 2026-08-24
+    # ownership ruling (gate task 4673 / esc-4673-1). Both properties are
+    # pinned as tests in orchestrator/tests/test_convert_to_blocked.py, not
+    # merely asserted here.
+    #
+    # The applier ships this in LOG MODE behind `convert_to_blocked_enforce`
+    # (config.py, default False) — see Harness._reconcile_one_stranded.
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.ON_MAIN, True, None):
-        RecoveryAction.LEAVE,
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (i) Same shape, branch deleted but a merge marker confirms the landing.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_WITH_MERGE_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (j) Same shape with the branch still off-main. Without the pin this is
+    # row (c)'s REVERT_TO_PENDING; the pin vetoes that re-dispatch, and
+    # before 3539 the veto left the row churning instead of resting.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.EXISTS_OFF_MAIN, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (k) Same shape with the branch gone and no marker — row (d)'s revert,
+    # vetoed identically. Note this row is deploy_phase=None, so the D1
+    # crashed-mid-deploy shape (row (h), DeployPhase.RAN) is untouched.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
     # (g) Stranded 'blocked' with no landing evidence and no escalation
     # already open at any level: blocked discipline forbids a silent
     # blocked->pending revert, so the sweep must re-file an escalation
