@@ -1,6 +1,5 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
-import ast
 import asyncio
 import contextlib
 import logging
@@ -2175,59 +2174,100 @@ class TestVerifyResultSkippedTestIds:
         assert restored.skipped_test_ids == []
         assert restored.skipped_test_ids is not None
 
-    def test_run_verification_parses_both_vectors_at_the_same_seam(self):
-        """Both parsers are called under ONE junit guard, and both reach the result.
+    @pytest.mark.asyncio
+    async def test_run_verification_parses_both_vectors_from_the_same_report(
+        self, tmp_path: Path,
+    ):
+        """Both vectors reach the result, parsed ONCE each from the SAME report.
 
-        STRUCTURAL rather than end-to-end, and deliberately so: driving
-        ``run_verification``'s junit seam for real needs a full subprocess
-        harness with an injected ``--junitxml``, which pins the plumbing at
-        enormous cost while the invariant that actually matters is cheap to
-        state — the two vectors must be parsed from the SAME report under the
-        SAME ``if junit_path is not None`` guard, so they always describe the
-        same run.  A skipped vector parsed under a different condition (or left
-        unwired while the failing one is populated) would silently pair a fresh
-        failing vector with a stale or absent skipped one, and every downstream
-        comparison between them would then be answering about two different
-        runs — a subtler version of the exact conflation this task closes.
+        Drives the real ``run_verification`` seam (nothing executes —
+        ``_run_cmd`` is a spy), rather than asserting on verify.py's source
+        text or AST shape: the invariant is behavioural, and it must survive
+        any refactor that preserves it (extracting the two parses into a
+        shared helper, ``**kwargs`` construction, a different guard spelling).
+
+        ``role='merge'`` plus ``merge_verify_breadth='full'`` is exactly what
+        makes ``junit_path`` non-None, so the seam is reached.  Asserting the
+        two parsers get the SAME path argument is the real same-report
+        invariant a divergent second condition would break: a skipped vector
+        read from a different (or stale) report would silently pair a fresh
+        failing vector with one describing a different run, and every
+        downstream comparison between them would be answering about two runs.
         """
-        tree = ast.parse(Path(verify.__file__).read_text())
-        fn = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
-            and n.name == 'run_verification'
+        worktree = tmp_path / 'merge-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        failing_sentinel = ['sentinel::failing']
+        skipped_sentinel = ['sentinel::skipped']
+        failing_parser = MagicMock(return_value=failing_sentinel)
+        skipped_parser = MagicMock(return_value=skipped_sentinel)
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_failing_test_ids_from_junit', new=failing_parser),
+            patch.object(verify, '_extract_skipped_test_ids_from_junit', new=skipped_parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='merge',
+                attempt_id=None,
+            )
+
+        # (a) both vectors reach the result on the correct fields — neither
+        #     dropped, aliased, nor swapped.
+        assert result.failing_test_ids == failing_sentinel, (
+            f'the failing vector must reach the result; got {result.failing_test_ids!r}'
+        )
+        assert result.skipped_test_ids == skipped_sentinel, (
+            f'the skipped vector must reach the result; got {result.skipped_test_ids!r}'
         )
 
-        guards = [
-            n
-            for n in ast.walk(fn)
-            if isinstance(n, ast.If)
-            and {
-                c.func.id
-                for c in ast.walk(n)
-                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
-            }
-            >= {'_extract_failing_test_ids_from_junit', '_extract_skipped_test_ids_from_junit'}
-        ]
-        assert guards, (
-            'both junit parsers must be called under the SAME guard in '
-            'run_verification, so the two vectors always describe one report'
+        # (b) each parser ran exactly once, against the SAME junit path.
+        assert failing_parser.call_count == 1, failing_parser.call_args_list
+        assert skipped_parser.call_count == 1, skipped_parser.call_args_list
+        assert failing_parser.call_args.args == skipped_parser.call_args.args, (
+            'both vectors must be parsed from ONE report, or they describe two '
+            f'different runs; failing={failing_parser.call_args.args!r} '
+            f'skipped={skipped_parser.call_args.args!r}'
         )
 
-        constructed = [
-            {kw.arg for kw in n.keywords}
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == 'VerifyResult'
-        ]
-        assert constructed, 'run_verification must construct a VerifyResult'
-        assert all(
-            {'failing_test_ids', 'skipped_test_ids'} <= kwargs for kwargs in constructed
-        ), (
-            f'every VerifyResult built by run_verification must carry BOTH id '
-            f'vectors; got {constructed!r}'
+    @pytest.mark.asyncio
+    async def test_neither_vector_is_parsed_when_the_seam_is_not_reached(
+        self, tmp_path: Path,
+    ):
+        """(c) role='task' leaves junit_path None: NEITHER parser is called and
+        BOTH fields come back None.  This is what pins that the two vectors
+        share ONE guard rather than merely both existing — a skipped vector
+        wired under its own condition would still be parsed here."""
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
         )
+        failing_parser = MagicMock(return_value=['sentinel::failing'])
+        skipped_parser = MagicMock(return_value=['sentinel::skipped'])
+
+        with (
+            patch('orchestrator.verify._run_cmd', new=AsyncMock(return_value=(0, '', False))),
+            patch.object(verify, '_extract_failing_test_ids_from_junit', new=failing_parser),
+            patch.object(verify, '_extract_skipped_test_ids_from_junit', new=skipped_parser),
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=ModuleConfig(prefix='pkg', test_command='pytest'),
+                role='task',
+                attempt_id=None,
+            )
+
+        failing_parser.assert_not_called()
+        skipped_parser.assert_not_called()
+        assert result.failing_test_ids is None, result.failing_test_ids
+        assert result.skipped_test_ids is None, result.skipped_test_ids
 
     def test_both_id_vectors_coexist_on_one_result(self):
         """The two fields are independent — neither aliases nor overwrites the other."""
