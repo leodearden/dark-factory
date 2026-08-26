@@ -33,6 +33,7 @@ Step → coverage map:
   step-13 RED — δ end to end (landing walk, tip fail, kill switch, hot reload)
   step-15 RED — a head whose outcome was already DELIVERED is not δ's to retract
   step-17 RED — the adopted head lands from its POST-verify worktree
+  step-19 RED — `on_merge_landed` reports the PREDECESSOR as base_sha
 
 Harness notes (see plan pre-1; conventions cloned from
 test_merge_queue_deep_dispatch.py:1-36):
@@ -1302,16 +1303,25 @@ async def _prefix_scene_upto_finalize(
 class TestInOrderCasWalk:
     """δ's walk: the whole verified PREFIX lands, in order, by CAS."""
 
-    async def _scene(self, git_repo: Path, tmp_path: Path, monkeypatch):
+    async def _scene(
+        self, git_repo: Path, tmp_path: Path, monkeypatch, *, on_landed=None,
+    ):
         """The clean 4-item chain, driven all the way THROUGH the finalize half.
 
         :func:`_prefix_scene_upto_finalize` owns the build; this adds only the
         ``_finalize_inflight`` call the walk hangs off, plus the event-loop
         turn that lets every ``_on_finalized`` done-callback run.
+
+        *on_landed*, when given, is installed as the worker's
+        ``_on_merge_landed`` hook — the PRIMARY in-process trigger the harness
+        wires to ``_note_merge_all``, and the one downstream consumer of the
+        walk that reads a RANGE rather than a single sha.
         """
         s = await _prefix_scene_upto_finalize(
             git_repo, tmp_path, monkeypatch, db_name='delta-walk.db',
         )
+        if on_landed is not None:
+            s['worker']._on_merge_landed = on_landed
         s['advanced'] = await s['worker']._finalize_inflight(s['entry'])
         await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
         return s
@@ -1446,6 +1456,95 @@ class TestInOrderCasWalk:
         assert s['worker']._lifecycle.current(trunc.request_id) == (
             ItemLifecycleState.LANE_BUFFERED
         ), 'it stays queued for its ordinary sequential path'
+
+
+    async def test_on_merge_landed_reports_the_predecessor_as_base_sha(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(review fix #2) The hook's range must be PREDECESSOR..own-merge-sha.
+
+        In the walk, ``expected_main = landed_sha`` executes BEFORE the hook
+        call, and ``adv_outcome.advanced_sha`` is always populated on an
+        ``'advanced'`` outcome — so both branches of
+        ``adv_outcome.advanced_sha or expected_main`` evaluate to the sha that
+        just landed, which is also ``outcome.merge_sha``.  Every deep-landed
+        link therefore reports a DEGENERATE ``X..X`` range.  The head path
+        (merge_queue.py's ``item.base_sha``) has always been correct; the walk
+        must match it.
+        """
+        seen: list[tuple[str, str, str]] = []
+
+        async def _hook(task_id, base_sha, head_sha):
+            seen.append((task_id, base_sha, head_sha))
+
+        s = await self._scene(git_repo, tmp_path, monkeypatch, on_landed=_hook)
+        link_shas = [mc for _tid, mc in s['chain'].links]
+
+        assert [t for t, _, _ in seen] == [
+            '101', *(tid for tid, _ in s['chain'].links)
+        ]
+        assert [h for _, _, h in seen] == [s['head_mc'], *link_shas]
+        # (c) head-path parity: chain item #1 reports the item's OWN base_sha,
+        # and every link reports its predecessor's merge commit.
+        assert [b for _, b, _ in seen] == [
+            s['main_sha'], s['head_mc'], *link_shas[:-1]
+        ]
+        for tid, base, head in seen:
+            assert base != head, (
+                f'task {tid} was reported over the degenerate range '
+                f'{base[:8]}..{head[:8]} — every consumer of it sees an EMPTY '
+                f'changed-file list'
+            )
+
+    async def test_the_reported_range_is_non_degenerate_by_its_consumer(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The stake, measured through the actual consumer.
+
+        ``harness._note_merge_all`` runs
+        ``git_ops.get_merge_diff_files(base_sha, head_sha)`` over exactly the
+        pair reported here and fans the result out to the service-restart
+        coordinator and the pipeline-landing tripwire.  Over ``X..X`` that list
+        is EMPTY — so today every deep-landed link silently arms both with
+        nothing, a fail-quiet degradation against this repo's
+        loud-over-silent norm.  Each item in this scene edits a distinct file,
+        so a correct range can never come back empty.
+        """
+        seen: list[tuple[str, str, str]] = []
+
+        async def _hook(task_id, base_sha, head_sha):
+            seen.append((task_id, base_sha, head_sha))
+
+        s = await self._scene(git_repo, tmp_path, monkeypatch, on_landed=_hook)
+
+        for tid, base, head in seen:
+            files, err = await s['git_ops'].get_merge_diff_files(base, head)
+            assert err is None, f'task {tid}: {err!r}'
+            assert files, (
+                f'task {tid}: {base[:8]}..{head[:8]} reports NO changed files '
+                f'— the coordinator and the tripwire are armed with nothing'
+            )
+
+    async def test_a_raising_hook_never_shortens_the_walk(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(d) The hook is FAIL-OPEN, and the corrected argument keeps it so.
+
+        A hook bug must never turn into a short landing — the existing
+        ``except Exception`` warning arm is what guarantees that, and it has to
+        keep covering every link once the argument changes.
+        """
+        called: list[str] = []
+
+        async def _boom(task_id, base_sha, head_sha):
+            called.append(task_id)
+            raise RuntimeError('hook exploded')
+
+        s = await self._scene(git_repo, tmp_path, monkeypatch, on_landed=_boom)
+
+        assert s['advanced'] is True
+        assert called == ['101', *(tid for tid, _ in s['chain'].links)]
+        assert await _rev_parse(s['repo'], 'main') == s['chain'].tip
 
 
 # ═══════════════════════════════════════════════════════════════════════════
