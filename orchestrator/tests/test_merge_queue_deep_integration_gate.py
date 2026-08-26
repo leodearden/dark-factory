@@ -1240,6 +1240,349 @@ class TestTwoWayOracleContractAsync:
         _assert_two_way_quiescent(worker, main_sha, [req])
 
 
+# ── the n-item gate scene (step-4) ───────────────────────────────────────────
+
+
+def _gate_followers(n: int, *, start: int = 102) -> tuple[str, ...]:
+    """*n* consecutive follower task ids, each destined for a DISJOINT file.
+
+    Disjointness is load-bearing at depth: a 16-deep build performs 15 real
+    sequential merges, and a single textual conflict anywhere in that run would
+    truncate the chain and turn a DEPTH claim into a truncation claim.  One
+    file per task (``f<tid>.txt``) makes every follower chainable by
+    construction, so a short chain can only ever be the code's doing.
+    """
+    return tuple(str(start + i) for i in range(n))
+
+
+class _StubRemoteAllocator:
+    """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
+
+    REMOTE deliberately (cloned from test_merge_queue_deep_dispatch.py): a
+    remote lease makes ``_run_post_merge_verify`` build its pool from the
+    injected runner instead of a real ``LocalRunner``, so
+    ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
+    genuinely runs and genuinely emits.  Stubbing ``_run_post_merge_verify``
+    wholesale (what ``remote=False`` does) emits no event at all and would make
+    every ``chain_items`` telemetry assertion vacuous.
+    """
+
+    def __init__(self, lease) -> None:
+        self._lease = lease
+        self._held = False
+
+    def free_host_count(self) -> int:
+        return 0 if self._held else 1
+
+    async def acquire(self, _local_factory):
+        if self._held:
+            return None
+        self._held = True
+        return self._lease
+
+    async def release(self, _lease) -> None:
+        self._held = False
+
+    async def cancel_and_release(self, _lease) -> bool:
+        self._held = False
+        return True
+
+
+def _verify_rows(db_path: Path) -> list[dict]:
+    """Return every ``merge_verify`` row's parsed ``data`` dict, in order.
+
+    The durable-tier twin of :func:`_finalized_rows`.  η1's predicate reads
+    these rows out of reify's runs.db, so the gate reads them the same way —
+    through real sqlite, after ``json.dumps`` — rather than through a capturing
+    fake that would pass even for a value the real emit path cannot serialise.
+    """
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_verify' "
+            'ORDER BY rowid'
+        ).fetchall()
+    finally:
+        conn.close()
+    return [json.loads(r[0]) for r in rows]
+
+
+class _GateScene:
+    """One repo + worker + queue, driven round after round THROUGH finalize.
+
+    The n-follower generalisation of
+    test_merge_queue_deep_landing.py::_DeltaScene, which is hard-wired to three
+    links plus one truncator and therefore cannot reach the PRD's stated depth
+    of 16.  What this adds beyond a wider fixture:
+
+      * ``n_followers`` is a parameter, so a row states its own queue depth;
+      * a REMOTE mode (``remote=True``) that drives the real
+        ``_run_post_merge_verify`` and therefore the real ``merge_verify``
+        emission site, for the rows whose claim is about TELEMETRY or about the
+        verify BUDGET rather than about landing;
+      * per-round FACT RECORDING onto :attr:`rounds`, so a multi-round row
+        asserts against what each round actually did instead of against
+        whatever the last round left behind.
+
+    Every spy is PASSTHROUGH (``advance_main``, ``release_chain_build_lane``,
+    ``build_chain``, ``_run_post_merge_verify`` in remote mode), so on-disk and
+    pool state stay REAL while the call ledgers stay observable.
+    """
+
+    def __init__(self, git_ops, config, worker, repo, store, db_path) -> None:
+        self.git_ops = git_ops
+        self.config = config
+        self.worker = worker
+        self.repo = repo
+        self.store = store
+        self.db_path = db_path
+        self.calls: list[dict] = []
+        self.posted: list[dict] = []
+        self.built: list[dict] = []
+        self.lane_releases: list[tuple] = []
+        self.advance_calls: list[tuple] = []
+        self.reqs: dict[str, MergeRequest] = {}
+        self.rounds: list[dict] = []
+        self._round_no = 0
+
+    @property
+    def depths(self) -> list[int | None]:
+        """The DISPATCHED chain depth of each round, in order.
+
+        ``None`` for a round that built no chain at all (kill switch, floor, or
+        a declined placement) — deliberately distinct from ``1``, which is a
+        chain the policy sized at the floor.
+        """
+        return [
+            None if r['chain'] is None else 1 + len(r['chain'].links)
+            for r in self.rounds
+        ]
+
+    async def enqueue(self, task_ids) -> None:
+        """Put *task_ids* on the queue through the REAL enqueue chokepoint.
+
+        ``enqueue_merge_request`` is what registers ``_on_finalized``, and
+        ``merge_finalized`` has no other emit site — so a scene that stuffed
+        ``_lane_buffers`` directly would make every landing assertion blind to
+        the payload this gate exists to read.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        for tid in task_ids:
+            self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
+            await enqueue_merge_request(
+                self.worker._queue, self.reqs[tid], self.store,
+            )
+        self.worker._drain_queue_into_lanes()
+
+    async def round_(
+        self, *, tag: str, head_tid: str, req: MergeRequest | None = None,
+    ) -> dict:
+        """Drive ONE round: dispatch → verify → finalize; record its facts.
+
+        *req* re-dispatches an EXISTING request (the one a previous round put
+        back) instead of picking the next one off the lane buffers — which is
+        how a scenario asserts that the very same request lands on a later
+        round's own verdict.
+        """
+        self._round_no += 1
+        worker = self.worker
+        n_built_before = len(self.built)
+        n_releases_before = len(self.lane_releases)
+        n_advances_before = len(self.advance_calls)
+        main_before = await _rev_parse(self.repo, 'main')
+        head_mc = await _merge_commit_off_main(
+            self.repo, f'task/{head_tid}', f'{tag}-r{self._round_no}',
+        )
+        # The head leaves the buffers the way the merger takes it — it must not
+        # still be queued when `chain_snapshot` runs, or it would chain itself.
+        popped = req if req is not None else worker._pop_next_pickable()
+        assert popped is not None and popped.task_id == head_tid, (
+            f'expected {head_tid} to be the pickable head, got '
+            f'{None if popped is None else popped.task_id}'
+        )
+        wt = _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}')
+        item = RealMergeItem(
+            request=popped,
+            merge_result=MergeResult(
+                success=True, merge_commit=head_mc, merge_worktree=wt,
+            ),
+            merge_wt=wt,
+            base_sha=main_before,   # this round really CASes against main
+            speculative=True,       # slot 2 — the only kind that chains
+        )
+        entry = await worker._dispatch_item(item)
+        assert entry is not None, 'dispatch must not decline: a host is free'
+        assert entry.verify_task is not None
+        await entry.verify_task
+        advanced = await worker._finalize_inflight(entry)
+        await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
+
+        rec = self.calls[-1]
+        outcome = popped.result.result() if popped.result.done() else None
+        rec.update({
+            'round': self._round_no,
+            'tag': tag,
+            'item': item,
+            'req': popped,
+            'advanced': advanced,
+            'main_before': main_before,
+            'main_after': await _rev_parse(self.repo, 'main'),
+            'head_mc': head_mc,
+            'halving_state': worker._chain_halving_state,
+            'outcome': outcome,
+            # Per-round SLICES of the cumulative ledgers, so a multi-round row
+            # reads what THIS round did rather than the running total.
+            'built': self.built[n_built_before:],
+            'lane_releases': self.lane_releases[n_releases_before:],
+            'advance_calls': self.advance_calls[n_advances_before:],
+            'landed': [
+                tid for tid, r in self.reqs.items()
+                if r.result.done() and not r.result.cancelled()
+                and r.result.result().status == 'done'
+            ],
+        })
+        self.rounds.append(rec)
+        if entry.lease is not None:
+            await worker._host_allocator.release(entry.lease)
+        return rec
+
+
+def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
+    """A RemoteRunner-shaped fake whose verdicts come from *script*, in order.
+
+    Used only in ``remote=True`` mode.  The verdict is decided HERE — below
+    ``VerifyRunnerPool.dispatch`` — rather than by replacing
+    ``_run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
+    path above it genuinely runs and the ``merge_verify`` row is genuinely
+    emitted.  A script that runs out returns PASS, matching δ's oracle.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify import VerifyResult
+
+    verdicts = list(script or [])
+
+    async def _run_merge_verify(*args, **kwargs):
+        scene.posted.append({'args': args, 'kwargs': kwargs})
+        passed = verdicts.pop(0) if verdicts else True
+        if passed:
+            return VerifyResult(
+                passed=True, test_output='ok', lint_output='', type_output='',
+                summary='ok', category='',
+            )
+        return _fail_verify_result()
+
+    fake = MagicMock()
+    fake.name = name
+    fake.is_local = False
+    fake.run_merge_verify = AsyncMock(side_effect=_run_merge_verify)
+    fake.cancel_verify = AsyncMock(return_value=0)
+    fake.probe_clean = AsyncMock(return_value=True)
+    return fake
+
+
+async def _make_gate_scene(
+    repo: Path, tmp_path: Path, monkeypatch, *,
+    chain_cap: int,
+    n_followers: int,
+    db_name: str,
+    script: list[bool] | None = None,
+    heads: tuple[str, ...] = ('101',),
+    remote: bool = False,
+) -> _GateScene:
+    """Build an n-follower, finalize-capable scene over a REAL git repo.
+
+    *script* is the ordered pass/fail verdict sequence; it runs out into PASS.
+    *remote* selects WHERE the verdict is injected:
+
+      * ``False`` — replace ``orchestrator.merge_queue._run_post_merge_verify``
+        outright (δ's shape).  Cheapest, and the right seam for a row whose
+        claim is about LANDING or about queue state.  No ``merge_verify`` event
+        is emitted on this path.
+      * ``True`` — install a ``_StubRemoteAllocator`` over a REMOTE
+        ``HostLease`` whose runner answers the script, and let the real
+        ``_run_post_merge_verify`` run.  The right seam for a row whose claim
+        is about TELEMETRY (``chain_items``, ``chain_build_ms``) or about the
+        verify BUDGET, because both are produced strictly below that call.
+
+    Module-level monkeypatching is confined to the four names
+    test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
+    ``_run_post_merge_verify``, ``release_chain_build_lane`` and
+    ``CHAIN_BUILD_TIMEOUT_SECS``); everything else is patched on the INSTANCE.
+    """
+    from orchestrator.event_store import EventStore
+
+    followers = _gate_followers(n_followers)
+    git_ops = _make_git_ops(repo, size=2)
+    config = _make_config(repo, chain_cap=chain_cap)
+    for tid in (*heads, *followers):
+        await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
+    db_path = tmp_path / db_name
+    store = EventStore(db_path, f'run-{db_name}')
+    worker = _make_worker(git_ops)
+    worker._event_store = store
+    scene = _GateScene(git_ops, config, worker, repo, store, db_path)
+
+    if remote:
+        from orchestrator.verify_runner import HostLease
+
+        # Installed BEFORE first use so `_ensure_host_allocator`'s cache check
+        # short-circuits on it rather than building a real one.
+        worker._host_allocator = _StubRemoteAllocator(HostLease(
+            name='laptop', runner=_scripted_remote_runner(scene, script),
+            is_local=False,
+        ))
+
+    await scene.enqueue((*heads, *followers))
+
+    # The round recorder, installed ONCE — re-wrapping per round would capture
+    # the previous round's recorder as `real` and nest a wrapper deeper each
+    # round.
+    real_verify = worker._run_inflight_verify
+
+    async def _recording(_item, _lease, **kwargs):
+        rec = dict(kwargs)
+        scene.calls.append(rec)
+        rec['result'] = await real_verify(_item, _lease, **kwargs)
+        return rec['result']
+
+    monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    scene.lane_releases = _spy_chain_lane_release(monkeypatch)
+    scene.advance_calls = _spy_advance_main(git_ops, monkeypatch)
+
+    real_build = merge_queue.build_chain
+
+    async def _recording_build(git_ops_, queue_snapshot, head_merge_commit, **kw):
+        record = {
+            'queue_snapshot': tuple(queue_snapshot),
+            'head_merge_commit': head_merge_commit, **kw,
+        }
+        scene.built.append(record)
+        record['result'] = await real_build(
+            git_ops_, queue_snapshot, head_merge_commit, **kw,
+        )
+        return record['result']
+
+    monkeypatch.setattr(merge_queue, 'build_chain', _recording_build)
+
+    if not remote:
+        verdicts = list(script or [])
+
+        async def _oracle(_git_ops, _req, merge_wt, **kwargs):
+            scene.posted.append({'merge_wt': merge_wt, **kwargs})
+            passed = verdicts.pop(0) if verdicts else True
+            return None if passed else _fail_verify_result()
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._run_post_merge_verify', _oracle,
+        )
+    return scene
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # -- step-03 RED: Row 11 (part 1) — the gate must reach PRD DEPTH 16 --
 #
