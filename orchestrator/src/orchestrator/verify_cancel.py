@@ -233,6 +233,7 @@ def cancel_request(
     kill=os.kill,
     killpg=os.killpg,
     failed_pids_out: list | None = None,
+    killed_pgid_out: list[int] | None = None,
 ) -> int:
     """Cancel the verify-merge identified by the pgid file at *path*.
 
@@ -266,7 +267,8 @@ def cancel_request(
 
     6. If any live process could not be killed → return 1 and **retain** the
        pgid file (lets a retry or β's quarantine probe act on it).
-       Otherwise remove the file and return 0.
+       Otherwise remove the file, report *pgid* on *killed_pgid_out*, and
+       return 0.
 
     Parameters
     ----------
@@ -275,11 +277,28 @@ def cancel_request(
         ``SIGKILL`` are appended.  Useful for callers that want to emit a
         human-readable diagnostic.  Pass ``[]`` (an empty list) and inspect
         it after the call.
+    killed_pgid_out:
+        Optional list to which the swept *pgid* is appended — and ONLY on the
+        path that reached the ``SIGKILL`` sweep + ``killpg`` backstop and then
+        returned 0.  Nothing is reported on the three nothing-to-cancel
+        return-0 paths (step 1) nor on the ``PermissionError`` return-1 path.
+        Same out-param idiom as *failed_pids_out*: pass ``[]`` and inspect it
+        after the call.
 
     Return value
     ------------
-    * ``0`` — all processes killed (or already gone), file removed.
+    * ``0`` — nothing to cancel, OR all processes killed (or already gone) and
+      the file removed.
     * ``1`` — at least one live process raised ``PermissionError``; file kept.
+
+    **``0`` does NOT mean something was killed.**  Three of the four return-0
+    paths (step 1: absent file, corrupt content, ``pgid <= 0``) never send a
+    signal at all, and the absent-file case is the COMMON one — a verify-merge
+    that completes normally removes its own per-request pgid file in its
+    ``finally``, so a cancel racing normal completion lands there.  A caller
+    whose next action depends on having actually killed the recorded process —
+    notably ``cli.py:cancel_verify`` clearing the SHARED fixed-key holder
+    rendezvous — must gate on *killed_pgid_out*, never on the rc.
     """
     # Step 1: read pgid file
     try:
@@ -333,15 +352,28 @@ def cancel_request(
     #
     # PARTIALLY CLOSED (task 3186, PRD δ).  The MERGE-WORKER-INITIATED route
     # -- ssh -> ``orchestrator cancel-verify`` -> this function -> SIGKILL --
-    # no longer leaks the fixed key: ``cli.py:cancel_verify`` now calls
-    # :func:`remove_lock_holder_pgid` on its rc == 0 path, so the caller that
-    # skipped the victim's ``finally`` performs the clear on its behalf.  That
-    # is the route δ's head-verify teardown takes for a REMOTE lease, and its
-    # cleanliness is DF-3071's precondition (a leaked key reads BUSY and defers
-    # the fleet).  Deliberately NOT closed: the ``fire_watchdog_kill``
-    # ``os._exit(1)`` route below, which is self-inflicted and has no surviving
-    # caller to clean up after it -- still the dominant leak source, and still
-    # what the hardening note below is for.
+    # no longer leaks the fixed key: ``cli.py:cancel_verify`` calls
+    # :func:`remove_lock_holder_pgid` when the key names the pgid this function
+    # actually swept, so the caller that skipped the victim's ``finally``
+    # performs the clear on its behalf.  That is the route δ's head-verify
+    # teardown takes for a REMOTE lease, and its cleanliness is DF-3071's
+    # precondition (a leaked key reads BUSY and defers the fleet).
+    #
+    # The clear is gated on IDENTITY, not on rc.  The key is FIXED and SHARED:
+    # its owner is whichever run last won the build-lane flock (cli.py:607-622),
+    # which is routinely a DIFFERENT, live verify than the one being cancelled.
+    # And rc == 0 is not evidence of a kill -- three of the four return-0 paths
+    # above never signal anything, the absent-file one being the common case (a
+    # verify that completed normally already removed its own per-request file).
+    # Clearing on rc alone would therefore trade this wedged-lane risk for a
+    # strictly worse one: a fail-OPEN lease read (``read_lock_holder_pgid`` ->
+    # None -> "not held") that lets the fleet redeploy over a LIVE verify.
+    # Hence :func:`cancel_request`'s ``killed_pgid_out``.
+    #
+    # Deliberately NOT closed: the ``fire_watchdog_kill`` ``os._exit(1)`` route
+    # below, which is self-inflicted and has no surviving caller to clean up
+    # after it -- still the dominant leak source, and still what the hardening
+    # note below is for.
     #
     # Hardening (unchanged, now better motivated): stamp a boot-id alongside
     # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
@@ -376,9 +408,15 @@ def cancel_request(
 
     # Step 6: decide outcome
     if failed:
-        # Retain the file so a retry can act on it
+        # Retain the file so a retry can act on it.  Report NOTHING: a live
+        # process refused SIGKILL, so it plausibly still holds whatever the
+        # caller was about to declare free.
         return 1
     remove_pgid_file(path)
+    # The ONLY path that both swept a real pgid and returned 0 — see the
+    # docstring's "0 does NOT mean something was killed" note.
+    if killed_pgid_out is not None:
+        killed_pgid_out.append(pgid)
     return 0
 
 

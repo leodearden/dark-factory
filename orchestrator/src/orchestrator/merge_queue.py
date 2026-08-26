@@ -19105,7 +19105,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ssh -> ``orchestrator cancel-verify`` -> ``cancel_request`` -> SIGKILL,
         which skips cli.py's own finally and would leak the rendezvous; δ
         closes that at ``cli.py:cancel_verify`` (see verify_cancel.py's
-        stale-file note).
+        stale-file note).  That clear is gated on IDENTITY, not on the cancel's
+        rc: the rendezvous key is FIXED and SHARED, so it routinely names some
+        OTHER live verify, and three of ``cancel_request``'s four return-0
+        paths never killed anything.  Clearing it blind would fail-OPEN the
+        very lease read this paragraph depends on — 3071 would then read
+        ``_merge-verify`` IDLE while a verify is live and redeploy over it,
+        which is worse than the deferral it was meant to avoid.
 
         Returns the adopted entry, or ``None`` when there is no head to adopt
         (single-slot round, head already finalized, passthrough head).
