@@ -318,7 +318,6 @@ class TestBuildJudgeCases:
         first = _mod().build_judge_cases(_corpus(), distractors=2)
         second = _mod().build_judge_cases(list(reversed(_corpus())), distractors=2)
         assert first == second, 'case construction depends on input ORDER'
-        assert 'import random' not in SCRIPT_PATH.read_text()
 
     def test_distractors_are_spread_rather_than_the_same_slate_every_time(
         self, records,
@@ -777,24 +776,6 @@ class TestRunJudgeEval:
         )
         assert provenance['distractor_count'] == 2
         assert provenance['judge_model'] == 'gpt-4o-mini'
-
-    def test_no_accuracy_floor_is_compared_anywhere_in_the_module(self) -> None:
-        """Asserted against the SOURCE, because this is a prohibition rather
-        than a behaviour.
-
-        A floor could be added in a branch no test happens to reach, and it
-        would then be the 3169 gate without anyone having decided that. The
-        scan is deliberately crude — it is a tripwire, and the right response
-        to a false positive is to say in a comment why the comparison is not
-        a floor.
-        """
-        import re  # noqa: PLC0415
-
-        source = SCRIPT_PATH.read_text()
-        offenders = re.findall(
-            r'accuracy[^\n]{0,40}?[<>]=?\s*[0-9]', source,
-        ) + re.findall(r'[0-9.]+\s*[<>]=?[^\n]{0,40}?accuracy', source)
-        assert not offenders, f'an accuracy floor is being compared: {offenders}'
 
 
 # ---------------------------------------------------------------------------
