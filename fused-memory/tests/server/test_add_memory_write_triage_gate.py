@@ -600,10 +600,18 @@ class TestTheFlagOnPathRetiresBothRejectGuards:
         is deferred deliberately and documented at the gate in
         `tools.py::add_memory` — the two are indistinguishable while
         `_stub_judge` answers `stored`, so building the arm now would add a
-        branch no test could tell from its absence. Leaf gamma's real judge is
-        what makes them differ, and gamma may well answer `restated` here; the
-        assertion below is expected to move with that arm rather than to
-        forbid it.
+        branch no test could tell from its absence.
+
+        REVIEWED at leaf gamma (task 3128), which wired the real judge in.
+        The `stored` assertion did NOT have to move, and the reason is worth
+        recording so the next reader does not mistake that for the deferral
+        having been closed: this fixture retrieves NOTHING
+        (`search.return_value = []`), so there is no candidate, no middle band
+        and no judge call — the write is `stored` because the bands said so,
+        not because a judge agreed. The deferral above is therefore still
+        open exactly as written: the cluster signal continues to reach no
+        routing decision, and a topic hit under `t_high` will only differ from
+        a plain miss once something feeds the cluster match into retrieval.
         """
         mock_service = AsyncMock()
         _configure_config(

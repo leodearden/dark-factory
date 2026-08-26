@@ -137,6 +137,15 @@ from fused_memory.server.write_triage import (
     resolve_write_triage_enabled,
     triage_write,
 )
+
+# The middle-band judge, imported HERE and nowhere else. `tools.py` is the
+# single wiring point on purpose: `write_triage_judge` imports `write_triage`
+# for the OUTCOME_* vocabulary, so `write_triage` importing the judge back
+# would close a cycle. Keeping the attachment at the consumer leaves that
+# dependency one-way, and leaves `_stub_judge` as `triage_write`'s default for
+# direct callers and for beta's judge-slot contract tests — which is what keeps
+# those tests meaningful rather than tautological.
+from fused_memory.server.write_triage_judge import judge_write
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
@@ -3246,6 +3255,15 @@ def create_mcp_server(
                 content=content,
                 project_id=project_id,
                 counter=_triage_fail_open_counter,
+                # Leaf gamma. Until this line the judge slot ran `_stub_judge`,
+                # so every middle-band write acked `stored` no matter what it
+                # said — building `write_triage_judge` changed no observable
+                # behaviour on its own, and this is the one line that makes it
+                # load-bearing. `triage_write` still owns the fail-open
+                # apparatus around it (INV-4): `judge_write` raises on
+                # transport error, timeout and unparseable output, and that
+                # `except` arm counts it and returns `stored`.
+                judge=judge_write,
                 # Both predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
