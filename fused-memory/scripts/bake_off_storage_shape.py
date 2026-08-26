@@ -2914,8 +2914,9 @@ def _reseeding_control_phrase(flat_stamping: dict[str, Any]) -> str:
     sitting beside the table that contradicts it.
 
     Why that row IS a control.  ``stamping_value`` cancels the baseline
-    (``(after_stamped - base) - (after_unstamped - base)``), so the `flat`
-    row compares two SEPARATELY SEEDED injected collections directly.  Their
+    (``(after_stamped - base) - (after_unstamped - base)``), so the
+    :data:`REGROWTH_CONTROL_ARM` row compares two SEPARATELY SEEDED
+    injected collections directly.  Their
     records carry byte-identical text and differ only in a ``topic`` metadata
     key, and a flat read consults no metadata — so nothing but the seeding
     can move it.  That is the same structural forcing
@@ -3026,12 +3027,13 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
         'contributes on top of the re-emission.',
         '',
         'The control for that is in this artifact rather than argued for. '
-        'The `flat` row of the stamping table below compares two separately '
+        f'The `{REGROWTH_CONTROL_ARM}` row of the stamping table below '
+        'compares two separately '
         'seeded INJECTED collections whose records carry byte-identical text '
         'and differ only in a `topic` metadata key a flat read never '
         'consults — so nothing but the seeding can move it, and it reads as '
         'the re-seeding noise floor at this corpus size.  In this run it '
-        f'{_reseeding_control_phrase(regrowth["stamping_value"]["flat"])}. '
+        f'{_reseeding_control_phrase(regrowth["stamping_value"][REGROWTH_CONTROL_ARM])}. '
         '**No threshold is asserted on any delta here** (gate G6): the probe '
         'informs gate η and task 4006\'s stamping campaign, it does not gate '
         'a build.',
@@ -3058,7 +3060,12 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
     recall, stored = 'claim_recall.at_5', (
         'discoverability.stored_canonical_in_top_5_rate'
     )
-    selected = REGROWTH_READ_ARMS[-1]
+    # BY NAME, not by position.  `REGROWTH_READ_ARMS[-1]` read as "whatever
+    # happens to be last", and a reorder of that tuple would have retargeted
+    # the signal sentence at a different transform with nothing at this call
+    # site to say so.  `_check_regrowth_named_arms` guards the name.
+    selected = REGROWTH_SELECTED_ARM
+    control = REGROWTH_CONTROL_ARM
     lines += [
         '',
         'As measured in THIS run, per read arm (derived from the table '
@@ -3090,18 +3097,18 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
         '',
         f'**The signal sentence.**  Under the ratified `{shape}` write '
         f'shape, one unstamped re-emission per topic '
-        f'{_cost_phrase(deltas["unstamped"]["flat"][recall], cost_sign=recall_sign)} '
+        f'{_cost_phrase(deltas["unstamped"][control][recall], cost_sign=recall_sign)} '
         f'claim recall@5 and '
-        f'{_cost_phrase(deltas["unstamped"]["flat"][stored], cost_sign=stored_sign)} '
+        f'{_cost_phrase(deltas["unstamped"][control][stored], cost_sign=stored_sign)} '
         f'stored canonical-in-top-5 on a flat read.  4004\'s selected '
         f'transform (`{selected}`) '
-        f'{_absorption_phrase(deltas["unstamped"]["flat"][recall], deltas["unstamped"][selected][recall], cost_sign=recall_sign)} '
+        f'{_absorption_phrase(deltas["unstamped"][control][recall], deltas["unstamped"][selected][recall], cost_sign=recall_sign)} '
         f'on claim recall@5, and '
-        f'{_absorption_phrase(deltas["unstamped"]["flat"][stored], deltas["unstamped"][selected][stored], cost_sign=stored_sign)} '
+        f'{_absorption_phrase(deltas["unstamped"][control][stored], deltas["unstamped"][selected][stored], cost_sign=stored_sign)} '
         f'on stored canonical-in-top-5.  Stamped, the same injection '
-        f'{_cost_phrase(deltas["stamped"]["flat"][recall], cost_sign=recall_sign)} '
+        f'{_cost_phrase(deltas["stamped"][control][recall], cost_sign=recall_sign)} '
         f'and '
-        f'{_cost_phrase(deltas["stamped"]["flat"][stored], cost_sign=stored_sign)} '
+        f'{_cost_phrase(deltas["stamped"][control][stored], cost_sign=stored_sign)} '
         f'on a flat read.',
         '',
         # A module constant, spliced BETWEEN the delta table and the
@@ -4967,6 +4974,19 @@ def regrowth_pass_key(mode: str) -> str:
 #: The three read arms, pinned by EQUALITY like ``ARM_SHAPES``.
 REGROWTH_READ_ARMS: tuple[str, ...] = ('flat', 'additive_pin', 'promoting_pin')
 
+#: The two arms that carry a SEMANTIC role in the section's prose, named
+#: rather than addressed by literal or by position.  ``_regrowth_lines``
+#: reached the selected transform as ``REGROWTH_READ_ARMS[-1]`` and the
+#: control as a hard-coded ``'flat'`` at four call sites: that is the one
+#: place this module departed from the "enumerate, never infer" discipline
+#: ``_REGROWTH_COST_SIGN`` and ``_REGROWTH_ARM_FLAGS`` follow.  A reorder of
+#: the tuple silently retargeted the signal sentence at a DIFFERENT
+#: transform, and a rename of ``flat`` raised a ``KeyError`` three call
+#: sites away from the tuple that named it.  Membership is checked at
+#: import, the way ``_check_regrowth_cost_signs`` is.
+REGROWTH_CONTROL_ARM: str = 'flat'
+REGROWTH_SELECTED_ARM: str = 'promoting_pin'
+
 #: ``arm -> (pin, promote)``.  ONE definition, so the fan-out, the delta
 #: table and the renderer cannot disagree about what an arm name means.
 _REGROWTH_ARM_FLAGS: dict[str, tuple[bool, bool]] = {
@@ -5084,6 +5104,35 @@ def _check_regrowth_cost_signs() -> None:
 
 
 _check_regrowth_cost_signs()
+
+
+def _check_regrowth_named_arms() -> None:
+    """The two semantically-named arms ARE read arms, or raise.
+
+    Called at import (immediately below) for the same reason
+    ``_check_regrowth_cost_signs`` is.  The renderer names
+    :data:`REGROWTH_SELECTED_ARM` as "4004's selected transform" and reads
+    :data:`REGROWTH_CONTROL_ARM`'s stamping row as the re-seeding noise
+    floor, so a rename that leaves either dangling must fail LOUDLY at
+    import rather than as a ``KeyError`` part-way through rendering a
+    report — which is the failure mode the hard-coded literals had.
+
+    A raise rather than an ``assert`` so ``python -O`` cannot strip it.
+    """
+    dangling = [
+        name for name in (REGROWTH_CONTROL_ARM, REGROWTH_SELECTED_ARM)
+        if name not in REGROWTH_READ_ARMS
+    ]
+    if dangling:
+        raise RuntimeError(
+            f'regrowth arm name(s) {dangling} are not in REGROWTH_READ_ARMS '
+            f'{list(REGROWTH_READ_ARMS)}. The renderer addresses the control '
+            f'arm and the selected transform BY NAME; a name that is not an '
+            f'arm renders a KeyError, not a report.'
+        )
+
+
+_check_regrowth_named_arms()
 
 
 def _pluck_regrowth_metrics(measurement: dict[str, Any]) -> dict[str, Any]:

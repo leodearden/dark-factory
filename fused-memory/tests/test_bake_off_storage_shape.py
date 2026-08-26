@@ -6265,6 +6265,72 @@ class TestRegrowthReadArmsAndMetricsArePinned:
         assert _mod().REGROWTH_SHAPE in _mod().ARM_SHAPES
 
 
+class TestTheTwoSemanticallyNamedReadArms:
+    """The prose's control arm and selected transform, addressed BY NAME.
+
+    `_regrowth_lines` used to reach the selected transform by POSITION
+    (`REGROWTH_READ_ARMS[-1]`) and the control by hard-coded literal
+    (`'flat'`, at four call sites plus a docstring).  That is the one place
+    the module departed from its own "enumerate, never infer" discipline:
+    a reorder of the tuple silently retargeted the signal sentence at a
+    different transform, and a rename of `flat` raised a `KeyError` three
+    call sites from the tuple that named it.
+    """
+
+    def test_both_names_are_pinned_by_equality(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_CONTROL_ARM == 'flat'
+        assert mod.REGROWTH_SELECTED_ARM == 'promoting_pin'
+
+    def test_both_names_are_members_of_the_read_arm_tuple(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_CONTROL_ARM in mod.REGROWTH_READ_ARMS
+        assert mod.REGROWTH_SELECTED_ARM in mod.REGROWTH_READ_ARMS
+
+    @pytest.mark.parametrize(
+        'name', ['REGROWTH_CONTROL_ARM', 'REGROWTH_SELECTED_ARM'],
+    )
+    def test_a_dangling_name_fails_the_import_time_check(self, name, monkeypatch):
+        """A `RuntimeError` at import, not a `KeyError` at render time.
+
+        Same discipline as `_check_regrowth_cost_signs`: a raise rather than
+        an `assert`, so `python -O` cannot strip the one check standing
+        between a renamed arm and a report that dies half-rendered.
+        """
+        mod = _mod()
+        monkeypatch.setattr(mod, name, 'grouped_pin')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            mod._check_regrowth_named_arms()
+
+        assert 'grouped_pin' in str(excinfo.value)
+
+    def test_reordering_the_tuple_does_not_retarget_the_signal_sentence(
+        self, monkeypatch,
+    ):
+        """The contract the positional `[-1]` could not carry.
+
+        `REGROWTH_READ_ARMS` is pinned by equality, so a reorder fails that
+        pin — but the pin is in a different section of this file from the
+        call site, and nothing AT the call site said the LAST arm had to be
+        the selected one.  Reversed, the sentence must still name
+        `promoting_pin`.
+        """
+        mod = _mod()
+        monkeypatch.setattr(
+            mod, 'REGROWTH_READ_ARMS', tuple(reversed(mod.REGROWTH_READ_ARMS)),
+        )
+
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth(_regrowth_block())),
+            '## Regrowth deltas',
+        ))
+
+        assert "4004's selected transform (`promoting_pin`)" in section
+
+
 class TestMeasureRegrowthArms:
     """One measurement block per read arm, routed to the right (pin, promote)."""
 
