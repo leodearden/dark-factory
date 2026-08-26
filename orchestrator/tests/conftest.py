@@ -1097,6 +1097,10 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Task 3540: harness._resume_repend_liveness feeds this straight into
+    # timedelta(seconds=...); a spec_set MagicMock attribute raises
+    # TypeError there. Mirrors OrchestratorConfig's real default (300.0).
+    config.claimant_liveness_ttl_secs = 300.0
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

@@ -35,6 +35,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_claimant import is_stranded
@@ -66,6 +68,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
         h = Harness(mock_orch_config)
 
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()

@@ -23,7 +23,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import assert_update_wire_mode
+from _orch_helpers import assert_update_wire_mode, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
@@ -48,6 +48,10 @@ def harness(mock_orch_config) -> Harness:
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
