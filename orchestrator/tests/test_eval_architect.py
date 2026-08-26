@@ -1607,6 +1607,7 @@ async def _run_architect_eval_hermetic(
     usage_gate=None,
     usage_gate_error=None,
     task_timeout_minutes=None,
+    declines: dict[str, dict] | None = None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1632,6 +1633,21 @@ async def _run_architect_eval_hermetic(
     reason — a truthy Mock is one that ``or 0`` cannot rescue, and it would
     land verbatim in the persisted cell. Both make the harness model reality so
     a RED here is caused by production behaviour, never by the double.
+
+    The FIVE DECLINE READERS on the patched ``TaskArtifacts``
+    (``read_already_done`` / ``read_blocking_dependency`` / ``read_false_premise``
+    / ``read_unactionable_task`` / ``read_ready_to_merge``) are pinned to
+    ``None`` for exactly that reason (task 4760). Unpinned they are bare Mock
+    attributes, so every one returns a TRUTHY Mock — and the moment the runner
+    reads them, every call site in this file would resolve to a decline it
+    never asked for. ``None`` is what the real ``TaskArtifacts`` returns when
+    the artifact file is absent, which is the state every pre-existing case is
+    actually in, so pinning it keeps those cases meaning what they always meant.
+
+    ``declines={'false_premise': {...}, ...}`` then opts a case IN, setting the
+    named kinds' readers to return the supplied artifact dicts (the shape
+    ``artifacts.write_*`` persists, including the ``reported_at`` stamp the
+    terminal-kind ordering policy compares). An unnamed kind stays ``None``.
 
     ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
     RAISE — the harness-crash shape where the eval orch config (and therefore
@@ -1689,6 +1705,21 @@ async def _run_architect_eval_hermetic(
 
     artifacts_instance = MagicMock()
     artifacts_instance.read_plan.return_value = produced_plan
+    # Absent-artifact default for every decline reader (see docstring): the
+    # real TaskArtifacts returns None when the file does not exist, and a bare
+    # Mock attribute would return a truthy Mock instead.
+    _decline_readers = (
+        'read_already_done', 'read_blocking_dependency', 'read_false_premise',
+        'read_unactionable_task', 'read_ready_to_merge',
+    )
+    for _reader in _decline_readers:
+        getattr(artifacts_instance, _reader).return_value = None
+    for _kind, _artifact in (declines or {}).items():
+        _reader = f'read_{_kind}'
+        assert _reader in _decline_readers, (
+            f'unknown decline kind {_kind!r}: no TaskArtifacts.{_reader}'
+        )
+        getattr(artifacts_instance, _reader).return_value = _artifact
 
     briefing_instance = MagicMock()
     briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
@@ -1706,6 +1737,12 @@ async def _run_architect_eval_hermetic(
     orch_stub = MagicMock()
     orch_stub.usage_cap = UsageCapConfig(enabled=False)
     orch_stub.prices = orch_prices if orch_prices is not None else {}
+
+    # Bound to a local (rather than inlined into the patch below) so a test can
+    # hang a side_effect on it and observe ORDERING against the decline reads —
+    # cleanup_eval_worktree rmtree's the meta root, so anything that must read
+    # an artifact has to have done so before this mock is awaited.
+    mock_cleanup = AsyncMock()
 
     # ``timeout_minutes`` rides in on the TASK dict (where it is untyped data)
     # rather than the ``timeout_override: int | None`` parameter, so a test can
@@ -1729,7 +1766,7 @@ async def _run_architect_eval_hermetic(
         p(patch('shared.cli_invoke.asyncio.sleep', mock_sleep))
         p(patch('orchestrator.evals.snapshots.create_eval_worktree',
                 AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
-        p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock()))
+        p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', mock_cleanup))
         p(patch('orchestrator.evals.snapshots.get_diff_between_commits',
                 AsyncMock(return_value=reference_diff)))
         p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
@@ -1754,6 +1791,7 @@ async def _run_architect_eval_hermetic(
         'invoke': mock_invoke, 'verify': mock_verify,
         'save': mock_save, 'judge': mock_judge,
         'sleep': mock_sleep, 'UsageGate': gate_factory, 'gate': usage_gate,
+        'cleanup': mock_cleanup, 'artifacts': artifacts_instance,
     }
 
 
