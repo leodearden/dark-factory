@@ -56,6 +56,19 @@ def _records() -> list[dict]:
     ]
 
 
+def _many_records(n: int) -> list[dict]:
+    """`n` records with edge uuids that are NOT substrings of one another.
+
+    `e2` would substring-match inside `e20`, which would make a
+    "the omitted ones are absent" assertion silently vacuous; the zero-padded
+    `e-000` form cannot.
+    """
+    return [
+        dict(_records()[0], edge_uuid=f'e-{i:03d}')
+        for i in range(n)
+    ]
+
+
 def _emit(tmp_path, **overrides) -> str | None:
     kwargs = {
         'project_id': 'dark_factory',
@@ -146,6 +159,55 @@ class TestTheFiledEscalation:
 
         for token in ('e1', 'n-3129', 'n-3127', 'Task 3127', 'set-membership'):
             assert token in detail, f'{token!r} missing from the escalation detail'
+
+    def test_a_long_record_list_is_truncated_and_the_truncation_is_REPORTED(
+        self, tmp_path,
+    ):
+        """SILENT TRUNCATION WOULD BE THE BUG.
+
+        A storm is exactly the condition that produces a pathological episode
+        carrying more records than a human will read, so the window is capped —
+        but a reader who cannot tell a window from the whole would draw the
+        wrong conclusion about the blast radius from the alarm that exists to
+        tell them. The count of what was dropped is therefore stated.
+        """
+        cap = rrse_mod._MAX_RECORDS_IN_DETAIL
+        overflow = 5
+        _emit(tmp_path, records=_many_records(cap + overflow))
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert f'{cap + overflow} total' in detail
+        assert f'{overflow} omitted below' in detail
+
+    def test_the_records_it_ships_are_the_first_window_not_a_sample(
+        self, tmp_path,
+    ):
+        """Every record up to the cap is present and every record past it is
+        absent — so the operator knows precisely which slice they are reading."""
+        cap = rrse_mod._MAX_RECORDS_IN_DETAIL
+        overflow = 5
+        _emit(tmp_path, records=_many_records(cap + overflow))
+        detail = _filed(tmp_path)[0]['detail']
+
+        for i in range(cap):
+            assert f'e-{i:03d}' in detail, f'record {i} should be shown'
+        for i in range(cap, cap + overflow):
+            assert f'e-{i:03d}' not in detail, f'record {i} should be omitted'
+
+    def test_exactly_at_the_cap_nothing_is_omitted_and_nothing_says_so(
+        self, tmp_path,
+    ):
+        """The boundary. A full-but-not-over list is the WHOLE truth, so the
+        detail must not hedge it with an omitted-count a reader would take as
+        evidence that more exists."""
+        cap = rrse_mod._MAX_RECORDS_IN_DETAIL
+        _emit(tmp_path, records=_many_records(cap))
+        detail = _filed(tmp_path)[0]['detail']
+
+        assert f'{cap} total' in detail
+        assert 'omitted' not in detail
+        for i in range(cap):
+            assert f'e-{i:03d}' in detail
 
     def test_the_suggested_action_names_where_to_look(self, tmp_path):
         _emit(tmp_path)
