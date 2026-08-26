@@ -15396,6 +15396,146 @@ class Harness:
             timedelta(seconds=self.config.claimant_liveness_ttl_secs),
         )
 
+    async def _fold_granted_files_on_repend(self, task_id: str) -> None:
+        """Deliver the steward's ``granted_files`` scope grant before a re-pend.
+
+        The re-pend-path twin of ``workflow.py::TaskWorkflow._collect_granted_
+        files`` + ``_set_task_scope`` (task 3540 / PRD
+        ``plans/task-escalation-state-graph-prd.md`` D8, spec E9).
+
+        ``granted_files`` — the structured scope expansion a steward stamps via
+        ``resolve_issue(..., action='resume', granted_files=[...])`` on a
+        ``scope_violation`` — is written to the escalation RECORD by
+        ``escalation/queue.py::EscalationQueue.resolve``. Its only production
+        reader was ``TaskWorkflow._collect_granted_files``, reached from
+        exactly one site: the LIVE in-workflow L0 resume loop. So a grant
+        resolved against a task with NO live workflow was recorded and never
+        applied — the task re-pended against its ORIGINAL scope and the agent
+        re-escalated for the same files. This closes that gap for the
+        re-pend path.
+
+        Both halves are written, and both are load-bearing:
+
+          - **plan.json is the durable half.** On redispatch,
+            ``workflow.py::TaskWorkflow._apply_revalidation_skip`` re-derives
+            the module set from ``plan['files']`` and calls
+            ``_reconcile_scope_locks(plan_files)``, which persists
+            ``metadata.files = plan_files``. A metadata-only widen would
+            therefore be silently NARROWED back away on the very next
+            dispatch.
+          - **``metadata.files`` is the half the next dispatch derives its
+            module LOCKS from**, so writing only plan.json leaves the two
+            diverged until the redispatch reconciles them — which is also what
+            the MERGE-entry ``_check_scope_invariant`` divergence tripwire
+            fires on.
+
+        Deliberately does NOT call ``handle_blast_radius_expansion``: the slot
+        exit already released every module lock this task held, so there is no
+        live lock to expand. The next dispatch acquires from the widened
+        ``metadata.files`` through the ordinary path.
+
+        Ownership: ``set_plan_files`` STAMPS ``_session_id`` when the caller
+        does not already own the plan, so the plan's OWN owner id
+        (``_session_id``, else ``_revalidated_by_session``) is passed back —
+        taking the ``already_owner`` branch, leaving provenance untouched and
+        never tripping ``_escalate_plan_overwrite``. The synthetic fallback is
+        reached only for a plan carrying neither, which cannot be owned by
+        anyone.
+
+        Failure is WARNING-and-continue by design, never a raise and never a
+        withheld re-pend. The grant is ADDITIVE: a failed fold degrades to the
+        pre-3540 status quo — the task re-pends against its original scope and
+        the agent re-escalates — which is self-healing and observable.
+        Withholding the flip instead would leave the task parked with its
+        escalation already closed and nothing left to advance it, i.e. exactly
+        the permanent silent hold INV-4 exists to prevent.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
+            # Bare-harness / eval mode — nothing to read (mirrors
+            # _collect_granted_files' own `if not self.escalation_queue` guard).
+            return
+        try:
+            # Union across the task's WHOLE resolved history, order-preserving
+            # — a verbatim structural mirror of _collect_granted_files. Not
+            # just the resolving record: a grant from an earlier resolution
+            # would otherwise be dropped on a later re-pend, silently
+            # narrowing a scope the steward already widened. A still-PENDING
+            # record is a request, not a grant, and is skipped.
+            seen: set[str] = set()
+            granted: list[str] = []
+            for esc in queue.get_by_task(task_id):
+                if esc.status != 'resolved':
+                    continue
+                for f in esc.granted_files:
+                    if f not in seen:
+                        seen.add(f)
+                        granted.append(f)
+            if not granted:
+                return
+
+            # Resolve the plan artifacts new-then-old, mirroring
+            # _resolve_recovery_artifact: the W11 `.task-meta` SIBLING first,
+            # the legacy `<worktree>/.task` second. Without the fallback arm
+            # every pre-relocation task would take the "no plan" exit below.
+            wt = self._resolve_task_worktree(task_id)
+            new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
+            if (new_root / 'plan.json').exists():
+                arts = TaskArtifacts(wt, meta_root=new_root)
+            elif (wt / '.task' / 'plan.json').exists():
+                arts = TaskArtifacts(wt)
+            else:
+                # A task can legitimately have no plan (never reached the
+                # architect, or its worktree was reclaimed). There is no scope
+                # to widen and the re-pend is still correct — the grant is not
+                # a precondition of the resume.
+                logger.debug(
+                    'granted-files fold: task %s has no plan.json at %s or %s '
+                    '— nothing to widen (grant %s)',
+                    task_id, new_root, wt / '.task', granted,
+                )
+                return
+
+            plan = arts.read_plan()
+            current = plan.get('files') or []
+            union = current + [f for f in granted if f not in current]
+            if union == current:
+                # The overwhelmingly common case (a resume with no NEW files):
+                # costs neither a plan rewrite nor an update_task round-trip.
+                return
+
+            # Pass the plan's OWN owner id back — see "Ownership" above.
+            arts.set_plan_files(
+                union,
+                plan.get('_session_id')
+                or plan.get('_revalidated_by_session')
+                or f'harness-repend:{task_id}',
+            )
+            # Same call shape as _check_reblock_guard's persist.
+            # metadata_mode='merge': shallow last-write-wins, so the files key
+            # is replaced wholesale while sibling metadata keys survive.
+            # 'additive' resolves scalar conflicts OLD-wins and would not
+            # replace the list.
+            await self.scheduler.update_task(
+                task_id, {'files': union}, metadata_mode='merge',
+            )
+            logger.info(
+                'granted-files fold: widened task %s scope %s → %s before the '
+                're-pend (grant %s)',
+                task_id, current, union, granted,
+            )
+        except Exception:
+            # Warn-and-continue by design — see the docstring. The plan write
+            # precedes the metadata write inside this try, so a failed plan
+            # write also skips the metadata write: a metadata-only widen would
+            # diverge from plan.files and be narrowed back on the next
+            # redispatch anyway.
+            logger.warning(
+                'granted-files fold: could not deliver the scope grant for '
+                'task %s — re-pending against the unwidened scope (the agent '
+                'will re-escalate)', task_id, exc_info=True,
+            )
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.
 
@@ -15439,6 +15579,12 @@ class Harness:
         via is_infra_held — task 2200/ω4) is checked FIRST, before the
         status/liveness gate below, because its status is 'infra-hold', never
         'blocked' or 'in-progress' — see the A1 guard.
+
+        Between the re-block guard and the write, an authorised re-pend also
+        DELIVERS any ``granted_files`` scope grant the steward stamped on this
+        task's resolved escalations — see
+        :meth:`_fold_granted_files_on_repend` for why that ordering is
+        load-bearing in both directions.
 
         TOCTOU note: these are separate MCP round-trips with no atomic
         compare-and-set, so the window cannot be closed — only narrowed. It is
@@ -15591,6 +15737,16 @@ class Harness:
         # intended: the resolution-driven flip still charges the guard.
         if not await self._check_reblock_guard(escalation, task_id):
             return
+
+        # Deliver the steward's scope grant BEFORE the row goes re-pendable
+        # (task 3540 / PRD D8, spec E9).  Ordering is load-bearing in both
+        # directions: AFTER the guard, because a withheld flip re-pends
+        # nothing and so may widen nothing; BEFORE the status write, because
+        # the status write is what makes the task dispatchable again and
+        # dispatch derives its locks from metadata.files — a fold landing
+        # after it would race the scheduler and the redispatched agent could
+        # observe the unwidened scope.  Best-effort: never raises.
+        await self._fold_granted_files_on_repend(task_id)
 
         # Only a re-pendable status with no live claimant reaches here.
         # Table B (ω3, task 2196): source the target from the same authority
