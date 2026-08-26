@@ -14,7 +14,16 @@ record that codebook.validate_coding_record schema-gates.
 Dependency-light library + argparse CLI, a plain-Python scripts/legibility
 sibling of digest.py/codebook.py — deliberately does NOT import the
 heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
-stores, cap-retry, transcript watchdogs). The real LLM call lives behind
+stores, cap-retry, transcript watchdogs). What it DOES take from ``shared``
+is one pure function: ``cap_markers.looks_like_blocking_banner``, the loose
+OR-substring DEFER GATE — the same matcher ``census.preflight_headroom``
+uses, and explicitly not the strict production cap detector
+(``usage_gate.detect_cap_hit``), whose combined prefix-AND-confirm policy is
+tuned for account failover. This module has nothing to fail over TO: the
+trickle unit runs under an interpreter where the orchestrator config, and
+therefore a multi-account ``UsageGate``, is unreachable. A defer gate is
+exactly the contract it needs, and ``cap_markers``' own docstring argues for
+that split (task 4736). The real LLM call lives behind
 exactly one swappable seam, the module-level ``_invoke_cli``, which every
 public function accepts as an ``invoke`` override. What no test ever does
 is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
@@ -52,8 +61,24 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import codebook as codebook_mod
-import yaml
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as census.py:74-88 (itself citing tasks 2881/2882/3329), with
+# parents[2] because coder.py sits at the same depth as census.py
+# (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
+# inside a `__main__` guard -- because the `shared.cap_markers` import it
+# enables is module-level, so it must resolve under pytest and package import
+# too.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+import codebook as codebook_mod  # noqa: E402
+import yaml  # noqa: E402
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 
 logger = logging.getLogger("legibility.coder")
 
@@ -82,6 +107,39 @@ class CoderInvocationError(Exception):
     A diagnostic the process EMITTED must never be dropped on the floor
     because it arrived on the less-expected stream.
     """
+
+
+class CoderCapExhausted(CoderInvocationError):
+    """Raised when the CLI answered with a capacity/auth banner instead of a
+    model turn — i.e. there is no headroom left to code this digest.
+
+    A SUBCLASS, not a sibling, and that is load-bearing: three sites already
+    catch ``CoderInvocationError`` (``code_digest`` here,
+    ``census._build_default_verify_fn`` and ``census.preflight_headroom``)
+    and none of them is touched by this task. A sibling type would escape all
+    three, turning a typed per-digest failure into an uncaught crash that
+    takes down the whole batch.
+
+    **This is a NORMAL operating condition, never a coder defect.** Leo's
+    standing directive (sibling task 4503): an all-accounts-capped night is
+    expected weather, not an incident. Before this existed, 2026-08-24
+    presented as 17 of 20 hard per-digest failures, tripped ``code_digests``'
+    >50% storm threshold, and became ``exit_code=1`` plus an ERROR-level
+    escalation — an infra page for a condition ruled routine.
+
+    ``marker`` names the banner marker that matched, so a deferral reason can
+    quote WHICH signal fired — the difference between an operator reading
+    "deferred: weekly limit" and reading "deferred". Mirrors
+    ``census.preflight_headroom``'s "...carries a banner marker: {marker!r}".
+
+    Never fabricated into a verdict. A capped digest yields no record at all;
+    it is labelled and excluded, exactly as ``evals/runner.py`` excludes a
+    ``cap_exhausted:`` cell from a reported mean rather than scoring it 0.0.
+    """
+
+    def __init__(self, message: str, *, marker: str) -> None:
+        super().__init__(message)
+        self.marker = marker
 
 
 @dataclass
@@ -405,11 +463,28 @@ def _invoke_cli(
         # said it. See CoderInvocationError's docstring for the incident.
         stdout_tail = (proc.stdout or "")[-_ERROR_STREAM_TAIL_CHARS:]
         stderr_tail = (proc.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
-        raise CoderInvocationError(
+        message = (
             f"claude CLI exited {proc.returncode} (model={model!r}, "
             f"claude_bin={resolved_bin!r}, cwd={cwd!r}): "
             f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
         )
+        # Scan for a cap/auth banner ONLY here, on an already-FAILED
+        # invocation. This is census's split-on-parse-success rule, adopted
+        # unchanged: a failed invocation is never a verdict, so re-reading it
+        # as a banner can only re-LABEL an already-failed digest. An exit-0
+        # reply is the opposite -- arbitrary model output, whose JSON
+        # `note`/`cause`/`evidence_quote` legitimately QUOTE cap-themed
+        # sessions. census._build_default_verify_fn records what happens when
+        # that distinction is lost: this repo's codebook is dominated by
+        # clusters ABOUT usage and weekly limits, so the loose markers match
+        # ordinary healthy content and the census aborted on cap-themed
+        # clusters. The exit-0 path below is therefore left alone, which also
+        # keeps census.preflight_headroom -- whose whole probe is "call this
+        # function and scan what comes BACK" -- working unchanged.
+        marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
+        if marker:
+            raise CoderCapExhausted(message, marker=marker)
+        raise CoderInvocationError(message)
 
     return proc.stdout
 
