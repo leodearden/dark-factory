@@ -40,14 +40,27 @@ inject their own fakes and must not accidentally exercise a live LLM.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.routing.json_extract import extract_json
+from fused_memory.server.grouped_read import PARENT_ID_KEY
+
+# The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
+# the same import, for the same reason, that ``write_triage`` itself makes.
+# A second copy does not raise when task 3658's
+# ``relevance_score → metadata['store_score']`` move happens again: it scores
+# every candidate as uncomparable, which empties the judge's slate and reads
+# exactly like a genuinely novel corpus.
+from fused_memory.server.near_duplicate_guard import _cosine_of
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
 )
+
+if TYPE_CHECKING:
+    from fused_memory.models.memory import MemoryResult
 
 
 class JudgeOutputError(Exception):
@@ -151,3 +164,198 @@ def parse_judge_verdict(raw: str) -> str:
             f'{word!r} is not one of {sorted(JUDGE_VERDICTS)}', payload,
         )
     return verdict
+
+
+# --- candidate selection ----------------------------------------------------
+
+#: How many candidates the judge is shown when nothing configures otherwise —
+#: the top of PRD C1's "top 3–5".
+_DEFAULT_JUDGE_CANDIDATE_COUNT = 5
+
+#: Per-field character budget for the rendered prompt. The calibration fixture
+#: holds a ~9k-character canonical, and C1 sizes the judge call at roughly
+#: 2.5k tokens; five untrimmed candidates would blow through that by an order
+#: of magnitude on exactly the consolidated topics where triage matters most.
+_FIELD_CHARS = 1_200
+
+#: Appended to any field this module cut. The marker is not decoration: a
+#: silent truncation hands the model a severed sentence to read as the whole
+#: record, and "this text continues" is information the verdict depends on.
+_ELIDED_MARKER = '…[elided]'
+
+
+def _elide(text: object) -> str:
+    """*text* as a string, bounded by :data:`_FIELD_CHARS` and marked if cut."""
+    body = text if isinstance(text, str) else str(text or '')
+    if len(body) <= _FIELD_CHARS:
+        return body
+    return body[:_FIELD_CHARS] + _ELIDED_MARKER
+
+
+def select_judge_candidates(
+    results: Any,
+    n: int,
+    *,
+    canonical_id: str | None,
+) -> list[MemoryResult]:
+    """The top *n* comparable candidates, with the band's winner guaranteed in.
+
+    *results* is whatever ``triage_write`` retrieved — the un-transformed
+    ``SearchResults`` object, iterated as given. Trimming to PRD C1's "top
+    3–5" happens HERE rather than at the call site, so the object keeps its
+    ``degraded``/``failed_stores`` attributes all the way to the one place
+    that reads them.
+
+    Ordered by DESCENDING per-store cosine, read through
+    ``near_duplicate_guard._cosine_of`` — the SAME reader ``decide_band``
+    uses, imported rather than re-implemented (INV-5). A second copy is
+    precisely how task 3658's ``relevance_score → metadata['store_score']``
+    move would go wrong again, and it would not raise: it would score every
+    candidate as uncomparable, which reads as a novel corpus.
+
+    A candidate with no numeric cosine is DROPPED. A topic-anchored pin
+    (``services/topic_anchor.py``) deliberately carries no ``store_score``,
+    and ``decide_band`` already drops it because it can never clear a
+    threshold; dropping it here is the adjacent point — there is no measured
+    similarity to show the model, so the slot is better spent on a record that
+    can actually be compared.
+
+    *canonical_id* — the band's winner, hoisted to a parent where the winner
+    was itself a child — is guaranteed present in the returned set, evicting
+    the weakest candidate if it would otherwise fall outside the top *n*. A
+    judge shown a set that excludes the attach target is answering about a
+    different memory than the one the attach will touch. When the hoisted
+    parent is not itself in the result set, the CHILD that carried the
+    evidence is kept instead, because dropping both would leave no view of
+    the match at all.
+
+    Returns ``[]`` for an empty or wholly uncomparable slate, and raises
+    nothing: an empty candidate set is a decision (:func:`judge_write` answers
+    ``stored`` without calling out), not a failure.
+    """
+    scored: list[tuple[float, MemoryResult]] = []
+    for result in results or ():
+        cosine = _cosine_of(result)
+        if cosine is not None:
+            scored.append((cosine, result))
+    if not scored:
+        return []
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    ordered = [result for _, result in scored]
+    if n <= 0:
+        n = _DEFAULT_JUDGE_CANDIDATE_COUNT
+    selected = ordered[:n]
+
+    if canonical_id is not None and all(r.id != canonical_id for r in selected):
+        # The winner is outside the window. Either it is further down the
+        # slate (take it, evicting the weakest), or it is a HOISTED parent id
+        # that never appeared as a result of its own — in which case the child
+        # whose `parent_id` points at it is the record carrying the evidence.
+        winner = next(
+            (r for r in ordered if r.id == canonical_id),
+            None,
+        ) or next(
+            (
+                r
+                for r in ordered
+                if (r.metadata or {}).get(PARENT_ID_KEY) == canonical_id
+            ),
+            None,
+        )
+        if winner is not None and winner not in selected:
+            selected = [*selected[: max(n - 1, 0)], winner]
+    return selected
+
+
+# --- prompt -----------------------------------------------------------------
+
+#: The judge's standing instructions. D3 lives HERE, in the model's own
+#: prompt, not only in a docstring: a model told merely to "classify" will
+#: happily decide which of two contradictory memories is true, and reify
+#: esc-5557/esc-5626 showed that adjudicating an apparent contradiction needs
+#: code-reading and cross-checking the synchronous ``add_memory`` write path
+#: cannot do. So the instruction says what ``contests`` MEANS — a detection
+#: that routes the entry onward — and says the judge is not deciding truth.
+JUDGE_SYSTEM_PROMPT = f"""\
+You classify the RELATIONSHIP between a new memory entry and a small set of \
+existing entries retrieved as its closest matches. You do not decide which \
+entry is correct, and you do not merge, rewrite or rank them.
+
+Answer with exactly one of these four words:
+
+- "distinct" — the new entry is about something the candidates do not cover. \
+Overlapping vocabulary is not enough; the new entry has to be making \
+substantially the same claim as a candidate to be anything else.
+- "restates" — the new entry asserts what a candidate already asserts, adding \
+nothing new. A paraphrase restates.
+- "amends" — the new entry asserts what a candidate asserts AND adds \
+something the candidate does not have: a detail, a scope, a later \
+observation, a correction of degree.
+- "contests" — the new entry asserts something that CANNOT be true at the \
+same time as a candidate. Use this only for a genuine incompatibility, not \
+for a difference in emphasis, scope, or point in time — two entries \
+describing different situations, or the same situation at different times, \
+are not in conflict. You are DETECTING a contradiction so a human or a \
+downstream gate can adjudicate it; you are NOT deciding which side is true, \
+and nothing you say here deletes or edits anything.
+
+When more than one word fits, prefer the earlier one in that list: \
+"distinct" over "restates", "restates" over "amends", "amends" over \
+"contests".
+
+Reply with a bare JSON object and nothing else:
+
+{{"{VERDICT_KEY}": "<one of: {', '.join(JUDGE_VERDICTS)}>"}}\
+"""
+
+
+def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
+    """Render the user-side prompt: the new entry, then the candidates.
+
+    CONTENT ONLY. No metadata is interpolated — not the agent_id, not the
+    project_id, not a task id, not a source path. That is PRD C1's "no repo or
+    task context reaches the judge", and rendering no metadata at all is what
+    makes it a structural property rather than an incidental one: there is no
+    field list to keep in sync and no leak to notice later. Candidate ids ARE
+    rendered, because the model must be able to say which candidate it means —
+    they are opaque memory uuids, not context.
+
+    Every field is bounded by :data:`_FIELD_CHARS` and marked with
+    :data:`_ELIDED_MARKER` when cut, so the call stays near C1's ~2.5k-token
+    budget regardless of a pathological canonical.
+
+    Pure, synchronous and total: it renders for an empty candidate list too,
+    though :func:`judge_write` never calls it with one.
+    """
+    lines = [
+        'NEW ENTRY:',
+        _elide(content),
+        '',
+        'EXISTING CANDIDATES:',
+    ]
+    for candidate in candidates:
+        lines.append(f'- id: {candidate.id}')
+        lines.append(f'  text: {_elide(candidate.content)}')
+    if not candidates:
+        lines.append('(none)')
+    lines.append('')
+    # The closed vocabulary and the output shape are RESTATED here, next to
+    # the data, even though JUDGE_SYSTEM_PROMPT already carries both. Two
+    # reasons, neither cosmetic. (1) The two provider arms deliver the system
+    # prompt differently — openai as messages[0], anthropic via `system=` —
+    # so a wiring mistake on either arm could drop it entirely; restating the
+    # contract in the user turn means the worst case is a weaker prompt, not
+    # a model answering in a vocabulary parse_judge_verdict rejects on every
+    # single write. (2) An out-of-vocabulary answer is a counted fail-open
+    # (write_triage.py:839), so vocabulary drift does not surface as a bad
+    # verdict — it surfaces as a storm escalation describing an outage.
+    lines.append(
+        'Classify the relationship between NEW ENTRY and the candidates. '
+        f'Answer with exactly one of: {", ".join(JUDGE_VERDICTS)}.',
+    )
+    lines.append(
+        'Reply with a bare JSON object and nothing else: '
+        f'{{"{VERDICT_KEY}": "<one of those four words>"}}',
+    )
+    return '\n'.join(lines)
