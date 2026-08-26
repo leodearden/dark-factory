@@ -359,3 +359,147 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
         f'{{"{VERDICT_KEY}": "<one of those four words>"}}',
     )
     return '\n'.join(lines)
+
+
+# --- defensive config resolvers ---------------------------------------------
+#
+# Same shape as ``write_triage``'s own: ``getattr`` at every hop, so a missing
+# service, config, section or leaf reads as the default rather than raising
+# into a write path contract C1 forbids from failing. Nothing is captured at
+# import or construction — every value is read LIVE per call, which is the
+# precondition that makes the green-tier ``RELOADABLE_FIELDS`` registration
+# real rather than restart-only in disguise (``apply_reload`` mutates the
+# shared config object in place, and a captured value cannot observe that).
+
+#: The judge's own kill switch defaults ON, asymmetrically with
+#: ``write_triage.enabled``, which ships OFF. The judge is structurally INERT
+#: while triage is disabled — no triage code executes at all — so this costs
+#: nothing on today's shipped config. Default-OFF would be the footgun: at the
+#: task-3169 flip the operator would turn ``enabled`` on, silently get stub
+#: behaviour, and read the resulting all-``stored`` ack stream as evidence
+#: that the corpus is novel. Its real purpose is stopping an in-flight JUDGE
+#: incident (spend, latency, a bad model) while leaving the deterministic
+#: bands running — a strictly finer lever than ``enabled``.
+_DEFAULT_JUDGE_ENABLED = True
+
+#: The providers with an implemented arm in :func:`_call_llm`.
+_KNOWN_PROVIDERS = ('openai', 'anthropic')
+
+#: Provider and model defaults, matching ``LLMConfig``'s own. "haiku-class" in
+#: PRD C1 is a cost/size class, not a vendor pin: measured on this deployment
+#: ``ANTHROPIC_API_KEY`` is unset (CLAUDE.md: agents use OAuth) while
+#: ``OPENAI_API_KEY`` is set and demonstrably works — leaf alpha's committed
+#: calibration report is the product of live OpenAI calls from this same
+#: checkout. The anthropic arm is implemented and selectable by config for a
+#: deployment that has the key.
+_DEFAULT_JUDGE_PROVIDER = 'openai'
+_DEFAULT_JUDGE_MODEL = 'gpt-4o-mini'
+
+#: No LLM call anywhere in fused-memory sets a timeout today, and the openai
+#: SDK default is 600 seconds. On the SYNCHRONOUS ``add_memory`` write path
+#: that is a wedge, not a degradation: the caller waits ten minutes for a
+#: write C1 promises never to block. Ten seconds is generous for a ~2.5k-token
+#: single-turn classification and bounded enough that a hung provider costs
+#: one slow write rather than a hung server.
+_DEFAULT_JUDGE_TIMEOUT_SECONDS = 10.0
+
+
+def _judge_attr(memory_service: Any, attr: str) -> Any:
+    """Navigate ``memory_service.config.write_triage.<attr>`` defensively.
+
+    A private twin of ``write_triage._write_triage_attr`` rather than an
+    import of it: that name is module-private to leaf beta, and reaching
+    across for it would couple two modules through a leading underscore. The
+    navigation is four lines; the coupling would be forever.
+    """
+    config = getattr(memory_service, 'config', None)
+    write_triage = getattr(config, 'write_triage', None)
+    return getattr(write_triage, attr, None)
+
+
+def _llm_attr(memory_service: Any, attr: str) -> Any:
+    """Navigate ``memory_service.config.llm.<attr>`` defensively."""
+    config = getattr(memory_service, 'config', None)
+    llm = getattr(config, 'llm', None)
+    return getattr(llm, attr, None)
+
+
+def resolve_judge_enabled(memory_service: Any) -> bool:
+    """The judge's kill switch. Defaults :data:`_DEFAULT_JUDGE_ENABLED` (True).
+
+    ``isinstance(bool)`` only, deliberately, and in BOTH directions. A truthy
+    ``1`` must not enable by accident — the usual reason — but neither may a
+    falsy ``0`` DISABLE by accident, because a silently-stubbed judge produces
+    exactly the all-``stored`` ack stream that default-True exists to prevent
+    an operator from misreading.
+    """
+    value = _judge_attr(memory_service, 'judge_enabled')
+    if isinstance(value, bool):
+        return value
+    return _DEFAULT_JUDGE_ENABLED
+
+
+def resolve_judge_provider(memory_service: Any) -> str:
+    """``write_triage.judge_provider``, else ``llm.provider``, else the default.
+
+    Inheriting rather than defaulting means the judge follows whatever model
+    the deployment already trusts for ``add_memory`` auto-classification,
+    without a second knob to keep in sync.
+
+    An unrecognised provider string FALLS BACK rather than raising: this
+    resolver runs on the write path, where C1 forbids raising. The
+    unresolvable-provider raise belongs in the fan-out
+    (:func:`_call_llm`) — which sits INSIDE ``triage_write``'s fail-open arm,
+    so it surfaces as a counted fail-open instead of an errored write.
+    """
+    pinned = _judge_attr(memory_service, 'judge_provider')
+    if isinstance(pinned, str) and pinned in _KNOWN_PROVIDERS:
+        return pinned
+    inherited = _llm_attr(memory_service, 'provider')
+    if isinstance(inherited, str) and inherited in _KNOWN_PROVIDERS:
+        return inherited
+    return _DEFAULT_JUDGE_PROVIDER
+
+
+def resolve_judge_model(memory_service: Any) -> str:
+    """``write_triage.judge_model``, else ``llm.model``, else the default.
+
+    A non-string or blank model name falls back: an empty model reaches the
+    SDK as a 404 on every single write, i.e. a total judge outage caused by a
+    config typo.
+    """
+    for value in (
+        _judge_attr(memory_service, 'judge_model'),
+        _llm_attr(memory_service, 'model'),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value
+    return _DEFAULT_JUDGE_MODEL
+
+
+def resolve_judge_timeout(memory_service: Any) -> float:
+    """The per-call budget, in seconds. Positive numbers only.
+
+    A zero or negative timeout would fail EVERY call, turning a config typo
+    into a permanent storm escalation whose stated cause — a broken judge — is
+    not what is actually wrong. ``bool`` is excluded for the usual reason:
+    ``True`` would resolve to a one-second budget with nothing to explain it.
+    """
+    value = _judge_attr(memory_service, 'judge_timeout_seconds')
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return _DEFAULT_JUDGE_TIMEOUT_SECONDS
+
+
+def resolve_judge_candidate_count(memory_service: Any) -> int:
+    """How many candidates reach the prompt. Positive ``int`` only.
+
+    A zero count would empty the slate on every write, and
+    :func:`judge_write`'s no-candidate early return would then answer
+    ``stored`` every time — triage silently reduced to its below-``t_low``
+    behaviour, with no error anywhere to say so.
+    """
+    value = _judge_attr(memory_service, 'judge_candidate_count')
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return _DEFAULT_JUDGE_CANDIDATE_COUNT
