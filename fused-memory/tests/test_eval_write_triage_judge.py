@@ -669,13 +669,18 @@ class TestRenderMarkdown:
         )
         assert self._row_cells(md, 'distinct')['accuracy'] == 'None'
 
-    def test_the_contested_caveat_is_stated_in_prose(self) -> None:
-        """The operator reads the markdown, not the JSON."""
+    def test_every_caveat_reaches_the_markdown_as_its_own_bullet(self) -> None:
+        """Every ``CAVEATS`` entry renders verbatim, so none is silently dropped.
+
+        Derived from the module's own constant BY IDENTITY, so it pins no
+        prose: rewording a caveat rewords the expectation with it. What it
+        does catch is the drift a keyword check could not — the renderer
+        ceasing to iterate ``report['caveats']``, or an entry going missing
+        on the way to the operator who reads the markdown, not the JSON.
+        """
         md = self._md()
-        assert 'contested' in md.lower()
-        assert 'false' in md.lower() and 'positive' in md.lower(), (
-            'the caveat must say what the contested number IS, not just cite it'
-        )
+        for caveat in _mod().CAVEATS:
+            assert f'- {caveat}' in md, caveat
 
     def test_renders_a_provenance_bullet_list(self) -> None:
         md = self._md()
@@ -913,15 +918,21 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert ground_truth['available'] is False
         assert ground_truth['reason'].split(':')[0].strip(), 'a reason code is required'
 
-    def test_the_markdown_sibling_states_the_caveat_in_prose(self) -> None:
-        """The operator reads the markdown; a caveat only in JSON is unread."""
+    def test_a_markdown_sibling_was_committed_beside_the_json(self) -> None:
+        """The operator reads the markdown, so the artifact must exist.
+
+        Only existence is checked. Deliberately NOT a ``CAVEATS``-identity
+        check like the renderer's: ``CAVEATS`` is source, whereas this ``.md``
+        is a measured artifact regenerable only by a live LLM run, so coupling
+        the two would make a one-word caveat edit require a paid
+        re-measurement to get back to green. The caveat's substance is pinned
+        in the JSON instead, by
+        :meth:`test_the_contested_caveat_survived_into_the_artifact`.
+        """
         _block, report, resolved = self._committed()
         assert report is not None and resolved is not None
         sibling = resolved.with_suffix('.md')
         assert sibling.exists(), f'no markdown sibling at {sibling}'
-        md = sibling.read_text().lower()
-        assert 'contested' in md
-        assert 'false positive' in md
 
     def test_provenance_names_the_model_and_the_fixture(self) -> None:
         _block, report, _resolved = self._committed()
