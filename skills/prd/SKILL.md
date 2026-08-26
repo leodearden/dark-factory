@@ -70,7 +70,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 | **G4** | Cross-PRD seams have a named owner; reciprocal "the other owns it" patterns resolved | **prompt** |
 | **G5** | High-stakes / architecturally-complex PRDs use approach **B + H** (contracts + two-way boundary tests) rather than bare B | **prompt with heuristic** |
 | **G6** | Every signal asserting a number/exactness/end-to-end capability/rejection has its premise validated — achievable, true, producible from the task's own dependency set, and rejection-mechanism-backed | **block** |
-| **G7** | Every task passes the five design invariants (docs/legibility/design-invariants.md); a hit blocks queueing until redesigned or waived with recorded rationale | **block** (decompose; advisory walk in author mode) |
+| **G7** | Every task passes the design invariants (docs/legibility/design-invariants.md); a hit blocks queueing until redesigned or waived with recorded rationale | **block** (decompose; advisory walk in author mode) |
 | **Manifest** | Per-leaf capability→evidence bindings committed beside the PRD, plus a machine-readable YAML sidecar twin carrying optional `delivered_check` bindings (mechanizes G3+G6: anti-orphan/wired, anti-inversion, field-population, grammar-fixture, numeric-floor); any FAIL binding blocks queueing | **block** (decompose) |
 | **META** | The "yes" question above | **block** at PRD save |
 

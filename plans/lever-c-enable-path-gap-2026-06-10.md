@@ -120,3 +120,14 @@ pushes thin).
    not stall. Watch for `runner=laptop` verify events + `verdict_parity_ok`.
 5. Run λ's real signal: one window of two-overlapping-verify spans + throughput delta
    vs single-host baseline.
+6. **Land-path cost decision (operator ruling 2026-08-12, task-2822 suggestion):**
+   with `verify_runners` non-empty, `verify_cross_check_remote_green` (default
+   True, green-tier reloadable) runs a FULL synchronous local merge-verify under
+   the lane lease before every remote-green land — re-serializing every land on
+   the local host and largely re-creating the serial bottleneck Lever C exists
+   to relieve (only fail-fast parallelism survives). There is no sampling knob
+   for this gate (`verify_drift_check_every_n_lands` belongs to the separate
+   async DriftDetector). At enable time either accept the doubled land
+   wall-clock explicitly, hot-reload the cross-check off once trust accrues, or
+   bundle a `verify_cross_check_every_n_lands` sampling knob into the task that
+   revives Lever C.

@@ -139,17 +139,37 @@ class TestForceExitWatchdog:
 
         The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
         in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
+
+        Structural fix (same class as test_disarm_prevents_force_exit below):
+        this previously armed with timeout_secs=2.0 and used a fixed
+        ``time.sleep(0.2)`` as a "10x margin" before checking ``calls == []``.
+        No fixed margin is safe under full-suite xdist load — the main thread's
+        wakeup from ``sleep(0.2)`` can itself be delayed by scheduler noise, and
+        if that delay pushes the check past the 2.0s deadline the watchdog has
+        legitimately fired by the time ``calls`` is read (same failure shape as
+        test_disarm_prevents_force_exit's observed ``calls == [137]``). Arming
+        with an effectively-unbounded timeout_secs instead makes the deadline
+        unreachable within the test's lifetime, so ``thread.join(timeout=...)``
+        can be used as the "has not fired yet" probe without racing a wall-clock
+        deadline: no matter how delayed the join itself is in landing,
+        ``is_alive()`` cannot go False before 3600s have elapsed.
         """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        handle = _force_exit_after_delay(timeout_secs=2.0, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
 
-        # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
-        time.sleep(0.2)
-
+        # "Has not fired yet" probe: join blocks for up to 0.2s or until the
+        # watchdog thread exits, whichever comes first. Unlike a free-standing
+        # sleep, there is no deadline here for scheduler noise to run past —
+        # timeout_secs is unreachable within the test's lifetime, so is_alive()
+        # cannot go False regardless of how delayed the join is in landing.
+        handle.thread.join(timeout=0.2)
+        assert handle.thread.is_alive(), (
+            'watchdog thread exited before its timeout elapsed — fired early?'
+        )
         assert calls == [], (
             f'watchdog fired before timeout elapsed (clean-exit window): {calls}'
         )
@@ -162,24 +182,57 @@ class TestForceExitWatchdog:
         )
 
     def test_disarm_prevents_force_exit(self):
-        """Calling disarm() before timeout prevents os._exit from being called."""
+        """Calling disarm() before timeout prevents os._exit from being called.
+
+        Structural fix (same class as done tasks 1836/1851/2320/2840/2921/2959/
+        3491): the watchdog thread blocks on ``threading.Event.wait(timeout_secs)``
+        and ``disarm()`` calls ``_event.set()``, which wakes the thread and makes
+        it return WITHOUT ever calling ``_exit_fn`` — regardless of how large
+        timeout_secs is, and regardless of whether the event is set before or
+        after the thread reaches ``.wait()`` (Event is stateful, not an
+        edge-triggered signal, so ordering can't be missed). The correctness
+        condition is only "does disarm() land before timeout_secs elapses" — a
+        small timeout_secs (previously 0.2s) instead raced the main thread's next
+        bytecode (the disarm() call) against the watchdog's internal deadline;
+        under full-suite xdist load that arm→disarm gap can exceed hundreds of ms
+        and the watchdog fires before disarm() lands (observed: `calls == [137]`
+        on a saturated worker). Using an effectively-unbounded timeout_secs makes
+        that gap structurally impossible to exceed rather than merely widening a
+        still-tight window, and removes the need for a compensating sleep.
+
+        Synchronisation note (load-bearing, keep this ordering): ``calls`` is
+        mutated by the watchdog thread and read by the main thread, so it is
+        only meaningfully observable after a happens-before edge between the
+        two. ``thread.join()`` is that edge. The join below is therefore NOT
+        cleanup — it MUST run, and its ``is_alive()`` check MUST be asserted,
+        BEFORE the ``calls == []`` assertion. Checking `calls` first would be
+        vacuous: right after `disarm()` the watchdog thread has had no chance
+        to run at all, so `calls` reads `[]` regardless of whether the
+        production guard (`cli.py`'s `fired = not _event.wait(timeout_secs)`)
+        is correct or inverted, letting a real regression go undetected. The
+        join timeout is deliberately generous (30.0s, not the usual 1.0s used
+        for pure cleanup joins elsewhere in this file): once `disarm()` sets
+        the Event the thread wakes in microseconds on the happy path, so the
+        bound is free there, but on a saturated xdist worker a tight bound
+        could itself manufacture a spurious `is_alive()` failure — exactly the
+        load-sensitive flake class this task removes. Do not reorder or
+        shrink this without re-deriving both properties.
+        """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
-        # disarm() sets the event immediately so the watchdog thread returns
-        # without calling os._exit even if the scheduler is delayed.
-        handle = _force_exit_after_delay(timeout_secs=0.2, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
         handle.disarm()
-        time.sleep(2.0)
 
-        assert calls == [], f'expected no calls, got {calls}'
-        handle.thread.join(timeout=1.0)
+        # Synchronisation point FIRST: join before making any claim about
+        # `calls`, which the watchdog thread mutates (see docstring above).
+        handle.thread.join(timeout=30.0)
         assert not handle.thread.is_alive(), (
             'watchdog thread did not exit after disarm'
         )
+        assert calls == [], f'expected no calls, got {calls}'
 
     def test_diagnostic_dump_lists_live_threads(self):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""

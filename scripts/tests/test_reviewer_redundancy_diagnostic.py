@@ -6,7 +6,6 @@ import logging
 import reviewer_redundancy_diagnostic as mod
 from orchestrator.evals.snapshots import eval_worktree_root
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

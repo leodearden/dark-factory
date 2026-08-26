@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestSummaryDedupeKey:
     """summary_dedupe_key() — pure helper, no I/O."""
@@ -826,6 +828,427 @@ class TestDedupeConfigForRecon:
         assert result == 'esc-1-1'
 
 
+class TestDedupeConfigForGateBacklog:
+    """DedupeConfig.for_gate_backlog() — sibling constructor for stale-gate dedup.
+
+    The gate-backlog path (fused_memory.reconciliation.stage1_stall_detector's
+    ``maybe_escalate_stalled_gate_backlog``) files one ``reconciliation_stale_gate_backlog``
+    L1 per cycle a gate stays stalled.  Folding those into a single parent is what
+    makes ``dedupe_count`` a recurrence signal instead of a constant 0.
+    """
+
+    _CATEGORY = 'reconciliation_stale_gate_backlog'
+
+    def _make_gate_esc(
+        self,
+        esc_id: str,
+        fingerprint: str | None = 'gate-fp',
+        ts: str | None = None,
+    ):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='645',
+            agent_role='reconciler',
+            severity='blocking',
+            category=self._CATEGORY,
+            summary='Gate task 645 has awaited a human decision since 2026-08-10T00:00:00+00:00',
+            level=1,
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    # --- (a) config shape ---
+
+    def test_for_gate_backlog_config_shape(self):
+        """for_gate_backlog() enables dedup on the gate-backlog category with a content key.
+
+        ``key_fn`` is ``gate_backlog_fingerprint_key`` — a superset of
+        ``content_fingerprint_key`` that also recovers pre-stamp parents.  See
+        that function's docstring for the live-queue measurement showing why the
+        plain stamped-only adapter is insufficient here (it would mint a
+        duplicate for every legacy record in the backlog).
+        """
+        from escalation.dedupe import DedupeConfig, gate_backlog_fingerprint_key
+
+        cfg = DedupeConfig.for_gate_backlog()
+        assert cfg.infra_dedupe_enabled is True
+        assert cfg.infra_dedupe_categories == (self._CATEGORY,)
+        assert cfg.key_fn is gate_backlog_fingerprint_key
+
+    def test_for_gate_backlog_window_is_unbounded(self):
+        """The window MUST be unbounded — a 300h-old gate must still fold.
+
+        Asserted via ``math.isinf`` rather than an equality against a bounded
+        default: any finite window silently mints a duplicate pending record and
+        re-pins ``dedupe_count`` at 0, which is the exact bug this config exists
+        to prevent.
+        """
+        import math
+
+        from escalation.dedupe import DedupeConfig
+
+        cfg = DedupeConfig.for_gate_backlog()
+        assert math.isinf(cfg.infra_dedupe_window_secs), (
+            'gate-backlog window must be unbounded; a bounded window re-pins '
+            f'dedupe_count at 0 for long-rotting gates. got: {cfg.infra_dedupe_window_secs}'
+        )
+        assert cfg.infra_dedupe_window_secs > 0, 'window must be +inf, not -inf'
+
+    # --- (b) regression guard on the sibling ---
+
+    def test_for_recon_categories_unchanged(self):
+        """REGRESSION: for_recon() is NOT widened by the new sibling.
+
+        ``fused-memory/scripts/backfill_recon_escalations.py`` derives its
+        eligible-collapse set (:168) and the complement defining
+        ``blocking_pending`` (:290) from this exact tuple.  Admitting
+        ``reconciliation_stale_gate_backlog`` here would silently change that
+        one-shot operator script's collapse plan and its report semantics.
+        """
+        from escalation.dedupe import DedupeConfig
+
+        assert DedupeConfig.for_recon().infra_dedupe_categories == ('recon_integrity_issue',)
+
+    # --- (c) behavioural fold against a real queue ---
+
+    def test_for_gate_backlog_folds_regardless_of_age(self, tmp_path):
+        """A 400h-old parent still folds: same id, one pending record, dedupe_count==1."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Backdate well past any bounded window (400h ≈ 16.7 days).
+        old_ts = (datetime.now(UTC) - timedelta(hours=400)).isoformat()
+        parent = self._make_gate_esc('esc-645-1', ts=old_ts)
+        parent_id = queue.submit(parent)
+
+        child = self._make_gate_esc('esc-645-2')
+        child.summary = 'Gate task 645 has awaited a human decision since 2026-08-10T00:00:00+00:00 (452h)'
+        result = submit_or_dedupe(queue, child, DedupeConfig.for_gate_backlog())
+
+        assert result['status'] == 'dedup_skipped', (
+            f'400h-old gate-backlog parent must still fold; got: {result}'
+        )
+        assert result['parent_id'] == parent_id
+        pending = queue.get_pending()
+        assert len(pending) == 1, (
+            f'fold must leave exactly ONE pending record; got {len(pending)}'
+        )
+        reread = queue.get(parent_id)
+        assert reread is not None
+        assert reread.dedupe_count == 1
+
+    # --- (d) negative ---
+
+    def test_for_gate_backlog_different_fingerprint_does_not_fold(self, tmp_path):
+        """A different fingerprint (different gate) gets its own record."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        parent = self._make_gate_esc('esc-645-1', fingerprint='gate-fp-a')
+        submit_or_dedupe(queue, parent, DedupeConfig.for_gate_backlog())
+
+        other = self._make_gate_esc('esc-646-1', fingerprint='gate-fp-b')
+        result = submit_or_dedupe(queue, other, DedupeConfig.for_gate_backlog())
+
+        assert result['status'] != 'dedup_skipped', (
+            f'distinct gates must not fold into each other; got: {result}'
+        )
+        assert len(queue.get_pending()) == 2
+
+
+class TestGateBacklogFingerprintKey:
+    """gate_backlog_fingerprint_key(esc) — tolerates LEGACY unstamped parents.
+
+    Every ``reconciliation_stale_gate_backlog`` record filed before the stamp
+    landed carries ``dedupe_fingerprint: None`` — see the adapter's own
+    docstring for the live-queue measurement that motivates this (kept in one
+    place, since any point-in-time census goes stale as records fold and
+    resolve).  With the plain ``content_fingerprint_key`` those parents key to
+    None, ``find_dedupe_parent`` short-circuits, and the very first post-change
+    cycle mints a SECOND pending record per stalled gate at ``dedupe_count 0``
+    — the exact defect this task exists to remove.  This adapter recovers the
+    parent's identity from its own ``detail`` so the backlog migrates itself
+    with no operator step.
+    """
+
+    _CATEGORY = 'reconciliation_stale_gate_backlog'
+
+    def _legacy_detail(self, project_id: str, task_id: str) -> str:
+        """The pre-change detail shape as actually observed on the live queue.
+
+        Note the PRE-3520 ``age_hours:`` key (not ``age_hours_at_filing:``) —
+        the parser must not depend on anything past the first line.
+        """
+        return '\n'.join([
+            f'project_id: {project_id}',
+            'run_id: 0189ae49-63a8-46a8-a62a-124f1de71180',
+            f'task_id: {task_id}',
+            'gate_escalated_at: 2026-07-25T21:47:26.573155+00:00',
+            'age_hours: 48.7',
+            'title: DECISION: establish rotation convention',
+        ])
+
+    def _legacy_esc(
+        self,
+        esc_id: str,
+        *,
+        task_id: str = '166',
+        detail: str | None = None,
+        project_id: str = 'dark_factory',
+        fingerprint: str | None = None,
+        ts: str | None = None,
+    ):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='reconciliation-stage1',
+            severity='blocking',
+            category=self._CATEGORY,
+            # The legacy PRE-3520 relative-age summary, as filed on disk.
+            summary=f'Gate task {task_id} has awaited a human decision for 48.7h',
+            detail=self._legacy_detail(project_id, str(task_id)) if detail is None else detail,
+            level=1,
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    # --- (1) stamped records take the fast path unchanged ---
+
+    def test_stamped_fingerprint_passthrough(self):
+        """A stamped record returns its fingerprint verbatim — no prose parsing."""
+        from escalation.dedupe import gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-9', fingerprint='abc123')
+        assert gate_backlog_fingerprint_key(esc) == 'abc123'
+
+    # --- (2) the core fix: legacy recompute ---
+
+    def test_legacy_unstamped_recomputes_true_identity(self):
+        """An unstamped parent recovers exactly the fingerprint a stamp would carry."""
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', task_id='166', project_id='dark_factory')
+        expected = compute_content_fingerprint(
+            'reconciliation_stale_gate_backlog', '', ['dark_factory:166'], ''
+        )
+        assert gate_backlog_fingerprint_key(esc) == expected
+
+    # --- (3) mirror-exactness: parent key == child key ---
+
+    def test_legacy_key_mirrors_new_child_stamp(self):
+        """The recovered parent key EQUALS the key a new child for that gate carries.
+
+        This is the single property that makes the migration fold work at all:
+        the child's stamp is built by stage1_stall_detector as
+        ``compute_content_fingerprint(category, '', [f'{project_id}:{task_id}'], '')``.
+        """
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        project_id, task_id = 'autopilot_video', '645'
+        legacy_parent = self._legacy_esc('esc-645-1', task_id=task_id, project_id=project_id)
+        child_stamp = compute_content_fingerprint(
+            'reconciliation_stale_gate_backlog', '', [f'{project_id}:{task_id}'], ''
+        )
+        assert gate_backlog_fingerprint_key(legacy_parent) == child_stamp
+
+    # --- (4) cross-project safety (load-bearing regression guard) ---
+
+    def test_same_task_id_different_projects_do_not_collide(self):
+        """REGRESSION: the fallback keys on (category, project_id, task_id).
+
+        The escalation queue is SHARED ACROSS PROJECTS and task ids are small
+        per-project integers, so a ``(category, task_id)`` fallback would
+        cross-fold two different projects' gates into one record and silently
+        discard an escalation a human is waiting on.  See
+        ``gate_backlog_fingerprint_key``'s docstring for the live-queue
+        project/record census behind that claim; the absence of a collision in
+        any given snapshot is a coincidence of that backlog, not an invariant,
+        which is why this is pinned as a test rather than left to observation.
+        """
+        from escalation.dedupe import gate_backlog_fingerprint_key
+
+        a = self._legacy_esc('esc-166-1', task_id='166', project_id='dark_factory')
+        b = self._legacy_esc('esc-166-2', task_id='166', project_id='reify')
+        assert gate_backlog_fingerprint_key(a) != gate_backlog_fingerprint_key(b), (
+            'task_id 166 in dark_factory and in reify are DIFFERENT gates; folding '
+            'them together would silently drop one project\'s escalation'
+        )
+
+    # --- (5) unparseable -> fail CLOSED ---
+
+    @pytest.mark.parametrize(
+        'detail',
+        [
+            pytest.param('run_id: x\ntask_id: 166', id='no_project_id_first_line'),
+            pytest.param('', id='empty_detail'),
+            pytest.param('  project_id: dark_factory', id='leading_whitespace_not_prefix'),
+            pytest.param('projectid: dark_factory\n', id='misspelled_key'),
+        ],
+    )
+    def test_unparseable_detail_returns_none(self, detail):
+        """No recoverable project_id → None → find_dedupe_parent refuses to fold.
+
+        Failing CLOSED (one duplicate record for that gate, visible and
+        self-correcting) is strictly safer than failing OPEN (guessing an
+        identity and folding unrelated gates, which destroys an escalation).
+        """
+        from escalation.dedupe import gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', detail=detail)
+        assert gate_backlog_fingerprint_key(esc) is None
+
+    def test_missing_task_id_returns_none(self):
+        """A record with no task_id cannot be identified → never fold."""
+        from escalation.dedupe import gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-x-1', task_id='166')
+        esc.task_id = ''
+        assert gate_backlog_fingerprint_key(esc) is None
+
+    def test_recompute_reads_the_records_own_category(self):
+        """REGRESSION: the recompute derives the category from the record, not a literal.
+
+        ``submit_or_dedupe`` gates the candidate on
+        ``config.infra_dedupe_categories`` and ``find_dedupe_parent`` skips any
+        parent whose category differs, so every record reaching the recompute
+        already carries the gate-backlog category — reading it off the record is
+        correct by construction.  A hardcoded copy of the string would instead
+        have to be kept in sync by hand with the emitter's
+        ``_GATE_BACKLOG_ESCALATION_CATEGORY`` across a package boundary; a rename
+        there would produce a key that can never match a new child's stamp,
+        folding would stop, and duplicates would silently reappear.  This test is
+        the thing that would catch that drift.
+        """
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', task_id='166', project_id='dark_factory')
+        esc.category = 'renamed_gate_backlog_category'
+
+        assert gate_backlog_fingerprint_key(esc) == compute_content_fingerprint(
+            'renamed_gate_backlog_category', '', ['dark_factory:166'], ''
+        )
+
+    def test_none_detail_returns_none(self):
+        """detail=None (defensive) must not raise — it fails closed like empty."""
+        from escalation.dedupe import gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1')
+        # Deliberate type violation: `Escalation.detail` is declared `str`, but a
+        # hand-edited or partially-migrated record on disk can deserialise with a
+        # null detail, and the adapter must fail CLOSED rather than raise there.
+        esc.detail = None  # pyright: ignore[reportAttributeAccessIssue]
+        assert gate_backlog_fingerprint_key(esc) is None
+
+    # --- (6) the literal token `None` is NOT special-cased ---
+
+    def test_literal_none_project_is_mirrored_not_special_cased(self):
+        """detail `project_id: None` keys on 'None:166', NOT to a None key.
+
+        stage1_stall_detector writes the line as ``f'project_id: {project_id}'``
+        and stamps children as ``f'{project_id}:{task_id}'``, so a filing made
+        with ``project_id=None`` yields the literal ``'None:166'`` on BOTH
+        sides.  Special-casing the token would break folding for exactly that
+        case, so the fallback reproduces ``str(project_id)`` byte-for-byte.
+        """
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', task_id='166', project_id='None')
+        expected = compute_content_fingerprint(
+            'reconciliation_stale_gate_backlog', '', ['None:166'], ''
+        )
+        assert gate_backlog_fingerprint_key(esc) == expected
+
+    def test_project_id_containing_a_space_is_taken_verbatim(self):
+        """The line remainder is taken verbatim, NOT via `\\S+`.
+
+        A `\\S+` match would silently truncate `my project` to `my`, producing a
+        DIFFERENT key that could collide with another project's — converting a
+        parse ambiguity into a wrong fold.  Verbatim can only fail to match.
+        """
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', task_id='166', project_id='my project')
+        expected = compute_content_fingerprint(
+            'reconciliation_stale_gate_backlog', '', ['my project:166'], ''
+        )
+        assert gate_backlog_fingerprint_key(esc) == expected
+
+    # --- (7) wiring ---
+
+    def test_for_gate_backlog_uses_the_tolerant_key(self):
+        """DedupeConfig.for_gate_backlog() must route through the tolerant adapter."""
+        from escalation.dedupe import DedupeConfig, gate_backlog_fingerprint_key
+
+        assert DedupeConfig.for_gate_backlog().key_fn is gate_backlog_fingerprint_key
+
+    # --- (8) end-to-end fold into a LEGACY parent ---
+
+    def test_stamped_child_folds_into_legacy_parent(self, tmp_path):
+        """The migration in one assertion: a stamped child folds into an unstamped parent."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, compute_content_fingerprint, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # A legacy parent exactly as filed pre-change: no fingerprint, ~400h old.
+        old_ts = (datetime.now(UTC) - timedelta(hours=400)).isoformat()
+        legacy = self._legacy_esc(
+            'esc-166-1', task_id='166', project_id='dark_factory', ts=old_ts
+        )
+        assert legacy.dedupe_fingerprint is None
+        parent_id = queue.submit(legacy)
+
+        # The child a post-stamp cycle would file for that same gate.
+        child = self._legacy_esc(
+            'esc-166-2',
+            task_id='166',
+            project_id='dark_factory',
+            fingerprint=compute_content_fingerprint(
+                'reconciliation_stale_gate_backlog', '', ['dark_factory:166'], ''
+            ),
+        )
+        result = submit_or_dedupe(queue, child, DedupeConfig.for_gate_backlog())
+
+        assert result['status'] == 'dedup_skipped', (
+            'a stamped child MUST fold into its legacy unstamped parent, else the '
+            f'first post-change cycle mints a duplicate at dedupe_count 0; got: {result}'
+        )
+        assert result['parent_id'] == parent_id
+        pending = queue.get_pending()
+        assert len(pending) == 1, (
+            f'fold must leave exactly ONE pending record; got {len(pending)}: '
+            f'{[e.id for e in pending]}'
+        )
+        reread = queue.get(parent_id)
+        assert reread is not None
+        assert reread.dedupe_count == 1
+
+    # --- (9) the recon path must not inherit gate-backlog prose parsing ---
+
+    def test_for_recon_key_fn_unchanged(self):
+        """REGRESSION: for_recon() still uses the plain stamped-only key adapter."""
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+
+        assert DedupeConfig.for_recon().key_fn is content_fingerprint_key
+
+
 class TestSubmitOrDedupe:
     """submit_or_dedupe(queue, esc, config, now=None) — gated orchestration wrapper."""
 
@@ -1125,3 +1548,258 @@ class TestEscalationDedupeFingerprint:
         assert esc_b.dedupe_fingerprint is None, (
             'Setting dedupe_fingerprint on one instance must not affect another'
         )
+
+
+class TestCrossLevelDedupeIsolation:
+    """find_dedupe_parent never folds a candidate into a parent at a DIFFERENT level.
+
+    Task 3236: once ``escalate_blocker(level=1)`` became filable, a steward's
+    level-1 re-escalation of an ``infra_issue`` — the single category in
+    ``DedupeConfig.infra_dedupe_categories`` — would otherwise fold straight
+    back into the pending level-0 record it was handling, and be swallowed
+    again by a new mechanism.  An L1 carries ``severity='blocking'``, so it
+    does NOT take the born-at-L2 dedupe bypass in ``server._submit_or_dedupe``
+    and does route through this matcher.
+
+    Cross-level folding is never correct regardless of this task: the levels
+    have different consumers by contract (models.py module header), so
+    collapsing an L1 into an L0 parent hands the record to the wrong consumer.
+    """
+
+    def _make_infra_esc(self, esc_id: str, level: int = 0, task_id: str = '42'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+            level=level,
+        )
+
+    def test_l1_candidate_does_not_fold_into_l0_parent(self, tmp_path):
+        """Same category + same summary key, different level -> no parent match."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=0))
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        assert find_dedupe_parent(queue, candidate, DedupeConfig(), now=now) is None
+
+    def test_l0_candidate_does_not_fold_into_l1_parent(self, tmp_path):
+        """The converse direction is equally isolated (L0 candidate, L1 parent)."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=1))
+
+        candidate = self._make_infra_esc('esc-42-2', level=0)
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        assert find_dedupe_parent(queue, candidate, DedupeConfig(), now=now) is None
+
+    def test_submit_or_dedupe_queues_l1_beside_pending_l0(self, tmp_path):
+        """End-to-end: the L1 gets its OWN record, not a dedup_skipped fold.
+
+        This is the swallow the level=1 fix would otherwise open.
+        """
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-42-1', level=0)
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'queued', f'Expected a fresh record, got: {result}'
+        assert result['id'] == 'esc-42-2', f'Expected a fresh id, got: {result}'
+        persisted = queue.get('esc-42-2')
+        assert persisted is not None
+        assert persisted.level == 1
+        # The L0 parent must be untouched — no child attached to it.
+        l0 = queue.get('esc-42-1')
+        assert l0 is not None
+        assert l0.dedupe_count == 0, f'L0 parent absorbed the L1: {l0.dedupe_children}'
+
+    def test_same_level_infra_candidates_still_fold(self, tmp_path):
+        """CONTROL: existing same-level dedupe behaviour is provably unbroken."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=0))
+
+        candidate = self._make_infra_esc('esc-42-2', level=0)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
+        assert result['parent_id'] == 'esc-42-1'
+        assert result['child_id'] == 'esc-42-2'
+
+    def test_same_level_l1_candidates_still_fold(self, tmp_path):
+        """CONTROL: the new condition is level EQUALITY, not 'level 0 only'."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=1))
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
+        assert result['parent_id'] == 'esc-42-1'
+
+
+class TestNormalisationLiftedToCanonical:
+    """The casefold/strip/collapse pipeline lives in ONE place: escalation.canonical.
+
+    dedupe.py had THREE uses of the two regexes — ``_normalize_description``
+    (feeding ``compute_content_fingerprint``) and ``summary_dedupe_key``'s direct
+    ``_NON_WORD_PATTERN.sub`` (feeding ``find_dedupe_parent``).  Both call sites
+    now delegate to the lifted helper under an explicitly-pinned
+    ``punctuation='strip'`` policy, and the tests below pin that delegation by
+    OUTPUT EQUALITY against ``canonical_text`` — not by the absence of any
+    particular private name.  The regexes themselves live on quite legitimately
+    inside ``escalation.canonical``, their one home, so their presence somewhere
+    was never the property worth asserting; DRIFT is.  A second implementation of
+    the pipeline is caught the moment it diverges by a single character: the
+    delegation-equality assertions and the digest/tuple characterisation pins
+    below then fail loudly (INV-5).  A copy that does not diverge is not the risk
+    INV-5 exists to catch.
+
+    The digests and key tuples below are CHARACTERISATION pins, not aspirations:
+    every value was obtained by RUNNING the pre-lift implementation.  They are
+    load-bearing because both outputs are already persisted across the live
+    corpus — a fingerprint digest that changes silently un-dedupes every recon
+    finding already on disk, and a ``summary_dedupe_key`` tuple that changes
+    silently re-partitions every dedupe cluster already keyed fleet-wide.
+    """
+
+    # (escalation_category, finding_category, description) -> sha256 hex digest,
+    # computed by running the PRE-LIFT dedupe implementation.
+    _FINGERPRINT_REFERENCE = {
+        ('infra_issue', 'flaky-test', 'Fused-memory  CONNECTION timeout!'):
+            '29d2adc399cddb4369e5ad754c054e0f6f595f43ba375846c3f6741e40f59ad4',
+        ('risk_identified', 'perf', 'cpu+memory leak in the sweep loop'):
+            '393e47310ab5186a41cd3554e656e52c7686aa7bb28e22dd3e61ac95896d52fc',
+        ('design_concern', 'coupling', '  Watcher lease STOLEN.  '):
+            '26b8b9918444def709c36684a7e1f1edce11a41bec7dab1169c04cf2278d460f',
+        ('cleanup_needed', 'dead-code', 'starvation:2370:persistent-lock-contention'):
+            '45538de967982d58f3aafd64bcfae927f51a41cbb445c2115134b927cb076dd2',
+    }
+
+    def test_normalize_description_delegates_to_the_strip_policy(self):
+        """_normalize_description IS canonical_text(..., punctuation='strip')."""
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import _normalize_description
+
+        for text in [
+            'a.b, c',
+            'Fused-memory  CONNECTION timeout!',
+            '  Watcher lease STOLEN.  ',
+            'risk:3184',
+            '',
+            '::',
+        ]:
+            assert _normalize_description(text) == canonical_text(
+                text, punctuation='strip'
+            ), f'delegation diverged for {text!r}'
+
+    def test_normalize_description_keeps_its_measured_outputs(self):
+        """Characterisation of the pipeline itself, independent of the delegation."""
+        from escalation.dedupe import _normalize_description
+
+        assert _normalize_description('a.b, c') == 'ab c'
+        assert _normalize_description('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory connection timeout'
+        )
+        assert _normalize_description('  Watcher lease STOLEN.  ') == 'watcher lease stolen'
+        # STRIP, not separator: the fingerprint policy must stay deletion-flavoured.
+        assert _normalize_description('risk:3184') == 'risk3184'
+
+    def test_content_fingerprint_digests_are_byte_identical(self):
+        """The digests already on disk must not move.
+
+        If this fails, the strip policy was changed (or the delegation is not
+        byte-identical) and every already-fingerprinted recon finding has stopped
+        matching its own past self — a large, invisible regression.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        for (esc_cat, find_cat, description), expected in self._FINGERPRINT_REFERENCE.items():
+            actual = compute_content_fingerprint(esc_cat, find_cat, [], description)
+            assert actual == expected, (
+                f'fingerprint digest changed for {description!r}: '
+                f'{actual} != {expected} — the live recon corpus would silently un-dedupe'
+            )
+
+    def test_content_fingerprint_ignores_description_when_affected_ids_present(self):
+        """Unchanged contract, re-pinned because the lift touched its only helper."""
+        from escalation.dedupe import compute_content_fingerprint
+
+        with_ids = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'], 'one description'
+        )
+        other_description = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'],
+            'a COMPLETELY different description!!',
+        )
+        assert with_ids == other_description
+        assert with_ids == '3d46b1b1c93febe00abf8d28be40c8c30db39d0a6136e04dce8532a5228666f9'
+
+    def test_summary_dedupe_key_matches_its_documented_examples(self):
+        """The five docstring doctests, promoted to real assertions.
+
+        ``summary_dedupe_key`` feeds ``find_dedupe_parent`` and its tuples are
+        persisted fleet-wide, so the rewire onto the lifted helper has to be
+        byte-identical.  These cases already cover the interesting shapes:
+        internal punctuation, a symbol join, a doubled space, a trailing '!',
+        the empty string, and the >3-token truncation.
+        """
+        from escalation.dedupe import summary_dedupe_key
+
+        assert summary_dedupe_key('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('fused-memory connection timeout on port 8002') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('lost link') == ('lost', 'link')
+        assert summary_dedupe_key('') == ()
+        assert summary_dedupe_key('cpu+memory leak') == ('cpumemory', 'leak')
+
+    def test_summary_dedupe_key_equals_the_strip_policy_expression(self):
+        """The rewire is exactly ``canonical_text(s, 'strip').split()[:3]``.
+
+        Verified during planning over all 2796 real summaries in the live queue
+        (0 mismatches): the helper's extra whitespace-collapse-and-strip is
+        absorbed by the subsequent ``.split()``.
+        """
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import summary_dedupe_key
+
+        for summary in [
+            'Fused-memory  CONNECTION timeout!',
+            'cpu+memory leak',
+            '  leading and trailing  ',
+            '\t\n',
+            '::',
+            'one two three four five',
+            'ロック競合 が 発生',
+        ]:
+            assert summary_dedupe_key(summary) == tuple(
+                canonical_text(summary, punctuation='strip').split()[:3]
+            ), f'summary_dedupe_key diverged from the lifted helper for {summary!r}'

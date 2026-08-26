@@ -402,6 +402,98 @@ class TestResolveCostUsd:
         assert cost == pytest.approx(6.0)
 
 
+class TestComposeCostSource:
+    """Task 3656: collapse a TWO-COMPONENT cost sum's provenance to ONE label.
+
+    ``run_architect_eval``'s ``cost_usd`` is architect spend PLUS plan-judge
+    spend. Only the architect component is resolved through
+    :func:`resolve_cost_usd`; the judge is always a native-cloud opus call, so
+    its component is always CLI-sourced and re-resolving it against the
+    candidate's price table would price opus tokens at a vLLM rate. That makes
+    one ``cost_source`` label describe two differently-sourced components the
+    moment the architect side resolves to ``price_table`` / ``unpriced_proxy``
+    — so the label COMPOSES: agreement → that source, disagreement (with judge
+    dollars actually in the sum) → ``'mixed'``.
+
+    ``'mixed'`` is deliberately the SAME word ``report._summarize_cost_source``
+    already emits for the cross-trial form of the same situation, so the
+    reporting vocabulary stays one word list and no report-side change is
+    needed.
+    """
+
+    _SOURCES = ('cli', 'price_table', 'unpriced_proxy')
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_no_second_component_keeps_the_primary_verbatim(self, primary):
+        """$0 judge spend → no second component entered the sum, so the label
+        describes the primary alone (every judge-SKIPPED architect branch)."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=0.0) == primary
+
+    def test_agreeing_sources_keep_that_source(self):
+        """TODAY'S architect cell: a native candidate resolves 'cli' and the
+        judge is 'cli' too, so a spending judge must NOT make it 'mixed'."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source('cli', secondary_cost_usd=0.42) == 'cli'
+
+    def test_price_table_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'price_table', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    def test_unpriced_proxy_primary_with_cli_judge_is_mixed(self):
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(
+            'unpriced_proxy', secondary_cost_usd=0.42,
+        ) == 'mixed'
+
+    @pytest.mark.parametrize('primary', _SOURCES)
+    def test_negative_secondary_is_treated_as_no_second_component(self, primary):
+        """Defensive: ``coerce_cost_usd`` already floors a nonsense figure to
+        0.0 upstream, but a negative that slipped through must never MANUFACTURE
+        a 'mixed' label out of spend that did not happen."""
+        from orchestrator.evals.metrics import compose_cost_source
+
+        assert compose_cost_source(primary, secondary_cost_usd=-1.0) == primary
+
+
+class TestIsProxiedEndpoint:
+    """Task 3656 (amendment): the proxied-endpoint predicate has ONE home.
+
+    ``ANTHROPIC_BASE_URL`` decides both whether ``build_eval_orch_config``
+    seeds the proxied price table (task 2820) and whether ``collect_metrics`` /
+    ``run_architect_eval`` stop trusting the CLI's own cost figure. Three
+    inline copies of the same env read could drift — a seeded table beside a
+    "native, trust the CLI" flag would resolve one candidate's cost two
+    different ways — so all three call the same helper.
+    """
+
+    @pytest.mark.parametrize('env_overrides,expected', [
+        ({'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}, True),
+        ({'ANTHROPIC_BASE_URL': '', 'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({'ANTHROPIC_MODEL': 'qwen3-coder'}, False),
+        ({}, False),
+        (None, False),
+    ])
+    def test_predicate(self, env_overrides, expected):
+        from orchestrator.evals.metrics import is_proxied_endpoint
+
+        assert is_proxied_endpoint(env_overrides) is expected
+
+    def test_runner_uses_the_metrics_singleton(self):
+        """Identity, not mere equality — a re-declared local copy in runner.py
+        (the price-table seeding site) would fail this, mirroring
+        ``TestCostPrimitivesSingleHome``'s pin on the cost primitives."""
+        from orchestrator.evals import metrics, runner
+
+        assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
+
+
 # ---------------------------------------------------------------------------
 # Task 2477 step-03: blend_composite — the C4 efficiency-adjusted composite
 # ---------------------------------------------------------------------------
@@ -534,6 +626,36 @@ class TestBlendComposite:
             0.95, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
         ) == 0.0
 
+    def test_the_no_plan_gate_is_unconditional_not_scoped_to_plan_only(self):
+        """Pins ``blend_composite``'s own contract that the *no_plan* gate is
+        UNCONDITIONAL rather than scoped to *plan_only* — quoting its
+        docstring, "so a caller cannot silently bypass it by forgetting the
+        flag." Deliberately exercised here at a shape the report layer's
+        ``no_plan = _has_plan_quality_score(m) and not produced_a_plan(m)``
+        call site never itself builds (it always passes ``plan_only``
+        alongside ``no_plan``) — a defence-in-depth contract of this PURE
+        function. (Cited by symbol/quote rather than line number: both drift
+        as the surrounding docstrings are edited.)
+
+        Both pre-existing no_plan tests above also pass ``plan_only=True``, so
+        before this test the source could be relaxed to
+        ``if plan_only and no_plan:`` and the whole eval sweep would stay
+        green (MEASURED with that mutant in place). ``plan_only`` is
+        therefore OMITTED here — not passed as ``False`` — to exercise the
+        exact "forgot the flag" hazard the docstring cites, the same
+        omit-the-flag idiom the default-behaviour tests above use.
+
+        ``tests_pass=True`` is deliberate, not incidental: under ``None`` or
+        ``False`` the FIRST gate would already return ``0.0``, and the
+        assertion would pass under the mutant too, proving nothing about the
+        second gate.
+        """
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=True, no_plan=True,
+        ) == 0.0
+
     def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
         """Additive: the default leaves the plan-only path byte-identical."""
         from orchestrator.evals.metrics import blend_composite
@@ -585,8 +707,11 @@ class TestCostPrimitivesSingleHome:
 # "did this architect actually produce a plan?" question downstream was answered
 # from plan_quality instead — a number the LLM judge can return NONZERO for a
 # stepless artifact that score_plan_structure floors to 0.0 (Graphiti episode
-# e2066ec6). These pin the predicate and its equivalence with the artifact-level
-# twin judge.is_scorable_plan.
+# e2066ec6). These pin the predicate itself; the equivalence with the
+# artifact-level twin judge.is_scorable_plan is pinned end-to-end through the
+# real runner by
+# test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin,
+# not by the tests below (which re-derive their own plan_steps locally).
 # ---------------------------------------------------------------------------
 
 class TestProducedAPlan:
@@ -636,14 +761,13 @@ class TestProducedAPlan:
         {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
         {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
     ])
-    def test_equivalent_to_the_artifact_level_twin(self, plan):
-        """produced_a_plan(metrics) == is_scorable_plan(plan), by construction.
-
-        The report layer only ever sees a persisted metrics dict and cannot call
-        is_scorable_plan, which reads the plan ARTIFACT. run_architect_eval
-        derives plan_steps from the identical `len(plan.get('steps') or [])`, so
-        the two ask the same question — PINNED here rather than left to
-        coincidence (the drift hazard _has_plan_quality_score was written for).
+    def test_agrees_with_the_artifact_level_twin_given_the_same_step_count(self, plan):
+        """Unit-level sanity: neither predicate carries a condition beyond
+        "step count > 0", across five artifact shapes — including the
+        header-only `create_plan` stub (TRUTHY, but not a plan). It
+        re-derives `plan_steps` locally rather than driving the runner, so it
+        cannot catch drift there; the real end-to-end pin lives in
+        `test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`.
         """
         from orchestrator.evals.judge import is_scorable_plan
         from orchestrator.evals.metrics import produced_a_plan

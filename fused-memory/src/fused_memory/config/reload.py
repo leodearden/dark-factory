@@ -53,6 +53,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Read live per MemoryService.search by resolve_topic_anchor_enabled
+    # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
+    # object — never captured at construction — so an in-place reload flips the
+    # topic-anchored canonical pin on the NEXT search without a restart (task
+    # 3111; see TestTopicAnchoredRecallReloadTier, which pins both the live-read
+    # property and the resulting search behaviour change). Registration is
+    # LOAD-BEARING, not cosmetic: anything absent from this frozenset silently
+    # degrades to restart-only.
+    'reconciliation.topic_anchored_recall_enabled',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -74,6 +83,25 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Replaced wholesale rather than merged, so a category the latest run
     # stopped deriving a cutoff for does not keep a stale one.
     'write_triage.t_high_by_category',
+    # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
+    # different reason than the calibrated thresholds above: they are hand-set,
+    # not derived, and both are read LIVE off the shared
+    # memory_service.config.write_triage object on every add_memory write by
+    # server/write_triage.py's resolvers -- nothing is captured at import or at
+    # construction, which is what makes this registration real rather than
+    # restart-only in disguise (the reload-safety rule this module documents).
+    # `enabled` is the staged-rollout kill switch (D10, flipped by task 3169)
+    # and MUST be green-tier for the same reason mem0_update.enabled below is:
+    # it is what an operator flips to stop an in-flight triage incident, and a
+    # restart-only kill switch is no kill switch. NOTE it lives in a section a
+    # script rewrites -- scripts/calibrate_write_triage.py --write-config
+    # replaces the calibration keys above and PRESERVES these two, precisely so
+    # a hot-reloadable flag cannot be silently reverted to off by a
+    # re-calibration.
+    'write_triage.enabled',
+    # Retrieval width, tuned against measured recall on a running server rather
+    # than by redeploying. Read live per write, same path as the flag above.
+    'write_triage.candidate_k',
     # In-place update_memory authorization (task 3088). Read live per tool call
     # by resolve_mem0_update_enabled (server/mem0_update_authz.py) off the
     # shared memory_service.config.mem0_update object -- the resolver captures

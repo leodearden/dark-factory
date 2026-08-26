@@ -16,13 +16,26 @@ if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
-from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    build_failure_message,
+    invoke_with_cap_retry,
+    no_mcp_servers_config,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 logger = logging.getLogger(__name__)
+
+# The CLOSED vocabulary of CLI-failure origins run() will propagate as
+# `warning_origin` (task 4343).  Both members are synthesised by _call_llm_cli
+# below; nothing else may enter, because the value lands in
+# VerificationResult.failure_token and from there in the reconciliation.db
+# `verify/codebase` audit row that operators GROUP BY.  An unbounded or
+# agent-controlled token there would make that census unqueryable.
+CLI_WARNING_ORIGINS = frozenset({'cli_output_unparseable', 'cli_output_empty'})
 
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
@@ -116,7 +129,35 @@ class AgentLoop:
             if not tool_use_blocks:
                 # No tool calls — agent stopped
                 text = ' '.join(b.text for b in text_blocks) if text_blocks else ''
-                return {'warning': 'no_tool_calls', 'text': text}, self._journal_entries
+                payload: dict = {'warning': 'no_tool_calls', 'text': text}
+                # Task 4343: surface the SPECIFIC failure origin additively.
+                # `warning` stays generic unconditionally — extract_agent_verdict
+                # derives its 'agent-failed:<token>' sentinel from it — while
+                # `warning_origin` carries the actionable diagnosis when one
+                # exists.  getattr with a default (not a bare read) is required:
+                # only _CLIResponseAdapter has `.warning`; the anthropic and
+                # OpenAI adapters do not.  The key is omitted entirely when
+                # there is no origin, rather than emitting an empty string that
+                # would read like a measured value.
+                #
+                # The membership test is load-bearing, not belt-and-braces:
+                # _CLIResponseAdapter.warning is structured_output['warning'],
+                # which is only OUR synthesised token when _call_llm_cli built
+                # the dict — on a real turn it is whatever the agent's own JSON
+                # happened to put there.  Propagating that unchecked would let
+                # agent-controlled content (or a non-str) reach
+                # VerificationResult.failure_token, which is a closed-vocabulary
+                # census column an operator groups by.  Unknown values are
+                # dropped: the generic 'no_tool_calls' still travels in
+                # `warning`, so nothing is silently lost.
+                # isinstance before the membership test: an unhashable value
+                # (a dict from agent-authored JSON) makes `in frozenset` raise
+                # TypeError, which would escape run() and turn a recoverable
+                # no-tool-call exit into a crash.
+                origin = getattr(response, 'warning', '')
+                if isinstance(origin, str) and origin in CLI_WARNING_ORIGINS:
+                    payload['warning_origin'] = origin
+                return payload, self._journal_entries
 
             tool_results = []
             terminal_result = None
@@ -336,7 +377,10 @@ class AgentLoop:
 
         Multi-turn is handled by passing ``resume_session_id`` on subsequent
         calls; ``_call_llm`` is responsible for serialising tool results into
-        the next turn's prompt before calling this method.
+        the next turn's prompt before calling this method. ``resume_delivers_prompt=True``
+        is what actually gets that serialised prompt to the CLI on turn >= 2 —
+        without it, ``invoke_with_cap_retry`` overwrites ``prompt`` with the
+        short crash-recovery continuation string before ever making the call.
 
         ``_cli_session_id`` is cleared to ``None`` before any exception propagates
         out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
@@ -353,6 +397,12 @@ class AgentLoop:
                 system_prompt=self._build_cli_system_prompt(tools),
                 output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
                 disallowed_tools=['*'],
+                # Closes MCP separately from the wildcard deny above, which the
+                # schema expands into a BUILT-INS-ONLY list. Must stay truthy, or
+                # --strict-mcp-config is never emitted (build_claude_argv gates it
+                # on `if mcp_config:`).
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 model=self.config.agent_llm_model,
                 # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
                 # _call_claude_cli again with resume_session_id.  A single CLI
@@ -362,12 +412,57 @@ class AgentLoop:
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
+                # This loop's --resume is its NORMAL operating mode, not crash
+                # recovery: each turn's prompt is _serialize_tool_results(...),
+                # computed in Python and never replayed in the CLI transcript
+                # (disallowed_tools=['*'] above), so it exists nowhere else.
+                # Without resume_delivers_prompt=True, cli_invoke.py would
+                # replace it with CRASH_RECOVERY_RESUME_PROMPT and the turn's
+                # tool results would be silently and unrecoverably lost.
+                # Passed unconditionally (not gated on _cli_session_id): it is
+                # already inert on turn 1 since cli_invoke only reads it inside
+                # `if invoke_kwargs.get('resume_session_id'):`.
+                resume_delivers_prompt=True,
+                # Robustness caveat (not a live bug): resume_delivers_prompt=True
+                # makes this a "live continuation" caller per invoke_with_cap_retry's
+                # own contract (cli_invoke.py:1600-1603, 1703-1706, 2071-2074) — its
+                # original_prompt (the bare _serialize_tool_results(...) string, with
+                # no conversation context) is only meaningful *inside* the resumed
+                # session. If that session is lost, the gated retry loop's
+                # rebuild_prompt hook is what reconstructs a self-contained prompt for
+                # the fresh session it starts instead; this call passes none. That is
+                # harmless today ONLY because AgentLoop's sole production caller
+                # (verify.py) never supplies a real usage_gate, so this call always
+                # takes the gate-less fast path (cli_invoke.py:1507) and never reaches
+                # the resume-to-fresh fallback, auth-failover, or zero-output-wedge
+                # branches that would invoke rebuild_prompt. If AgentLoop is ever
+                # constructed with a real usage_gate, add a rebuild_prompt hook here
+                # at the same time.
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
                 # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies with
-                # CLI built-in tools disabled (disallowed_tools=['*']), so the
+                # actively adjudicates memory-vs-codebase discrepancies, and the
                 # auto-loaded CLAUDE.md is plausibly its main passive codebase
                 # signal.
+                #
+                # This cwd is the project root and holds a live .mcp.json, which
+                # bypassPermissions would otherwise let the CLI ambient-merge and
+                # expose unreviewed. disallowed_tools=['*'] above does NOT cover
+                # that: with output_schema set, cli_invoke expands the wildcard
+                # into _REAL_BUILTIN_TOOLS_DENYLIST, a BUILT-INS-ONLY list that
+                # carries no MCP tool pattern. MCP tools are closed SEPARATELY,
+                # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
+                # pair above — which must stay truthy, since --strict-mcp-config is
+                # emitted only inside build_claude_argv's `if mcp_config:` block.
+                # Both kwargs survive every cap-retry resume: _reset_for_fresh_retry
+                # touches only resume_session_id/prompt/session_id, and the `if
+                # mcp_config:` argv block sits outside the resume conditional.
+                # Confirmed by reading shared/cli_invoke.py, but NOT independently
+                # pinned by a resume-path test at that layer — a future refactor
+                # that moved the mcp_config handling into build_claude_argv's
+                # `elif session_id:` branch would silently reopen this for every
+                # turn >= 2 with a green suite here. Tracked as a follow-up test
+                # in shared/tests/test_build_claude_argv.py (out of this task's
+                # locked-module scope).
                 cwd=Path(self.config.explore_codebase_root),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
@@ -395,12 +490,16 @@ class AgentLoop:
                     ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
                     structured[:200],
                 )
+                # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
+                # or run() will drop it as unknown.
                 structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
             logger.warning(
                 'cli_output_empty: Claude CLI reported success but structured_output'
                 ' was empty/missing; treating as empty tool-call turn.',
             )
+            # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
+            # or run() will drop it as unknown.
             structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
 
         return _CLIResponseAdapter(structured, session_id=result.session_id)
@@ -437,16 +536,27 @@ class _CLIResponseAdapter:
     ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
 
     Note on ``.warning``: this attribute surfaces the specific CLI-failure
-    token (``'cli_output_unparseable'`` / ``'cli_output_empty'``) to the log
-    and to delegation-level tests.  It is intentionally **not** propagated
-    through ``AgentLoop.run()``'s return value, which emits the generic
-    ``{'warning': 'no_tool_calls'}`` shape regardless of the origin.
-    Site-22's ``extract_agent_verdict`` guard already converts that shape
-    into the loud ``'agent-failed:no_tool_calls'`` sentinel end-to-end, so
-    threading the more specific token through ``run()`` would add surface
-    area (and break existing adapter-independent tests) for no required
-    behaviour change.  Revisit if a downstream caller ever needs to
-    distinguish the two origins.
+    token (``'cli_output_unparseable'`` — the CLI returned junk — versus
+    ``'cli_output_empty'`` — the CLI returned nothing) to the log and to
+    delegation-level tests.  Task 4343 is the revisit this docstring used to
+    invite: ``AgentLoop.run()`` now **does** propagate the token, under the
+    separate ``warning_origin`` key.  ``warning`` itself stays generic
+    (``'no_tool_calls'``) unconditionally, so site-22's
+    ``extract_agent_verdict`` still converts it into the loud
+    ``'agent-failed:no_tool_calls'`` sentinel and the adapter-independent
+    tests that pin that shape stay green — the additive key was chosen
+    precisely to avoid renegotiating either contract.
+
+    The downstream consumer that needed the distinction is targeted.py's
+    ``verify/codebase`` audit row: it stores the token in
+    ``VerificationResult.failure_token`` so an operator reading
+    ``reconciliation.db`` can tell an empty CLI response from an unparseable
+    one without re-running anything.
+
+    Because this attribute is just ``structured_output['warning']``, it holds
+    OUR synthesised token only when ``_call_llm_cli`` built the dict; on a real
+    turn it is whatever the agent's own JSON put under that key.  ``run()``
+    therefore propagates it only if it is a member of ``CLI_WARNING_ORIGINS``.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):

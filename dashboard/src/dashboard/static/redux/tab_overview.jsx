@@ -29,6 +29,23 @@ function formatLoadValue(type, v) {
   /* type === 'int' */  return `${Math.round(v)}`;
 }
 
+/* Period of the HostLoadCard /api/load poll, in ms.
+ *
+ * LOAD-BEARING BEYOND THIS FILE: this is a recurring HTTP poller, so it holds a
+ * keep-alive connection and reuses it every LOAD_POLL_INTERVAL_MS. The systemd
+ * unit's `--timeout-keep-alive` must stay strictly ABOVE the slowest such
+ * poller, or the server closes this socket in the gap between polls and exposes
+ * the server-closes-while-client-writes race. The value is parsed from this
+ * declaration by tests/scripts/test_dashboard_service_template.py
+ * (CLIENT_POLLERS), so RAISING IT REQUIRES raising --timeout-keep-alive in BOTH
+ * scripts/dashboard.service.template and
+ * dashboard/dark-factory-dashboard.service.
+ *
+ * Named distinctly from data.js's POLL_INTERVAL_MS (the 3s main data refresh):
+ * these are two independent pollers with two independent periods.
+ */
+const LOAD_POLL_INTERVAL_MS = 5000;
+
 function HostLoadCard({ paused }) {
   const [load, setLoad] = useState(null);
   const [stale, setStale] = useState(false);
@@ -45,7 +62,7 @@ function HostLoadCard({ paused }) {
       } catch (_) { if (alive) setStale(true); }
     }
     fetchLoad();
-    const id = setInterval(fetchLoad, 5000);
+    const id = setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);
     return () => { alive = false; clearInterval(id); };
   }, [paused]);
 
@@ -54,7 +71,7 @@ function HostLoadCard({ paused }) {
       <div className="panel-head">
         <span className="title">Host load</span>
         {stale && <span className="badge stale">stale</span>}
-        <span className="meta">5-min window · 5s poll</span>
+        <span className="meta">5-min window · {LOAD_POLL_INTERVAL_MS / 1000}s poll</span>
       </div>
       <div className="panel-body">
         <table className="tbl" style={{ width: '100%' }}>
@@ -330,6 +347,18 @@ function OverviewTab({ paused }) {
               const v = D.RECON_STATE.verdict;
               const sev = v?.severity || 'none';
               const action = v?.action_taken || 'none';
+              // A PHANTOM verdict is a fabricated placeholder for a review
+              // that never happened — produced by Judge._parse_verdict's
+              // except block when the judge's own output could not be parsed,
+              // and classified by shared.phantom_verdict. It is stored with
+              // severity='serious', so without this branch the row below
+              // paints a red `bad` dot reading "verdict: serious · halt" for a
+              // finding no judge ever made. Rendered `warn` (yellow) rather
+              // than `bad`: the run genuinely went unreviewed, which is
+              // degraded, but nothing serious was actually found.
+              if (v?.is_phantom) {
+                return { l: 'Reconciliation', sub: `verdict: unreviewed (unparseable judge output) · ${action}`, ok: true, warn: true };
+              }
               return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
             })(),
             (() => {

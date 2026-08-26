@@ -438,9 +438,11 @@ class TestMem0UpdateLeavesAreGreenTier:
         [
             ('mem0_update.enabled', False),
             ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            # NB: must differ from the shipped default (which already carries
+            # recon-stage- and curator-), or the diff is vacuously empty.
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
-                ['recon-stage-', 'curator-'],
+                ['recon-stage-', 'curator-', 'auditor-'],
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -489,8 +491,13 @@ class TestMem0UpdateLeavesAreGreenTier:
         )
 
     def test_widened_metadata_bar_is_observed_live(self):
-        """The operator story: admit a curator-gate metadata patch on a running
-        server WITHOUT granting content-amend authority."""
+        """The operator story: admit an interactive tagging flow on a running
+        server WITHOUT granting content-amend authority.
+
+        auditor- as the example prefix, NOT curator-: curator- moved onto the
+        shipped default of BOTH arms (esc-3524-1 + the 2026-08-12 ruling), so
+        widening to it would be a vacuous no-op diff and the content-amend
+        denial below would fail."""
         from types import SimpleNamespace
 
         from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
@@ -502,15 +509,15 @@ class TestMem0UpdateLeavesAreGreenTier:
         object.__setattr__(
             fresh.mem0_update,
             'metadata_patch_allowed_agent_prefixes',
-            ['recon-stage-', 'curator-'],
+            ['recon-stage-', 'curator-', 'auditor-'],
         )
         apply_reload(live, fresh)
 
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=False, metadata_patch=True,
+            svc, agent_id='auditor-session', content_amend=False, metadata_patch=True,
         ).allowed is True
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+            svc, agent_id='auditor-session', content_amend=True, metadata_patch=False,
         ).allowed is False, 'widening one bar must not widen the other'
 
 
@@ -526,6 +533,15 @@ class TestWriteTriageLeavesAreGreenTier:
         'write_triage.t_high',
         'write_triage.t_low',
         'write_triage.calibration_report_path',
+        # Operator knobs (task 3127, PRD leaf beta), green-tier for a
+        # DIFFERENT reason than their calibrated siblings above. `enabled` is
+        # the staged-rollout kill switch: it is what an operator flips to stop
+        # an in-flight triage incident, and a restart-only kill switch is no
+        # kill switch (the mem0_update.enabled lesson, reload.py). `candidate_k`
+        # is the retrieval width, tuned against measured recall on a running
+        # server rather than by redeploying.
+        'write_triage.enabled',
+        'write_triage.candidate_k',
     )
 
     @pytest.mark.parametrize('path', PATHS)
@@ -538,6 +554,8 @@ class TestWriteTriageLeavesAreGreenTier:
             ('write_triage.t_high', 0.87),
             ('write_triage.t_low', 0.61),
             ('write_triage.calibration_report_path', 'calibration/report.json'),
+            ('write_triage.enabled', True),
+            ('write_triage.candidate_k', 37),
         ],
     )
     def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
@@ -545,7 +563,15 @@ class TestWriteTriageLeavesAreGreenTier:
         fresh = FusedMemoryConfig()
         field = path.split('.', 1)[1]
         old = getattr(live.write_triage, field)
-        assert old is None, 'the uncalibrated default is None'
+        # The precondition this needs is only that the leaf actually CHANGES —
+        # diff_config reports nothing otherwise and the lookup below raises
+        # KeyError on a test that is not about that. It used to be spelled
+        # `old is None`, which stopped being true of the whole section when the
+        # operator knobs landed with real defaults (there is no such thing as
+        # an uncalibrated kill switch). The `defaults to None` invariant for
+        # the three CALIBRATED fields is pinned where it belongs, in
+        # test_config_schema.py::TestWriteTriageConfig.
+        assert old != new_value, f'{path} must actually change for this to assert anything'
         object.__setattr__(fresh.write_triage, field, new_value)
 
         d = diff_config(live, fresh)
@@ -632,3 +658,96 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         apply_reload(live, fresh)
 
         assert live.write_triage.t_high_by_category == self.SYNTHETIC
+
+
+class TestTopicAnchoredRecallReloadTier:
+    """The topic pin's kill switch is GREEN TIER (task 3111).
+
+    Green-tier classification is EARNED, not asserted: a knob captured by value
+    at construction would not observe an in-place reload and would have to stay
+    restart-only (config/reload.py's module docstring states the rule). So the
+    classification test is paired with the live-consumer test that justifies it.
+    """
+
+    def test_classified_hot_reloadable_not_restart_required(self):
+        """RED while the field is absent from RELOADABLE_FIELDS — it buckets as restart."""
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.reconciliation.topic_anchored_recall_enabled
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates['reconciliation.topic_anchored_recall_enabled'] == {
+            'old': old,
+            'new': not old,
+        }
+        assert 'reconciliation.topic_anchored_recall_enabled' not in d.restart_required
+
+    def test_flip_observed_by_live_resolver_without_reconstruction(self):
+        """The live-read property that MAKES the green-tier classification honest."""
+        from fused_memory.services.topic_anchor import resolve_topic_anchor_enabled
+
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert memory_service.config.reconciliation.topic_anchored_recall_enabled is True
+        assert resolve_topic_anchor_enabled(memory_service) is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.topic_anchored_recall_enabled' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolve_topic_anchor_enabled(memory_service) is False
+
+    @pytest.mark.asyncio
+    async def test_flip_changes_the_next_searchs_behaviour(self, mock_config):
+        """End of the chain: the in-place flip changes real search behaviour.
+
+        Asserts on the observable consequence — whether the metadata lookup is
+        made at all — rather than on the resolver's return value, so this
+        cannot pass while the search path ignores the knob.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from _fm_helpers import install_identity_mocks
+
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        service.graphiti = MagicMock()
+        service.graphiti.search = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        install_identity_mocks(service.graphiti)
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': [{
+            'id': 'sibling-1',
+            'memory': 'a narrow sibling',
+            'score': 0.85,
+            'metadata': {'category': 'procedural_knowledge', 'topic': 'topic-a'},
+        }]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        async def _search() -> None:
+            # Spelled out rather than splatted from a dict: a heterogeneous
+            # dict literal infers `str | list[str] | int` for every value and
+            # pyright rejects the splat against search's real signature.
+            await service.search(
+                query='q',
+                project_id='dark_factory',
+                categories=['procedural_knowledge'],
+                stores=['mem0'],
+                limit=5,
+            )
+
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+        apply_reload(service.config, fresh)
+
+        # Same service object, no reconstruction — the next search skips the I/O.
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1

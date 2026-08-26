@@ -17,9 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from legibility import codebook as mod
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -584,6 +582,187 @@ def test_apply_coding_record_different_candidate_same_day_increments_id():
 
 
 # ---------------------------------------------------------------------------
+# task-4144 step-1: RED — the merger must never resurrect an adjudicated
+# candidate by fabricating a byte-identical-title pending twin. This is the
+# defect that turned rejected `cand-20260722-28` back into pending
+# `cand-20260724-2` in the live registry: `same_title` spans every
+# disposition, but `pending_match` filters to `pending` only, so a title
+# whose records are all rejected/promoted fell through to the create branch.
+# ---------------------------------------------------------------------------
+
+def _codebook_with_adjudicated_candidate(disposition: str) -> dict:
+    """A v2 codebook carrying exactly one already-adjudicated candidate —
+    the shape `census.reject_candidate`/`promote_candidate` leave behind."""
+    codebook = _codebook_with_entry_a()
+    codebook["candidates"] = [
+        {
+            "id": "cand-20260722-28",
+            "title": "novel shape",
+            "cause": "...",
+            "area": "...",
+            "first_seen": "2026-07-22",
+            "disposition": disposition,
+            "sightings": [
+                {
+                    "date": "2026-07-22",
+                    "project": "dark_factory",
+                    "session": "sess-old",
+                    "origin_phase": "architect",
+                    "manifested_phase": "verify",
+                }
+            ],
+        }
+    ]
+    return codebook
+
+
+def test_apply_coding_record_does_not_resurrect_rejected_candidate():
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 1  # NO pending twin fabricated
+    candidate = result["candidates"][0]
+    assert candidate["id"] == "cand-20260722-28"
+    assert candidate["disposition"] == "rejected"  # census verdict untouched
+    # recurrence signal preserved, append-only
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["candidate_disposition_conflicts"] == 1
+    assert stats["candidates_applied"] == 0
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_does_not_duplicate_promoted_candidate():
+    """The FALLBACK half of the promoted case: this fixture's candidate is
+    stamped `promoted` but carries no `promoted_to` (a hand-edited or
+    pre-`promote_candidate` record), so there is no entry to route the
+    recurrence to — it lands on the candidate and counts as a conflict,
+    exactly like the rejected case."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["id"] == "cand-20260722-28"
+    assert candidate["disposition"] == "promoted"  # census verdict untouched
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["candidate_disposition_conflicts"] == 1
+    assert stats["candidates_applied"] == 0
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_routes_promoted_recurrence_to_its_entry():
+    """A promoted candidate's `sightings` list is a DEAD field for new
+    signal: `census.promote_candidate` deep-copies it into the new entry
+    once, at promotion time, and nothing re-reads it afterwards (the matrix
+    path and the codebook index both read ENTRY sightings). So a recurrence
+    of a promoted title must land on the entry named by `promoted_to` and
+    count as a `matched` sighting — filing it on the candidate would report
+    the signal as preserved while writing it where no consumer looks."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+    assert stats["matched"] == 1
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert stats["candidates_applied"] == 0
+
+    # The candidate itself is untouched — verdict AND sightings; no twin.
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["disposition"] == "promoted"
+    assert len(candidate["sightings"]) == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_promoted_recurrence_dedupes_on_the_entry():
+    """Session-level dedup on the ENTRY, mirroring the match path: a record
+    that both matches the entry directly and re-mines the promoted title
+    appends exactly one sighting, not two."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+    record["matches"] = [
+        {"entry_id": "entry-a", "origin_phase": "implement", "manifested_phase": "merge"}
+    ]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+    assert stats["matched"] == 1  # the match path's append; the candidate re-sighting deduped
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert stats["candidates_applied"] == 0
+    assert len(result["candidates"][0]["sightings"]) == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_promoted_with_dangling_promoted_to_falls_back():
+    """`promoted_to` naming an entry that does not exist must NOT silently
+    drop the recurrence: fall back to the candidate append + conflict
+    counter (the merger never fabricates an entry — only the census does)."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-that-was-never-created"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["entries"]) == 1  # no entry fabricated
+    assert result["entries"][0]["sightings"] == []
+    candidate = result["candidates"][0]
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["matched"] == 0
+    assert stats["candidate_disposition_conflicts"] == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_adjudicated_conflict_is_idempotent():
+    """The pre-existing `already_seen` guard already spans every
+    disposition, so re-applying the same record appends nothing and reports
+    no fresh conflict."""
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    once, first_stats = mod.apply_coding_record(codebook, record)
+    twice, second_stats = mod.apply_coding_record(once, record)
+
+    assert len(twice["candidates"]) == 1
+    assert len(twice["candidates"][0]["sightings"]) == 2  # unchanged by the 2nd apply
+    assert first_stats["candidate_disposition_conflicts"] == 1
+    assert second_stats["candidate_disposition_conflicts"] == 0
+    assert mod.validate(twice) == []
+
+
+def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
+    """Regression guard: the new conflict branch must not swallow genuinely
+    novel titles — only an ALREADY-SEEN title takes it."""
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(
+        title="a different shape", session="sess-new", date="2026-07-24"
+    )
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 2
+    fresh = next(c for c in result["candidates"] if c["title"] == "a different shape")
+    assert fresh["disposition"] == "pending"
+    assert fresh["id"] == "cand-20260724-1"
+    assert stats["candidates_applied"] == 1
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert mod.validate(result) == []
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
@@ -896,6 +1075,101 @@ class TestMainCLI:
         assert len(reloaded["candidates"]) == 1
         assert mod.validate(reloaded) == []
 
+    def test_apply_skips_deletion_directive_record_without_aborting_batch(
+        self, tmp_path, capsys
+    ):
+        """A single deletion-shaped record must be skipped and counted like
+        a malformed JSON line — not abort the whole batch. dump() is AFTER
+        the per-line loop, so a NeverDeleteError escaping _cmd_apply
+        discarded every already-applied in-memory record along with the
+        records that came after the bad line."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+        good = json.loads(records_path.read_text(encoding="utf-8"))
+
+        bad = _match_record()
+        bad["matches"][0]["action"] = "delete"  # trips _reject_deletion_directive
+
+        # A second good record under a DIFFERENT session, so it is not
+        # deduped away by the session-keyed idempotency guard — its arrival
+        # proves the records AFTER the bad line were not discarded.
+        good_2 = copy.deepcopy(good)
+        good_2["session"] = "sess-2"
+
+        records_path.write_text(
+            "\n".join(json.dumps(r) for r in (good, bad, good_2)) + "\n",
+            encoding="utf-8",
+        )
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert str(records_path) in captured.err
+        assert ":2:" in captured.err  # the offending line number
+        assert "deletion directive" in captured.err
+        assert "deletion_directive=1" in captured.out
+
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert {s["session"] for s in entry["sightings"]} == {"sess-1", "sess-2"}
+        assert mod.validate(reloaded) == []
+
+    def test_apply_summary_reports_candidate_disposition_conflicts(self, tmp_path, capsys):
+        """A recurrence sighting appended to an already-adjudicated candidate
+        must be REPORTED, not hidden. Secondary to the nightly fix: _cmd_apply
+        dumps unconditionally after its loop, so the sighting was always
+        persisted here — only the printed summary was blind, leaving the new
+        stat vestigial at this merge site."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+
+        cb = mod.load(codebook_path)
+        cb["candidates"] = [
+            {
+                "id": "cand-20260722-28",
+                "title": "recurring rejected cause",
+                "first_seen": "2026-07-22",
+                "disposition": "rejected",
+                "sightings": [
+                    {
+                        "date": "2026-07-22",
+                        "project": "dark_factory",
+                        "session": "sess-old",
+                        "origin_phase": "architect",
+                        "manifested_phase": "verify",
+                    }
+                ],
+            }
+        ]
+        mod.dump(cb, codebook_path)
+
+        # session must be absent from the seeded sightings, or `already_seen`
+        # short-circuits the conflict branch.
+        records_path.write_text(
+            json.dumps(
+                _candidate_record(
+                    title="recurring rejected cause", session="sess-new", date="2026-07-24"
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert "candidate_disposition_conflicts=1" in captured.out
+        # Reported SEPARATELY rather than conflated with applied candidates.
+        assert "candidates_applied=0" in captured.out
+
+        reloaded = mod.load(codebook_path)
+        assert len(reloaded["candidates"]) == 1  # no fabricated pending twin
+        candidate = reloaded["candidates"][0]
+        assert candidate["disposition"] == "rejected"
+        assert len(candidate["sightings"]) == 2
+        assert candidate["sightings"][1]["session"] == "sess-new"
+        assert mod.validate(reloaded) == []
+
     def test_migrate_empty_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
         """An empty codebook file loads via yaml.safe_load() as None.
         _cmd_migrate must report a clear error and return 1, not raise an
@@ -959,3 +1233,65 @@ def test_live_codebook_is_v2_and_validates_green():
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
     assert codebook["version"] == 2
     assert mod.validate(codebook) == []
+
+
+def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
+    """Live-file guard against the resurrection that already happened.
+
+    (a) is the resurrection signature: the merger fabricated a *pending* twin
+    for a title the census had already adjudicated (rejected cand-20260722-28
+    came back as pending cand-20260724-2). (b) is the forward guard — already
+    green today — asserted so the invariant is stated whole.
+
+    This is the checkable invariant the merge fix guarantees going forward: a
+    title with an existing pending record takes the `pending_match` branch; a
+    title whose records are all adjudicated takes the conflict branch (sighting
+    appended, disposition untouched, NO new pending); only a genuinely unseen
+    title reaches the create branch. census.py only flips dispositions and
+    never creates candidates, so it can only violate (a) by rejecting one of
+    two same-title pendings — which (b) proves cannot currently arise.
+
+    Deliberately asserted on the pending-vs-adjudicated split rather than on
+    duplicate titles outright: the never-delete contract forbids removing the
+    resurrected record, so the repair can only restore its verdict, not erase
+    it, and a "no duplicate titles" assertion could never go green.
+    """
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+
+    by_title = {}
+    for candidate in codebook.get("candidates") or []:
+        by_title.setdefault(candidate.get("title"), []).append(candidate)
+
+    def _describe(title):
+        return "{!r}: {}".format(
+            title,
+            [
+                (c.get("id"), c.get("disposition"), c.get("first_seen"))
+                for c in by_title[title]
+            ],
+        )
+
+    # (a) THE RESURRECTION SIGNATURE — a pending record alongside an
+    #     already-adjudicated one for the byte-identical title.
+    resurrected = [
+        title
+        for title, group in by_title.items()
+        if any(c.get("disposition") == "pending" for c in group)
+        and any(c.get("disposition") in {"rejected", "promoted"} for c in group)
+    ]
+    assert resurrected == [], (
+        "pending candidate(s) coexist with an already-adjudicated candidate of "
+        "the same title — the census verdict was resurrected: "
+        + "; ".join(_describe(t) for t in resurrected)
+    )
+
+    # (b) forward guard — never two pending records for one title.
+    duplicated = [
+        title
+        for title, group in by_title.items()
+        if sum(1 for c in group if c.get("disposition") == "pending") > 1
+    ]
+    assert duplicated == [], (
+        "more than one pending candidate shares a title: "
+        + "; ".join(_describe(t) for t in duplicated)
+    )

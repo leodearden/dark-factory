@@ -149,8 +149,8 @@ def resolve_marker_expression(
 
     *pyproject_text* is the content of the ini file at pytest's ROOTDIR, which
     the caller locates from the command's effective cwd — see
-    ``verify_plan._marker_deselecting_expression``.  This function does not and
-    cannot check that the two describe the same invocation.
+    ``verify_plan.deselecting_expression_for_command``.  This function does not
+    and cannot check that the two describe the same invocation.
 
     Never raises — every failure path returns None.
 

@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -718,6 +719,57 @@ def _pass_result() -> MagicMock:
     return MagicMock(passed=True, summary='')
 
 
+class _DispatchReturnsMidVerifyRemote:
+    """Stub RemoteRunner whose `dispatch_in_flight` is a real `@property`
+    over a mutable flag — not a MagicMock snapshot — so it can genuinely
+    transition True -> False mid-verify while the awaited
+    `run_merge_verify` coroutine stays pending. Mirrors production
+    (`verify_runner.py` sets the flag live before ssh dispatch and clears
+    it in the outer `finally` once dispatch returns, while the lease may
+    still be held for post-dispatch work such as task 2822's local
+    cross-check).
+
+    Shared by every trigger-3 dispatch-transition test below (reviewer
+    finding, duplication) so the transition they all depend on cannot
+    silently drift between per-test copies. `never_release` is
+    caller-owned and gates the (never reached) post-dispatch
+    continuation; `on_dispatch_start`, if given, is called with no
+    arguments at the very top of `run_merge_verify`, before the dispatch
+    flag goes live — used by the seed-ordering pin to capture state at
+    that exact point.
+    """
+
+    name = 'remote-host'
+    is_local = False
+
+    def __init__(
+        self,
+        never_release: asyncio.Event,
+        on_dispatch_start: Callable[[], None] | None = None,
+    ) -> None:
+        self._never_release = never_release
+        self._on_dispatch_start = on_dispatch_start
+        self._dispatch_live = False
+        self.dispatch_returned = asyncio.Event()
+
+    @property
+    def dispatch_in_flight(self) -> bool:
+        return self._dispatch_live
+
+    async def run_merge_verify(self, *args: object, **kwargs: object) -> MagicMock:
+        if self._on_dispatch_start is not None:
+            self._on_dispatch_start()
+        self._dispatch_live = True  # ssh dispatch is LIVE
+        await asyncio.sleep(0.06)  # a few VERIFY_ABANDON_POLL_SECS ticks
+        self._dispatch_live = False  # dispatch RETURNS (verify_runner.py:1483)
+        self.dispatch_returned.set()
+        await self._never_release.wait()  # the (simulated) post-dispatch window
+        raise AssertionError('unreachable — never_release is never set in this test')
+
+    async def cancel_verify(self) -> int:
+        return 0
+
+
 @pytest.mark.asyncio
 class TestDeadInflightVerifyAborts:
     """SpeculativeMergeWorker._run_inflight_verify LOCAL no-progress abort
@@ -1119,6 +1171,278 @@ class TestDeadInflightVerifyAborts:
         verify_future.cancel()
         with contextlib.suppress(BaseException):
             await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_is_not_aborted_while_local_content_progresses(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Pins Abort trigger 3's union semantics for the task-2822 cross-check window: a REMOTE lease
+        whose ssh dispatch has RETURNED mid-verify (`RemoteRunner.dispatch_in_flight` True -> False,
+        cleared in `run_merge_verify`'s outer `finally`) while a local post-dispatch verify keeps
+        advancing merge_wt's content mtime must NOT be progress-aborted.
+
+        This transition is not hypothetical: it is what every remote-dispatch-then-cross-check
+        verify does in production once the ssh dispatch returns and task 2822's
+        `LocalRunner(merge_wt, ...)` cross-check takes over inside the same awaited verify_task.
+        Reify specimen mr-945466ca / task 6393: three passing ~17.4-min remote verifies discarded as
+        dead 2026-08-20 before this fix.
+
+        Uses the shared `_DispatchReturnsMidVerifyRemote` stub (a real `@property` over a mutable
+        flag, not a MagicMock snapshot) so the flag genuinely flips mid-verify while the awaited
+        coroutine stays pending — no prior remote-lease trigger-3 test in this class expressed that
+        transition.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-a', 'rcc.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        # task 2921 anti-flake pattern: strictly-increasing stub so the
+        # content-mtime arm (once it exists for remote leases) unconditionally
+        # observes fresh progress on every probe, decoupling this
+        # must-NOT-abort assertion from real wall-clock file-write timing —
+        # simulates the task-2822 cross-check writing under merge_wt without
+        # coupling to real file I/O.
+        _mtime = [1000.0]
+
+        def _always_progress(_root: Path) -> float:
+            _mtime[0] += 1.0
+            return _mtime[0]
+
+        with patch('orchestrator.merge_queue.newest_content_mtime', _always_progress):
+            verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.wait_for(runner.dispatch_returned.wait(), timeout=15.0)
+            # Let several whole budget windows elapse AFTER the dispatch flag
+            # went False, while merge_wt content keeps advancing.
+            await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+            assert not verify_future.done(), (
+                'a REMOTE lease whose ssh dispatch has RETURNED while a local '
+                'post-dispatch verify keeps writing under merge_wt must NOT '
+                'be progress-aborted (task 2822 cross-check)'
+            )
+            assert q.empty(), 'a progressing post-dispatch cross-check must not be re-queued'
+            assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
+                'no strike should be recorded while local content is progressing'
+            )
+
+            verify_future.cancel()
+            with contextlib.suppress(BaseException):
+                await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_with_real_merge_wt_writes_is_not_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Companion to the stubbed positive test above (reviewer finding, test-coverage): that test
+        patches `newest_content_mtime` with an unconditionally-increasing stub, so it cannot catch a
+        regression that made evidence A probe the wrong root (e.g. the request worktree instead of
+        merge_wt) or reintroduced a root-inode/.git-sensitive signal — the stub returns "progress"
+        regardless of what evidence A actually reads. This test performs REAL writes under merge_wt
+        — the exact tree `newest_content_mtime` walks in production — with the helper left
+        completely UNPATCHED, so it can only pass if evidence A reads the right directory with the
+        right semantics.
+
+        Deliberate exception to this class's task-2921 anti-flake convention (see the class
+        docstring): a real-write test couples the assertion to wall-clock file-write timing, which
+        the stubbed sibling test exists to avoid. Accepted here, once, to close the gap the stub
+        cannot — a genuinely wrong probe target — and mitigated by writing on every
+        VERIFY_ABANDON_POLL_SECS tick (10x more often than the no-progress budget elapses), so only
+        an extreme multi-hundred-ms event-loop stall could produce a false abort.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-real-write-a', 'rccrw.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+        progress_file = item.merge_wt / 'crosscheck-progress.txt'
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(runner.dispatch_returned.wait(), timeout=15.0)
+
+        # Real writes under merge_wt, once per poll tick, for several whole budget
+        # windows — the UNPATCHED newest_content_mtime helper must observe each one
+        # to keep suppressing the abort (no stub standing in for evidence A here).
+        for i in range(50):
+            progress_file.write_text(str(i))
+            await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS)
+
+        assert not verify_future.done(), (
+            'real writes under merge_wt during the post-dispatch window must be observed '
+            'by the unpatched newest_content_mtime helper and suppress the progress-abort, '
+            'exactly like the stubbed test above'
+        )
+        assert q.empty(), 'a progressing post-dispatch cross-check must not be re-queued'
+        assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
+            'no strike should be recorded while local content is progressing'
+        )
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_with_no_local_content_still_aborts(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The NEGATIVE TWIN to the positive test above, and the scope fence for Abort trigger 3's
+        progress union: the ONLY difference is that nothing writes under merge_wt during the
+        post-dispatch window, so `newest_content_mtime` is left completely UNPATCHED and reads the
+        real (static) merge worktree `_make_merged_item` produced.
+
+        This is the fence for the reify-5067 coasting-lease class (closed by task 2566): a remote
+        lease that is genuinely coasting — ssh child exited, or a post-dispatch probe hung — writes
+        nothing under merge_wt (RemoteRunner's only local writes are `git push`/`fetch` under
+        `.git`, which `newest_content_mtime` prunes), so widening the progress signal to a union
+        must NOT rescue it. If a future change makes this test abort late or not at all, trigger 3
+        has been silently disabled for remote leases.
+
+        The seed-ordering pin is a separate concern, split into
+        test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn below, so
+        this test stays a pure behavioural guard.
+        """
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-no-progress-a', 'rccnp.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a remote lease with no live dispatch AND no local content '
+            f'progress must still be progress-aborted, got '
+            f'status={result.status!r}'
+        )
+        assert not q.empty(), 'the coast must re-dispatch the request onto _queue'
+        assert q.get_nowait() is req
+        assert result.merge_wt is None, 'merge_wt must be cleaned on the coast abort'
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            req.task_id in r.message and 'progress' in r.message.lower()
+            for r in warnings
+        ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+    async def test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """SEED PIN, split out from the negative twin above so each test pins one invariant (the twin's
+        abort assertions hold via evidence B alone, independent of this one).
+
+        Proves `_last_content_mtime` is seeded unconditionally at verify-task creation — immediately
+        after verify_task is created, before the poll loop's first `await` — rather than lazily on
+        the first probe. Otherwise the `_last_content_mtime is None` arm would hand a genuinely
+        coasting remote lease one free budget window the first time it probes.
+
+        `newest_content_mtime` is wrapped in a recorder that still delegates to the real
+        implementation, reusing the same real static merge worktree and abort semantics as the
+        negative twin. The stub records, at the very top of `run_merge_verify` (before the dispatch
+        flag even goes live), how many times the recorder had already been called —
+        `_run_inflight_verify` creates verify_task and runs the seed call entirely synchronously
+        before its first `await`, so `run_merge_verify` cannot get a turn on the event loop until
+        after the seed call has already happened, making "at least one recorded call at that point"
+        a direct pin of the unconditional seed.
+        """
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.merge_queue import newest_content_mtime as _real_newest_content_mtime
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        mtime_calls: list[float | None] = []
+        seed_call_count_at_dispatch_start: list[int] = []
+
+        def _recording_real_mtime(root: Path) -> float | None:
+            result = _real_newest_content_mtime(root)
+            mtime_calls.append(result)
+            return result
+
+        def _on_dispatch_start() -> None:
+            # SEED PIN: record whether the seed already ran BEFORE this
+            # coroutine gets its first turn on the event loop.
+            seed_call_count_at_dispatch_start.append(len(mtime_calls))
+
+        runner = _DispatchReturnsMidVerifyRemote(
+            never_release, on_dispatch_start=_on_dispatch_start,
+        )
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-seed-pin-a', 'rcsp.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        with patch('orchestrator.merge_queue.newest_content_mtime', _recording_real_mtime):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert seed_call_count_at_dispatch_start and seed_call_count_at_dispatch_start[0] >= 1, (
+            f'_last_content_mtime must be seeded unconditionally at verify-task creation, '
+            f'strictly before run_merge_verify gets its first turn on the event loop — '
+            f'otherwise a remote lease is left with a None seed until the first probe, handing '
+            f'a genuinely coasting lease one free budget window; observed '
+            f'{seed_call_count_at_dispatch_start!r} recorder calls at that point'
+        )
+        # Sanity: the abort still lands under the recorder exactly as it does
+        # in the negative twin above (the recorder must not change behaviour).
+        assert result.status == InflightStatus.REQUEUED
 
 
 # ---------------------------------------------------------------------------
@@ -3179,3 +3503,635 @@ class TestContendedLeaseDefers:
             f'exactly the non-valve attempts may swap to the warm tree; got '
             f'{len(reset_calls)} warm swaps across {every_n} attempts'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-5 RED / step-6 GREEN: the dead-verify abort must requeue into
+# the LIVE queue — registry included.
+#
+# Trigger 3 does `_release_or_cleanup + put_nowait + on_requeued` but NOT
+# `_note_requeue`, so the registry is left at VERIFYING while the request sits
+# on `_queue`. The existing TestDeadInflightVerifyAborts tests never registered
+# the request at all, which is exactly why they never exercised the registry
+# side of this branch. The one added `_register_item` line below is the whole
+# difference.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
+    """A dead-verify no-progress abort must return the LIFECYCLE REGISTRY to
+    QUEUED at the requeue site, so the re-queued request re-enters through the
+    normal drain instead of being coalesce-dropped (task 3082 step-5 RED /
+    step-6 GREEN).
+
+    Extends TestDeadInflightVerifyAborts::
+    test_dead_local_verify_is_aborted_and_requeued_within_budget's driver
+    verbatim (real merged item, real wall clock, 0.2s no-progress budget, the
+    never-returning gate) rather than inventing a second one.
+
+    RED until step-6 adds the missing ``_note_requeue`` at the requeue site.
+    """
+
+    async def _drive_dead_abort(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+    ):
+        """Drive one trigger-3 dead-verify abort on a REGISTERED request.
+
+        Returns ``(worker, q, req, vr, spy_note)``.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        req, item = await _make_merged_item(git_ops, config, branch, filename, 'x=1\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+        # THE one addition vs the existing driver: production always arrives
+        # here registered at VERIFYING (via the dispatch chokepoint).
+        worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _dead_gate_never_returns,
+            ),
+            patch.object(worker, '_note_requeue', wraps=worker._note_requeue) as spy_note,
+        ):
+            vr = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+        return worker, q, req, vr, spy_note, fake_eq
+
+    async def test_trigger3_abort_returns_the_registry_to_queued_at_the_requeue_site(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The requeue SITE itself must bounce the registry to QUEUED — this
+        assertion is deliberately independent of ``_finalize_inflight``'s
+        chokepoint repair (never called here), so per-branch symmetry is
+        pinned on its own.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        worker, q, req, vr, spy_note, _fake_eq = await self._drive_dead_abort(
+            git_ops, config, 'df3082-dead-verify-requeue', 'dvr.py',
+        )
+        rid = req.request_id
+
+        assert vr.status == InflightStatus.REQUEUED, (
+            f'a dead-verify abort must REQUEUE, got status={vr.status!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'the requeue site must return the registry to QUEUED so the request '
+            f'can re-enter through the drain; registry reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest after the requeue: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        # Drain the (inert — no worker loop is running here) queue rather than
+        # reaching into asyncio.Queue's undocumented `_queue` deque: this is the
+        # test's last use of `q`, and identity membership is the actual claim.
+        parked = [q.get_nowait() for _ in range(q.qsize())]
+        assert any(p is req for p in parked), (
+            f'the request must actually be parked on the live queue: {parked!r}'
+        )
+        assert not req.result.done(), (
+            'a re-queued request must be left PENDING for its re-dispatch'
+        )
+        assert rid not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request never ages out'
+        )
+        spy_note.assert_called_once()
+
+    async def test_abort_requeue_is_rebuffered_not_coalesce_dropped(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The re-queued request must survive the very next drain: land in a
+        lane buffer, keep its future PENDING, and leave no finalize head.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        worker, _q, req, _vr, _spy, fake_eq = await self._drive_dead_abort(
+            git_ops, config, 'df3082-dead-verify-redrain', 'dvrd.py',
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._drain_queue_into_lanes()
+
+        buffered = [it for buf in worker._lane_buffers.values() for it in buf]
+        assert req in buffered, (
+            f'the re-queued request must be buffered by the next drain, not '
+            f'coalesce-dropped; lane buffers hold {buffered!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.LANE_BUFFERED, (
+            f'the re-drained request must reach LANE_BUFFERED; registry reads {current!r}'
+        )
+        assert not req.result.done(), (
+            'the real waiter must NOT be handed a fabricated already_merged by the '
+            'coalesce path'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'no finalize head may survive the abort: {worker._finalizing_head_entry()!r}'
+        )
+        drop_warnings = [
+            r.getMessage() for r in caplog.records
+            if 'dropping duplicate/re-entrant merge submission' in r.getMessage()
+        ]
+        assert drop_warnings == [], (
+            f'the re-drain must not be coalesce-dropped: {drop_warnings!r}'
+        )
+        assert fake_eq.submitted == [], (
+            f'a clean abort-and-re-drain must not escalate: {fake_eq.submitted!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer_comprehensive, task 3082): the DROPPED sentinel gets the
+# same PER-SITE registry ownership every requeue branch has, so
+# `_finalize_inflight`'s chokepoint disposition is genuine defence in depth for
+# BOTH sentinels rather than the sole owner for one of them.  Without this, any
+# future path consuming a DROPPED result without finalizing would silently
+# re-introduce the `_live_items` residue / phantom-head leak this task fixes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSoleWaiterAbandonRetiresAtTheSite:
+    """The sole-waiter-gave-up abort (abort trigger 1) must retire the registry
+    entry AT THE SITE — TERMINAL plus the ``_live_items`` pop — not leave the
+    disposition to ``_finalize_inflight``.
+
+    Deliberately independent of ``_finalize_inflight`` (never called here), so
+    per-branch symmetry is pinned on its own — mirroring
+    TestDeadVerifyAbortRequeuesIntoTheLiveQueue::
+    test_trigger3_abort_returns_the_registry_to_queued_at_the_requeue_site.
+    """
+
+    async def test_abandon_abort_retires_the_registry_at_the_requeue_site(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            ItemLifecycleState,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        req, item = await _make_merged_item(
+            git_ops, config, 'df3082-abandon-retire', 'dar.py', 'a=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+        worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+        rid = req.request_id
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns,
+        ):
+            verify = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.sleep(0.1)  # let the abandon poll loop spin
+            req.result.cancel()       # sole waiter gives up -> _request_abandoned
+            vr = await asyncio.wait_for(verify, timeout=15.0)
+
+        assert vr.status == InflightStatus.DROPPED, (
+            f'a cancelled sole waiter must DROP, got status={vr.status!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.TERMINAL, (
+            f'the abandon site must retire the registry entry itself; reads {current!r}'
+        )
+        assert rid not in worker._live_items, (
+            f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'a dropped request must never be a finalize head: '
+            f'{worker._finalizing_head_entry()!r}'
+        )
+        assert q.empty(), 'a DROPPED request must NOT be re-queued'
+        assert fake_eq.submitted == [], (
+            f'retiring a dropped request must not escalate: {fake_eq.submitted!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-9: end-to-end — a dead-verify abort SELF-HEALS, and every
+# user-observable surface tells the truth while it does.
+#
+# This is the consolidated guard against the whole class recurring through a
+# DIFFERENT trigger.  Steps 2/4/6/8 fix the four mechanisms; this class pins
+# the seven observable surfaces the task enumerates, mapped 1:1 in the
+# assertions below.
+#
+# Deliberately NOT asserted: "landings resume" / queue throughput.  The
+# task's corrected OPERATIONAL NOTE measured landings_total advancing 4->7
+# while the zombie sat, with other tasks verifying on the same host
+# afterwards.  The queue was never wedged — the defect is observability
+# integrity plus the LATENT frozen-prefix wedge (surface 7).  Asserting
+# throughput would pin a property that never broke.
+# ---------------------------------------------------------------------------
+
+
+def _assert_quiescent_registry(
+    worker,
+    main_sha: str,
+    requests: list[MergeRequest],
+) -> None:
+    """Assert the registry/ledger/two-layer quiescence surfaces for *worker*.
+
+    Copied and narrowed from test_merge_queue_invariant_integration_gate.py's
+    ``_assert_quiescent`` (:510-586) — per-file duplication convention, see
+    this module's docstring.  The permit/worktree sub-checks (b)/(c) are
+    dropped deliberately: both short-circuit to ``[]`` on a stopped worker,
+    and this class asserts AFTER ``worker.stop()``, so including them would
+    be vacuous rather than meaningful.
+
+    Retained, because each is meaningful post-stop:
+      (a) every request resolved — no dangling in-flight work.
+      (d) the request-liveness ledger is empty AFTER ``sweep_resolved()``.
+          Resolution is detected PASSIVELY (RequestLedger has no on-resolve
+          hook), so sweeping first is required, not optional.
+      (e) ``two_layer_invariants(main_sha) == []`` — *main_sha* MUST be a
+          REAL sha, never the ``'unknown'`` sentinel: the base-chain and
+          verify-base sub-checks are silently SKIPPED for 'unknown', which
+          would make this pass vacuously.
+      (f) ``set(worker._lifecycle.non_terminal_items()) == set()`` — no
+          ItemLifecycle registry leak survives quiescence.  This is the
+          surface a phantom finalize head corrupts.
+    """
+    for req in requests:
+        assert req.result.done() or req.result.cancelled(), (
+            f'request {req.request_id!r} (task {req.task_id!r}) still pending at quiescence'
+        )
+
+    worker._request_ledger.sweep_resolved()
+    assert worker._request_ledger.is_empty(), (
+        f'request-liveness ledger non-empty at quiescence: '
+        f'{worker._request_ledger.open_request_ids()!r}'
+    )
+
+    assert main_sha and main_sha != 'unknown', (
+        f'this helper requires a REAL main_sha (the "unknown" sentinel silently '
+        f'skips the frozen-prefix sub-checks), got {main_sha!r}'
+    )
+    tli = worker.two_layer_invariants(main_sha)
+    assert tli == [], (
+        f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli!r}'
+    )
+
+    registry_ids = set(worker._lifecycle.non_terminal_items())
+    assert registry_ids == set(), (
+        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
+    )
+
+
+class _HangThenPassVerify:
+    """Stateful ``run_scoped_verification`` stub: HANGS once, then PASSES.
+
+    Call 1 blocks on a never-set Event (mirrors ``_dead_gate_never_returns``
+    above) so trigger 3's no-progress budget fires and the request is
+    RE-QUEUED.  Call 2 returns a pass, so the re-dispatched merge actually
+    lands.  ``.calls`` is the surface-1 assertion: it must reach 2, proving
+    the re-queued request genuinely re-entered the pipeline rather than being
+    swallowed by ``_coalesce_reentrant_drain``.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.first_entered = asyncio.Event()
+
+    async def __call__(self, *args: object, **kwargs: object) -> MagicMock:
+        self.calls += 1
+        if self.calls == 1:
+            self.first_entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable — never set')  # pragma: no cover
+        return MagicMock(
+            passed=True, summary='ok', test_output='ok',
+            lint_output='', type_output='', category='',
+            timed_out=False, verify_skipped=False,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3927: real (unmocked) worker.run() loop with
+# real git subprocesses, gating on wait_for(20) + wait_for(40) deadlines per
+# drive cycle -- widened from the 60s default to tolerate host
+# oversubscription, same convention as test_crash_recovery.py (task 2376)
+# and test_merge_queue_restart_hook.py (task 3927).
+class TestDeadVerifyAbortSelfHealsEndToEnd:
+    """A dead-verify no-progress abort must SELF-HEAL through the live queue,
+    leaving every user-observable surface truthful (task 3082 step-9).
+
+    Modelled on ``TestWedgedVerifyIntegration`` (:412) — the only class in
+    this file that runs a real ``asyncio.create_task(worker.run())`` loop and
+    feeds it via ``await q.put(req)``.  Unlike that class (which observes a
+    verify that stays wedged), this one lets the abort fire and then asserts
+    the recovery.
+
+    May already be green after steps 2/4/6/8 — expected and fine.  Its job is
+    to be the consolidated cross-surface guard, not a fresh RED signal.
+    """
+
+    async def _drive_abort_then_land(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Run one abort-then-land cycle on a real ``worker.run()`` loop.
+
+        Returns ``(worker, req, outcome, gate, fake_eq, main_sha, snap_after)``.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, 'x = 1\n')
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+
+        # Same small instance-level constants step-5 uses — REAL wall clock,
+        # no monkeypatched time.* — sized to stay well inside this class's
+        # widened 180s per-test timeout (see the class decorator above).
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        # task 3927 amend (reviewer finding, robustness): PROBE/BUDGET raised
+        # 0.02/0.2 -> 0.2/2.0 (same 1:10 ratio) to address the gate.calls
+        # load-sensitivity at its root, not just its symptom. Under host CPU
+        # oversubscription the whole process can be descheduled for a
+        # stretch; too small a budget mistakes that scheduling stall for
+        # genuine verify no-progress and fires an extra abort before the
+        # just-redispatched call ever gets to run. 2.0s makes that far less
+        # likely while staying well inside the wait_for(40) below — the
+        # first verify hangs forever, so the abort still fires promptly at
+        # the budget boundary.
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.2
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 2.0
+
+        req = _make_request(branch, branch, wt, config)
+        gate = _HangThenPassVerify()
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            patch('orchestrator.merge_queue.run_scoped_verification', gate),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            try:
+                await q.put(req)
+                # Wait for the DEAD first verify to be entered, so the
+                # no-progress budget is genuinely armed before we wait on
+                # the recovery.
+                await asyncio.wait_for(gate.first_entered.wait(), timeout=20.0)
+                outcome = await asyncio.wait_for(req.result, timeout=40.0)
+            finally:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker.stop(), timeout=10.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=10.0)
+
+        main_sha = await git_ops.get_main_sha()
+        return worker, req, outcome, gate, fake_eq, main_sha, worker.snapshot()
+
+    async def test_abort_then_redispatch_delivers_the_true_outcome_and_a_clean_queue(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The seven surfaces from the task's REGRESSION COVERAGE list."""
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+
+        worker, req, outcome, gate, fake_eq, main_sha, snap = (
+            await self._drive_abort_then_land(
+                git_ops, config, 'df3082-e2e-selfheal', 'selfheal.py', caplog,
+            )
+        )
+        rid = req.request_id
+        messages = [r.getMessage() for r in caplog.records]
+
+        # ── (1) the request ACTUALLY re-enters the live queue and is
+        #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
+        #
+        # task 3927: exact equality (calls == 2) is load-sensitive. Under
+        # host CPU oversubscription, the no-progress watchdog's independent
+        # wall-clock poll can race ahead of the just-redispatched call-2
+        # coroutine actually getting scheduled and fire a SECOND no-progress
+        # abort before call 2 ever runs, inflating the count to 3 (observed:
+        # esc-3609-4) — this is a load-induced extra retry, not the
+        # coalesce-drop bug this assertion actually guards against (which
+        # would show calls == 1). Lower bound (2) still fails on that
+        # coalesce-drop regression.
+        #
+        # task 3927 amend (reviewer finding, test-quality): the upper bound
+        # is derived from worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS rather than
+        # a hardcoded literal. _drive_abort_then_land never monkeypatches
+        # that cap (default 3 -- see merge_queue.py), and the per-task
+        # dead-abort counter is only cleared once verify_task actually
+        # returns a result, so each CONSECUTIVE dead/no-progress abort counts
+        # toward it; the MAX_INFLIGHT_DEAD_VERIFY_ABORTS-th one takes the
+        # terminal 'blocked' branch instead of re-dispatching again. So
+        # gate.calls == worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS is the true
+        # reachable ceiling -- a hardcoded 5 would be unreachable (vacuous)
+        # and would silently stop catching a genuine redispatch-storm
+        # regression anywhere below it. A busy-loop-cap trip is instead
+        # caught by `outcome.status == 'done'` below (it would read
+        # 'blocked').
+        assert 2 <= gate.calls <= worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
+            f'expected the abort to be followed by a genuine RE-DISPATCH '
+            f'(run_scoped_verification called >=2 times), got {gate.calls} '
+            f'call(s) — a single call means the re-queued request was dropped '
+            f'before re-dispatch, and >{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} '
+            f'calls cannot happen without also tripping the busy-loop cap'
+        )
+        drop_warnings = [
+            m for m in messages
+            if 'dropping duplicate/re-entrant merge submission' in m
+        ]
+        assert drop_warnings == [], (
+            f'the re-queued request must never be coalesce-dropped: {drop_warnings!r}'
+        )
+
+        # ── (2) the entry never remains finalizing / position 0 / head_of_line
+        #        past its abort point.
+        assert worker._finalizing_head_entry() is None, (
+            f'a phantom finalize head survived the abort: '
+            f'{worker._finalizing_head_entry()!r}'
+        )
+        finalizing = [e for e in snap['entries'] if e['state'] == 'finalizing']
+        assert finalizing == [], (
+            f"no snapshot entry may report state='finalizing' once quiescent: "
+            f'{finalizing!r}'
+        )
+        assert snap['depth'] == 0, (
+            f"snapshot depth must be 0 once quiescent, got {snap['depth']} "
+            f"with entries {snap['entries']!r}"
+        )
+        assert snap['head_of_line'] is None, (
+            f"head_of_line must be None once quiescent, got {snap['head_of_line']!r}"
+        )
+        assert snap['verify_in_progress'] is None, (
+            f"verify_in_progress must be None once quiescent, got "
+            f"{snap['verify_in_progress']!r}"
+        )
+        _live = worker._live_items.get(rid)
+        assert not isinstance(_live, InflightEntry), (
+            f'a non-TERMINAL InflightEntry survived in _live_items for {rid}: {_live!r}'
+        )
+        _cur = worker._lifecycle.current(rid)
+        assert _cur in (None, ItemLifecycleState.TERMINAL), (
+            f'the landed request must end TERMINAL (or be retired), registry '
+            f'reads {_cur!r}'
+        )
+
+        # ── (3) the waiter's future is NOT resolved to already_merged by the
+        #        abort path — it receives the TRUE outcome.
+        assert outcome.status == 'done', (
+            f'the waiter must receive the TRUE outcome of the re-dispatched '
+            f'merge, got {outcome!r}'
+        )
+        assert outcome.status != 'already_merged', (
+            f'the abort path must never fabricate already_merged for the real '
+            f'waiter: {outcome!r}'
+        )
+
+        # ── (4) occupancy.by_host must NOT report a host busy for the
+        #        aborted/requeued entry.  by_host merges the FINALIZE HEAD's
+        #        lease in HEAD-FIRST over the _inflight leases, so a phantom
+        #        head injects a stale lease for an actually-free host — the
+        #        surface that made this class look like a stuck host slot on
+        #        three separate days.
+        occ = snap['occupancy']
+        assert req.task_id not in occ['by_host'].values(), (
+            f'the aborted/requeued task must not be reported as occupying a '
+            f"host: by_host={occ['by_host']!r}"
+        )
+        assert occ['hosts_busy'] == 0, (
+            f"hosts_busy must be 0 once quiescent, got {occ['hosts_busy']} "
+            f"(by_host={occ['by_host']!r})"
+        )
+
+        # ── (6) two_layer_invariants + registry/ledger quiescence, against the
+        #        REAL post-merge main SHA (never the 'unknown' sentinel).
+        _assert_quiescent_registry(worker, main_sha, [req])
+
+        # ── (7) the aborted/requeued entry is ABSENT from the frozen prefix
+        #        and never becomes its tip.  _frozen_inflight_entries appends
+        #        the finalize head whenever its phase is in
+        #        {verifying, gate_reverify, finalizing}, so a phantom head puts
+        #        a DEAD merge commit at the frozen-prefix tip and every later
+        #        real-verify dispatch mismatches it.  Survivable today only
+        #        because _warn_if_verify_base_not_frozen_tip is log-only —
+        #        pinning it here is what lets the separate eps=1890
+        #        enforcement-flip task proceed without this class re-poisoning it.
+        fp = worker.frozen_prefix()
+        assert rid not in fp, (
+            f'the aborted/requeued request must not sit in the frozen prefix: {fp!r}'
+        )
+        assert fp == (), (
+            f'the frozen prefix must be empty once quiescent, got {fp!r}'
+        )
+        tip = worker.frozen_prefix_tip(main_sha)
+        assert tip == main_sha, (
+            f'with an empty frozen prefix the tip must be the REAL main sha '
+            f'{main_sha!r}, not a dead merge commit: {tip!r}'
+        )
+
+        # ── Plus: no rejected-transition escalation, and no accretion WARNING.
+        rejected = [
+            e for e in fake_eq.submitted
+            if e.category == 'merge_lifecycle_transition_rejected'
+        ]
+        assert rejected == [], (
+            f'a legitimate dead-verify abort must not fire a rejected-transition '
+            f'L1: {[(e.category, e.summary) for e in rejected]!r}'
+        )
+        accretion = [
+            m for m in messages
+            if 'Invariant violation:' in m or 'extra InflightEntry object(s)' in m
+        ]
+        assert accretion == [], (
+            f'_finalizing_head_entry must not report accretion: {accretion!r}'
+        )
+
+    async def test_recovery_is_internal_to_the_abort_path_not_operator_driven(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Recovery must need NO operator action of any kind.
+
+        Pins the task's OPERATIONAL NOTE: a live zombie of this class cannot
+        be cleared by ``merge_cancel`` (proved three times in the field),
+        because the zombie lives in the ORCHESTRATOR's ``_live_items``, not
+        the escalation server's waiter registry — only a process restart
+        clears it.  So the recovery MUST be internal to the abort path.
+
+        This test therefore calls NO cancel API, no ``merge_cancel``, no
+        ``_cancel_request``, no halt/unhalt, and no ``_retire_item`` — the
+        drive is purely: put the request on the queue and wait.
+        """
+        worker, req, outcome, gate, fake_eq, main_sha, snap = (
+            await self._drive_abort_then_land(
+                git_ops, config, 'df3082-e2e-nooperator', 'nooperator.py', caplog,
+            )
+        )
+
+        # task 3927: see the sibling test above for why exact equality is
+        # load-sensitive (a starved no-progress watchdog can add a
+        # load-induced extra retry) — bounded range keeps the coalesce-drop
+        # guard (lower bound) meaningful.
+        #
+        # task 3927 amend (reviewer finding, test-quality): upper bound
+        # derived from worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, not a
+        # hardcoded literal -- see the sibling test above for why a fixed 5
+        # is vacuous (unreachable given the untouched default cap of 3).
+        assert 2 <= gate.calls <= worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
+            f'the abort path must re-dispatch on its own, with no operator '
+            f'intervention; run_scoped_verification saw {gate.calls} call(s) '
+            f'(expected >=2, and <={worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} to '
+            f'still catch a redispatch storm)'
+        )
+        assert outcome.status == 'done', (
+            f'the request must land unaided, got {outcome!r}'
+        )
+        assert not worker._operator_halt.is_set(), (
+            'recovery must not depend on (or leave behind) an operator halt'
+        )
+        assert not worker.is_wip_halted, (
+            'recovery must not depend on (or leave behind) a WIP halt'
+        )
+        assert not req.result.cancelled(), (
+            'the waiter must be resolved by the re-dispatch, never cancelled'
+        )
+        _assert_quiescent_registry(worker, main_sha, [req])

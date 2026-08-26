@@ -17,12 +17,12 @@ Measured corpus facts that shape this script (live Qdrant, 2026-07-29):
     (``fused_dark_factory`` 19,464; ``fused_reify`` 29,951). ``fused_reify``
     alone holds 24,408 ``observations_and_summaries``, so a single capped
     scroll would silently drop most of it -- real pagination is mandatory.
-    ``Mem0Backend.scroll_by_metadata`` discards Qdrant's ``next_offset``
-    (mem0_client.py:395) and exposes no offset parameter, so it structurally
-    cannot page; this script drives the raw async Qdrant client instead
-    (the established in-repo script pattern -- clear_malformed_empty_memory.py:334,
-    consolidate_namespace_families.py:804) and loops on ``next_offset``.
-    Pages are folded into counters as they arrive, so peak memory is one page.
+    ``Mem0Backend.scroll_by_metadata`` returns one capped page and discards
+    Qdrant's ``next_offset``, so this script originally drove the raw async
+    Qdrant client and looped on ``next_offset`` itself. Task 3225 moved that
+    loop into the backend as ``Mem0Backend.scroll_all_by_metadata``; the
+    census now drives it and owns no paging code. Records are folded into
+    counters as they arrive, so peak memory is one page.
 
   - Every Mem0 write is stamped with ``category`` (memory_service.py:2185-2190)
     and ``category``-absent measured 0 in both collections -- but the three
@@ -93,11 +93,14 @@ import logging
 import re
 import sys
 from collections import Counter
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    DEFAULT_SCROLL_MAX_PAGES,
+    ScrollPageBudgetExhausted,
+)
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 logger = logging.getLogger('census_memory_metadata')
@@ -125,7 +128,12 @@ DEFAULT_TOP_N = 50
 # (fused_reify, 29,951). Hitting it means either the corpus grew hugely or
 # the paging loop is not advancing -- either way the scan raises rather than
 # returning a silently short stream.
-DEFAULT_MAX_PAGES = 200
+#
+# ALIASED, never restated: the budget now travels with the paging loop it
+# bounds, which lives in Mem0Backend.scroll_collection_pages. 200 has one
+# home (INV-5). The script-local spelling survives because --max-pages'
+# help text and every caller here already bind this name.
+DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
 
 # All six categories, Mem0-primary first, derived from the shared enum --
 # never a restated literal list (INV-5 no-lockstep-duplication). The three
@@ -148,14 +156,21 @@ _HEX32_RE = re.compile(r'^[0-9a-f]{32}$', re.IGNORECASE)
 _SHORT_HEX_RE = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 
 
-class CensusScanIncomplete(RuntimeError):
-    """A scroll could not enumerate its full result set.
-
-    Raised rather than returning a short stream: a truncated census is
-    indistinguishable from a census of a smaller corpus, and its consumer
-    (leaf beta's grandfather list) cannot tell the difference (INV-2
-    no-silent-fail-soft).
-    """
+#: A scroll could not enumerate its full result set.
+#:
+#: Raised rather than returning a short stream: a truncated census is
+#: indistinguishable from a census of a smaller corpus, and its consumer
+#: (leaf beta's grandfather list) cannot tell the difference (INV-2
+#: no-silent-fail-soft).
+#:
+#: An ALIAS of the backend's exception, not a subclass. The paging loop that
+#: raises it now lives in ``Mem0Backend.scroll_collection_pages``, so
+#: ``except CensusScanIncomplete`` in :func:`_run` must name exactly what the
+#: backend raises -- a subclass would not catch its parent and would silently
+#: convert an abort-with-nonzero-exit into an uncaught traceback. The
+#: script-local spelling survives because ``_run``'s handler and
+#: ``TestCliExitCodes`` already bind this name.
+CensusScanIncomplete = ScrollPageBudgetExhausted
 
 
 # ---------------------------------------------------------------------------
@@ -635,78 +650,6 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
 # Thin I/O band (mock-tested — no live services required)
 # ---------------------------------------------------------------------------
 
-async def scroll_all_payloads(
-    client: Any,
-    collection: str,
-    filters: dict[str, Any],
-    page_size: int = 1000,
-    max_pages: int = DEFAULT_MAX_PAGES,
-    read_timeout: float | None = None,
-) -> AsyncIterator[dict[str, Any]]:
-    """Yield every payload matching *filters*, paging on Qdrant's ``next_offset``.
-
-    This is the paging loop ``Mem0Backend.scroll_by_metadata`` structurally
-    cannot perform -- it takes only ``limit`` and discards ``next_offset``
-    (mem0_client.py:395), so repeated calls re-read the same head of the
-    collection. ``consolidate_namespace_families.py:600-610`` documents that
-    same caveat as a known gap; this closes it for the census.
-
-    Payloads are yielded one at a time (never accumulated) so a caller
-    folding them into counters holds one page in memory regardless of corpus
-    size. The payload filter is built exactly as ``count_by_metadata`` builds
-    its own (mem0_client.py:386-394), so the cross-check count and this scroll
-    select the same points.
-
-    Each page request is bounded by *read_timeout* (the backend's
-    ``_read_timeout``, as every other Qdrant read on this path is --
-    mem0_client.py:287, 331, 395), so a wedged connection fails loudly instead
-    of hanging a ~30-page scan forever with no artifact and no diagnostic.
-    ``None`` disables the bound.
-
-    Raises:
-        CensusScanIncomplete: If *max_pages* is consumed while ``next_offset``
-            is still live -- the stream is truncated, so it raises instead of
-            ending short.
-        TimeoutError: If a single page request exceeds *read_timeout*. Not
-            swallowed: a census that skipped a page would under-report
-            silently (INV-2 no-silent-fail-soft).
-    """
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
-    must: list[Any] = [
-        qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-        for k, v in filters.items()
-    ]
-    scroll_filter = qmodels.Filter(must=must)
-
-    offset: Any = None
-    pages = 0
-    while True:
-        page = client.scroll(
-            collection_name=collection,
-            scroll_filter=scroll_filter,
-            with_payload=True,
-            limit=page_size,
-            offset=offset,
-        )
-        if read_timeout is not None:
-            page = asyncio.wait_for(page, timeout=read_timeout)
-        points, next_offset = await page
-        pages += 1
-        for point in points:
-            yield dict(point.payload or {})
-
-        if next_offset is None:
-            return
-        if pages >= max_pages:
-            raise CensusScanIncomplete(
-                f'scroll of collection={collection!r} filters={filters!r} exhausted its '
-                f'page budget after {pages} page(s) of {page_size} with next_offset still '
-                f'live — the scan is truncated. Raise --max-pages or --page-size.',
-            )
-        offset = next_offset
-
-
 async def census_project(
     backend: Any,
     project_id: str,
@@ -747,18 +690,9 @@ async def census_project(
         c.value for c in CENSUS_CATEGORIES
     ]
     scope = Scope(project_id=project_id)
+    # Still resolved here even though the scroll no longer needs it: the
+    # collection name is part of the coverage record.
     collection = scope.mem0_collection_name(backend.config.mem0.collection_prefix)
-    client = await backend._get_async_qdrant()
-    # Same per-read bound every other Qdrant call on this path uses, so a
-    # wedged socket is never mistaken for a slow one. Guarded by type: a
-    # backend without a numeric bound scrolls unbounded rather than blowing
-    # up inside asyncio.wait_for.
-    raw_timeout = getattr(backend, '_read_timeout', None)
-    read_timeout = (
-        float(raw_timeout)
-        if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool)
-        else None
-    )
 
     # Bracket the WHOLE scan, the same way each category brackets its own
     # scroll. A write landing after the last per-category recount but before
@@ -775,11 +709,14 @@ async def census_project(
         expected = await backend.count_by_metadata(scope, filters)
 
         census = CategoryCensus()
-        async for payload in scroll_all_payloads(
-            client, collection, filters, page_size=page_size, max_pages=max_pages,
-            read_timeout=read_timeout,
+        # The backend owns the offset/next_offset walk, the per-page read
+        # bound and the page budget; the SAME scope and filters go to
+        # count_by_metadata above, and the shared _build_payload_filter means
+        # the count and this scroll provably select the same points.
+        async for record in backend.scroll_all_by_metadata(
+            scope, filters, page_size=page_size, max_pages=max_pages,
         ):
-            census.add(payload)
+            census.add(record['metadata'])
 
         # Re-count AFTER the scroll: the corpus is live, so a delta against
         # the pre-scroll count alone cannot distinguish a truncated scan from

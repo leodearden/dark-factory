@@ -1,8 +1,9 @@
 /* Escalations tab — read-only queue view.
  *
- * No JS test runner in this project (see scheduler_drawer.jsx comment).
- * Wiring contracts are verified via Python source-assertion tests in
- * dashboard/tests/test_tab_escalations.py.
+ * No JS test runner for .jsx in this project (see scheduler_drawer.jsx
+ * comment) — but the pure decisions lifted OUT of this file are covered
+ * by `node --test` under dashboard/tests/js/. Wiring contracts are
+ * verified via Python tests in dashboard/tests/test_tab_escalations.py.
  *
  * Load order: tabs.jsx → tab_escalations.jsx → app.jsx
  * Export:     window.DF_TABS.EscalationsTab  (additive mutation of the object
@@ -12,6 +13,7 @@ const { useState: uS, useEffect: uE } = React;
 const { ProjectGroup, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
+const { pinningSummary } = window.DF_PINS_RECOVERY;
 
 // ── Cross-tab focus helpers (module scope) ──
 //
@@ -224,9 +226,10 @@ function sliceDailyByWindow(dailyObj, cutoff) {
   return out;
 }
 
-// ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
-//    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
-//    wired into DF_DATA by the analytics tab (no duplicated computation) ──
+// ── EscalationStatStrip — five-tile summary (benign rate, 6h breaches,
+//    esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
+//    already wired into DF_DATA by the analytics tab (no duplicated
+//    computation) ──
 
 function EscalationStatStrip({ analytics, projectFilter }) {
   const a = analytics || DF.ESCALATION_ANALYTICS;
@@ -288,6 +291,15 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     openItems = openItems.concat((p.lifespan || {}).open_items || []);
   }
   const breachCount = openItems.filter(item => item.breach_6h).length;
+
+  // (b2) pinning — same live open_items array, no extra payload. Truthiness,
+  // never an equality test: the backend OMITS pins_recovery when it could not
+  // compute the annotation, so `item.pins_recovery === false` would count an
+  // unclassified item as "does not pin". Unknown simply falls out of the count.
+  // That rule lives in pins_recovery.js, shared with the analytics tab's chip
+  // so the two surfaces cannot disagree, and covered by
+  // dashboard/tests/js/pins_recovery.test.mjs.
+  const { count: pinningCount, pinnedTaskCount } = pinningSummary(openItems);
 
   // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
   // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
@@ -365,6 +377,11 @@ function EscalationStatStrip({ analytics, projectFilter }) {
         value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
         spark={churnSpark}
         sparkColor={C.PALETTE.bad}
+      />
+      <C.StatTile
+        label="pinning"
+        value={pinningCount}
+        hint={`blocking ${pinnedTaskCount} task${pinnedTaskCount === 1 ? '' : 's'}`}
       />
     </div>
   );

@@ -33,18 +33,23 @@ import logging
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_STRETCH,
+    RESPONSIVE_WAIT_WALL_CAP,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import HostAllocator
+from orchestrator.verify_runner import HostAllocator, HostLease
 
 # ---------------------------------------------------------------------------
 # (a) Temp-repo GitOps + branch-with-file builders
@@ -201,7 +206,34 @@ HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+    # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
+    # gate-barrier nominal, so a scanned call site spelling either one
+    # resolves rather than silently contributing 0.0 (which would let the
+    # late-arrival gate barriers vanish from the audited budget entirely).
+    'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
+    'MERGE_GATE_BARRIER_TIMEOUT': float(MERGE_GATE_BARRIER_TIMEOUT),
 }
+
+# task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its
+# budget in loop-responsive time, so its worst-case WALL clock is the nominal
+# `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
+# RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
+# own per-call default cap from the very same constant, so the RATIO cannot
+# drift and this bill is an EXACT upper bound for any site that leaves
+# `max_wall_s` at its default.
+#
+# The exactness is NOT unconditional: an explicit `max_wall_s=` wins over the
+# scaled default inside the helper and the branch below does not scan for it,
+# so such a site would be under-billed.  No scanned site passes `max_wall_s`
+# (only the hermetic unit tests do, and they carry no mark obligation), so the
+# claim holds over the audited corpus today; closing that gap structurally is
+# tracked as follow-up.
+#
+# Fixing the ratio at 2 is what lets a reviewer check the paired-mark
+# arithmetic instead of trusting a number: the worst per-method budget this
+# scan computes for test_merge_speculation.py is 240s, clearing
+# HEAVY_BARRIER_TEST_TIMEOUT (300s).
+_RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
 def _resolve_wait_value(node: ast.expr | None) -> float:
@@ -222,11 +254,14 @@ def _resolve_wait_value(node: ast.expr | None) -> float:
 def _call_wait_budget(call: ast.Call) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    Recognises exactly three call shapes -- ``asyncio.wait_for(..., timeout=N)``
     (the attribute's value must itself be the ``asyncio`` name, so
-    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
     ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
-    when no ``timeout=`` kwarg is given). Every other call shape --
+    when no ``timeout=`` kwarg is given), and ``wait_responsive(...)``
+    (task 3980; same hidden default, but its worst-case WALL clock is the
+    nominal budget stretched by ``_RESPONSIVE_WAIT_STRETCH`` and hard-bounded
+    by ``RESPONSIVE_WAIT_WALL_CAP`` -- see below). Every other call shape --
     ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
     non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
     unknown names -- contributes 0.0 and is skipped silently (this is a
@@ -253,6 +288,24 @@ def _call_wait_budget(call: ast.Call) -> float:
             if kw.arg == 'timeout':
                 return _resolve_wait_value(kw.value)
         return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    if isinstance(func, ast.Name) and func.id == 'wait_responsive':
+        # task 3980: the nominal `timeout` is charged in loop-responsive
+        # time, so real wall clock can run past it under starvation. Bill
+        # the stretched worst case, hard-bounded by the wall cap the helper
+        # itself enforces -- a wait_responsive call that leaves `max_wall_s`
+        # at its default can never consume more wall clock than
+        # RESPONSIVE_WAIT_WALL_CAP, whatever its nominal budget.  A site
+        # passing an explicit `max_wall_s` is NOT covered by that bound and is
+        # not scanned here; see the RESPONSIVE_WAIT_STRETCH comment above.
+        nominal = _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                nominal = _resolve_wait_value(kw.value)
+                break
+        return min(
+            nominal * _RESPONSIVE_WAIT_STRETCH,
+            _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
+        )
     return 0.0
 
 
@@ -488,6 +541,69 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     for key, value in overrides.items():
         setattr(fake, key, value)
     return fake
+
+
+# ---------------------------------------------------------------------------
+# Disposition fail-open predicate (task 3980 amendment) — the companion guard
+# to _fake_verify_result above, and deliberately colocated with it.
+#
+# The classifier has TWO fail-open sites, on two different loggers, both
+# emitting the same substring:
+#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
+#      logger 'orchestrator.merge_disposition'.
+#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
+#      belt-and-suspenders catch for anything site 1 re-raises past, logger
+#      'orchestrator.merge_queue'.
+# Keying on the shared substring catches both; filtering by a single logger
+# name silently excludes site 2.
+#
+# Lives HERE rather than in test_merge_speculation.py so there is exactly one
+# predicate for one production invariant. Task 3980 first wrote a second copy
+# over there, and the two had already diverged before the amendment pass: this
+# file's older inline version keyed on a longer substring that matched only
+# site 1. Two copies of a drift-detector is how the drift gets back in.
+_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+
+
+def _fail_open_records(
+    records: list[logging.LogRecord],
+) -> list[logging.LogRecord]:
+    """Return the disposition fail-open WARNINGs among *records* (both sites).
+
+    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
+    NOTHING at WARNING (it logs only on the degrade paths,
+    merge_disposition.py:695 and :711), so an empty return here means "no
+    fail-open", never "the classifier was reached". Proving the classifier was
+    reached needs a delegating SPY on the callable — see
+    test_merge_speculation.py's ``TestLateArrivalFailCascade`` for the live one
+    and ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
+    Do not read log silence here as evidence the classifier never ran: a
+    successful classification is precisely the silent case.
+
+    Deliberately does NOT match merge_disposition.py:695's *other* degrade
+    ('degrading implicated landings to INDETERMINATE (...)'), which is a
+    legitimate evidence-absent verdict rather than a swallowed exception.
+    """
+    return [
+        r for r in records
+        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
+    ]
+
+
+def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
+    """Render fail-open records for an assertion message, naming the underlying
+    exception (the actionable part — the WARNING text alone never says WHY)."""
+    return '\n'.join(
+        f'  - [{r.name}] {r.getMessage()}'
+        + (
+            f'\n    underlying: {r.exc_info[1]!r}\n'
+            + ''.join(traceback.format_exception(*r.exc_info))
+            if r.exc_info
+            else ''
+        )
+        for r in records
+    )
 
 
 def _mock_verify_pass() -> AsyncMock:
@@ -4736,6 +4852,473 @@ class TestCascadeErrorContainment:
 
 
 # ---------------------------------------------------------------------------
+# task 3204 step-3 RED / step-4 GREEN: the verify-abort teardown has a single
+# CHOKEPOINT — `SpeculativeMergeWorker._teardown_verify_task`.
+#
+# The remote-abort-BEFORE-cancel ordering is currently stated only in prose on
+# `_abort_remote_verify`, and re-typed at six sites. Because the helper always
+# cancels AFTER aborting, making it the SOLE caller of `_abort_remote_verify`
+# turns that ordering from a convention into a property of the code: there is
+# no code path that can abort without also cancelling afterwards.
+#
+# The guard scans BOTH halves of the recipe — the abort AND
+# `verify_task.cancel()` — because sole-callership of the abort alone only
+# closes one direction. The converse (a local cancel with no prior remote
+# abort, the exact defect task 1757 fixed) needs the cancel half guarded too;
+# see `_teardown_chokepoint_offenders`.
+#
+# The `cancel_verify` call-count/ordering classes above (
+# TestRunInflightVerifyRemoteCancelOnAbort, TestStopDrainFiresRemoteCancel,
+# TestCascadeFiresRemoteCancel, TestCascadeErrorContainment) are deliberately
+# left UNTOUCHED — they are the behavioural regression net that proves the
+# step-4 extraction is behaviour-neutral.
+# ---------------------------------------------------------------------------
+
+_MQ_CHOKEPOINT_CLASS = 'SpeculativeMergeWorker'
+_MQ_TEARDOWN_CHOKEPOINT = '_teardown_verify_task'
+_MQ_GUARDED_ABORT = '_abort_remote_verify'
+_MQ_GUARDED_CANCEL_RECEIVER = 'verify_task'
+
+
+def _chokepoint_ranges(tree: ast.Module, cls_name: str, method_name: str) -> list[tuple[int, int]]:
+    """Line ranges of every *method_name* defined DIRECTLY on ``class cls_name``.
+
+    Copied from test_lock_release_single_writer_guard.py:134 per the per-file
+    duplication convention for orchestrator test helpers (the same recursion
+    now also backs the requeue chokepoint guard in
+    test_merge_queue_lifecycle_registry.py — duplicated rather than
+    cross-imported between test modules, which this repo does not do).
+
+    Tracks the nearest *directly enclosing* ClassDef and resets it to None
+    inside a function body, so neither a same-named method on another class
+    nor a closure nested within the method can accidentally sanction a site.
+    """
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, enclosing_class: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name == method_name and enclosing_class == cls_name:
+                    ranges.append((child.lineno, getattr(child, 'end_lineno', child.lineno)))
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
+def _is_teardown_step_call(node: ast.AST) -> TypeGuard[ast.Call]:
+    """True for either HALF of the verify-abort teardown recipe.
+
+    The abort half is any ``<something>._abort_remote_verify(...)``; the name
+    exists solely for this recipe, so it needs no receiver anchor. The cancel
+    half is anchored on the receiver instead — ``verify_task.cancel()`` or
+    ``<expr>.verify_task.cancel()`` — because a bare ``.cancel()`` is far too
+    common in this module (loop tasks, heartbeat/reprobe tasks, request
+    futures) to guard unanchored. Exact-matching ``cancel`` also keeps the
+    neighbouring ``verify_task.cancelled()`` / ``.done()`` / ``.result()``
+    peeks out of the offender list.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so a True result
+    narrows the walked ``ast.AST`` to ``ast.Call`` at the call site — the
+    offender list reads ``.lineno``, which lives on ``ast.expr``, not on the
+    ``ast.AST`` base that :func:`ast.walk` yields.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    if node.func.attr == _MQ_GUARDED_ABORT:
+        return True
+    if node.func.attr != 'cancel':
+        return False
+    receiver = node.func.value
+    if isinstance(receiver, ast.Name):
+        return receiver.id == _MQ_GUARDED_CANCEL_RECEIVER
+    if isinstance(receiver, ast.Attribute):
+        return receiver.attr == _MQ_GUARDED_CANCEL_RECEIVER
+    return False
+
+
+def _teardown_chokepoint_offenders(source: str) -> list[str]:
+    """Every verify-abort-teardown call site outside the teardown helper, as
+    ``'<enclosing_fn>:<lineno> <call_src>'``.
+
+    Scans BOTH halves of the recipe — ``self._abort_remote_verify(...)`` and
+    ``<...>verify_task.cancel()`` — exactly as the sibling requeue guard in
+    test_merge_queue_lifecycle_registry.py scans both ``_queue.put_nowait``
+    and ``on_requeued``. Scanning only the abort half would enforce "every
+    abort is followed by a cancel" while leaving the CONVERSE — the actual
+    defect class task 1757 fixed — unguarded: a ``verify_task.cancel()`` fired
+    without a prior remote abort silently orphans the remote verify-merge
+    process, because the verify coroutine's finally clause has by then cleared
+    ``_inflight_request_id``. Guarding both halves is what makes the pairing
+    AND the ordering properties of the code (task 3204 amend, reviewer finding
+    test-coverage).
+
+    ``ast.Call``-only, so ``_abort_remote_verify``'s own ``async def``
+    DEFINITION is not reported — the invariant is about call sites, not about
+    the implementation they call. Pure (takes source text, not a path) so the
+    scanner self-tests can drive it on synthetic modules; returns ``[]`` rather
+    than raising on source that cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, _MQ_TEARDOWN_CHOKEPOINT)
+
+    parent: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cur = parent.get(id(cur))
+        return getattr(cur, 'name', '<module>')
+
+    calls = [node for node in ast.walk(tree) if _is_teardown_step_call(node)]
+    offenders = [
+        f'{_enclosing_fn(call)}:{call.lineno} {ast.unparse(call)}'
+        for call in calls
+        if not any(start <= call.lineno <= end for start, end in ranges)
+    ]
+    # ast.walk is breadth-first; sort so the offender list reads top-to-bottom.
+    offenders.sort(key=lambda entry: int(entry.split(':', 1)[1].split(' ', 1)[0]))
+    return offenders
+
+
+def _never_finishes() -> asyncio.Task:
+    """A real, never-completing asyncio.Task to stand in for a live verify."""
+    return asyncio.get_running_loop().create_task(asyncio.Event().wait())
+
+
+class TestVerifyTeardownChokepoint:
+    """``_teardown_verify_task`` is the SOLE caller of BOTH teardown steps —
+    ``_abort_remote_verify`` and ``verify_task.cancel()`` (task 3204 step-3
+    RED; the cancel half added by the step-3 amend).
+
+    Sync-only, and deliberately NOT marked ``@pytest.mark.asyncio``: this
+    repo runs pytest warnings-as-errors, and pytest-asyncio raises on a sync
+    test carrying that mark. The async helper-contract tests live in
+    :class:`TestVerifyTeardownHelper` below.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_a_compliant_chokepoint(self) -> None:
+        """POSITIVE control: both steps are inside the helper -> no offenders."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        if lease is not None:\n'
+            '            await self._abort_remote_verify(lease, task_id)\n'
+            '        if verify_task is not None:\n'
+            '            verify_task.cancel()\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_an_abort_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS (abort half): an abort typed at a call site is flagged."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+            '        verify_task.cancel()\n'
+            '\n'
+            '    async def _sneaky(self, entry):\n'
+            '        await self._abort_remote_verify(entry.lease, entry.task_id)\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_sneaky:'), offenders
+
+    def test_scanner_flags_a_cancel_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS (cancel half): this is the task-1757 defect class —
+        a local cancel with NO prior remote abort orphans the remote verify.
+
+        Both receiver shapes must be caught: the bare ``verify_task`` local
+        the helper itself uses, and the ``<entry>.verify_task`` attribute the
+        call sites hold.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _teardown_verify_task(self, lease, verify_task, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+            '        verify_task.cancel()\n'
+            '\n'
+            '    async def _sneaky(self, entry, verify_task):\n'
+            '        entry.verify_task.cancel()\n'
+            '        verify_task.cancel()\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 2, offenders
+        assert all(entry.startswith('_sneaky:') for entry in offenders), offenders
+
+    def test_scanner_ignores_unrelated_cancels_and_verify_task_peeks(self) -> None:
+        """ANCHORING: the cancel half is receiver-anchored on ``verify_task``.
+
+        merge_queue.py cancels plenty of OTHER tasks (merger/verifier loop
+        tasks, heartbeat, reprobe, request futures) and peeks at a verify
+        task's ``.cancelled()`` / ``.done()`` / ``.result()`` right next to the
+        teardown — none of those are teardown steps, and flagging them would
+        make the ratchet unsatisfiable.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _elsewhere(self, entry, t):\n'
+            '        t.cancel()\n'
+            '        self._heartbeat_task.cancel()\n'
+            '        entry.item.request.result.cancel()\n'
+            '        if entry.verify_task.done() and not entry.verify_task.cancelled():\n'
+            '            entry.verify_task.result()\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_a_same_named_method_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: a ``_teardown_verify_task`` on some OTHER class
+        does not sanction its body.
+        """
+        src = (
+            'class SomethingElse:\n'
+            '    async def _teardown_verify_task(self, lease, task_id):\n'
+            '        await self._abort_remote_verify(lease, task_id)\n'
+        )
+        offenders = _teardown_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_teardown_verify_task:'), offenders
+
+    def test_scanner_ignores_docstring_and_comment_mentions(self) -> None:
+        """AST-not-regex: prose naming a guarded symbol is not a call site.
+
+        merge_queue.py genuinely carries such mentions (the module-level
+        teardown narrative and the back-pointer on ``_abort_remote_verify``,
+        which spells ``verify_task.cancel()`` in its own docstring), so a
+        grep-based guard would flag them forever. The bare ``async def``
+        definition must not be flagged either.
+        """
+        src = (
+            '"""Prose naming self._abort_remote_verify(lease, task_id)."""\n'
+            '\n'
+            '# self._abort_remote_verify(lease, task_id) in a comment.\n'
+            'class SpeculativeMergeWorker:\n'
+            '    async def _abort_remote_verify(self, lease, task_id):\n'
+            '        """See self._abort_remote_verify, called before '
+            'verify_task.cancel()."""\n'
+            '        return None\n'
+        )
+        assert _teardown_chokepoint_offenders(src) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _teardown_chokepoint_offenders('async def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_teardown_steps_are_only_called_from_the_teardown_helper(self) -> None:
+        """STRUCTURAL: sole-callership of BOTH steps is what makes the pairing
+        and the ordering unviolatable.
+
+        ``_abort_remote_verify`` must fire BEFORE ``verify_task.cancel()``,
+        because the verify coroutine's finally clause clears
+        ``_inflight_request_id`` on cancellation, which makes a later
+        ``cancel_verify()`` a silent no-op that orphans the remote
+        verify-merge process (task 1757). Since the helper always cancels
+        after aborting, a caller that cannot abort on its own cannot get the
+        order wrong — and since it cannot cancel on its own either, it cannot
+        skip the abort altogether, which is the direction the abort-only
+        form of this guard left open.
+        """
+        import orchestrator.merge_queue as _mq  # module-local import convention
+
+        offenders = _teardown_chokepoint_offenders(Path(_mq.__file__).read_text())
+        assert offenders == [], (
+            f'`{_MQ_GUARDED_ABORT}` and `{_MQ_GUARDED_CANCEL_RECEIVER}.cancel()` '
+            f'must only be called from `{_MQ_CHOKEPOINT_CLASS}.'
+            f'{_MQ_TEARDOWN_CHOKEPOINT}`, which always aborts the remote verify '
+            'FIRST and cancels the local task second — that sole-callership is '
+            'what makes the abort-before-cancel ordering a property of the code '
+            'rather than a convention re-typed at every site. Route these '
+            'through `await self._teardown_verify_task(lease, verify_task, '
+            f'task_id)` instead. Offenders: {offenders!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestVerifyTeardownHelper:
+    """``_teardown_verify_task`` aborts the remote verify, THEN cancels and
+    awaits the local task, no-oping either step whose argument is None
+    (task 3204 step-3 RED).
+    """
+
+    async def test_aborts_before_cancelling_the_local_task(self, git_ops: GitOps) -> None:
+        """ORDER: the remote abort is awaited while verify_task is still live."""
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        calls: list[str] = []
+        verify_task = _never_finishes()
+        cancel_requested_at_abort: int | None = None
+
+        runner = MagicMock()
+
+        async def _cancel_verify() -> int:
+            nonlocal cancel_requested_at_abort
+            calls.append('abort')
+            # OBSERVE ONLY — never assert in here (task 3204 amend, reviewer
+            # finding test-quality). This coroutine is awaited from inside
+            # `_abort_remote_verify`'s `try/except Exception` block, and an
+            # AssertionError IS an Exception: an inline assertion is swallowed
+            # and merely logged as a WARNING, so it can never fail the test.
+            # `.cancelled()` would also be the wrong probe — cancellation is
+            # not DELIVERED until the task next runs, so it reads False right
+            # after `.cancel()`. `.cancelling()` counts cancel REQUESTS and is
+            # non-zero the moment `.cancel()` returns, which is exactly the
+            # ordering fact this test is about: the remote cancel must land
+            # while the local task is still live, or it arrives after the
+            # verify coroutine's finally has cleared _inflight_request_id.
+            cancel_requested_at_abort = verify_task.cancelling()
+            return 0
+
+        runner.cancel_verify = _cancel_verify
+        lease = HostLease(name='remote', runner=runner, is_local=False)
+
+        real_cancel = verify_task.cancel
+
+        def _spy_cancel(*a: Any, **k: Any) -> bool:
+            calls.append('cancel')
+            return real_cancel(*a, **k)
+
+        verify_task.cancel = _spy_cancel  # type: ignore[method-assign]
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-order')
+
+        assert calls == ['abort', 'cancel'], calls
+        # Asserted OUT HERE, where nothing can swallow it.
+        assert cancel_requested_at_abort == 0, (
+            f'the remote abort must land while the local verify task is still '
+            f'live; verify_task.cancelling() was {cancel_requested_at_abort!r} '
+            f'when cancel_verify() ran (None = the abort never fired at all), '
+            f'so the remote cancel would be a no-op against an already-cleared '
+            f'_inflight_request_id'
+        )
+        assert verify_task.done(), 'the helper must AWAIT the cancelled task'
+
+    async def test_awaits_the_cancelled_task(self, git_ops: GitOps) -> None:
+        """AWAITED: no pending task is left behind after the helper returns."""
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-awaited')
+
+        assert verify_task.done()
+        assert verify_task.cancelled()
+
+    async def test_none_lease_skips_only_the_remote_abort(self, git_ops: GitOps) -> None:
+        """``lease=None`` no-ops THAT STEP internally — the caller must not
+        have to branch (task 3204 requirement 2) — but still cancels + awaits.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+        verify_task = _never_finishes()
+
+        await worker._teardown_verify_task(None, verify_task, 'df3204-nolease')
+
+        worker._abort_remote_verify.assert_not_awaited()
+        assert verify_task.cancelled()
+
+    async def test_none_verify_task_skips_only_the_cancel(self, git_ops: GitOps) -> None:
+        """``verify_task=None`` no-ops THAT STEP — the abort still fires and
+        there is no AttributeError.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        runner = MagicMock()
+        runner.cancel_verify = AsyncMock(return_value=0)
+        lease = HostLease(name='remote', runner=runner, is_local=False)
+
+        await worker._teardown_verify_task(lease, None, 'df3204-notask')
+
+        runner.cancel_verify.assert_awaited_once()
+
+    async def test_both_none_is_a_clean_no_op(self, git_ops: GitOps) -> None:
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+
+        await worker._teardown_verify_task(None, None, 'df3204-both-none')
+
+        worker._abort_remote_verify.assert_not_awaited()
+
+    async def test_swallows_an_exception_from_awaiting_the_verify_task(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The ``await verify_task`` is unconditionally suppressed — as it is at
+        all six sites today — so a verify that died with an exception cannot
+        derail the teardown.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        async def _boom() -> None:
+            raise RuntimeError('verify blew up')
+
+        verify_task = asyncio.get_running_loop().create_task(_boom())
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(lease, verify_task, 'df3204-raiser')
+
+        assert verify_task.done()
+
+    async def test_shutdown_defensive_swallows_a_raising_abort(
+        self, git_ops: GitOps,
+    ) -> None:
+        """``shutdown_defensive=True``: a BaseException out of the remote abort
+        (e.g. a SIGTERM-driven CancelledError) must not abort the drain loop,
+        and the teardown still proceeds to cancel.
+
+        This is the one genuine per-site difference: the two stop() drain sites
+        wrap the abort in ``contextlib.suppress(BaseException)``.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock(  # type: ignore[method-assign]
+            side_effect=asyncio.CancelledError(),
+        )
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        await worker._teardown_verify_task(
+            lease, verify_task, 'df3204-defensive', shutdown_defensive=True,
+        )
+
+        worker._abort_remote_verify.assert_awaited_once()
+        assert verify_task.cancelled(), 'must still cancel after swallowing the abort'
+
+    async def test_default_lets_a_raising_abort_propagate(self, git_ops: GitOps) -> None:
+        """DEFAULT (``shutdown_defensive=False``): the exception PROPAGATES.
+
+        The head-failure cascade deliberately does not suppress — a
+        CancelledError there must stop the verifier loop, which is correct
+        behaviour. Collapsing the flag either way would be a silent behaviour
+        change on one path or the other.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker._abort_remote_verify = AsyncMock(  # type: ignore[method-assign]
+            side_effect=asyncio.CancelledError(),
+        )
+        verify_task = _never_finishes()
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await worker._teardown_verify_task(lease, verify_task, 'df3204-propagates')
+
+        # Clean up the task this deliberately-aborted teardown left behind.
+        verify_task.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_task
+
+
+# ---------------------------------------------------------------------------
 # task 2063: _redispatch-parked speculative permit accounting (signal test)
 # ---------------------------------------------------------------------------
 
@@ -4997,25 +5580,25 @@ class TestRedispatchSpeculativeConservation:
         # task 3477: A's VerifyResult double (passed=False) reaches
         # classify_merge_failure_disposition via the real post-merge-verify
         # path. That classifier must complete honestly, not silently degrade
-        # to its fail-open path (merge_disposition.py:710-719) because the
-        # double's cause_hint/test_output shape confused
-        # _extract_failing_tests_and_candidate_files. This guard is what
-        # proves the (b) fidelity fix actually reached this call site — any
-        # future double built without a real cause_hint re-trips it.
-        fail_open_records = [
-            r for r in caplog.records
-            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
-        ]
+        # to its fail-open path because the double's cause_hint/test_output
+        # shape confused _extract_failing_tests_and_candidate_files. This guard
+        # is what proves the (b) fidelity fix actually reached this call site —
+        # any future double built without a real cause_hint re-trips it.
+        #
+        # task 3980 amendment: routed through the shared `_fail_open_records`
+        # predicate above. The inline version this replaces keyed on a longer
+        # substring ('internal error; degrading to ...') that matched only
+        # merge_disposition.py:711, so the second fail-open site
+        # (merge_queue.py:1000, logger 'orchestrator.merge_queue') could swallow
+        # the same defect here undetected.
+        fail_open_records = _fail_open_records(caplog.records)
         assert fail_open_records == [], (
             'classify_merge_failure_disposition degraded to the silent '
             'fail-open path while classifying A\'s failing verify — the '
             'VerifyResult double reached _extract_failing_tests_and_'
             'candidate_files and raised instead of returning a real '
-            'disposition. Offending record(s):\n' + '\n'.join(
-                ''.join(traceback.format_exception(*r.exc_info))
-                if r.exc_info else r.message
-                for r in fail_open_records
-            )
+            'disposition. Offending record(s):\n'
+            + _format_fail_open_records(fail_open_records)
         )
 
 

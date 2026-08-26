@@ -225,9 +225,15 @@ class TestBackendListIndicesLive:
 
     Complements TestCallDbIndexesOverRoQuery: while that class verifies RPC-level acceptance,
     this class verifies the full path consumed by drop_vector_indices() — that list_indices()
-    correctly parses the [label, field, type, entity_type] column layout from a live response.
+    correctly projects a live response onto its {label, field, type, entity_type} RECORD keys.
 
-    Task 530 / esc-486-49.  See also: tests/test_reindex.py::TestListIndices for unit tests.
+    Those four keys are NOT the response's column layout: the live header is 9 columns
+    (label, properties, types, options, language, stopwords, entitytype, status, info) and
+    list_indices() resolves them BY NAME (task 3706).  Describing it as a 4-column layout is
+    what made the old entity_type -> row[3] positional read look plausible.
+
+    Task 530 / esc-486-49.  See also: tests/test_reindex.py::TestListIndices for unit tests,
+    and tests/test_drop_vector_indices_integration.py for the live drop path itself (3769).
     """
 
     @pytest.mark.asyncio
@@ -244,6 +250,14 @@ class TestBackendListIndicesLive:
             assert len(records) >= 1
             for rec in records:
                 assert set(rec.keys()) >= {'label', 'field', 'type', 'entity_type'}
+                # Assert the VALUE, not just the key (task 3706). Key-presence
+                # alone is why the pre-3706 mis-binding survived: entity_type was
+                # bound to the `options` column and returned an OrderedDict like
+                # {'uuid': {}}, which passes a presence check and fails this one.
+                assert rec['entity_type'] in {'NODE', 'RELATIONSHIP'}, (
+                    f'entity_type={rec["entity_type"]!r} is not a FalkorDB entity '
+                    'type — list_indices() is reading the wrong column again'
+                )
             # At least one record should be the Entity.name index we created in the fixture.
             # Note: FalkorDB returns field names as a list (e.g. ['name']), not a bare string.
             entity_records = [r for r in records if r['label'] == 'Entity']

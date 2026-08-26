@@ -75,6 +75,9 @@ summarized here so this batch's substrate story is complete in one artifact.
 
 ## §β2 — committed v2 campaign driver
 
+- Realized driver path: `scripts/run_fable_trial_v2_campaign.py` (tests at
+  `scripts/tests/test_run_fable_trial_v2_campaign.py`), resolving PRD open
+  question 4 per D1's instrument single-ownership constraint. **PASS**
 - Copy source exists: `data/eval-campaign/fable_architect_only.py` (v1
   driver, main checkout). **PASS**
 - Per-candidate cap_excluded substrate already in the report layer

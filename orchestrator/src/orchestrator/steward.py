@@ -722,9 +722,10 @@ class TaskSteward:
         exceeding it by an unbounded multiple of the cap-retry count.
 
         Kwargs are forwarded verbatim to :func:`invoke_agent` — including the
-        ``backend`` kwarg ``invoke_with_cap_retry`` injects for custom
-        ``invoke_fn`` callers (cli_invoke.py:1079-1086), whose disposition is
-        unchanged by this shim.
+        ``backend`` kwarg that ``invoke_with_cap_retry`` (shared/cli_invoke.py)
+        forwards into the dispatched call only when a custom ``invoke_fn`` is
+        supplied — see its multi-backend reconnect block — whose disposition
+        is unchanged by this shim.
         """
         self.metrics.subprocess_attempts += 1
         return await invoke_agent(**kwargs)
@@ -811,21 +812,9 @@ class TaskSteward:
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
 
-        # NOTE (reviewer_comprehensive, task W4-eta amendment): the `backend`
-        # kwarg below only feeds invoke_with_cap_retry's own
-        # classify_invocation / detect_cap_hit calls — it is never forwarded
-        # into `invoke_kwargs` before `invoke_fn` (invoke_agent) is called,
-        # so invoke_agent always runs with its own default (backend='claude')
-        # regardless of this value. This matches every other
-        # invoke_with_cap_retry caller (workflow._invoke,
-        # _pre_triage_suggestions below), and is a no-op today because the
-        # steward only ever runs backend='claude' in practice. If
-        # `config.backends.steward` is ever set to a non-claude backend, the
-        # steward would silently keep invoking Claude. The real fix
-        # (forwarding `backend` into `invoke_kwargs` inside
-        # shared/cli_invoke.py before it calls `invoke_fn`) touches a file
-        # outside this task's locked scope (steward.py / test_steward.py
-        # only) — left for a follow-up task rather than fixed here.
+        # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
+        # it into invoke_kwargs only when a custom invoke_fn is supplied, and
+        # invoke_fn=_invoke_agent_counted below is exactly that case.
         result = await invoke_with_cap_retry(
             self.usage_gate,
             f'Steward for task {self.task_id}',
@@ -1232,6 +1221,15 @@ def _is_timeout_kill(result) -> bool:
     return has_marker and 'timeout' in stderr
 
 
+# Subtypes sharing the instant-empty-stdout shape, and therefore the "no real
+# work was done, so don't consume retry budget" treatment.
+# error_cli_input_rejected (task 3143 / esc-3118-1) joins the generic subtype
+# rather than being handled separately: the agent was never asked anything at
+# all, which is a strictly STRONGER claim to the carve-out than the generic
+# case has.
+_EMPTY_OUTPUT_SUBTYPES = frozenset({'error_empty_output', 'error_cli_input_rejected'})
+
+
 def _is_empty_output(result) -> bool:
     """Return True when *result* represents an instant-empty-stdout subprocess failure.
 
@@ -1243,17 +1241,27 @@ def _is_empty_output(result) -> bool:
     was done, so this attempt should NOT consume retry budget (mirrors the
     ``_is_timeout_kill`` carve-out).
 
+    ``error_cli_input_rejected`` (task 3143) is accepted on the same terms: the
+    CLI rejected the invocation on argument validation BEFORE any model turn —
+    zero cost, no work done, and the agent was never even asked the question —
+    so it must not consume retry budget either.  Note ``invoke_with_cap_retry``
+    has already spent its own one-shot fresh retry by the time a rejection
+    reaches here, so the steward's bounded counter
+    (``steward_max_empty_outputs_per_escalation``) is the outer bound, not the
+    only one.
+
     Note: a SIGTERM/SIGKILL-killed productive run (e.g. reify-4415: 43 assistant
     turns over 1198s) can ALSO produce subtype='error_empty_output' because the
     CLI emits its JSON only at exit.  ``is_timed_out_with_progress`` (keyed on
     transcript_turns) distinguishes that case — those runs DID do real work and
-    must NOT be treated as instant empty-output failures.
+    must NOT be treated as instant empty-output failures.  The carve-out applies
+    to every subtype in ``_EMPTY_OUTPUT_SUBTYPES``, not just the generic one.
     """
-    if result.timed_out and result.transcript_turns is None and result.subtype == 'error_empty_output':
+    if result.timed_out and result.transcript_turns is None and result.subtype in _EMPTY_OUTPUT_SUBTYPES:
         logger.debug(
             '_is_empty_output: timed_out=True but transcript_turns=None '
             '(transcript could not be located for session %r) — '
             'conservative empty-output classification may misidentify a productive run',
             getattr(result, 'session_id', ''),
         )
-    return result.subtype == 'error_empty_output' and not is_timed_out_with_progress(result)
+    return result.subtype in _EMPTY_OUTPUT_SUBTYPES and not is_timed_out_with_progress(result)

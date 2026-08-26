@@ -47,6 +47,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+
 logger = logging.getLogger('invalidate_shipping_edges')
 
 # Pattern for the historically-fabricated edge text. The LLM emitted variants
@@ -184,6 +189,43 @@ async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE anything.
+    #
+    # Placed above the lazy backend imports rather than at the config load, so
+    # a refused run imports no backend stack, constructs no service, opens no
+    # connection and issues no ``ro_query`` candidate scan. (This mirrors
+    # ``audit_duplicate_memories``, which likewise guards before its
+    # MemoryService exists.) The guard needs nothing from ``args.config``:
+    # ``resolve_history_dir()`` keys off ``MEM0_DIR`` at call time or mem0's
+    # own configured ``history_db_path``, never this repo's ``CONFIG_PATH``.
+    #
+    # It must not go in the invalidation loop below: that loop's
+    # ``except Exception`` swallows ``RuntimeError``, which
+    # ``StoreMutationUnavailable`` subclasses, and ``_run`` then returns 0 --
+    # so a write-denied environment would report a clean exit over a
+    # half-applied invalidation.
+    #
+    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(
+                operation='invalidate_fabricated_shipping_edges --apply'
+            )
+        except StoreMutationUnavailable:
+            logger.error(
+                'invalidate_fabricated_shipping_edges: --apply NOT started '
+                "(fail-closed) -- this process cannot write mem0's history "
+                'directory, so each invalidation would supersede its edge and '
+                'then fail to record the change, leaving the fabricated-edge '
+                'sweep half-applied with no trace of which edges were already '
+                'retired. Nothing was scanned and nothing was mutated, and no '
+                'client was opened. Route the invalidations through the '
+                'fused-memory MCP server (the unsandboxed owner of the store), '
+                'or re-run from an unsandboxed operator shell. To obtain the '
+                'candidate report safely from anywhere, re-run without --apply.'
+            )
+            raise
 
     import os  # noqa: PLC0415
 

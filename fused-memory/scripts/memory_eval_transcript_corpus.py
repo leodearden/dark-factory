@@ -29,8 +29,8 @@ The transcript shapes it reads (measured, not assumed)
 ------------------------------------------------------
 Archive layout, written by ``shared.transcript_archive``::
 
-    <archive_root>/<task_id>/<enc-cwd>/<session_id>.jsonl.gz
-    <archive_root>/<task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+    <archive_root>/<task_id>/<enc-cwd>/<session_id>.jsonl
+    <archive_root>/<task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
 
 A search is an ``assistant`` record whose ``message.content`` holds::
 
@@ -64,7 +64,7 @@ holding::
 
     {
       "schema_version": 1,             // SCHEMA_VERSION; bump on any change
-      "transcript":     "3214/-home-…/<session>.jsonl.gz",
+      "transcript":     "3214/-home-…/<session>.jsonl",
       "task_id":        "3214",        // ─┐
       "session_id":     "<uuid>",      //  │ ALL path-derived, by
       "is_subagent":    false,         //  │ parse_archive_path — never
@@ -165,13 +165,12 @@ failed) therefore differ in BOTH the status string a human reads and the exit
 code a wrapper reads. See :func:`coverage_status`.
 
 That vocabulary is only closed if a damaged file lands INSIDE it. The archive
-is fire-and-forget runtime state written by the running fleet, so a unit
-killed mid-write or a file read while still compressing leaves a partially
-written ``.gz``, and a flipped byte in stored data damages an intact one — and
-an unreadable transcript surfaces as FOUR different exception types, only one
-of which is an ``OSError``. ``legibility.inventory.as_unreadable_file_error``
-enumerates them and normalizes all four to ``OSError`` preserving the original
-message; BOTH readers this script uses funnel through that one helper, so
+is fire-and-forget runtime state written by the running fleet, so a flipped
+byte in stored data, or a file half-written by a unit killed mid-write, can
+leave bytes that are not valid UTF-8 — and that shape surfaces as
+``UnicodeDecodeError``, a ``ValueError`` subclass rather than an ``OSError``.
+``legibility.inventory.as_unreadable_file_error`` normalizes it to ``OSError``
+preserving the original message; BOTH readers this script uses funnel through that one helper, so
 every shape lands in the counted ``parse_failures`` path — ``degraded`` if
 other files read, ``total_failure`` if none did — instead of aborting the run
 with a traceback and an exit code outside this table.
@@ -189,7 +188,7 @@ Usage::
 
     # one transcript, for debugging
     python fused-memory/scripts/memory_eval_transcript_corpus.py \
-        --transcript <path/to/session.jsonl.gz>
+        --transcript <path/to/session.jsonl>
 """
 from __future__ import annotations
 
@@ -223,32 +222,26 @@ if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
 # from fused-memory/ whose extraPaths cannot see repo-root scripts/. Same
 # situation, same idiom, as escalation/'s imports of orchestrator.*.
 from legibility.digest import load_transcript  # type: ignore[reportMissingImports]  # noqa: E402
-from legibility.inventory import iter_json_lines  # type: ignore[reportMissingImports]  # noqa: E402
+from legibility.inventory import (  # type: ignore[reportMissingImports]  # noqa: E402
+    count_residual_gz,
+    iter_json_lines,
+)
 from shared.memory_eval_metrics import (  # noqa: E402
     RUN_STAMP_ENV_VAR,
     MetricSchemaError,
     eval_dir,
     report_artifact_path,
     run_stamp,
-)
-from shared.memory_eval_metrics import (  # noqa: E402
-    _validate_stamp as validate_stamp,  # noqa: PLC2701
+    validate_stamp,
 )
 
-# `_validate_stamp` is imported across a package boundary under an underscore,
-# which normally means "find another way". The alternatives here are worse:
-# re-deriving the stamp regex would be a SECOND definition of a shape that
-# module documents as the one thing it must validate (an override "is going
-# into a filename the window loader will order and cut by string comparison"),
-# and not validating at all is the defect this fixes. The public
-# `run_stamp()`/`write_metric_series(stamp=)` entry points both route through
-# it; this script needs the check WITHOUT their side effects, since it stamps
-# three artifacts of its own. Promoting it to that module's `__all__` is a
-# one-line change filed as a follow-up — outside this task's locked modules.
+# `validate_stamp` rather than an entry point: this script stamps three artifacts of
+# its own, so it needs the shape check WITHOUT `run_stamp()`/`write_metric_series(stamp=)`'s
+# side effects. Why the check is exported at all is documented on the function itself.
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
-# streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
-# files); --transcript mode slurps via load_transcript (an ordered list is the
+# streams via iter_json_lines (memory-bounded across thousands of multi-MB
+# transcripts); --transcript mode slurps via load_transcript (an ordered list is the
 # right shape for one small file). Both feed the identical extract_searches.
 # The test asserts these bindings ARE those functions, so a future regression
 # that quietly reintroduces a local parser fails rather than passing review.
@@ -276,9 +269,7 @@ minable without editing this file.
 
 
 def _strip_transcript_suffix(name: str) -> str:
-    """``<x>.jsonl.gz`` / ``<x>.jsonl`` -> ``<x>``."""
-    if name.endswith('.jsonl.gz'):
-        return name[: -len('.jsonl.gz')]
+    """``<x>.jsonl`` -> ``<x>``."""
     if name.endswith('.jsonl'):
         return name[: -len('.jsonl')]
     return name
@@ -291,8 +282,8 @@ def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
     than line-cited so this reader stays coupled to that producer by name as
     it evolves::
 
-        <task_id>/<enc-cwd>/<session_id>.jsonl.gz
-        <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+        <task_id>/<enc-cwd>/<session_id>.jsonl
+        <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
 
     Every field degrades to None independently rather than raising. An archive
     is append-only runtime state that can acquire a stray file, and one
@@ -313,10 +304,10 @@ def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
     if len(parts) >= 1:
         parsed['task_id'] = parts[0] if len(parts) > 1 else None
     if len(parts) == 3:
-        # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+        # <task_id>/<enc-cwd>/<session_id>.jsonl
         parsed['session_id'] = _strip_transcript_suffix(parts[2])
     elif len(parts) == 5 and parts[3] == 'subagents':
-        # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+        # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
         parsed['session_id'] = parts[2]
         parsed['is_subagent'] = True
         parsed['subagent_id'] = _strip_transcript_suffix(parts[4])
@@ -368,10 +359,10 @@ def archive_relative_slice(path: str | Path) -> str:
     provenance is not.
     """
     parts = Path(path).parts
-    # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+    # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl
     if len(parts) >= 5 and parts[-2] == 'subagents' and _is_encoded_cwd(parts[-4]):
         return Path(*parts[-5:]).as_posix()
-    # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+    # <task_id>/<enc-cwd>/<session_id>.jsonl
     if len(parts) >= 3 and _is_encoded_cwd(parts[-2]):
         return Path(*parts[-3:]).as_posix()
     return Path(path).name
@@ -661,6 +652,11 @@ def _new_coverage() -> dict[str, Any]:
         'tasks_scanned': 0,
         'transcripts_found': 0,
         'transcripts_read': 0,
+        # Archived transcripts still in the pre-3618 gzipped form, which the
+        # walk does not enumerate at all. Zero once the human-operated
+        # migration sweep has run; non-zero it says, in a field rather than by
+        # omission, exactly how much of the archive this run could not see.
+        'residual_gz': 0,
         'searches_extracted': 0,
         'searches_unresolved': 0,
         'parse_failures': {
@@ -694,7 +690,7 @@ def iter_transcripts(root: Path) -> list[Path]:
     """
     if not root.is_dir():
         return []
-    found = set(root.glob('*/**/*.jsonl.gz')) | set(root.glob('*/**/*.jsonl'))
+    found = set(root.glob('*/**/*.jsonl'))
     return sorted(p for p in found if p.is_file())
 
 
@@ -707,8 +703,8 @@ def scan_archive(
     """Mine a whole archive tree. Returns ``(records, coverage)``.
 
     Each file streams through the PROMOTED ``legibility.inventory.iter_json_lines``
-    rather than being slurped: the live archive is thousands of multi-MB gz
-    files, so memory has to stay bounded by the largest single record.
+    rather than being slurped: the live archive is thousands of multi-MB
+    transcripts, so memory has to stay bounded by the largest single record.
 
     Per that reader's documented contract, a blank or corrupt LINE is skipped
     silently while an unreadable FILE raises ``OSError``. That split is
@@ -717,15 +713,15 @@ def scan_archive(
     every fire-and-forget writer eventually produces — does not inflate it
     into a false alarm.
 
-    All FOUR unreadable-file shapes reach that ``except OSError`` — bad magic,
-    a truncated stream, a corrupt body, and a non-UTF-8 byte — because
-    ``legibility.inventory.as_unreadable_file_error`` normalizes them at the
-    reader seam. The handler is deliberately NOT widened here to also catch
-    ``EOFError``/``zlib.error``/``UnicodeDecodeError``: that helper is the one
-    answer to "which exceptions mean an unreadable file", and a second answer
-    at each call site is exactly what INV-5 forbids. The original message
-    survives normalization, so the disclosed ``parse_failures`` example still
-    says which shape it was.
+    With the archive stored plain (task 3618) the one unreadable-file shape
+    that is not already an ``OSError`` — a non-UTF-8 byte — still reaches that
+    ``except OSError``, because ``legibility.inventory.as_unreadable_file_error``
+    normalizes it at the reader seam. The handler is deliberately NOT widened
+    here to also catch ``UnicodeDecodeError``: that helper is the one answer to
+    "which exceptions mean an unreadable file", and a second answer at each
+    call site is exactly what INV-5 forbids. The original message survives
+    normalization, so the disclosed ``parse_failures`` example still says which
+    shape it was.
 
     A missing *root* is not an error here; it is zero transcripts found, which
     :func:`coverage_status` turns into ``no_input``.
@@ -756,6 +752,13 @@ def scan_archive(
         records.extend(extracted)
 
     coverage['tasks_scanned'] = len(tasks)
+    # What the walk could NOT see. `iter_transcripts` globs `*.jsonl` only, so
+    # a residual `.jsonl.gz` is absent from `transcripts_found` rather than
+    # counted as a failure — an under-report indistinguishable from a smaller
+    # archive, which is the one thing this coverage exists to prevent. Counted
+    # through inventory's helper (never a second answer to "what is residual"),
+    # and it costs no read.
+    coverage['residual_gz'] = count_residual_gz(root)
     coverage['searches_extracted'] = len(records)
     coverage['searches_unresolved'] = sum(
         1 for record in records if record['result_status'] != 'ok'
@@ -945,6 +948,18 @@ def render_report(coverage: Mapping[str, Any]) -> str:
         lines.append(
             '  DEGRADED — some transcripts were unreadable. The corpus is '
             'usable but incomplete by exactly the count above.'
+        )
+
+    residual_gz = coverage.get('residual_gz', 0)
+    if residual_gz:
+        # Not a parse failure — these were never opened, or even listed. Said
+        # in words next to the counters, because a corpus that is short by
+        # thousands of transcripts otherwise reads as a complete small one.
+        lines.append(
+            f'  NOTE: {residual_gz} archived transcript(s) are still gzipped '
+            'and were NOT enumerated. Run '
+            'scripts/migrate_transcript_archive_gunzip.py --apply '
+            '(OPERATIONS.md §13); this note clears itself once you have.'
         )
 
     examples = failures.get('examples') or []

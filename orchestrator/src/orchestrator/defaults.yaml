@@ -77,6 +77,15 @@ requeue_cap: 3
 # exempt from requeue_cap.  Guards against unbounded retry on a persistent
 # provider outage.  Process-local; orchestrator restart resets it.
 transient_requeue_cap: 10
+# Jittered exponential backoff for the transient lane (PRD contract C3).  The
+# n-th transient requeue arms min(base * 2**(n-1), cap) seconds, drawn with
+# equal jitter U(cooldown/2, cooldown); n is the task's transient requeue
+# count at arming.  30/900 walks 30/60/120/240/480 and pins at 900s from n=6,
+# so a provider outage settles into a 7.5-15 min cadence instead of a flat-30s
+# retry storm (2026-07-29: 67 starts in one half-hour bucket).  GENUINE
+# (non-5xx) requeues are unaffected — they stay flat at requeue_cooldown_secs.
+transient_requeue_backoff_base_secs: 30.0
+transient_requeue_backoff_cap_secs: 900.0
 
 # Verification timeouts
 verify_command_timeout_secs: 1800
@@ -351,7 +360,15 @@ budgets:
   architect: 15.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 5.0
+  # 5.0 -> 12.0 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Measured over 475 reviewer_comprehensive invocations since 2026-08-10:
+  # 5.3% hit the $5 ceiling, and $268 of $908 total reviewer spend (29.5%) went
+  # to cap-killed runs that produced nothing. Successful reviews cost p50=$1.46,
+  # p95=$3.10, max=$4.92 — the ceiling sat barely above the largest legitimate
+  # review. $12 is ~4x p95 / ~2.4x observed max: a runaway guard normal
+  # operation never touches. Reduces net spend, since a cap-killed run burns the
+  # full ceiling, yields nothing, then retries up to 4 more times.
+  reviewer: 12.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
@@ -367,7 +384,16 @@ max_turns:
   architect: 100
   implementer: 80
   debugger: 50
-  reviewer: 30
+  # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Same failure mode simple_task hit below, and worse: over 475
+  # reviewer_comprehensive invocations since 2026-08-10, 19.6% exceeded 30
+  # turns, and of 79 failures 43 sat at EXACTLY turns=31 while only 11 were
+  # anything other than a cap hit. Successful reviews run p50=19, p90=31,
+  # p95=33, max=43 — so the cap was firing BELOW the p90 of normal successful
+  # operation, which makes it a throttle rather than a runaway guard. 60 leaves
+  # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
+  # the cap itself, so true demand may run higher.
+  reviewer: 60
   merger: 50
   steward: 100
   triage: 25
@@ -624,6 +650,24 @@ zero_progress_requeue:
   threshold: 5
   min_span_seconds: 900.0
 
+# Structured recovery-decision emission (task 3535, PRD
+# plans/task-escalation-state-graph-prd.md D5).  Every veto/LEAVE site in the
+# recovery machinery emits a recovery_vetoed / recovery_left event naming WHAT
+# held a stranded task, and a blocking L1 is filed against a streak sentinel
+# after `veto_streak_threshold` IDENTICAL consecutive vetoes spanning at least
+# `veto_streak_min_span_secs`.  Changes no recovery disposition — see
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring) for the
+# canonical WHY, the signature-transition emission cadence, and the derivation
+# of the 1500.0s span default.  Shipped ENABLED: without it a strand held by an
+# open escalation leaves no machine-readable trace of what held it.
+recovery_emission:
+  enabled: true
+  veto_streak_threshold: 3
+  veto_streak_min_span_secs: 1500.0
+  # The narrower kill switch: the only part of the mechanism that WRITES to the
+  # escalation queue.  Turn this off to keep the telemetry and silence the L1.
+  streak_escalation_enabled: true
+
 # Autonomous dry-run unblock hook
 unblock_auto:
   enabled: true
@@ -716,6 +760,42 @@ usage_cap:
 park_stop_enabled: true
 park_stop_parked_threshold: 15
 park_stop_parked_window_hours: 1.0
+
+# EASY-backfill admission through parks (task 3823, PRD task η / C7)
+#
+# A candidate blocked ONLY by another task's park may be admitted through it
+# when its predicted hold, times a safety factor, provably fits inside the gap
+# the park's owner is going to wait anyway.  The final acquisition still goes
+# through try_acquire, and only the PARK gate is bypassed — the held-lock limit
+# gate is untouched, so an admitted-but-actually-contended candidate simply
+# fails to acquire.
+#
+# Evidence: plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+#
+# backfill_enabled: operator kill switch.  When false, a park-blocked candidate
+#   is passed over exactly as before (no admission is even attempted).
+#
+# backfill_safety_factor: multiplier on the candidate's predicted hold before it
+#   is compared against the parked owner's provable assembly delay (gt=0;
+#   default 2.5).  2.5 is INTERPOLATED between two measured 80%-coverage
+#   multipliers — x2.9 (dark-factory) and x2.0 (reify), report :126 — not
+#   guessed; modelled overstay at x2.5 is 7-9% (:254-255).  Raise it toward 2.9
+#   if park_backfill_overstay events show a sustained higher rate.
+#
+# backfill_min_samples: minimum observed hold samples before the predictor will
+#   answer at all (ge=1; default 3).  Below it predicted_hold is None and
+#   backfill REFUSES.  This is the single source of truth for HoldHistory's
+#   sample floor.  A floor of 0 would let an empty history certify a backfill.
+#
+# backfill_max_park_age_secs: refuse backfill through any park older than this,
+#   measured from the owner's FIRST install (gt=0; default 3600.0).  The clause
+#   is measured (report :256 — without a cutoff one reify starver flips to
+#   never-dispatched in-window); the 1h figure is a judgment default, ~40% of
+#   the measured 2.2-3h median process era.
+backfill_enabled: true
+backfill_safety_factor: 2.5
+backfill_min_samples: 3
+backfill_max_park_age_secs: 3600.0
 
 # Escalation-watcher subprocess supervisor (AFK hardening, task 1326)
 #

@@ -20,6 +20,36 @@ Every prefix this script deletes is listed in :data:`PREFIXES`, and any
 script that seeds under one imports its constant from HERE.  A name coined
 in one file and reaped by a constant in another is one rename away from
 orphaning collections forever.
+
+WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
+------------------------------------------------------------------------
+``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``
+is the fail-closed capability probe the shared-store mutators in
+``fused-memory/scripts/`` call before their first write.  The
+``client.delete_collection`` below is unconditional and unprobed, and that is
+a decision rather than an omission.  Three reasons, each measured against
+this file AS IT STANDS at task 4293 — not a standing exemption for whatever
+it becomes:
+
+  * its blast radius is already bounded, statically.  Only names starting
+    with a member of :data:`PREFIXES` are deleted, and the production
+    ``collection_prefix`` default (``fused``) cannot match one — see the
+    section above.  Bounding an otherwise unbounded mutation is exactly what
+    the preflight is for; here an equality-pinned allowlist does it;
+  * it never constructs a ``MemoryService``.  It talks to a raw
+    ``QdrantClient`` and writes no mem0 SQLite history at all, so the
+    capability the preflight probes for — writing mem0's history directory —
+    is not one this script needs, and a probe would refuse runs that would
+    have worked;
+  * it is an unattended cron job whose contract at the top of this docstring
+    is "Always exits 0 (idempotent)".  Every failure path here is a bare
+    ``return``; there is no ``sys.exit`` in the file.  The preflight refuses
+    by RAISING, deliberately (a refusal must not be mistakable for a handled
+    outcome), which would break that contract.
+
+If a later edit gives this script a ``MemoryService``, or lets any input
+widen :data:`PREFIXES` past the two test-only names, the first two premises
+die and the guard becomes required.
 """
 
 from __future__ import annotations

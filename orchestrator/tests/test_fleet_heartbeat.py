@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.fleet_heartbeat import (
     DEFAULT_FLEET_DIR,
     build_heartbeat_payload,
@@ -199,3 +201,62 @@ class TestWriteHeartbeat:
         assert result.name != '.json'
         assert result.exists()
         assert result == tmp_path / 'unknown-unit.json'
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``fleet_heartbeat.write_heartbeat`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``,
+    which also gives this site a unique-per-writer temp name in place of the old
+    fixed ``<dest>.json.tmp`` (two concurrent writers used to share it).
+    ``mode`` must stay at the umask default: this file is read by other
+    processes (the dashboard, the gamma/epsilon watchers, scripts/drain_check.py),
+    so narrowing it to 0o600 is the specific silent regression this task avoids.
+    """
+
+    @staticmethod
+    def _recorder(monkeypatch):
+        import shared.safe_io as _safe_io
+
+        calls = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+        return calls
+
+    @staticmethod
+    def _assert_common(kwargs):
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert kwargs.get('mode') is None, (
+            'umask default, NOT 0o600 — this file is read by other processes'
+        )
+
+    def test_delegates_with_preserved_semantics(self, tmp_path: Path, monkeypatch) -> None:
+        calls = self._recorder(monkeypatch)
+        write_heartbeat(tmp_path / 'fleet', 'orchestrator-df.service', {'ts': 1})
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        self._assert_common(calls[0][2])
+
+    def test_on_disk_mode_matches_write_text_reference(self, tmp_path: Path) -> None:
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+        path = write_heartbeat(tmp_path, 'orchestrator-df.service', {'ts': 1})
+        assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+    def test_oserror_still_propagates(self, tmp_path: Path, monkeypatch) -> None:
+        """This site propagates — it has no fail-open boundary."""
+        import shared.safe_io as _safe_io
+
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        with pytest.raises(OSError, match='disk full'):
+            write_heartbeat(tmp_path, 'orchestrator-df.service', {'ts': 1})

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from shared.invocation_outcome import OK, AuthFailed, CapHit, NearCap
+from shared.invocation_outcome import OK, AuthFailed, CapHit, NearCap, auth_failure_reason
 from shared.usage_gate import InvokeSlot, UsageGate
 
 __all__ = ['make_gate_mock']
@@ -49,10 +49,16 @@ def make_gate_mock(**overrides) -> MagicMock:
     async-context-manager per call. ``__aenter__`` yields a slot whose
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
-    ``gate.confirm_account_ok.assert_called_with(...)``, etc. ``report(outcome)``
+    ``gate.confirm_account_ok.assert_called_with(...)``, etc.
+    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
+    on a truthy hit it calls ``release_probe_slot`` and then settles
+    (task 4096). ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
-    CapHit→``_handle_cap_detected``, AuthFailed→``_handle_auth_failure``,
+    CapHit→``_handle_cap_detected``+``release_probe_slot`` (task 4096),
+    AuthFailed→``_handle_auth_failure`` (reason rendered by the single-sourced
+    ``invocation_outcome.auth_failure_reason``, so it cannot drift from
+    production — task 4042),
     NearCap→``_handle_near_cap_warning``+``release_probe_slot``, everything
     else→``release_probe_slot``; always settling in a ``finally``. Kept in step
     with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
@@ -97,6 +103,11 @@ def make_gate_mock(**overrides) -> MagicMock:
                     oauth_token=slot.token,
                 )
                 if hit:
+                    # Mirrors production InvokeSlot.detect_cap_hit (task 4096):
+                    # settling suppresses the __aexit__ safety net, so the probe
+                    # claim is released here. Real gate makes this a guarded
+                    # no-op once the account is already CAPPED.
+                    gate.release_probe_slot(slot.token)
                     slot._settled = True
                 return hit
 
@@ -114,15 +125,21 @@ def make_gate_mock(**overrides) -> MagicMock:
                 outcome variant, then settle in a ``finally`` so every path
                 leaves the slot settled exactly once. Kept byte-for-byte in
                 step with the sister proxy in
-                ``tests/test_cap_retry.py::_mock_gate``."""
+                ``tests/test_cap_retry.py::_mock_gate``.
+
+                The AuthFailed reason format is no longer hand-mirrored: it is
+                single-sourced in ``invocation_outcome.auth_failure_reason``,
+                which production ``InvokeSlot.report`` also calls, so this arm
+                cannot drift on the reason string (task 4042)."""
                 token = slot.token
                 try:
                     if isinstance(outcome, OK):
                         gate.confirm_account_ok(token)
                     elif isinstance(outcome, CapHit):
                         gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                        gate.release_probe_slot(token)
                     elif isinstance(outcome, AuthFailed):
-                        gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                        gate._handle_auth_failure(auth_failure_reason(outcome), token)
                     elif isinstance(outcome, NearCap):
                         gate._handle_near_cap_warning(outcome.reason, token)
                         gate.release_probe_slot(token)

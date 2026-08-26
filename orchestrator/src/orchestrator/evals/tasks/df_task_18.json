@@ -23,6 +23,14 @@
     "cd fused-memory && uv sync --quiet"
   ],
   "expected_files_changed": [],
+  "reference": {
+    "post_task_commit": "818c368f6c79d239c603881de895c5abd7f7cb62",
+    "diff_stat": {
+      "files": 36,
+      "insertions": 6784,
+      "deletions": 12
+    }
+  },
   "plan": {
     "task_id": "df_task_18",
     "title": "Sleep mode reconciliation system",

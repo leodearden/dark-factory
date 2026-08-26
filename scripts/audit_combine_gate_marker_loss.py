@@ -57,18 +57,34 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 (tasks.db discovery) ONLY, imported as a flat sibling. This module
-# deliberately keeps its own format_report/format_json/_build_parser/main, for
-# the same reasons audit_wiped_metadata_files.py does: a fourth exit code
-# (3 = roots resolved but every one failed to audit, kept distinct from 0 per
-# docs/legibility/design-invariants.md's no-silent-fail-soft rule) and
-# object-shaped rather than array-shaped JSON.
+# Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
+# loop, the warn-and-continue skip, the exit-code ladder and the two reporting
+# layout primitives), imported as a flat sibling and shared with
+# audit_wiped_metadata_files.py as of task 3616. Tier 2 is the LEAK-SCANNER
+# skeleton and does not apply here — it sweeps db paths and accumulates
+# matches, not one audit per project root.
+#
+# This module deliberately keeps its own format_report/format_json/_build_parser,
+# for the same reasons audit_wiped_metadata_files.py does: its object-shaped
+# rather than array-shaped JSON, its --project-id handling, its epilog wording
+# (ACTIONABLE findings and terminal-row suppression) and its COVERAGE
+# caveat/labels are genuinely different behaviour, not duplication. main() is
+# no longer among them, and neither is exit 3 — both are Tier 3's, shared.
 #
 # IMPORT-RESOLUTION CONTRACT: _task_db_scan.py must stay a flat sibling in
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import discover_project_roots, tasks_db_path  # noqa: F401
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    format_coverage_block,
+    format_kv_line,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -942,12 +958,20 @@ _COVERAGE_CAVEAT = (
 
 
 def _format_finding_line(finding: Finding) -> str:
-    """One finding, in the precedent's ``key=value`` style."""
-    return (
-        f"  task_id={finding.task_id} tag={finding.tag} "
-        f"status={finding.status} key={finding.key} "
-        f"severity={finding.severity} source={finding.expected_source}"
-    )
+    """One finding, in the precedent's ``key=value`` style.
+
+    The field set and order are this script's; format_kv_line supplies only
+    the indent and separator. ``source`` is deliberately shorter than the
+    ``expected_source`` attribute it carries.
+    """
+    return format_kv_line([
+        ("task_id", finding.task_id),
+        ("tag", finding.tag),
+        ("status", finding.status),
+        ("key", finding.key),
+        ("severity", finding.severity),
+        ("source", finding.expected_source),
+    ])
 
 
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
@@ -956,22 +980,27 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
     Never omitted and never abbreviated when there are no findings: the whole
     point is that the finding list is an observable subset, and a reader must
     be told the size of the unobservable remainder.
+
+    The details NAME the unreadable sidecars, never just count them. A count
+    alone tells an operator that coverage is incomplete but not where to look,
+    which swallows the failure at the reporting boundary (no-silent-fail-soft).
+
+    Only the ALIGNMENT is shared with audit_wiped_metadata_files.py (via
+    format_coverage_block); _COVERAGE_CAVEAT and the labels below are this
+    script's, and say what this script could not see.
     """
-    lines = [
+    return format_coverage_block(
         _COVERAGE_CAVEAT,
-        f"    combine targets scanned:            {coverage.total_combine_targets}",
-        f"    with a creating ticket:             {coverage.targets_with_ticket}",
-        f"    with a capability manifest:         {coverage.targets_with_manifest}",
-        f"    with NO comparison source:          {coverage.targets_without_comparison_source}",
-        f"    contested manifest bindings:        {coverage.ambiguous_manifest_bindings}",
-        f"    manifests that failed to parse:     {coverage.manifest_parse_failures}",
-    ]
-    # NAME the unreadable sidecars, never just count them. A count alone tells
-    # an operator that coverage is incomplete but not where to look, which
-    # swallows the failure at the reporting boundary (no-silent-fail-soft).
-    for detail in coverage.manifest_parse_failure_details:
-        lines.append(f"      - {detail}")
-    return lines
+        [
+            ("combine targets scanned:", coverage.total_combine_targets),
+            ("with a creating ticket:", coverage.targets_with_ticket),
+            ("with a capability manifest:", coverage.targets_with_manifest),
+            ("with NO comparison source:", coverage.targets_without_comparison_source),
+            ("contested manifest bindings:", coverage.ambiguous_manifest_bindings),
+            ("manifests that failed to parse:", coverage.manifest_parse_failures),
+        ],
+        details=coverage.manifest_parse_failure_details,
+    )
 
 
 def _format_section(label: str, findings: list[Finding]) -> list[str]:
@@ -1069,11 +1098,22 @@ def format_json(audits: list[ProjectAudit]) -> str:
 # returns can never drift into disagreeing about what a number means. Each
 # denotes EXACTLY ONE outcome -- that is the whole reason 3 exists rather than
 # being folded into 0.
-EXIT_OK = 0                # audited; no ACTIONABLE findings and no id mismatch
-EXIT_LIVE_FINDINGS = 1     # an actionable finding (is_actionable), or the
-                           # project_id guard fired
-EXIT_NO_ROOT = 2           # no project root resolved to a readable tasks.db
-EXIT_NOTHING_SCANNED = 3   # roots resolved but EVERY one failed to audit
+#
+# The per-script NAMES survive because the epilog wording is per-script (this
+# one is about ACTIONABLE findings and terminal-row suppression; wiped's is
+# about candidates), but since task 3616 the VALUES have ONE home: the returns
+# now live in _task_db_scan.run_audit_cli, so a local re-spelling would drift
+# from what actually gets returned. test_exit_constants_alias_the_shared_
+# tier_3_codes is what keeps these aliases honest.
+EXIT_OK = AUDIT_EXIT_OK                       # audited; no ACTIONABLE findings
+                                              # and no id mismatch
+EXIT_LIVE_FINDINGS = AUDIT_EXIT_FINDINGS      # an actionable finding
+                                              # (is_actionable), or the
+                                              # project_id guard fired
+EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT             # no project root resolved to a
+                                              # readable tasks.db
+EXIT_NOTHING_SCANNED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
+                                                   # one failed to audit
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1125,6 +1165,52 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root under the (possibly overridden) project_id.
+
+    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
+    other exception propagates. Returns exactly one audit, per that function's
+    one-audit-per-root contract.
+    """
+    return audit_project(root, args.project_id)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    """Exit 1 keys on ACTIONABLE findings, or a fired project-id guard.
+
+    See :func:`main`'s docstring for why the excluded rows are excluded -- they
+    are still printed in full and still counted in COVERAGE.
+    """
+    actionable = any(is_actionable(f) for a in audits for f in a.findings)
+    mismatch = any(a.project_id_mismatch for a in audits)
+    return actionable or mismatch
+
+
+def _warn_project_id_across_roots(roots: list[str], args: argparse.Namespace) -> None:
+    """Warn once, up front, that ONE --project-id is being applied to MANY roots.
+
+    Runs on the RESOLVED root list, before the empty-roots exit-2 return -- the
+    position it has always occupied, preserved verbatim through the Tier-3
+    extraction (task 3616). It fits neither the per-root audit callback nor the
+    post-sweep renderer, which is why run_audit_cli takes an on_roots hook.
+    """
+    if len(roots) > 1 and args.project_id:
+        print(
+            f"warning: --project-id {args.project_id!r} is applied to ALL "
+            f"{len(roots)} resolved project roots, but a project_id is "
+            "per-project; any root whose real id differs will be audited "
+            "against the wrong tickets.db rows (and a root with no created "
+            "tickets will silently report '(no comparison source)' instead of "
+            "flagging the mismatch). Prefer one --project-id run per root.",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -1166,59 +1252,23 @@ def main(argv: list[str] | None = None) -> int:
     override is legitimate for a multi-root sweep over same-id checkouts (a
     main checkout plus its worktrees), which is a real use, and this script
     reports rather than gatekeeps.
+
+    The roots loop, the warn-and-continue skip and the exit-code ladder are
+    :func:`_task_db_scan.run_audit_cli` (Tier 3, task 3616), shared with
+    audit_wiped_metadata_files.py. What stays here is what genuinely differs:
+    this script's parser and epilog, its ``--project-id`` handling
+    (:func:`_audit_root` and :func:`_warn_project_id_across_roots`), its
+    object-shaped JSON, its report and its actionable-findings predicate
+    (:func:`_is_dirty`). Nothing in this file returns a bare integer any more.
     """
-    args = _build_parser().parse_args(argv)
-
-    roots = discover_project_roots(project_roots=args.project_roots)
-    if len(roots) > 1 and args.project_id:
-        print(
-            f"warning: --project-id {args.project_id!r} is applied to ALL "
-            f"{len(roots)} resolved project roots, but a project_id is "
-            "per-project; any root whose real id differs will be audited "
-            "against the wrong tickets.db rows (and a root with no created "
-            "tickets will silently report '(no comparison source)' instead of "
-            "flagging the mismatch). Prefer one --project-id run per root.",
-            file=sys.stderr,
-        )
-    if not roots:
-        print(
-            "no project root resolvable with a readable tasks.db (checked "
-            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
-            "dark-factory default)",
-            file=sys.stderr,
-        )
-        return EXIT_NO_ROOT
-
-    audits: list[ProjectAudit] = []
-    unreadable: list[str] = []
-    for root in roots:
-        try:
-            audits.append(audit_project(root, args.project_id))
-        except sqlite3.Error as exc:
-            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
-            unreadable.append(root)
-
-    if unreadable:
-        print(
-            f"warning: {len(unreadable)} project(s) skipped due to read errors "
-            "(see warnings above); results below are incomplete",
-            file=sys.stderr,
-        )
-
-    print(format_json(audits) if args.json else format_report(audits))
-
-    if unreadable and not audits:
-        # Nothing was scanned at all -- never report that as a clean sweep.
-        print(
-            "error: every resolved project was unreadable; NOTHING was "
-            "audited (this is not a clean result)",
-            file=sys.stderr,
-        )
-        return EXIT_NOTHING_SCANNED
-
-    actionable = any(is_actionable(f) for a in audits for f in a.findings)
-    mismatch = any(a.project_id_mismatch for a in audits)
-    return EXIT_LIVE_FINDINGS if (actionable or mismatch) else EXIT_OK
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+        on_roots=_warn_project_id_across_roots,
+    )
 
 
 if __name__ == "__main__":

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
+import hashlib
 import itertools
 import json
 import logging
 import os
+import sys
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +27,7 @@ from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
     _cpu_priority_prefix,
+    _materialize_stdin,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
@@ -38,6 +43,11 @@ from shared.cli_invoke import (
 )
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
+from shared.testing_stdin import (
+    STDIN_DIGEST_STUB,
+    STDIN_STARVATION_STUB,
+    make_starving_exec,
+)
 
 
 class TestToTokenCount:
@@ -697,6 +707,182 @@ class TestCapHitResume:
 
 
 @pytest.mark.asyncio
+class TestResumeFallbackCounter:
+    """``AgentResult.resume_fallbacks`` counts armed-then-lost resumes.
+
+    The population this makes visible: ``invoke_with_cap_retry`` armed
+    ``--resume``, the CLI rejected the session, the loop silently retried fresh
+    and returned a SUCCESS.  Today nothing anywhere records that a resume — and
+    with it the whole prior transcript — was lost; the 28 measured occurrences
+    left no runs.db event at all.  ``shared`` has no event store, so the count
+    rides out on the result as the carrier the orchestrator reads (step-22)
+    without ``shared`` acquiring an event-store dependency.
+
+    THE PREDICATE, EXACTLY: every resumed attempt this loop made that then
+    failed non-cap — the caller's ``resume_session_id`` AND any resume the loop
+    re-armed itself off a capped attempt.  It is therefore not the answer to
+    "did the resume the ORCHESTRATOR adopted survive?"; the orchestrator gates
+    its ``session_resume_failed(stage='cli')`` emit on its own armed session id
+    for that.  ``resume_fallback_session_ids`` names which sessions were lost,
+    because after ``_reset_for_fresh_retry`` the ids are otherwise unrecoverable.
+
+    THE LOAD-BEARING SUBTLETY: the retry loop rebinds ``result`` on every pass,
+    so a counter stamped onto the DISCARDED first result is lost by
+    construction.  Only a loop-local counter stamped at the single return point
+    survives — which is exactly what the ``got is ok_result`` assertions below
+    pin: the object handed back is the LAST result, not the failed one.
+    """
+
+    async def test_single_resume_fallback_counted(self):
+        """One armed-then-failed resume → the RETURNED result carries 1.
+
+        Caller-initiated resume (the pooled-warm-lane shape this task fixes):
+        the first invocation carries the caller's ``resume_session_id``, fails
+        non-cap, and the loop retries fresh and succeeds.
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        # cost_usd defaults to 0.5, so the failure does not trip the zero-cost
+        # heuristic — it routes through the resume-fallback branch under test.
+        failed_resume = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 2
+        assert got is ok_result, (
+            'the loop rebinds result on each pass — the counter must be stamped '
+            'on the final returned object, not on the discarded failed resume'
+        )
+        assert got.resume_fallbacks == 1
+        assert got.resume_fallback_session_ids == ('sess-lost',)
+
+    async def test_two_resume_fallbacks_counted(self):
+        """Two armed-then-failed resumes across a cap re-arm → the count reaches 2.
+
+        Realistic FOUR-call shape: caller resume fails (fallback 1) → fresh
+        retry hits a cap that carries a session id → the loop re-arms
+        ``--resume`` itself → that resume fails too (fallback 2) → fresh retry
+        succeeds.  Proves the counter accumulates rather than latching at one.
+
+        Also the row that pins the counter's REAL predicate: increment 2 comes
+        from a resume the LOOP re-armed, not one the caller asked for — which
+        is why the orchestrator's ``stage='cli'`` emit gates on its own armed
+        session id instead of on a non-zero count.
+        """
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-a', 't-b']),
+            detect_cap_hit=MagicMock(side_effect=[False, True, False, False]),
+            active_account_name='acct-b',
+        )
+        failed_resume_1 = _make_result(success=False, output='resume error')
+        capped = _make_result(session_id='sess-capped')
+        failed_resume_2 = _make_result(success=False, output='resume error')
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[failed_resume_1, capped, failed_resume_2, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-lost',
+            )
+
+        assert mock_invoke.call_count == 4
+        # Call 1 armed the caller's resume; call 3 armed the cap-hit re-resume.
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-lost'
+        assert mock_invoke.call_args_list[2].kwargs.get('resume_session_id') == 'sess-capped'
+        assert got is ok_result
+        assert got.resume_fallbacks == 2
+        # …and the carrier NAMES both lost sessions, oldest first.  The count
+        # alone cannot: _reset_for_fresh_retry regenerates the pre-allocated
+        # session_id and the cap re-arm replaced the armed id, so neither the
+        # caller's id nor got.session_id identifies what was dropped.
+        assert got.resume_fallback_session_ids == ('sess-lost', 'sess-capped')
+
+    async def test_no_resume_leaves_counter_zero(self):
+        """A plain invocation with no ``--resume`` leaves the default 0.
+
+        Every existing caller must see an unchanged result shape: the field is
+        additive, and a non-resumed invocation can never have lost a resume.
+
+        Asserting ``== 0`` alone would pin the dataclass DEFAULT and stay green
+        with the whole feature deleted, so the row asserts the behaviour that
+        can actually break: exactly ONE call, carrying no ``resume_session_id``
+        — i.e. the loop never armed (and so never lost) a resume of its own.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ) as mock_invoke:
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='do stuff')
+
+        assert got is ok_result
+        assert mock_invoke.call_count == 1, 'no fresh retry should have happened'
+        assert not mock_invoke.call_args_list[0].kwargs.get('resume_session_id')
+        assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
+
+    async def test_successful_resume_reports_zero(self):
+        """Scope check: the counter counts FALLBACKS taken, not resumes armed.
+
+        A resumed invocation that SUCCEEDS took no fallback, so nothing was
+        lost and the count stays 0 — the orchestrator must not emit a
+        ``session_resume_failed`` event for a resume that worked.
+
+        Same teeth as the row above: the resume is provably ARMED (call 1
+        carries ``resume_session_id``) and provably NOT retried
+        (``call_count == 1``), so a spurious increment or a lost stamp is
+        detectable rather than masked by the field's default.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        ok_result = _make_result()
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=ok_result,
+        ) as mock_invoke:
+            got = await invoke_with_cap_retry(
+                gate, 'test-label', prompt='do stuff', resume_session_id='sess-ok',
+            )
+
+        assert got is ok_result
+        assert mock_invoke.call_count == 1, (
+            'the resume succeeded — no fresh fallback invocation should exist'
+        )
+        assert mock_invoke.call_args_list[0].kwargs.get('resume_session_id') == 'sess-ok'
+        assert got.resume_fallbacks == 0
+        assert got.resume_fallback_session_ids == ()
+
+@pytest.mark.asyncio
 class TestResumeDiscardProgressTimeout:
     """Regression for reify-4827 (task 2360 fix #2): a RESUMED invocation that
     hit the working-regime ceiling but made real agentic progress
@@ -903,13 +1089,29 @@ class TestLargePayloadHandling:
         assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
 
     async def test_prompt_sent_via_stdin_not_args(self, tmp_path):
-        """User prompt is piped via stdin, not passed as a CLI argument."""
+        """User prompt is delivered on stdin, not passed as a CLI argument."""
         captured_cmd = []
         captured_kwargs = {}
+        # Read the payload INSIDE the fake: _run_subprocess closes the parent's
+        # handle the moment create_subprocess_exec returns (that close is what
+        # gives the child its EOF), so it is unreadable by the time the
+        # assertions below run.
+        stdin_seen: dict = {}
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
             captured_kwargs.update(kwargs)
+            stdin_arg = kwargs.get('stdin')
+            stdin_seen['is_pipe'] = stdin_arg == asyncio.subprocess.PIPE
+            # `is not None` is what narrows for the type checker; hasattr alone
+            # leaves the None arm live on kwargs.get()'s `Any | None`.
+            if stdin_arg is not None and hasattr(stdin_arg, 'read'):
+                stdin_seen['is_file'] = True
+                stdin_seen['pos'] = stdin_arg.tell()
+                stdin_arg.seek(0)
+                stdin_seen['payload'] = stdin_arg.read()
+            else:
+                stdin_seen['is_file'] = False
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -935,8 +1137,18 @@ class TestLargePayloadHandling:
                 f'Prompt text found in cmd arg: {arg!r}'
             )
 
-        # stdin must be PIPE (for piping prompt data)
-        assert captured_kwargs.get('stdin') == asyncio.subprocess.PIPE
+        # stdin is a pre-materialized file object, NOT a PIPE (task 3147): the
+        # payload must already be readable by the kernel at execve, so a
+        # stalled event loop cannot cost the child its prompt.
+        assert not stdin_seen['is_pipe'], (
+            'stdin is a bare PIPE — the prompt would be written by the event '
+            'loop after execve, reopening the task-3147 starvation race'
+        )
+        assert stdin_seen['is_file'], (
+            f'stdin is not a readable file object: {captured_kwargs.get("stdin")!r}'
+        )
+        assert stdin_seen['pos'] == 0, 'pre-materialized stdin is not rewound to 0'
+        assert stdin_seen['payload'] == prompt_text.encode()
 
     async def test_temp_files_cleaned_up_on_error(self, tmp_path):
         """Temp files are cleaned up even when subprocess raises."""
@@ -972,14 +1184,21 @@ class TestLargePayloadHandling:
         MAX_ARG_STRLEN = 131072  # 128KB, Linux per-argument limit
 
         captured_cmd = []
-        captured_communicate_input = []
+        # Read the pre-materialized stdin INSIDE the fake — _run_subprocess
+        # closes the parent's handle as soon as create_subprocess_exec returns.
+        captured_stdin_payload = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            stdin_arg = kwargs.get('stdin')
+            assert stdin_arg is not None and hasattr(stdin_arg, 'read'), (
+                f'expected a pre-materialized stdin file object, got {stdin_arg!r}'
+            )
+            stdin_arg.seek(0)
+            captured_stdin_payload.append(stdin_arg.read())
             proc = MagicMock()
 
             async def fake_communicate(input=None):
-                captured_communicate_input.append(input)
                 return (_successful_json_output().encode(), b'')
 
             proc.communicate = fake_communicate
@@ -1005,16 +1224,33 @@ class TestLargePayloadHandling:
                 f'CLI arg exceeds MAX_ARG_STRLEN ({len(str(arg).encode())} bytes): {str(arg)[:100]}...'
             )
 
-        # The large prompt should arrive via stdin, not args
-        assert len(captured_communicate_input) == 1
-        assert captured_communicate_input[0] == large_prompt.encode()
+        # The large prompt should arrive via stdin, not args.  260 KB is
+        # load-bearing: it is >4x the 65536-byte default pipe capacity, so this
+        # also proves the task-3147 pre-materialization is not silently
+        # capacity-bounded the way a pre-filled os.pipe() fix would be.
+        assert len(captured_stdin_payload) == 1
+        assert captured_stdin_payload[0] == large_prompt.encode()
 
-    async def test_resume_skips_system_prompt_file(self, tmp_path):
-        """When resuming a session, --system-prompt-file is not used."""
+    async def test_resume_still_passes_system_prompt_file(self, tmp_path):
+        """When resuming a session, --system-prompt-file is STILL used (task 3983).
+
+        The system prompt is a process-invocation parameter the session does not
+        carry, so a resumed invocation that omitted it ran under the stock Claude
+        Code prompt with no role charter.  The resume path therefore writes the
+        prompt to a temp file just like the fresh path — and that new temp file
+        must be swept by the same cleanup the fresh path relies on.
+        """
         captured_cmd = []
+        captured_sysprompt = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            # Read the sysprompt file HERE — spawn time is the only moment it is
+            # guaranteed to exist; _invoke_claude's `finally` unlinks it as soon
+            # as the call returns.
+            if '--system-prompt-file' in args:
+                idx = args.index('--system-prompt-file')
+                captured_sysprompt.append(Path(args[idx + 1]).read_text())
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -1029,14 +1265,75 @@ class TestLargePayloadHandling:
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
             await invoke_claude_agent(
                 prompt='continue',
-                system_prompt='ignored on resume',
+                system_prompt='You are a resumed role agent.',
                 cwd=tmp_path,
                 resume_session_id='sess-abc',
             )
 
         assert '--resume' in captured_cmd
-        assert '--system-prompt-file' not in captured_cmd
+        assert '--system-prompt-file' in captured_cmd
+        # The inline form must still never appear (ARG_MAX).
         assert '--system-prompt' not in captured_cmd
+        assert captured_sysprompt == ['You are a resumed role agent.']
+
+        # The newly-created resume temp file is swept by the existing cleanup.
+        idx = captured_cmd.index('--system-prompt-file')
+        file_path = captured_cmd[idx + 1]
+        assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
+
+    async def test_resume_carries_the_current_system_prompt(self, tmp_path):
+        """A resume runs under the CURRENT system prompt, not the original one.
+
+        This is the one caller-visible SEMANTIC consequence of task 3983, and it
+        only shows up when the two invocations differ: charter A opens the
+        session, charter B resumes it, and B is what reaches the process.  The
+        prompt is a process-invocation parameter the session does not carry, so
+        there is nothing to replay — whatever the resuming caller passes NOW is
+        the charter in force.
+
+        That matters because real call sites re-resolve the prompt at resume
+        time rather than passing a constant: `workflow._resolve_role_system_prompt(
+        role, model)` is a model-keyed PromptArtifactStore lookup, and recon
+        Stage 2 builds its prompt from `project_id`.  A crash-recovery resume
+        that re-resolves to a different model therefore legitimately swaps the
+        charter mid-transcript.  `build_claude_argv` documents this as the
+        intended semantics; this test holds it.
+        """
+        captured_sysprompts: list[str] = []
+
+        async def fake_exec(*args, **kwargs):
+            # Read at spawn time — the only moment the temp file exists, since
+            # _invoke_claude's `finally` unlinks it as soon as the call returns.
+            idx = args.index('--system-prompt-file')
+            captured_sysprompts.append(Path(args[idx + 1]).read_text())
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='start',
+                system_prompt='charter A',
+                cwd=tmp_path,
+                session_id='sess-abc',
+            )
+            await invoke_claude_agent(
+                prompt='continue',
+                system_prompt='charter B',
+                cwd=tmp_path,
+                resume_session_id='sess-abc',
+            )
+
+        assert captured_sysprompts == ['charter A', 'charter B'], (
+            'the resumed process must receive the prompt supplied at RESUME time'
+        )
 
 
 # ── session_id preallocation (crash-recovery resume) ──────────────────
@@ -2444,6 +2741,44 @@ class TestInvokeWithCapRetryOutcomeRouting:
             'invoke_with_cap_retry must classify the result via '
             'classify_invocation so CliLocalError precedence applies'
         )
+
+    async def test_unresolvable_resume_session_not_treated_as_cap(self):
+        """An unresolvable ``--resume`` must not mark a HEALTHY account CAPPED.
+
+        Exactly the reify-3604 shape, third instance (after the ``ServerError``
+        escape of 2026-07-29): a zero-cost, <=1-turn, sub-5s failure the CLI
+        produced entirely LOCALLY — it resolves the session id against the
+        on-disk transcript store and exits before contacting the API, so a usage
+        cap can never be the cause.  Without a positive non-cap attribution the
+        heuristic net takes its ``else`` branch and reports a SYNTHETIC cap hit,
+        churning the account pool through compounding cooldowns for an error the
+        API never saw.
+
+        LATENT-FRAGILITY hardening with ZERO live occurrences — real resume
+        failures currently exceed the net's 5000 ms floor — not an active
+        incident.  The stderr string and its placement were measured against
+        Claude Code CLI 2.1.236 on 2026-08-19.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = _make_result(
+            success=False, cost_usd=0, turns=1, duration_ms=400,
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  return_value=result) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        mock_invoke.assert_awaited_once()
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        assert got is result
 
     async def test_auth_failure_401_403_routes_via_outcome(self):
         """A 401/403 result routes to _handle_auth_failure + failover,
@@ -4504,3 +4839,558 @@ class TestBackendForwarding:
             'oauth_token': 'tok',
             'config_dir': None,
         }, f'invoke_claude_agent call shape changed unexpectedly (gated path): {call_kwargs}'
+
+
+# ── INV-4: the unreadable-transcript storm escape, wiring half (task 4003) ────
+
+_ESCAPE_NEEDLE = 'Transcript UNREADABLE'
+
+
+def _escape_records(caplog):
+    """The storm-escape WARNINGs emitted during a driven watchdog run.
+
+    The WARNING is the product here: `note_unreadable_transcript` deliberately
+    keeps no process-wide counter (nothing in production read one), so the log
+    record IS the observable and the assertion is made on it directly.
+    """
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and _ESCAPE_NEEDLE in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestUnreadableTranscriptEscapeWiring:
+    """The watchdog loop must surface an unreadable transcript, once, past grace.
+
+    The unit half (test_transcript_unreadable_escape.py) pins the helper. This
+    pins that the loop actually calls it, gated on the SAME wall-clock grace the
+    startup kill uses, latched to one record per crossing, and only for roles
+    configured to have a transcript.
+
+    The escape must not change any kill decision — "NEVER kill on None" stays
+    exactly as it is. It only makes the degrade observable.
+    """
+
+    @staticmethod
+    def _proc(run_secs: float = 0.25):
+        """A process whose communicate() stays pending across many watchdog polls."""
+        payload = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-escape',
+        }).encode()
+
+        async def _communicate(input=None):  # noqa: A002
+            await asyncio.sleep(run_secs)
+            return (payload, b'')
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=_communicate)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+        proc.pid = 4003
+        return proc
+
+    async def _drive(
+        self,
+        tmp_path,
+        *,
+        turns_side_effect,
+        config_dir,
+        session_id,
+        startup_grace_secs=0.0,
+        working_idle_secs=None,
+        absolute_cap_secs=None,
+    ):
+        """Run the watchdog loop at millisecond cadence with a patched transcript read."""
+        proc = self._proc()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=turns_side_effect,
+            ) as mock_turns,
+        ):
+            result = await _run_subprocess(
+                ['fake'],
+                cwd=tmp_path,
+                env={},
+                model='opus',
+                timeout_seconds=30.0,
+                session_id=session_id,
+                config_dir=config_dir,
+                startup_grace_secs=startup_grace_secs,
+                working_idle_secs=working_idle_secs,
+                absolute_cap_secs=absolute_cap_secs,
+            )
+
+        # The process exited normally — no kill decision was taken, which is the
+        # invariant the escape must not disturb.
+        assert result.timed_out is False, 'the escape must not change the kill decision'
+        return mock_turns
+
+    async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
+        """A transcript still unreadable past grace fires the escape exactly once.
+
+        This is the test that would have fired on 2026-07-18. Every poll of every
+        recon stage read None for three weeks and nothing said so.
+
+        ONCE, not once per poll: a wedged invocation polls its transcript for the
+        whole of a long run, and one WARNING per poll would bury the very signal
+        this exists to raise. The caller owns that latch.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must produce several polls for "once" to mean anything; '
+            f'got {mock_turns.call_count}'
+        )
+        records = _escape_records(caplog)
+        assert len(records) == 1, (
+            f'an always-unreadable transcript must fire exactly one escape over '
+            f'{mock_turns.call_count} polls; got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_no_escape_inside_grace(self, tmp_path, caplog):
+        """An unreadable transcript INSIDE the grace window is silent.
+
+        The gate is wall-clock, and this is the regime it exists to protect: the
+        session JSONL does not exist until the CLI writes its first record, and a
+        recon stage spawns with fused-memory + escalation MCP servers to
+        initialise first. A poll-count gate of 3 would fire ~15s after spawn and
+        so emit this WARNING once on every healthy invocation.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                # The driven run lasts ~0.25s; nothing may fire inside 30s.
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must actually poll for this to mean anything; '
+            f'got {mock_turns.call_count}'
+        )
+        records = _escape_records(caplog)
+        assert not records, (
+            f'no escape may fire inside grace over {mock_turns.call_count} polls; '
+            f'got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_no_escape_when_transcript_readable(self, tmp_path, caplog):
+        """A readable transcript never fires the escape, even with grace at zero."""
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
+
+        records = _escape_records(caplog)
+        assert not records, (
+            f'a readable transcript must not fire; got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_latch_clears_on_a_readable_read(self, tmp_path, caplog):
+        """A relapse after a readable read is a NEW crossing and fires again.
+
+        Alternates None/1 with the progress extension engaged, so ``seen_turn``
+        latches on the first readable poll and the loop keeps reading every poll
+        via the extension branch (without the extension it would short-circuit
+        all further reads and the alternation would be untestable). The idle and
+        absolute bounds are far beyond the ~0.25s run, so no kill is in play.
+        """
+        alternating = itertools.cycle([None, 1])
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: next(alternating),
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+                working_idle_secs=30.0,
+                absolute_cap_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 6, (
+            f'need several alternations for this to mean anything; '
+            f'got {mock_turns.call_count} polls'
+        )
+        records = _escape_records(caplog)
+        assert len(records) >= 2, (
+            f'each relapse after a readable read is a new crossing; got '
+            f'{[r.getMessage() for r in records]} over {mock_turns.call_count} polls'
+        )
+
+    async def test_no_escape_without_config_dir_or_session_id(self, tmp_path, caplog):
+        """A role with no transcript configured is out of scope and never fires.
+
+        The watchdog never reads a transcript for such a role, so its Nones mean
+        nothing — counting them would be noise, not signal. This is the scope
+        bound from the amendment.
+        """
+        for config_dir, session_id in (
+            (None, 'sid'),
+            (tmp_path / 'cfg', None),
+            (None, None),
+        ):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+                mock_turns = await self._drive(
+                    tmp_path,
+                    turns_side_effect=lambda *a, **k: None,
+                    config_dir=config_dir,
+                    session_id=session_id,
+                    startup_grace_secs=0.0,
+                )
+
+            assert mock_turns.call_count == 0, (
+                f'no transcript read is expected for config_dir={config_dir!r} '
+                f'session_id={session_id!r}; got {mock_turns.call_count} calls'
+            )
+            records = _escape_records(caplog)
+            assert not records, (
+                f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
+                f'got {[r.getMessage() for r in records]}'
+            )
+
+
+# ── stdin-starvation race (task 3147 / esc-3118-1) ───────────────────────────
+#
+# The confirmed root cause of the pre-turn `CLI_INPUT_REJECTED` burst: the
+# spawn path handed the child a bare PIPE and left the prompt bytes to be
+# written by the EVENT LOOP after `execve`.  The claude CLI gives up on an
+# empty stdin after ~3s and exits on argument validation, so any event-loop
+# stall >= that deadline in the window between exec and the parent's write
+# silently loses the run (turns=0, cost=0, timed_out=False).
+#
+# These tests reproduce that gap deterministically rather than probabilistically
+# (see the module's design note in cli_invoke._materialize_stdin): the failure
+# is not "load" per se, it is ">=3s of wall clock between child exec and the
+# parent's stdin write", so the tests inject exactly that gap.
+
+# The stubs and the loop-starving exec fake live in shared.testing_stdin —
+# ONE definition, imported by this suite and by orchestrator's sibling suite
+# for _run_subprocess_local.  Their stderr is coupled to
+# CLI_INPUT_REQUIRED_MARKERS by an import-time check in that module.
+
+
+@pytest.mark.asyncio
+class TestStdinStarvationRace:
+    """The prompt reaches the child even when the parent's loop stalls after spawn."""
+
+    @pytest.mark.timeout(30)
+    async def test_prompt_delivered_when_event_loop_starved_after_spawn(self, tmp_path):
+        """A 1.0s post-spawn loop stall must not cost the child its prompt.
+
+        RED before task 3147: the payload was written by the loop via
+        ``communicate(input=...)``, so the stalled parent missed the stub's
+        deadline and the child exited on argument validation with empty stdout.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        payload = b'X' * 4242
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(1.0),
+        ):
+            result = await _run_subprocess(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env={},
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
+        )
+        # The child received the WHOLE payload, not a truncated prefix.
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        # Neither production marker line may appear.
+        assert 'no stdin data received' not in result.stderr
+        assert 'Input must be provided' not in result.stderr
+
+    @pytest.mark.timeout(60)
+    async def test_concurrent_starved_spawns_each_receive_their_own_payload(self, tmp_path):
+        """8 concurrent spawns under ONE starved loop each get their own payload.
+
+        This is the "under load" coverage: genuine concurrency, used to prove
+        payload ISOLATION rather than to trigger the timing race (which the
+        injected loop block already makes deterministic).
+
+        RED against two plausible-but-wrong implementations:
+          * a pre-filled ``os.pipe()`` fix — every payload here exceeds the
+            65536-byte default pipe capacity, so ``os.write`` would block the
+            parent before spawn with no reader attached and deadlock until this
+            test's timeout;
+          * any shared or module-level scratch buffer — the payloads have
+            distinct lengths AND distinct content, and each result is matched
+            back to its own invocation by digest.
+        """
+        stub = tmp_path / 'digest_cli.py'
+        stub.write_text(STDIN_DIGEST_STUB)
+
+        # Distinct length AND distinct fill byte; every one >65536.
+        payloads = [bytes([65 + i]) * (70_000 + i * 1_000) for i in range(8)]
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(0.5),
+        ):
+            results = await asyncio.gather(*[
+                _run_subprocess(
+                    [sys.executable, str(stub)],
+                    tmp_path,
+                    env={},
+                    model=f'stub-{i}',
+                    timeout_seconds=40.0,
+                    stdin_data=payload,
+                )
+                for i, payload in enumerate(payloads)
+            ])
+
+        for i, (payload, result) in enumerate(zip(payloads, results, strict=True)):
+            expected = f'GOT:{len(payload)}:{hashlib.sha256(payload).hexdigest()[:16]}'
+            assert result.returncode == 0, (
+                f'spawn {i} rejected the invocation; stderr={result.stderr!r}'
+            )
+            assert result.stdout.strip() == expected, (
+                f'spawn {i} received the wrong payload — expected {expected}, '
+                f'got {result.stdout.strip()!r} (cross-wired or truncated)'
+            )
+
+    @pytest.mark.timeout(30)
+    async def test_stdin_survives_govern_and_nice_wrapper_chain(self, tmp_path):
+        """The pre-materialized payload survives the govern → nice → CLI exec chain.
+
+        The cpu-govern wrapper was named as a suspect for the original race and
+        was REFUTED as its cause (it is inert in the live deployment:
+        ``cpu_governance.exec_path`` is unset, so ``_cpu_govern_prefix`` emits
+        nothing).  But it remains a live risk to the FIX: ``cpu-governed-exec.sh``
+        execs ``systemd-run --user --scope``, and an exec chain that re-opened or
+        redirected fd 0 would silently destroy the pre-materialized payload.
+
+        The DF_AGENT_* pop assertions are kept alongside so the govern/nice env
+        contract stays pinned next to the stdin one.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        govern = tmp_path / 'cpu-governed-exec.sh'
+        govern.write_text('#!/bin/sh\n# consume the `--role <role> --` contract, then exec in place\nshift 3\nexec "$@"\n')
+        govern.chmod(0o755)
+
+        payload = b'Z' * 4242
+        captured_args: list = []
+        captured_kwargs: dict = {}
+        starving = make_starving_exec(1.0)
+
+        async def capturing_starving_exec(*args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+            return await starving(*args, **kwargs)
+
+        env = {
+            'DF_AGENT_CPU_GOVERN': str(govern),
+            'DF_AGENT_CPU_NICE': '10',
+            # `nice` is resolved by /bin/sh from the child's PATH.
+            'PATH': os.environ.get('PATH', ''),
+        }
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=capturing_starving_exec,
+        ):
+            result = await _run_subprocess(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env=env,
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        # The wrapper chain really was in play (govern outermost, nice inner).
+        assert captured_args[:7] == [
+            str(govern), '--role', 'task', '--', 'nice', '-n', '10',
+        ], f'expected govern-outermost nice-inner prefix; got {captured_args[:7]}'
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation through the wrapper chain; '
+            f'stderr={result.stderr!r}'
+        )
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        assert 'no stdin data received' not in result.stderr
+
+        # Both DF_* keys stripped from the child env.
+        child_env = captured_kwargs.get('env', {})
+        assert 'DF_AGENT_CPU_GOVERN' not in child_env
+        assert 'DF_AGENT_CPU_NICE' not in child_env
+
+    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
+        """stdin_data=None must still spawn with stdin=None (inherited).
+
+        Pins the contract _run_subprocess's own docstring states — "``None``
+        leaves stdin inherited from the parent" — and mirrors the sibling
+        assertion on orchestrator's _run_subprocess_local.  Without it, a
+        refactor that unconditionally materialized (handing the child an EMPTY
+        temp file) would hand every stdin_data=None caller instant EOF on fd 0
+        instead of the parent's own stdin, and nothing here would notice:
+        test_proc_tree_populated_on_real_timeout spawns a real `sleep 30`,
+        which neither reads stdin nor cares what it is.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['true'],
+                tmp_path,
+                env={},
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=None,
+            )
+
+        assert 'stdin' in captured_kwargs
+        assert captured_kwargs['stdin'] is None, (
+            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
+        )
+
+
+class TestMaterializeStdin:
+    """The helper's two deliberate, load-bearing promises (task 3147).
+
+    Both are asserted in ``_materialize_stdin``'s docstring and neither was
+    otherwise executed by any test, so a refactor could have quietly dropped
+    either one with the whole suite still green.
+    """
+
+    def test_write_failure_propagates_and_closes_the_file(self):
+        """An OSError mid-write escapes, with the fd already closed.
+
+        "Raises rather than falling back to ``stdin=PIPE``" is grounded in the
+        ``no-silent-fail-soft`` design invariant: an ``except OSError: return
+        None`` fallback would reinstate the bare PIPE — and therefore the exact
+        task-3147 race — in precisely the degraded conditions (disk pressure,
+        exhausted fds) where the event loop is most likely to be stalled.
+
+        The fd-leak half is asserted on the REAL file object's ``.closed``
+        rather than by counting ``/proc/self/fd`` entries: it is the same fact,
+        stated directly, and immune to an unrelated fd opened by pytest between
+        the two counts.
+        """
+        # noqa SIM115: the whole point is a handle that outlives the `with` —
+        # it must still be inspectable (`.closed`) after the call under test.
+        real = tempfile.TemporaryFile()  # noqa: SIM115
+        try:
+            proxy = MagicMock(wraps=real)
+            proxy.write.side_effect = OSError(28, 'No space left on device')
+
+            with (
+                patch('shared.cli_invoke.tempfile.TemporaryFile', return_value=proxy),
+                pytest.raises(OSError),
+            ):
+                _materialize_stdin(b'payload')
+
+            proxy.close.assert_called_once()
+            assert real.closed, (
+                '_materialize_stdin leaked the fd on the write-failure path'
+            )
+        finally:
+            if not real.closed:
+                real.close()
+
+    def test_tempfile_creation_failure_propagates(self):
+        """Fd exhaustion at creation raises too — no fallback arm anywhere."""
+        with (
+            patch(
+                'shared.cli_invoke.tempfile.TemporaryFile',
+                side_effect=OSError(24, 'Too many open files'),
+            ),
+            pytest.raises(OSError),
+        ):
+            _materialize_stdin(b'payload')
+
+    def test_child_receives_a_read_only_unlinked_fd(self):
+        """The fd handed to the child is O_RDONLY, unlinked, and at offset 0.
+
+        ``tempfile.TemporaryFile()`` opens ``O_RDWR``, and fd 0 is inherited by
+        the child's whole subtree (bwrap, the systemd-run scope, nice, the CLI,
+        and every tool the agent spawns).  The pipe this replaced gave the child
+        a read-only end, so the narrowing keeps that capability unchanged.
+        """
+        f = _materialize_stdin(b'payload')
+        try:
+            accmode = fcntl.fcntl(f.fileno(), fcntl.F_GETFL) & os.O_ACCMODE
+            assert accmode == os.O_RDONLY, (
+                f'child stdin is writable (accmode={accmode}); the agent subtree '
+                f'can write to its own prompt'
+            )
+            # Still O_TMPFILE-unlinked: no name in the filesystem namespace.
+            assert os.readlink(f'/proc/self/fd/{f.fileno()}').endswith('(deleted)')
+            assert f.tell() == 0
+            assert f.read() == b'payload'
+        finally:
+            f.close()
+
+    def test_read_only_narrowing_is_best_effort(self, caplog):
+        """A failed narrowing degrades to the read-write fd, loudly.
+
+        The narrowing is defense-in-depth; the race-closing invariant (payload
+        resident in the kernel before execve) holds either way.  So a host
+        where ``/proc`` is unavailable must still spawn — it must NOT lose every
+        agent — and it must say so rather than degrade silently.
+        """
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('shared.cli_invoke.open', side_effect=OSError(2, 'No such file')),
+        ):
+            f = _materialize_stdin(b'payload')
+        try:
+            assert f.tell() == 0, 'fallback handle is not rewound'
+            assert f.read() == b'payload', 'fallback handle lost the payload'
+        finally:
+            f.close()
+
+        assert any(
+            'read-only fd' in r.message for r in caplog.records
+        ), f'narrowing was skipped silently; records={[r.message for r in caplog.records]}'

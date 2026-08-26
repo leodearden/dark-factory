@@ -27,11 +27,17 @@ Test coverage:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from orchestrator import verify_classify
-from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
+from orchestrator.verify_categories import (
+    CATEGORY_POLICY,
+    INFRA_TRANSIENT_CATEGORIES,
+    FailureCategory,
+    RetryKind,
+)
 from orchestrator.verify_cmd import ToolKind
 
 # Every recognised tool identity, including OPAQUE — the guards in step-1
@@ -822,15 +828,30 @@ _SLOT_TIMEOUT_LANE_X_OUTPUT = (
     '(LOCK=/tmp/reify-lane-x.lock)\n'
 )
 
-# reify companion task — NOT emitted by reify today (verified by grep over
-# reify `scripts/` on 2026-08-05). Same column-0, first-token `@@REIFY_*@@`
-# emission contract as scripts/lib_clock_stop.sh:141, so DF can detect it the
-# moment reify starts emitting it. This asserts DF's OWN classifier behaviour
-# on an anchored line — a capability this task delivers and verifies
-# first-hand — NOT that reify emits the line; it is a COMPLEMENT to the three
-# grounded anchors above and never the sole positive.
+# task 4212 update: this shape predates reify 6024's `disposition` field
+# (invented by task 3679, before reify emitted `@@REIFY_SLOT_TIMEOUT@@` at
+# all — same column-0, first-token `@@REIFY_*@@` emission contract as
+# scripts/lib_clock_stop.sh:141). It is retained DELIBERATELY, now doing
+# double duty as the FIELD-ABSENT / older-reify compatibility shape: a
+# sentinel line with no `disposition=` token at all. reify's emit is
+# prefix-compatible with the anchor, so this must keep classifying
+# SEMAPHORE_TIMEOUT unchanged — pinned, across every ToolKind, by this
+# corpus entry's membership below in `TestGroundedSlotTimeoutMarkersAreDetected`;
+# see `_has_fatal_slot_timeout_sentinel`'s fail-safe-direction docstring
+# (verify_classify.py) for why an absent field classifies rather than demotes.
 _SLOT_TIMEOUT_SENTINEL_OUTPUT = (
     '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
+)
+
+# reify scripts/lib_test_semaphore.sh via slot_acquire's `fatal` default (the
+# 6th arg all three wrapper paths omit) — task 4212's fatal-disposition
+# counterpart to `_SLOT_TIMEOUT_SOFT_POOL_OUTPUT` (defined in the task-4212
+# section below). Defined here, alongside the other grounded sentinel/
+# basename shapes and ahead of `_ANCHORED_SLOT_TIMEOUT_SHAPES`, rather than
+# in that later section, so step-5 (task 4212) can add it to this corpus.
+_SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+    'disposition=fatal lock=/tmp/reify-test-slot.lock\n'
 )
 
 # reify scripts/lib_test_semaphore.sh:170-173 — when REIFY_TEST_SEMAPHORE_WAIT
@@ -851,14 +872,118 @@ _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT = (
 # nothing, even though the anchoring is the heart of task 3679.
 _SLOT_TIMEOUT_INDENTED_OUTPUT = '    ' + _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT
 
-_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [
-    _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT,
-    _SLOT_TIMEOUT_OCCT_OUTPUT,
-    _SLOT_TIMEOUT_LANE_X_OUTPUT,
-    _SLOT_TIMEOUT_SENTINEL_OUTPUT,
-    _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT,
-    _SLOT_TIMEOUT_INDENTED_OUTPUT,
+# Named (name, output) pairs — same shape as _ALL_COLLATERAL_SHAPES below —
+# so a cross-product against another axis (task 4126) gets legible pytest ids
+# instead of positional ones. _GROUNDED_SLOT_TIMEOUT_OUTPUTS is DERIVED from
+# this, not re-spelled, keeping exactly one literal per producer line (the
+# discipline stated above).
+_ANCHORED_SLOT_TIMEOUT_SHAPES: list[tuple[str, str]] = [
+    ('test_semaphore', _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT),
+    ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
+    ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
+    ('sentinel', _SLOT_TIMEOUT_SENTINEL_OUTPUT),
+    ('sentinel_fatal', _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT),
+    ('unlimited_wait', _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT),
+    ('indented', _SLOT_TIMEOUT_INDENTED_OUTPUT),
 ]
+
+_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [output for _, output in _ANCHORED_SLOT_TIMEOUT_SHAPES]
+
+
+# ---------------------------------------------------------------------------
+# task 4212 — reify task 6024 landed `disposition=<fatal|soft>` as
+# `slot_acquire`'s optional 6th argument (reify scripts/lib_slot_acquire.sh:147,
+# closed vocabulary documented at reify docs/notes/verify-pipeline-knobs.md:
+# 74-77; default `fatal`, taken by all three wrapper call sites whose grounded
+# shapes make up `_ANCHORED_SLOT_TIMEOUT_SHAPES` above). Exactly ONE caller
+# passes `soft`: reify tests/infra/run_all.sh:1692's pool worker
+# (run_all.sh:1398-1427). Its rc=75 is a SOFT ADMISSION — the worker proceeds
+# UNSLOTTED, the member still runs, and run_all itself still exits 0 — not an
+# infra hold. That pool wait is deliberately NOT one of the three basenames
+# `_SLOT_ACQUIRE_DEADLINE_RE` allowlists (run_all.sh:1398-1408 states this
+# explicitly), so the `@@REIFY_SLOT_TIMEOUT@@` sentinel is the pool's ONLY
+# classification route, which is exactly why a `disposition=soft` sentinel
+# must not classify SEMAPHORE_TIMEOUT.
+#
+# RED today (measured against the live module on this branch, not assumed):
+# every case below classifies `semaphore_timeout`.
+# ---------------------------------------------------------------------------
+
+# reify tests/infra/run_all.sh:1692 — the pool worker, the ONLY caller
+# that passes slot_acquire's 6th arg as `soft`. Its rc=75 is a SOFT
+# ADMISSION: the worker proceeds unslotted, the member still runs, and
+# run_all still exits 0. Deliberately NOT one of the three basenames in
+# _SLOT_ACQUIRE_DEADLINE_RE (run_all.sh:1398-1408), so this sentinel is
+# the pool's only classification route — which is why the gate belongs
+# on the sentinel arm.
+_SLOT_TIMEOUT_SOFT_POOL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 waited=1800 '
+    'disposition=soft lock=/tmp/reify-run-all-pool.lock\n'
+)
+
+# Deliberately NOT added to `_ANCHORED_SLOT_TIMEOUT_SHAPES` above: that list
+# is the "must classify SEMAPHORE_TIMEOUT" corpus feeding
+# `_SLOT_TIMEOUT_WITH_COLLATERAL_CASES` below — the soft shape's contract is
+# the opposite.
+
+
+class TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout:
+    """task 4212: a `disposition=soft` slot-timeout sentinel is a degraded-
+    but-healthy pool admission (reify run_all.sh's pool worker proceeding
+    unslotted), not an infra hold, and must not classify SEMAPHORE_TIMEOUT —
+    mirroring `TestGroundedSlotTimeoutMarkersAreDetected`'s tool-blind style,
+    since a soft admission is equally not-a-timeout regardless of which
+    tool's command was waiting on the pool."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_semaphore_timeout(self, tool):
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft slot-timeout sentinel must not classify '
+            f'semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_infra_transient(self, tool):
+        """The operationally meaningful half, mirroring
+        ``TestDeterministicLintFailureIsNotSemaphoreTimeout.
+        test_deterministic_fault_is_not_infra_transient``'s stated reasoning:
+        merely asserting ``!= SEMAPHORE_TIMEOUT`` would still pass if the
+        output were relabelled to some other infra-transient category, which
+        would reproduce the incident this task exists to close (a red routed
+        into the bounded infra-retry loop, terminating in a blocking human
+        escalation, instead of reaching the debugger). The concrete post-fix
+        category is asserted too, so this cannot pass vacuously."""
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'a disposition=soft-only output with no other signal must fall '
+            f'through to unknown_test_failure, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft slot-timeout sentinel must not land in an '
+            f'infra-transient category (it would be silently retried), got '
+            f'{result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
+    @pytest.mark.parametrize('order', ['soft_first', 'pytest_first'])
+    def test_soft_pool_sharing_a_leg_with_a_real_test_failure_keeps_test_failure(
+        self, order, tool
+    ):
+        """task 4212 / the misfiling incident itself: a genuine pytest red
+        sharing ONE aggregated leg with a degraded-but-healthy pool (a soft
+        admission, not an infra hold) must keep its real cause —
+        ``_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT`` is the task-2821
+        grounded golden from the reify 2026-07-19 red-main incident."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT
+        else:
+            output = _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'a genuine pytest verdict sharing a leg with a soft pool '
+            f'admission must keep classifying test_failure, got {result!r}'
+        )
 
 
 class TestGroundedSlotTimeoutMarkersAreDetected:
@@ -1521,6 +1646,970 @@ class TestBrokenWorktreeOrderingNegatives:
         )
 
 
+# ---------------------------------------------------------------------------
+# task 4126, recovered from the task-3679 review: verify_classify.py:421 has
+# cited a class named ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``
+# since task 3679 landed, but no such class existed anywhere in the repo —
+# the ORDERING note's co-occurrence tie (an anchored slot-timeout marker and
+# a merge-verify restart-collateral shape in ONE aggregated output) was
+# documented but never pinned.
+#
+# GREEN today (measured against the live module on this branch, not
+# assumed): every slot-shape x collateral-shape x order x ToolKind
+# combination already classifies ENV_TRANSIENT — the arm order in
+# ``_classify_environmental`` already resolves the tie correctly. The corpus
+# below samples that full cross-product at ``ToolKind.OPAQUE`` plus one
+# representative non-opaque tool rather than re-crossing every ``ToolKind``,
+# because guard 3 runs before any per-tool dispatch and its tool-blindness is
+# already pinned, tool-by-tool, by ``TestMergeVerifyCollateralEnvGuard``
+# above. The defect is missing PROTECTION of the ordering, not wrong
+# behaviour, so this class is green on arrival by design; see its docstring
+# for the mutation-kill that supplies the RED half.
+# ---------------------------------------------------------------------------
+
+_SLOT_TIMEOUT_WITH_COLLATERAL_CASES: list[tuple[str, str]] = [
+    (f'{slot_name}+{shape_name}:{order_name}', combined)
+    for slot_name, slot in _ANCHORED_SLOT_TIMEOUT_SHAPES
+    for shape_name, collateral in _ALL_COLLATERAL_SHAPES
+    for order_name, combined in (
+        ('slot_first', slot + collateral),
+        ('collateral_first', collateral + slot),
+    )
+]
+
+# `pytest.param(..., id=case_id)` so pytest node ids surface the compact
+# combination name (e.g. `sentinel+getcwd:collateral_first`) instead of
+# embedding the raw fixture text positionally.
+_SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS = [
+    pytest.param(case_id, output, id=case_id)
+    for case_id, output in _SLOT_TIMEOUT_WITH_COLLATERAL_CASES
+]
+
+# Guard 3 (`_classify_environmental`) runs BEFORE any per-tool dispatch and
+# is tool-blind by construction (it never even receives `tool`); that
+# tool-blindness is already pinned, cross-producted over every ToolKind, by
+# `TestMergeVerifyCollateralEnvGuard` and `TestGroundedSlotTimeoutMarkersAreDetected`
+# above. Re-crossing ALL_TOOL_KINDS here would multiply the same 70 real
+# cases (task 4212 grew this from 60 by adding the `sentinel_fatal` shape to
+# `_ANCHORED_SLOT_TIMEOUT_SHAPES`) by 7 identical code paths for no added
+# detection power — confirmed by mutation-kill: hoisting the SEMAPHORE_TIMEOUT arm
+# (verify_classify.py:571-572) above the ENV_TRANSIENT branches flips every
+# case in this corpus regardless of which ToolKind carries it, so any single
+# tool already kills the mutant. OPAQUE (the generic fallback) plus PYTEST
+# (the one ToolKind with its own, unrelated ENV_TRANSIENT path —
+# `_ENV_TRANSIENT_PATTERNS` above — so this also shows guard 3's tie-break
+# winning even for a tool with an overlapping category of its own) is enough
+# to demonstrate the tool-blindness locally without re-paying that cost.
+_REPRESENTATIVE_TOOL_KINDS = (ToolKind.OPAQUE, ToolKind.PYTEST)
+
+
+class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
+    """task 4126 (recovered from the task-3679 review): pins the
+    co-occurrence tie the ORDERING note in ``_classify_environmental``'s
+    docstring documents — an anchored slot-timeout marker (the
+    ``_ANCHORED_SLOT_TIMEOUT_SHAPES`` corpus above) co-occurring, in ONE
+    aggregated output, with a merge-verify restart-collateral shape (the
+    ``_ALL_COLLATERAL_SHAPES`` corpus above) — which resolves ENV_TRANSIENT,
+    not SEMAPHORE_TIMEOUT, because the removed worktree is the more specific
+    root cause and the only one of the two with a recovery path.
+
+    The category-pin method below,
+    ``test_anchored_slot_timeout_with_collateral_is_env_transient``,
+    parametrizes the full slot-shape x collateral-shape x order
+    cross-product at ``ToolKind.OPAQUE`` and one representative non-opaque
+    tool (``_REPRESENTATIVE_TOOL_KINDS`` above), not the full
+    ``ALL_TOOL_KINDS`` axis: guard 3 runs before any per-tool dispatch and is
+    tool-blind by construction, and that tool-blindness is already
+    cross-producted over every ``ToolKind`` by
+    ``TestMergeVerifyCollateralEnvGuard`` above, so re-crossing it here
+    would add cases with no added detection power.
+
+    GREEN ON ARRIVAL, by design: every combination below already classifies
+    ENV_TRANSIENT on this branch (measured before this class was written),
+    because the three ENV_TRANSIENT branches in ``_classify_environmental``
+    are all evaluated before the SEMAPHORE_TIMEOUT arm. The defect this
+    class fixes is that nothing PINNED that ordering, not that the ordering
+    was wrong — so there is no failing assertion to author.
+
+    The RED half is instead a recorded mutation-kill: hoisting the
+    SEMAPHORE_TIMEOUT arm (``_SLOT_TIMEOUT_SENTINEL_RE`` /
+    ``_SLOT_ACQUIRE_DEADLINE_RE``, verify_classify.py:571-572) to sit
+    immediately after the two DISK_FULL checks and before
+    ``_VERIFY_ENV_BROKEN_RE`` flips every one of this class's cases to
+    SEMAPHORE_TIMEOUT (measured), while
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``,
+    ``TestMergeVerifyCollateralEnvGuard``,
+    ``TestGroundedSlotTimeoutMarkersAreDetected`` and
+    ``TestBrokenWorktreeOrderingNegatives`` all stay green under that same
+    mutation (also measured) — demonstrating, not merely asserting, the
+    ORDERING note's claim that the replayed 5164/5071 fixtures "pin nothing
+    about this tie". See the task-4126 commit message for both recorded
+    runs.
+
+    The narrowness side — an anchored slot timeout with NO collateral still
+    classifies SEMAPHORE_TIMEOUT — is deliberately NOT re-asserted here: it
+    is already pinned once, by ``TestBrokenWorktreeOrderingNegatives.
+    test_genuine_slot_timeout_without_collateral_stays_semaphore_timeout``
+    and by ``TestGroundedSlotTimeoutMarkersAreDetected`` above."""
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
+    def test_anchored_slot_timeout_with_collateral_is_env_transient(self, tool, case_id, output):
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.ENV_TRANSIENT, (
+            f'case {case_id!r} must classify ENV_TRANSIENT (not SEMAPHORE_TIMEOUT) '
+            f'under {tool!r}, got {result!r}'
+        )
+
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
+    def test_anchored_slot_timeout_with_collateral_keeps_recovery_path(self, case_id, output):
+        """Pins the CONSEQUENCE the ORDERING note names, not just the label:
+        ENV_TRANSIENT carries a bounded self-recovery
+        (``RetryKind.ENV_SERIAL``), where SEMAPHORE_TIMEOUT's
+        ``RetryKind.NONE`` would instead surface to a human."""
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL, (
+            f'case {case_id!r} must keep the ENV_SERIAL recovery path (not '
+            f"SEMAPHORE_TIMEOUT's blocking RetryKind.NONE), got {result!r}"
+        )
+        assert result in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 4212 (continued from the section above `_ANCHORED_SLOT_TIMEOUT_SHAPES`,
+# see that section for the disposition-gate grounding): step-2's whole-output
+# `disposition=soft` search is the simplest change that turns
+# `TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout` above green, and it is
+# wrong in two measurable ways this section pins. Placed here, after
+# `_REPRESENTATIVE_TOOL_KINDS` is defined, rather than alongside the rest of
+# the task-4212 fixtures above, purely so its cases can use that same
+# representative-tool axis — task 4126's stated rationale for why
+# re-crossing every ToolKind on a combination axis adds no detection power
+# applies identically here (guard 3 runs before any per-tool dispatch and is
+# tool-blind by construction; that tool-blindness is already cross-producted
+# over every ToolKind by `TestGroundedSlotTimeoutMarkersAreDetected` and
+# `TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout` above).
+#
+# RED under step-2 (measured against that tree, not assumed): cases (a) and
+# (b) below classify `unknown_test_failure` / `unknown_test_failure` — the
+# whole-output soft search suppresses a co-occurring genuine starvation
+# abort. Cases (c) and (d) are GREEN ON ARRIVAL under step-2 and are pinned
+# anyway, as guards against a future refactor: (c) against hoisting the soft
+# check above the whole arm, (d) against step-4's head-of-line disposition
+# parse regressing the narrowness of the fix in the other direction.
+# ---------------------------------------------------------------------------
+
+
+class TestSoftDispositionDoesNotVetoAGenuineSlotTimeout:
+    """task 4212: step-2's whole-output `disposition=soft` search is wrong in
+    two ways this class pins — a soft line must never veto a co-occurring
+    FATAL slot timeout (verify hands this classifier the ENTIRE aggregated
+    leg output, so a degraded pool and a genuine starved test slot CAN
+    co-occur in one leg), and the operator-controlled `lock=` tail must not
+    be able to forge or suppress the disposition (reify's field-order
+    contract puts `lock=` last precisely because it is the one field an
+    operator controls)."""
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize('order', ['soft_first', 'fatal_first'])
+    def test_cooccurring_fatal_sentinel_is_not_vetoed_by_a_soft_one(self, order, tool):
+        """(a) RED under step-2: a soft pool deadline and a fatal test-slot
+        deadline in ONE output — the whole-output soft search suppresses the
+        arm entirely, when only the co-occurring soft LINE should ever be
+        demoted."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT
+        else:
+            output = _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a genuine fatal slot timeout sharing a leg with a soft pool '
+            f'admission must still classify semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_lock_path_forging_the_soft_token_does_not_suppress_a_fatal_sentinel(self, tool):
+        """(b) RED under step-2: the OPERATOR-controlled lock base
+        (`REIFY_TEST_SEMAPHORE_LOCK` et al.) is the one field reify's own
+        field-order contract treats as untrusted; a fatal sentinel whose lock
+        path happens to embed the literal `disposition=soft` token must still
+        classify semaphore_timeout."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+            'disposition=fatal lock=/tmp/df-4212-disposition=soft.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=fatal sentinel must not be suppressed by a lock '
+            f'path that happens to embed the literal disposition=soft token, '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize(
+        ('basename_name', 'basename_output'),
+        [
+            ('test_semaphore', _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT),
+            ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
+            ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
+        ],
+    )
+    @pytest.mark.parametrize('order', ['soft_first', 'basename_first'])
+    def test_soft_sentinel_does_not_suppress_a_cooccurring_basename_deadline(
+        self, order, basename_name, basename_output, tool
+    ):
+        """(c) Green already under step-2 (the ``or`` keeps the ungated
+        basename half live) — pinned anyway as a guard against a future
+        refactor that hoists the soft check above the whole arm."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + basename_output
+        else:
+            output = basename_output + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'basename shape {basename_name!r} co-occurring with a soft pool '
+            f'sentinel must still classify semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_lock_path_forging_the_fatal_token_does_not_promote_a_soft_sentinel(self, tool):
+        """(d) CONVERSE FORGERY, green already under step-2 — pinned so
+        step-4's head-of-line parse cannot regress it in the other
+        direction: a soft sentinel whose lock path happens to embed the
+        literal `disposition=fatal` token must still be treated as soft."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 waited=1800 '
+            'disposition=soft lock=/tmp/df-4212-disposition=fatal.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft sentinel must not be promoted by a lock '
+            f'path that happens to embed the literal disposition=fatal '
+            f'token, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft sentinel forged with a disposition=fatal '
+            f'lock path must still avoid every infra-transient category, '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_unrecognized_disposition_token_is_treated_as_fatal(self, tool):
+        """(e) Fail-safe-direction pin: `_has_fatal_slot_timeout_sentinel`'s
+        docstring promises an unrecognized future token is treated as NOT
+        soft. reify's disposition vocabulary is closed to `fatal`/`soft`
+        today (docs/notes/verify-pipeline-knobs.md:74-77), so `deferred` is
+        a deliberately-invented future/unknown token, not a grounded shape —
+        it exists solely to pin the documented fail-safe direction.
+        Mutation-killing: a whitelist read (`token == 'fatal'`) in place of
+        the documented blacklist (`token != 'soft'`) would silently demote
+        this to `unknown_test_failure`."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+            'disposition=deferred lock=/tmp/reify-test-slot.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'an unrecognized disposition token must be treated as fatal '
+            f'(fail-safe direction), got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_soft_disposition_with_no_lock_field_is_still_demoted(self, tool):
+        """(f) Every `_SLOT_TIMEOUT_SOFT_POOL_OUTPUT`-derived fixture used
+        elsewhere in this module carries a trailing ` lock=` field, so the
+        no-lock (`head = tail`) branch of `_has_fatal_slot_timeout_sentinel`'s
+        parse is otherwise never exercised. `slot_acquire`'s `lock=%s`
+        argument is always populated in practice, so this is a defensive-
+        parse pin rather than a grounded producer shape. Mutation-killing: a
+        parse that only ever looked at `tail[:lock.start()]` (assuming a
+        match) would raise ``AttributeError`` on this input instead of
+        falling back to the whole tail."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 '
+            'waited=1800 disposition=soft\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'still be demoted, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'not land in an infra-transient category, got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 4492 — guard 3 must be scoped to the output that is NOT covered by a
+# passing suite's attestation, so an aggregated `run_all.sh` transcript stops
+# being classified as host-infra trouble on the strength of marker lines
+# emitted by suites that reported ZERO failures.
+#
+# The producer framing this pins is reify tests/infra/run_all.sh, read at
+# c09a26b5b1 — four emit sites, all the same two shapes:
+#     :1222 / :1226-1228          H9 path
+#     :1274 / :1293-1308          member-subset path (the only SKIP emitter)
+#     :1772 / :1792-1806          H2 concurrent-pool path
+#     :1840 / :1850               legacy all-serial fallback
+#
+#     ^--- Running: <name> ---                 (open,  column 0)
+#     ^  RESULT: (PASS|FAIL|SKIP) (<name>)     (close, two-space indent,
+#                                               optional trailing
+#                                               " [flaky: passed on serial retry]")
+#
+# Two facts from that source that the contract below depends on:
+#   * Blocks are ATOMIC. Phase 2 buffers each member's output to its own file
+#     and Phase 3 (:1767-1810) replays it under its own header in discovered
+#     order, so the concurrent pool cannot interleave two blocks.
+#   * `--- attempt 1 (concurrent pool) ---` / `--- attempt 2 (serial retry) ---`
+#     (:1783-1789) deliberately do NOT match `^--- Running: ` — run_all.sh says
+#     so in a comment at :1776, to keep its one-header-per-discovered-test
+#     contract intact. They are ordinary interior lines here too.
+#
+# RED today: `_redact_passed_suite_blocks` does not exist, so every test in
+# this class fails with AttributeError. Referenced directly (never via
+# getattr-with-default) so the step cannot pass vacuously.
+# ---------------------------------------------------------------------------
+
+_PASS_CLOSE = '  RESULT: PASS (t.sh)'
+_FAIL_CLOSE = '  RESULT: FAIL (t.sh)'
+_SKIP_CLOSE = '  RESULT: SKIP (t.sh)'
+_OPEN = '--- Running: t.sh ---'
+
+# A marker line of the kind guard 3 keys on, used as the interior payload so
+# each case reads as "would this evidence survive?" rather than as an opaque
+# string shuffle.
+_INTERIOR_MARKER = (
+    'lib_test_semaphore.sh: failed to acquire test slot within 0s '
+    '(LOCK=/tmp/reify-test-semaphore-1000.lock, N=1))'
+)
+
+
+class TestRedactPassedSuiteBlocks:
+    """task 4492: the scoping helper's unit contract.
+
+    The helper blanks the INTERIOR of every run_all block whose open header
+    and `RESULT: PASS` close agree on the suite name, and leaves literally
+    everything else alone. Every ambiguous framing shape (name mismatch,
+    unclosed block, SKIP, FAIL, no framing at all) must redact NOTHING, so
+    the failure direction is always "detect exactly as before", never
+    "detect less" — that fail-safe direction is what bounds the blast radius
+    of wiring this into guard 3 (step-4).
+    """
+
+    # -- (a) IDENTITY ON UNFRAMED OUTPUT -----------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            '',
+            'FAILED tests/test_x.py::test_y - assert 1 == 2\n',
+            'error[E0308]: mismatched types\n  --> src/lib.rs:4:9\n',
+        ],
+        ids=['empty', 'pytest_blob', 'rustc_blob'],
+    )
+    def test_unframed_output_returns_the_same_object(self, text):
+        """`is`, not just `==`. A refactor that rebuilds an equal-but-new
+        string on the no-op path would still be correct-by-value, but it
+        would erase the cheap proof that non-reify projects and
+        non-aggregated tools are byte-identically unaffected."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text, (
+            'the no-op path must return the INPUT OBJECT, so "unframed '
+            'output is untouched" is an assertable property rather than a claim'
+        )
+
+    @pytest.mark.parametrize('output', _GROUNDED_SLOT_TIMEOUT_OUTPUTS)
+    def test_grounded_slot_timeout_corpus_round_trips_identically(self, output):
+        """The whole existing grounded corpus carries no run_all framing, so
+        every entry must survive the helper as the same object — this is what
+        makes step-5's preservation controls meaningful rather than lucky."""
+        result = verify_classify._redact_passed_suite_blocks(output)
+        assert result is output
+
+    # -- (b) PASS BLOCK INTERIOR IS BLANKED ---------------------------------
+
+    def test_pass_block_interior_is_removed_and_framing_survives(self):
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result, (
+            'the interior of a PASSED suite carries no evidence about the '
+            'failure and must be blanked'
+        )
+        assert _OPEN in result
+        assert _PASS_CLOSE in result
+
+    # -- (c) BYTE-STRUCTURE PRESERVED ---------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n\nstill interior\n{_PASS_CLOSE}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_FAIL_CLOSE}\n',
+            'no framing at all\n',
+        ],
+        ids=[
+            'trailing_newline',
+            'no_trailing_newline',
+            'blank_line_in_interior',
+            'fail_block',
+            'unframed',
+        ],
+    )
+    def test_line_structure_is_preserved(self, text):
+        """Blanking rather than deleting keeps a redacted log line-addressable
+        against the original during triage, and cannot create a new adjacency
+        between two previously-separated lines."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result.count('\n') == text.count('\n')
+        assert len(result.split('\n')) == len(text.split('\n'))
+
+    # -- (d) FAIL AND SKIP BLOCKS ARE NOT TOUCHED ---------------------------
+
+    @pytest.mark.parametrize(
+        'close', [_FAIL_CLOSE, _SKIP_CLOSE], ids=['fail', 'skip']
+    )
+    def test_non_pass_blocks_are_returned_verbatim(self, close):
+        """SKIP is treated as NOT-attested for the same reason FAIL is: a
+        skipped suite never asserted the host was healthy, so a marker inside
+        it is still evidence."""
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{close}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    # -- (e) FLAKY SUFFIX STILL CLOSES A PASS BLOCK -------------------------
+
+    def test_flaky_suffix_closes_a_pass_block(self):
+        """run_all.sh:1792. The retried member archives BOTH attempts under
+        one header; the two attempt delimiters are ordinary interior lines
+        (they deliberately do not match `^--- Running: `, run_all.sh:1776)."""
+        close = '  RESULT: PASS (t.sh) [flaky: passed on serial retry]'
+        text = (
+            f'{_OPEN}\n'
+            '--- attempt 1 (concurrent pool) ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '--- attempt 2 (serial retry) ---\n'
+            'second attempt output\n'
+            f'{close}\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result
+        assert '--- attempt 1 (concurrent pool) ---' not in result, (
+            'the attempt delimiters are interior lines of the PASSED block, '
+            'not headers, so they are blanked with the rest of the interior'
+        )
+        assert _OPEN in result
+        assert close in result
+
+    # -- (f) NAME MISMATCH IS FAIL-SAFE -------------------------------------
+
+    def test_name_mismatch_redacts_nothing(self):
+        """The nesting guard. reify ships suites that test run_all.sh itself
+        and can replay its transcript; without the name check a nested
+        `RESULT: PASS (inner)` could close — and thus silently delete the
+        evidence inside — an outer block."""
+        text = (
+            '--- Running: a.sh ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '  RESULT: PASS (b.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    def test_indented_quoted_framing_cannot_open_a_block(self):
+        """The OPEN pattern's hard column-0 anchoring, pinned (amendment,
+        review #2).
+
+        `_RUN_ALL_SUITE_OPEN_RE` deliberately carries NO `^[ \\t]*` tolerance
+        even though the CLOSE pattern does, because reify suites that assert
+        on run_all's own output contract QUOTE `--- Running: ` inside indented
+        `  PASS: ...` assertion prose (two such lines in the 4492 sample log,
+        at source L8934/L9254 — see the fixture's PROVENANCE.md; neither falls
+        inside the five retained `sed` ranges, so the excerpt alone cannot
+        catch this).
+
+        Unlike every other shape in this class, relaxing that anchor fails in
+        the UNSAFE direction rather than the fail-safe one: an indented quoted
+        header inside a FAILING suite's prose would OPEN a spurious block, a
+        later quoted `  RESULT: PASS (y.sh)` would CLOSE it, and the interior
+        blanked would lie INSIDE the failing block — deleting real failure
+        evidence. Measured under the mutant
+        `^[ \\t]*--- Running: (?P<name>.+?) ---[ \\t]*$`: the marker is dropped
+        and `_classify(OPAQUE, ...)` falls semaphore_timeout ->
+        unknown_test_failure.
+        """
+        text = (
+            '--- Running: outer.sh ---\n'
+            '  --- Running: y.sh ---\n'
+            f'{_INTERIOR_MARKER}\n'
+            '  RESULT: PASS (y.sh)\n'
+            '  RESULT: FAIL (outer.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result is text, (
+            'an INDENTED quoted `--- Running: ` is assertion prose, not a '
+            'block header; opening a block on it would blank a region that '
+            'lies inside the FAILING block'
+        )
+        assert _INTERIOR_MARKER in result
+        # the consequence, one layer up: the evidence still reaches guard 3.
+        assert (
+            _classify(ToolKind.OPAQUE, text, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+    # -- (g) UNCLOSED BLOCK IS FAIL-SAFE ------------------------------------
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n',
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n--- Running: u.sh ---\nmore\n',
+        ],
+        ids=['eof_before_close', 'second_header_before_close'],
+    )
+    def test_unclosed_block_redacts_nothing(self, text):
+        """An aborted run is exactly where a genuine host event surfaces, so
+        an unclosed block must never be treated as attested. A second open
+        header REPLACES the pending one, and the earlier block is then never
+        redacted."""
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert result == text
+        assert result is text
+
+    # -- (h) TEXT OUTSIDE ANY BLOCK SURVIVES --------------------------------
+
+    def test_preamble_and_tail_survive_verbatim(self):
+        """The regions design option (a) — "narrow to the failing leg" —
+        would have discarded. They are where a genuine pool-admission
+        starvation or a runner-level host abort surfaces."""
+        preamble = 'verify.sh: + ./scripts/check-manifold-deps.sh'
+        tail_lines = [
+            '=== Summary: 145 discovered, 1 failed ===',
+            '=== FAILED: t.sh ===',
+            'FAILED t.sh',
+            '--- FAILED-DETAIL: t.sh ---',
+            '  FAIL: live fingerprints are a subset of committed baseline',
+            '--- END FAILED-DETAIL: t.sh ---',
+        ]
+        text = (
+            f'{preamble}\n'
+            f'{_OPEN}\n{_INTERIOR_MARKER}\n{_PASS_CLOSE}\n'
+            + '\n'.join(tail_lines)
+            + '\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert preamble in result
+        for line in tail_lines:
+            assert line in result, f'tail line vanished: {line!r}'
+        assert _INTERIOR_MARKER not in result
+
+    # -- (i) INDENTED CLOSE TOLERATED, NOT REQUIRED -------------------------
+
+    @pytest.mark.parametrize(
+        'close',
+        ['  RESULT: PASS (t.sh)', 'RESULT: PASS (t.sh)', '\tRESULT: PASS (t.sh)'],
+        ids=['two_space', 'zero_indent', 'tab'],
+    )
+    def test_close_tolerates_leading_horizontal_whitespace(self, close):
+        """Same `^[ \\t]*` tolerance `_SLOT_ACQUIRE_DEADLINE_RE` and
+        `verify._match_clock_marker` already use: run_all emits two spaces,
+        but verify output is aggregated from wrappers that routinely indent
+        captured sub-output."""
+        text = f'{_OPEN}\n{_INTERIOR_MARKER}\n{close}\n'
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert _INTERIOR_MARKER not in result
+        assert close in result
+
+    # -- (j) MULTIPLE BLOCKS ------------------------------------------------
+
+    def test_only_pass_interiors_are_blanked_across_multiple_blocks(self):
+        text = (
+            '--- Running: a.sh ---\n'
+            'a interior\n'
+            '  RESULT: PASS (a.sh)\n'
+            '--- Running: b.sh ---\n'
+            'b interior\n'
+            '  RESULT: FAIL (b.sh)\n'
+            '--- Running: c.sh ---\n'
+            'c interior\n'
+            '  RESULT: PASS (c.sh)\n'
+        )
+        result = verify_classify._redact_passed_suite_blocks(text)
+        assert 'a interior' not in result
+        assert 'c interior' not in result
+        assert 'b interior' in result, (
+            'the FAILING suite block is the one region that certainly does '
+            'carry evidence about the failure'
+        )
+        assert result.count('\n') == text.count('\n')
+
+
+
+# task 4492 — the REPLAYED-LOG regression test. The fixture is a verbatim
+# line-slice excerpt of the real reify 5623 test-leg transcript that caused
+# the incident; see its PROVENANCE.md for the source path, sha256 and the
+# exact five `sed` ranges. Do NOT edit the fixture to make a test here pass.
+_RUN_ALL_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'verify_classify_run_all'
+#
+# `encoding='utf-8'` is EXPLICIT and load-bearing (amendment, review #3): the
+# fixture carries 195 non-ASCII bytes (reify's own assertion prose uses `→`,
+# `—` and `’`), so a bare `read_text()` decodes with the interpreter's locale
+# encoding. Under a non-UTF-8 locale that raises UnicodeDecodeError at MODULE
+# scope, which errors out collection of this ENTIRE file (~1100 tests), not
+# just the task-4492 classes — reproduced with `LC_ALL=C PYTHONCOERCECLOCALE=0`.
+# PEP 538/540 coercion masks it on a default CPython invocation, but verify
+# runs under `verify._target_subprocess_env`, which deliberately strips ambient
+# env. Matches the established in-repo convention for fixture reads in guard
+# tests (test_git_repo_isolation_guard.py:521, test_eval_boundary_suite.py:442).
+_REIFY_5623_TEST_LEG = (
+    _RUN_ALL_FIXTURE_DIR / 'reify-5623-run-all-test-leg.log'
+).read_text(encoding='utf-8')
+
+
+def _line_containing(text: str, position: int) -> str:
+    """The full line of *text* containing the character offset *position*."""
+    start = text.rfind('\n', 0, position) + 1
+    end = text.find('\n', position)
+    return text[start:] if end == -1 else text[start:end]
+
+
+class TestAggregatedRunAllScopingReplay:
+    """task 4492: the user-observable signal. An aggregated `run_all.sh`
+    transcript whose ONLY slot-marker lines were emitted by suites reporting
+    ZERO failures must classify as the branch fault it is, not as host-infra
+    trouble.
+
+    reify 5623 was held blocked 2026-08-09 -> 08-19 on this exact output
+    under a false "disk pressure / SEMAPHORE_TIMEOUT" L1, while its own tail
+    named the real cause: a `test_reify_audit_ptodo.sh` PTODO ratchet
+    failure.
+    """
+
+    # -- FIXTURE INTEGRITY --------------------------------------------------
+    #
+    # These are NOT documentation tests. They are the only thing standing
+    # between "this regression test passes because the fix works" and "this
+    # regression test passes because the fixture got truncated or
+    # regenerated wrong and no longer contains the markers at all" — the one
+    # way this class could silently stop testing anything.
+
+    def test_fixture_carries_exactly_three_deadline_markers_at_column_zero(self):
+        """Column 0 is the load-bearing part: it proves these are GENUINE
+        emitter output, not the mid-line assertion-prose vector task 3679
+        already closed. That is precisely why no further line-anchoring could
+        have fixed this class, and why the scoping layer was needed."""
+        matches = list(
+            verify_classify._SLOT_ACQUIRE_DEADLINE_RE.finditer(_REIFY_5623_TEST_LEG)
+        )
+        assert len(matches) == 3, (
+            f'fixture must carry exactly 3 deadline markers, found '
+            f'{len(matches)} — the fixture has drifted, re-cut it per '
+            f'PROVENANCE.md rather than adjusting this number'
+        )
+        for match in matches:
+            line = _line_containing(_REIFY_5623_TEST_LEG, match.start())
+            assert not line[: len(line) - len(line.lstrip())], (
+                f'marker must be at column 0 to be genuine emitter output, '
+                f'got indented line {line!r}'
+            )
+
+    def test_every_marker_sits_inside_a_passing_suite_block(self):
+        """The whole premise of the fix: each marker is enclosed by an open
+        header and that SAME suite's `RESULT: PASS` close, so every one of
+        them is covered by a positive zero-failures attestation."""
+        lines = _REIFY_5623_TEST_LEG.split('\n')
+        marker_line_numbers = [
+            index
+            for index, line in enumerate(lines)
+            if verify_classify._SLOT_ACQUIRE_DEADLINE_RE.match(line)
+        ]
+        assert len(marker_line_numbers) == 3
+
+        for number in marker_line_numbers:
+            opened = None
+            for candidate in range(number - 1, -1, -1):
+                match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(lines[candidate])
+                if match is not None:
+                    opened = match.group('name')
+                    break
+            assert opened is not None, f'marker at line {number} has no open header'
+
+            closed = None
+            for candidate in range(number + 1, len(lines)):
+                match = verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(lines[candidate])
+                if match is not None:
+                    closed = match
+                    break
+            assert closed is not None, f'marker at line {number} has no close'
+            assert closed.group('name') == opened, (
+                f'marker at line {number} is not enclosed by a matched-name '
+                f'block: opened {opened!r}, closed {closed.group("name")!r}'
+            )
+            assert closed.group('verdict') == 'PASS', (
+                f'marker at line {number} must sit in a PASSING block — that '
+                f'is what makes it a false positive; got '
+                f'{closed.group("verdict")!r}'
+            )
+
+    def test_fixture_carries_the_real_failure_and_the_summary_tail(self):
+        assert '=== Summary: 145 discovered, 1 failed ===' in _REIFY_5623_TEST_LEG
+        assert '  RESULT: FAIL (test_reify_audit_ptodo.sh)' in _REIFY_5623_TEST_LEG
+
+    # -- BEHAVIOUR ----------------------------------------------------------
+
+    def test_replayed_run_all_log_classifies_test_failure(self):
+        """RED before step-4: returns `semaphore_timeout`. Reproduced
+        first-hand on both the full 922 KB log and this 332-line excerpt."""
+        result = _classify(ToolKind.OPAQUE, _REIFY_5623_TEST_LEG, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'the 5623 transcript is a deterministic branch fault (a PTODO '
+            f'ratchet failure named in its own tail), not a host event; '
+            f'got {result!r}'
+        )
+
+    def test_replayed_run_all_log_is_not_infra_transient(self):
+        """The CONSEQUENCE assertion, in the style of
+        TestDeterministicLintFailureIsNotSemaphoreTimeout. INFRA_TRANSIENT
+        membership is what routed 5623 into an infra hold instead of to the
+        debugger for 10 days — asserting only the enum label would still pass
+        if the fault were relabelled to some other infra-transient category,
+        reproducing the incident exactly."""
+        result = _classify(ToolKind.OPAQUE, _REIFY_5623_TEST_LEG, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a branch fault must not land in an infra-transient category '
+            f'(it would be silently infra-retried), got {result!r}'
+        )
+        assert CATEGORY_POLICY[result].is_infra_transient is False
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_scoping_is_tool_blind(self, tool):
+        """Guard 3 runs BEFORE per-tool dispatch, so its scoping must hold
+        for every ToolKind. Non-OPAQUE tools may legitimately reach a
+        different non-infra category than TEST_FAILURE, so the portable
+        claims are the two that matter operationally: not SEMAPHORE_TIMEOUT,
+        and not infra-transient."""
+        result = _classify(tool, _REIFY_5623_TEST_LEG, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'{tool!r}: markers emitted by suites reporting zero failures '
+            f'must not classify semaphore_timeout, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'{tool!r}: must not land in an infra-transient category, '
+            f'got {result!r}'
+        )
+        assert CATEGORY_POLICY[result].is_infra_transient is False
+
+
+def _fixture_lines() -> list[str]:
+    return _REIFY_5623_TEST_LEG.split('\n')
+
+
+def _index_of_first_open_header() -> int:
+    for index, line in enumerate(_fixture_lines()):
+        if verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line):
+            return index
+    raise AssertionError('fixture carries no open header')
+
+
+def _index_of_failing_block_open() -> int:
+    for index, line in enumerate(_fixture_lines()):
+        match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line)
+        if match is not None and match.group('name') == 'test_reify_audit_ptodo.sh':
+            return index
+    raise AssertionError('fixture carries no test_reify_audit_ptodo.sh block')
+
+
+def _index_of_last_close() -> int:
+    lines = _fixture_lines()
+    for index in range(len(lines) - 1, -1, -1):
+        if verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(lines[index]):
+            return index
+    raise AssertionError('fixture carries no close line')
+
+
+def _index_inside_first_passing_block() -> int:
+    """A line index strictly INSIDE the first block that closes with a PASS —
+    i.e. a region `_redact_passed_suite_blocks` will blank."""
+    lines = _fixture_lines()
+    pending: tuple[int, str] | None = None
+    for index, line in enumerate(lines):
+        open_match = verify_classify._RUN_ALL_SUITE_OPEN_RE.match(line)
+        if open_match is not None:
+            pending = (index, open_match.group('name'))
+            continue
+        close = verify_classify._RUN_ALL_SUITE_CLOSE_RE.match(line)
+        if close is not None and pending is not None and close.group('name') == pending[1]:
+            if close.group('verdict') == 'PASS':
+                assert index > pending[0] + 1, 'fixture PASS block has no interior'
+                return pending[0] + 1
+            pending = None
+    raise AssertionError('fixture carries no PASS-closed block')
+
+
+def _splice(marker: str, at: int) -> str:
+    """Insert *marker* (a single producer line, newline-terminated) into the
+    fixture immediately before line index *at*."""
+    lines = _fixture_lines()
+    return '\n'.join(lines[:at] + marker.rstrip('\n').split('\n') + lines[at:])
+
+
+class TestGenuineHostEventSurvivesRunAllScoping:
+    """task 4492 preservation controls: a genuine host event that is NOT
+    covered by a passing suite's attestation must still be detected.
+
+    HONEST FRAMING: unlike TestRedactPassedSuiteBlocks and
+    TestAggregatedRunAllScopingReplay, every assertion in this class is GREEN
+    on unmodified HEAD. They are preservation pins, not a RED->GREEN proof,
+    so their value is established against MUTANTS rather than against the
+    pre-fix code. The three mutants and their measured kills are recorded in
+    this step's commit message; if a future edit makes one of these cases
+    unfalsifiable, re-run those mutants before trusting the class.
+
+    Each case splices a real emitter line into the pre-1 fixture, so the
+    surrounding output is the genuine 5623 transcript rather than a toy.
+    """
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n1_marker_in_preamble_is_detected(self, tool, name, marker):
+        """The case that would break design option (a) — "narrow to the
+        failing suite's block" — and the reason option (b) was chosen. The
+        runner PREAMBLE is where a genuine pool-admission starvation
+        surfaces, before any suite has opened."""
+        output = _splice(marker, _index_of_first_open_header())
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n2_marker_inside_the_failing_block_is_detected(self, tool, name, marker):
+        """The FAILING suite's block is never redacted, so a marker there is
+        still evidence about the failure being classified."""
+        output = _splice(marker, _index_of_failing_block_open() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n3_marker_in_an_aborted_run_is_detected(self, tool, name, marker):
+        """The run-aborting starvation the task names explicitly: an open
+        header with NO closing RESULT and no `=== Summary:` tail. An aborted
+        run is exactly where a real host event surfaces, so an unclosed block
+        must never be treated as attested."""
+        lines = _fixture_lines()[: _index_of_last_close() + 1]
+        output = '\n'.join(
+            lines + ['--- Running: test_x.sh ---', marker.rstrip('\n')]
+        )
+        assert '=== Summary:' not in output
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n4_marker_in_the_tail_is_detected(self, tool, name, marker):
+        """The aggregate TAIL — the other region design option (a) would have
+        discarded. A runner-level host abort surfaces here, after the last
+        suite closed."""
+        output = _REIFY_5623_TEST_LEG + marker
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n5_marker_in_a_skipped_block_is_detected(self, tool, name, marker):
+        """A SKIPPED suite carries no PASS attestation — it never asserted
+        the host was healthy — so a marker inside it is still evidence."""
+        block = (
+            '--- Running: test_x.sh ---\n'
+            + marker.rstrip('\n')
+            + '\n  RESULT: SKIP (test_x.sh)'
+        )
+        output = _splice(block + '\n', _index_of_last_close() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    @pytest.mark.parametrize('name,marker', _ANCHORED_SLOT_TIMEOUT_SHAPES)
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n6_marker_under_mismatched_framing_is_detected(self, tool, name, marker):
+        """The nesting guard, from the detection side: a name mismatch makes
+        the helper fail SAFE (redact nothing), so a marker inside a replayed
+        or malformed transcript is still detected."""
+        block = (
+            '--- Running: a.sh ---\n'
+            + marker.rstrip('\n')
+            + '\n  RESULT: PASS (b.sh)'
+        )
+        output = _splice(block + '\n', _index_of_last_close() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    # -- the guard's OTHER arms, since step-4 scopes all of it ---------------
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n7_enospc_inside_the_failing_block_is_disk_full(self, tool):
+        """DISK_FULL is scoped too, so it needs its own preservation pin —
+        and it must still outrank the SEMAPHORE_TIMEOUT markers already in
+        the fixture, per the unchanged ORDERING."""
+        marker = 'error: failed to write output: No space left on device\n'
+        output = _splice(marker, _index_of_failing_block_open() + 1)
+        assert _classify(tool, output, 1, False) == FailureCategory.DISK_FULL
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n8_interrupted_marker_in_the_tail_is_env_transient(self, tool):
+        """Collateral shape 5 is a literal marker a suite testing run_all's
+        interrupt path could legitimately replay — which is precisely why the
+        whole guard is scoped rather than just the SEMAPHORE_TIMEOUT arm.
+        Outside a PASS block it must still classify."""
+        output = _REIFY_5623_TEST_LEG + _COLLATERAL_INTERRUPTED_MARKER_OUTPUT
+        assert _classify(tool, output, 1, False) == FailureCategory.ENV_TRANSIENT
+
+    # -- the VETO ASYMMETRY, the change's single safety invariant ------------
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_n9_rustc_span_veto_still_reads_the_full_unscoped_output(self, tool):
+        """The safety invariant of the whole change, pinned (amendment,
+        review #1).
+
+        `_classify_environmental` passes `scoped` to every POSITIVE detector
+        but keeps passing the FULL `output` to its one NEGATIVE condition,
+        `_RUSTC_DIAGNOSTIC_SPAN_RE`. That asymmetry is what bounds the change
+        to a single direction — scoping a VETO would make ENV_TRANSIENT
+        EASIER to reach, the false-GREEN direction.
+
+        The plausible future edit is small and looks like a tidy-up: making
+        the argument of a two-line boolean consistent (`.search(output)` ->
+        `.search(scoped)`). Nothing else in the suite catches it — measured:
+        that mutant left the full suite at 1211 passed, 0 failed.
+
+        This case is the one that does. A genuine rustc `#[path = ...]`
+        branch fault (shape 1's exact wording) lands in the TAIL, outside any
+        block, so redaction cannot touch it and the positive detector fires;
+        its span-pointer line sits INSIDE a PASSED suite's block, so it
+        survives ONLY as long as the veto reads the unscoped output. GREEN
+        today (`test_failure`); under the `scoped`-veto mutant the span is
+        redacted away, the veto never fires, and the branch fault is excused
+        as host collateral -> `env_transient` (measured).
+        """
+        with_span = _splice(' --> src/lib.rs:3:1\n', _index_inside_first_passing_block())
+        output = with_span + '\n' + _COLLATERAL_COULDNT_READ_OUTPUT
+
+        # control: without the span line this output IS env_transient, so the
+        # assertion below is about the veto and not about the splice being inert.
+        assert (
+            _classify(tool, _REIFY_5623_TEST_LEG + '\n' + _COLLATERAL_COULDNT_READ_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.ENV_TRANSIENT, (
+            f'{tool!r}: the rustc span veto must read the FULL output — a span '
+            'line inside a PASSED block still vetoes shape 1, so a genuine '
+            'branch fault is never excused as host collateral'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES
+        assert CATEGORY_POLICY[result].is_infra_transient is False
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
@@ -1532,10 +2621,26 @@ class TestBrokenWorktreeOrderingNegatives:
 # check's cmd) raises TypeError before the body even runs.
 
 
-def _summarize(*args):
+def _summarize(*args, **kwargs):
+    """Forward to ``verify._summarize_checks``.
+
+    ``**kwargs`` was added by task 3173 for the keyword-only
+    ``test_duration``/``lint_duration``/``type_duration`` params.  Every
+    pre-existing 12-positional-arg call site in this module passes no kwargs
+    and is byte-identical, which is the point: the duration params are
+    purely additive (see the design decision on keeping the 12 positionals).
+
+    ``[:4]`` (task 3173 review amendment): ``_summarize_checks`` now returns a
+    FIVE-tuple, whose fifth element is the per-failing-leg category list.  The
+    slice keeps all fourteen pre-existing 4-tuple unpack call sites in this
+    module BYTE-IDENTICAL — none of them care about the new element — while
+    the tests that DO care call ``_summarize_checks`` directly rather than
+    going through this harness.  Widening every old call site instead would
+    have been fourteen edits that assert nothing.
+    """
     from orchestrator.verify import _summarize_checks  # noqa: PLC0415
 
-    return _summarize_checks(*args)
+    return _summarize_checks(*args, **kwargs)[:4]
 
 
 class TestSummarizeChecksThreadsToolIdentity:
@@ -1774,3 +2879,400 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
         member is introduced; ENV_TRANSIENT already carries precisely this policy.
         """
         assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 3173: an EXTERNALLY killed process never produced an exit verdict
+#
+# ``_run_cmd`` returns ``proc.returncode`` verbatim, and asyncio sets that to
+# the NEGATIVE signal number when the child is killed externally. Today a -9
+# with an empty/1-line log matches no pattern and falls out the bottom of the
+# ladder as UNKNOWN_TEST_FAILURE — a blocking, branch-blaming verdict for a
+# process the branch never got to influence.
+#
+# RED today: ``is_external_kill_rc`` does not exist and no guard inspects
+# ``rc < 0`` anywhere in verify.py/verify_classify.py/verify_categories.py.
+# ---------------------------------------------------------------------------
+
+
+class TestExternalKillIsIndeterminate:
+    """rc < 0 for an EXTERNAL termination signal is INFRA_KILL, tool-blind."""
+
+    # -- (a) the predicate -------------------------------------------------
+
+    @pytest.mark.parametrize('rc', [-9, -15, -2, -1])
+    def test_external_termination_signals_are_kills(self, rc):
+        from orchestrator.verify_classify import is_external_kill_rc
+        assert is_external_kill_rc(rc) is True
+
+    @pytest.mark.parametrize('rc', [0, 1, 5, 137, -11, -6, -7, -4, -8])
+    def test_non_external_kill_rcs_are_not(self, rc):
+        # 137 is 128+9 as a SHELL-reported status, not a raw asyncio
+        # returncode — the predicate must not guess at shell conventions.
+        # -11/-6/-7/-4/-8 are CRASH signals (SEGV/ABRT/BUS/ILL/FPE): genuine
+        # faults of the code under test that must stay RED.
+        from orchestrator.verify_classify import is_external_kill_rc
+        assert is_external_kill_rc(rc) is False
+
+    # -- (b) the measured case --------------------------------------------
+
+    def test_measured_case_sigkill_with_one_line_header(self):
+        """The exact shape of the incident: the lint leg was SIGKILLed after
+        emitting only its role header, and classified UNKNOWN_TEST_FAILURE."""
+        from orchestrator.verify_classify import classify_failure
+        measured_output = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, measured_output, False,
+        ) == FailureCategory.INFRA_KILL
+
+    def test_empty_output_sigkill(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(ToolKind.OPAQUE, -9, '', False) == FailureCategory.INFRA_KILL
+
+    # -- (c) the guard is tool-blind, above per-tool dispatch --------------
+
+    @pytest.mark.parametrize(
+        'tool', [ToolKind.OPAQUE, ToolKind.RUFF, ToolKind.PYTEST, ToolKind.CARGO_CLIPPY],
+    )
+    @pytest.mark.parametrize('rc', [-9, -15])
+    def test_kill_classification_is_tool_blind(self, tool, rc):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(tool, rc, '', False) == FailureCategory.INFRA_KILL
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_every_tool_kind_agrees(self, tool):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(tool, -9, '', False) == FailureCategory.INFRA_KILL
+
+    # -- (d) guard ORDER ---------------------------------------------------
+
+    def test_kill_wins_over_environmental_output_mining(self):
+        """A killed process's TRUNCATED output must not be mined for a root
+        cause: whatever it managed to flush before dying is not a diagnosis."""
+        from orchestrator.verify_classify import classify_failure
+        enospc_output = "error: failed to write: No space left on device (os error 28)\n"
+        # Sanity: without the kill this same output IS disk_full.
+        assert classify_failure(
+            ToolKind.OPAQUE, 1, enospc_output, False,
+        ) == FailureCategory.DISK_FULL
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, enospc_output, False,
+        ) == FailureCategory.INFRA_KILL
+
+    def test_timeout_guard_still_wins_over_kill(self):
+        """The timeout guard stays FIRST: our own watchdog SIGKILLing a
+        command it timed out is a timeout, and must keep RetryKind.TIMEOUT."""
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, '', True,
+        ) == FailureCategory.INFRA_TIMEOUT
+
+    # -- (e) NEGATIVE CONTROLS: crash signals are untouched ----------------
+
+    @pytest.mark.parametrize('rc', [-11, -6])
+    def test_crash_signals_are_not_kills_and_keep_todays_category(self, rc):
+        """SIGSEGV/SIGABRT are faults of the code UNDER TEST. Reclassifying
+        them as retryable infra would be the false-GREEN inverse of this
+        defect — the exact class tasks 2822/1700 hardened against."""
+        from orchestrator.verify_classify import classify_failure
+        category = classify_failure(ToolKind.PYTEST, rc, '', False)
+        assert category != FailureCategory.INFRA_KILL
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+        assert category not in INFRA_TRANSIENT_CATEGORIES
+
+    def test_segv_with_a_real_test_verdict_still_reports_the_test_failure(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(
+            ToolKind.PYTEST, -11, 'FAILED tests/x.py::y\n', False,
+        ) == FailureCategory.TEST_FAILURE
+
+    # -- (f) rc == 0 is still PASSED --------------------------------------
+
+    def test_rc_zero_still_passes(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(ToolKind.OPAQUE, 0, '', False) == FailureCategory.PASSED
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-5: the SUMMARY may never assert a property the gate did not
+# measure.
+#
+# ``_summarize_checks`` builds its ``parts`` purely from ``rc != 0``:
+# ``if lint_rc != 0: parts.append('lint issues')``.  So a lint leg that was
+# SIGKILLed before it could emit a single diagnostic is reported as
+# "lint issues", and merge_queue surfaces that verbatim as
+# ``Post-merge verification failed: Failures: lint issues`` — a branch-blaming
+# sentence about a process the branch never got to influence.  (Same defect
+# shape as task 3110.)
+#
+# RED today: ``_summarize_checks`` accepts no ``*_duration`` kwargs (TypeError)
+# and has no signal-aware branch in its parts assembly.
+# ---------------------------------------------------------------------------
+
+_MEASURED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
+_MEASURED_LINT_OUT = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+_MEASURED_LINT_DURATION = 0.31010722508654
+
+
+class TestSummarizeChecksNamesTheKill:
+    """A leg killed by an external signal contributes a note saying so,
+    instead of a fabricated tool verdict."""
+
+    # -- (a) THE MEASURED CASE --------------------------------------------
+
+    def test_measured_case_lint_leg_sigkilled_at_0_31s(self):
+        """The exact incident: lint SIGKILLed after 0.31s having flushed only
+        its role header, while test and type both passed."""
+        passed, category, cause_hint, summary = _summarize(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        assert category == FailureCategory.INFRA_KILL
+        # Says which leg, which signal, how long it survived, and that no
+        # verdict exists — every clause is a measured fact.
+        assert 'lint' in summary
+        assert 'signal 9' in summary
+        assert '0.31' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'indeterminate' in summary
+        # And does NOT assert the property the gate never measured.
+        assert 'lint issues' not in summary
+
+    def test_measured_case_keeps_the_failures_envelope(self):
+        """Every existing consumer prefix/substring-matches on 'Failures: ',
+        so the envelope must survive."""
+        _, _, _, summary = _summarize(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert summary.startswith('Failures: ')
+
+    @pytest.mark.parametrize(
+        ('leg_index', 'label', 'duration_kw'),
+        [(0, 'test', 'test_duration'), (1, 'lint', 'lint_duration'), (2, 'type', 'type_duration')],
+    )
+    def test_every_leg_can_report_its_own_kill(self, leg_index, label, duration_kw):
+        """The note is per-leg, not lint-special-cased."""
+        args = [0, '', False, None] * 3
+        args[leg_index * 4] = -15
+        args[leg_index * 4 + 3] = f'./scripts/verify.sh {label}'
+        _, category, _, summary = _summarize(*args, **{duration_kw: 12.5})
+        assert category == FailureCategory.INFRA_KILL
+        assert label in summary
+        assert 'signal 15' in summary
+        assert '12.50' in summary
+        assert 'indeterminate' in summary
+
+    # -- (b) REGRESSION GUARD: a genuine failure is worded exactly as today -
+
+    def test_genuine_lint_failure_wording_is_byte_identical(self):
+        ruff_out = 'src/x.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n'
+        passed, category, _, summary = _summarize(
+            0, '', False, None,
+            1, ruff_out, False, 'ruff check .',
+            0, '', False, None,
+            lint_duration=4.2,
+        )
+        assert not passed
+        assert summary == 'Failures: lint issues'
+        assert category != FailureCategory.INFRA_KILL
+
+    def test_genuine_multi_leg_failure_wording_is_byte_identical(self):
+        _, _, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            1, 'Found 1 error.\n', False, 'ruff check .',
+            1, 'error: bad type\n', False, 'pyright',
+        )
+        assert summary == 'Failures: tests failed, lint issues, type errors'
+
+    def test_all_passing_is_unchanged(self):
+        passed, category, cause_hint, summary = _summarize(
+            0, '', False, None,
+            0, '', False, None,
+            0, '', False, None,
+            test_duration=1.0, lint_duration=2.0, type_duration=3.0,
+        )
+        assert passed
+        assert summary == 'All checks passed'
+        assert category == 'passed'
+
+    # -- (c) MIXED: a real verdict plus a kill keeps BOTH ------------------
+
+    def test_real_test_failure_plus_killed_lint_keeps_both(self):
+        """The kill must not erase the leg that DID produce a verdict, and
+        must not be erased BY it (severity_rank=1 outranks test_failure)."""
+        passed, category, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            test_duration=901.0, lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        assert category == FailureCategory.INFRA_KILL
+        assert 'tests failed' in summary
+        assert 'signal 9' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'lint issues' not in summary
+
+    # -- (d) no duration in scope -> omit the clause, keep the sentence ----
+
+    def test_killed_leg_without_a_duration_omits_the_after_clause(self):
+        """None (not 0.0) is the default so a caller with no timing gets an
+        omitted clause rather than a fabricated 'after 0.00s'."""
+        _, category, _, summary = _summarize(
+            0, '', False, None,
+            -9, '', False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+        )
+        assert category == FailureCategory.INFRA_KILL
+        assert 'lint' in summary
+        assert 'signal 9' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'indeterminate' in summary
+        assert 'after' not in summary
+        assert '0.00' not in summary
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-14 (REVIEW AMENDMENT, blocking finding 1): the aggregate
+# `category` and the per-leg verdicts answer DIFFERENT questions, and
+# collapsing them is a false-GREEN.
+#
+# `_worst_category` is severity-ranked, and INFRA_KILL sits at rank 1 while
+# TEST_FAILURE sits at rank 11.  So a run whose TEST leg COMPLETED and blamed
+# the branch, alongside an UNRELATED lint leg that was SIGKILLed, aggregates to
+# category == 'infra_kill'.  That is the RIGHT answer for "how bad was this
+# run" (it drives the retry budget, archival, and the transient-infra hold) and
+# a catastrophic answer for "did this run produce a verdict at all" — which is
+# what merge_queue's veto gate needs.  Keying the gate off the single aggregate
+# would discard a completed, branch-blaming verdict and land the remote PASS.
+#
+# So `_summarize_checks` publishes what EACH failing leg decided, and the gate
+# reads that instead of inferring it.  RED today: the fifth tuple element does
+# not exist (`per_check_categories` is computed and then thrown away).
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeChecksReportsEveryFailingLegCategory:
+    """`_summarize_checks` returns a FIVE-tuple whose last element is one
+    category per FAILING leg, in test/lint/type order."""
+
+    def test_mixed_real_test_failure_plus_killed_lint_lists_both(self):
+        """THE REVIEWER'S CASE. The aggregate category and the per-leg list
+        must DECOUPLE: severity dominance still governs `category`, while the
+        list preserves the completed test verdict the gate must not discard."""
+        from orchestrator.verify import _summarize_checks
+
+        passed, category, _, _, failing_leg_categories = _summarize_checks(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            test_duration=901.0, lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        # Unchanged: severity_rank=1 still dominates rank-11 test_failure.
+        assert category == FailureCategory.INFRA_KILL
+        # New: the completed test verdict is still visible, in leg order.
+        assert failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_single_killed_leg_lists_only_that_leg(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, category, _, _, failing_leg_categories = _summarize_checks(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert category == FailureCategory.INFRA_KILL
+        assert failing_leg_categories == ['infra_kill']
+
+    def test_passing_short_circuit_still_returns_five_elements(self):
+        """The `passed` early return is a separate `return` statement, so it
+        needs its own fifth element — an EMPTY list (no failing legs), which
+        the gate must never read as "every leg was indeterminate"."""
+        from orchestrator.verify import _summarize_checks
+
+        result = _summarize_checks(
+            0, '', False, None,
+            0, '', False, None,
+            0, '', False, None,
+        )
+        assert len(result) == 5
+        assert result[0] is True
+        assert result[4] == []
+
+    def test_crash_signal_leg_is_not_listed_as_a_kill(self):
+        """CONTROL: SIGSEGV is a genuine fault OF THE CODE UNDER TEST, not an
+        external kill — it must stay RED and must never reach the per-leg list
+        as 'infra_kill', or the veto gate would wave a segfaulting branch
+        through."""
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, _, failing_leg_categories = _summarize_checks(
+            0, '', False, None,
+            -11, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert failing_leg_categories == ['unknown_test_failure']
+        assert 'infra_kill' not in failing_leg_categories
+
+    def test_every_failing_leg_appears_in_test_lint_type_order(self):
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, _, failing_leg_categories = _summarize_checks(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            1, 'flock: failed to acquire lock on /var/lock/mylock\n', False, 'ruff check . && x',
+            -9, '', False, './scripts/verify.sh type',
+        )
+        assert failing_leg_categories == ['test_failure', 'flock_error', 'infra_kill']
+
+    def test_first_four_elements_are_unchanged_for_every_prior_caller(self):
+        """REGRESSION GUARD for the `_summarize(...)[: 4]` harness slice: the
+        four legacy elements keep their exact positions and values."""
+        from orchestrator.verify import _summarize_checks
+
+        args = (
+            0, '', False, None,
+            1, 'src/x.py:1:1: F401 unused\nFound 1 error.\n', False, 'ruff check .',
+            0, '', False, None,
+        )
+        full = _summarize_checks(*args)
+        assert full[:4] == _summarize(*args)
+        assert full[3] == 'Failures: lint issues'
+
+    # -- (e) crash-signal control -----------------------------------------
+
+    def test_crash_signal_leg_still_reports_lint_issues(self):
+        """SIGSEGV is a fault of the code under test, not an external kill:
+        today's wording and today's blocking verdict both stand."""
+        _, category, _, summary = _summarize(
+            0, '', False, None,
+            -11, '', False, 'ruff check .',
+            0, '', False, None,
+            lint_duration=0.5,
+        )
+        assert summary == 'Failures: lint issues'
+        assert category != FailureCategory.INFRA_KILL
+        assert 'signal' not in summary
+        assert 'indeterminate' not in summary
+
+    # -- (f) the new params are PURELY additive ----------------------------
+
+    def test_twelve_positional_args_with_no_kwargs_still_works(self):
+        """Proves the pre-existing 12-positional call sites (and the
+        `_summarize(*args)` harness above) need no edit."""
+        passed, category, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            0, '', False, None,
+            0, '', False, None,
+        )
+        assert not passed
+        assert category == FailureCategory.TEST_FAILURE
+        assert summary == 'Failures: tests failed'

@@ -1915,6 +1915,8 @@ class VerifyRunnerPool:
         attempt: int = 0,
         depth: int | None = None,
         speculative: bool | None = None,
+        chain_items: int = 1,
+        chain_build_ms: int | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -1929,6 +1931,45 @@ class VerifyRunnerPool:
         per-event schema branching.  Bare/legacy callers that omit both
         kwargs get ``None`` for each, which is byte-identical to pre-2340
         behaviour aside from the two extra always-present keys.
+
+        ``chain_items`` (task 3185, PRD γ decision 8) is the **count, in
+        CHAIN-ITEM units, of the items contained in the tree this verify
+        actually exercised** — the dispatching item is chain item #1 and each
+        chained successor actually built adds one.  It is deliberately
+        frontier-INDEPENDENT: a verify that chained nothing is 1 however many
+        other verifies are in flight, which is what makes ``chain_items >= 2``
+        a sound deep-verify discriminator.  It defaults to ``1``, deliberately
+        NOT to ``None`` the way ``depth``/``speculative`` do, for two
+        reasons.  (1) Semantics: a
+        count of items in a verified tree has a smallest TRUTHFUL value of
+        1 — every merge verify exercises at least the one item it was created
+        for — so there is no "absent" state to represent, and ``None`` would
+        be a lie rather than a missing signal.  (2) Contract: the PRD requires
+        the field on EVERY merge verify, and several callers thread no
+        telemetry kwargs at all (``merge_shadow.py:1254``/``:1368``); a
+        ``None`` default would emit ``chain_items: null`` for exactly those
+        and break both the contract and η1's reader
+        (``scripts/merge-deep-canary-predicate.sh``).
+
+        ``chain_build_ms`` (task 3185 amend) is the wall-clock cost of the
+        deep chain build that produced this verify's tree, in milliseconds.
+        Unlike ``chain_items`` it DOES default to ``None``, and correctly so:
+        a verify that chained nothing paid no build, so there is a genuine
+        "absent" state to represent and 0 would be a lie.  It is emitted
+        always-present-but-nullable for the same reason ``depth`` is — a
+        reader does a plain ``data.get('chain_build_ms')`` with no
+        per-event schema branching.  It exists because the build is awaited
+        INLINE on the merge worker's dispatch path, so it is a per-round
+        DISPATCH STALL (no head can be finalized or landed while it runs) that
+        must never be mistaken for verify time; η1 reads it alongside
+        drain-time.  Non-``None`` implies ``chain_items >= 2``.
+
+        ``chain_items`` SUPERSEDES ``depth`` as the honest depth signal: a
+        firing speculation probe (task 2359) relabels ``depth`` into an
+        attribution fact about a stack that was never verified, whereas
+        ``chain_items`` is derived from the tree that actually ran.  See the
+        ``merge_verify`` doc-comment in ``event_store.py`` for the full field
+        note.
 
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch falls back to the local runner (if
@@ -2036,6 +2077,11 @@ class VerifyRunnerPool:
                     'attempt': attempt,
                     'depth': depth,
                     'speculative': speculative,
+                    # task 3185 (PRD γ): 1-indexed count of items in the tree
+                    # actually verified -- always >= 1, never None. See
+                    # dispatch()'s docstring for why the default is 1.
+                    'chain_items': chain_items,
+                    'chain_build_ms': chain_build_ms,
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
@@ -2802,6 +2848,16 @@ _SLOT_FREE = 'FREE'
 _SLOT_BUSY = 'BUSY'
 _SLOT_PARKED = 'PARKED'   # cancel-fail path: held + non-acquirable, pending pgrep probe
 
+# Wire vocabulary for the slot constants above (task 3275).  Derived from the
+# constants rather than re-spelled so the two can never drift apart.  Consumers
+# of HostAllocator.host_states() see ONLY these lowercase strings, never the
+# internal _SLOT_* spelling — see host_states() for the rationale.
+_SLOT_WIRE = {
+    _SLOT_FREE: 'free',
+    _SLOT_BUSY: 'busy',
+    _SLOT_PARKED: 'parked',
+}
+
 
 @dataclass(frozen=True)
 class HostLease:
@@ -2949,6 +3005,152 @@ class HostAllocator:
         were never quarantined) is a safe no-op.
         """
         self._quarantine.discard(name)
+
+    def readmit(self, name: str) -> None:
+        """Fully re-engage host *name* in the pool: un-quarantine AND un-PARK.
+
+        This is the auto-reprobe re-engagement primitive (task 1795 recovery,
+        task 3043 strand fix).  :meth:`clear_quarantine` alone cannot recover a
+        host whose slot the cancel-fail path PARKed, because
+        :meth:`acquire_remote` additionally requires ``_SLOT_FREE`` — so a
+        recovery that only discards the quarantine can resolve the host's L1 and
+        pop its unavailability-tracker entry while leaving it non-acquirable:
+        unquarantined, untracked AND unusable, invisible to every recovery
+        mechanism until an orchestrator restart.  That is how a host that was
+        down at orchestrator start stays out of the pool indefinitely.
+
+        BUSY carve-out: only a PARKED slot is reset.  A BUSY slot is left BUSY,
+        so re-admission can never steal a verify that is genuinely in flight
+        (cf. the "Known limitation (ABA)" note on :meth:`cancel_and_release`).
+        An unknown name never fabricates a slot entry — the lookup uses
+        ``.get``, never ``[]``/``setdefault`` — and the local host is unaffected
+        because local is never PARKED by the remote cancel-fail path.
+
+        Caller obligation: PARK means "the cancel RPC failed, so a stale verify
+        process may still be running on that host".  Callers must therefore have
+        probed the host clean first — the reprobe sweep gates re-admission on
+        ``health()`` AND ``probe_clean()`` — so that freeing the slot cannot
+        double-dispatch onto a host still churning on a previous merge.
+
+        Idempotent: a repeat call on an already-FREE, unquarantined host is a
+        safe no-op.
+        """
+        self._quarantine.discard(name)
+        if self._slots.get(name) == _SLOT_PARKED:
+            self._slots[name] = _SLOT_FREE
+
+    def is_quarantined(self, name: str) -> bool:
+        """Return True if host *name* is currently quarantined.
+
+        Mirrors :meth:`VerifyRunnerPool.is_quarantined`.  Because the
+        quarantine set is shared **by reference** with the worker's
+        ``_runner_quarantine``, this reflects every writer of that set — not
+        just :meth:`quarantine_and_release`, but also the DriftDetector-driven
+        verdict-divergence quarantines and the land-time per-land cross-check,
+        which add names to the worker's set directly without going through the
+        allocator.
+
+        A name this allocator does not manage returns its membership in the
+        shared set rather than raising — the read is pure set membership, not
+        a slot lookup, so it answers for unmanaged names too (False for one
+        that was never quarantined).  That is precisely why it exists
+        alongside :meth:`host_states`: its production caller is
+        ``SpeculativeMergeWorker._host_states_block``'s **orphan** arm (task
+        3275), which classifies RU-tracked hosts that have no slot in this
+        allocator.  :meth:`host_states` structurally cannot answer for those —
+        it enumerates ``_slots`` — so the two are complementary, not redundant.
+        """
+        return name in self._quarantine
+
+    def host_states(self) -> list[dict]:
+        """Return per-host slot state + quarantine membership, one dict per host.
+
+        Ordering matches the :attr:`host_names` property: ``_slots`` insertion
+        order, i.e. local first, then remotes in declaration order.
+
+        Each dict is ``{'name', 'is_local', 'slot_state', 'quarantined'}`` —
+        a uniform schema, every key always present.
+
+        Notes
+        -----
+        - The returned dicts are **plain data, not live views**: mutating them
+          cannot affect allocator state, and they do not update as slots change.
+        - ``slot_state`` is the lowercase wire vocabulary (``free`` / ``busy`` /
+          ``parked``) from :data:`_SLOT_WIRE`, deliberately distinct from the
+          internal ``_SLOT_*`` constants so a consumer can never come to depend
+          on the internal spelling.
+        - This is the sanctioned read path for
+          :meth:`~orchestrator.merge_queue.SpeculativeMergeWorker.snapshot`
+          (task 3275), which must NOT reach into ``_slots`` / ``_quarantine``
+          directly.  Pure read — no mutation, no I/O, no await — so it is safe
+          to call from that synchronous method.
+        """
+        return [
+            {
+                'name': name,
+                'is_local': name == self._local_name,
+                'slot_state': _SLOT_WIRE[state],
+                'quarantined': name in self._quarantine,
+            }
+            for name, state in self._slots.items()
+        ]
+
+    @property
+    def local_name(self) -> str:
+        """Name of the local (trust-anchor) host this allocator was built with.
+
+        The O(1) read for "is this host the local anchor?".  Callers that need
+        only the name must use this rather than scanning :meth:`host_states`
+        for its ``is_local`` flag, which materialises one dict per host on
+        every call (task 3043 amend).  :meth:`host_states` remains the
+        sanctioned read when the *full* per-host block is wanted.
+
+        Pure read of the constructor argument — never None, never mutated
+        after construction.
+        """
+        return self._local_name
+
+    def is_parked(self, name: str) -> bool:
+        """Return True if host *name*'s slot is PARKED (held + non-acquirable).
+
+        Exists because PARKED is a *strand* state no other accessor can cheaply
+        answer for (task 3043).  When :meth:`cancel_and_release` runs against an
+        unreachable host the cancel RPC returns rc != 0 and every
+        ``probe_clean()`` poll fails, so on exhaustion the slot is deliberately
+        left PARKED — the correct fail-closed state, since a stale verify
+        process may still be running there.  But that path writes **only**
+        ``_slots``: the host is NOT added to ``_quarantine``, so
+        :meth:`quarantined_remote_runners` never yields it and the auto-reprobe
+        path cannot even consider it.  ``SpeculativeMergeWorker`` uses this
+        predicate on its release paths to detect exactly that strand and record
+        the host in its unavailability tracker.
+
+        Deliberately consistent with :meth:`host_states`'s
+        ``slot_state == 'parked'`` — both read ``_slots``, and ``_SLOT_WIRE`` is
+        just the wire spelling of the same state.  This is the cheap per-host
+        boolean for the hot path; ``host_states()`` remains the sanctioned
+        list-shaped read for snapshot consumers.
+
+        A name this allocator does not manage returns False rather than raising.
+        """
+        return self._slots.get(name) == _SLOT_PARKED
+
+    def remote_runner(self, name: str) -> Any | None:
+        """Return the runner object declared for remote host *name*, else None.
+
+        Exists because reprobe candidacy is TRACKER-driven (task 3043): the
+        sweep iterates the worker's ``_runner_unavailable`` tracker and must
+        resolve a runner for hosts that are unavailable but **not** in the
+        quarantine set — the escaping-exception and PARKED-strand shapes.
+        :meth:`quarantined_remote_runners` structurally cannot supply those; it
+        filters on quarantine membership by construction.
+
+        Resolution is independent of slot state and of quarantine membership —
+        it is a pure declaration lookup.  Returns None for the local host name
+        (``_remote_runners`` holds only remotes; local is the trust anchor and
+        is never probed for re-admission) and None for an unknown name.
+        """
+        return self._remote_runners.get(name)
 
     def quarantined_remote_runners(self) -> list[tuple[str, Any]]:
         """Return (name, runner) pairs for remote runners currently in quarantine.

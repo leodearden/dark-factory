@@ -133,6 +133,22 @@ class TerminalReport:
     # Defaults True so every pre-existing construction site (DONE/CANCELLED
     # and all non-warm-lane block paths) is unchanged and keeps counting.
     counts_against_requeue_cap: bool = True
+    # Task 3315 (PRD `plans/server-side-api-error-handling-prd.md` task β,
+    # contract C2): the STRUCTURED HTTP status of a server-side API failure,
+    # carried verbatim from ``AgentResult.api_error_status`` (via
+    # ``shared.cli_invoke.classify_agent_failure``).  This is the PRIMARY
+    # transient-requeue routing signal (INV-1 "structured field over regex"),
+    # replacing the regex-over-prose match on the block reason — which
+    # survives only as a legacy fallback in
+    # ``scheduler.is_transient_api_requeue``.  The thread is
+    # ``TerminalReport -> TaskReport ->
+    # Scheduler.record_requeue(api_error_status=...) ->
+    # is_transient_api_requeue``.
+    # PRODUCERS — the phases that actually SET this on a REQUEUED report —
+    # land in the sibling PRD tasks γ (execute), η (review) and θ
+    # (planning/simple_task); it therefore defaults ``None`` at every
+    # construction site today, exactly like every other additive field here.
+    api_error_status: int | None = None
 
 
 class RequeueKind(enum.Enum):
@@ -238,7 +254,11 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         return _disposition_table_cache
 
     from shared.cli_invoke import AllAccountsCappedException
-    from shared.usage_gate import IllegalTransitionError, SessionBudgetExhausted
+    from shared.usage_gate import (
+        IllegalTransitionError,
+        ProbeSpawnError,
+        SessionBudgetExhausted,
+    )
 
     from orchestrator.git_ops import (
         BranchResetError,
@@ -530,6 +550,30 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='lane_lock_self_owned_leak',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only row (task 4512) — same category as
+        # MergeParkError/EphemeralWorktreeError below. ProbeSpawnError is
+        # raised at exactly one site (UsageGate._run_probe, when
+        # create_subprocess_exec fails to spawn the CLI binary) and is caught
+        # by BOTH of that method's callers inside shared/usage_gate.py
+        # (_account_resume_probe_loop and _reprobe_account), so it never
+        # reaches _drive()'s ladder or classify_failure(). The row exists so
+        # _lookup_disposition(ProbeSpawnError) is non-None for BD-2's
+        # completeness check; ProbeSpawnError derives directly from Exception
+        # (deliberately NOT OSError — see its docstring), so no ancestor row
+        # is inherited via MRO.
+        #
+        # Values mirror IllegalTransitionError below: a host fault (missing or
+        # non-executable binary, broken self-update symlink, unresolvable
+        # PATH) that no amount of waiting or requeueing can fix, so BLOCK +
+        # escalate_to_human rather than REQUEUE.
+        ProbeSpawnError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Usage-gate probe binary could not be spawned',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         IllegalTransitionError: BlockDisposition(

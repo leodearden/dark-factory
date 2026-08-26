@@ -32,7 +32,7 @@ from _orch_helpers import (
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.event_store import EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults, RoutingDecision
@@ -234,9 +234,25 @@ _REVIEW_PHASE1 = VerifyResult(
 )
 
 
+# Deliberately OUTSIDE pytest's tmp_path — NOT a sandbox escape.
+# ReviewCheckpoint._run_review (review_checkpoint.py:150-155) raises ValueError
+# on any project_root containing '/tmp/pytest', a guard added by commit
+# 7187958699 (2026-03-31) after Harness tests passing tmp_path fired real review
+# agents at empty fixture dirs.  The guard is the FIRST statement of _run_review,
+# ahead of every seam these tests patch, so no patching arrangement avoids it.
+# Same workaround as test_review_checkpoint_cap.py:30 and
+# test_review_checkpoint_full_gate.py:31.  The directory is never created and
+# need not exist — run_full_verification is mocked in these tests.  Spelled
+# distinctly from the '/tmp/fake-project' literal task 3551 retired elsewhere so
+# a future grep-driven cleanup can tell a deliberate workaround from an accident.
+# Enforced, not merely documented: moving this root under a pytest path fails
+# 5 tests in this module with that ValueError (measured, task 3551).
+_REVIEW_PROJECT_ROOT = Path('/tmp/dark-factory-review-nonpytest-root')
+
+
 def _review_config():
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    cfg.project_root = Path('/tmp/fake-project')
+    cfg.project_root = _REVIEW_PROJECT_ROOT
     cfg.fused_memory.project_id = 'dark_factory'
     cfg.models.deep_reviewer = 'opus'
     cfg.budgets.deep_reviewer = 10.0
@@ -409,6 +425,15 @@ def _unblock_config():
     cfg.invocation_timeout = 7200.0
     skip_role_config_layer(cfg)
     stamp_stock_routing_config(cfg)
+    # task 3271: run_dry_run_unblock's finally archives the per-investigation
+    # config dir, reading config.project_root / config.transcript_archive.root.
+    # Under spec_set both auto-vivify as MagicMocks and the hook's internal
+    # Path() coercion raises TypeError, which its except-Exception would turn
+    # into a spurious WARNING on every routing test here. Stamp real values
+    # with archival OFF — these tests pin ROUTING, not archival, and the
+    # archival behaviour is covered by test_dry_run_unblock.py.
+    cfg.project_root = Path('.')
+    cfg.transcript_archive = TranscriptArchiveConfig(enabled=False)
     return cfg
 
 

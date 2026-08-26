@@ -57,6 +57,7 @@ asserted against the REAL born-at-L2 writer, which ``tests/scripts/`` cannot
 import).
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -205,6 +206,20 @@ def log(msg: str) -> None:
     entirely with no signal. That is precisely the silent degradation the
     storm escape exists to eliminate, arriving through the LOGGING path.
     ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
+
+    NEVER raises from either journal route. A tooling failure in the logging
+    path must not become a control-flow event at a call site — dashboard-
+    watchdog has no per-unit loop, but every log() call inside tick() — the
+    startup-grace streak reset, the healthy-again streak reset, and the
+    ceiling re-trip log that precedes the ceiling_open write — is ordered
+    BEFORE the save_state() it narrates, so an exception escaping here
+    aborts tick() mid-branch and skips that write: a stale streak survives a
+    startup grace or a recovery (arming a restart of a *healthy* dashboard
+    on the next single missed probe), or the ``ceiling_open`` write is lost.
+    main()'s ``except Exception`` does NOT cover this — it only keeps the
+    process exit code at 0; the tick's state write is already skipped by the
+    time that handler runs. (An unrelated non-tooling exception type is
+    still deliberately propagated — see the narrow except clause below.)
     """
     try:
         subprocess.run(
@@ -217,7 +232,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        print(f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
+        # The fallback is itself best-effort: writing to stderr raises on a
+        # broken pipe or a full/failing journal socket, and that OSError
+        # would otherwise escape log() and abort tick() mid-branch (see the
+        # never-raises contract above). Both journal routes are gone at this
+        # point, so there is nothing left to report WITH — dropping the
+        # message is the only remaining option, and it is strictly better
+        # than dropping the rest of the tick with it.
+        with contextlib.suppress(OSError):
+            print(
+                f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]",
+                file=sys.stderr,
+            )
 
 
 class _JournalLog:
@@ -236,10 +262,9 @@ class _JournalLog:
     """
 
     def warning(self, msg: str) -> None:
-        try:
+        # Broad by design: logging must never break a fail-soft path.
+        with contextlib.suppress(Exception):
             log(f"WARNING: {msg}")
-        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft path
-            pass
 
 
 logger = _JournalLog()
@@ -426,10 +451,8 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
         tmp_path = None  # renamed away — nothing to clean up
     except Exception as exc:  # noqa: BLE001 -- a failed stamp must not crash the tick
         if tmp_path is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
         logger.warning(f"save_state: failed to persist state to {path}: {exc!r}")
 
 

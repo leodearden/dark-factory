@@ -7,7 +7,9 @@ invocation_end event tagging, sha-stamping, and keep-last-N trim.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
+import logging
 import subprocess
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -23,7 +25,7 @@ from _orch_helpers import (
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -103,7 +105,8 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  model='sonnet', max_turns=50, effort='high', backend='claude',
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
                  b3_proposal_keep_last=5, working_idle_secs=1800.0,
-                 invocation_timeout=7200.0):
+                 invocation_timeout=7200.0, project_root=None,
+                 transcript_archive=None):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
@@ -129,6 +132,23 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     # RoleDefaults(ua_cfg.*) base stands — byte-equivalent to pre-η.
     skip_role_config_layer(cfg)
     stamp_stock_routing_config(cfg)
+    # task 3271: run_dry_run_unblock's finally now archives the
+    # per-investigation config dir via archive_task_transcripts, reading
+    # config.project_root / config.transcript_archive.root. Under spec_set
+    # BOTH auto-vivify as MagicMocks and `Path(MagicMock() / MagicMock())`
+    # raises TypeError INSIDE the hook, which its except-Exception would
+    # swallow into a WARNING on every one of the ~30 call sites below — a
+    # suite that logs a real-looking archival failure 30x per run is exactly
+    # the noise that trains reviewers to ignore the signal. So stamp REAL
+    # values: archival OFF by default (these tests genuinely do not exercise
+    # it, and an enabled default would leak archive trees under the repo or
+    # /tmp), and ON only where a caller passes a real project_root. The
+    # production-on path is covered explicitly by TestDryRunTranscriptArchival.
+    cfg.project_root = Path(project_root) if project_root is not None else Path('.')
+    cfg.transcript_archive = (
+        transcript_archive if transcript_archive is not None
+        else TranscriptArchiveConfig(enabled=False)
+    )
     return cfg
 
 
@@ -1146,6 +1166,64 @@ class TestInfraFailureClassification:
         assert entry['status'] == 'investigation_failed'
 
     @pytest.mark.asyncio
+    async def test_cli_input_rejected_classified_as_infra_failure(self, tmp_path):
+        """Task 3143: a pre-turn CLI rejection means the investigation never
+        ran at all, so it must stay a RETRYABLE infra_failure proposal and
+        never be presented as a human-review conclusion.
+
+        It reached that status by accident before (via EMPTY_OUTPUT), carrying
+        the fixed 'agent returned empty output' text that actively misdescribed
+        the cause; the proposal must now carry the CLI's real stderr line.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_cli_input_rejected',
+            output='Agent produced no output',
+            cost_usd=0.0,
+            timed_out=False,
+            duration_ms=2100,
+            transcript_turns=None,
+            session_id='sess-y',
+            stderr=(
+                'Warning: no stdin data received in 3s, proceeding without it.\n'
+                'Error: Input must be provided either through stdin or as a '
+                'prompt argument when using --print\n'
+            ),
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='703',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        _assert_one_proposal_persist(scheduler)
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"a rejection means the investigation never ran -- it must stay a "
+            f"retryable infra_failure, got {entry['status']!r}"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['subtype'] == 'error_cli_input_rejected'
+        assert 'Input must be provided' in entry['proposal_text'], (
+            f"the proposal must carry the CLI's real cause, got "
+            f"{entry['proposal_text']!r}"
+        )
+        assert 'agent returned empty output' not in entry['proposal_text']
+
+    @pytest.mark.asyncio
     async def test_high_turn_timeout_still_classified_infra_failure(self, tmp_path):
         """Pin current behavior (review note, task 2020): classification is
         by AgentFailureKind alone (timed_out=True -> TIMED_OUT), NOT gated on
@@ -2022,3 +2100,436 @@ class TestMergeCompletionRiskClamp:
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['risk_label'] == 'low'
         assert entry['block_class'] == 'agent_failure'
+
+
+# ---------------------------------------------------------------------------
+# task 3271 step-1: the per-investigation transcript must survive the run
+# ---------------------------------------------------------------------------
+
+# The encoded-project dir the fake transcripts are laid down under (idiom from
+# test_transcript_archive_producer_hook.py:33).
+ENC = '-home-leo-projX'
+
+
+def _transcript_writing_invoke(results):
+    """Build a fake ``invoke_agent`` that lays down a real transcript file.
+
+    ``invoke_with_cap_retry`` hands ``invoke_fn`` the per-investigation
+    ``config_dir`` as a ``Path`` and the ``session_id`` the caller allocated
+    (both already pinned by ``TestDryRunResilienceScaffolding``), so the
+    side-effect can write ``<config_dir>/projects/<ENC>/<session_id>.jsonl`` —
+    exactly the layout ``archive_task_transcripts`` globs — and record which
+    session ids and payloads it produced.
+
+    Returns ``(async_side_effect, state)`` where ``state.payloads`` maps each
+    allocated session id to the bytes written for it, in call order.
+    """
+    state = MagicMock()
+    state.sessions = []
+    state.payloads = {}
+    results = list(results)
+
+    async def _side_effect(*_args, **kwargs):
+        config_dir = Path(kwargs['config_dir'])
+        session_id = kwargs['session_id']
+        enc_dir = config_dir / 'projects' / ENC
+        enc_dir.mkdir(parents=True, exist_ok=True)
+        payload = (
+            _json.dumps({'type': 'user', 'session_id': session_id}) + '\n'
+        ).encode()
+        (enc_dir / f'{session_id}.jsonl').write_bytes(payload)
+        state.sessions.append(session_id)
+        state.payloads[session_id] = payload
+        # Clamp: the wedge path calls twice with the same canned result list.
+        return results[min(len(state.sessions) - 1, len(results) - 1)]
+
+    return _side_effect, state
+
+
+def _archive_enc_of(path: Path, archive_root: Path):
+    """Call the REAL legibility pre-filter deriver on *path*.
+
+    Asserting through the miner's own deriver (rather than restating the
+    ``<key>/<enc>/<sid>.jsonl`` layout as a string comparison) is what keeps
+    this test and ``_enumerate``'s pre-filter from drifting — the drift that
+    let this layout constraint go unchecked in the first place. ``scripts/`` is
+    installed nowhere and is not on orchestrator's pytest pythonpath, so reuse
+    the guarded sys.path insertion idiom of the other cross-package consumers
+    (shared/tests/toolcall_markup_corpus_extract.py:86-94). No layering cycle:
+    inventory.py is stdlib-only and imports nothing first-party.
+    """
+    import sys
+
+    scripts_root = Path(__file__).resolve().parents[2] / 'scripts'
+    if scripts_root.exists() and str(scripts_root) not in sys.path:
+        sys.path.insert(0, str(scripts_root))
+    from legibility.inventory import _archive_enc  # type: ignore[reportMissingImports]
+
+    return _archive_enc(path, archive_root)
+
+
+class TestDryRunTranscriptArchival:
+    """A dry-run-unblock investigation's transcript must outlive its config dir.
+
+    The per-investigation ``TaskConfigDir`` is named ``{task_id}-unblock``, and
+    BOTH exit branches lose it today: the normal path ``rmtree``s it, and the
+    forensic ``preserve_config_dir`` path merely defers the loss to ``git
+    worktree remove --force``. The ``GitOps.cleanup_worktree`` teardown
+    backstop cannot cover either, because it composes its target by literal
+    f-string ``f'claude-config-{branch}'`` — which never matches the
+    ``-unblock`` suffix. So the producer-side archival call is mandatory, not
+    redundant, and it must sit ABOVE the preserve/cleanup branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_successful_run_archives_transcript_durably(self, tmp_path):
+        from shared.transcript_archive import durable_archive_path
+
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(side_effect=side_effect)):
+            await run_dry_run_unblock(
+                task_id='3271',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        assert len(state.sessions) == 1, (
+            f'Expected exactly one investigation session, got {state.sessions}'
+        )
+        sid = state.sessions[0]
+
+        # Existing teardown behaviour is untouched: the config dir is gone.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+        # …but the transcript survived it, under the durable archive root.
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        archived = archive_root / '3271' / ENC / f'{sid}.jsonl'
+        assert archived.exists(), (
+            f'Expected the investigation transcript to be archived durably at '
+            f'{archived}; the config dir it lived in has already been removed, '
+            f'so this content is otherwise unrecoverable. Archive root tree: '
+            f'{sorted(p for p in archive_root.rglob("*")) if archive_root.exists() else "(absent)"}'
+        )
+        assert archived.read_bytes() == state.payloads[sid]
+
+        # Enumerability: the archive-root-relative parts[1] really is the
+        # encoded cwd, so _enumerate's pre-filter ADMITS this file. A subkeyed
+        # layout (<task_id>/unblock/<enc>/...) would put the literal 'unblock'
+        # here, matching no project prefix, and every archived investigation
+        # would be silently skipped by the miner — the same invisibility this
+        # fix exists to end, but with the files present on disk.
+        assert _archive_enc_of(archived, archive_root) == ENC
+
+        # Locatability via the module's declared SOLE session-id-keyed locator
+        # (invariant I-E): the plain-task_id key keeps the investigation
+        # reachable by the canonical reader.
+        assert durable_archive_path(archive_root, '3271', sid) == archived
+
+    @pytest.mark.asyncio
+    async def test_doubly_wedged_run_archives_even_though_config_dir_is_preserved(
+        self, tmp_path,
+    ):
+        """The forensic preserve path does NOT save the transcript.
+
+        It only defers the loss from ``cleanup()`` to ``git worktree remove
+        --force``, which no backstop covers for this dir name — so archival
+        must happen ABOVE the ``if preserve_config_dir:`` branch. This is also
+        the HIGHEST-value case: it fires only on a doubly-wedged investigation,
+        exactly the pathology a legibility miner wants the reasoning trace for.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+        side_effect, state = _transcript_writing_invoke([wedge, wedge])
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(side_effect=side_effect)):
+            await run_dry_run_unblock(
+                task_id='3272',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        # Two attempts, two freshly-allocated session ids — and the FIRST is
+        # the wedge, the diagnostically interesting one. Keying archival on a
+        # single session id would discard it; the whole-dir sweep keeps both.
+        assert len(state.sessions) == 2, (
+            f'Expected the zero-output wedge retry, got sessions {state.sessions}'
+        )
+
+        # Existing forensic behaviour intact: the dir is still preserved.
+        task_dir = worktree / '.task'
+        preserved = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert len(preserved) == 1, (
+            f'Expected the config dir to be PRESERVED after a doubly-wedged '
+            f'run (forensics), found: {preserved}'
+        )
+
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        for sid in state.sessions:
+            archived = archive_root / '3272' / ENC / f'{sid}.jsonl'
+            assert archived.exists(), (
+                f'Expected session {sid} archived at {archived} even though the '
+                f'config dir was preserved — preservation only defers the loss '
+                f'to worktree teardown, which no backstop covers for a '
+                f'claude-config-*-unblock dir. Archive root tree: '
+                f'{sorted(p for p in archive_root.rglob("*")) if archive_root.exists() else "(absent)"}'
+            )
+            assert archived.read_bytes() == state.payloads[sid]
+
+    @pytest.mark.asyncio
+    async def test_archival_disabled_writes_nothing(self, tmp_path):
+        """The fleet-wide off switch must be honoured by EVERY producer.
+
+        ``TranscriptArchiveConfig.enabled`` is documented as "disable
+        transcript archival entirely — the _invoke producer hook short-circuits
+        and never calls archive_task_transcripts" (config.py:1075-1082). That
+        contract is only true fleet-wide if this producer consults the same
+        knob, rather than being true-for-two-of-three.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(return_value=0)) as mock_archive,
+        ):
+            await run_dry_run_unblock(
+                task_id='3273',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(enabled=False),
+                ),
+            )
+
+        # The transcript really was produced — so a passing assertion below is
+        # a genuine short-circuit, not an empty run with nothing to archive.
+        assert len(state.sessions) == 1
+
+        # Pin the SHORT-CIRCUIT itself, not merely an empty result: the
+        # disabled path must not even spin up the archiver's worker thread.
+        assert not mock_archive.called, (
+            f'archive_task_transcripts must not be called when '
+            f'transcript_archive.enabled is False; got calls: '
+            f'{mock_archive.call_args_list}'
+        )
+
+        # …and it leaves zero on-disk trace. _archive_one only ever mkdirs
+        # per-file, so a genuine short-circuit means the archive root is never
+        # even created.
+        archive_root = project_root / 'data/orchestrator/agent-transcripts'
+        assert not archive_root.exists(), (
+            f'Expected no archive root at all with archival disabled, found: '
+            f'{sorted(p for p in archive_root.rglob("*"))}'
+        )
+
+        # Disabling archival must not change teardown.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+    @pytest.mark.asyncio
+    async def test_archival_failure_neither_breaks_the_run_nor_skips_teardown(
+        self, tmp_path, caplog,
+    ):
+        """A raising archiver must not replace the run's result or its cleanup.
+
+        The hook's ``except Exception`` exists for exactly this: it sits in a
+        ``finally`` that may be unwinding an in-flight exception, so an archival
+        error must be logged as a structured fact and swallowed, never
+        propagated. And because the hook was inserted AHEAD of teardown, the
+        second property matters just as much — ``config_dir.cleanup()`` must
+        still run afterwards. (``archive_task_transcripts`` is total by
+        contract, so this drives the defense-in-depth branch directly rather
+        than hoping the real helper misbehaves.)
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'),
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(side_effect=OSError('boom'))) as mock_archive,
+        ):
+            await run_dry_run_unblock(
+                task_id='3274',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        assert mock_archive.called, 'archival must have been attempted'
+        assert len(state.sessions) == 1
+
+        # (a) The run's own result is intact — the archival error did not
+        # replace it, and the proposal still reached the scheduler.
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        # The success shape carries no explicit 'status' (it defaults to 'ok'
+        # downstream) — so pin the substantive fields instead of a sentinel.
+        assert entry.get('status', 'ok') == 'ok'
+        assert entry['proposal_text'] == 'Rebase on main'
+        assert entry['risk_label'] == 'low'
+
+        # Loud, not silent: a structured WARNING names the failure.
+        assert any(
+            'transcript archival failed' in rec.message
+            and rec.levelno == logging.WARNING
+            for rec in caplog.records
+        ), f'Expected an archival-failure WARNING, got: {[r.message for r in caplog.records]}'
+
+        # (b) Teardown still ran. This is the property most likely to regress
+        # silently, since the archival hook was inserted ahead of it.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], (
+            f'A failed archival must not skip config-dir teardown (the dir holds '
+            f'.credentials.json); found: {leftover}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_archival_still_reaps_the_config_dir(self, tmp_path):
+        """CancelledError propagates — but must not take teardown down with it.
+
+        The archival ``await`` is the FIRST await point in this ``finally``, and
+        its ``except asyncio.CancelledError: raise`` is deliberate (cooperative
+        cancellation is a ``BaseException`` and must propagate). Under loop
+        teardown / SIGTERM that re-raise would, unnested, skip the
+        preserve-or-cleanup branch below it and strand a config dir containing
+        ``.credentials.json`` — a regression created purely by inserting a new
+        await ahead of teardown. The hook is nested in its own ``try/finally``
+        so cleanup runs either way.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, _state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(side_effect=asyncio.CancelledError())),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_dry_run_unblock(
+                task_id='3275',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], (
+            f'Cancellation must still reap the per-investigation config dir — it '
+            f'holds .credentials.json and was unconditionally cleaned up before '
+            f'the archival hook was inserted ahead of teardown; found: {leftover}'
+        )

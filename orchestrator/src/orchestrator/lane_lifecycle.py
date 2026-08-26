@@ -15,16 +15,15 @@ mixing those in would break the pool's purity and its existing 2-value
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared import safe_io
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -276,7 +275,7 @@ class LaneLifecycle:
         if not path.is_file():
             return None
         try:
-            return LaneRecord.from_json(path.read_text())
+            return LaneRecord.from_json(path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
@@ -300,23 +299,45 @@ class LaneLifecycle:
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
 
-        Mirrors ``escalation.queue.EscalationQueue._atomic_write_path``: the
-        tmp file is created in the target's own parent dir so the replace
-        stays within one filesystem, and is cleaned up on failure.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+        consolidated this repo's copies of the tmp+rename writer). The
+        arguments reproduce exactly what the previously-inlined body produced:
+        ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
+        :func:`tempfile.mkstemp` create, and no fsync.
+
+        Task 3223 reproduced the old inlined body's behaviour verbatim: a bare
+        ``os.fdopen(fd, 'w')``, which is locale-dependent, was preserved rather
+        than silently upgraded (that consolidation explicitly forbade changing
+        per-site encoding). Task 3387 fixed the resulting latent bug: this
+        payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
+        disk to be UTF-8 — under a non-UTF-8 locale this wrote bytes that THIS
+        CLASS'S OWN READER then rejects. Name it precisely, so the next
+        investigator does not go looking in the wrong module:
+        ``_read_or_raise`` raises ``CorruptLaneRecord`` (the decode error is a
+        ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+        method's ``except`` clause), which ``read()`` logs and maps to
+        ``None``, so ``all_records()`` then silently omits the lane. (An
+        earlier version of this paragraph cited
+        ``shared.safe_io.load_json_or_warn``; that helper never reads lane
+        records — its callers are ``b3_gate``, ``chronic_flake``,
+        ``landed_outbox`` and ``merge_queue_store``.)
+
+        ``encoding`` is now pinned ``'utf-8'`` at both halves of the
+        round-trip — here on write, and on ``_read_or_raise``'s ``read_text``
+        — regardless of the ambient locale.
+
+        Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
+        id, not a task id — the curator resolves tickets to tasks
+        asynchronously, so do not search ``tasks.json`` for it and conclude it
+        is fake.
         """
-        path = self._record_path(lane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+        safe_io.atomic_write_text(
+            self._record_path(lane),
+            record.to_json(),
+            encoding='utf-8',
+            mode=0o600,
+            mkdir=True,
         )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(record.to_json())
-            os.replace(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
 
     def transition(self, lane: Path | str, to: LaneState, **fields: object) -> LaneRecord:
         """The one mutator: validate (from, to), persist, return the new record.

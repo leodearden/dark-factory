@@ -7,15 +7,17 @@ module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
 """
 
-import ast
 import asyncio
 import contextlib
 import functools
+import importlib.util
 import inspect
 import json
 import os
 import pathlib
 import re
+import sys
+import types
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -779,6 +781,49 @@ def unique_graph_name(slug: str) -> str:
     return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
 
 
+def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.Session) -> str:
+    """Return this worker's id ('gw0', 'gw1', …) or 'master' — without the xdist PLUGIN.
+
+    Backs the session-scoped ``worker_id`` fixture in ``tests/conftest.py``,
+    which exists because ``worker_id`` was otherwise supplied *solely* by
+    pytest-xdist (``xdist/plugin.py``).  The offline-deep lane's serial confirm
+    re-run appends ``-p no:xdist -o addopts=`` (see
+    ``orchestrator/src/orchestrator/verify_cmd.py``), and ``-p no:xdist``
+    unregisters the plugin along with its FIXTURES — not just its ``-n`` /
+    ``--dist`` CLI options.  Every test requesting ``worker_id`` therefore
+    ERRORED at setup with ``fixture 'worker_id' not found`` in that re-run, and
+    a developer typing ``pytest -p no:xdist`` locally hit the same wall.
+
+    It DELEGATES to xdist's own ``get_xdist_worker_id`` rather than
+    reimplementing its three lines of ``workerinput`` logic.  A conftest
+    fixture SHADOWS a same-named plugin fixture, so the shim takes over
+    ``worker_id`` for every fused-memory test — including healthy
+    ``-n auto --dist loadgroup`` runs, where per-worker isolation is the whole
+    point.  Any semantic drift from xdist would silently collapse worker
+    namespaces and cause the cross-worker collisions those suffixes exist to
+    prevent; delegating makes such drift structurally impossible, which is what
+    makes the shadowing provably safe.
+
+    The import is function-local and deliberate: ``-p no:xdist`` unregisters the
+    PLUGIN but leaves the MODULE importable, so delegation works in exactly the
+    case that is otherwise broken.
+
+    There is deliberately no ``except ImportError: return 'master'`` fallback.
+    pytest-xdist is a declared dev dependency here and this project's addopts
+    hardcode ``-n auto``, so a venv genuinely missing the module is broken
+    rather than a supported configuration — and quietly collapsing every worker
+    onto one shared 'master' namespace there would reintroduce precisely the
+    collisions above, as flaky live-service tests instead of a clear error.
+
+    Args:
+        request_or_session: a pytest ``request`` or ``session`` object — the
+            same parameter xdist's own function takes.
+    """
+    from xdist.plugin import get_xdist_worker_id
+
+    return get_xdist_worker_id(request_or_session)
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
@@ -843,6 +888,131 @@ async def poll_until(
             return result
         if loop.time() >= deadline:
             raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Shared poll_until_stable() settle barrier (task 3697)
+# ---------------------------------------------------------------------------
+#
+# The companion to poll_until above, and deliberately placed beside it so the
+# two read as a matched PAIR of barrier primitives rather than two unrelated
+# utilities. poll_until is a LIVENESS barrier; this is a SETTLE barrier. Picking
+# the wrong one is the defect this exists to prevent -- see the docstring's
+# decision rule. Public (no leading underscore) for the reason this module
+# already documents for poll_until / ensure_fresh_collection: it is imported
+# cross-module.
+# ---------------------------------------------------------------------------
+
+#: Cap on the observed-value trail carried in the never-settled AssertionError.
+#: A pathological sampler must not be able to produce a multi-megabyte message.
+_STABLE_TRAIL_LIMIT = 10
+
+
+async def poll_until_stable(
+    sample: Callable[[], Any],
+    *,
+    settle: float = 0.2,
+    timeout: float = 10.0,
+    interval: float = 0.02,
+    message: str | None = None,
+) -> Any:
+    """Poll *sample* until its truthy value STOPS CHANGING, then return it verbatim.
+
+    Choosing between this and :func:`poll_until` — the whole point of having
+    both:
+
+    * ``poll_until`` is a **liveness** barrier. Correct when the assertion that
+      follows is "X happened".
+    * ``poll_until_stable`` is a **settle** barrier. **Required** when the
+      assertion that follows is an exact count or an "exactly once" claim,
+      because a liveness poll returns at the *first* occurrence and therefore
+      structurally cannot observe a duplicate that arrives after it.
+
+    The motivating call site is
+    ``test_ticket_worker.py::test_worker_created_path_emits_journal_event``,
+    whose ``assert len(task_created_events) == 1`` was gated on
+    ``poll_until(lambda: any(...))`` — so the assertion ran the instant the
+    first event landed. The duplicate that assertion exists to catch is
+    concrete, not hypothetical: ``task_created`` is emitted from two distinct
+    code paths (``task_interceptor.py`` lines 3786-3795 and 4164-4173), each
+    persisting the terminal ticket row *before* emitting — so no ticket-row
+    predicate closes the emission window either, and only a settle window does.
+
+    **The flake asymmetry**, which is what makes adding a settle window safe: a
+    too-short *settle* can only cause a false PASS (a missed duplicate), never
+    a false FAIL, because a stable value stays stable no matter how starved the
+    host is. The only false-FAIL surface is the outer *timeout*, which keeps
+    ``poll_until``'s already-proven 10s default. Raising *settle* is therefore
+    always safe, and is the correct response to a suspected missed duplicate.
+
+    *sample* may be a plain sync callable or an async/coroutine function —
+    either way it is called with no arguments each iteration and, if the result
+    is awaitable (``inspect.isawaitable``), awaited before use. A falsy result
+    means "not ready yet": polling continues and the settle window does not
+    start. Change detection uses ``!=``, and the deadline uses the asyncio
+    event-loop monotonic clock (same rationale as ``poll_until``), bounding
+    total time *including* settle restarts so a forever-changing value cannot
+    spin past *timeout*.
+
+    Args:
+        sample: Zero-arg sync or async callable evaluated each iteration.
+        settle: Seconds the value must be observed unchanged before it is
+            returned. Any change restarts this window. Defaults to 0.2s.
+        timeout: Total seconds to keep polling before giving up. Defaults to
+            10s, matching ``poll_until``.
+        interval: Seconds to sleep between polls. Defaults to 0.02s.
+        message: Custom AssertionError message used when the value never
+            became truthy at all.
+
+    Returns:
+        The settled truthy value, returned verbatim (not coerced to ``True``),
+        matching ``poll_until``.
+
+    Raises:
+        AssertionError: with two deliberately DISTINGUISHABLE messages, because
+            "it never happened" and "it kept changing" demand different
+            debugging and must not collapse into one string —
+
+            * never became truthy → the caller's *message* (or a default
+              naming *timeout*), matching ``poll_until``'s failure text so the
+              common case reads identically;
+            * became truthy but never settled → a message saying so and
+              naming the observed values (capped at the last
+              ``_STABLE_TRAIL_LIMIT`` distinct ones).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    candidate: Any = None
+    have_candidate = False
+    stable_since = 0.0
+    trail: list[Any] = []
+    while True:
+        result = sample()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            now = loop.time()
+            if not have_candidate or result != candidate:
+                candidate = result
+                have_candidate = True
+                stable_since = now
+                trail.append(result)
+                del trail[:-_STABLE_TRAIL_LIMIT]
+            elif now - stable_since >= settle:
+                return candidate
+        else:
+            # Not ready yet — a falsy sample does not start the settle window.
+            have_candidate = False
+        if loop.time() >= deadline:
+            if trail:
+                raise AssertionError(
+                    f'poll_until_stable: value never settled for {settle}s within '
+                    f'{timeout}s; observed (last {len(trail)}): {trail!r}'
+                )
+            raise AssertionError(
+                message or f'poll_until_stable: condition not met within {timeout}s'
+            )
         await asyncio.sleep(interval)
 
 
@@ -1152,50 +1322,181 @@ async def reap_leaked_ticket_workers() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Shared AST migration-guard machinery (task 3502)
+# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
+# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
+# independent copies of the same loader).
 # ---------------------------------------------------------------------------
+
+# sys.modules keys this helper itself installed. Only these may be REPLACED by
+# a later load of a different file under the same key -- see the shadowing
+# guard in load_script_module().
+_LOADED_SCRIPT_MODULE_NAMES: set[str] = set()
+
+
+def load_script_module(
+    script_path: pathlib.Path, mod_name: str | None = None
+) -> types.ModuleType:
+    """Load a non-package script (e.g. under ``scripts/``) by file path.
+
+    ``scripts/`` is not a package and its modules are not on ``PYTHONPATH``,
+    so this is how a script's pure functions get imported into a test without
+    ``sys.path`` pollution. *mod_name* defaults to the file stem and is the
+    key the module is registered under in ``sys.modules``.
+
+    An already-loaded module for the SAME file is reused rather than
+    re-executed: two independent test modules loading the same script under
+    the same *mod_name* would otherwise make the second load silently
+    replace the first module object in ``sys.modules`` -- two live module
+    objects whose identity depends on collection order. Harmless while only
+    pure functions are used, but a latent hazard the moment anything holds
+    module state.
+
+    A ``sys.modules`` entry this helper did NOT install is never replaced:
+    that raises ``ImportError`` instead. The stem default makes accidental
+    collisions easy to write (``scripts/config.py``, ``scripts/utils.py``,
+    ``scripts/types.py`` are ordinary script names), and a silent replacement
+    persists for the rest of the pytest process, so the damage would surface
+    as an unrelated test failing far away. Deliberate key SHARING -- two test
+    modules loading the same script, or a test loading a different file under
+    a key this helper owns -- is unaffected.
+    """
+    name = mod_name or script_path.stem
+    cached = sys.modules.get(name)
+    cached_file = getattr(cached, '__file__', None)
+    if cached is not None and cached_file is not None and (
+        pathlib.Path(cached_file).resolve() == script_path.resolve()
+    ):
+        return cached
+    if cached is not None and name not in _LOADED_SCRIPT_MODULE_NAMES:
+        raise ImportError(
+            f'refusing to shadow already-imported module {name!r} '
+            f'(from {cached_file!r}) with {script_path}; '
+            'pass an explicit mod_name that does not collide'
+        )
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {script_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    _LOADED_SCRIPT_MODULE_NAMES.add(name)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        # The failed load left nothing installed under *name*, so ownership
+        # lapses with it: a later real import of that name must be protected
+        # by the guard above rather than treated as this helper's to replace.
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
+        raise
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Cross-run citation repair fixtures (task 3065)
 #
-# Migration guards (tests/test_falkor_probe_routing_guard.py;
-# tests/test_gather_idiom_helper_routing.py) assert over the source text of a
-# fixed set of migrated modules. Parsing is shared and memoised here so several
-# guards asserting over overlapping module sets pay one parse per file per
-# session rather than one each.
+# Shared by BOTH tests/reconciliation/test_citation_repair.py and
+# tests/server/test_recon_report_citation_repair.py — one definition here rather
+# than a copy in each module, so the journal shape the repair path reads and the
+# lookup verdicts it branches on cannot drift between the two suites.
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def _test_module_source(path: pathlib.Path) -> str:
-    return path.read_text()
+async def build_journal_with_closed_run(
+    tmp_path: Any,
+    *,
+    run_id: str,
+    project_id: str = 'reify',
+    status: str = 'completed',
+    stage: str = 'memory_consolidator',
+    findings: list[dict[str, Any]],
+    extra_stage_reports: dict[str, Any] | None = None,
+):
+    """Open a real ``ReconciliationJournal`` holding one run with ``findings``.
 
+    A REAL journal on a tmp_path SQLite file, not a fake: the repair path's whole
+    reason to exist is that a closed run's findings live only in the journal's
+    ``runs.stage_reports`` blob, so a test that stubbed the round-trip would stop
+    exercising the one thing under test (``StageReport`` parse on read,
+    ``model_dump(mode='json')`` re-serialize on write).
 
-@functools.cache
-def parse_test_module(path: pathlib.Path) -> ast.Module:
-    """Parse *path* into an ``ast.Module``, memoised per session.
+    ``findings`` becomes ``stage_reports[stage].items_flagged``.
+    ``extra_stage_reports`` is merged in verbatim AFTER that entry, so a caller
+    can seed a second real stage or a raw non-``StageReport`` entry
+    (``{'_error': {...}}``) to prove the stage scan tolerates it.
 
-    Test sources do not change mid-session, so several guards asserting over
-    overlapping module sets can share one parse per file.
+    Returns the OPEN journal — the caller closes it (``await journal.close()``).
     """
-    assert path.exists(), f'{path} not found'
-    return ast.parse(_test_module_source(path), filename=str(path))
+    from datetime import UTC, datetime
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+    from fused_memory.reconciliation.journal import ReconciliationJournal
+
+    journal = ReconciliationJournal(pathlib.Path(tmp_path))
+    await journal.initialize()
+    now = datetime.now(UTC)
+    # ``status``/``stage`` stay plain ``str`` in the signature so a caller writes
+    # the same literal the journal row holds; coerced here because the model
+    # fields are StrEnums (pydantic would coerce anyway — this just makes the
+    # conversion visible to the type checker rather than implicit).
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=now,
+            completed_at=None if status == 'running' else now,
+            status=RunStatus(status),
+        )
+    )
+    reports: dict[str, Any] = {
+        stage: StageReport(
+            stage=StageId(stage),
+            started_at=now,
+            completed_at=now,
+            items_flagged=findings,
+        )
+    }
+    reports.update(extra_stage_reports or {})
+    await journal.update_run_stage_reports(run_id, reports)
+    return journal
 
 
-def calls_named(node: ast.AST, name: str) -> list[ast.Call]:
-    """Every ``ast.Call`` under *node* whose callee is ``name(...)`` / ``….name(...)``.
+class FakeMemoryLookup:
+    """Async ``get_memory_by_id`` stub with an explicit per-id verdict.
 
-    AST, not string grep: prose that merely mentions the name — a docstring
-    describing the helper a guard enforces — must not satisfy or trip a check.
+    The map's value decides the branch, so a test states which of the THREE
+    outcomes it means without any implicit default:
 
-    Takes any node, not only a module, so a guard can ask the narrower question
-    "is it called *here*" — inside a decorator, or inside the value assigned to
-    ``pytestmark`` — rather than only "is it called anywhere in the file".
+    - ``dict``      -> the memory resolves (live);
+    - ``None``      -> genuinely absent (the only verdict that licenses a repair);
+    - ``Exception`` -> the backend RAISED (unknown, never "absent").
+
+    An id missing from the map resolves to ``None``, matching the real service's
+    not-found return. ``calls`` records every ``(project_id, memory_id)`` in
+    order, so a test can assert a gate fired BEFORE any lookup was attempted.
+
+    Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
+    replacement's fingerprint off the raw Qdrant payload this returns, not
+    through ``MemoryService.get_memory`` (whose mem0 fingerprint is
+    structurally ``{category: None, agent_id: None, ...}`` — see
+    ``citation_repair._fingerprint_from_record``). A test that needs to pin
+    that non-call subclasses this and adds a recording ``get_memory``.
     """
-    found: list[ast.Call] = []
-    for descendant in ast.walk(node):
-        if not isinstance(descendant, ast.Call):
-            continue
-        func = descendant.func
-        if (isinstance(func, ast.Name) and func.id == name) or (
-            isinstance(func, ast.Attribute) and func.attr == name
-        ):
-            found.append(descendant)
-    return found
+
+    def __init__(self, memories: dict[str, Any] | None = None):
+        self.memories: dict[str, Any] = dict(memories or {})
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_memory_by_id(self, project_id: str, memory_id: str) -> Any:
+        self.calls.append((project_id, memory_id))
+        verdict = self.memories.get(memory_id)
+        if isinstance(verdict, BaseException):
+            raise verdict
+        return verdict

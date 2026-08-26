@@ -97,6 +97,63 @@ class EventType(StrEnum):
     # Both keys are ALWAYS present (None when not narrowed) so the survey's
     # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
     # and can NEVER miscount a narrowed retry as a full green gate.
+    # PLUS one always-present deep merge-ahead key (task 3185, PRD γ):
+    #   chain_items  int, ALWAYS >= 1, NEVER None.  The count, in CHAIN-ITEM
+    #                units, of the items contained in the tree this verify
+    #                actually exercised: the dispatching item is chain item #1
+    #                and each chained successor actually built adds one.
+    #                1 = an ordinary single-item verify (head or
+    #                adjacent speculative); >= 2 = a deep merge-ahead tip
+    #                verify covering that many stacked items.
+    #                DELIBERATELY FRONTIER-INDEPENDENT: an ordinary adjacent
+    #                speculative verify is 1 no matter how many other verifies
+    #                are in flight ahead of it (that height is `depth`'s job,
+    #                below), so under the shipped merge_deep.chain_cap=0 kill
+    #                switch NOTHING can emit >= 2.  That is precisely what
+    #                scripts/merge-deep-canary-predicate.sh:84 depends on --
+    #                it classifies a deep verify as `chain_items >= 2`, and
+    #                that expression is both ζ's "first deep verify observed"
+    #                deploy signal and η1's deep-fail-rate DENOMINATOR.  A
+    #                frontier-inclusive reading would fire it on day one and
+    #                count rounds that chained nothing.  The floor is 1
+    #                rather than 0/None because every merge verify exercises
+    #                at least the item it was created for, so there is no
+    #                "absent" state to represent -- which is what lets a
+    #                reader treat data['chain_items'] as unconditionally
+    #                present and lets the deep-canary predicate count deep
+    #                verifies as `chain_items >= 2`.
+    #                SUPERSEDES reliance on `depth` as a depth signal: a
+    #                firing speculation probe (task 2359) relabels `depth`
+    #                into an attribution fact about a stack that was never
+    #                verified (see ProbePlacement's known-limitation note), so
+    #                probe-era `depth` values are excluded from calibration.
+    #                `chain_items` is derived from the tree that actually ran
+    #                and carries no such caveat.
+    # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
+    # reviewer_comprehensive performance):
+    #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
+    #                build that produced this verify's tree cost.  None
+    #                whenever no chain was built -- i.e. on every event with
+    #                chain_items == 1, which under the shipped chain_cap=0
+    #                kill switch is EVERY event.  Non-None therefore implies
+    #                chain_items >= 2, and the two fields are read together.
+    #                Nullable where chain_items is not, and correctly so: a
+    #                verify that chained nothing paid no build, so there IS a
+    #                genuine "absent" state here and 0 would be a lie rather
+    #                than an absence (whereas every verify exercises at least
+    #                one item, so chain_items has no absent state at all).
+    #                WHY IT EXISTS: the chain build is awaited INLINE on the
+    #                merge worker's dispatch path, so for its whole duration
+    #                _verifier_loop cannot run FINALIZE-HEAD -- an
+    #                already-green head verify can neither finalize nor land,
+    #                and nothing else can dispatch.  That is a per-round
+    #                DISPATCH STALL, not verify time, and the PRD's whole
+    #                justification for deep merge-ahead is throughput, so the
+    #                cost must be measurable before ζ raises the cap.  η1 reads
+    #                it alongside drain-time for exactly that attribution.
+    #                Measured by _deep_chain_placement, not by build_chain, so
+    #                it covers the FULL stall: lane acquisition, the sequential
+    #                merges, and the asyncio.timeout wrapper's overhead.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
@@ -251,9 +308,81 @@ class EventType(StrEnum):
     # the numerator by json_extract(data, '$.reason') to separate expected
     # reseeds from genuine corroboration failures. (enabled=False emits nothing,
     # so a zero total means either no recovered sessions or the kill switch.)
+    #
+    # session_resume_fallback additionally carries `data.archive_available: bool`
+    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # answering "was this session actually RECOVERABLE from the durable
+    # transcript archive?", i.e. did its transcript survive outside the wiped
+    # worktree. Query it as json_extract(data, '$.archive_available') alongside
+    # the existing '$.reason' split, so the fallback population can be cut into
+    # recoverable vs genuinely lost.
+    #
+    # session_resume and session_resume_capped deliberately do NOT carry the
+    # field, so the ratio recipe's DENOMINATOR above is unchanged — the
+    # instrument was added to exactly one of the three outcome events.
+    #
+    # The rate this field exposes is a MEASUREMENT, not a target: it quantifies
+    # a recoverable population that nothing yet acts on (INV-3
+    # instrument-before-acting). Task 3619 will deliberately move it upward, so
+    # a rising archive_available rate is that work landing, not a regression.
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
+
+    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
+    # _run_slot guard above and then still failed to happen. It closes the
+    # population that was previously journal-only and runs.db-INVISIBLE: an
+    # armed --resume whose transcript the CLI could not resolve exits before it
+    # ever contacts the API, so none of the three events above, and no cost or
+    # cap row, ever recorded that the session was lost.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it. The three events above are emitted by
+    # the _run_slot guard, exactly once per DISPATCH that carried a recovered
+    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
+    # INVOCATION — and a single dispatch invokes several roles — so adding it to
+    # that sum would compare populations counted on different units and silently
+    # inflate the attempt count.
+    #
+    # data.stage splits the two ways an adopted resume dies:
+    #   pre_flight — _invoke corroborated the session against the config dir it
+    #                was about to export as CLAUDE_CONFIG_DIR, found no
+    #                transcript there (and could not rehydrate one from the
+    #                durable archive), and dispatched FRESH instead of arming a
+    #                --resume the CLI would reject. data: {stage, session_id,
+    #                role, restore} — `restore` is the rehydration OUTCOME, one
+    #                of 'disabled' (session_resume.restore_from_archive off),
+    #                'miss' (the archive genuinely holds no entry for that
+    #                session and nothing else — the archive-COVERAGE signal),
+    #                'fault' (the restore raised: archive-root composition OR
+    #                the restore's own I/O, the latter reaching this arm only
+    #                because _invoke calls the helper with strict=True — see
+    #                the restore_outcome vocabulary comment in workflow.py) or
+    #                'published' (restore claimed success yet the CLI-facing
+    #                locator still cannot see it: pathological, unreachable by
+    #                construction, counted rather than assumed away).
+    #   cli        — the resume WAS armed and the CLI rejected it;
+    #                invoke_with_cap_retry silently retried fresh and returned a
+    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #                {stage, session_id, session_ids, role, fallbacks}, where
+    #                `fallbacks` is AgentResult.resume_fallbacks — the count of
+    #                fresh retries this one invocation had to make — and
+    #                `session_ids` are the ids those retries dropped, oldest
+    #                first (`session_id` is the first of them, i.e. the resume
+    #                the orchestrator itself adopted). Emitted ONLY when _invoke
+    #                armed the resume: the shared/ counter also increments for a
+    #                resume its retry loop re-armed internally after a cap hit,
+    #                which a plain fresh dispatch can reach, and counting those
+    #                would inflate the ratio below past 1.
+    #
+    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+    #     FROM events WHERE event_type = 'session_resume_failed'
+    #    GROUP BY stage;
+    # Read it against session_resume (the adopted-resume count) rather than
+    # against the three-event sum: it answers "of the resumes we decided to
+    # make, how many did not survive to the agent?".
+    session_resume_failed = 'session_resume_failed'
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
@@ -271,6 +400,29 @@ class EventType(StrEnum):
     # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
     park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
+    # EASY-backfill admission through parks (task 3823 / scheduler-scoring PRD
+    # C7).  Emitted when a candidate blocked ONLY by another task's park is
+    # admitted through it because its predicted hold, times the configured
+    # safety factor, fits inside the gap that park is provably still waiting
+    # on.  Payload: {predicted_hold, safety_factor, admission_bound,
+    # provable_assembly_delay, park_owners, modules}.
+    #
+    # Predicted AND (via park_backfill_overstay) realized are both recorded so
+    # the modelled 7-9% overstay rate at safety x2.5
+    # (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255)
+    # is MEASURED in production rather than assumed.  backfill_safety_factor
+    # is green-tier reloadable precisely so that measurement can retune it.
+    park_backfill_granted = 'park_backfill_granted'
+    # The settlement of the above: emitted at release when a back-filled hold
+    # ran LONGER than the bound its admission promised.  Payload:
+    # {predicted_hold, safety_factor, admission_bound, realized_hold,
+    # overstay_secs, park_owners, modules}.  Predicted and realized both ride
+    # on the event on purpose — the comparison is the finding, and nobody
+    # should have to reconstruct it from log lines.
+    #
+    # NOT emitted through _emit_lock_event: that chokepoint is contractually
+    # the lock-event single writer and raises on any other event type.
+    park_backfill_overstay = 'park_backfill_overstay'
 
     # Scheduler priority overrides
     #
@@ -490,6 +642,53 @@ class EventType(StrEnum):
     #   writable set so an operator can diff exactly what a given invocation
     #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
     sandbox_applied = 'sandbox_applied'
+
+    # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
+    # D5; spec docs/task-escalation-state-spec.md S6/E12; task beta 3535).  The
+    # canonical WHY lives in orchestrator/src/orchestrator/recovery_emission.py
+    # (module docstring) — every other site carries a pointer, never a copy.
+    #
+    # Both members share ONE payload key vocabulary:
+    #   {task_id, site, shape, reason, escalation_ids, ages_secs, measured_at,
+    #    store_unavailable, streak}
+    #   site           — a RecoverySite member naming WHICH veto/LEAVE site
+    #                    spoke (the deterministic-recon pair deliberately use
+    #                    two distinct labels so their duplication is countable).
+    #   shape          — the pipe-joined 5-tuple task_ground_truth._shape keys
+    #                    the _RECOVERY table on, rendered by render_shape.
+    #   reason         — the closed LeaveReason vocabulary: escalation_pinned,
+    #                    escalation_store_unavailable, unmapped_shape,
+    #                    live_claimant, deploy_phase_in_flight,
+    #                    provenance_arbitration.
+    #   escalation_ids — the open records that held it, bucketed by
+    #                    escalation.pins.classify_pins
+    #                    ({dead_l0, queue_handoff, non_pinning}).
+    #   ages_secs      — {escalation_id: seconds}, a MAPPING (join by id, never
+    #                    by position); an unparseable timestamp maps to null
+    #                    rather than dropping the id.
+    # task_id is ALSO a first-class column, so these rows stay joinable against
+    # task_completed / escalation_created.
+    #
+    # The discriminator between the two:
+    #   recovery_vetoed — an open escalation actively vetoed a recovery /
+    #     redispatch / done-flip / dispatch that would OTHERWISE have been
+    #     taken.  Something was held back, and the payload names by what:
+    #     reason escalation_pinned, or provenance_arbitration for the
+    #     already-landed gate's contested-task withhold.
+    #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
+    #     unmapped shape, an in-flight deploy phase, or escalation_store_
+    #     unavailable.  Nothing was held back by a record; the site simply had
+    #     no mapped action (or could not read the store to find out).
+    #
+    # Read these as STATE, not as a rate.  Emission is signature-transition-
+    # gated (new-or-changed (site, task_id) veto signature, plus exactly once at
+    # the streak threshold crossing) rather than one row per observation,
+    # because two of the sites run per dispatch TICK and unconditional emission
+    # would storm the store (INV-4).  Per-sweep cadence is carried by the
+    # reconcile sweep's always-logged summary line instead.  The ABSENCE of
+    # these rows for a stranded task is therefore meaningful: nothing held it.
+    recovery_vetoed = 'recovery_vetoed'
+    recovery_left = 'recovery_left'
 
 
 class EventStore:

@@ -8,7 +8,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from shared.cli_invoke import _REAL_BUILTIN_TOOLS_DENYLIST, build_claude_argv
+from shared.cli_invoke import (
+    _REAL_BUILTIN_TOOLS_DENYLIST,
+    build_claude_argv,
+    no_mcp_servers_config,
+)
 
 _TMP_PLACEHOLDER = '<TMP>'
 
@@ -75,16 +79,27 @@ def test_build_claude_argv_fresh_full_options() -> None:
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_resume_skips_system_prompt_file() -> None:
-    """RESUME case: --resume replaces --system-prompt-file/--session-id entirely.
+def test_build_claude_argv_resume_still_passes_system_prompt_file() -> None:
+    """RESUME case: --resume displaces ONLY --session-id, never the system prompt.
 
-    No sysprompt temp file is created (temp_files is empty) since the system
-    prompt was already set on the session being resumed.
+    The system prompt is a process-invocation parameter that the session does
+    not carry, so a resumed invocation that omits --system-prompt-file runs
+    under the stock Claude Code prompt with no role charter (task 3983).  The
+    sysprompt temp file is therefore created on the resume path too, and holds
+    the CURRENT ``system_prompt`` argument.
+
+    Scope: the resume-SPECIFIC facts only.  The full resumed argv — every flag,
+    in order, including where the ``['--resume', <id>]`` pair sits relative to
+    the ``--system-prompt-file <path>`` pair — is pinned once, as a delta against
+    the fresh argv, by
+    ``test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt``
+    below.  Do not re-add a hard-coded expected list here: two copies of the
+    same argv shape drift, and every future flag would need editing in both.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
         max_budget_usd=5.0,
-        system_prompt='unused system prompt',
+        system_prompt='role charter text',
         max_turns=10,
         permission_mode='bypassPermissions',
         allowed_tools=None,
@@ -96,19 +111,70 @@ def test_build_claude_argv_resume_skips_system_prompt_file() -> None:
         session_id='sess-should-be-ignored',
     )
     try:
-        assert temp_files == [], f'resume path must create no sysprompt temp file; got {temp_files!r}'
-        assert '--system-prompt-file' not in cmd
+        assert len(temp_files) == 1, f'resume path must create a sysprompt temp file; got {temp_files!r}'
+        assert Path(temp_files[0]).read_text() == 'role charter text'
+        assert '--system-prompt-file' in cmd
+        assert cmd[cmd.index('--system-prompt-file') + 1] == temp_files[0]
+        # --session-id stays displaced by --resume: unlike --system-prompt-file,
+        # it IS genuinely exclusive with it.  Probed on CLI 2.1.226:
+        #   "Error: --session-id can only be used with --continue or --resume
+        #    if --fork-session is also specified."
+        # Do not "helpfully" hoist --session-id out of the branch too.
         assert '--session-id' not in cmd
-        assert cmd == [
-            'claude', '--print', '--output-format', 'json',
-            '--model', 'opus',
-            '--max-budget-usd', '5.0',
-            '--resume', 'resume-abc',
-            '--permission-mode', 'bypassPermissions',
-            '--max-turns', '10',
-        ], f'got {cmd!r}'
+
+        assert '--resume' in cmd
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc'
     finally:
         _cleanup(temp_files)
+
+
+def test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt() -> None:
+    """A resumed invocation is byte-identical to a fresh one but for --resume.
+
+    Task 3983's central property, which no single-case test can express: the
+    ONE hoisted sysprompt write serves both arms, so replacing the prompt (not
+    appending it) makes the resumed argv the fresh argv with a single
+    ``['--resume', <id>]`` pair spliced in.  Both arms carry the same prompt
+    text to disk.
+
+    This is the SINGLE site pinning that delta — including where the resume pair
+    sits in the argv.  ``test_build_claude_argv_resume_still_passes_system_prompt_file``
+    deliberately asserts only the resume-specific facts and keeps no expected-argv
+    list of its own, so the shape never has to be edited in two places.
+    """
+    kwargs: dict = dict(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='shared role charter',
+        max_turns=10,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        session_id=None,
+    )
+    fresh_cmd, fresh_temps = build_claude_argv(resume_session_id=None, **kwargs)
+    resume_cmd, resume_temps = build_claude_argv(resume_session_id='r1', **kwargs)
+    try:
+        assert '--system-prompt-file' in fresh_cmd
+        assert '--system-prompt-file' in resume_cmd
+        assert len(fresh_temps) == 1 and len(resume_temps) == 1
+        assert Path(fresh_temps[0]).read_text() == Path(resume_temps[0]).read_text() == 'shared role charter'
+
+        # The resumed argv is the fresh argv with ['--resume', 'r1'] spliced in
+        # immediately after the --system-prompt-file <path> pair — nothing else
+        # differs once the nondeterministic temp paths are normalized.
+        fresh_norm = _normalize(fresh_cmd, fresh_temps)
+        resume_norm = _normalize(resume_cmd, resume_temps)
+        splice_at = fresh_norm.index('--system-prompt-file') + 2
+        assert fresh_norm[:splice_at] + ['--resume', 'r1'] + fresh_norm[splice_at:] == resume_norm, (
+            f'fresh={fresh_cmd!r} resume={resume_cmd!r}'
+        )
+    finally:
+        _cleanup(fresh_temps)
+        _cleanup(resume_temps)
 
 
 def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
@@ -141,30 +207,37 @@ def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_resume_keeps_json_schema_and_denylist() -> None:
-    """RESUME + output_schema: the schema survives, the system prompt does not.
+def test_build_claude_argv_resume_keeps_system_prompt_schema_and_denylist() -> None:
+    """RESUME + output_schema: BOTH the system prompt and the schema survive.
 
-    This asymmetry is load-bearing for every caller that carries an output
-    contract across a cap-retry resume (cli_invoke.py:1270-1272 re-invokes with
-    resume_session_id set and all other kwargs intact):
+    HISTORY.  This test used to pin the OPPOSITE — an asymmetry where a
+    prose-carried contract silently evaporated on resume while a schema-carried
+    one was undroppable:
 
-      --system-prompt-file  DROPPED on resume  (:1501-1503, inside the branch)
-      --json-schema         ALWAYS emitted     (:1552-1553, outside the branch)
+      --system-prompt-file  DROPPED on resume  (inside the resume branch)
+      --json-schema         ALWAYS emitted     (outside the branch)
 
-    So a prose-carried contract silently evaporates on resume while a
-    schema-carried one is undroppable — which is why the reconciliation judge was
-    migrated onto output_schema (task 3067).  The existing resume test above
-    cannot pin this: it passes output_schema=None.  Also confirms the wildcard
-    deny-list expansion applies on the resume path too, so the synthetic
-    StructuredOutput tool the schema rides on is not blocked.
+    That asymmetry is GONE as of task 3983, which hoisted the sysprompt write
+    above the resume branch: --system-prompt-file is now emitted unconditionally
+    alongside --json-schema, so both survive a resume.  This test's old
+    "if this test fails, escalate rather than editing the assertions" tripwire
+    was retired deliberately by that task — it fired for the one reason it was
+    meant to allow, namely the underlying defect being FIXED rather than an
+    assertion being weakened to hide a regression.
 
-    If this test fails, the premise of the judge migration is broken — escalate
-    rather than editing the assertions.
+    The reconciliation judge's migration onto output_schema (task 3067) remains
+    correct on its own merits and is NOT invalidated by this: the
+    anthropic/openai provider branches never see --json-schema at all, and a
+    machine-validated contract beats a prose one regardless.  It simply is no
+    longer needed as a *resume* workaround.
+
+    Also confirms the wildcard deny-list expansion applies on the resume path,
+    so the synthetic StructuredOutput tool the schema rides on is not blocked.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
         max_budget_usd=5.0,
-        system_prompt='dropped on resume',
+        system_prompt='carried across resume',
         max_turns=10,
         permission_mode='bypassPermissions',
         allowed_tools=None,
@@ -176,9 +249,9 @@ def test_build_claude_argv_resume_keeps_json_schema_and_denylist() -> None:
         session_id='sess-ignored',
     )
     try:
-        # The system prompt (and its pre-allocated session id) are gone...
-        assert temp_files == [], f'resume path must create no sysprompt file; got {temp_files!r}'
-        assert '--system-prompt-file' not in cmd
+        # The system prompt survives; only its pre-allocated session id is gone...
+        assert len(temp_files) == 1, f'resume path must create a sysprompt file; got {temp_files!r}'
+        assert '--system-prompt-file' in cmd
         assert '--session-id' not in cmd
         assert '--resume' in cmd
         assert cmd[cmd.index('--resume') + 1] == 'resume-abc'
@@ -290,5 +363,167 @@ def test_build_claude_argv_strict_mcp_config_noop_without_mcp_config() -> None:
     try:
         assert '--mcp-config' not in cmd
         assert '--strict-mcp-config' not in cmd
+    finally:
+        _cleanup(temp_files)
+
+
+def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
+    """no_mcp_servers_config() is a TRUTHY zero-server scoping config, so a
+    wildcard-deny caller under an output_schema still gets --strict-mcp-config.
+
+    The wildcard expansion above (``output_schema and '*' in disallowed_tools``)
+    substitutes a BUILT-INS-ONLY deny-list, which contains no MCP tool pattern.
+    A caller whose cwd carries an ambient ``.mcp.json`` therefore keeps MCP
+    tools reachable unless it ALSO strict-scopes its MCP servers — and the
+    ``--strict-mcp-config`` emit is gated on ``if mcp_config:``, so a bare
+    ``{}`` would silently no-op and reinstate the hole while looking correct.
+    The argv assertion below is what catches that: an empty config emits
+    NEITHER flag.
+    """
+    assert no_mcp_servers_config() == {'mcpServers': {}}
+    # A fresh dict per call, so no caller can widen the server set for every
+    # other consumer by mutating shared module-level state in place.
+    assert no_mcp_servers_config() is not no_mcp_servers_config()
+
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        output_schema={'type': 'object'},
+        effort=None,
+        resume_session_id=None,
+        session_id='sess-123',
+        strict_mcp_config=True,
+    )
+    try:
+        assert '--mcp-config' in cmd
+        assert '--strict-mcp-config' in cmd
+
+        # The on-disk artifact really scopes the run to zero MCP servers.
+        assert len(temp_files) == 2, f'expected sysprompt + mcp temp files; got {temp_files!r}'
+        _sysprompt_path, mcp_path = temp_files
+        with open(mcp_path) as f:
+            assert json.load(f) == {'mcpServers': {}}
+    finally:
+        _cleanup(temp_files)
+
+
+# ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
+
+# Flags this builder emits with NO value of their own.  The walk below needs
+# arity knowledge only for these — every other flag opens a value run.  Kept
+# deliberately tiny and explicit; a newly-added boolean flag must be listed
+# here or the walk fails loudly, which is the intended forcing function.
+_BOOLEAN_FLAGS = {'--print', '--strict-mcp-config'}
+
+MAX_ARG_STRLEN = 131072  # Linux per-argument limit (128 KiB)
+
+
+def test_argv_never_carries_the_user_prompt() -> None:
+    """The user prompt can never reach argv — the single most tempting wrong fix.
+
+    `claude --help` on v2.1.226 documents `claude [options] [command] [prompt]`,
+    so the CLI *does* accept a positional prompt.  "Just pass the prompt on
+    argv" therefore looks like it would dodge the task-3147 stdin race
+    entirely, while silently:
+      * reintroducing the ARG_MAX ceiling this builder exists to avoid
+        (a 260 KB briefing exceeds MAX_ARG_STRLEN twice over), and
+      * leaking the full prompt into `ps` output and systemd scope names.
+
+    The load-bearing guard is the provenance walk below: every non-flag token
+    must be one the caller actually supplied.
+    """
+    # A 260 KB system prompt is the adversarial case: if it were inlined rather
+    # than written to --system-prompt-file, it alone would blow ARG_MAX.
+    big_system = 'S' * 260_000
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt=big_system,
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=['Read', 'Grep'],
+        disallowed_tools=['Bash'],
+        mcp_config={'mcpServers': {'foo': {'command': 'bar'}}},
+        output_schema={'type': 'object'},
+        effort='high',
+        resume_session_id=None,
+        session_id='sess-123',
+        strict_mcp_config=True,
+    )
+    try:
+        normalized = _normalize(cmd, temp_files)
+
+        # No `-` stdin marker.  Its ABSENCE is exactly why the CLI cannot tell
+        # "input is coming" from "there is no input" and gives up after ~3s —
+        # the mechanism task 3147 closes by pre-materializing stdin.  (The
+        # codex backend does append '-'; this builder deliberately does not.)
+        assert '-' not in cmd, f'argv grew a `-` stdin marker: {normalized}'
+
+        # No argument may exceed the Linux per-argument limit.
+        for tok in cmd:
+            assert len(tok.encode()) <= MAX_ARG_STRLEN, (
+                f'argv token exceeds MAX_ARG_STRLEN ({len(tok.encode())} bytes): {tok[:80]}...'
+            )
+
+        # The system prompt went to a file, never inline.
+        assert big_system not in cmd
+        assert '--system-prompt-file' in cmd
+
+        # PROVENANCE: every non-flag token must be something the caller
+        # supplied, a constant of the base argv, or a normalized temp path.
+        # This is the assertion that actually catches a smuggled-in prompt: a
+        # structural walk alone cannot, because a trailing positional is
+        # indistinguishable from one more value of the preceding multi-value
+        # flag (verified by mutation — appending a positional after
+        # `--json-schema <schema>` slips past the walk but fails here).
+        supplied = {
+            'claude', 'json',              # base argv constants
+            _TMP_PLACEHOLDER,              # --system-prompt-file / --mcp-config
+            'opus', '5.0', '50', 'bypassPermissions', 'high', 'sess-123',
+            'Read', 'Grep', 'Bash',
+            json.dumps({'type': 'object'}),
+        }
+        for tok in normalized:
+            if tok.startswith('--'):
+                continue
+            assert tok in supplied, (
+                f'argv carries a token the caller never supplied: {tok[:120]!r}. '
+                'If this is a new constant-valued flag, add it to `supplied`; if it '
+                'is the user prompt, that is exactly the ARG_MAX regression this '
+                'test exists to prevent (task 3147).'
+            )
+
+        # Structural walk: argv[0] is the program; everything after it is a
+        # flag or a flag's value.  There is no bare positional.
+        assert cmd[0] == 'claude'
+        tokens = normalized[1:]
+        assert tokens and tokens[0].startswith('--'), (
+            f'argv does not begin with a flag after the program name: {tokens[:3]}'
+        )
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            assert tok.startswith('--'), (
+                f'orphan positional token at index {i}: {tok!r} in {tokens}'
+            )
+            if tok in _BOOLEAN_FLAGS:
+                i += 1
+                continue
+            j = i + 1
+            assert j < len(tokens) and not tokens[j].startswith('--'), (
+                f'{tok} is treated as value-taking but has no value; if it is a new '
+                f'boolean flag, add it to _BOOLEAN_FLAGS. argv={tokens}'
+            )
+            # --allowed-tools / --disallowed-tools splat several values after
+            # one flag, so consume the whole run.
+            while j < len(tokens) and not tokens[j].startswith('--'):
+                j += 1
+            i = j
     finally:
         _cleanup(temp_files)

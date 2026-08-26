@@ -38,7 +38,7 @@ import pytest
 import yaml
 from test_verify_scope_kappa import _executed_module_configs, _run_verification_spy
 
-from orchestrator import verify
+from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_plan import ScopeKind, derive_verify_plan, parse_config_command
@@ -572,3 +572,236 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
             )
         assert not any('test_new_thing.py' in t for t in run.cmd.targets)
         assert run.scoped_targets == ()
+
+
+# ---------------------------------------------------------------------------
+# task 3787 (flake-ledger γ) step-3: run_scoped_verification delegates the
+# "effective merge module set" decision to the ONE shared helper (INV-5)
+# ---------------------------------------------------------------------------
+
+
+def _effective_helper_spy(returns: list[ModuleConfig]):
+    """A stand-in for ``verify_plan.effective_merge_module_configs`` returning
+    *returns*, recording every ``(config, module_configs)`` it was called with.
+
+    Returns ``(spy, calls)``. Patch onto the ``verify_plan`` MODULE object —
+    verify.py does ``from orchestrator import verify_plan`` and resolves the
+    attribute at CALL time, so patching there intercepts; patching the name
+    re-imported into some other module would install the spy off the
+    resolution path and pass vacuously.
+    """
+    calls: list[tuple[object, list[ModuleConfig]]] = []
+
+    def _spy(config, module_configs):
+        calls.append((config, list(module_configs)))
+        return list(returns)
+
+    return _spy, calls
+
+
+class TestRunScopedVerificationDelegatesEffectiveModuleConfigs:
+    """``run_scoped_verification`` asks ``verify_plan.effective_merge_module_configs``
+    which modules a merge covers — it does NOT reimplement the expansion inline.
+
+    Flake-ledger PRD §8.2 / task 3787 (γ), INV-5: there must be exactly ONE
+    implementation of "the effective merge module set" in the tree, because γ
+    also resolves it at the merge-request boundary (merge_queue) so the local
+    runner, the wire spec and the suppression gate all receive the identical
+    set BY CONSTRUCTION. Two copies of the expression would be two things
+    asserted to agree — which is the drift §8.2 exists to remove.
+
+    The spy returns modB — the REGISTERED-but-untouched module, which is
+    neither the passed set (modA) nor, on its own, the registry — so an
+    execution set equal to the spy's return can only have come THROUGH the
+    helper, not from an inline re-expansion that happens to look similar.
+
+    Note ``derive_verify_plan``'s own internal breadth fork (a FULL_SUITE-vs-
+    file-scoped decision about HOW to run a module) is a separate concern and
+    stays untouched here; this is about WHICH modules arrive.
+    """
+
+    # -- (a) the module_configs branch (verify.py site B) ---------------------
+
+    @pytest.mark.asyncio
+    async def test_module_configs_branch_executes_exactly_the_helpers_return(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(a) role='merge' + breadth='full': the helper is consulted ONCE with
+        ``(config, <passed set>)`` and the EXECUTED module set is its return —
+        not the registry, and not the passed set."""
+        mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        spy, calls = _effective_helper_spy([mod_b])
+        monkeypatch.setattr(verify_plan, 'effective_merge_module_configs', spy)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], task_files=[source_path], role='merge',
+            )
+
+        assert result.passed
+        assert len(calls) == 1, f'expected exactly one helper call; got {len(calls)}'
+        called_config, called_modules = calls[0]
+        assert called_config is config
+        assert called_modules == [mod_a], (
+            f'the helper must be handed the PASSED (task-scoped) set; got '
+            f'{[m.prefix for m in called_modules]!r}'
+        )
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == {'modb'}, (
+            f"expected execution to follow the helper's return exactly; got {executed!r}"
+        )
+
+    # -- (b) the force_workspace branch (verify.py site A) --------------------
+
+    @pytest.mark.asyncio
+    async def test_force_workspace_branch_fans_out_over_exactly_the_helpers_return(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(b) The same delegation on the ``force_workspace`` per-module
+        full-suite fan-out — the second site that used to re-expand inline."""
+        mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='full')
+
+        spy, calls = _effective_helper_spy([mod_b])
+        monkeypatch.setattr(verify_plan, 'effective_merge_module_configs', spy)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], force_workspace=True, role='merge',
+            )
+
+        assert result.passed
+        assert len(calls) == 1, f'expected exactly one helper call; got {len(calls)}'
+        called_config, called_modules = calls[0]
+        assert called_config is config
+        assert called_modules == [mod_a]
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == {'modb'}, (
+            f"expected the fan-out to cover exactly the helper's return; got {executed!r}"
+        )
+
+    # -- (c) role='task' control: the helper is never consulted ---------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('force_workspace', [False, True])
+    async def test_task_role_never_consults_the_helper(
+        self, tmp_path: Path, monkeypatch, force_workspace: bool,
+    ):
+        """(c) Breadth is merge-role-gated ONLY. At role='task' the helper is
+        not called at all and execution stays task-scoped — the train-member
+        override (workflow.py) must not pick up the broad gate by accident."""
+        mod_a, mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        spy, calls = _effective_helper_spy([mod_b])
+        monkeypatch.setattr(verify_plan, 'effective_merge_module_configs', spy)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a],
+                task_files=None if force_workspace else [source_path],
+                force_workspace=force_workspace,
+                role='task',
+            )
+
+        assert result.passed
+        assert calls == [], (
+            f'the helper must never be consulted at role="task"; got {len(calls)} call(s)'
+        )
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert 'modb' not in executed, (
+            f'role="task" must stay task-scoped; got {executed!r}'
+        )
+
+    # -- (d) VALUE-PRESERVATION goldens with the REAL helper ------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('force_workspace', [False, True])
+    async def test_real_helper_full_breadth_still_executes_every_registered_module(
+        self, tmp_path: Path, force_workspace: bool,
+    ):
+        """(d1) No spy: breadth='full' + role='merge' still executes EVERY
+        registered module on BOTH branches, exactly as before the refactor."""
+        mod_a, _mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a],
+                task_files=None if force_workspace else [source_path],
+                force_workspace=force_workspace,
+                role='merge',
+            )
+
+        assert result.passed
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == {'moda', 'modb'}, (
+            f'value-preservation: merge+full must still cover the whole registry; '
+            f'got {executed!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_helper_scoped_breadth_still_executes_only_the_touched_module(
+        self, tmp_path: Path,
+    ):
+        """(d2) The R4 rollback golden: breadth='scoped' + role='merge' still
+        executes only the touched module. The helper is the identity here, so
+        this path is byte-identical to the legacy one."""
+        mod_a, _mod_b, config = _two_module_registry(tmp_path, breadth='scoped')
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], task_files=[source_path], role='merge',
+            )
+
+        assert result.passed
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == {'moda'}, (
+            f'R4 rollback: breadth="scoped" must stay task-scoped; got {executed!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_helper_full_breadth_empty_registry_falls_back_to_passed_set(
+        self, tmp_path: Path,
+    ):
+        """(d3) breadth='full' with an EMPTY registry still falls back to the
+        passed module_configs rather than executing nothing — the safe degrade,
+        pinned end-to-end through execution and not just at the helper."""
+        mod_a, _mod_b, config = _two_module_registry(tmp_path, breadth='full')
+        config._module_configs = {}
+        source_path = 'moda/helpers.py'
+        full = tmp_path / source_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def helper():\n    return 1\n')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mod_a], task_files=[source_path], role='merge',
+            )
+
+        assert result.passed
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == {'moda'}, (
+            f'safe degrade: an empty registry must fall back to the passed set, '
+            f'never execute nothing; got {executed!r}'
+        )

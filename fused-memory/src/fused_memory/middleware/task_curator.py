@@ -47,10 +47,13 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
+from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
@@ -1040,6 +1043,16 @@ class TaskCurator:
         )
         return decision
 
+    @staticmethod
+    def _claim_verification_text(candidate: CandidateTask) -> str:
+        """Concatenated candidate text the claim-verification guard scans.
+
+        Single source of truth for both :meth:`_maybe_flag_unverified_claims`
+        (per-candidate extraction) and ``curate_batch_prepared``'s batch-level
+        "does any candidate carry a claim" pre-check, so the two never drift.
+        """
+        return f'{candidate.title}\n{candidate.description}\n{candidate.details}'
+
     async def _maybe_flag_unverified_claims(
         self, candidate: CandidateTask, probe: Callable[[str], bool] | None = None,
     ) -> list[AttributedClaim]:
@@ -1058,6 +1071,13 @@ class TaskCurator:
         ``self._cwd`` via ``make_source_and_history_probe`` when not injected —
         tests inject a fake probe to stay git-free).
 
+        Claim extraction runs FIRST and is pure/sync/cheap (a regex scan, no
+        I/O): when *candidate* carries no attributed claim at all — the
+        overwhelmingly common case, since a claim requires a code token AND a
+        numbered task/ACTION/commit anchor within the co-occurrence window —
+        this returns ``[]`` before a probe is ever built or a worker thread is
+        ever spawned for it.
+
         Unlike :meth:`_maybe_premise_refuted_drop`, this hook NEVER drops the
         candidate or returns/mutates a :class:`CuratorDecision` — it only surfaces
         unverified claims via a grep-stable ``recon_claim_verification.unverified``
@@ -1072,6 +1092,9 @@ class TaskCurator:
           claim can be verified (one WARNING logged).
         - *candidate*'s title/description/details carry no attributed claims at all.
         - Every attributed claim's token verifies present (self-correcting).
+        - Probe construction or verification raises for any reason (one
+          WARNING logged) — this is an advisory backstop and must never fail
+          the task submission it rides along with.
 
         Never raises.
         """
@@ -1088,22 +1111,51 @@ class TaskCurator:
             return []
 
         from fused_memory.middleware.recon_claim_verification_guard import (
+            extract_attributed_claims,
             make_source_and_history_probe,
-            unverified_claims_in_text,
+            verify_attributed_claims,
         )
 
-        if probe is None:
-            probe = make_source_and_history_probe(self._cwd)
+        claims = extract_attributed_claims(self._claim_verification_text(candidate))
+        if not claims:
+            return []
 
-        text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
-        # Offload to a worker thread: probe (when not injected by a test) is
-        # make_source_and_history_probe's blocking git-subprocess adapter —
-        # git grep, and on a miss (always true for a fabricated token, the
-        # exact case this guard targets) a full-history `git log --all -S`
-        # pickaxe too, up to ~10s each. Running it inline here would stall
-        # the curator/reconciliation event loop for every other coroutine
-        # sharing it. unverified_claims_in_text itself stays pure/sync.
-        unverified = await asyncio.to_thread(unverified_claims_in_text, text, probe)
+        def _build_probe_and_verify(repo_root: Path) -> list[AttributedClaim]:
+            local_probe = make_source_and_history_probe(repo_root)
+            return verify_attributed_claims(claims, local_probe)
+
+        try:
+            if probe is None:
+                # Off the event loop, in a SINGLE thread-pool hop: construction
+                # resolves the git top level via _resolve_git_toplevel — a
+                # blocking `git rev-parse --show-toplevel` subprocess bounded
+                # only by a 10s timeout — and verification (git grep, and on a
+                # miss — always true for a fabricated token, the exact case
+                # this guard targets — a full-history `git log --all -S`
+                # pickaxe too, up to ~10s each) then runs against the
+                # freshly-built probe on that same worker thread. Only
+                # reached when `claims` above is non-empty, so a candidate
+                # with no attributed claim never pays for either. Mirrors
+                # curate_batch_prepared's construction (see the batch
+                # claim-verification block below), which likewise only
+                # builds a probe when at least one candidate in the batch
+                # carries a claim.
+                unverified = await asyncio.to_thread(_build_probe_and_verify, self._cwd)
+            else:
+                # probe was injected — curate_batch_prepared builds one probe
+                # per batch and shares it across candidates, or a test
+                # supplies a fake. Still offload: a real probe's git grep,
+                # and on a miss a full-history pickaxe, is blocking
+                # regardless of who built it.
+                unverified = await asyncio.to_thread(verify_attributed_claims, claims, probe)
+        except Exception as exc:
+            # Advisory backstop — must fail open rather than take the whole
+            # task submission down with it (see "Never raises" above).
+            logger.warning(
+                'recon_claim_verification: guard errored, failing open: %s', exc,
+            )
+            return []
+
         for claim in unverified:
             logger.warning(
                 'recon_claim_verification.unverified token=%s attribution=%s candidate=%r',
@@ -1606,21 +1658,32 @@ class TaskCurator:
         # surfacing is via the recon_claim_verification.unverified WARNING
         # census logged inside _maybe_flag_unverified_claims itself.
         #
-        # Build the probe ONCE for the whole batch — off the event loop, since
-        # construction resolves the git top level via a blocking subprocess
-        # call — and fan the per-candidate checks out concurrently instead of
-        # awaiting a freshly-built probe serially per candidate: a fabricated
-        # (i.e. actually-absent) token always runs the full
-        # git-grep-then-pickaxe path (up to ~10s), so a batch with several
-        # attributed tokens would otherwise serialize into tens of seconds of
-        # git work on the reconciliation path for a purely advisory check.
+        # Build the probe at most ONCE for the whole batch — off the event
+        # loop, since construction resolves the git top level via a blocking
+        # subprocess call — and only when at least one candidate actually
+        # attributes a code-level claim to prior work (extraction is
+        # pure/sync/cheap, so checking first costs nothing; a batch with no
+        # attributed claims at all, the common case, now skips the git
+        # subprocess entirely). When needed, fan the per-candidate checks out
+        # concurrently instead of awaiting a freshly-built probe serially per
+        # candidate: a fabricated (i.e. actually-absent) token always runs
+        # the full git-grep-then-pickaxe path (up to ~10s), so a batch with
+        # several attributed tokens would otherwise serialize into tens of
+        # seconds of git work on the reconciliation path for a purely
+        # advisory check.
         claim_probe: Callable[[str], bool] | None = None
         if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
             from fused_memory.middleware.recon_claim_verification_guard import (
+                extract_attributed_claims,
                 make_source_and_history_probe,
             )
 
-            claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
+            any_claims = any(
+                extract_attributed_claims(self._claim_verification_text(candidates[i]))
+                for i in unique_indices
+            )
+            if any_claims:
+                claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
         await asyncio.gather(
             *(
                 self._maybe_flag_unverified_claims(candidates[i], probe=claim_probe)
@@ -2171,7 +2234,26 @@ class TaskCurator:
         project_root: str,
     ) -> tuple[list[_PoolEntry], dict[str, int]]:
         """Assemble the four-stream pool for the LLM prompt."""
-        lock_depth = self._config.curator.lock_depth
+        # Resolve lock_depth PER PROJECT, not from a single global scalar:
+        # fused-memory serves many projects and each orchestrator resolves its
+        # own depth (3..12 across the fleet). The scheduler snapshot already
+        # publishes the effective value, so we read it rather than
+        # reimplementing orchestrator.config's layering here. lock_depth is
+        # red-tier (changes only at orchestrator restart), so an hours-old
+        # snapshot still carries the correct depth. Absent/unreadable snapshot
+        # falls back COARSE (the config scalar) — see effective_lock_depth.
+        #
+        # Dispatched via to_thread because the underlying snapshot read is
+        # blocking, matching recon_write_policy's handling of the same file.
+        # Unlike that call site there is no existing thread hop to ride here
+        # (_build_corpus is awaited straight off the event loop), so this adds
+        # its own. It stays cheap because effective_lock_depth memoises per
+        # project — this runs once per candidate but only reaches the disk
+        # once per project per TTL, and the hop is noise next to the taskmaster
+        # and embedding round-trips below.
+        lock_depth = await asyncio.to_thread(
+            effective_lock_depth, project_root, self._config.curator.lock_depth,
+        )
         pool: list[_PoolEntry] = []
         seen_ids: set[str] = set()
 
@@ -2760,14 +2842,6 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_dependencies(task: dict) -> list[str]:
-    deps = task.get('dependencies') or []
-    if isinstance(deps, str):
-        # CSV fallback
-        return [d.strip() for d in deps.split(',') if d.strip()]
-    return [str(d) for d in deps if d]
-
-
 def _task_metadata_spawned_from(task: dict) -> str | None:
     meta = task.get('metadata') or {}
     if isinstance(meta, dict):
@@ -2775,6 +2849,26 @@ def _task_metadata_spawned_from(task: dict) -> str | None:
         if isinstance(v, str) and v:
             return v
     return None
+
+
+def is_combine_eligible_status(status: str) -> bool:
+    """Single source of truth for combine STATUS eligibility (task 4035).
+
+    Called from BOTH the curator's selection snapshot
+    (``_to_pool_entry.combine_eligible``) and the interceptor's
+    execution-time combine guard (``_execute_combine``). Keeping one
+    definition is the point: the two sites previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting 20.2% of combines
+    land on non-pending targets mid-planning.
+
+    Status ONLY. Liveness (``claimant_run_id``) is execution-side and
+    deliberately NOT part of this predicate — the selection snapshot cannot
+    observe it (D11).
+
+    Fails closed: anything outside the canonical vocabulary (an unknown
+    status, a blank, a case variant) is not eligible.
+    """
+    return status == TaskStatus.PENDING.value
 
 
 def _to_pool_entry(
@@ -2797,7 +2891,7 @@ def _to_pool_entry(
         status=status,
         priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
-        combine_eligible=(status == 'pending'),
+        combine_eligible=is_combine_eligible_status(status),
     )
 
 

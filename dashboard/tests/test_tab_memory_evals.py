@@ -15,51 +15,14 @@ from __future__ import annotations
 
 import html.parser
 import re
+from typing import NamedTuple
 
 import pytest
-from starlette.testclient import TestClient
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def tab_escalations_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalations.jsx').text
 
 
 @pytest.fixture(scope='module')
@@ -84,11 +47,8 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     POSITION also matters, callers additionally anchor to the accessing
     expression (`lim.alpha`, `storm.alarm_count`, ...) rather than the bare
     name.
-
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_memory_evals_jsx_body)
+    return strip_js_comments(tab_memory_evals_jsx_body)
 
 
 @pytest.fixture(scope='module')
@@ -121,11 +81,8 @@ def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
     it, so a whole-file grep for a parity state is satisfied by a MENTION in
     the comment above the table.  `alarmed_open` and `clear` were once
     asserted present by exactly such a grep, matching only prose.
-
-    Safe to strip naively for the same reason: no `//` inside a string
-    literal and no regex literals in the source.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', memory_evals_fmt_js_body)
+    return strip_js_comments(memory_evals_fmt_js_body)
 
 
 # ---------------------------------------------------------------------------
@@ -166,47 +123,6 @@ def _extract_df_data_block(src: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +182,83 @@ def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
                 [p.strip() for p in params_text.split(',') if p.strip()],
             )
     return best
+
+
+# ---------------------------------------------------------------------------
+# Helper: find the JSX opening tag that contains a given attribute
+# ---------------------------------------------------------------------------
+
+
+def _jsx_open_tag_end(src: str, start: int) -> int:
+    """Return the index of the ``>`` closing the opening tag that begins at ``start``.
+
+    ``-1`` when ``start`` does not begin one.  Quote- and brace-aware, which is
+    the whole point: a ``>`` or ``<`` inside an attribute EXPRESSION
+    (``onClick={() => ...}``, ``aria-label={points > 1 ? ... : ...}``) or inside
+    a string/template literal is an operator, not the end of the tag.
+    """
+    depth = 0  # brace depth inside attribute expressions
+    quote = ''  # active string/template delimiter
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = ''
+        elif c in '"\'`':
+            quote = c
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return -1  # started inside an expression, not at a tag
+        elif depth == 0:
+            if c == '>':
+                return i
+            if c == '<':
+                return -1  # a new tag opened first, so this was not one
+        i += 1
+    return -1
+
+
+def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
+    """Return the text of the single JSX opening tag containing ``needle``.
+
+    ``None`` when ``needle`` is absent or sits outside any opening tag.  Only
+    the FIRST occurrence of ``needle`` is considered; callers pass a unique
+    anchor (a ``data-testid=``).
+
+    WHY A WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``<[^<>]*<needle>[^<>]*>`` — matches an opening tag only while no attribute
+    expression inside it contains a bare ``<`` or ``>``.  That is a documented
+    false-FAILURE trap, not a theoretical one: measured on the shipped
+    drawn-chart tag, adding an ordinary ``onClick={() => onNavigate(m)}`` or
+    ``aria-label={points > 1 ? ... : ...}`` makes the search return ``None``,
+    so the test fails claiming the element is GONE — against behaviourally
+    correct code.  The previous spelling pushed that onto future authors as a
+    style rule ("hoist comparisons into locals"); this walks the tag instead,
+    the way ``extract_function_body`` and ``_enclosing_function`` already walk
+    braces rather than spanning them.
+
+    Confinement to ONE opening tag is preserved, and is what gives callers
+    their meaning: a mention in a neighbouring element cannot satisfy a check
+    made against the returned text.  Attribute ORDER is not constrained — the
+    tag is taken whole, from its ``<`` to its matching ``>``.
+    """
+    idx = src.find(needle)
+    if idx == -1:
+        return None
+    # Innermost first: the closest tag start before the needle whose span
+    # actually reaches past it.
+    for m in reversed(list(re.finditer(r'<[A-Za-z_$/]', src[:idx]))):
+        end = _jsx_open_tag_end(src, m.start())
+        if end >= idx + len(needle):
+            return src[m.start() : end + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -793,13 +786,590 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Presence-grep contracts and their mutation guard (task 3471)
+# ---------------------------------------------------------------------------
+
+# (label, pattern, deletion targets) for every POSITIVE presence assertion in
+# this file — the live assertion below consumes the pattern from here, so the
+# guard and the assertion cannot drift apart.
+#
+# A presence grep has TWO ways to pass without proving anything, and this table
+# exists because both were live:
+#
+#   1. COMMENT FALSE PASS — the grep runs over the raw served body, and the
+#      ~150 lines of explanatory prose in the .jsx name most of the payload
+#      fields the render code names.  Delete the render site, keep the comment,
+#      stay green.  The `tab_memory_evals_jsx_code` fixture already exists for
+#      this; the assertions below simply had not all been moved onto it.
+#   2. NON-DISCRIMINATING PATTERN — the grep runs over code, but the string it
+#      hunts for occurs somewhere OTHER than the render site it is about.
+#      `MEMORY_EVALS` also occurs in `window.DF_MEMORY_EVALS_FMT` and the export
+#      statement; `truncated` also occurs in the operator-facing "(truncated)"
+#      label.  Switching such a grep to comment-stripped source closes hole (1)
+#      and leaves hole (2) wide open — the same false pass, one layer down.
+#
+# `_deletions` are REGEXES whose every match is removed from the comment-stripped
+# source to build the mutant.  The result is not valid JSX and is not meant to
+# be: this is a text-level falsification check, and requiring a parseable mutant
+# would mean shipping a JSX parser to test a grep.
+#
+# Regexes rather than literal substrings because the live assertions they guard
+# are whitespace-tolerant and the targets must be too.  As literals, a cosmetic
+# reformat of the .jsx — collapsing `{ MemoryEvalsSection }` to
+# `{MemoryEvalsSection}`, wrapping the `ME_CHART_BY_TAG` initializer across
+# lines — left every real contract intact and every live assertion green while
+# failing this guard with "the deletion target is not present", i.e. a suite
+# failure caused purely by formatting in a repo that deliberately does not adopt
+# `ruff format` (CLAUDE.md).
+#
+# NOT derived from the guarded pattern's own match, which would be simpler and
+# is WRONG: deleting every match of the pattern deletes the unrelated occurrence
+# that makes a non-discriminating pattern non-discriminating, so arm (2) below
+# would pass on exactly the greps it exists to catch.  `\btruncated\b` matched
+# both `ev.truncated &&` and the `(truncated)` label; a target aimed at the GATE
+# leaves the label standing and the grep is caught.  The target is therefore
+# deliberately narrower than the pattern — it names the accessing site, and the
+# pattern is what the live assertion runs.
+#
+# CONVENTION for live presence assertions: consume the pattern via
+# `_presence_pattern(label, code)` rather than restating a regex at the call
+# site, and search the comment-stripped `code` fixture rather than `body`.
+# Consuming keeps a pattern hardened here hardened at the assertion too;
+# searching `code` is what stops the .jsx prose answering the grep.  This is
+# advisory — enforcing it would mean regex-matching this module's own source,
+# which fails on semantically identical refactors and still cannot see a
+# freshly written `assert 'foo' in body` that never reaches the table.  Code
+# review is the enforcement mechanism.
+_PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        # Line-anchored: the header comment reproduces this statement verbatim
+        # ("Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection }"), indented
+        # inside the block, so column 0 is what separates the export from the
+        # sentence describing it.
+        'window.DF_MEMORY_EVALS export',
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{',
+        (r'window\.DF_MEMORY_EVALS\s*=\s*\{\s*MemoryEvalsSection\s*\}\s*;',),
+    ),
+    (
+        # Same statement, captured, for the test that parses the exported NAMES
+        # rather than checking the statement exists.  That one was the worst of
+        # the false passes found here and the only one that was not merely
+        # latent: `re.search` over the raw body returned the HEADER COMMENT's
+        # copy of the statement (jsx:33, ~560 lines ahead of the real one), so
+        # the assertion parsed a sentence and never saw the export at all.
+        # Measured: re-exporting `verdictBadge` — the exact drift its own
+        # message says it prevents — passed. Line-anchored, it fails.
+        'window.DF_MEMORY_EVALS exported names',
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}',
+        (r'window\.DF_MEMORY_EVALS\s*=\s*\{\s*MemoryEvalsSection\s*\}\s*;',),
+    ),
+    (
+        # Anchored to the payload READ, not the bare name. A plain
+        # comment-strip is NOT enough here: `window.DF_MEMORY_EVALS_FMT` and
+        # the export statement both survive it, so deleting the actual
+        # `MEDF.MEMORY_EVALS` read left the old grep green. The alias is
+        # DERIVED (`{alias}`) rather than pinned, so renaming it is a refactor
+        # and deleting the read is a failure.
+        'DF_DATA.MEMORY_EVALS payload read',
+        r'{alias}\s*\.\s*MEMORY_EVALS',
+        # `{alias}` is resolved in deletion targets too, so the alias stays
+        # DERIVED on both sides of the guard rather than pinned on one.
+        (r'const\s+\w+\s*=\s*{alias}\s*\.\s*MEMORY_EVALS\s*;',),
+    ),
+    (
+        # `[:,}]` puts the primitive in an object/destructure position. Prose
+        # names these components in passing ("both Sparkline and StepSpark"),
+        # and a bare alternation is answered by that sentence.
+        'charts.jsx primitive is used',
+        r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b\s*[:,}]',
+        (
+            r'Sparkline\s*:\s*MESpark\s*,\s*StepSpark\s*:\s*MEStep',
+            r'ME_CHART_BY_TAG\s*=\s*\{[^}]*\}',
+        ),
+    ),
+    (
+        # Anchored to the GATE. `\btruncated\b` also matches the operator-facing
+        # "(truncated)" label in the disclosure's own text, so deleting the flag
+        # that gates the disclosure left the grep matching the words inside it.
+        'eval-level truncation disclosure',
+        r'ev\.truncated\s*&&',
+        (r'\{\s*ev\.truncated\s*&&\s*\(',),
+    ),
+    (
+        # `localStorage` is real code in this file (the persisted open-state
+        # helpers), so the old alternation stayed green with `<details` deleted
+        # — it was answered by a different feature entirely. `\s` spans the
+        # newline before `open={provOpen}`.
+        'provenance is collapsed by default',
+        r'<details\s+open=',
+        (r'<details\b',),
+    ),
+    # -----------------------------------------------------------------------
+    # The rest of the class.  The five entries above are the ones MEASURED to
+    # be false-passing; the rest were still reading the raw `body`.  Every one
+    # of them passes both arms today — they are here as REGRESSION guards, and
+    # because enumerating instances has already failed once: item (2a) of the
+    # task this lands with exists solely because item (2) listed the sites it
+    # happened to notice rather than closing the class.  A grep that is
+    # discriminating today silently stops being so the next time the .jsx
+    # prose grows, and nothing would say a word.
+    #
+    # THE CLASS IS "positive presence greps over the RAW BODY", and after this
+    # table no such grep remains: `tab_memory_evals_jsx_body` is now consumed
+    # only by the `tab_memory_evals_jsx_code` fixture that strips it.  Two
+    # greps moved onto `code` WITHOUT joining the table, deliberately:
+    #
+    #   * the chart-gate pair in
+    #     test_trend_holes_are_never_handed_to_a_chart_primitive and
+    #     test_empty_trend_is_a_named_state_not_an_empty_chart_box — an inline
+    #     `{Chart && ...gaps...}` and a named-local `const p = Chart && gaps...;`
+    #     joined by `or`.  BOTH spellings are accepted on purpose, so exactly
+    #     one of them matches at any time (today: the named local).  Arm (1)
+    #     below requires every tabled pattern to match the real source, so
+    #     tabling either would pin the .jsx to one of two legal spellings and
+    #     make the refactor between them a suite failure.
+    #
+    # Greps that ALREADY read `code` and are not tabled (the `data-testid=`
+    # membership checks, `trendGaps(`, `{gaps`) are out of the class by
+    # construction: prose cannot answer them, since prose is not in the text
+    # they search.
+    # -----------------------------------------------------------------------
+    (
+        'MemoryEvalsSection function declaration',
+        r'\bfunction\s+MemoryEvalsSection\s*\(',
+        (r'function\s+MemoryEvalsSection\s*\(',),
+    ),
+    (
+        # Deletion target is the `= window.DF_CHARTS;` tail, not the whole
+        # destructure: adding a primitive to the list must not break the guard
+        # (it would fail as a stale deletion target, which reads like a bug in
+        # the .jsx rather than in this table).  The tail IS the accessing act.
+        'DF_CHARTS module-level destructure',
+        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;',
+        (r'\}\s*=\s*window\.DF_CHARTS\s*;',),
+    ),
+    (
+        'window.DF_DATA read',
+        r'window\.DF_DATA',
+        (r'=\s*window\.DF_DATA\s*;',),
+    ),
+    (
+        'evals list read',
+        r'\.evals\b',
+        (r'\bpayload\s*\.\s*evals\b',),
+    ),
+    (
+        'eval card keyed on eval_id',
+        r'key=\{[^}]*\beval_id\b',
+        (r'key=\{\s*ev\.eval_id\s*\}',),
+    ),
+    (
+        'metrics list read',
+        r'\.metrics\b',
+        (r'\bev\s*\.\s*metrics\b',),
+    ),
+    (
+        'metric row keyed on metric_id',
+        r'key=\{[^}]*\bmetric_id\b',
+        (r'key=\{\s*m\.metric_id\s*\}',),
+    ),
+    (
+        'per-metric escalation guard',
+        r'm\.escalation\s*&&',
+        (r'm\s*\.\s*escalation\s*&&\s*\(',),
+    ),
+    (
+        # The producer end of the escalation-link contract, and the exact site
+        # `test_memory_evals_escalation_id_contract.py` is built around: the id
+        # handed to `onNavigate` is what `tab_escalations.jsx` resolves with
+        # `row.id === id`.  Not comment-answered today, but the .jsx prose does
+        # discuss the navigation handoff, so one sentence naming the call is all
+        # it would take — which is the latent false pass this entry closes.
+        'escalation link navigates by id',
+        r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",
+        (r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",),
+    ),
+    (
+        # The `MEDF\.` disjunct is a spelling pin that nothing matches today
+        # (the `payload` local is what the banner reads); it is kept verbatim
+        # from the assertion it replaces rather than quietly narrowed, since
+        # this step moves WHICH TEXT the greps run over, not what they accept.
+        'storm banner reads the top-level block',
+        r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape',
+        (r'\bpayload\s*\.\s*storm_escape\b',),
+    ),
+    (
+        'per-metric link suppressed under storm',
+        r"parity\s*===\s*'storm_collapsed'",
+        (r"parity\s*===\s*'storm_collapsed'",),
+    ),
+    (
+        # A region ANCHOR, not a plain presence grep: its group(1) is fed to
+        # downstream assertions about the captured block.  It belongs in this
+        # table for the same reason as the rest — anchored to a comment, the
+        # capture is prose and every downstream assertion is about prose.
+        'stale hint branch',
+        r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}',
+        (r'ev\s*\.\s*stale\s*&&\s*\(',),
+    ),
+    (
+        # The other region anchor.  Comment-stripping only ever grows what its
+        # fixed-width window reaches, so the captured block is a superset of
+        # the code it captured before.
+        'artifact issues notice',
+        r'data-testid="memory-eval-issues"([\s\S]{0,1600})',
+        ('data-testid="memory-eval-issues"',),
+    ),
+)
+
+
+def _resolved_pattern(pattern: str, code: str) -> str:
+    """Substitute `{alias}` with the file's own `window.DF_DATA` local.
+
+    Derive-don't-pin, the idiom this file already uses for `lim_local` and the
+    cross-file prop names: renaming the alias is a refactor and must not fail a
+    test, while DELETING the payload read must.
+    """
+    if '{alias}' not in pattern:
+        return pattern
+    match = re.search(r'const\s+(\w+)\s*=\s*window\.DF_DATA\s*;', code)
+    assert match is not None, (
+        'no `const <alias> = window.DF_DATA;` in tab_memory_evals.jsx, so the '
+        'payload-read patterns below cannot be anchored to it. If the file stopped '
+        'aliasing DF_DATA, re-derive the anchor rather than pinning a spelling.'
+    )
+    return pattern.replace('{alias}', re.escape(match.group(1)))
+
+
+def _presence_pattern(label: str, code: str) -> str:
+    """The `_PRESENCE_CONTRACTS` pattern for *label*, alias-resolved.
+
+    The live assertions call this rather than restating their own regex, so a
+    pattern hardened in the table is hardened at the assertion too — the guard
+    and the thing it guards cannot drift apart.
+    """
+    for entry_label, pattern, _deletions in _PRESENCE_CONTRACTS:
+        if entry_label == label:
+            return _resolved_pattern(pattern, code)
+    raise AssertionError(
+        f'no _PRESENCE_CONTRACTS entry labelled {label!r} — an assertion is reaching '
+        'for a contract that does not exist, so nothing mutation-tests it.'
+    )
+
+
+def test_presence_greps_are_falsified_by_deleting_the_code(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """Every presence grep must go RED when the code it is about is deleted.
+
+    The task this test lands with prescribes exactly this discipline — "verify
+    each switch by mutation (delete the accessing expression → the assertion
+    must go red)" — as a MANUAL procedure.  A manual check leaves no evidence
+    and is not re-run: item (2a) of that task exists precisely because it was
+    not re-run when the .jsx comment block grew and quietly swallowed one more
+    assertion.  Making it executable is what stops the rot being fixed here
+    from simply recurring.
+
+    Two arms per contract, each closing a different way to pass vacuously:
+
+    (1) MATCHES the real comment-stripped source — otherwise the pattern is
+        wrong and the live assertion is about nothing.
+    (2) does NOT match once the accessing expression is deleted — the pattern
+        actually discriminates, rather than being satisfied by some unrelated
+        occurrence of the same string elsewhere in the file.  The deletion is
+        driven by the entry's own targets, which name the SITE and are narrower
+        than the guarded pattern; deleting every match of the pattern itself
+        would take the unrelated occurrence with it and pass this arm on the
+        very greps it exists to catch.
+
+    Both arms run over the comment-stripped `code` fixture, which is what every
+    live presence assertion in this module reads.  Prose is therefore out of
+    scope by construction and cannot answer any of them — so this guard has no
+    business asserting on comment CONTENTS.  A third arm doing exactly that was
+    removed: it made writing an ACCURATE comment in tab_memory_evals.jsx a suite
+    failure (`// aliased off window.DF_DATA` would have tripped the payload-read
+    entry), which is the very pathology `_FORBIDDEN_PATTERNS` below decries,
+    merely with the opposite sign.
+    """
+    code = tab_memory_evals_jsx_code
+
+    for label, pattern, deletions in _PRESENCE_CONTRACTS:
+        resolved = _resolved_pattern(pattern, code)
+
+        assert re.search(resolved, code, re.MULTILINE), (
+            f'[{label}] pattern {resolved!r} does not match the comment-stripped '
+            'source at all. The live assertion that consumes it is therefore about '
+            'nothing — fix the pattern, not this guard.'
+        )
+
+        mutated = code
+        for raw_target in deletions:
+            target = _resolved_pattern(raw_target, code)
+            assert re.search(target, mutated), (
+                f'[{label}] the deletion target {target!r} matches nothing in the '
+                'comment-stripped source, so the falsification below would be '
+                'vacuous. The code moved; re-locate the accessing expression. '
+                '(Targets are whitespace-tolerant REGEXES, so a reformat should '
+                'not land here — if one did, widen the target rather than pinning '
+                'the new spelling.)'
+            )
+            mutated = re.sub(target, '', mutated)
+        assert not re.search(resolved, mutated, re.MULTILINE), (
+            f'[{label}] pattern {resolved!r} STILL matches after deleting '
+            f'{deletions!r}. It does not discriminate: something other than the '
+            'render site satisfies it, so the live assertion would stay green with '
+            'the feature removed. Anchor the pattern to the accessing expression.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Forbidden-pattern contracts (task 3471)
+# ---------------------------------------------------------------------------
+
+# The mirror image of `_PRESENCE_CONTRACTS`.  A presence grep over raw source
+# passes when it should fail; a FORBIDDEN-pattern grep over raw source fails
+# when it should pass — the same defect, opposite sign, and the more corrosive
+# of the two, because it punishes the operator for writing an accurate comment.
+# A guard that rejects `trend.values.filter(Boolean)` is right to; a guard that
+# also rejects the SENTENCE "we never call trend.values.filter(Boolean)" has
+# made the file's own explanation of an invariant into a violation of it, and
+# teaches the next author to delete the explanation.
+#
+# This is not hypothetical here: the .jsx carries ~150 lines of prose whose
+# whole job is naming what the render code must not do.  Two of these guards
+# had already been moved onto comment-stripped source for exactly this reason
+# (see `test_no_client_side_alarm_derivation`); the rest had not.
+#
+# Nothing a guard REJECTS changes — only which text it reads.  That is safe in
+# a way the presence direction is not: a violation is by definition executable,
+# so it cannot hide inside a comment.
+#
+# ANTI-VACUITY.  A forbidden pattern is asserted to match nothing, so one that
+# can NEVER match is indistinguishable from one guarding perfectly.
+# `test_forbidden_patterns_are_falsified_by_injecting_a_violation` splices each
+# entry's violating snippet into the source and requires the pattern to fire.
+#
+# CONVENTION for live guards: consume the patterns via
+# `_forbidden_patterns(label)` rather than restating a regex at the call site,
+# search the comment-stripped `code` fixture, and carry the table's flags
+# through to `re.search` — one of these entries is `re.IGNORECASE` and the rest
+# are not, so a flag dropped at the call site is a guard quietly weakened with
+# nothing failing.  Advisory, for the same reason as the presence table above:
+# a regex over this module's own source asserts the formatting of test code
+# rather than behaviour.
+#
+# Entry: (label, ((pattern, what, a violating snippet), ...), flags).
+#
+# The third member is what `test_forbidden_patterns_are_falsified_by_injecting_a_violation`
+# splices into the source to prove the pattern can still FIRE.  A forbidden
+# pattern has a failure mode the presence table does not: it is asserted to
+# match NOTHING, so a pattern that can never match anything is permanently
+# vacuous and no test says a word.  Typo `\.split\(` as `\.spilt\(` and
+# `dedupe_fingerprint.split('|')` could land in the .jsx with the suite green.
+#
+# The snippet is spelled INDEPENDENTLY of the regex — real JSX, not the pattern
+# with its escapes removed — because a snippet mechanically derived from the
+# pattern would carry the same typo and match it happily.
+_FINGERPRINT_PARSE: tuple[tuple[str, str, str], ...] = tuple(
+    (rf'{field}\s*{op}', f'`{field}` is {verb}', f'const bit = esc.{field}{call};')
+    for field in ('dedupe_fingerprint', 'fingerprint')
+    for op, verb, call in (
+        (r'\.split\(', 'split', ".split('|')[0]"),
+        (r'\.slice\(', 'sliced', '.slice(0, 12)'),
+        (r'\.match\(', 'matched', '.match(/eval:([^|]+)/)'),
+        (r'\.substring\(', 'taken apart with substring()', '.substring(0, 12)'),
+    )
+)
+
+_SYNTHETIC_ZERO: tuple[tuple[str, str, str], ...] = tuple(
+    (
+        rf'\.\s*{field}\s*\|\|\s*0\b',
+        f'`{field}` is defaulted with `|| 0`',
+        f'<td>{{fmtNum(m.{field} || 0)}}</td>',
+    )
+    for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count')
+)
+
+_FORBIDDEN_PATTERNS: tuple[
+    tuple[str, tuple[tuple[str, str, str], ...], int], ...
+] = (
+    (
+        'trend series is never compacted',
+        (
+            # a chart fed a transformed series rather than the payload array itself
+            (
+                r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(',
+                'a chart is fed a transformed series',
+                '<Chart values={trend.values.reduce(pack, [])} />',
+            ),
+            # `.filter(Boolean)` drops nulls AND legitimate zeroes
+            (
+                r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)',
+                '.filter(Boolean) drops holes',
+                'const pts = trend.values.filter(Boolean);',
+            ),
+            # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
+            # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
+            (
+                r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
+                'a null-dropping filter predicate',
+                'const pts = trend.values.filter(v => v !== null);',
+            ),
+            (
+                r'trend\.(?:values|labels)\s*\.\s*flatMap\(',
+                'flatMap can drop elements',
+                'const pts = trend.values.flatMap(v => (v == null ? [] : [v]));',
+            ),
+        ),
+        0,
+    ),
+    (
+        # Consumed at TWO render sites (the holed-trend test and the
+        # empty-series one).  Tabling it also collapses a spelling that was
+        # written out twice and could have been hardened in only one place.
+        #
+        # The `(?![^\n]*\bgaps\b)` lookahead this pattern used to carry is GONE
+        # (task 3490).  It existed to spare the one legitimate inline spelling
+        # of the OLD suppression gate, `{Chart && ... gaps ...}`, back when a
+        # hole vetoed the chart.  Option (b) retired that veto: a holed series
+        # is now DRAWN by the hole-aware primitive, the gate is a named
+        # `plottable` local, and no inline `{Chart &&` render guard is
+        # legitimate any more — one that mentions `gaps` least of all, since it
+        # would be the retired veto itself.  Keeping the lookahead would have
+        # left exactly the resuppression it was written to permit unguarded.
+        'no chart render site is gated on Chart alone',
+        (
+            (
+                r'\{\s*Chart\s*(?:\?|&&)',
+                'a bare `Chart` gate',
+                '{Chart && <Chart values={trend.values} labels={trend.labels} />}',
+            ),
+        ),
+        0,
+    ),
+    (
+        'the escalation projection has no url',
+        (
+            (
+                r'escalation\s*\.\s*url\b',
+                'the UI reads a `url` off the projection',
+                '<a href={escalation.url}>open</a>',
+            ),
+        ),
+        0,
+    ),
+    (
+        'fingerprints are rendered whole',
+        _FINGERPRINT_PARSE,
+        0,
+    ),
+    (
+        'absent scalars are dashed, never zeroed',
+        _SYNTHETIC_ZERO,
+        0,
+    ),
+    (
+        'the artifact issues notice is never collapsed',
+        (
+            (
+                r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue',
+                'the issues notice is wrapped in a <details>',
+                '<details className="me-note"><summary>Artifact issues</summary>',
+            ),
+        ),
+        re.IGNORECASE,
+    ),
+)
+
+
+def _forbidden_patterns(label: str) -> tuple[tuple[str, str, int], ...]:
+    """The `_FORBIDDEN_PATTERNS` entry for *label*, as (pattern, what, flags).
+
+    Flags travel WITH the pattern rather than being restated at the call site:
+    one of these guards is case-insensitive and the rest are not, and a flag
+    dropped at the call site is a guard quietly weakened with no test failing.
+    """
+    for entry_label, patterns, flags in _FORBIDDEN_PATTERNS:
+        if entry_label == label:
+            return tuple((pattern, what, flags) for pattern, what, _violation in patterns)
+    raise AssertionError(
+        f'no _FORBIDDEN_PATTERNS entry labelled {label!r} — an assertion is '
+        'rejecting something no table describes, so the pattern it runs is '
+        'hardened in one place and spelled in another.'
+    )
+
+
+def test_forbidden_patterns_are_falsified_by_injecting_a_violation(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """Every forbidden pattern must still FIRE on the thing it forbids.
+
+    The inverse of `test_presence_greps_are_falsified_by_deleting_the_code`, and
+    it closes the hole that table's harness was written to close, left open on
+    this mirror table.  A presence grep fails loudly when its pattern rots — it
+    stops matching real code.  A FORBIDDEN pattern is asserted to match NOTHING,
+    so a pattern that can never match anything is indistinguishable from one
+    guarding perfectly: it is permanently vacuous and the suite stays green.
+
+    That is not a theoretical rot.  Typo `_FINGERPRINT_PARSE`'s `\\.split\\(` as
+    `\\.spilt\\(`, and `dedupe_fingerprint.split('|')` could land in the .jsx
+    with nothing failing — the fingerprint sliced into a synthetic "eval id"
+    that the payload never claimed, which is exactly what these guards exist to
+    stop.  The generated tuples make that likelier, not less: one typo in a
+    comprehension silently disarms eight patterns at once.
+
+    Two arms per pattern:
+
+    (1) it does NOT match the real comment-stripped source — the same thing the
+        live guards assert, restated here so arm (2) means something.  Without
+        it, a pattern matching the whole file would "pass" arm (2) trivially.
+    (2) it DOES match once its violating snippet is spliced in.  The snippet is
+        hand-written JSX carried in the table beside the pattern, deliberately
+        NOT derived from the pattern: a snippet generated by stripping the
+        regex's escapes would reproduce any typo and match it.
+
+    Nothing about what a guard REJECTS changes here — the snippets are appended
+    to a local copy of the source, never to the .jsx.
+    """
+    code = tab_memory_evals_jsx_code
+
+    for label, patterns, flags in _FORBIDDEN_PATTERNS:
+        for pattern, what, violation in patterns:
+            assert not re.search(pattern, code, flags), (
+                f'[{label}] pattern {pattern!r} ({what}) matches the real '
+                'comment-stripped source. Either the .jsx has a live violation, '
+                'or the pattern is far too broad — and if it matches everything, '
+                'the injection arm below proves nothing about it.'
+            )
+            mutant = f'{code}\n{violation}\n'
+            assert re.search(pattern, mutant, flags), (
+                f'[{label}] pattern {pattern!r} does NOT match {violation!r}, the '
+                f'very thing it claims to forbid ({what}). The guard is VACUOUS: '
+                'it can never fire, so the .jsx could grow this exact line and the '
+                'suite would stay green. Fix the pattern — and if the snippet is '
+                'the thing that is wrong, check it against a real render site '
+                'rather than re-deriving it from the pattern.'
+            )
+
+
+# ---------------------------------------------------------------------------
 # step-5 tests: tab_memory_evals.jsx is served and renders eval cards + trends
 # ---------------------------------------------------------------------------
 
 
-def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
+def test_tab_memory_evals_jsx_served_and_exports_section(
+    _client,
+    tab_memory_evals_jsx_code: str,
+) -> None:
     """The section file must be served and export MemoryEvalsSection on its
     own window global, following the scheduler_heatmap.jsx:191 producer idiom.
+
+    The export greps read the COMMENT-STRIPPED view of the same served file the
+    `_client` fetch returns (the fixture is that fetch).  The header comment
+    reproduces the export statement verbatim — "Exports:
+    window.DF_MEMORY_EVALS = { MemoryEvalsSection }" — so both assertions below
+    were satisfied by prose alone: deleting the real export at the file tail
+    left this test green while every tab blanked in the browser.
     """
     resp = _client.get('/static/redux/tab_memory_evals.jsx')
     assert resp.status_code == 200, (
@@ -807,14 +1377,16 @@ def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
         f'{resp.status_code} — index.html already references the file '
         '(step-4), so a missing file is a hard 404 in the browser.'
     )
-    body = resp.text
-    assert 'window.DF_MEMORY_EVALS = {' in body, (
+    code = tab_memory_evals_jsx_code
+    assert re.search(
+        _presence_pattern('window.DF_MEMORY_EVALS export', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must set `window.DF_MEMORY_EVALS = { ... }` at '
         'the file tail (the scheduler_heatmap.jsx:191 precedent) — that global '
         'is what tabs.jsx destructures at module top level.'
     )
     assert re.search(
-        r'window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bMemoryEvalsSection\b', body
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bMemoryEvalsSection\b', code, re.MULTILINE
     ), (
         'window.DF_MEMORY_EVALS must export MemoryEvalsSection — tabs.jsx '
         'renders it inside MemoryTab.'
@@ -822,17 +1394,23 @@ def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
 
 
 def test_tab_memory_evals_renders_eval_cards_and_trends(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """The section renders one card per eval and a trend per metric, from the
     payload's own parallel-array trend shape.
+
+    Reads ONLY comment-stripped source.  The raw-body fixture is deliberately
+    not requested: an assertion here cannot accidentally be answered by the
+    .jsx prose if the prose is not in scope.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (c) the component exists as a named function declaration
-    assert re.search(r'\bfunction\s+MemoryEvalsSection\s*\(', body), (
+    fn_decl = re.search(
+        _presence_pattern('MemoryEvalsSection function declaration', code), code,
+        re.MULTILINE,
+    )
+    assert fn_decl is not None, (
         'tab_memory_evals.jsx must define `function MemoryEvalsSection(`.'
     )
 
@@ -840,7 +1418,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     #     level, under file-unique aliases (the per-file alias convention:
     #     tabs.jsx uses CP/ST, tab_scheduler.jsx uses stUseState, ...).
     charts_destructure = re.search(
-        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;', body
+        _presence_pattern('DF_CHARTS module-level destructure', code), code,
+        re.MULTILINE,
     )
     assert charts_destructure is not None, (
         'tab_memory_evals.jsx must destructure its chart primitives off '
@@ -859,8 +1438,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     # collision at in-browser-Babel load time) is enforced structurally by
     # test_index_html_registers_tab_memory_evals_load_order, which pins this
     # file's script tag ahead of tabs.jsx.
+    # Both offsets are read from the SAME string.  They were compared across
+    # two different strings for a while — one from `body`, one from `code` —
+    # which is not a weak comparison but a meaningless one: comment stripping
+    # shifts every offset after it, so the two indices are not on a common
+    # axis and their `<` says nothing about where anything sits.
     charts_pos = charts_destructure.start()
-    fn_pos = body.index('function MemoryEvalsSection')
+    fn_pos = fn_decl.start()
     assert charts_pos < fn_pos, (
         'the window.DF_CHARTS destructure must sit at module top level, above '
         'MemoryEvalsSection — not inside it.'
@@ -868,22 +1452,37 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 
     # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, metrics on
     #     metric_id
-    assert 'window.DF_DATA' in body, (
+    assert re.search(
+        _presence_pattern('window.DF_DATA read', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must read window.DF_DATA.'
     )
-    assert 'MEMORY_EVALS' in body, (
-        'tab_memory_evals.jsx must read the MEMORY_EVALS key of DF_DATA.'
+    assert re.search(
+        _presence_pattern('DF_DATA.MEMORY_EVALS payload read', code), code, re.MULTILINE
+    ), (
+        'tab_memory_evals.jsx must read the MEMORY_EVALS key of DF_DATA. '
+        'Anchored to the payload-access expression on the file\'s own DF_DATA '
+        'alias: a bare `MEMORY_EVALS` grep is answered by `DF_MEMORY_EVALS_FMT` '
+        'and by the export statement, so it stayed green with the read deleted.'
     )
-    assert re.search(r'\.evals\b', body), (
+    assert re.search(
+        _presence_pattern('evals list read', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must render the payload\'s `evals` list.'
     )
-    assert re.search(r'key=\{[^}]*\beval_id\b', body), (
+    assert re.search(
+        _presence_pattern('eval card keyed on eval_id', code), code, re.MULTILINE
+    ), (
         'each eval card must be keyed on `eval_id`.'
     )
-    assert re.search(r'\.metrics\b', body), (
+    assert re.search(
+        _presence_pattern('metrics list read', code), code, re.MULTILINE
+    ), (
         "tab_memory_evals.jsx must render each eval's `metrics` list."
     )
-    assert re.search(r'key=\{[^}]*\bmetric_id\b', body), (
+    assert re.search(
+        _presence_pattern('metric row keyed on metric_id', code), code, re.MULTILINE
+    ), (
         'each metric row must be keyed on `metric_id`.'
     )
 
@@ -900,20 +1499,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     # is explicitly permitted and in fact required (see
     # test_trend_holes_are_never_handed_to_a_chart_primitive below).  What is
     # forbidden is COMPACTION: a hole REMOVED from the series.
-    for hostile, what in (
-        # a chart fed a transformed series rather than the payload array itself
-        (r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(', 'a chart is fed a transformed series'),
-        # `.filter(Boolean)` drops nulls AND legitimate zeroes
-        (r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)', '.filter(Boolean) drops holes'),
-        # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
-        # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
-        (
-            r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
-            'a null-dropping filter predicate',
-        ),
-        (r'trend\.(?:values|labels)\s*\.\s*flatMap\(', 'flatMap can drop elements'),
-    ):
-        assert not re.search(hostile, body), (
+    for hostile, what, flags in _forbidden_patterns('trend series is never compacted'):
+        assert not re.search(hostile, code, flags), (
             f'trend values/labels must never be COMPACTED ({what}). A `null` '
             'in `values` is a deliberate hole (that run produced no sample); '
             'dropping it would shift this metric\'s points against every '
@@ -923,9 +1510,12 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         )
 
     # (g) charts.jsx primitives only — no new chart library
-    assert re.search(r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b', body), (
+    assert re.search(
+        _presence_pattern('charts.jsx primitive is used', code), code, re.MULTILINE
+    ), (
         'the section must use at least one charts.jsx primitive '
-        '(Sparkline / StepSpark / StatTile / LineChart).'
+        '(Sparkline / StepSpark / StatTile / LineChart) — in an object or '
+        'destructure position, not merely named in a comment.'
     )
     # Run over the comment-stripped `code`, not `body`: a comment that merely
     # NAMES a library ("deliberately not d3") is prose, not a dependency, and
@@ -949,8 +1539,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     #     was two assertions about one fact.
 
     # (i) the truncation disclosure names both counts
-    assert re.search(r'\btruncated\b', body), (
-        "the eval-level `truncated` flag must gate a visible disclosure."
+    assert re.search(
+        _presence_pattern('eval-level truncation disclosure', code), code, re.MULTILINE
+    ), (
+        'the eval-level `truncated` flag must GATE a visible disclosure. '
+        'Anchored to the gate expression: a bare `truncated` grep is answered by '
+        'the operator-facing "(truncated)" label inside the disclosure itself, so '
+        'it survived deleting the very flag that decides whether it renders.'
     )
     assert re.search(r'\bev\.run_count\b', code) and re.search(
         r'\bev\.runs_on_disk\b', code
@@ -1107,8 +1702,7 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
         'spelling if the producer renamed the state.'
     )
 
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    badge_body = extract_function_body(code, 'verdictBadge')
     labels = _return_label_exprs(badge_body)
     assert labels, 'verdictBadge returns no `label`.'
     for expr in labels:
@@ -1264,8 +1858,7 @@ def test_unknown_verdict_is_visibly_unrenderable(
     # un-say it, and the composed label would then assert both halves of the
     # distinction at once ("no verdict · unrecognised verdict" — absent in the
     # first clause, present-but-unreadable in the second).
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    badge_body = extract_function_body(code, 'verdictBadge')
     assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
     assert assigned, 'verdictBadge assigns no literal `base` label.'
     absent = assigned[0]  # the seed, in force until a verdict is recognised
@@ -1288,7 +1881,7 @@ def test_unknown_verdict_is_visibly_unrenderable(
 
 
 def test_verdict_badges_driven_by_persisted_verdict(
-    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """Badges must name every persisted verdict and every server-derived
@@ -1299,10 +1892,13 @@ def test_verdict_badges_driven_by_persisted_verdict(
     `memory_evals._verdict_class()`, which buckets an absent value to
     `unjudged` rather than to a verdict, and the UI must not undo it.
     """
-    body = tab_memory_evals_jsx_body
-    code = memory_evals_fmt_js_code
+    code = tab_memory_evals_jsx_code
+    fmt_code = memory_evals_fmt_js_code
 
-    export_m = re.search(r'window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}', body)
+    export_m = re.search(
+        _presence_pattern('window.DF_MEMORY_EVALS exported names', code), code,
+        re.MULTILINE,
+    )
     assert export_m, 'tab_memory_evals.jsx sets no window.DF_MEMORY_EVALS export.'
     exported = {n.strip() for n in export_m.group(1).split(',') if n.strip()}
     assert exported == {'MemoryEvalsSection'}, (
@@ -1326,7 +1922,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
     # appears in the prose above verdictBadge, so a whole-file grep would stay
     # green after the branch itself was deleted.
     for parity in sorted(PARITY_STATES):
-        assert f"'{parity}'" in code, (
+        assert f"'{parity}'" in fmt_code, (
             f'memory_evals_fmt.js must name the server-derived parity state '
             f"'{parity}' in CODE, as a quoted string literal — the comment "
             'block above verdictBadge names all of them, so a whole-file grep '
@@ -1339,7 +1935,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
     for cls in ('badge bad', 'badge ok', 'badge warn', 'badge info', 'badge muted'):
-        assert cls in code, (
+        assert cls in fmt_code, (
             f"memory_evals_fmt.js must use the existing '{cls}' class "
             '(styles.css:239-261) rather than inventing badge styling. The '
             'badge tables moved there with verdictBadge (task 3481); the .jsx '
@@ -1347,8 +1943,11 @@ def test_verdict_badges_driven_by_persisted_verdict(
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    # The call is kept for its EXISTENCE check alone — `extract_function_body`
+    # raises if `verdictBadge` is renamed or removed (task 3549), which is what
+    # the node tests named below depend on and what the discarded body used to
+    # be asserted truthy for.
+    extract_function_body(fmt_code, 'verdictBadge')
     # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
     #     verdict-derived label — now lives in
     #     `test_parity_vocabulary_fully_covered`, asserted structurally over
@@ -1543,13 +2142,7 @@ def test_no_client_side_alarm_derivation(
     #     characters that appear in prose (an `->` arrow, a "<Chart" reference)
     #     are not comparisons, and failing on them would push the next author
     #     to reword a correct comment rather than fix real code.
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, (
-        'could not extract the verdictBadge body from memory_evals_fmt.js. '
-        'This assertion is the anti-vacuity guard for everything below it: if '
-        'verdictBadge moves again, FOLLOW it here rather than deleting this '
-        'check, or the ordering-operator scan silently stops scanning anything.'
-    )
+    badge_body = extract_function_body(code, 'verdictBadge')
     assert 'parity' in badge_body, (
         'verdictBadge must read `parity` — the server-derived display state.'
     )
@@ -1604,35 +2197,165 @@ def test_no_client_side_alarm_derivation(
             )
 
 
-def test_trend_holes_are_never_handed_to_a_chart_primitive(
-    tab_memory_evals_jsx_body: str,
+# ---------------------------------------------------------------------------
+# Helper: derive the trend cell's chart gate out of MemoryEvalMetricRow
+# ---------------------------------------------------------------------------
+
+
+class _TrendGate(NamedTuple):
+    """The locals the trend chart's gate is built from, plus the gate's own text.
+
+    ``points``     — the series length: ``const points = (trend.values || []).length``
+    ``plotted``    — the drawable-sample count: ``const plotted = points - gaps``
+    ``gate``       — the gate: ``const plottable = Chart && plotted > 0 && ...``
+    ``gate_decl``  — that gate declaration's full source text, for callers that
+                     need to assert what ELSE it consumes (e.g. the mismatch local).
+    """
+
+    points: str
+    plotted: str
+    gate: str
+    gate_decl: str
+
+
+def _derive_trend_gate(row_body: str) -> _TrendGate:
+    """Walk ``points -> plotted -> gate`` in MemoryEvalMetricRow, asserting each hop.
+
+    ONE derivation, shared by both trend tests, because the two must not drift
+    apart on what "the gate" means — between them they are the only thing
+    standing between an unrenderable series and a blank 26px box.  That
+    agreement used to be prose in two docstrings, and the copies had ALREADY
+    diverged: one required the ``const <name> = ...gaps...;`` candidate to name
+    the series-length local before accepting it, the other took the first
+    candidate and only then asserted it did.  Measured, not argued: inserting an
+    unrelated ``const gapPct = gaps * 100;`` above ``const plotted = points -
+    gaps;`` passed the first test and failed the second, with a message blaming
+    ``plotted`` for something ``gapPct`` had done.  Structure, not comments, is
+    what keeps them identical now.
+
+    The surviving rule is the stricter of the two: among the ``gaps``-consuming
+    declarations that are neither ``gaps`` itself nor the gate, the drawable
+    count is the one that ALSO consumes the series length.  When no candidate
+    qualifies, the rejected ones are named in the failure so an author is not
+    left guessing which declaration the assertion was looking at.
+
+    Every assertion lives here rather than at the call sites, so a caller cannot
+    accidentally accept a shape its sibling rejects.
+    """
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so it '
+        'can neither tell an empty series from a populated one nor subtract the '
+        'gap count from it to learn how many samples the primitive will actually '
+        'draw. `trendGaps([])` is 0, so the gap count alone passes a no-runs '
+        'metric straight to a chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # The drawable count: a plain arithmetic local (NOT the gate itself, hence
+    # the `Chart` exclusion) combining the series length and the gap count.
+    candidates = [
+        decl
+        for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body)
+        if decl.group(1) != 'gaps' and not re.search(r'\bChart\b', decl.group(0))
+    ]
+    plotted_decl = next(
+        (
+            decl
+            for decl in candidates
+            if re.search(r'\b' + re.escape(points_local) + r'\b', decl.group(0))
+        ),
+        None,
+    )
+    assert plotted_decl is not None, (
+        'MemoryEvalMetricRow never derives the DRAWABLE-sample count. The chart '
+        'is gated on how many samples the primitive will draw, so a '
+        f'`const plotted = {points_local} - gaps;` local (any name, but not '
+        '`gaps` and not the gate itself) must exist. Without it the gate is '
+        'either back to a zero-hole veto or blind to an all-hole series. '
+        + (
+            'Rejected candidates, none of which consume the series-length local '
+            f'`{points_local}`: {[d.group(0).strip() for d in candidates]!r}.'
+            if candidates
+            else 'No `const <name> = ...gaps...;` declaration exists at all.'
+        )
+    )
+    plotted_local = plotted_decl.group(1)
+
+    gate_decl = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
+        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
+            continue
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'the `<Chart ...>` render site is not gated on the drawable-sample count '
+        f'`{plotted_local}`. Expected a single-line '
+        f'`const plottable = Chart && {plotted_local} > 0 && ...;` whose local '
+        'reaches a `{<local>` JSX position. Neither an empty series nor an '
+        'all-hole one may reach a primitive: sparkPaths returns an empty line, '
+        'Sparkline/StepSpark return null, and the cell renders a blank 26px box. '
+        f'The empty series is excluded TRANSITIVELY — {points_local} -> '
+        f'{plotted_local} -> gate — not by a direct `{points_local} > 0` term.'
+    )
+
+    return _TrendGate(
+        points=points_local,
+        plotted=plotted_local,
+        gate=gate_decl.group(1),
+        gate_decl=gate_decl.group(0),
+    )
+
+
+def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A series containing a hole must NOT be drawn — charts.jsx cannot
-    represent one, so drawing it fabricates a measurement.
+    """A series containing a hole IS drawn, with its missing samples disclosed
+    alongside it.  The chart is gated on AT LEAST ONE DRAWABLE SAMPLE, never on
+    zero holes.
 
-    The defect: charts.jsx's `Sparkline` (:42-53) and `StepSpark` (:66-90) do
-    plain arithmetic with no null handling — `Math.max(...values, 1)`,
-    `Math.min(...values, 0)`, `y = height - ((v - min) / range) * height` — in
-    which a `null` coerces to 0.  A hole handed to them is therefore drawn as a
-    REAL point at the chart floor, joined by a line segment to its neighbours
-    and indistinguishable from a measured regression to zero.  For a
-    `proportion` metric sitting at 0.95 that reads as a plunge and recovery
-    that never happened.
+    HISTORY: this test previously pinned the opposite invariant — a holed
+    series was suppressed entirely.  Its sole justification was that charts.jsx
+    could not REPRESENT a hole: `Sparkline` and `StepSpark` did plain
+    arithmetic with no null handling, so a `null` coerced to 0 and was drawn as
+    a real point at the chart floor, joined to its neighbours — for a
+    `proportion` metric sitting at 0.95, a plunge and recovery that never
+    happened.  Task 3436 removed that limitation: the scale/path math moved to
+    spark_path.js, which excludes non-finite samples from the extrema, keeps
+    index-based x positions so the axis does not shift, and emits separate
+    M-started subpaths so the line is genuinely discontinuous across a hole.
 
-    That directly contradicts this file's own `dash()` invariant — "Missing
-    scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
-    measured zero".  The trend column was the one place it was violated.
+    DECISION (task 3490): with the primitive hole-aware, the suppression was a
+    workaround for a fixed defect, so it is retired.  Three facts settled it.
+    The trend window is 90 runs (memory_evals.py `_TREND_RUN_CAP`), so
+    suppressing on any hole discards up to 89 real measurements to avoid
+    disclosing 1 missing one — itself a silent degradation.  The dominant
+    real-world source of a hole is a metric INTRODUCED MID-WINDOW
+    (memory_evals.py: "a legitimate shape"), so suppression withheld the chart
+    for a newly-added metric until the entire window rolled over, exactly when
+    an operator most wants the shape.  And a fraction-of-holes threshold was
+    rejected outright: this file consumes the server's judgments and never
+    re-derives them, and no server field authorises a draw/suppress fraction.
 
-    The fix is suppression, not compaction: the array is still passed through
-    verbatim (guarded above), but a series the primitive cannot represent is
-    not drawn at all.
+    What replaced the old invariant is NOT "no gate".  `gaps === 0` was
+    silently doing double duty as the ALL-HOLE guard: a series of nothing but
+    holes yields an empty path, both primitives `return null`, and the cell
+    renders a blank 26px box — the failure
+    test_empty_trend_is_a_named_state_not_an_empty_chart_box exists to prevent.
+    So the gate now counts what will actually be DRAWN
+    (`plotted = points - gaps`) and requires at least one.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
-    # (iv) hole DETECTION must still exist and still run — the fix is to act on
-    #      the count, not to stop counting.
+    row_body = extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (iv) hole DETECTION must still exist and still run.  UNCHANGED by the
+    #      decision, and required MORE than before: the count is now both the
+    #      operator-facing disclosure and an input to the chart gate.
     assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
         'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
         'memory_evals_fmt.js (task 3481) so node can execute it. Two '
@@ -1653,153 +2376,221 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
         'ignoring the count is the defect this test exists to prevent.'
     )
 
-    # (ii) the gap count must participate in the guard on the <Chart render
-    #      site.  Two spellings are accepted — an inline `Chart && !gaps`, or a
-    #      named local (`plottable` / `hasGaps` / ...) combining both — because
-    #      the invariant is "the count gates the chart", not one exact phrasing.
+    # (ii') the gap count must still reach the `<Chart ...>` render site — but
+    #       now as the SUBTRAHEND that yields the drawable-sample count, not as
+    #       a zero-equality veto.  Derived in two hops so the gate's meaning is
+    #       readable from the source: a count local that consumes both the
+    #       series length and the gap count, then a gate that consumes `Chart`
+    #       and that count and reaches a `{<local>` JSX position.
     #
-    #      KEPT DELIBERATELY, against a review suggestion to delete this block
-    #      as identifier-spelling introspection covered by the `bare` negative
-    #      check below.  Measured, not argued: regressing the JSX to
-    #      `const plottable = Chart;` (gate removed, holed series reaches the
-    #      primitive) fails HERE and `bare` passes it — `bare` only matches the
-    #      literal `{Chart &&` / `{Chart ?` spelling, so any named local evades
-    #      it entirely.  The two are not redundant: this is the only POSITIVE
-    #      check that a gate exists at all, and deleting it silently reopens
-    #      the defect 5ad120a0b3 fixed (charts.jsx coerces null to 0 and draws
-    #      a fabricated plunge to the chart floor; see task 3436).
-    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', body)
-    via_local = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+    #       KEPT DELIBERATELY, against a review suggestion to delete this block
+    #       as identifier-spelling introspection covered by the `bare` negative
+    #       check below.  Measured, not argued: regressing the JSX to
+    #       `const plottable = Chart;` (gate removed, an all-hole series reaches
+    #       the primitive) fails HERE and `bare` passes it — `bare` only matches
+    #       the literal `{Chart &&` / `{Chart ?` spelling, so any named local
+    #       evades it entirely.  The two are not redundant: this is the only
+    #       POSITIVE check that a gate exists at all, and deleting it lets the
+    #       cell hand a series of nothing but holes to a primitive that returns
+    #       null, leaving the blank 26px box.
+    #
+    #       Derived through the SHARED `_derive_trend_gate` walk — the same call
+    #       test_empty_trend_is_a_named_state_not_an_empty_chart_box makes, so
+    #       "the two tests derive the gate the same way" is structural rather
+    #       than a promise in two docstrings.
+    gate = _derive_trend_gate(row_body)
+
+    # (ii'-negative) the RETIRED suppression must be gone. Without this,
+    #                leaving `gaps === 0` in the gate would keep the old
+    #                behaviour while every other assertion above passed.
+    suppression = re.search(r'\bgaps\s*(?:===?)\s*0|!\s*gaps\b', code)
+    assert suppression is None, (
+        f'a zero-gap veto survives: {suppression.group(0)!r}. Task 3490 '
+        'retired it — a holed series is DRAWN by the hole-aware primitive and '
+        f'its gaps disclosed. The gate is `{gate.plotted} > 0` (at least one '
+        'drawable sample), never "no holes at all".'
+    )
+
+    # ...and no path may reach the primitive around the named gate. `<Chart `
+    # (the element itself) and `!Chart` (the no-kind arm) do not match this;
+    # only an inline `{Chart &&` / `{Chart ?` render guard does, and such a
+    # guard would hand an ALL-HOLE series to a primitive that returns null.
+    for pattern, what, flags in _forbidden_patterns(
+        'no chart render site is gated on Chart alone'
     ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
-            via_local = decl.group(1)
-            break
-    assert inline or via_local, (
-        'the `<Chart ...>` render site is not gated on the gap count. A holed '
-        'series must not reach a charts.jsx primitive: declare e.g. '
-        '`const plottable = Chart && gaps === 0;` and render the chart only '
-        'when it holds.'
-    )
+        bare = re.search(pattern, code, flags)
+        assert bare is None, (
+            f'a chart render site is guarded by `Chart` alone ({what}): '
+            f'{bare.group(0)!r} — it bypasses the `{gate.gate}` gate, so a '
+            'series in which nothing was measured would reach the primitive '
+            'and render a blank box.'
+        )
 
-    # ...and the bare `Chart` guard must be gone, so no path reaches the
-    # primitive without the gap check.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
-    assert bare is None, (
-        f'a chart render site is still guarded by `Chart` alone: '
-        f'{bare.group(0)!r} — a holed series would reach the primitive '
-        'through it.'
-    )
-
-    # (iii) a suppressed series must still DISCLOSE its gap count — silently
-    #       withholding the sparkline would read as a render bug.  Asserted
-    #       structurally (the `gaps` local reaches a JSX render position in
-    #       comment-stripped source) rather than as operator-facing copy:
-    #       pinning the sentence would fail the suite on any rewording while
-    #       proving nothing extra about the branch, which is the rule this
+    # (iii) a DRAWN holed series must still DISCLOSE how many samples are
+    #       missing — a line with unexplained breaks in it reads as a render
+    #       bug.  Asserted structurally (the `gaps` local reaches a JSX render
+    #       position in comment-stripped source) rather than as operator-facing
+    #       copy: pinning the sentence would fail the suite on any rewording
+    #       while proving nothing extra about the branch, which is the rule this
     #       file states at lines 1134-1138 and 1203-1211.
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count is computed but never reaches render position. A '
-        'holed series must disclose how many samples are missing — the '
-        'operator still gets value, current_value, n, denominator, direction '
-        'and the verdict badge, and only the sparkline is withheld.'
+        'holed series is now drawn, so the count is the ONLY thing that '
+        'explains the breaks in the line — the operator still gets value, '
+        'current_value, n, denominator, direction and the verdict badge, but '
+        'nothing would say how many runs produced no sample.'
+    )
+
+    # (iii-b) ...and the disclosure must also reach the DRAWN ARM ITSELF, in
+    #         that element's own opening tag, so the breaks are explained where
+    #         they appear (on hover) and not only in the footer below.
+    #
+    #         Matched on the WHOLE opening tag, taken from its `<` to its
+    #         matching `>` by `_jsx_open_tag_containing`, rather than by a
+    #         directional `gaps ... <testid>` window.  A one-sided window would
+    #         encode JSX attribute ORDER, which is not behaviour: reordering to
+    #         `<div style={...} data-testid="..." title={gaps ? ... : span}>`
+    #         renders identically yet would fail a before-the-testid regex.  The
+    #         walk still confines the match to a SINGLE opening tag, so a `gaps`
+    #         mention in a neighbouring element cannot satisfy it — that
+    #         confinement is what gives the assertion its meaning — but unlike
+    #         the `<[^<>]*...>` span it was spelled with before, it does not
+    #         mistake a `<`/`>` OPERATOR inside an attribute expression for the
+    #         end of the tag (see that helper's docstring for the measurement).
+    tag = _jsx_open_tag_containing(row_body, 'data-testid="memory-eval-trend-chart"')
+    assert tag is not None, (
+        'no opening tag carries `data-testid="memory-eval-trend-chart"` — the '
+        'drawn-chart arm is gone. This assertion is also the vacuity guard for '
+        'the one below, which would otherwise pass trivially.'
+    )
+    assert re.search(r'\bgaps\b', tag), (
+        'the drawn-chart element does not consume `gaps` in its own opening '
+        'tag. The sparkline is drawn with a break at every missing sample; '
+        'without the count in that element\'s `title=`, an operator hovering '
+        'the broken line gets no account of why it is broken. Attribute ORDER '
+        'inside the tag is deliberately NOT constrained.'
     )
 
 
 def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A metric with NO runs is a third suppression state, not a chart.
+    """A series a primitive would render as NOTHING is a named state, not a
+    chart.
 
-    The defect: `trendGaps([])` counts zero holes in zero samples, so the
-    `Chart && gaps === 0` gate is TRUE for a metric that has never been
-    measured.  The empty series is then handed to a charts.jsx primitive —
+    The original defect: `trendGaps([])` counts zero holes in zero samples, so
+    the old `Chart && gaps === 0` gate was TRUE for a metric that had never
+    been measured.  The empty series was handed to a charts.jsx primitive —
     and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
-    on a zero-length array.  The cell therefore renders an empty 26px <div>
-    plus a "0 pts" footer: a blank box that is indistinguishable from a
-    rendering bug, which is precisely the failure mode the gap-suppression
-    path already exists to avoid.  The deliberate 'no runs' text the row
-    ALREADY computes reaches only a `title=` on that invisible div, so the
-    state is never stated in the open.
+    on a zero-length array.  The cell therefore rendered an empty 26px <div>
+    plus a "0 pts" footer: a blank box indistinguishable from a rendering bug.
+    The deliberate 'no runs' text the row ALREADY computes reached only a
+    `title=` on that invisible div, so the state was never stated in the open.
+
+    Task 3490 widened the blast radius of that defect and this test with it.
+    Now that a holed series is DRAWN (the primitive became hole-aware in 3436),
+    an ALL-HOLE series — one that ran but in which no run produced a sample —
+    reaches the same dead end: an empty path, `return null`, blank box.  So the
+    gate stopped meaning "no holes" and started meaning "at least one sample
+    the primitive will actually draw", and the empty series is now excluded
+    TRANSITIVELY through that count rather than by its own `points > 0` term.
+
+    This test therefore derives the gate through ``_derive_trend_gate``, the
+    same call its sibling
+    test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed makes.  That
+    pairing is deliberate and load-bearing: the two tests must not drift apart
+    on what "the gate" means, because between them they are the only thing
+    standing between an unrenderable series and a blank box.  It is one shared
+    walk rather than two matching copies because the copies had already
+    diverged — the helper's docstring records the measurement.
 
     Asserted on structure and on `data-testid` values, never on copy: a
     rewording keeps this green, deleting a state does not.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
-    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
-    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+    row_body = extract_function_body(code, 'MemoryEvalMetricRow')
 
-    # (a) something must MEASURE the series length. Nothing did.
-    points_decl = re.search(
-        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
-    )
-    assert points_decl is not None, (
-        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
-        'it cannot tell an empty series from a populated one. `trendGaps([])` '
-        'is 0, so the gap check alone passes a no-runs metric straight to a '
-        'chart primitive that renders nothing.'
-    )
-    points_local = points_decl.group(1)
-
-    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
-    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
-    #     the two tests cannot drift apart on what "the gate" means.
-    gate_decl = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
-    ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
-            gate_decl = decl
-            break
-    assert gate_decl is not None, (
-        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
-        'reaches a `{<local>` JSX position — see '
-        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
-        'the gate the same way.'
-    )
-    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
-        f'series-length local `{points_local}`. An empty series must never '
-        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
-        'null for a zero-length array, leaving a blank 26px box.'
-    )
+    # (a)+(b) the series length must be MEASURED, and the chart gate must
+    #     CONSUME that measurement — now TRANSITIVELY, through the
+    #     drawable-sample count, since the gate no longer names `points`
+    #     directly (gaps <= points always, so `plotted > 0` implies `points > 0`
+    #     and restating it would leave a dead conjunct).
+    #
+    #     Both hops come from the SHARED `_derive_trend_gate` walk, the same
+    #     call test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed
+    #     makes.  One derivation, so the two tests cannot drift apart on what
+    #     "the gate" means — which they had already begun to do while the rule
+    #     was only stated in prose (see that helper's docstring).
+    gate = _derive_trend_gate(row_body)
+    points_local, plotted_local = gate.points, gate.plotted
 
     # (c) FIVE structurally distinct trend states. A separate no-runs arm is
-    #     required rather than folding it into the gap message because
-    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
-    #     that reads as a bug — the very failure this suppression path exists
-    #     to prevent.  A separate mismatch arm is required for the same reason,
-    #     one payload shape further out: labels and values are PARALLEL arrays
-    #     (memory_evals.py:955,993), so a disagreement makes every other
-    #     sentence this cell could produce untrustworthy.
+    #     required rather than folding it into the all-gaps message because
+    #     "none of the 0 runs produced a sample" is a nonsense sentence that
+    #     reads as a bug — the very failure this state inventory exists to
+    #     prevent.  The two must stay separate for a second reason as well:
+    #     "no runs yet — nothing to chart" and "none of the 90 runs produced a
+    #     sample" are DIFFERENT FACTS about the metric, and collapsing them
+    #     would tell an operator that a measured-but-empty metric had never
+    #     run.  A separate mismatch arm is required one payload shape further
+    #     out: labels and values are PARALLEL arrays (memory_evals.py:955,993),
+    #     so a disagreement makes every other sentence this cell could produce
+    #     untrustworthy.
+    #
+    #     `memory-eval-trend-gaps` was RENAMED to `memory-eval-trend-all-gaps`
+    #     (task 3490) because its meaning NARROWED, from "the series has at
+    #     least one hole" to "the series has nothing but holes" — a different
+    #     predicate over a different population. Keeping the old id would let a
+    #     test that means the old thing pass green against the new thing.
     testids = (
         'memory-eval-trend-chart',
         'memory-eval-trend-no-kind',
         'memory-eval-trend-mismatch',
         'memory-eval-trend-no-runs',
-        'memory-eval-trend-gaps',
+        'memory-eval-trend-all-gaps',
     )
     assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
     for testid in testids:
         assert f'data-testid="{testid}"' in code, (
             f'the trend cell must render a `data-testid="{testid}"` arm. The '
-            'five states — drawn chart, unrenderable kind, labels/values length '
-            'disagreement, no runs yet, and holed series — must be structurally '
-            'distinguishable, so a rewording cannot silently collapse two of '
-            'them into one.'
+            'five states — drawn chart (INCLUDING a holed series, drawn by the '
+            'hole-aware primitive with its gaps disclosed), unrenderable kind, '
+            'labels/values length disagreement, no runs yet, and not one run '
+            'produced a sample — must be structurally distinguishable, so a '
+            'rewording cannot silently collapse two of them into one.'
         )
+
+    # (c2) the all-gaps arm must be reachable ONLY when the drawable count is
+    #      zero. Without this the arm becomes dead code the moment the gate
+    #      changed: it sits last in the else-chain, so nothing else in the
+    #      source ties it to the predicate it claims to state.
+    assert re.search(
+        re.escape(plotted_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-all-gaps"',
+        row_body,
+    ), (
+        f'`{plotted_local}` does not gate the '
+        '`data-testid="memory-eval-trend-all-gaps"` arm. That arm now means '
+        'the series exists but NOT ONE run produced a sample — the one shape '
+        'the hole-aware primitive still cannot draw — so the drawable-sample '
+        'count is what must select it.'
+    )
 
     # (d) the existing guards must SURVIVE, re-asserted here so a later
     #     refactor to a `trendState()` discriminator cannot quietly drop them.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
-    assert bare is None, (
-        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
-        'a holed OR empty series would reach the primitive through it.'
-    )
+    #     The `gaps` lookahead is gone (mirroring the sibling test): holes no
+    #     longer veto the chart, so ANY inline `{Chart &&` / `{Chart ?` render
+    #     guard is a bypass of the named gate.
+    for pattern, what, flags in _forbidden_patterns(
+        'no chart render site is gated on Chart alone'
+    ):
+        bare = re.search(pattern, code, flags)
+        assert bare is None, (
+            f'a chart render site is guarded by `Chart` alone ({what}): '
+            f'{bare.group(0)!r} — an all-hole OR empty series would reach the '
+            'primitive through it and render a blank 26px box.'
+        )
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count must still reach a render position — adding the '
         'no-runs state must not cost the holed-series disclosure.'
@@ -1836,8 +2627,8 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
         'and nothing this cell says about the series would be trustworthy.'
     )
     mismatch_local = mismatch_decl.group(1)
-    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate.gate_decl), (
+        f'the chart gate {gate.gate_decl.strip()!r} does not consume '
         f'`{mismatch_local}`, so a malformed series is still drawn — against a '
         'title derived from the other, differently-sized array.'
     )
@@ -1858,14 +2649,15 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
 
 
 def test_escalation_links_and_storm_aggregate_banner(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """The escalation affordances must be real, built only from fields the
     projection actually carries, and read the banner from the top-level block.
+
+    Reads ONLY comment-stripped source — see
+    `test_tab_memory_evals_renders_eval_cards_and_trends`.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (a) a metric row carrying an escalation renders a link, guarded so a null
@@ -1883,31 +2675,35 @@ def test_escalation_links_and_storm_aggregate_banner(
         'id alone makes the operator click to find out what it is. Anchored to '
         'the JSX expression position, not a bare name grep.'
     )
-    assert re.search(r'm\.escalation\s*&&', body), (
+    assert re.search(
+        _presence_pattern('per-metric escalation guard', code), code, re.MULTILINE
+    ), (
         'the escalation control must be guarded by `m.escalation &&` so a null '
         'projection renders nothing rather than a dead control.'
     )
 
     # (b) built from `id` only — the projection has no `url` field.
-    assert not re.search(r'escalation\s*\.\s*url\b', body), (
-        'the escalation projection has exactly six keys — id, summary, '
-        'severity, level, created_at, dedupe_fingerprint. There is no `url`; '
-        'the UI constructs its own affordance from `id`.'
-    )
+    for no_url, what, flags in _forbidden_patterns(
+        'the escalation projection has no url'
+    ):
+        assert not re.search(no_url, code, flags), (
+            f'{what}: the projection has exactly six keys — id, summary, '
+            'severity, level, created_at, dedupe_fingerprint. There is no `url`; '
+            'the UI constructs its own affordance from `id`.'
+        )
 
     # (c) fingerprints are rendered whole, never parsed.
     #     memory_evals._escalation_projection() — the fingerprint is the
     #     producer's private construction; the dashboard must not depend on
     #     its substructure.
-    for field in ('dedupe_fingerprint', 'fingerprint'):
-        for op in (r'\.split\(', r'\.slice\(', r'\.match\(', r'\.substring\('):
-            assert not re.search(rf'{field}\s*{op}', body), (
-                f'`{field}` must be rendered whole — never split/sliced/matched. '
-                'The fingerprint is the producer\'s private construction '
-                '(memory_evals._escalation_projection()); parsing its '
-                'substructure here would couple the dashboard to a format it '
-                'does not own.'
-            )
+    for parsed, what, flags in _forbidden_patterns('fingerprints are rendered whole'):
+        assert not re.search(parsed, code, flags), (
+            f'{what} — a fingerprint must be rendered whole. It is the '
+            'producer\'s private construction '
+            '(memory_evals._escalation_projection()); parsing its '
+            'substructure here would couple the dashboard to a format it '
+            'does not own.'
+        )
 
     # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
     assert 'data-testid="memory-eval-storm-banner"' in code, (
@@ -1921,7 +2717,8 @@ def test_escalation_links_and_storm_aggregate_banner(
         'the prose describing the banner.'
     )
     assert re.search(
-        r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
+        _presence_pattern('storm banner reads the top-level block', code), code,
+        re.MULTILINE,
     ), (
         'the storm banner must read the TOP-LEVEL MEMORY_EVALS.storm_escape '
         '(memory_evals._build_payload() fills it; _empty_payload() declares it '
@@ -1933,7 +2730,8 @@ def test_escalation_links_and_storm_aggregate_banner(
 
     # (e) per-metric links are suppressed under storm.
     assert re.search(
-        r"parity\s*===\s*'storm_collapsed'", body
+        _presence_pattern('per-metric link suppressed under storm', code), code,
+        re.MULTILINE,
     ), (
         "the metric row must branch on `parity === 'storm_collapsed'` and "
         'render the suppression reason instead of a per-metric link — under '
@@ -1999,14 +2797,17 @@ _LIMITS_KEYS = (
 
 
 def test_limits_provenance_rendered(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """Every limits-provenance key must be rendered, the staleness of the
     provenance itself must be disclosed, and a null limits artifact must say so.
+
+    Reads comment-stripped source only.  The raw body fixture is deliberately
+    NOT requested any more: the collapsed-by-default grep below was its last
+    consumer, and leaving it in scope invites the next assertion to reach for
+    it and re-open the false pass this test was just cleaned of.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # Anchored to `lim.<key>` in comment-stripped source: the provenance keys
@@ -2037,8 +2838,7 @@ def test_limits_provenance_rendered(
     # LimitsProvenance must early-return its own element when `ev.limits` is
     # falsy.  Pinning the operator-facing sentence would fail the suite on any
     # rewording while proving nothing extra about the branch.
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
+    prov_body = extract_function_body(code, 'LimitsProvenance')
     # The local's NAME is derived from the `ev.limits` read rather than pinned,
     # so renaming `lim` is not a test failure; what must hold is that whatever
     # it is called gates the early return.
@@ -2054,10 +2854,22 @@ def test_limits_provenance_rendered(
     )
 
     # Compact / expandable so provenance does not dominate the card.
-    assert re.search(r'<details|useOpenSet|usePersistedState|localStorage', body), (
-        'the provenance block must be collapsed-by-default and expandable '
-        '(a <details> element or a persisted open-state key), so it does not '
-        'dominate the eval card.'
+    #
+    # Narrowed to the <details> element carrying an `open=` attribute. The old
+    # alternation also accepted `localStorage`, which is real code in this file
+    # for the persisted open-state helpers — so it stayed green with `<details`
+    # deleted, answered by a different feature entirely.
+    #
+    # It deliberately does NOT re-assert what the open state is BOUND to:
+    # `test_limits_provenance_open_state_is_per_eval` already pins that
+    # expression (`<details\s[^>]*open=\{(\w+)\}`) and follows it through to the
+    # per-eval key. Two assertions about one fact is how they drift.
+    assert re.search(
+        _presence_pattern('provenance is collapsed by default', code), code, re.MULTILINE
+    ), (
+        'the provenance block must be collapsed-by-default and expandable — a '
+        '<details> element with an `open=` attribute — so it does not dominate '
+        'the eval card.'
     )
 
     # Local re-assertion of the step-7 guard: alpha and min_samples appear only
@@ -2113,8 +2925,7 @@ def test_limits_provenance_open_state_is_per_eval(
     """
     code = tab_memory_evals_jsx_code
 
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
+    prov_body = extract_function_body(code, 'LimitsProvenance')
 
     # (a) the `open=` attribute is a bare identifier, not a call.
     open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
@@ -2225,13 +3036,14 @@ def test_limits_provenance_open_state_is_per_eval(
 
 
 def test_staleness_empty_states_and_issues_notice(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """Staleness is a HINT, the two empty states are distinct, missing scalars
     are em-dashes rather than zeros, and artifact issues are loudly visible.
+
+    Reads ONLY comment-stripped source — see
+    `test_tab_memory_evals_renders_eval_cards_and_trends`.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (a) latest-run age renders, and the stale branch carries no alarm wording.
@@ -2245,7 +3057,7 @@ def test_staleness_empty_states_and_issues_notice(
         'the eval card must READ `ev.latest_run_stamp`.'
     )
     stale_branch = re.search(
-        r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}', body
+        _presence_pattern('stale hint branch', code), code, re.MULTILINE
     )
     assert stale_branch is not None, (
         '`ev.stale` must gate a visible hint badge.'
@@ -2295,11 +3107,12 @@ def test_staleness_empty_states_and_issues_notice(
         'defining it and then interpolating raw fields leaves the synthetic-'
         'zero hole open (feedback_redux_no_synthetic_data).'
     )
-    for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count'):
-        assert not re.search(rf'\.\s*{field}\s*\|\|\s*0\b', body), (
-            f'`{field}` is defaulted with `|| 0`. A synthetic zero reads as a '
-            'measured zero — use the dash() helper so an absent measurement '
-            'looks absent.'
+    for zeroed, what, flags in _forbidden_patterns(
+        'absent scalars are dashed, never zeroed'
+    ):
+        assert not re.search(zeroed, code, flags), (
+            f'{what}. A synthetic zero reads as a measured zero — use the dash() '
+            'helper so an absent measurement looks absent.'
         )
 
     # (d) the issues notice is VISIBLE and lists the detail, not just a count.
@@ -2309,8 +3122,11 @@ def test_staleness_empty_states_and_issues_notice(
     assert re.search(r'issue_count\s*>\s*0', code), (
         'the issues notice must be gated on `issue_count > 0`.'
     )
+    # Captured from `code`: the fixed-width window is a budget of CHARACTERS,
+    # so over the raw body every line of prose inside it displaced a line of
+    # markup the field assertions below were supposed to be reading.
     issues_block = re.search(
-        r'data-testid="memory-eval-issues"([\s\S]{0,1600})', body
+        _presence_pattern('artifact issues notice', code), code, re.MULTILINE
     )
     assert issues_block is not None
     issues_text = issues_block.group(1)
@@ -2321,11 +3137,15 @@ def test_staleness_empty_states_and_issues_notice(
             'silent-degradation failure the notice exists to prevent '
             '(INV-2/INV-4).'
         )
-    assert not re.search(r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue', body, re.IGNORECASE), (
-        'the issues notice must be expanded by default — collapsing a '
-        'degraded-state notice reproduces the silent degradation it exists to '
-        'prevent (INV-2/INV-4, the 2658 parse_failures precedent).'
-    )
+    for collapsed, what, flags in _forbidden_patterns(
+        'the artifact issues notice is never collapsed'
+    ):
+        assert not re.search(collapsed, code, flags), (
+            f'the issues notice must be expanded by default ({what}) — '
+            'collapsing a degraded-state notice reproduces the silent '
+            'degradation it exists to prevent (INV-2/INV-4, the 2658 '
+            'parse_failures precedent).'
+        )
 
     # (e) payload age is visible.
     assert re.search(r'\bpayload\.generated_at\b', code), (
@@ -2368,8 +3188,7 @@ def test_tabs_jsx_memory_tab_renders_evals_section(
     )
 
     # (c) rendered inside MemoryTab and nowhere else; NOT a DF_TABS entry.
-    memory_tab_body = _extract_function_body(body, 'MemoryTab')
-    assert memory_tab_body, 'could not extract the MemoryTab body.'
+    memory_tab_body = extract_function_body(body, 'MemoryTab')
     assert '<MemoryEvalsSection' in memory_tab_body, (
         'MemoryTab must render <MemoryEvalsSection ... /> (PRD DD3: the eval '
         'view lives with the memory panels).'
@@ -2406,7 +3225,7 @@ def test_escalation_link_navigation_is_wired(
     app_jsx_body: str,
     tabs_jsx_body: str,
     tab_escalations_jsx_body: str,
-    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """The link from step-10 must navigate for real.
 
@@ -2515,7 +3334,16 @@ def test_escalation_link_navigation_is_wired(
         'visit to the tab.'
     )
 
-    # (f) the producer end of the contract, re-asserted here.
-    assert re.search(r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)", tab_memory_evals_jsx_body), (
+    # (f) the producer end of the contract, re-asserted here — over
+    #     COMMENT-STRIPPED source, and through `_PRESENCE_CONTRACTS` so the
+    #     mutation guard covers it.  The id this call passes is what
+    #     tab_escalations.jsx resolves with `row.id === id`, which is the
+    #     contract `test_memory_evals_escalation_id_contract.py` checks on the
+    #     payload side; a sentence in the .jsx prose naming the call must not be
+    #     able to stand in for the call.
+    code = tab_memory_evals_jsx_code
+    assert re.search(
+        _presence_pattern('escalation link navigates by id', code), code, re.MULTILINE
+    ), (
         "tab_memory_evals.jsx's link must call onNavigate('esc', escalation.id)."
     )

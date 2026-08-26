@@ -55,11 +55,9 @@ code path rather than a habit each module keeps locally.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -72,6 +70,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from shared import safe_io
 
 __all__ = [
     'RUN_STAMP_ENV_VAR',
@@ -94,6 +94,7 @@ __all__ = [
     'run_stamp',
     'serialize_metric_series',
     'validate_metric_series',
+    'validate_stamp',
     'write_metric_series',
 ]
 
@@ -153,8 +154,16 @@ class MetricSchemaError(ValueError):
     """
 
 
-def _validate_stamp(stamp: str, *, what: str) -> str:
+def validate_stamp(stamp: str, *, what: str) -> str:
     """Return *stamp* if it matches :data:`_STAMP_PATTERN`, else raise.
+
+    Public: this is the one shape check for a run stamp, and the one thing
+    this module documents as mandatory for a caller-supplied override — a
+    caller sidesteps the validated ``run_stamp``/``write_metric_series(stamp=)``
+    field precisely by supplying its own stamp, and this is the check it must
+    run instead. Exported (rather than left underscore-private) so a
+    cross-package caller that needs the check without either entry point's
+    side effects imports the real thing instead of re-deriving the regex.
 
     Raises :class:`MetricSchemaError` — the module's one error type — so a
     malformed stamp reads the same to a caller wherever it entered from, and so
@@ -344,7 +353,7 @@ class MetricSeries(BaseModel):
         # write call makes it a property of the schema, so an artifact that
         # sorts into the wrong place cannot be constructed, written OR read
         # back — one rule instead of a guard per entry point.
-        return _validate_stamp(value, what='run_stamp')
+        return validate_stamp(value, what='run_stamp')
 
     @model_validator(mode='after')
     def _check_unique_metric_ids(self) -> MetricSeries:
@@ -447,7 +456,7 @@ def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
     """
     override = os.environ.get(env_var)
     if override:
-        return _validate_stamp(override, what=f'${env_var}')
+        return validate_stamp(override, what=f'${env_var}')
     return datetime.now(UTC).strftime(_STAMP_FORMAT)
 
 
@@ -458,14 +467,14 @@ def eval_dir(root: str | Path, eval_id: str) -> Path:
     "has this eval ever run") does not have to route through
     :func:`metrics_artifact_path` with a throwaway stamp just to reach
     ``.parent`` — which used to be the one caller these path helpers left
-    stamp-unvalidated for (see :func:`_validate_stamp`).
+    stamp-unvalidated for (see :func:`validate_stamp`).
     """
     return Path(root) / eval_id
 
 
 def metrics_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     """``<root>/<eval_id>/metrics-<STAMP>.json`` (M1 §3)."""
-    _validate_stamp(stamp, what='metrics_artifact_path stamp')
+    validate_stamp(stamp, what='metrics_artifact_path stamp')
     return eval_dir(root, eval_id) / f'metrics-{stamp}.json'
 
 
@@ -476,7 +485,7 @@ def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     evaluator and dashboard read, this is what an operator reads when an
     escalation points them at a run.
     """
-    _validate_stamp(stamp, what='report_artifact_path stamp')
+    validate_stamp(stamp, what='report_artifact_path stamp')
     return eval_dir(root, eval_id) / f'report-{stamp}.txt'
 
 
@@ -541,28 +550,22 @@ def render_report(series: MetricSeries) -> str:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace.
 
-    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
-    imported (it is module-private there, and ``shared.safe_io`` has only a
-    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
-    temp file comes from :func:`tempfile.mkstemp` — an OS-guaranteed fresh,
-    exclusively-created name — rather than a pid-derived one, because the
-    memory-eval runners (PRD leaves β/γ/δ) all write under a single artifact
-    root and a shared ``<name>.<pid>.tmp`` would let concurrent writers clobber
-    each other's in-flight write.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+    consolidated the four copies of this writer that used to exist). The
+    arguments preserve exactly what the previously-inlined body produced:
+    ``mode=0o600`` matches the :func:`tempfile.mkstemp` create, utf-8 was
+    already the encoding, and this site neither fsynced nor created its parent.
+
+    The unique-per-writer temp name the shared helper guarantees is what this
+    site always needed: the memory-eval runners (PRD leaves β/γ/δ) all write
+    under a single artifact root, and a shared ``<name>.<pid>.tmp`` would let
+    concurrent writers clobber each other's in-flight write.
 
     A reader never observes a half-written file: either the old contents (if
     any) or the complete new contents. On any failure the temp is unlinked and
     the exception re-raised, so a failed write leaves nothing behind.
     """
-    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
 
 
 def write_metric_series(
@@ -589,7 +592,7 @@ def write_metric_series(
     if stamp is None:
         effective_stamp = model.run_stamp  # already shape-checked by the schema
     else:
-        effective_stamp = _validate_stamp(stamp, what='stamp override')
+        effective_stamp = validate_stamp(stamp, what='stamp override')
     metrics_path = metrics_artifact_path(root, model.eval_id, effective_stamp)
     report_path = report_artifact_path(root, model.eval_id, effective_stamp)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -657,7 +660,7 @@ def load_series_window(
     # first run of a new eval would swallow the bad argument and only the
     # second would report it.
     if before_stamp is not None:
-        _validate_stamp(before_stamp, what='before_stamp')
+        validate_stamp(before_stamp, what='before_stamp')
     directory = eval_dir(root, eval_id)
     if not directory.is_dir():
         return []

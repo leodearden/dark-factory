@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -51,6 +52,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    loads the reviewed manifest (task 4293). That probe touches the real
+    filesystem, so without this fixture every ``--apply`` test in this file
+    would pass or fail according to whether the machine running pytest happens
+    to be able to write mem0's history directory -- and it genuinely cannot
+    inside an agent sandbox, which is the whole reason the guard exists. This
+    suite is deliberately MOCK-unit (MagicMock graphs, AsyncMock service, no
+    live FalkorDB), so the environment must not be an input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -1647,6 +1671,97 @@ class TestRunApplyCoMovingPreserved:
 
 
 # ===========================================================================
+# Tests: run() apply surfaces the MERGE fold's dropped-MENTIONS census
+# (task 4183)
+# ===========================================================================
+
+class TestRunApplyMergeMentionsDroppedCensus:
+    """Proves Phase B's dropped-MENTIONS census (merge_mentions_dropped +
+    merge_mentions_dropped_uuids -- the incoming MENTIONS links onto a MERGE
+    spec's wrong copy that Phase C's DETACH DELETE destroys) reaches the
+    report verbatim, and follows embedding_omitted's informational,
+    NOT-folded-into-exit_code precedent rather than
+    dropped_cross_target_edges/phase_b_blocked's gating one.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    async def _run_with_edge_result(self, tmp_path, monkeypatch, edge_result):
+        """Drive run() over one clean MOVE node with *edge_result* injected as
+        Phase B's return -- the same SubgraphEdgeResult-injection harness the
+        embedding_omitted / dropped_cross_target_edges tests use."""
+        move_node = _classified_node(
+            'u-M', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_node], {'reify': 1, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=edge_result),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        return await _mod.run(args, memory_service)
+
+    @pytest.mark.asyncio
+    async def test_merge_mentions_dropped_surfaced_in_report_and_does_not_gate_exit_code(
+        self, tmp_path, monkeypatch,
+    ):
+        """A Phase-B result carrying merge_mentions_dropped=2 with two
+        mentioning-episode uuids, everything else clean: both fields reach
+        the report VERBATIM (never truncated or re-ordered), and exit_code
+        stays 0. The census is deliberately NOT folded into exit_code, exactly
+        like embedding_omitted -- a MERGE whose wrong copy carries MENTIONS is
+        the EXPECTED case (a wrong-graph mentioning episode is EPISODIC_SKIP,
+        never actioned), so gating on it would make nearly every merge run
+        exit non-zero and train operators to ignore the signal.
+        """
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch,
+            SubgraphEdgeResult(
+                merge_mentions_dropped=2,
+                merge_mentions_dropped_uuids=['episode-1', 'episode-2'],
+            ),
+        )
+
+        assert report['merge_mentions_dropped'] == 2
+        assert report['merge_mentions_dropped_uuids'] == ['episode-1', 'episode-2']
+
+        # nothing else is dirty -- the census alone must not force a
+        # human-review exit.
+        assert report['post_verify']['matched'] is True
+        assert report['dropped_cross_target_edges'] == []
+        assert report['phase_b_blocked'] == []
+        assert report['exit_code'] == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_census_still_reports_both_keys(self, tmp_path, monkeypatch):
+        """A default (all-clean) Phase-B result still reports the keys as
+        0/[] -- they are always present, never conditionally omitted, so an
+        operator diffing two runs never has to distinguish "no dropped
+        MENTIONS" from "this build didn't count them"."""
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch, SubgraphEdgeResult(),
+        )
+
+        assert report['merge_mentions_dropped'] == 0
+        assert report['merge_mentions_dropped_uuids'] == []
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
 # Tests: run() apply surfaces cross-target-dropped edges
 # (task 2415, step-15/16)
 # ===========================================================================
@@ -2057,3 +2172,291 @@ class TestBuildMemoryService:
         memory_instance.initialize.assert_awaited_once_with()
         backend_cls.assert_not_called()
         assert result is memory_instance
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight (task 4293)
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    This script's apply path is a three-phase, create-before-delete graph
+    migration: Phase A creates the moved node in its home graph, Phase B
+    recreates its edges/mentions, Phase C ``DETACH DELETE``s the source copy.
+    Every one of those dispatches is wrapped in a per-node ``except Exception``
+    that records a blocked result and CONTINUES, and
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError`` -- so a probe
+    placed inside the apply loop would be swallowed into N blocked rows while
+    the remaining nodes carried on mutating. Worse, a run stopped part-way
+    through the three phases strands nodes BETWEEN graphs: a created home copy
+    with no edges, or a deleted source whose edges never landed. Only one probe
+    per run, ahead of the manifest load, bounds that.
+
+    Placement is pinned from both sides here: the guard must sit BELOW the two
+    legitimate non-mutating refusals (the dry-run census return, and the
+    ``--apply`` with no manifest refusal) so neither is gated on write
+    capability, and ABOVE ``load_reviewed_manifest`` so nothing is read for a
+    run that was never going to be allowed to mutate.
+    """
+
+    def _manifest_path(self, tmp_path) -> Path:
+        """A reviewed manifest that drives ALL FOUR mutation primitives.
+
+        One MOVE (Phase A create + Phase B recreate + Phase C delete), one
+        MERGE (Phase B + Phase C delete, no create), and one REKEY (the
+        immediate in-place ``SET`` applied outside the three-phase barrier).
+        Covering a single disposition would make the zero-mutation assertion
+        below vacuous -- REKEY in particular is applied by a different code
+        path from MOVE/MERGE and would be missed.
+        """
+        nodes = [
+            _classified_node(
+                'u-move', source_graph='reify', target_graph='dark_factory',
+                disposition=_mod.MOVE,
+            ),
+            _classified_node(
+                'u-merge', source_graph='reify', target_graph='know_live',
+                disposition=_mod.MERGE,
+            ),
+            _classified_node(
+                'u-rekey', source_graph='reify', target_graph='dark_factory',
+                disposition=_mod.REKEY,
+            ),
+        ]
+        manifest = _mod.build_manifest(nodes, {'reify': 3}, dry_run=True)
+        path = tmp_path / 'manifest.json'
+        path.write_text(json.dumps(manifest))
+        return path
+
+    def _scenario(self, monkeypatch):
+        """Patch every mutation primitive and build the service ``run`` drives.
+
+        The graph's ``ro_query`` is a callable side effect (not a page list) so
+        the post-verify re-census can issue as many reads as it likes -- this
+        fixture is about mutations, not paging.
+        """
+        mocks = {
+            'rekey': AsyncMock(return_value=None),
+            'create': AsyncMock(return_value=CreateResult(
+                uuid='u-move', source_graph='reify', target_graph='dark_factory',
+            )),
+            'recreate': AsyncMock(return_value=SubgraphEdgeResult()),
+            'delete': AsyncMock(return_value=None),
+        }
+        monkeypatch.setattr(_mod, 'rekey_node_in_place', mocks['rekey'])
+        monkeypatch.setattr(_mod, 'create_moved_node', mocks['create'])
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', mocks['recreate'])
+        monkeypatch.setattr(_mod, 'delete_source_node', mocks['delete'])
+
+        graph = _make_graph_mock(ro_side_effect=lambda *_a, **_kw: _result([]))
+        memory_service = _make_memory_service({'reify': graph})
+        return mocks, memory_service, graph
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has no handler at all here -- it hands ``_run_live`` straight
+        to ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
+        this ERROR record is the ONLY place the operator is told what was
+        refused and what to do instead. Pinned on the fail-closed marker and
+        the remedy noun ONLY, so every other word stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'migrate_cross_graph_leak'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, tmp_path, monkeypatch,
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The refusal must PROPAGATE, and EVERY primitive is asserted un-awaited
+        -- not one of them. Asserting a single phase would be vacuous precisely
+        because each node's dispatch is independently ``except Exception``-
+        wrapped: a swallowed refusal becomes blocked rows, not an abort, and
+        a half-applied three-phase move is the worst outcome available (a home
+        copy with no edges, or a deleted source whose edges never landed).
+        """
+        self._deny(monkeypatch)
+        mocks, memory_service, _ = self._scenario(monkeypatch)
+        manifest_path = self._manifest_path(tmp_path)
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        mocks['rekey'].assert_not_awaited()
+        mocks['create'].assert_not_awaited()
+        mocks['recreate'].assert_not_awaited()
+        mocks['delete'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_manifest_is_even_read(
+        self, tmp_path, monkeypatch,
+    ):
+        """It aborts without reading the reviewed manifest off disk, so a run
+        that was never going to be allowed to mutate pays for nothing -- and
+        no graph is resolved for the REKEY dispatch either."""
+        self._deny(monkeypatch)
+        _, memory_service, _ = self._scenario(monkeypatch)
+        manifest_path = self._manifest_path(tmp_path)
+
+        load_mock = MagicMock(side_effect=AssertionError('manifest was loaded'))
+        monkeypatch.setattr(_mod, 'load_reviewed_manifest', load_mock)
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        load_mock.assert_not_called()
+        memory_service.graphiti._graph_for.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A census/classify PREVIEW mutates nothing, so it must not require
+        the ability to mutate -- the manifest stays obtainable from anywhere,
+        with the deny still installed. It is not probed at all: the guard sits
+        below the dry-run return, so a denied environment can still produce the
+        manifest a later reviewed ``--apply`` consumes."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch)
+
+        manifest = await _mod.run(_args(apply=False), memory_service)
+
+        assert manifest['dry_run'] is True
+        assert manifest['exit_code'] == 0
+        assert calls == [], 'a dry run mutates nothing, so it must not probe'
+        mocks['create'].assert_not_awaited()
+        mocks['delete'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_without_a_manifest_is_never_gated_either(self, monkeypatch):
+        """``--apply`` with no ``--manifest`` refuses through the NORMAL return
+        path (``exit_code`` 1, zero mutations, no census recompute) on grounds
+        that have nothing to do with write capability.
+
+        Pinned because it fixes the guard's placement from the other side: a
+        probe hoisted to the top of ``run`` would gate this refusal too, so an
+        operator who forgot ``--manifest`` inside a sandbox would be told the
+        store is unwritable instead of being told what they actually got wrong.
+        """
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch)
+
+        report = await _mod.run(_args(apply=True, manifest=None), memory_service)
+
+        assert report['exit_code'] == 1
+        assert 'requires an existing, human-reviewed manifest file' in report['error']
+        assert calls == [], 'a refusal that mutates nothing must not probe'
+        mocks['create'].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, tmp_path, monkeypatch,
+    ):
+        """Happy path: a writable environment migrates exactly as before,
+        driving all three dispositions through their phases."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        mocks, memory_service, _ = self._scenario(monkeypatch)
+        manifest_path = self._manifest_path(tmp_path)
+
+        report = await _mod.run(
+            _args(apply=True, manifest=str(manifest_path)), memory_service,
+        )
+
+        assert report['dry_run'] is False
+        assert {r['uuid'] for r in report['apply_results'] if r['applied']} == {
+            'u-move', 'u-merge', 'u-rekey',
+        }
+        mocks['rekey'].assert_awaited_once()
+        mocks['create'].assert_awaited_once()
+        mocks['recreate'].assert_awaited_once()
+        assert mocks['delete'].await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(
+        self, tmp_path, monkeypatch,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and for a manifest that
+        drives three nodes across three phases it is still probed exactly
+        once."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        mocks, memory_service, _ = self._scenario(monkeypatch)
+        manifest_path = self._manifest_path(tmp_path)
+
+        await _mod.run(
+            _args(apply=True, manifest=str(manifest_path)), memory_service,
+        )
+
+        # Non-vacuity: the manifest really did reach more than one phase.
+        mocks['create'].assert_awaited_once()
+        assert mocks['delete'].await_count == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per manifest node'
+        assert 'migrate_cross_graph_leak' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, tmp_path, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: this script's ``main`` has no blanket handler,
+        so without this record the operator sees a bare traceback naming an
+        exception class and no remedy.
+        """
+        self._deny(monkeypatch)
+        _, memory_service, _ = self._scenario(monkeypatch)
+        manifest_path = self._manifest_path(tmp_path)
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await _mod.run(
+                _args(apply=True, manifest=str(manifest_path)), memory_service,
+            )
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )

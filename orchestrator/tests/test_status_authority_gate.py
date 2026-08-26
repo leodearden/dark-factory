@@ -407,7 +407,12 @@ class TestB2StrandedInProgressRevert:
         l2-cascade path (-> _cascade_unblock_member) is a DEBUG-skipped
         no-op — _cascade_unblock_member is blocked-only and DELIBERATELY
         carves out in-progress (test_cascade_unblock.py:143,
-        test_criterion_4_in_progress_task_not_flipped)."""
+        test_criterion_4_in_progress_task_not_flipped).
+
+        Unaffected by task 3538, and deliberately distinct from it: this row's
+        status is 'in-progress' (is_infra_held False), so it never reaches the
+        infra pre-gate whose target that task changed. The carve-out asserted
+        here is a NO-WRITE, not a write of any particular status."""
         task_id = 'zeta-b2-not-cascade'
         esc = _make_esc(
             task_id=task_id,
@@ -429,24 +434,31 @@ class TestB2StrandedInProgressRevert:
 
 
 # ---------------------------------------------------------------------------
-# B6 — infra-hold first-class: resolved infra_issue escalation on an
-# infra-held task resumes-at-verify (in-progress), NEVER 'pending'; the
-# reconcile stranded sweep skips an infra-held row; a non-infra blocked task
-# still flips to pending (contrast).
+# B6 — infra-hold first-class: a resolved infra_issue escalation on an
+# infra-held task resumes through the dedicated is_infra_held branch (never
+# dropped by the blocked-only gate); the reconcile stranded sweep skips an
+# infra-held row; a non-infra blocked task still flips to pending (contrast).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestB6InfraHoldFirstClass:
     """B6: infra-hold is a first-class status (task 2200/omega4). A resolved
-    infra_issue escalation on an infra-held task resumes-at-verify
-    (in-progress) via _cascade_unblock_member's A1 guard (harness.py:9402-
-    9439), never re-pends to 'pending'; the reconcile stranded sweep skips
-    an infra-held row entirely (is_infra_held guard); a non-infra blocked
-    task still flips to pending. Mirrors
-    test_harness_infra_hold_repend.py:224-424."""
+    infra_issue escalation on an infra-held task resumes via
+    _cascade_unblock_member's A1 pre-gate rather than being skipped by the
+    blocked-only gate (an infra-held row is never 'blocked'); the reconcile
+    stranded sweep skips an infra-held row entirely (is_infra_held guard); a
+    non-infra blocked task still flips to pending. Mirrors
+    test_harness_infra_hold_repend.py's TestInfraHoldEscalationResolution.
 
-    async def test_infra_hold_resolved_escalation_resumes_at_verify(
+    HOLD side vs RESUME side (task 3538 / PRD γ3): the sweep-skip below is the
+    HOLD side and is unchanged. The RESUME side's target moved from
+    'in-progress' to 'pending' — a claimant-less 'in-progress' is the stranded
+    shape and is undispatchable, while resume-at-verify is branch-keyed
+    (_has_prior_implementation) and survives the change. See
+    test_harness_infra_resume_truthful.py."""
+
+    async def test_infra_hold_resolved_escalation_repends_for_dispatch(
         self, harness: Harness,
     ) -> None:
         tid = 'zeta-b6-infra'
@@ -463,14 +475,14 @@ class TestB6InfraHoldFirstClass:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'in-progress')  # type: ignore[attr-defined]
-        pending_calls = [
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+        inprog_calls = [
             c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-            if c.args[1] == 'pending'
+            if c.args[1] == 'in-progress'
         ]
-        assert not pending_calls, (
-            f"set_task_status('pending') was called despite status='infra-hold'. "
-            f'Calls: {pending_calls}'
+        assert not inprog_calls, (
+            f"set_task_status('in-progress') was called for status='infra-hold' — "
+            f'that is the claimant-less strand shape. Calls: {inprog_calls}'
         )
 
     async def test_reconcile_sweep_skips_infra_held_row(self, harness: Harness) -> None:

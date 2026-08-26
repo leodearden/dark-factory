@@ -34,10 +34,12 @@ the invoke-driver's ``TaskArtifacts(cwd)`` uses the legacy ``.task`` root that
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import shutil
+import uuid
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +47,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from shared.cli_invoke import transcript_exists
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
@@ -451,6 +454,50 @@ _InvokeCapture = namedtuple(
 )
 
 
+# The ``projects/<encoded-cwd>/`` component the CLI writes its session JSONL
+# under.  Its VALUE is deliberately arbitrary here: CLI 2.1.236 was measured
+# (task 3578 hard gate) to scan every ``projects/*/`` subdir by session id and
+# to ignore both this directory's name and the ``cwd`` recorded inside the
+# records, which is exactly why the restore mirrors the archive's own encoded
+# component verbatim instead of re-deriving one for the new lane.
+_RESUME_ENC = '-home-leo-src-dark-factory--worktrees-lane-a'
+_TRANSCRIPT_BYTES = b'{"type":"user","message":{"role":"user","content":"p"}}\n'
+
+
+def _seed_live_transcript(
+    config_dir: Path, sid: str, data: bytes = _TRANSCRIPT_BYTES,
+) -> Path:
+    """Lay a transcript where ``transcript_exists`` (and the CLI) finds it:
+    ``<config_dir>/projects/<ENC>/<sid>.jsonl``.
+
+    Shape copied from test_transcript_archival_boundary_gate.py:_write_transcript
+    so the two suites cannot drift on the layout the producer writes.
+    """
+    p = Path(config_dir) / 'projects' / _RESUME_ENC / f'{sid}.jsonl'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def _seed_archived_transcript(
+    repo: Path, task_id: str, sid: str, data: bytes = _TRANSCRIPT_BYTES,
+) -> Path:
+    """Lay a DURABLE archive entry where ``durable_archive_path`` finds it:
+    ``<project_root>/data/orchestrator/agent-transcripts/<task_id>/<ENC>/<sid>.jsonl``.
+
+    ``_config(repo)`` sets ``project_root=repo``, so the archive root the
+    dispatch path composes (``project_root / transcript_archive.root``) lands
+    under the repo tmpdir — OUTSIDE the worktree, exactly as in production.
+    """
+    p = (
+        Path(repo) / 'data' / 'orchestrator' / 'agent-transcripts'
+        / str(task_id) / _RESUME_ENC / f'{sid}.jsonl'
+    )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
 async def _init_resume_repo(repo: Path) -> None:
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -517,15 +564,34 @@ async def _make_resumed_workflow(
 
 async def _drive_resumed_invoke(
     tmp_path: Path, recovered_session, role, caplog, *, task_id: str = '42',
+    seed_transcript: bool = False,
+    seed_archive: bool = False,
+    config_overrides: dict | None = None,
+    event_store=None,
+    slug: str = '',
+    result_kwargs: dict | None = None,
+    drop_config_dir: bool = False,
 ) -> _InvokeCapture:
     """Feed *recovered_session* as ``resume_session_id`` into a REAL
     ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
     ``invoke_with_cap_retry`` patched. Snapshots the sidecar MID-invocation
     (the finally clears it on completion) and captures the iwcr kwargs.
+
+    ``seed_transcript`` lays the recovered session's JSONL into the workflow's
+    OWN ``_config_dir`` before the drive — the state a same-lane resume starts
+    from, and the premise every pre-3578 caller left implicit.
+    ``seed_archive`` instead lays it only into the durable archive under
+    ``project_root``, the pooled-warm-lane state this task exists to rehydrate.
+    ``result_kwargs`` overrides fields on the ``AgentResult`` the patched
+    ``invoke_with_cap_retry`` returns — used to hand back the
+    ``resume_fallbacks`` count the CLI-stage instrumentation reads.
+    ``drop_config_dir`` clears ``workflow._config_dir`` after construction,
+    driving the arm site's third scoping arm: with no concrete directory there
+    is nowhere correct to glob, so the corroboration must NOT veto.
     """
     caplog.set_level(logging.INFO)
     sid = (recovered_session or {}).get('session_id', 'x')
-    repo = tmp_path / f'resume-repo-{sid}'
+    repo = tmp_path / f'resume-repo-{slug or sid}'
     repo.mkdir()
     await _init_resume_repo(repo)
     git_ops = GitOps(
@@ -536,17 +602,25 @@ async def _drive_resumed_invoke(
         repo,
     )
     with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):
-        config = _config(repo)
+        config = _config(repo, **(config_overrides or {}))
     assignment = _resume_assignment(task_id)
     workflow, cwd = await _make_resumed_workflow(
         config, git_ops, assignment, recovered_session,
     )
+    workflow.event_store = event_store
+    if seed_transcript:
+        assert workflow._config_dir is not None
+        _seed_live_transcript(workflow._config_dir.path, sid)
+    if seed_archive:
+        _seed_archived_transcript(repo, task_id, sid)
+    if drop_config_dir:
+        workflow._config_dir = None
     snapshot: dict = {}
 
     def _side_effect(**kwargs):
         assert workflow.artifacts is not None
         snapshot['sidecar'] = workflow.artifacts.read_agent_session()
-        return AgentResult(success=True, output='')
+        return AgentResult(success=True, output='', **(result_kwargs or {}))
 
     with patch(
         'orchestrator.workflow.invoke_with_cap_retry',
@@ -582,10 +656,593 @@ async def test_b1_resumed_invocation_journals_prior_session(
     await harness._recover_crashed_tasks()
     recovered = harness._recovered_sessions[task_id]
 
-    cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
+    # seed_transcript makes this row's previously-IMPLICIT premise explicit
+    # (task 3578): the session id reaches invoke_with_cap_retry only once the
+    # arm site corroborates the transcript against the config dir it exports.
+    # The B1v rows below own the provably-absent case.
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_transcript=True,
+    )
 
     assert cap.kwargs['resume_session_id'] == session_id
     assert f'resuming prior session {session_id}' in caplog.text
+
+
+# ── B1v: the arm-site VETO — corroborate against the config dir we will USE ──
+@pytest.mark.asyncio
+async def test_b1v_invoke_vetoes_resume_when_transcript_provably_absent(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The core defect (task 3578): ``_invoke`` armed ``--resume`` from the
+    recovered sidecar with ZERO corroboration against ``self._config_dir`` —
+    the directory it is about to export as ``CLAUDE_CONFIG_DIR``.
+
+    The harness guard corroborated a BOOT-TIME snapshot path; under a pooled
+    warm lane ``self._config_dir`` is constructed fresh from whatever lane was
+    acquired AFTERWARDS, so the two can disagree.  When they do, the CLI exits
+    ``No conversation found with session ID`` having emitted no runs.db event at
+    all — the measured, invisible failure population.
+
+    Here the config dir is real but EMPTY and no archive exists, so the resume
+    is provably unreachable: ``_invoke`` must fall through to a FRESH session
+    rather than arm a doomed one.  The pending fields must also be consumed, so
+    a permanently-unreachable sid cannot be re-attempted every iteration.
+    """
+    task_id, session_id = '78', 'uuid-b1v-veto'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
+
+    # Armed nothing, and allocated a genuinely fresh id — not the doomed one.
+    assert cap.kwargs['resume_session_id'] is None
+    fresh = cap.kwargs['session_id']
+    assert fresh != session_id
+    uuid.UUID(fresh)  # a real uuid4, not a recycled or empty string
+    # Consumed-on-first-use: a sid we just proved unreachable must not be
+    # retried on the next invocation of this role.
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    # Loud, and greppable by BOTH coordinates of the disagreement.
+    assert session_id in caplog.text
+    assert str(cap.workflow._config_dir.path) in caplog.text
+    assert any(
+        r.levelname == 'WARNING' and session_id in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_b1v_invoke_arms_resume_when_transcript_present_in_config_dir(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The veto's mirror image: it is scoped to PROVABLE ABSENCE, not blanket.
+
+    Same recovered session, same real config dir — but the transcript is
+    actually sitting in it, so the corroboration succeeds and ``--resume`` is
+    armed exactly as before.  Scoping copied verbatim from the precedent at
+    ``cli_invoke.py`` ("we have a directory and the transcript is provably not
+    in it"), whose own comment says it mirrors the orchestrator's guard.
+    """
+    task_id, session_id = '79', 'uuid-b1v-present'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_transcript=True,
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert cap.kwargs['session_id'] == session_id
+    assert f'resuming prior session {session_id}' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_b1v_no_config_dir_arms_the_resume_unchanged(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The veto's THIRD arm, and the one a future tightening would silently
+    break: ``self._config_dir is None`` → corroborated, arm as before.
+
+    The scoping is deliberate and copied from ``cli_invoke.py``'s precedent —
+    without a concrete directory there is no correct place to glob (the process
+    default ``~/.claude`` would be wrong for any caller under an isolated
+    ``CLAUDE_CONFIG_DIR``), so the veto is scoped to "we HAVE a directory and
+    the transcript is provably not in it".  Rewriting the check as
+    ``self._config_dir is not None and transcript_exists(...)`` would veto every
+    config-dir-less dispatch — and every other row in this file would still
+    pass, because they all set one.  This row is the only thing standing there.
+    """
+    task_id, session_id = '88', 'uuid-b1v-no-config-dir'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        drop_config_dir=True, event_store=store,
+    )
+
+    assert cap.workflow._config_dir is None  # the premise actually held
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert cap.kwargs['session_id'] == session_id
+    assert f'resuming prior session {session_id}' in caplog.text
+    # Not a loss: nothing was vetoed, so nothing is counted.
+    assert store.of_type(EventType.session_resume_failed) == []
+
+
+# ── B1r: the RESTORE — rehydrate from the durable archive at the arm site ────
+@pytest.mark.asyncio
+async def test_b1r_invoke_rehydrates_transcript_from_durable_archive(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """This task's headline behaviour: under a pooled warm lane the config dir
+    the workflow is about to export has NEVER seen the recovered session's
+    JSONL — the dir that held it was destroyed at lane teardown — but the
+    durable archive under ``project_root`` still has it.
+
+    ``_invoke`` must rehydrate it BEFORE corroborating, so the veto is
+    satisfied by a genuinely restored transcript and the resume becomes real
+    instead of a silent fresh start.
+
+    Note ``_config`` sets ``transcript_archive={'enabled': False}``: the restore
+    deliberately does not consult that flag (archival switched off today still
+    leaves restorable archives from yesterday), so this row also pins that.
+    """
+    task_id, session_id = '80', 'uuid-b1r-restore'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_archive=True,
+    )
+
+    # (a) the veto did NOT fire — the restore satisfied it.
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert cap.kwargs['session_id'] == session_id
+    # (b) the transcript is PHYSICALLY there now, at the layout the CLI globs.
+    cfg = cap.workflow._config_dir.path
+    assert transcript_exists(cfg, session_id)
+    restored = list(cfg.glob(f'projects/*/{session_id}.jsonl'))
+    assert len(restored) == 1
+    assert restored[0].read_bytes() == _TRANSCRIPT_BYTES
+    # The archive's own encoded-cwd component is mirrored VERBATIM (measured:
+    # CLI 2.1.236 ignores this directory's name, so re-encoding it would buy a
+    # second implementation obliged to track a private encoding forever).
+    assert restored[0].parent.name == _RESUME_ENC
+    # (c) the win is greppable in the journal.
+    assert any(
+        r.levelname == 'INFO'
+        and 'archive' in r.getMessage()
+        and session_id in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_b1r_restore_from_archive_false_leaves_the_veto_to_fire(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The narrow kill switch: with ``session_resume.restore_from_archive`` off
+    and the SAME archive present, no rehydration happens and the step-12 veto
+    fires instead.
+
+    Distinct from ``enabled``, which kills the whole feature at the harness
+    guard: an operator can disable restoration alone without going blind on the
+    resume population — which is why the veto (and its WARNING) must still run.
+    """
+    task_id, session_id = '81', 'uuid-b1r-killswitch'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_archive=True,
+        event_store=store,
+        config_overrides={
+            'session_resume': SessionResumeConfig(restore_from_archive=False),
+        },
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    assert cap.kwargs['session_id'] != session_id
+    # Nothing was written into the config dir — a disabled restore leaves NO
+    # trace, exactly as a miss does.
+    assert not transcript_exists(cap.workflow._config_dir.path, session_id)
+    assert not (cap.workflow._config_dir.path / 'projects').exists()
+    # …and the veto still ran, so the population stays observable.
+    assert any(
+        r.levelname == 'WARNING' and session_id in r.getMessage()
+        for r in caplog.records
+    )
+    # The event says WHY nothing was restored: 'disabled', not the 'miss' an
+    # absent archive produces.  Collapsing the two would make an operator read
+    # a deliberately-pulled kill switch as an archive-coverage failure.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['restore'] == 'disabled'
+
+
+@pytest.mark.asyncio
+async def test_b1r_restore_fault_degrades_to_a_fresh_dispatch(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """A broken restore costs CONTEXT, never a DISPATCH — the entire reason the
+    ``try/except`` around the archive-root composition exists.
+
+    ``resolve_archive_root`` is deliberately not total: under a config
+    regression either operand can be a type ``Path.__truediv__`` refuses (a
+    ``None`` ``project_root``, a non-PathLike ``root`` from malformed YAML) and
+    it raises ``TypeError`` — here, on the production dispatch path.  Unguarded,
+    a mere config regression would escalate into a dispatch fault.  Injected
+    here as the exception itself, so the row pins the DEGRADATION (fresh
+    dispatch + WARNING + a countable event), not one particular bad config.
+    """
+    task_id, session_id = '89', 'uuid-b1r-fault'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    with patch(
+        'orchestrator.workflow.resolve_archive_root',
+        side_effect=TypeError("unsupported operand type(s) for /: 'NoneType' and 'str'"),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, event_store=store,
+        )
+
+    # (a) the dispatch still HAPPENED, fresh — _invoke did not raise.
+    assert cap.kwargs['resume_session_id'] is None
+    fresh = cap.kwargs['session_id']
+    assert fresh != session_id
+    uuid.UUID(fresh)
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    # (b) loud, and greppable by the structured event name.
+    assert any(
+        r.levelname == 'WARNING'
+        and getattr(r, 'event', '') == 'session_resume_restore_fault'
+        and session_id in r.getMessage()
+        for r in caplog.records
+    )
+    # (c) countable, and distinguishable from an archive MISS — the whole point
+    # of an outcome string: here the archive was seeded and present, so a bool
+    # would have reported the same False as a genuinely missing archive and
+    # sent the operator to check coverage that is in fact fine.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['stage'] == 'pre_flight'
+    assert failed[0]['data']['restore'] == 'fault'
+
+
+@pytest.mark.asyncio
+async def test_b1r_an_internal_restore_fault_is_a_fault_not_a_miss(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The MAJORITY of real restore faults must land in ``fault``, not ``miss``.
+
+    The row above injects the only fault the arm site could originally see: a
+    ``TypeError`` out of ``resolve_archive_root``.  Every OTHER real fault —
+    an unreadable archive, ENOSPC part-way, a corrupt gzip member, a config
+    dir whose parent is a regular file — happens INSIDE
+    ``restore_archived_transcript``, which is total by default and answers all
+    of them with the same ``None`` a plain miss returns.  The arm site's
+    ``else`` arm then stamps ``'miss'``, telling an operator to go work archive
+    COVERAGE while the restore path itself is the broken thing — the exact
+    misdiagnosis the outcome-string split exists to prevent, applied to almost
+    the whole fault population.
+
+    The fault is injected at ``shutil.copyfile`` — inside the helper, past
+    every early-return — so this row pins the classification of a fault the
+    caller cannot see unaided, rather than re-pinning the one it already could.
+    """
+    task_id, session_id = '90', 'uuid-b1r-internal-fault'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    with patch(
+        'shared.transcript_archive.shutil.copyfile',
+        side_effect=OSError(errno.ENOSPC, 'No space left on device'),
+    ):
+        cap = await _drive_resumed_invoke(
+            tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+            seed_archive=True, event_store=store,
+        )
+
+    # (a) still a FRESH dispatch: a broken restore costs context, never a
+    # dispatch, and the doomed session id is consumed so it cannot be retried
+    # forever.
+    assert cap.kwargs['resume_session_id'] is None
+    fresh = cap.kwargs['session_id']
+    assert fresh != session_id
+    uuid.UUID(fresh)
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    # (b) classified as what it IS.  The archive was seeded and present, so
+    # 'miss' here would be a lie about coverage, not merely a coarse label.
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['stage'] == 'pre_flight'
+    assert failed[0]['data']['restore'] == 'fault'
+    # (c) and greppable at the dispatch layer, same as the composition fault.
+    assert any(
+        r.levelname == 'WARNING'
+        and getattr(r, 'event', '') == 'session_resume_restore_fault'
+        and session_id in r.getMessage()
+        for r in caplog.records
+    )
+
+
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing ``(event_type, kwargs)`` emits.
+
+    A real ``EventStore`` would be a SQLite round-trip per row for no added
+    proof; ``emit`` is the whole surface ``_invoke`` uses.
+    """
+
+    def __init__(self) -> None:
+        self.emits: list[tuple] = []
+
+    def emit(self, event_type, **kwargs) -> None:
+        self.emits.append((event_type, kwargs))
+
+    def of_type(self, event_type) -> list[dict]:
+        return [kw for et, kw in self.emits if et is event_type]
+
+
+# The three PER-DISPATCH session-resume types emitted by the _run_slot guard.
+# The ratio recipe documented on EventType divides by their sum, so this path
+# must never add a fourth term to that denominator.
+_PER_DISPATCH_RESUME_EVENTS = (
+    EventType.session_resume,
+    EventType.session_resume_fallback,
+    EventType.session_resume_capped,
+)
+
+
+# ── B1e: the pre-flight instrumentation event ───────────────────────────────
+@pytest.mark.asyncio
+async def test_b1e_veto_emits_session_resume_failed_pre_flight(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The second half of this task's user-observable signal: the veto is now
+    measurable in runs.db, not merely journalled.
+
+    Before this, a resume armed against a transcript the CLI could not find
+    produced NO runs.db row anywhere — the invisible population the task
+    measured at 28 occurrences.  ``data.stage`` splits the two populations:
+    ``pre_flight`` here (we vetoed before invoking), ``cli`` when the CLI itself
+    rejected a resume we did arm.
+    """
+    task_id, session_id = '82', 'uuid-b1e-preflight'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, event_store=store,
+    )
+
+    assert cap.kwargs['resume_session_id'] is None
+    uuid.UUID(cap.kwargs['session_id'])
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data'] == {
+        'stage': 'pre_flight',
+        'session_id': session_id,
+        'role': IMPLEMENTER.name,
+        # An OUTCOME, not a bool: this row has restoration ENABLED and no
+        # archive entry, which is the archive-coverage case operators are told
+        # to read as "archives are missing" — distinguishable only because
+        # 'miss' is not the same value as 'disabled' or 'fault'.
+        'restore': 'miss',
+    }
+    # The per-dispatch denominator is untouched by this per-INVOCATION path.
+    for et in _PER_DISPATCH_RESUME_EVENTS:
+        assert store.of_type(et) == []
+
+
+@pytest.mark.asyncio
+async def test_b1e_no_pre_flight_event_when_the_resume_succeeds(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """Both success paths — transcript already live, and transcript restored
+    from the durable archive — are silent.
+
+    A failure event that also fires on success is not an instrument; the
+    ``pre_flight`` population must count exactly the resumes that were lost.
+    """
+    harness.config.session_resume = SessionResumeConfig()
+
+    for idx, (task_id, session_id, mode) in enumerate((
+        ('83', 'uuid-b1e-live', 'live'),
+        ('84', 'uuid-b1e-restored', 'restored'),
+    )):
+        _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+        await harness._recover_crashed_tasks()
+        recovered = harness._recovered_sessions[task_id]
+        store = _RecordingEventStore()
+
+        cap = await _drive_resumed_invoke(
+            tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+            event_store=store, slug=f'b1e-{idx}',
+            seed_transcript=mode == 'live', seed_archive=mode == 'restored',
+        )
+
+        assert cap.kwargs['resume_session_id'] == session_id, mode
+        assert store.of_type(EventType.session_resume_failed) == [], mode
+        for et in _PER_DISPATCH_RESUME_EVENTS:
+            assert store.of_type(et) == [], mode
+
+
+# ── B1e: the CLI-stage instrumentation event ────────────────────────────────
+@pytest.mark.asyncio
+async def test_b1e_cli_stage_event_when_the_cli_rejected_an_armed_resume(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The OTHER uninstrumented population: the resume was armed, the CLI
+    rejected it, ``invoke_with_cap_retry`` silently retried fresh and returned
+    a SUCCESS.
+
+    Nothing anywhere records that loss today — the invocation looks perfect
+    from runs.db, because the fresh retry worked.  ``shared`` has no event
+    store, so the count rides out on ``AgentResult.resume_fallbacks`` and the
+    orchestrator turns it into the ``stage='cli'`` half of
+    ``session_resume_failed``.
+
+    Seeded LIVE, so the pre-flight veto provably did not fire: this row isolates
+    the CLI-stage emit rather than re-testing step-12.
+    """
+    task_id, session_id = '85', 'uuid-b1e-cli'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+        result_kwargs={
+            'resume_fallbacks': 1,
+            'resume_fallback_session_ids': (session_id,),
+        },
+    )
+
+    # The resume WAS armed — this is not the vetoed population.
+    assert cap.kwargs['resume_session_id'] == session_id
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data'] == {
+        'stage': 'cli',
+        'session_id': session_id,
+        'session_ids': [session_id],
+        'role': IMPLEMENTER.name,
+        'fallbacks': 1,
+    }
+    # Per-INVOCATION, so the per-dispatch ratio denominator is untouched.
+    for et in _PER_DISPATCH_RESUME_EVENTS:
+        assert store.of_type(et) == []
+
+
+@pytest.mark.asyncio
+async def test_b1e_cli_stage_event_reports_the_fallback_count(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """``data.fallbacks`` carries the count, not a bare boolean.
+
+    ``invoke_with_cap_retry`` can arm and lose a resume more than once inside a
+    single invocation (a caller resume fails, the fresh retry hits a cap that
+    carries a session id, that re-armed resume fails too).  Collapsing the
+    count to a flag would under-report the loss on exactly the pathological
+    invocations worth finding.
+    """
+    task_id, session_id = '86', 'uuid-b1e-cli-2'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+        result_kwargs={
+            'resume_fallbacks': 2,
+            # The realistic pair: the resume WE adopted, then the one
+            # invoke_with_cap_retry re-armed itself off the capped attempt.
+            'resume_fallback_session_ids': (session_id, 'sess-capped-rearm'),
+        },
+    )
+
+    failed = store.of_type(EventType.session_resume_failed)
+    assert len(failed) == 1
+    assert failed[0]['data']['stage'] == 'cli'
+    assert failed[0]['data']['fallbacks'] == 2
+    # Both lost sessions are NAMED, oldest first, and the scalar session_id is
+    # the resume this orchestrator adopted — not the pre-allocated id, which a
+    # fresh retry inside cli_invoke has already regenerated by then.
+    assert failed[0]['data']['session_ids'] == [session_id, 'sess-capped-rearm']
+    assert failed[0]['data']['session_id'] == session_id
+
+
+@pytest.mark.asyncio
+async def test_b1e_no_cli_stage_event_when_the_resume_held(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """``resume_fallbacks == 0`` emits nothing — the overwhelmingly common case.
+
+    A failure event that also fires on success is not an instrument.  This is
+    also the row that keeps the emit cheap for every ordinary invocation.
+    """
+    task_id, session_id = '87', 'uuid-b1e-cli-ok'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True, event_store=store,
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert store.of_type(EventType.session_resume_failed) == []
+
+
+@pytest.mark.asyncio
+async def test_b1e_no_cli_stage_event_when_we_never_adopted_a_resume(
+    tmp_path: Path, caplog,
+):
+    """The counter is NOT the predicate: a non-zero ``resume_fallbacks`` on a
+    dispatch this orchestrator never resumed emits nothing.
+
+    ``cli_invoke`` increments the counter for any resumed attempt that failed
+    non-cap and was retried fresh — including one its OWN cap-retry loop
+    re-armed (``invoke_kwargs['resume_session_id'] = result.session_id``, pinned
+    by ``shared/tests/test_cli_invoke.py::test_two_resume_fallbacks_counted``).
+    A plain FRESH dispatch that hits a cap therefore comes back with a
+    non-zero count while no resume was ever adopted here.  Counting those
+    inflates precisely the ratio OPERATIONS.md tells operators to read against
+    ``session_resume`` — "of the resumes we DECIDED to make, how many did not
+    survive?" — and can push it above 1, which is why the emit gates on our own
+    armed session id rather than on the counter.
+    """
+    store = _RecordingEventStore()
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, None, IMPLEMENTER, caplog, task_id='90', event_store=store,
+        slug='b1e-never-adopted',
+        result_kwargs={
+            'resume_fallbacks': 1,
+            'resume_fallback_session_ids': ('sess-capped-rearm',),
+        },
+    )
+
+    # Fresh dispatch: nothing was recovered, so nothing was armed.
+    assert cap.kwargs['resume_session_id'] is None
+    assert store.of_type(EventType.session_resume_failed) == []
 
 
 # ── B1: WIP commit preserved across recovery + architect skipped ─────────────
@@ -1084,8 +1741,13 @@ async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
     assert 'schema_version' not in adopted_v1  # …nor a version discriminator
 
     # ── PRODUCER (α): resume the v1 dict → next write is v2, id preserved ──
+    # seed_transcript makes this row's previously-IMPLICIT premise explicit: it
+    # asserts the v1→v2 REWRITE, which presupposes a resume was armed, which
+    # (since task 3578) presupposes the transcript is corroborated in the config
+    # dir _invoke is about to export.  The B1v rows own the absent case.
     cap = await _drive_resumed_invoke(
         tmp_path, adopted_v1, IMPLEMENTER, caplog, task_id=task_id,
+        seed_transcript=True,
     )
     # Resumed against the PRIOR id (not a fresh uuid).
     assert cap.kwargs['resume_session_id'] == session_id

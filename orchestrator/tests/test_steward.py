@@ -2778,6 +2778,22 @@ class TestIsEmptyOutput:
             'predicate must guard with is_timed_out_with_progress'
         )
 
+    def test_cli_input_rejected_subtype_returns_true(self):
+        """Task 3143: a pre-turn CLI rejection has the SAME zero-cost/zero-turn
+        shape and the same "no work was done" property, so it must keep the
+        steward's bounded, retry-budget-preserving path (capped by
+        steward_max_empty_outputs_per_escalation).  Widening the taxonomy must
+        not silently drop it out of that path into normal retry accounting.
+        """
+        result = _make_result(success=False, subtype='error_cli_input_rejected')
+        assert _is_empty_output(result) is True
+
+    def test_cli_input_rejected_progress_run_still_returns_false(self):
+        """The is_timed_out_with_progress carve-out applies to BOTH subtypes."""
+        result = _make_result(success=False, subtype='error_cli_input_rejected', timed_out=True)
+        result.transcript_turns = 5
+        assert _is_empty_output(result) is False
+
 
 # ---------------------------------------------------------------------------
 # Empty-output recovery

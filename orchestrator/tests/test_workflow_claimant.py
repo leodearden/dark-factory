@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,11 +24,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from escalation.pins import PinReport, classify_pins
 from shared.task_claimant import compose_claimant_run_id
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeInfo
+from orchestrator.task_ground_truth import ClaimantSource
 from orchestrator.workflow import TaskWorkflow
+
+
+@dataclasses.dataclass(frozen=True)
+class _FilingRec:
+    """A minimal ``escalation.pins.PinRecord`` double (task 3563).
+
+    Mirrors ``escalation/tests/test_pins.py``'s ``_Rec`` — keeps these tests
+    independent of ``Escalation``'s much wider constructor.
+    """
+
+    id: str
+    level: int
+    severity: str
+    filing_claimant_run_id: str | None
 
 
 def _make_workflow(
@@ -293,3 +310,165 @@ async def test_reap_leaked_claimant_heartbeats_noop_when_nothing_leaked():
     from _orch_helpers import reap_leaked_claimant_heartbeats
 
     assert await reap_leaked_claimant_heartbeats() == 0
+
+
+# ---------------------------------------------------------------------------
+# task 3563: the plan.lock identity matches the DB stamp for one incarnation
+# ---------------------------------------------------------------------------
+
+
+def _resolve_plan_lock_claimant(wf: TaskWorkflow):
+    """Resolve *wf*'s plan.lock through the REAL TaskGroundTruth resolver.
+
+    Uses the claimant-absent task shape, which is the ONLY shape that reaches
+    the plan.lock leg (a present db claimant wins outright).
+
+    NO FIXTURE BRIDGE — this is the production path end to end.
+    ``TaskWorkflow`` builds its artifacts with
+    ``meta_root=_meta_root_for_worktree(self.worktree)`` (workflow.py), so
+    plan.lock lives in the ``.task-meta`` SIBLING, and
+    ``_resolve_live_claimant`` derives that same root through
+    ``TaskArtifacts.meta_root_for`` on the read side (task 4028).  Writer and
+    reader meet at one path with nothing manufactured in between.
+
+    That is what gives these tests their reach.  Before 4028 the reader
+    constructed a bare ``TaskArtifacts(worktree_path)`` and looked under
+    ``<worktree>/.task``, so a ``.task`` -> ``.task-meta`` symlink had to be
+    forged HERE for the leg to see anything at all — and they proved only the
+    identity ALGEBRA, not that the composition branch was reachable on a real
+    orchestrator run.  It was not.  With the read repointed they now prove
+    both: that one incarnation's lock-derived and DB-stamped identities are
+    the same string, that the result discriminates in the real
+    ``classify_pins``, and that a real run can actually get there.  If the
+    repoint ever regresses, these go red rather than passing on a shim.
+    """
+    from orchestrator.task_ground_truth import TaskGroundTruth
+
+    assert wf.artifacts is not None and wf.worktree is not None
+    worktree = Path(wf.worktree)
+
+    scheduler = MagicMock()
+    # Not held in memory — signal 1 short-circuits to IN_MEMORY otherwise, and
+    # a bare MagicMock return is truthy.
+    scheduler.is_actively_held = MagicMock(return_value=False)
+    resolver = TaskGroundTruth(
+        MagicMock(), scheduler, None, lambda _tid: worktree,
+    )
+    return resolver._resolve_live_claimant(
+        '303',
+        {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None},
+        worktree,
+    )
+
+
+async def _acquire_plan_lock_via_workflow(wf: TaskWorkflow) -> None:
+    """Drive a real production plan-lock acquisition on *wf*.
+
+    Goes through ``_apply_revalidation_skip`` — the most self-contained of the
+    four ``lock_plan`` call sites — rather than calling ``lock_plan`` directly,
+    so the test proves the PRODUCTION wiring passes the run id, not merely that
+    ``lock_plan`` can accept one.
+    """
+    from orchestrator.workflow import WorkflowOutcome
+
+    assert wf.artifacts is not None
+    wf.artifacts.write_plan({'steps': [{'id': 'step-1', 'type': 'impl'}], 'files': []})
+    wf._reconcile_scope_locks = AsyncMock(return_value=True)
+    wf._stamp_optimistic_path = AsyncMock()
+
+    outcome = await wf._apply_revalidation_skip({'files': []}, 'b' * 40)
+
+    assert outcome is WorkflowOutcome.PLANNED, (
+        'precondition: the revalidation-skip path must have acquired the lock'
+    )
+    assert wf.artifacts.is_plan_locked()
+
+
+@pytest.mark.asyncio
+async def test_plan_lock_identity_is_byte_identical_to_the_db_stamp(tmp_path: Path):
+    """One incarnation's plan.lock and DB claimant identities are the SAME string.
+
+    This is the payoff of task 3563.  Before it, the plan.lock claimant source
+    yielded a BARE session_id while the DB source yielded a composed identity,
+    so the two could never be compared — ``escalation.pins`` had to reject the
+    plan.lock shape outright rather than risk converting a live filer's L0.
+    """
+    wf = _make_workflow(project_root=tmp_path, task_id='303', run_id='run-abc123')
+    await _setup(wf)
+    await wf._stop_claimant_heartbeat()
+
+    db_identity = wf.scheduler.set_task_status.call_args.kwargs['claimant_run_id']  # type: ignore[attr-defined]
+    await _acquire_plan_lock_via_workflow(wf)
+
+    claimant = _resolve_plan_lock_claimant(wf)
+
+    assert claimant is not None
+    assert claimant.source == ClaimantSource.PLAN_LOCK
+    # The single string equality that makes discrimination work at all.
+    assert claimant.run_id == db_identity
+    assert claimant.run_id == compose_claimant_run_id(
+        'run-abc123', wf.session_id, os.getpid(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_less_workflow_degrades_to_unknown_not_a_partial_identity(
+    tmp_path: Path,
+):
+    """No process run id => run_id is None (UNKNOWN), never '/{sess}/pid={pid}'.
+
+    A partially-composed identity would carry the ``/pid=`` marker, survive
+    ``escalation.pins._norm_id``'s shape guard, and then mismatch every
+    DB-composed filing identity — read downstream as "a DIFFERENT incarnation
+    is live".  The fail-safe unknown is the whole point of omitting the key.
+    """
+    wf = _make_workflow(project_root=tmp_path, task_id='303', run_id=None)
+    await _setup(wf)
+    await wf._stop_claimant_heartbeat()
+
+    await _acquire_plan_lock_via_workflow(wf)
+
+    claimant = _resolve_plan_lock_claimant(wf)
+
+    assert claimant is not None
+    assert claimant.run_id is None
+    assert claimant.session_id == wf.session_id
+
+
+@pytest.mark.asyncio
+async def test_resolved_plan_lock_identity_discriminates_live_from_dead_filers(
+    tmp_path: Path,
+):
+    """The resolved identity drives REAL classify_pins discrimination.
+
+    Previously unreachable from a plan.lock claimant: with a bare session id
+    (or None) the shape guard collapsed the comparison to "unknown", so BOTH
+    cases fell back to ``queue_handoff`` and a dead incarnation's L0 pinned the
+    task forever.
+    """
+    wf = _make_workflow(project_root=tmp_path, task_id='303', run_id='run-abc123')
+    await _setup(wf)
+    await wf._stop_claimant_heartbeat()
+    await _acquire_plan_lock_via_workflow(wf)
+
+    claimant = _resolve_plan_lock_claimant(wf)
+    assert claimant is not None
+    live_id = claimant.run_id
+    assert live_id is not None
+    # A DIFFERENT incarnation of the same session — differing pid only.
+    dead_id = compose_claimant_run_id('run-abc123', wf.session_id, os.getpid() + 1)
+    assert dead_id != live_id
+
+    def _classify(filing: str) -> PinReport:
+        return classify_pins(
+            '303',
+            [_FilingRec(id='esc-303-1', level=0, severity='blocking',
+                        filing_claimant_run_id=filing)],
+            live_claimant=True,
+            live_claimant_id=live_id,
+        )
+
+    # The live filer still pins — its handoff has a consumer.
+    assert _classify(live_id).queue_handoff == ('esc-303-1',)
+    # A dead incarnation's L0 does not — nobody is left to consume it.
+    assert _classify(dead_id).dead_l0 == ('esc-303-1',)

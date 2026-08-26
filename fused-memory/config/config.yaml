@@ -14,6 +14,26 @@ llm:
   model: "gpt-4o-mini"
   max_tokens: 4096
 
+  # Which graphiti LLM client to build (restart-tier — not hot-reloadable).
+  # Leave commented for stock OpenAI. Uncomment for an OpenAI-compatible LOCAL
+  # endpoint (llama.cpp / vLLM / LM Studio): those serve chat.completions but
+  # not the Responses API that the default 'openai' client requires. Point
+  # providers.openai.api_url below at the local endpoint as well.
+  # client_class: "openai_generic"
+  #
+  # Force response_format={'type': 'json_object'} instead of json_schema.
+  # Only applies when client_class is "openai_generic". Needed for the
+  # llama.cpp MoE arm, which silently ignores $ref/$defs in a json_schema
+  # response_format (llama.cpp#21228).
+  # structured_output_mode: "json_object"
+
+  # NOTE: api_url below is always passed explicitly to the LLM/embedder
+  # clients, so this config WINS over the ambient OPENAI_BASE_URL /
+  # OPENAI_API_BASE environment variables that the openai SDK and mem0 would
+  # otherwise fall back to. If you route OpenAI traffic through a gateway by
+  # exporting OPENAI_BASE_URL, set OPENAI_API_URL (or edit api_url) to the same
+  # value — otherwise traffic goes to whatever is written here. A disagreement
+  # is logged as a warning at client construction.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
@@ -26,8 +46,18 @@ llm:
 embedder:
   provider: "openai"
   model: "text-embedding-3-small"
+  # NOTE: changing this on an EXISTING deployment is not a live migration.
+  # It is now plumbed through to both the embedder (what width is requested
+  # from the API) and the Qdrant collection (what width the collection is
+  # created with), but mem0 skips creation for a collection that already
+  # exists — so an existing 1536-wide collection stays 1536-wide and every
+  # upsert then fails on a dimension mismatch. Recreate and re-embed the
+  # collection when changing this.
   dimensions: 1536
 
+  # api_url wins over OPENAI_BASE_URL / OPENAI_API_BASE here too — see the
+  # note in the llm block above. Set this to a different literal from the llm
+  # one to point the embedder at a separate endpoint.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
@@ -61,6 +91,48 @@ queue:
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
+  # Error-aware retry budget (task 1936, membership revised by task 3585).
+  # Errors whose class name matches any entry below — walked over the raised
+  # exception's __mro__, so subclasses match too — get transient_max_attempts
+  # instead of the plain max_attempts ceiling.
+  #
+  # The not-found family (NodeNotFoundError, EdgeNotFoundError,
+  # EdgesNotFoundError) is DELIBERATELY ABSENT: esc-3561-3 refuted the
+  # visibility-race premise it was added on. See
+  # DEFAULT_TRANSIENT_ERROR_NAMES in
+  # src/fused_memory/services/durable_queue.py for the evidence and for the
+  # clustered/read-routed-backend condition that would justify putting it back.
+  #
+  # RECORDED COST (task 3585). Spelling the list out here makes it a THIRD
+  # copy — schema.QueueConfig's default and durable_queue's frozenset are the
+  # other two — so a future membership change in code has to be made in three
+  # places, not two. That is accepted deliberately, for one reason: the policy
+  # is otherwise editable only by changing code, and an operator responding to
+  # an incident needs it visible and tunable in the DEPLOYED file. Retuning
+  # here is expected and supported; CI does not freeze this list to the code
+  # default. What it does enforce (test_config_schema.py::
+  # TestQueueConfigTransientErrorFields::
+  # test_deployed_config_transient_retry_policy) is the 3585 verdict plus the
+  # anti-drift floor: this list may ADD names, must contain every name in
+  # DEFAULT_TRANSIENT_ERROR_NAMES, and must not readmit the not-found family.
+  # Re-add one of those three only after re-deriving the argument from the
+  # durable_queue.py comment — the test will make you mean it.
+  #
+  # queue.* is NOT in reload.py's hot-reload allowlist, so mcp__fused-memory__
+  # reload_config reports a change here under restart_required rather than
+  # silently no-op'ing — the queue reads this config once, at construction.
+  # A change takes effect on restart.
+  #
+  # transient_error_names is spelled literally: _expand_env_vars substitutes
+  # per string and recurses INTO lists, so a whole-list ${VAR:default} would
+  # reach pydantic as one string and fail validation.
+  transient_max_attempts: ${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}
+  transient_error_names:
+    - TimeoutError
+    - ConnectionError
+    - ConnectionResetError
+    - ServerDisconnectedError
+    - OperationalError
 
 # ── Project isolation (task 1143) ────────────────────────────────────────────
 # The reconciliation harness hard-binds project_root per project_id via a
@@ -108,7 +180,28 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
-  conditional_trigger_ratio: 0.2
+  # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
+  # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
+  # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
+  #
+  # Cycle cost fits T(B) = F + c*B with F ~ 900s and c ~ 2.5 s/event — almost
+  # entirely FIXED (measured 2026-07-25 on reify: 50 events/945s steady state =
+  # 18.9 s/event; 393 events/954s backlog chunk = 2.43 s/event). At the old
+  # 50-event batch that 900s bought only 50 events: (900 + 2.5*50)/50 = 20.5
+  # s/event, matching the 18.9 observed. At 150 it buys three times as many:
+  # (900 + 2.5*150)/150 = 8.5 s/event — a 2.2x amortisation for a batching
+  # change alone, no work saved.
+  #
+  # Latency stays bounded: max_staleness_seconds above is a HARD trigger that
+  # fires independently of this ratio (event_buffer.py:359), so raising it
+  # delays the quiescent trigger, NOT the staleness backstop. An event's
+  # worst-case wait is unchanged.
+  #
+  # The fit is deliberately conservative and comes from two points on two
+  # different tiers — re-derive it from live data with
+  # `python -m fused_memory.reconciliation.throughput --db ... --project ...`
+  # rather than trusting it indefinitely.
+  conditional_trigger_ratio: 0.6
   burst_window_seconds: 30
   burst_cooldown_seconds: 150
   stale_lock_seconds: 7200
@@ -151,6 +244,28 @@ reconciliation:
   sonnet_model: "sonnet"
   opus_model: "opus"
   opus_threshold_ratio: 1.5
+  # Task 3049: consecutive full cycles for which the inline remediation pass is
+  # deferred while the project is in backlog mode (buffer >
+  # buffer_size_threshold * opus_threshold_ratio). Every backlog chunk is a full
+  # cycle and so drags in its own zero-event remediation pass — measured at ~44%
+  # of backlog-mode drain wall-clock on 2026-07-25 (reify), i.e. roughly half the
+  # drain duty cycle spent not draining. Deferral is lossless (Stage-3 findings
+  # are persisted before this point and forward-fed to the next cycle) and
+  # self-terminating (the gate re-reads the buffer, so remediation resumes once
+  # the backlog drains). The cap bounds the debt so a deep backlog cannot starve
+  # remediation; 0 disables deferral entirely.
+  #
+  # 1 is the schema ceiling (MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING), not a
+  # taste call: a deferred cycle writes ONE completed run instead of two, so a
+  # longer streak would let the integrity-finding persistence counter reach its
+  # recurrence threshold without a single remediation attempt having run — the
+  # first failed remediation would then escalate immediately. The gate reads
+  # D deferred parents + this cycle's parent + this cycle's own remediation run
+  # = D + 2, and that must stay below the recurrence threshold of 4, so D <= 1.
+  # Costs some of lever 1's ideal 1.78x (remediation runs once per two cycles
+  # rather than never during a backlog); correctness of the escalation
+  # semantics wins.
+  max_backlog_remediation_deferrals: 1
   sonnet_episode_limit: 125
   sonnet_memory_limit: 250
   opus_episode_limit: 500
@@ -237,8 +352,17 @@ summary_rebuild:
 #   # to notice and cheap to correct, a silent content rewrite is neither.
 #   # agent_id is self-reported, so this deters misuse by cooperating callers
 #   # rather than enforcing a security boundary.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-']
+#   #
+#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+#   # all-deployments default): it admits the interactive memory-consolidation
+#   # sitting defined by skills/curate-fused-memories, which cannot work
+#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+#   # stamps retained peers via metadata-only patches, so content_amend alone
+#   # would be the destructive half without the preserving half. Full
+#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
 #   # Content-amend burst alarm: escalates, never blocks (a hard block would
 #   # risk a legitimate large consolidation cycle failing mid-run over its own
 #   # success count). Metadata-only calls do not count toward it.
@@ -246,6 +370,25 @@ summary_rebuild:
 #   storm_window_seconds: 3600.0
 
 write_triage:
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
+  # keys in this block a human is meant to edit; everything below the fence is
+  # derived. Both are green-tier hot-reloadable, and
+  # scripts/calibrate_write_triage.py --write-config preserves them when it
+  # rewrites the calibrated keys below.
+  #
+  # enabled: the staged-rollout flag for add_memory write triage (PRD D10,
+  # spelled `write_triage_enabled` there). While false the existing near-dup
+  # and topic-cluster reject guards run unchanged and no triage code executes.
+  # Flipped by task 3169, after the judge (leaf gamma) lands — until then the
+  # middle band is answered by a deliberate stub. Also the lever that stops an
+  # in-flight triage incident.
+  enabled: false
+  # candidate_k: retrieval WIDTH, not a threshold — it caps what any band can
+  # achieve, since an unretrieved candidate cannot be scored at all. 20 is the
+  # measured 69.4% same-category recall point (26.1% @5, 43.9% @10, 69.4% @20,
+  # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
+  # not. Counted as a TOTAL across the three Mem0-primary categories.
+  candidate_k: 20
   # CALIBRATION OUTPUT — do not hand-edit.
   # Derived from measured similarity distributions by
   # scripts/calibrate_write_triage.py; both values are order statistics of
@@ -263,8 +406,11 @@ write_triage:
     procedural_knowledge: 0.839045608910388
   # EVIDENCE STATUS (hand-added prose, task 3357 — no numbers here; the
   # machine-readable record is the report's per_category section, which
-  # the calibration guard test binds. A later --write-config run rewrites
-  # this whole block and drops this note; the report survives it.)
+  # the calibration guard test binds. A later --write-config run replaces
+  # the four CALIBRATION keys above and PRESERVES the hand-set operator
+  # knobs at the top of this block -- this trailing note included (task
+  # 3127): a comment run with no key beneath it is re-emitted HERE, at the
+  # end of the block, which is what lets it survive repeated runs.)
   # - procedural_knowledge: has its own cutoff above, derived from that
   #   category's own 242 duplicate / 3328 negative labeled pairs.
   # - observations_and_summaries: NO cutoff. Refusal reason

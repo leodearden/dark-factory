@@ -8,47 +8,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 from dashboard.data.memory import get_curator_state
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP JSON-RPC response wrapping *inner_dict*."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ]
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP initialize response."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    """Build a 202 Accepted response for notifications."""
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
 
 
 class _SessionAwareHandler:
@@ -89,17 +56,17 @@ class _SessionAwareHandler:
         self.calls.append(body)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
 
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         if self.error_on_tool:
             raise self.error_on_tool
         if self.error_status:
             return httpx.Response(self.error_status, text='Server Error')
-        return _make_mcp_response(self.tool_response, request_id)
+        return mcp_tool_response(self.tool_response, request_id)
 
 
 class TestSessionAwareHandler:
@@ -251,10 +218,10 @@ class TestMcpToolCall:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -279,7 +246,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         # MockTransport normally attaches the request; set it here since we
         # bypass the transport and return the response from a mocked client.
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
@@ -301,7 +268,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
         mock_client = AsyncMock()
         mock_client.post.return_value = resp
@@ -315,6 +282,234 @@ class TestDashboardClientOpIdInjection:
         assert 'client_op_id' not in posted['params']['arguments'], (
             'read tools must not get a client_op_id injected'
         )
+
+
+# ── per-call timeout budget threading ──────────────────────────
+
+
+class TestMcpToolCallTimeoutBudget:
+    """A caller's per-call budget must reach EVERY post of the flow.
+
+    ``timeout=`` on ``client.post`` bounds connect/read/write *and pool
+    acquisition*. Without threading, a caller working to a 2.0s budget still
+    waited up to httpx's 10s default for a pool slot on each of the three
+    posts a cold session performs — the incoherence this closes. The
+    ``notifications/initialized`` post is the subtlest of the three: it
+    hardcoded 10 with no parameter at all.
+    """
+
+    async def test_budget_reaches_every_post_of_a_cold_session(self):
+        from dashboard.data.memory import mcp_tool_call
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
+
+        result = await mcp_tool_call(
+            mock_client, 'http://localhost:8000', 'get_status', {}, timeout=2.0,
+        )
+
+        assert result == {'ok': True}
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 3, (
+            f'cold session should post initialize + notify + tools/call, '
+            f'got {len(posts)} posts'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [2.0, 2.0, 2.0], (
+            f'the caller budget must reach every post (including the notify, '
+            f'which hardcoded 10), got {timeouts}'
+        )
+
+    async def test_default_timeout_is_unchanged_at_ten(self):
+        """Guard: the default must stay 10 — nothing is silently raised."""
+        from dashboard.data.memory import mcp_tool_call
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
+
+        await mcp_tool_call(mock_client, 'http://localhost:8000', 'get_status', {})
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], (
+            f'omitting timeout must keep the pre-existing 10s default on every '
+            f'post, got {timeouts}'
+        )
+
+
+class TestAggregateTimeoutBudget:
+    """The two multi-URL aggregates must thread a budget to every post.
+
+    ``metrics.py`` wraps ``get_memory_status`` and ``get_queue_stats`` in
+    ``asyncio.wait_for``, but those wrappers bound the *aggregate*: both
+    functions walk N fused-memory URLs (``get_memory_status`` short-circuits
+    on the first success, ``get_queue_stats`` visits all of them), so the
+    outer bound alone left each individual post free to wait httpx's 10s
+    default — including for a pool slot. The two layers are complementary,
+    not redundant, so both must be present.
+    """
+
+    async def test_get_memory_status_threads_budget_across_failover(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import get_memory_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        # First URL's initialize post fails outright → fall through to the
+        # second, which serves a full cold-session sequence.
+        mock_client.post.side_effect = [
+            httpx.ConnectError('refused'),
+            *cold_session_responses({'graphiti': {'connected': True}}, url_b),
+        ]
+
+        result = await get_memory_status(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected failover success: {result}'
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 4, (
+            f'expected 1 failed post on {url_a} + 3 cold-session posts on '
+            f'{url_b}, got {len(posts)}'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [3.0] * 4, (
+            f'the budget must reach every post of every URL tried, got {timeouts}'
+        )
+
+    async def test_get_memory_status_default_timeout_is_ten(self, two_url_config):
+        """Guard: omitting the budget keeps the pre-existing 10s default."""
+        from dashboard.data.memory import get_memory_status
+
+        _url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses({'ok': True}, url_b)
+
+        await get_memory_status(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], f'default must stay 10, got {timeouts}'
+
+    async def test_get_queue_stats_threads_budget_to_every_url(self, two_url_config):
+        from dashboard.data.memory import get_queue_stats
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
+        mock_client = AsyncMock()
+        # get_queue_stats visits ALL urls — two cold sessions, six posts.
+        mock_client.post.side_effect = [
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
+        ]
+
+        result = await get_queue_stats(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected success: {result}'
+        assert result['counts'] == {'graphiti': 2}, 'both urls must be summed'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [3.0] * 6, (
+            f'the budget must reach every post of all N urls, got {timeouts}'
+        )
+
+    async def test_get_queue_stats_default_timeout_is_ten(self, two_url_config):
+        """Guard: omitting the budget keeps the pre-existing 10s default."""
+        from dashboard.data.memory import get_queue_stats
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
+        ]
+
+        await get_queue_stats(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10] * 6, f'default must stay 10, got {timeouts}'
+
+
+class TestRemainingHelpersThreadTheirBudget:
+    """The last two helpers that were still pinned to the 10s default.
+
+    Threading the budget through most of this module but not these two left a
+    live incoherence: /api/v2/dashboard/curator gathered get_curator_state
+    alongside a fan_out_list_tickets leg honouring a 5s budget, so during a
+    fused-memory outage one leg could still block for roughly N x 3 x 10s.
+    ``get_wal_status`` had the same shape inside /memory.
+    """
+
+    async def test_get_wal_status_threads_budget_to_every_url(self, two_url_config):
+        from dashboard.data.memory import get_wal_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        payload = {'stores': {'tasks': {'busy': 0}}}
+        mock_client = AsyncMock()
+        # get_wal_status collects from ALL urls — two cold sessions, six posts.
+        mock_client.post.side_effect = [
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
+        ]
+
+        result = await get_wal_status(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected success: {result}'
+        assert set(result['stores']) == {url_a, url_b}, 'one column per server'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [3.0] * 6, (
+            f'the budget must reach every post of all N urls, got {timeouts}'
+        )
+
+    async def test_get_wal_status_default_timeout_is_ten(self, two_url_config):
+        from dashboard.data.memory import get_wal_status
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        payload = {'stores': {}}
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
+        ]
+
+        await get_wal_status(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10] * 6, f'default must stay 10, got {timeouts}'
+
+    async def test_get_curator_state_threads_budget_across_failover(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import get_curator_state
+
+        url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            httpx.ConnectError('refused'),
+            *cold_session_responses({'paused': False}, url_b),
+        ]
+
+        result = await get_curator_state(mock_client, two_url_config, timeout=3.0)
+
+        assert result.get('offline') is not True, f'expected failover success: {result}'
+        posts = mock_client.post.call_args_list
+        assert len(posts) == 4, (
+            f'expected 1 failed post on {url_a} + 3 cold-session posts on '
+            f'{url_b}, got {len(posts)}'
+        )
+        timeouts = [c.kwargs['timeout'] for c in posts]
+        assert timeouts == [3.0] * 4, (
+            f'the budget must reach every post of every URL tried, got {timeouts}'
+        )
+
+    async def test_get_curator_state_default_timeout_is_ten(self, two_url_config):
+        from dashboard.data.memory import get_curator_state
+
+        _url_a, url_b = two_url_config.fused_memory_urls
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cold_session_responses({'paused': False}, url_b)
+
+        await get_curator_state(mock_client, two_url_config)
+
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [10, 10, 10], f'default must stay 10, got {timeouts}'
 
 
 # ── SSE response parsing ───────────────────────────────────────
@@ -355,10 +550,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -382,10 +577,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -518,6 +713,86 @@ class TestGetQueueStats:
         assert 9001 in handler.ports_seen
 
 
+# ── the hand-rolled per-URL loops obey the same log policy ──────
+
+
+class TestAggregatingLoopsLogFailuresAtWarning:
+    """get_queue_stats / get_wal_status visit ALL N urls, not first-success.
+
+    They are therefore the paths where a *partial* outage silently
+    under-reports — a summed count quietly missing one server's contribution,
+    a WAL column quietly absent — and at DEBUG that left no journal trace at
+    all. They now share mcp_fanout's transition-only WARNING policy (task
+    3871) instead of each hand-rolling its own level.
+    """
+
+    async def test_get_queue_stats_partial_failure_warns_once_per_url(
+        self, two_url_config, caplog,
+    ):
+        from dashboard.data.memory import get_queue_stats
+
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await get_queue_stats(client, two_url_config)
+
+        assert 'offline' not in result, 'the reachable server still aggregates'
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'the one dead server must leave exactly one trace, got {warnings}'
+        )
+        assert 'get_queue_stats' in warnings[0] and '9000' in warnings[0], (
+            f'the warning must name the path and the failing url, got {warnings[0]}'
+        )
+
+    async def test_get_wal_status_partial_failure_warns_once_per_url(
+        self, two_url_config, caplog,
+    ):
+        from dashboard.data.memory import get_wal_status
+
+        handler = _SessionAwareHandler({'stores': {}}, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                result = await get_wal_status(client, two_url_config)
+
+        assert 'offline' not in result, 'the reachable server still reports'
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'the one dead server must leave exactly one trace, got {warnings}'
+        )
+        assert 'get_wal_status' in warnings[0] and '9000' in warnings[0], (
+            f'the warning must name the path and the failing url, got {warnings[0]}'
+        )
+
+    async def test_repeat_failures_do_not_flood(self, two_url_config, caplog):
+        """A sustained partial outage warns once, not once per 2s poll."""
+        from dashboard.data.memory import get_queue_stats
+
+        handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, fail_port=9000)
+        transport = httpx.MockTransport(handler)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            async with httpx.AsyncClient(transport=transport) as client:
+                for _ in range(5):
+                    await get_queue_stats(client, two_url_config)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'five poll cycles against one dead server must warn once, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+
 # ── Malformed responses ─────────────────────────────────────────
 
 
@@ -533,9 +808,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {}},
@@ -557,9 +832,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {'content': []}},
@@ -588,9 +863,9 @@ class TestMcpToolCallLogging:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={

@@ -30,6 +30,25 @@ required filename: it's what the dashboard's escalation-URL discovery
 a discovery fallback for not-yet-migrated projects, not a supported choice
 for new ones.
 
+This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
+and most files are not format-clean. Do not file or perform
+formatting-cleanup work — see `CONTRIBUTING.md` section 3 (task 3441).
+
+<!-- line-pin-policy:begin — mirrors CONTRIBUTING.md §2; pinned by
+     tests/scripts/test_line_pin_policy.py (markers + non-enforcement only,
+     never the wording). -->
+Cite cross-file references in comments and docstrings as
+`path/to/module.py::symbol`, never `module.py:1234`. The **428** existing
+bare line pins are **tolerated drift, not debt** — ~80% are already stale
+(hand-adjudicated n=49) and none has ever been shown to mislead a reader.
+**Do not file or perform pin-cleanup work, and do not escalate the
+population**; a task or escalation proposing a sweep is correctly closable
+as won't-fix. Fix a pin only in prose your own change introduces or edits.
+Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
+(esc-3815-7).
+<!-- line-pin-policy:end -->
+
+
 ## Prerequisites
 
 ```bash
@@ -174,12 +193,20 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both funnel through `scripts/restart-all-orchestrators.sh --drain` and
-share one 8h fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
+fleet-deploy clock). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
+
+Two things that section used to claim, and that measurement disproved on
+2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
+passes no arguments, so it restarts mid-merge units ungated), and the two
+tiers **can** both redeploy inside one 8h window — the clock is stamped only
+when a sweep completes, so a long sweep leaves it reading the previous deploy
+throughout. Tasks **4754** and **4755** close this. Until they land, don't
+reason as if a fleet redeploy is at most once per 8h.
 
 ## Working in the main checkout
 
@@ -195,6 +222,15 @@ directly, not just interactive agents.
   `pyright skipped (no Python changes)` and is quick. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
+- `git commit --only` holds `.git/index.lock` for that **entire** hook run,
+  and under a held lock `git stash create` fails silently (rc=1, empty
+  stdout *and* stderr). The merge worker therefore **stands off** for up to
+  `git.merge_park_lock_grace_seconds` (default 300s, matching the pre-commit
+  budget above) whenever `project_root` has main checked out and the index
+  lock is held: a docs-direct-commit-on-main now merely *delays* a merge
+  instead of halting the queue, and no operator rescue is needed for this
+  case. If the grace still expires, that one merge is blocked per-task (see
+  `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto
@@ -216,4 +252,4 @@ directly, not just interactive agents.
   stage/judge prompt sources), `RECONCILIATION_PLAN.md`
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
-- **Design invariants**: `docs/legibility/design-invariants.md` — five checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2

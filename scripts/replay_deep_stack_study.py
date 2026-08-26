@@ -91,7 +91,7 @@ SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
 
 def log(msg: str) -> None:
-    print(f'[{dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}] {msg}',
+    print(f'[{dt.datetime.now(dt.UTC).isoformat(timespec="seconds")}] {msg}',
           flush=True)
 
 
@@ -111,7 +111,7 @@ def load_spans(db_path: Path, since_days: int) -> list[tuple[str, dt.datetime, d
     and collapses the whole window into one mega-episode.
     """
     con = sqlite3.connect(str(db_path))
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
+    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=since_days)
     open_q: dict[str, dt.datetime] = {}
     spans: list[tuple[str, dt.datetime, dt.datetime]] = []
     rows = con.execute(
@@ -339,7 +339,7 @@ def main() -> int:
         tree_obj = git(args.repo, 'rev-parse', 'HEAD^{tree}').stdout.strip()
         rec = {**j, 'tips': [t for t, _ in j['tips']], 'tree': tree,
                'tree_object': tree_obj, 'script_version': SCRIPT_VERSION,
-               'items_merged': merged, 'started_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+               'items_merged': merged, 'started_at': dt.datetime.now(dt.UTC).isoformat()}
         if merged == 0:
             rec.update(exit_code=None, passed=None, skipped='no_items_merged')
         else:

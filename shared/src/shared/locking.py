@@ -7,7 +7,7 @@ tasks whose module footprint overlaps a candidate.
 
 Directory/file path classifier (α/γ shared predicate)
 ------------------------------------------------------
-``CODE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
+``FILE_EXTENSIONS``, ``is_file_path``, ``directory_locks``, and
 ``strip_directory_locks`` live here so the orchestrator scheduler (α
 enforcement point) can import them without a ``fused_memory`` dependency
 (the orchestrator must not import fused_memory; see
@@ -19,10 +19,41 @@ names so it remains self-contained in the fused-memory virtual environment
 predates this relocation).  The two copies are **not** connected by a
 re-export; drift between them is caught by explicit equality tests:
 
-- ``shared/tests/test_locking.py::TestCodeExtensionsDriftGuard``
+- ``shared/tests/test_locking.py::TestFileExtensionsDriftGuard``
   (pins this copy)
 - ``fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard``
   (pins the lock_charter_guard.py copy)
+
+STATUS — cross-repo agreement on the extension-less vector (#3248)
+-------------------------------------------------------------------
+``EXTENSIONLESS_FILENAMES`` (below) is NOT a dark_factory-only lead, and this
+paragraph exists because #3248 was planned on the opposite assumption.  reify
+got there FIRST: ``scripts/lock-charter-guard.sh`` already carries the same
+8-name vector inside its bash ``_is_file_path`` and exposes it via
+``--list-extensionless`` (reify #5890).  Measured 2026-08-09 on the live
+script — the two vectors are identical, and ``classify hooks/project-checks``
+returns ACCEPT, not REJECT.  So this change CONVERGED the seam rather than
+opening one; no reify follow-up is owed.
+
+The extension-half Tier-2 drift guard
+(``test_extension_drift_guard_vs_reify_script``) compares
+``sorted(FILE_EXTENSIONS)`` against ``--list-extensions``, i.e. an EXTENSION
+vector only, and is structurally blind to this frozenset.  That gap is closed
+by its extension-less sibling (``test_extensionless_drift_guard_vs_reify_script``),
+which pins this vector against ``--list-extensionless``.
+
+WHAT IS ACTUALLY ENFORCED, precisely — the Tier-1 guards compare each Python
+copy against a literal in its OWN test file, so they cannot see the other two
+copies; only the Tier-2 guards reach across a source boundary.  Both vectors
+are therefore pinned against the bash emitters from BOTH sides — α in
+``shared/tests/test_locking.py`` and γ in
+``fused-memory/tests/test_lock_charter_guard.py`` — and α↔γ agreement follows
+transitively (α == bash and γ == bash ⇒ α == γ).  That two-sided arrangement is
+what makes three-way α/γ/bash agreement ENFORCED rather than merely asserted in
+prose; a single-sided Tier-2 would NOT, because an edit changing one Python copy
+together with its own local literal would pass every guard in that package.
+The Tier-2 guards hard-fail (never skip) when the reify script is present but
+its emitter is gone, so the enforcement cannot silently retire itself.
 """
 
 from __future__ import annotations
@@ -31,7 +62,8 @@ from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
-    'CODE_EXTENSIONS',
+    'EXTENSIONLESS_FILENAMES',
+    'FILE_EXTENSIONS',
     'directory_locks',
     'files_to_modules',
     'is_file_path',
@@ -43,22 +75,21 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — authoritative Python copy for the α enforcement point.
 #
-# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
-# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
-# TOKENS whose presence after the last dot of a path's final segment is evidence
-# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# NAMING — the contract.  This is the set of recognised FILE-EXTENSION TOKENS
+# whose presence after the last dot of a path's final segment is evidence that
+# the segment names a FILE rather than a DIRECTORY — which is all any caller
 # (is_file_path, directory_locks, strip_directory_locks,
-# module_charter.derive_modules) relies on.  Its non-code members are therefore
-# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
-# typed service template example python-version gitignore gitkeep gitmodules
-# gitattributes npmrc envrc conf.
-# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
-# "is this code?".  That misreading of the name is exactly what let the list sit
-# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
-# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
-# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
-# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
-# dedicated follow-up rather than done half-way here.
+# module_charter.derive_modules) relies on.  It is NOT a code-file allowlist, so
+# its non-code members are correct and load-bearing: png svg ico icns log lock
+# diff golden manifest timer typed service template example python-version
+# gitignore gitkeep gitmodules gitattributes npmrc envrc conf.
+# ADMISSION RULE: judge a candidate addition by "does a real tracked file end in
+# this?", NEVER by "is this code?".  Reading this list's former, CODE_-prefixed
+# name as if it meant "code" is exactly what let it sit at a 22-extension
+# undercount until #3117 — the history this rule exists to prevent repeating,
+# and the reason the name now says FILE.
+# Renamed to FILE_EXTENSIONS by #3248, the dedicated follow-up #3117 deferred
+# that rename to.
 #
 # Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
 # git-ls-files sweep 2026-07-28 (reify #5726 / dark_factory #3117) — 22 tracked-file
@@ -71,11 +102,11 @@ __all__ = [
 # Widened 58 -> 59 on 2026-08-06: `csv` — caught by the corpus->allowlist guard
 # (test_every_tracked_extension_is_allowlisted) once plans/evidence/
 # scheduler-scoring-2026-08-06/*.csv landed on dark-factory main (e1c51efa8d).
-# Drift guard (this shared copy): shared/tests/test_locking.py::TestCodeExtensionsDriftGuard
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestFileExtensionsDriftGuard
 # Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extension_drift_guard
 # ---------------------------------------------------------------------------
 
-CODE_EXTENSIONS: frozenset[str] = frozenset(
+FILE_EXTENSIONS: frozenset[str] = frozenset(
     {
         'c',
         'cc',
@@ -139,6 +170,75 @@ CODE_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Canonical extension-LESS filename allowlist (dark_factory #3248).
+#
+# CONTRACT: recognised final-segment NAMES that carry no extension at all yet
+# denote a FILE.  FILE_EXTENSIONS above can never reach these — there is no dot,
+# so there is no token to look up — which is why they need a second enumerated
+# vector rather than another entry in the first.  Matched against the final
+# segment BEFORE the "no dot ⇒ directory" reject in is_file_path.
+#
+# EVIDENCE: `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (identical
+# to the 2026-07-31 measurement) — every tracked path whose final segment
+# contains no '.'.  dark-factory contributes Dockerfile LICENSE pre-commit
+# pre-merge-commit project-checks; reify adds cargo cargo-audit-orphans
+# reference-transaction.  Union = the 8 below.
+#
+# GITLINK EXCLUSION — load-bearing, and a deliberate decision rather than an
+# accident of the sweep: `git ls-files -s` entries with mode 160000 are submodule
+# mount points (`graphiti`, `mem0` in dark-factory).  They are extension-less and
+# would otherwise qualify, but admitting them would let a task declare an ENTIRE
+# VENDORED SUBMODULE as its lock charter — strictly worse than the bug being
+# fixed.  They stay DIRECTORIES.  The corpus sweeps assert this filter is doing
+# real work rather than passing vacuously.
+#
+# CASE-SENSITIVITY: exact tracked spelling only.  `LICENSE` matches; `license`
+# and `License` do not.  Same rule as the (lowercase) extension allowlist: a
+# tracked file whose case differs is a naming problem, not an allowlist gap.
+#
+# ADMISSION RULE, as for FILE_EXTENSIONS: judge a candidate by "is this a real
+# tracked file?", never by "does it look like a file?".  The list must stay
+# ENUMERATED — a general rule such as "an extension-less segment naming an
+# executable is a file" cannot be evaluated as pure string (C-P3) and would
+# re-admit directories.
+#
+# CROSS-PROJECT SCOPE — the limitation this enumeration knowingly accepts, and
+# the reason the admission rule above is stricter than it looks.  Members are
+# matched as BARE FINAL SEGMENTS and several are generic: `cargo`, `Dockerfile`,
+# `LICENSE`, `pre-commit`.  The collision guard that bounds this risk
+# (test_no_canonical_name_is_also_a_directory) sweeps only the dark-factory and
+# reify checkouts — but this predicate governs lock charters for EVERY project
+# the orchestrator targets.  In a third project containing `tools/cargo/` or
+# `docker/Dockerfile/` as a real DIRECTORY, that directory now classifies as a
+# FILE: directory_locks stops rejecting it and derive_modules RETAINS it,
+# yielding a prefix lock over the entire subtree (modules_conflict is
+# prefix-based) — the reify-3468 over-wide-charter failure the strip exists to
+# prevent, and now with NO INFO diagnostic, because nothing was stripped.
+# Admitting a generic basename is therefore a CROSS-PROJECT COMMITMENT, not a
+# local one: weigh a candidate against every targeted repo, not only the two
+# that are actually swept.
+#
+# Drift guard (this shared copy): shared/tests/test_locking.py::TestExtensionlessFilenamesDriftGuard
+# Drift guard (γ copy in lock_charter_guard.py): fused-memory/tests/test_lock_charter_guard.py::test_extensionless_drift_guard
+# Self-audit (both copies): test_every_tracked_extensionless_file_is_allowlisted
+#   sweeps both repos' tracked corpora, so the 9th extension-less file surfaces
+#   as a red test rather than as another LockCharterViolation incident.
+# ---------------------------------------------------------------------------
+
+EXTENSIONLESS_FILENAMES: frozenset[str] = frozenset(
+    {
+        'Dockerfile',
+        'LICENSE',
+        'cargo',
+        'cargo-audit-orphans',
+        'pre-commit',
+        'pre-merge-commit',
+        'project-checks',
+        'reference-transaction',
+    }
+)
+
 
 def is_file_path(path: str) -> bool:
     """Return True iff *path* is a file-level declaration (not a directory).
@@ -150,10 +250,18 @@ def is_file_path(path: str) -> bool:
     1. Strip ALL trailing ``/`` from *path*.
     2. Final segment = substring after last ``/``.
        Empty segment (path was all slashes) → directory → return False.
-    3. If the segment contains no ``.`` → extension-less → return False.
-    4. ext = substring after the last ``.`` in the segment.
-       Return ``ext in CODE_EXTENSIONS`` (case-sensitive, matching α's
+    3. If the segment is in ``EXTENSIONLESS_FILENAMES`` → file → return True.
+       Checked BEFORE the no-dot reject below, because these names carry no
+       extension and would otherwise be rejected at step 4 (dark_factory #3248).
+    4. If the segment contains no ``.`` → extension-less → return False.
+    5. ext = substring after the last ``.`` in the segment.
+       Return ``ext in FILE_EXTENSIONS`` (case-sensitive, matching α's
        ``[ "$ext" = "$e" ]`` against a lowercase allowlist).
+
+    C-P3 is PRESERVED by step 3: it is a set membership test on a string, so
+    the predicate remains pure string — no stat, no filesystem access, no model
+    call.  A ghost path that is not on disk still classifies deterministically,
+    exactly as before.
     """
     # Strip all trailing slashes.
     p = path
@@ -166,6 +274,11 @@ def is_file_path(path: str) -> bool:
     # Empty segment → path was all slashes → directory.
     if not seg:
         return False
+
+    # Recognised extension-less FILE name → file.  Must precede the no-dot
+    # reject below, which would otherwise swallow every one of these.
+    if seg in EXTENSIONLESS_FILENAMES:
+        return True
 
     # No dot in segment → extension-less → treat as directory (REJECT).
     if '.' not in seg:
@@ -185,7 +298,7 @@ def is_file_path(path: str) -> bool:
     #                  rule: that rule would make '.worktrees' (the whole
     #                  worktree pool) declarable as a lock charter.
     # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
-    return ext in CODE_EXTENSIONS
+    return ext in FILE_EXTENSIONS
 
 
 def directory_locks(files: list[Any]) -> list[str]:

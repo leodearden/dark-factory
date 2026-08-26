@@ -17,8 +17,6 @@ than passing vacuously when no stub was installed ahead of it.
 import sys
 from types import ModuleType
 
-import pytest
-
 # Imported eagerly, at module scope, for two reasons.  (1) It is the executable
 # proof of this file's premise: httpx IS importable here — a direct dependency
 # of `shared` (shared/pyproject.toml, `httpx>=0.27`, task 2965) — so if that
@@ -28,6 +26,7 @@ import pytest
 # teardown-restoration test below compares against a known object rather than
 # taking a vacuous "key was absent" branch.
 import httpx as _real_httpx
+import pytest
 
 # Appended to by every test here that installs a stub; read by the
 # teardown-restoration test, which can only observe a restoration that actually
@@ -98,7 +97,10 @@ def test_install_fake_httpx_fails_loudly_on_an_unstubbed_attribute(install_fake_
     _INSTALLED_STUBS.append(fake)
 
     try:
-        fake.HTTPError
+        # The bare attribute ACCESS is the probe; bind it so the access is not a
+        # bare (B018 "useless") expression statement. Nothing reads the value —
+        # every meaningful path below leaves via one of the handlers.
+        _ = fake.HTTPError
     except Exception as exc:
         raise AssertionError(
             'an unstubbed attribute raised a swallowable Exception '
