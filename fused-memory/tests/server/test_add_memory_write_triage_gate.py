@@ -133,6 +133,7 @@ def _configure_config(
     near_dup_guard_enabled: bool = True,
     near_dup_threshold: float = 0.90,
     topic_clusters: list | None = None,
+    judge_enabled: bool = False,
 ) -> None:
     """Stand in for ``memory_service.config`` with plain namespaces.
 
@@ -140,6 +141,17 @@ def _configure_config(
     ``reconciliation`` for the two reject guards it supersedes, so a single
     harness can assert the flag-on and flag-off behaviours against identical
     config in every other respect.
+
+    ``judge_enabled`` DEFAULTS FALSE, diverging from production's default-True
+    on purpose. Once `tools.py` passes the real `judge_write` into
+    `triage_write`, every middle-band write in this file reaches an LLM
+    provider — and `OPENAI_API_KEY` is set in this environment, so those calls
+    would SUCCEED: a unit suite silently billing an account and depending on a
+    network round-trip for a routing assertion. Leaving the attribute off the
+    namespace entirely is what would do that, because the resolver defaults it
+    True when absent. Tests that mean to exercise the judge patch
+    `tools.judge_write` outright (see `TestTheRealJudgeIsWiredAtTheToolSeam`),
+    which is both cheaper and a stronger assertion than a live call.
     """
     mock_service.config = types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
@@ -147,6 +159,7 @@ def _configure_config(
             candidate_k=candidate_k,
             t_high=t_high,
             t_low=t_low,
+            judge_enabled=judge_enabled,
         ),
         reconciliation=types.SimpleNamespace(
             procedural_knowledge_near_dup_guard_enabled=near_dup_guard_enabled,
@@ -1464,6 +1477,169 @@ class TestEveryWiredAttachKindReachesThePersistedChild:
             'C1: the submitted content is what gets attached, verbatim'
         )
         assert counter.live_count() == 0, 'a wired attach outcome is not a failure'
+
+
+#: The judge as `tools.py` binds it, for `patch()`. Patched at the CONSUMER's
+#: module path rather than at `write_triage_judge.judge_write`, because
+#: `tools.py` imports the name into its own namespace at import time — patching
+#: the definition site would leave the already-bound reference untouched and
+#: the test would assert against the real judge while believing otherwise.
+#: Same idiom as `tests/test_path_scope_adjudicator.py::_INVOKE_PATH`.
+_JUDGE_PATH = 'fused_memory.server.tools.judge_write'
+
+#: A middle-band cosine: strictly between `_T_LOW` and `_T_HIGH`, so the bands
+#: decline to answer and the question goes to the judge.
+_MIDDLE_BAND = 0.80
+
+
+class TestTheRealJudgeIsWiredAtTheToolSeam:
+    """The judge module existed for four steps with nothing calling it.
+
+    `triage_write`'s judge slot defaults to `_stub_judge`, so building
+    `write_triage_judge` changed no observable behaviour on its own: every
+    middle-band write still acked `stored`. What these pin is the one line
+    that makes the module load-bearing — `judge=judge_write` at the call site
+    — and they pin it at the seam rather than by importing the judge, because
+    an import proves the module exists and nothing about whether it runs.
+    """
+
+    @staticmethod
+    def _service(score: float = _MIDDLE_BAND) -> AsyncMock:
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [_candidate('canonical-A', score)]
+        return mock_service
+
+    @pytest.mark.asyncio
+    async def test_the_judge_sees_the_write_the_band_and_the_candidates(self) -> None:
+        """PRD C1's judge input: the new entry AND its top candidates.
+
+        The candidates are the assertion that matters. A judge handed only a
+        canonical ID and a score can classify nothing — it would be re-deriving
+        the band's own verdict from the band's own numbers — so an empty
+        `candidates` is a wiring that looks connected and answers noise.
+        """
+        mock_service = self._service()
+        judge = AsyncMock(return_value=OUTCOME_STORED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            server = create_mcp_server(mock_service)
+            await _call(server)
+
+        judge.assert_awaited_once()
+        kwargs = judge.await_args.kwargs
+        assert kwargs['content'] == _CONTENT, f'{kwargs!r}'
+        assert kwargs['project_id'] == _PROJECT_ID, f'{kwargs!r}'
+        assert kwargs['decision'].canonical_id == 'canonical-A', f'{kwargs!r}'
+        assert kwargs['decision'].similarity == pytest.approx(_MIDDLE_BAND), f'{kwargs!r}'
+        assert list(kwargs['candidates']), (
+            f'the judge was handed an empty slate and cannot classify anything: '
+            f'{kwargs!r}'
+        )
+        assert kwargs['candidates'][0].id == 'canonical-A', f'{kwargs!r}'
+
+    @pytest.mark.asyncio
+    async def test_the_middle_band_can_now_answer_something_other_than_stored(
+        self, monkeypatch,
+    ) -> None:
+        """Structurally impossible before this wiring, which is the whole point.
+
+        `_stub_judge` returns `stored` unconditionally, so no middle-band input
+        of any shape could produce an attach. The assertion is not that the
+        judge said `amended` — a fake said that — but that the verdict reached
+        the ack and the persisted record at all.
+        """
+        counter = _install_counter(monkeypatch)
+        mock_service = self._service()
+
+        with patch(_JUDGE_PATH, new=AsyncMock(return_value=OUTCOME_AMENDED)):
+            server = create_mcp_server(mock_service)
+            result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_AMENDED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert metadata['kind'] == AMENDMENT_KIND, f'{metadata!r}'
+        assert metadata[PARENT_ID_KEY] == 'canonical-A', f'{metadata!r}'
+        assert counter.live_count() == 0, 'a judge that answered is not a failure'
+
+    @pytest.mark.asyncio
+    async def test_a_contested_verdict_reaches_the_flag_through_the_real_seam(
+        self, monkeypatch,
+    ) -> None:
+        """The whole leaf end to end, with only the LLM faked.
+
+        Elsewhere the contested path is driven by replacing `triage_write`
+        wholesale; here everything between the tool and the provider is
+        production code, so this is what says the three pieces — judge slot,
+        attach table, metadata stamp — are actually connected to each other.
+        """
+        counter = _install_counter(monkeypatch)
+        mock_service = self._service()
+
+        with patch(_JUDGE_PATH, new=AsyncMock(return_value=OUTCOME_CONTESTED)):
+            server = create_mcp_server(mock_service)
+            result = await _call(server)
+
+        assert result[ROUTED_KEY] == OUTCOME_CONTESTED, f'{result!r}'
+        metadata = mock_service.add_memory.await_args.kwargs['metadata']
+        assert is_contested_child(metadata) is True, f'{metadata!r}'
+        assert metadata['kind'] == AMENDMENT_KIND, f'{metadata!r}'
+        assert counter.live_count() == 0, f'{result!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('label', 'score'),
+        [
+            ('a deterministic restatement, at or above t_high', 0.97),
+            ('a clearly novel write, below t_low', 0.10),
+        ],
+    )
+    async def test_a_band_that_already_decided_never_pays_for_a_judge(
+        self, label, score,
+    ) -> None:
+        """No spend on a question the deterministic bands already answered.
+
+        The judge costs a network round-trip on the SYNCHRONOUS write path, so
+        consulting it outside the middle band buys nothing and charges latency
+        to every write in the corpus. Asserted as `not awaited` rather than by
+        timing, so it holds on a fast machine too.
+        """
+        mock_service = self._service(score)
+        judge = AsyncMock(return_value=OUTCOME_STORED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            server = create_mcp_server(mock_service)
+            await _call(server)
+
+        assert judge.await_count == 0, (
+            f'{label}: the bands already decided, so the judge is pure spend'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_force_stored_write_never_reaches_the_judge(self) -> None:
+        """The exemptions are exemptions from SPEND, not just from routing.
+
+        `allow_near_duplicate`, a recon-stage agent and a caller-declared
+        parentage all force-store. Each already skips retrieval; this pins that
+        none of them can reach the judge either, which is the expensive half.
+        """
+        judge = AsyncMock(return_value=OUTCOME_AMENDED)
+        for label, overrides in [
+            ('allow_near_duplicate', {'metadata': {'allow_near_duplicate': True}}),
+            ('a recon-stage agent', {'agent_id': 'recon-stage-1'}),
+            ('a caller-declared kind', {'metadata': {'kind': 'cycle_summary'}}),
+        ]:
+            mock_service = self._service()
+            with patch(_JUDGE_PATH, new=judge):
+                server = create_mcp_server(mock_service)
+                result = await _call(server, **overrides)
+
+            assert result[ROUTED_KEY] == OUTCOME_STORED, f'{label}: {result!r}'
+            assert judge.await_count == 0, (
+                f'{label}: a force-store is an exemption from SPEND too'
+            )
 
 
 #: A verdict word no judge publishes and no table wires — the FIFTH outcome,
