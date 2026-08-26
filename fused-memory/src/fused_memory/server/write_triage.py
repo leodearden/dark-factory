@@ -59,7 +59,11 @@ from typing import TYPE_CHECKING, Any
 from shared.storm_counter import StormCounter
 
 from fused_memory.models.enums import MEM0_PRIMARY
-from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
+from fused_memory.server.grouped_read import (
+    CHILD_KINDS,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+)
 
 # The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
 # the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
@@ -124,13 +128,27 @@ FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 #: below is derived from, so the two cannot drift: every key the attach
 #: writes is a key a caller must be allowed to keep.
 #:
+#: THREE keys, not two, since task 3128 wired the ``contested`` outcome: that
+#: child is an amendment PLUS ``CONTESTED_METADATA_KEY``, so a caller who set
+#: the contested flag themselves must force-store like any other. Note the
+#: outcomes no longer write the SAME keys — only ``contested`` writes the
+#: third — so this set is the UNION over outcomes, which is what the force
+#: store has to defend. The gate suite pins it that way, sweeping every attach
+#: outcome and unioning what each persisted.
+#:
 #: ``'kind'`` is spelled as a literal because ``grouped_read`` exports the
 #: kind VALUES (``AMENDMENT_KIND``/``SIGHTING_KIND``) but no constant for the
 #: key itself, and that module is outside this task's scope to extend.
+#: ``CONTESTED_METADATA_KEY`` by contrast IS exported, so it is imported —
+#: ``grouped_read`` owns the read-side predicate that has to recognise what
+#: the write side stamps, and two spellings of that key would produce children
+#: flagged in a way nothing reads.
 #: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
-#: the keys ``tools.py`` actually writes, so a third key added to the attach
+#: the keys ``tools.py`` actually writes, so a FOURTH key added to the attach
 #: without widening this set fails there rather than silently.
-ATTACH_OWNED_KEYS: frozenset[str] = frozenset({PARENT_ID_KEY, 'kind'})
+ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
+    PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY,
+})
 
 #: The write was stored as a new standalone memory. Also the fail-open
 #: outcome and the deliberate-stub outcome — from the caller's side those are
@@ -329,16 +347,22 @@ def declares_attach_keys(metadata: Any) -> bool:
     keys — ``memory_metadata`` validates ``kind`` against ``KIND_REGISTRY``
     and ``parent_id`` for UUID shape, and ``MemoryService`` resolves parent
     liveness — so an agent CAN and does set both through ``add_memory``. An
-    ATTACH outcome overwrites BOTH (see :data:`ATTACH_OWNED_KEYS`), so
+    ATTACH outcome overwrites them (see :data:`ATTACH_OWNED_KEYS`), so
     whatever the caller put there is destroyed with no log line and no
     fail-open count. Under a contract whose first clause is *never lose
     content*, a write that would cost the caller its own metadata force-stores
     instead.
 
-    Scoped to those two keys and NOT to metadata generally: triage must still
+    Scoped to those keys and NOT to metadata generally: triage must still
     fire for the ordinary write that carries a ``source`` or a ``topic``,
     which is nearly all of them. The keys here are exactly the ones the attach
     clobbers, no wider.
+
+    PRESENCE is the test, never truthiness — which matters most for the third
+    key: a caller who explicitly wrote ``x_contested: False`` has made a
+    claim about the record, and letting a contested attach flip it to ``True``
+    would be the same silent overwrite in the one direction where the value
+    reverses the record's meaning.
 
     ANY ``kind`` counts, not just ``CHILD_KINDS``. The narrower rule looked
     sufficient — an ``amendment`` demoted to a ``sighting`` is the loudest

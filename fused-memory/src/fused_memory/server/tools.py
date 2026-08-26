@@ -94,6 +94,7 @@ from fused_memory.server.grouped_read import (
     # produce children that exist but never group, which reads as content
     # loss without being one.
     AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
     SIGHTING_KIND,
     group_memory_document,
@@ -125,6 +126,7 @@ from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
     OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
@@ -1433,13 +1435,21 @@ def create_mcp_server(
     _TRIAGED_CATEGORIES = frozenset(c.value for c in MEM0_PRIMARY)
     # outcome -> child `kind` for the ATTACH outcomes. Membership in this
     # map is the definition of "attach outcome": anything absent is stored
-    # standalone. `contested` is deliberately NOT here — leaf gamma's judge
-    # is what produces it, and its child also carries
-    # grouped_read.CONTESTED_METADATA_KEY, so wiring a half-shaped
-    # contested child now would be a second thing for that leaf to unpick.
+    # standalone.
+    #
+    # `contested` maps to AMENDMENT_KIND and NOT to SIGHTING_KIND, and the
+    # difference is content visibility rather than bookkeeping: grouped_read
+    # DIGESTS amendment text into the grouped document, while sightings are
+    # only COUNTED. A contested child filed as a sighting has its correction
+    # suppressed to a tally underneath the very entry it contests — the
+    # esc-5712 five-week-wrong-appendix shape that grouped_read.
+    # is_contested_child exists to prevent. Its child additionally carries
+    # CONTESTED_METADATA_KEY (stamped in the attach below), which is what
+    # distinguishes it from an ordinary amendment for the read side.
     _TRIAGE_ATTACH_KINDS = {
         OUTCOME_RESTATED: SIGHTING_KIND,
         OUTCOME_AMENDED: AMENDMENT_KIND,
+        OUTCOME_CONTESTED: AMENDMENT_KIND,
     }
     # Remediation hint returned alongside conflicting_task_status_framing_write_blocked
     # (task 2276 amendment) so a blocked recon-stage agent can self-correct instead of
@@ -3040,6 +3050,18 @@ def create_mcp_server(
         lost and no write is ever blocked — a retrieval or judge failure
         degrades to a plain ``stored``, never to an error.
 
+        A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
+        its parent. Nothing was blocked and nothing was decided: triage
+        DETECTS that your write contradicts the memory it names, it does not
+        adjudicate which of the two is right. Your full text is stored and
+        readable in the canonical's grouped document (amendment text is
+        digested there; sighting text is only counted), the flag is picked up
+        by the existing gate machinery, and the memory you contradict is left
+        untouched for a human to settle. Getting a ``contested`` ack is not a
+        rejection and needs no action from you — but it is the ack worth
+        reading, because it says the corpus now holds two claims that cannot
+        both be true.
+
         With triage on, ``metadata={'allow_near_duplicate': True}`` is
         reinterpreted rather than retired: it now means FORCE-STORE — store
         this standalone, do not reroute it — for the same reason it meant
@@ -3358,15 +3380,21 @@ def create_mcp_server(
             and attach_kind is None
             and triage_decision.outcome != OUTCOME_STORED
         ):
-            # A verdict this body cannot ACT on. `contested` is the concrete
-            # case: it is a full member of TRIAGE_OUTCOMES, so `triage_write`
-            # accepts it from a judge, but it has no entry in
-            # _TRIAGE_ATTACH_KINDS (deliberately — leaf gamma owns the
-            # contested child, which also carries CONTESTED_METADATA_KEY).
-            # Without this arm the verdict is discarded and the ack quietly
-            # reports `stored`, indistinguishable from "nothing matched" — a
-            # trap laid for leaf gamma's FIRST contested verdict, whose
-            # silence would read as the judge never firing.
+            # A verdict this body cannot ACT on. Without this arm the verdict
+            # is discarded and the ack quietly reports `stored`,
+            # indistinguishable from "nothing matched" — so a consumer waiting
+            # on that outcome waits forever with nothing to grep.
+            #
+            # NOT DEAD CODE, despite now being unreachable for all four
+            # published outcomes: task 3128 wired `contested`, which is the
+            # case this arm was originally laid as a trap for, and wiring it
+            # sprung the trap the right way round. What remains is the guard
+            # for the FIFTH verdict — a future judge whose vocabulary grows
+            # without _TRIAGE_ATTACH_KINDS growing with it. Deleting it as
+            # unreachable restores exactly the silence it was written to
+            # break. tests/server/test_add_memory_write_triage_gate.py::
+            # TestAVerdictWithNoWiredAttachKindIsVisible holds it live against
+            # a stand-in verdict for that reason.
             #
             # Counted as a fail-open for the same reason `triage_write` counts
             # an out-of-vocabulary verdict: the write still lands untriaged
@@ -3383,17 +3411,34 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # These two keys are ATTACH_OWNED_KEYS, and overwriting them is
-            # safe ONLY because `caller_owns_attach_keys` force-stored every
-            # write that carried either one — so neither can be present here.
-            # Adding a third key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
+            # them is safe ONLY because `caller_owns_attach_keys` force-stored
+            # every write that carried any one of them — so none can be
+            # present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
-            # pins the two sets against each other for exactly that reason.
+            # pins the two sets against each other for exactly that reason,
+            # unioned across the outcomes because they no longer write the
+            # same keys.
             write_meta = {
                 **(cleaned_meta or {}),
                 PARENT_ID_KEY: attached_to,
                 'kind': attach_kind,
             }
+            if triage_decision is not None and triage_decision.outcome == OUTCOME_CONTESTED:
+                # The one key that distinguishes a contested child from an
+                # ordinary amendment — both are AMENDMENT_KIND, because both
+                # need their text DIGESTED into the grouped document rather
+                # than counted. Composed from grouped_read's constant, never
+                # the 'x_contested' literal: that module owns the read-side
+                # predicate (is_contested_child) which has to recognise what
+                # is stamped here, and two spellings would produce children
+                # flagged in a way nothing reads.
+                #
+                # Triage DETECTS the contradiction; it does not adjudicate it
+                # (D3). The flag is a marker for the existing gate machinery
+                # and a human, and the canonical it contradicts is left
+                # exactly as it was.
+                write_meta[CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
