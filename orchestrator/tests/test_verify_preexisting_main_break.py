@@ -2089,16 +2089,24 @@ class TestMainBaselineSkippedIds:
             'a degraded (B3) probe must not seed the skipped side either'
         )
 
-    def test_failing_cache_shape_and_seed_signature_stay_back_compat(self) -> None:
+    def test_failing_cache_shape_stays_back_compat(self) -> None:
         """BACK-COMPAT PIN — this is what forbids "just widen the value tuple".
 
         ``verify._BASELINE_FAILING_IDS_CACHE[sha]`` must stay a 2-tuple
-        unpackable as ``_, ids = ...`` (pinned by
-        test_merge_queue_main_health.py's direct unpack), and
-        ``seed_main_baseline`` must keep its two-argument signature.
-        """
-        import inspect
+        unpackable as ``_, ids = ...``: that exact unpack is performed
+        directly by test_merge_queue_main_health.py, so a widened value tuple
+        would break it.  The skipped population therefore has to live in a
+        PARALLEL dict, not a third slot here.
 
+        Arity back-compat needs no introspection and gets none: the
+        ``seed_main_baseline(MAIN_SHA, ['t::x'])`` call below is itself the
+        behavioural pin — it passes two positional arguments and would raise
+        ``TypeError`` if a third required parameter were ever added.  Every
+        real caller passes positionally too (main_baseline_failing_ids and
+        merge_queue's post-merge pass path), so PARAMETER NAMES are not part
+        of the contract and are deliberately not asserted: renaming ``ids``
+        is a pure refactor that must not redden this test.
+        """
         from orchestrator import verify as verify_module
 
         verify_module.seed_main_baseline(MAIN_SHA, ['t::x'])
@@ -2108,11 +2116,6 @@ class TestMainBaselineSkippedIds:
         )
         _, ids = entry  # the exact unpack pinned by test_merge_queue_main_health.py
         assert ids == frozenset({'t::x'})
-
-        params = list(inspect.signature(verify_module.seed_main_baseline).parameters)
-        assert params == ['main_sha', 'ids'], (
-            f'seed_main_baseline must keep its 2-arg signature; got {params}'
-        )
 
     def test_the_two_caches_are_distinct_objects(self) -> None:
         """The skipped baseline is a separate dict, not an alias — seeding one
@@ -2284,7 +2287,21 @@ class TestIdDiffFastPathSkippedOnMainGuard:
     def test_no_skipped_baseline_cached_behaves_as_today(self, tmp_path: Path) -> None:
         """An UNSEEDED skipped baseline (cache-only peek returns None) must not
         change anything: the guard is a cache-only refinement, never a probe,
-        so a cold skipped cache degrades to today's verdict."""
+        so a cold skipped cache degrades to today's verdict.
+
+        NOT the normal state, and reading it as one is what let the step-19
+        defect ship.  A sha with a WARM failing cache and a COLD skipped one is
+        reachable only at cold start, on TTL expiry, or from a test (like this
+        one) that seeds a single side by hand — never in steady state.  Both
+        producers seed the two caches TOGETHER: ``main_baseline_failing_ids``
+        seeds both from one probe, and merge_queue's post-merge pass path seeds
+        both inside one guard.  The steady-state path — the guard firing against
+        a MERGE-seeded rather than a hand-seeded baseline — is covered by
+        test_merge_queue_main_health.py::TestPostMergeVerifySeedsBaseline::
+        test_merge_seeded_baseline_arms_the_skipped_on_main_guard.  So this case
+        pins a genuine fail-safe degrade, NOT evidence that the guard is
+        expected to be inert.
+        """
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
