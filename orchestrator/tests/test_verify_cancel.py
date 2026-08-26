@@ -278,6 +278,164 @@ class TestCancelRequest:
 
 
 # ---------------------------------------------------------------------------
+# Task 3186 (PRD δ) step-21: `killed_pgid_out` — what cancel_request ACTUALLY
+# killed, as distinct from what it returned.
+#
+# THE STAKE.  `cancel_request` returns 0 for FOUR distinct cases and only ONE
+# of them killed anything: a successful kill, `FileNotFoundError`,
+# corrupt/unparseable content, and `pgid <= 0`.  Its sole production caller
+# (`cli.py:cancel_verify`) must clear the SHARED fixed-key holder rendezvous
+# ONLY when the key names the process it actually SIGKILLed — and rc alone
+# cannot tell it that.  cli.py:607-622 shows the key's owner writes it only
+# when it won the build-lane flock and clears it only in its own `finally`, so
+# the key routinely names a DIFFERENT, live verify; clearing it then makes
+# `GitOps._merge_verify_lease_active` fail-OPEN (`read_lock_holder_pgid` ->
+# None -> "not held"), losing `reset_persistent_merge_worktree`'s typed
+# `MergeVerifyLeaseHeld` diagnosis and making DF-3071's admission guard read
+# `_merge-verify` as IDLE while a verify is live — so the fleet redeploys over
+# it instead of deferring.
+#
+# The reporting channel follows the established `failed_pids_out` out-param
+# idiom, and is additive + keyword-only so every existing caller stays
+# source-compatible (test_cli.py's `fake_cancel_request(path, **kwargs)`
+# absorbs it; its rc=42 never reaches the clear).
+# ---------------------------------------------------------------------------
+
+
+class TestCancelRequestReportsWhatItKilled:
+    """`killed_pgid_out` reports on the kill path only — rc == 0 does not."""
+
+    def _run(self, path, ppid_map, *, kill_side_effects=None, out=None, failed_out=None):
+        """Run cancel_request with declawed kill/killpg and the new out-param."""
+        from orchestrator.verify_cancel import cancel_request
+
+        def _kill(pid, sig):
+            if kill_side_effects and kill_side_effects.get(pid) is not None:
+                raise kill_side_effects[pid]
+
+        rc = cancel_request(
+            path,
+            ppid_map_provider=lambda: ppid_map,
+            kill=_kill,
+            killpg=lambda pgid, sig: None,
+            failed_pids_out=failed_out,
+            killed_pgid_out=out,
+        )
+        return rc
+
+    def test_success_path_reports_the_killed_pgid(self, tmp_path):
+        """(a) The one return-0 path that killed something reports it."""
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-killed')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(path, {900: 4242}, out=out, failed_out=failed)
+
+        assert rc == 0
+        assert out == [4242], (
+            'the caller can only gate its shared-key clear on identity if the '
+            'pgid that was swept is reported back'
+        )
+        assert failed == []
+        assert not path.exists()
+
+    def test_absent_file_reports_nothing(self, tmp_path):
+        """(b) `FileNotFoundError` -> rc 0, nothing killed, nothing reported.
+
+        The COMMON case: a verify-merge that completes normally removes its own
+        per-request pgid file in its finally, so a cancel racing normal
+        completion lands here.
+        """
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-absent')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+
+    def test_corrupt_content_reports_nothing(self, tmp_path):
+        """(c) Unparseable content -> rc 0, file removed, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-corrupt')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not-an-int')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+        assert not path.exists()
+
+    def test_nonsensical_pgid_reports_nothing(self, tmp_path):
+        """(d) `pgid <= 0` -> rc 0, treated as corrupt, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        for i, raw in enumerate(('0', '-1')):
+            path = pgid_file(tmp_path / 'wt', f'req-nonsense-{i}')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            out: list[int] = []
+
+            assert self._run(path, {}, out=out) == 0, raw
+            assert out == [], f'{raw!r} kills nothing, so it reports nothing'
+            assert not path.exists()
+
+    def test_permission_error_path_reports_nothing(self, tmp_path):
+        """(e) rc == 1 -> a LIVE process refused SIGKILL; report nothing.
+
+        The victim plausibly still holds both lease axes, so the caller must
+        stay fail-closed and leave the rendezvous alone.  `failed_pids_out`
+        keeps its existing behaviour on this same path.
+        """
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-refused')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(
+            path, {}, kill_side_effects={4242: PermissionError()},
+            out=out, failed_out=failed,
+        )
+
+        assert rc == 1
+        assert out == [], 'a refused SIGKILL killed nothing — report nothing'
+        assert failed == [4242], 'the existing out-param is unchanged'
+        assert path.exists()
+
+    def test_out_param_is_optional_and_keyword_only(self, tmp_path):
+        """(f) Every existing call site stays source-compatible.
+
+        `cancel_request(path)` with no out-params must still work, and the new
+        parameter must be keyword-only so no positional caller can bind it by
+        accident.
+        """
+        import inspect
+
+        from orchestrator.verify_cancel import cancel_request, pgid_file, write_pgid_file
+
+        params = inspect.signature(cancel_request).parameters
+        assert params['killed_pgid_out'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params['killed_pgid_out'].default is None
+
+        path = pgid_file(tmp_path / 'wt', 'req-nokwargs')
+        write_pgid_file(path, 4242)
+        rc = cancel_request(
+            path,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+        )
+        assert rc == 0
+        assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: start_own_process_group — setsid + fallback
 # ---------------------------------------------------------------------------
 

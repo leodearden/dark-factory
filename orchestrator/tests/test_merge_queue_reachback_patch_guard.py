@@ -280,6 +280,14 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue.py', '_resolve_second_parent'),
     ('test_merge_queue.py', '_reverify_rebased_tree'),
     ('test_merge_queue_concurrent_verify.py', '_maybe_schedule_shadow_compare'),
+    # Task 3186 (deep merge-ahead delta) — the adopted-head shadow-compare
+    # cadence test.  Same genuinely-unavoidable reach-back as the four other
+    # ('_maybe_schedule_shadow_compare') pairs here: the consumer at
+    # merge_queue.py::_finalize_inflight resolves the name through the
+    # merge_queue module global (imported at merge_queue.py:124), so a spy
+    # installed on merge_shadow would sit off the resolution path and the
+    # test's `len(head_calls) == 1` assertion would pass vacuously.
+    ('test_merge_queue_deep_landing.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_queue_equivalence.py', '_check_post_merge_pyright'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),
