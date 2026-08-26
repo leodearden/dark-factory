@@ -24,6 +24,8 @@ MagicMock traps are closed here deliberately — see ``harness`` below.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -219,3 +221,249 @@ class TestFixtureWiring:
         """Step-8's on-disk plan.json fixtures resolve through
         ``git_ops.worktree_base``; it must be inside tmp_path, not the repo."""
         assert harness.git_ops.worktree_base.is_relative_to(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# step-1 — the _cascade_unblock_member claimant-liveness fork
+# ---------------------------------------------------------------------------
+
+def _resume_target(esc: Escalation) -> str:
+    """The Table B target for this escalation's ``resume``.
+
+    Asserted against the SAME authority the production code consults so a
+    future Table B edit propagates into these tests instead of drifting from
+    them — never the literal ``'pending'``.
+    """
+    from escalation.action_effects import effect_for
+
+    effect = effect_for('resume', esc.level, esc.category)
+    assert effect is not None and effect.target_status is not None
+    return effect.target_status
+
+
+async def _drive(harness: Harness, esc: Escalation) -> None:
+    """Fire the resolve callback and drain the scheduled background work.
+
+    The existing cascade-suite drain idiom — ``_on_escalation_resolved`` is
+    synchronous and schedules ``_cascade_unblock_member`` via
+    ``_schedule_coro_threadsafe``.
+    """
+    harness._on_escalation_resolved(esc)
+    await asyncio.gather(*list(harness._background_tasks))
+
+
+def _wire(harness: Harness, row: dict) -> None:
+    """Point BOTH reads at the same row.
+
+    ``get_status`` is the gate's status source and ``get_task`` the liveness
+    source; production reads them independently (see ``_cascade_unblock_
+    member``'s "Efficiency note"), so a fixture that sets only one of them
+    silently tests a row that cannot exist.
+    """
+    harness.scheduler.get_status = AsyncMock(return_value=row['status'])
+    harness.scheduler.get_task = AsyncMock(return_value=row)
+
+
+def _guard_charges(harness: Harness) -> list:
+    """The ``update_task`` calls that charged the re-block guard."""
+    return [
+        c for c in harness.scheduler.update_task.await_args_list  # type: ignore[attr-defined]
+        if 'reblock_guard' in (c.args[1] if len(c.args) > 1 else c.kwargs.get('updates', {}))
+    ]
+
+
+@pytest.mark.asyncio
+class TestCascadeMemberLivenessFork:
+    """``_cascade_unblock_member`` gates on claimant liveness, not ``status ==
+    'blocked'`` (task 3540 / PRD D8, spec E9)."""
+
+    async def test_in_progress_with_no_claimant_is_repended(
+        self, harness: Harness, caplog
+    ):
+        """[boundary #11 — THE red assertion] A stranded in-progress row
+        re-pends.
+
+        Today this DEBUG-skips on ``status != 'blocked'``, leaving a task
+        in-progress with nobody heartbeating it and its escalation now closed.
+        """
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+
+        with caplog.at_level(logging.INFO):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_in_progress_with_stale_heartbeat_is_repended(
+        self, harness: Harness
+    ):
+        """A claimant whose heartbeat aged past ``claimant_liveness_ttl_secs``
+        is not a live claimant — the row re-pends."""
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='stale'))
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_in_progress_with_fresh_heartbeat_is_not_flipped(
+        self, harness: Harness, caplog
+    ):
+        """A LIVE claimant owns its own re-pend (woken by ``event.set()``) —
+        flipping here would race a running workflow."""
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
+            for r in caplog.records
+        ), "Expected a DEBUG record naming the live claimant as the reason for the skip"
+
+    async def test_is_actively_held_alone_suppresses_the_flip(
+        self, harness: Harness, caplog
+    ):
+        """The in-memory signal is consulted FIRST and is sufficient on its own.
+
+        Mirrors ``TaskGroundTruth._resolve_live_claimant``'s priority order: a
+        workflow can hold the slot and the module locks before it has stamped
+        a claimant row, which a DB-only oracle reads as stranded.
+        """
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.is_actively_held.assert_called_with('3438')
+
+    async def test_blocked_with_no_claimant_still_flips(self, harness: Harness):
+        """[regression] Today's behaviour for the ordinary blocked orphan is
+        unchanged — this is the common production shape."""
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('blocked', claimant=None, heartbeat=None))
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_blocked_with_fresh_heartbeat_is_not_flipped(
+        self, harness: Harness, caplog
+    ):
+        """[the second red assertion] Today ``blocked`` flips UNCONDITIONALLY.
+
+        The rule is status-agnostic: a live claimant means the wake path owns
+        the re-pend at every allowed status, blocked included.  The recovery
+        edge for the skipped row is the scheduler's stranded-blocked-redispatch
+        sweep, which re-owns exactly "blocked, no live claimant, no open
+        escalation" once the claimant goes stale.
+        """
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('blocked', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
+            for r in caplog.records
+        ), "Expected a DEBUG record naming the live claimant"
+
+    @pytest.mark.parametrize(
+        'status',
+        ['done', 'cancelled', 'deferred', 'merge-deferred', 'pending', 'review'],
+    )
+    async def test_status_outside_the_allow_list_is_never_flipped(
+        self, harness: Harness, caplog, status: str
+    ):
+        """The allow-list is ``{blocked, in-progress}`` — an ALLOW-list, not a
+        deny-list, so a future status is skipped by construction rather than
+        silently acquired.
+
+        A NULL claimant makes every one of these read as "not live", so only
+        the status gate can be what withholds the flip.
+        """
+        esc = _esc(task_id='3438')
+        _wire(harness, _row(status, claimant=None, heartbeat=None))
+
+        with caplog.at_level(logging.DEBUG):
+            await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            r.levelno == logging.DEBUG and status in r.getMessage()
+            for r in caplog.records
+        ), f"Expected a DEBUG record naming the skipped status {status!r}"
+
+
+@pytest.mark.asyncio
+class TestLivenessForkReblockGuardSemantics:
+    """"Re-block guard semantics unchanged: the resolution-driven flip still
+    charges it" — including for the newly-eligible in-progress origin."""
+
+    async def test_stranded_in_progress_flip_charges_the_guard(
+        self, harness: Harness
+    ):
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+
+        await _drive(harness, esc)
+
+        charges = _guard_charges(harness)
+        assert len(charges) == 1, f'expected exactly one guard charge, got {charges}'
+        assert charges[0].kwargs.get('metadata_mode') == 'merge'
+        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
+
+    async def test_live_claimant_skip_does_not_charge_the_guard(
+        self, harness: Harness
+    ):
+        """The liveness gate sits BEFORE the guard, so a skipped row never
+        burns a re-pend budget it did not spend."""
+        esc = _esc(task_id='3438')
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+
+        await _drive(harness, esc)
+
+        assert _guard_charges(harness) == []
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_guard_at_threshold_withholds_the_in_progress_flip_too(
+        self, harness: Harness
+    ):
+        """A same-signature guard already at the threshold withholds the flip
+        regardless of whether the row originated blocked or in-progress."""
+        from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD
+
+        esc = _esc(task_id='3438')
+        signature = harness._reblock_signature(esc)
+        _wire(
+            harness,
+            _row(
+                'in-progress',
+                claimant=None,
+                heartbeat=None,
+                metadata={
+                    'reblock_guard': {
+                        'count': _REBLOCK_GUARD_THRESHOLD,
+                        'signature': signature,
+                    }
+                },
+            ),
+        )
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert _guard_charges(harness) == []
