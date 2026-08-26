@@ -506,3 +506,275 @@ class TestScoreCases:
         cases = _cases(('a', 'distractor'), ('b', 'distractor'))
         got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_RESTATED])
         assert got['per_class']['distractor'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
+
+
+# ---------------------------------------------------------------------------
+# Report assembly / rendering / the runner
+# ---------------------------------------------------------------------------
+
+def _fake_judge(answer: str = OUTCOME_RESTATED):
+    """A judge_fn that always answers *answer*, recording every call.
+
+    Deliberately not a Mock: the recorded `.calls` list is asserted on
+    positionally, and a Mock's call objects would let a signature change pass
+    unnoticed.
+    """
+    def judge_fn(case, candidates):
+        judge_fn.calls.append((case['memory_id'], [c['memory_id'] for c in candidates]))
+        return answer
+
+    judge_fn.calls = []
+    return judge_fn
+
+
+_PROVENANCE = {
+    'fixture_path': 'tests/fixtures/write_triage_calibration.jsonl',
+    'judge_provider': 'openai',
+    'judge_model': 'gpt-4o-mini',
+}
+
+
+def _run(tmp_path: Path, *, judge=None, corpus=None, distractors: int = 2):
+    return _mod().run_judge_eval(
+        records=corpus if corpus is not None else _corpus(),
+        judge_fn=judge if judge is not None else _fake_judge(),
+        report_path=tmp_path / 'report.json',
+        provenance=dict(_PROVENANCE),
+        distractors=distractors,
+    )
+
+
+class TestBuildReport:
+    """The report is the deliverable — D10 makes it the operator's input."""
+
+    def _report(self, **kwargs):
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        verdicts = [OUTCOME_RESTATED] * len(cases)
+        return _mod().build_report(
+            scored=_mod().score_cases(cases, verdicts),
+            provenance=dict(_PROVENANCE),
+            **kwargs,
+        )
+
+    def test_carries_every_top_level_key_the_operator_reads(self) -> None:
+        assert set(self._report()) >= {
+            'per_class', 'confusion', 'duplicate_outcome_split', 'false_contested',
+            'contested_ground_truth', 'caveats', 'provenance',
+        }
+
+    def test_states_in_machine_readable_form_that_contested_is_unmeasurable(
+        self,
+    ) -> None:
+        """The single most misleading reading this report could invite.
+
+        `false_contested: 0` looks like "the contradiction detector is
+        precise". It is not: alpha's corpus carries no positively-labelled
+        contradiction, so a judge that can NEVER say `contested` scores
+        identically to a perfect one. That has to be stated in the artifact
+        rather than left to the reader, and machine-readably rather than only
+        in prose, so a future consumer cannot join on the number without
+        tripping over the caveat.
+        """
+        ground_truth = self._report()['contested_ground_truth']
+        assert ground_truth['available'] is False
+        assert ':' in ground_truth['reason'], (
+            "alpha's '<code>: <measured detail>' reason format"
+        )
+        assert ground_truth['reason'].split(':')[0].strip(), 'a bare detail is not a code'
+
+    def test_all_four_classes_are_present_with_an_explicit_n(self) -> None:
+        per_class = self._report()['per_class']
+        assert set(per_class) == set(_mod().EVAL_CLASSES)
+        for name, entry in per_class.items():
+            assert isinstance(entry['n'], int), name
+
+    def test_provenance_names_the_model_that_produced_the_numbers(self) -> None:
+        """An accuracy figure with no model attached cannot be acted on: the
+        operator at the 3169 gate is deciding about a SHIPPED judge, and the
+        judge follows `llm.model` unless pinned.
+        """
+        provenance = self._report()['provenance']
+        for key in (
+            'fixture_path', 'judge_provider', 'judge_model',
+            'record_count', 'case_count', 'candidate_count', 'distractor_count',
+        ):
+            assert key in provenance, key
+
+    def test_the_report_round_trips_through_json(self) -> None:
+        report = self._report()
+        assert json.loads(json.dumps(report)) == report
+
+    def test_caveats_is_a_list_of_prose_strings(self) -> None:
+        caveats = self._report()['caveats']
+        assert isinstance(caveats, list) and caveats
+        assert all(isinstance(c, str) and c for c in caveats)
+
+
+class TestRenderMarkdown:
+    """Positional column binding — the `_row_cells` idiom from the sibling suite."""
+
+    COLUMNS = ('class', 'n', 'correct', 'accuracy')
+
+    @staticmethod
+    def _cells(row: str) -> list[str]:
+        return [c.strip() for c in row.strip().strip('|').split('|')]
+
+    @classmethod
+    def _row_cells(cls, md: str, name: str) -> dict[str, str]:
+        row = next(ln for ln in md.splitlines() if ln.startswith(f'| {name} |'))
+        cells = cls._cells(row)
+        assert len(cells) == len(cls.COLUMNS), (
+            f'row has {len(cells)} cells, header declares {len(cls.COLUMNS)}: {row}'
+        )
+        return dict(zip(cls.COLUMNS, cells, strict=True))
+
+    def _md(self, verdict: str = OUTCOME_RESTATED) -> str:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        scored = _mod().score_cases(cases, [verdict] * len(cases))
+        return _mod().render_markdown(
+            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
+        )
+
+    def test_the_header_declares_the_columns_this_class_binds(self) -> None:
+        """Pins the binding itself: a reordered header fails here, once."""
+        header = next(ln for ln in self._md().splitlines() if ln.startswith('| class |'))
+        assert self._cells(header) == list(self.COLUMNS)
+
+    def test_emits_one_row_per_class_including_the_empty_ones(self) -> None:
+        md = self._md()
+        for name in _mod().EVAL_CLASSES:
+            assert self._row_cells(md, name), name
+
+    def test_the_row_carries_that_classes_own_numbers(self) -> None:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        scored = _mod().score_cases(cases, [OUTCOME_RESTATED] * len(cases))
+        md = _mod().render_markdown(
+            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
+        )
+        cells = self._row_cells(md, 'duplicate')
+        entry = scored['per_class']['duplicate']
+        assert cells['n'] == str(entry['n'])
+        assert cells['correct'] == str(entry['correct'])
+        assert cells['accuracy'] == str(entry['accuracy'])
+
+    def test_an_unmeasured_class_renders_its_none_rather_than_a_number(self) -> None:
+        """`0.0` in this cell would read as a measured failure."""
+        scored = _mod().score_cases([], [])
+        md = _mod().render_markdown(
+            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
+        )
+        assert self._row_cells(md, 'distinct')['accuracy'] == 'None'
+
+    def test_the_contested_caveat_is_stated_in_prose(self) -> None:
+        """The operator reads the markdown, not the JSON."""
+        md = self._md()
+        assert 'contested' in md.lower()
+        assert 'false' in md.lower() and 'positive' in md.lower(), (
+            'the caveat must say what the contested number IS, not just cite it'
+        )
+
+    def test_renders_a_provenance_bullet_list(self) -> None:
+        md = self._md()
+        assert '## Provenance' in md
+        assert '- `judge_model`: `gpt-4o-mini`' in md
+
+
+class TestRunJudgeEval:
+    """The runner: build cases, call the judge once each, score, write, return."""
+
+    def test_writes_the_json_report(self, tmp_path: Path) -> None:
+        report = _run(tmp_path)
+        assert json.loads((tmp_path / 'report.json').read_text()) == report
+
+    def test_writes_a_markdown_sibling(self, tmp_path: Path) -> None:
+        _run(tmp_path)
+        assert (tmp_path / 'report.md').exists()
+
+    def test_creates_the_report_directory(self, tmp_path: Path) -> None:
+        nested = tmp_path / 'calibration' / 'nested'
+        _mod().run_judge_eval(
+            records=_corpus(),
+            judge_fn=_fake_judge(),
+            report_path=nested / 'report.json',
+            provenance=dict(_PROVENANCE),
+            distractors=2,
+        )
+        assert (nested / 'report.json').exists()
+
+    def test_calls_the_judge_exactly_once_per_case(self, tmp_path: Path) -> None:
+        """Every call is paid for; a re-ask would double the bill silently."""
+        judge = _fake_judge()
+        _run(tmp_path, judge=judge)
+        expected = _mod().build_judge_cases(_corpus(), distractors=2)
+        assert len(judge.calls) == len(expected)
+
+    def test_the_judge_is_handed_resolved_candidate_records_not_bare_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        """A judge shown ids has no text to compare and is answering noise —
+        the same defect `TestTheRealJudgeIsWiredAtTheToolSeam` pins at the
+        production seam.
+        """
+        judge = _fake_judge()
+        _run(tmp_path, judge=judge)
+        for memory_id, candidate_ids in judge.calls:
+            assert candidate_ids, f'{memory_id} was handed an empty slate'
+        by_case = dict(judge.calls)
+        assert by_case['c1-dup-1'][0] == 'c1-canon', (
+            'the attach target must lead the resolved slate'
+        )
+
+    def test_a_judge_that_is_wrong_on_every_case_still_produces_a_report(
+        self, tmp_path: Path,
+    ) -> None:
+        """No pass/fail verdict, at any accuracy. D10 makes the report the
+        arbiter and the human the gate; a runner that raised or flagged on a
+        low score would be that gate, made of code.
+        """
+        report = _run(tmp_path, judge=_fake_judge(OUTCOME_CONTESTED))
+        assert report['per_class']['duplicate']['accuracy'] == 0.0
+        assert 'verdict' not in report
+        assert 'passed' not in report and 'failed' not in report
+
+    def test_a_judge_failure_propagates_rather_than_scoring_a_wrong_answer(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same discipline `run_calibration` applies to embed_fn/search_fn.
+
+        A swallowed judge error is indistinguishable from a genuine
+        misclassification, so it would silently shrink the measured population
+        AND depress the accuracy it reports — a doubly wrong number.
+        """
+        def boom(case, candidates):
+            raise RuntimeError('the judge exploded')
+
+        with pytest.raises(RuntimeError, match='exploded'):
+            _run(tmp_path, judge=boom)
+
+    def test_provenance_records_the_measured_population(self, tmp_path: Path) -> None:
+        report = _run(tmp_path)
+        provenance = report['provenance']
+        assert provenance['record_count'] == len(_corpus())
+        assert provenance['case_count'] == len(
+            _mod().build_judge_cases(_corpus(), distractors=2),
+        )
+        assert provenance['distractor_count'] == 2
+        assert provenance['judge_model'] == 'gpt-4o-mini'
+
+    def test_no_accuracy_floor_is_compared_anywhere_in_the_module(self) -> None:
+        """Asserted against the SOURCE, because this is a prohibition rather
+        than a behaviour.
+
+        A floor could be added in a branch no test happens to reach, and it
+        would then be the 3169 gate without anyone having decided that. The
+        scan is deliberately crude — it is a tripwire, and the right response
+        to a false positive is to say in a comment why the comparison is not
+        a floor.
+        """
+        import re  # noqa: PLC0415
+
+        source = SCRIPT_PATH.read_text()
+        offenders = re.findall(
+            r'accuracy[^\n]{0,40}?[<>]=?\s*[0-9]', source,
+        ) + re.findall(r'[0-9.]+\s*[<>]=?[^\n]{0,40}?accuracy', source)
+        assert not offenders, f'an accuracy floor is being compared: {offenders}'
