@@ -6683,6 +6683,61 @@ class TestCheckRegrowth:
         assert 'unstamped' in message
         assert 'flat' in message
 
+    @pytest.mark.parametrize('table', ['baseline', 'stamping_value'])
+    def test_an_unknown_metric_in_a_flat_table_is_named(self, table):
+        """The UNKNOWN half is actionable at the METRIC level too.
+
+        This check's docstring promises missing and unknown are collected
+        together at every level, for the reason `_check_arms` does it: a
+        misspelling produces both at once and only the unknown half says
+        WHERE the metric went.  The arm and mode levels honored that; the
+        metric level computed `absent` alone, so a renamed metric key
+        passed silently on the unknown side and the reader was told only
+        that something had vanished.
+        """
+        block = _regrowth_block()
+        block[table]['flat']['claim_recall.at_50'] = 0.0
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_50' in message
+        assert 'flat' in message
+
+    @pytest.mark.parametrize('table', ['after', 'deltas'])
+    def test_an_unknown_metric_in_a_per_mode_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['unstamped']['flat']['tokens_per_query.median'] = 1.0
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'tokens_per_query.median' in message
+        assert 'unstamped' in message
+        assert 'flat' in message
+
+    def test_a_misspelled_metric_reports_BOTH_halves_in_one_message(self):
+        """One rename, one message, both halves — the actionable shape.
+
+        A metric key renamed in the producer without being renamed in
+        `REGROWTH_METRICS` is exactly one edit, and the pair of names in a
+        single message is what turns "a metric is missing" into "this
+        metric was spelled that way".
+        """
+        block = _regrowth_block()
+        block['baseline']['flat']['claim_recall.at5'] = (
+            block['baseline']['flat'].pop('claim_recall.at_5')
+        )
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_5' in message
+        assert 'claim_recall.at5' in message
+
     def test_a_none_VALUE_does_not_raise(self):
         """`None` is a legitimate "measured, no denominator" in this pipeline.
 

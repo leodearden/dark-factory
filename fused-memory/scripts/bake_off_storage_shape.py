@@ -2484,12 +2484,24 @@ def _check_regrowth(regrowth: dict[str, Any]) -> None:
                 f'{list(REGROWTH_READ_ARMS)}.'
             )
         for arm in REGROWTH_READ_ARMS:
+            # Missing AND unknown, together — the same shape as the arm and
+            # mode levels above, and for the same reason.  Reporting only
+            # `absent` told a reader a metric had vanished and left them to
+            # find where it went; a rename produces both halves at once and
+            # the unknown half is the one that names the new spelling.
             absent = sorted(expected_metrics - set(table[arm]))
-            if absent:
+            unknown_metrics = sorted(set(table[arm]) - expected_metrics)
+            if absent or unknown_metrics:
+                problems = []
+                if absent:
+                    problems.append(f'missing metric(s) {absent}')
+                if unknown_metrics:
+                    problems.append(f'unknown metric(s) {unknown_metrics}')
                 raise IncompleteReportError(
-                    f"regrowth {where}: read arm '{arm}' is missing metric(s) "
-                    f"{absent}. A metric absent from a delta table is a metric "
-                    f"absent from the decision."
+                    f"regrowth {where}: read arm '{arm}' has "
+                    f'{"; ".join(problems)}. A metric absent from a delta '
+                    f'table is a metric absent from the decision, and an '
+                    f'unknown one is where a renamed metric went.'
                 )
 
     for key in _REQUIRED_REGROWTH_KEYS:
