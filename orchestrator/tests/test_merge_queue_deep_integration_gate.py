@@ -158,6 +158,20 @@ file AND its origin red, and the origin is where the unit-level contract lives.
                                  |   half (permit census by TOKEN, thrash
                                  |   ladder equality) is ORIGINAL here.
   -------------------------------+-------------------------------------------
+  _capture_verify_timeouts       | the ``_run_cmd`` recorder is the shape of
+                                 |   test_verify.py::
+                                 |   TestRunVerificationColdFirstUse::
+                                 |   _make_success_mock.  The second patch it
+                                 |   installs (restoring the REAL
+                                 |   run_scoped_verification over conftest's
+                                 |   autouse stub) is ORIGINAL here — no
+                                 |   merge-queue test had needed to reach
+                                 |   BELOW that stub before.
+  _timed_out_verify_result       | ORIGINAL; the timed_out=True verdict shape
+                                 |   is test_merge_queue.py::
+                                 |   _mock_verify_timeout's, narrowed to a
+                                 |   real VerifyResult rather than a mock.
+  -------------------------------+-------------------------------------------
   _canary_predicate_items_per    | a verbatim transcription of the SHIPPED
                                  |   scripts/merge-deep-canary-predicate.sh,
                                  |   re-cloned from
@@ -546,6 +560,32 @@ def _fail_verify_result():
     )
 
 
+def _timed_out_verify_result():
+    """A :class:`VerifyResult` that TIMED OUT — a red that names no culprit.
+
+    Distinct from :func:`_fail_verify_result` on exactly one axis, and the
+    whole of Row 11 leg (c) turns on it: ``timed_out=True`` is the ONLY thing
+    that advances ``_post_merge_verify_timeouts`` (a real test/lint/type red
+    deliberately does not feed the loop-breaker — those bubble to the steward
+    instead of oscillating).  Everything else is empty rather than
+    plausible-looking: a timeout produced no verdicts, so a populated
+    ``test_output`` here would be fiction, and an ENOSPC-looking string in one
+    of these fields would route the result down the transient-infra branch
+    instead of the timeout one.
+
+    ``category=''`` is load-bearing for the same reason — a category in
+    ``INFRA_TRANSIENT_CATEGORIES`` would make ``_run_post_merge_verify`` RETRY
+    the dispatch rather than conclude, and the leg would be measuring the retry
+    loop rather than the timeout path.
+    """
+    from orchestrator.verify import VerifyResult
+
+    return VerifyResult(
+        passed=False, test_output='', lint_output='', type_output='',
+        summary='verify timed out', category='', timed_out=True,
+    )
+
+
 # ── dispatch-scene spies ─────────────────────────────────────────────────────
 
 
@@ -585,6 +625,53 @@ def _spy_post_merge_verify(
         'orchestrator.merge_queue._run_post_merge_verify', _recording,
     )
     return calls
+
+
+def _capture_verify_timeouts(monkeypatch) -> list[float]:
+    """Record the per-command ``timeout`` a merge verify hands down, in order.
+
+    Row 11's budget claim has to be about the number the code THREADS, never
+    about elapsed wall clock: the budget under test is 7200 seconds, and there
+    is no fake-clock facility for verify in this repo (by design — the verify
+    path's deadlines are real subprocess deadlines).  So this captures at the
+    bottom of the stack, at the subprocess launcher, and lets everything above
+    it run for real.
+
+    TWO patches, and BOTH are required for the capture to be non-vacuous:
+
+      * ``verify._run_cmd`` -> a recorder returning ``(0, '', False)`` (rc 0,
+        no output, not timed out).  The recorder is the reason no configured
+        command ever actually executes — the gate's config carries the SHIPPED
+        ``test_command``/``lint_command``/``type_check_command``, which would
+        otherwise launch the whole repo's suite.  Same shape as
+        test_verify.py::TestRunVerificationColdFirstUse.
+      * ``merge_queue.run_scoped_verification`` -> the REAL
+        ``verify.run_scoped_verification``.  The conftest autouse
+        ``_mock_merge_queue_verification`` replaces this with a passed=True
+        stub for every test in the suite, and that stub sits ABOVE
+        ``run_verification`` — i.e. above ``_resolve_verify_timeout``.  Without
+        this restore the recorder is never called at all and the assertion
+        passes on an empty list.  (Hence the ``assert captured`` vacuity guard
+        every caller carries.)
+
+    Returns the live list, appended to as commands dispatch.
+    """
+    from orchestrator import verify as _verify
+
+    captured: list[float] = []
+
+    async def _recording_run_cmd(
+        cmd, cwd, timeout, env=None, log_path=None, **kwargs,
+    ):
+        captured.append(timeout)
+        return 0, '', False
+
+    monkeypatch.setattr('orchestrator.verify._run_cmd', _recording_run_cmd)
+    monkeypatch.setattr(
+        'orchestrator.merge_queue.run_scoped_verification',
+        _verify.run_scoped_verification,
+    )
+    return captured
 
 
 def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
@@ -1459,6 +1546,18 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
     ``_run_post_merge_verify``, so the whole dispatch/emit/timeout-resolution
     path above it genuinely runs and the ``merge_verify`` row is genuinely
     emitted.  A script that runs out returns PASS, matching δ's oracle.
+
+    Three script vocabularies, the third added for Row 11 leg (c):
+
+      * ``True``  — a green real-suite verdict;
+      * ``False`` — an ordinary red (:func:`_fail_verify_result`);
+      * a :class:`VerifyResult` — returned VERBATIM.  This is the injector for
+        a verdict whose SHAPE is the claim rather than its polarity — a
+        ``timed_out=True`` result, say — and injecting it here rather than by
+        replacing ``_run_post_merge_verify`` (the ``outcome=`` vocabulary
+        :func:`_spy_post_merge_verify` uses) is what leaves the real
+        function's ``timeouts``/``enospc_retries`` bookkeeping in the loop.
+        A stub in its place would be asserting the test's own arithmetic.
     """
     from unittest.mock import AsyncMock, MagicMock
 
@@ -1469,6 +1568,8 @@ def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
     async def _run_merge_verify(*args, **kwargs):
         scene.posted.append({'args': args, 'kwargs': kwargs})
         passed = verdicts.pop(0) if verdicts else True
+        if isinstance(passed, VerifyResult):
+            return passed
         if passed:
             return VerifyResult(
                 passed=True, test_output='ok', lint_output='', type_output='',
@@ -1493,21 +1594,31 @@ async def _make_gate_scene(
     script: list[bool] | None = None,
     heads: tuple[str, ...] = ('101',),
     remote: bool = False,
+    real_local: bool = False,
 ) -> _GateScene:
     """Build an n-follower, finalize-capable scene over a REAL git repo.
 
     *script* is the ordered pass/fail verdict sequence; it runs out into PASS.
-    *remote* selects WHERE the verdict is injected:
+    *remote* / *real_local* select WHERE the verdict is injected — three
+    mutually exclusive seams, deepest last:
 
-      * ``False`` — replace ``orchestrator.merge_queue._run_post_merge_verify``
+      * neither — replace ``orchestrator.merge_queue._run_post_merge_verify``
         outright (δ's shape).  Cheapest, and the right seam for a row whose
         claim is about LANDING or about queue state.  No ``merge_verify`` event
         is emitted on this path.
-      * ``True`` — install a ``_StubRemoteAllocator`` over a REMOTE
+      * ``remote=True`` — install a ``_StubRemoteAllocator`` over a REMOTE
         ``HostLease`` whose runner answers the script, and let the real
         ``_run_post_merge_verify`` run.  The right seam for a row whose claim
-        is about TELEMETRY (``chain_items``, ``chain_build_ms``) or about the
-        verify BUDGET, because both are produced strictly below that call.
+        is about TELEMETRY (``chain_items``, ``chain_build_ms``), because that
+        is produced strictly below that call.
+      * ``real_local=True`` — patch NOTHING on the verify path: a LOCAL lease,
+        the real ``_run_post_merge_verify``, its real ``LocalRunner``, and (via
+        :func:`_capture_verify_timeouts`, which the caller installs) the real
+        ``run_scoped_verification`` → ``run_verification``.  The ONLY seam that
+        reaches ``verify._resolve_verify_timeout``, so the only one a BUDGET
+        claim can be made at.  The caller supplies the recorder; *script* is
+        ignored on this arm (the verdict is whatever the real stack produces —
+        a pass, since the recorder returns rc 0).
 
     Module-level monkeypatching is confined to the four names
     test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
@@ -1569,7 +1680,7 @@ async def _make_gate_scene(
 
     monkeypatch.setattr(merge_queue, 'build_chain', _recording_build)
 
-    if not remote:
+    if not remote and not real_local:
         verdicts = list(script or [])
 
         async def _oracle(_git_ops, _req, merge_wt, **kwargs):
