@@ -2397,6 +2397,58 @@ def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
     )
 
 
+def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HEAD-START skip line obeys SKIP_LOG_INTERVAL_SECS too (task 4754).
+
+    Sibling of test_staleness_pass_suppresses_skip_log_outside_log_bucket
+    above, for the second clock gate. The cost being avoided is the same one
+    SKIP_LOG_INTERVAL_SECS exists for: this pass runs every ~60s from a FRESH
+    oneshot process with no cross-tick memory (see the module docstring), so
+    an unthrottled line would write ~30 near-identical entries per 30-minute
+    head start, per tier, burying actionable watchdog output.
+
+    Also pins that the head-start gate returns BEFORE the git subprocess AND
+    before enumeration — both are monkeypatched to pytest.fail.
+
+    The paired positive case (at a bucket boundary the line IS emitted) is
+    already covered by
+    test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_file,
+    which pins now to a bucket boundary and asserts the skip line is present;
+    it is deliberately not duplicated here.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    # Halfway into the bucket — well outside the logging slot near its start.
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted while the head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_enumerate_running_units",
+        lambda: pytest.fail("must not enumerate while the head start is running"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no head-start skip line outside the log-rate-limit bucket: "
+        f"{log_messages}"
+    )
+
+
 def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6371,6 +6423,61 @@ def test_fused_memory_staleness_pass_within_min_interval_suppresses_log_outside_
     wdog.fused_memory_staleness_pass()
 
     assert log_messages == [], f"Expected no skip log outside the bucket: {log_messages}"
+
+
+def test_fm_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fm HEAD-START skip line obeys SKIP_LOG_INTERVAL_SECS too (task 4754).
+
+    fm mirror of test_staleness_pass_suppresses_head_start_skip_log_outside_
+    log_bucket. Same cost being avoided: this pass runs every ~60s from a
+    FRESH oneshot process with no cross-tick memory (see the module
+    docstring), so an unthrottled line would write ~30 near-identical entries
+    per 30-minute head start, per tier, burying actionable watchdog output.
+
+    Also pins that the fm head-start gate returns before the git subprocess,
+    before the enabled probe, and before any delegation — all three are
+    monkeypatched to pytest.fail.
+
+    The paired positive case is already covered by
+    test_fm_staleness_head_start_anchored_on_fm_min_interval_expiry_real_clock_file,
+    which pins now to a bucket boundary and asserts the skip line is present;
+    it is deliberately not duplicated here.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: True)
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted while the fm head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "is_unit_enabled",
+        lambda _u: pytest.fail("must not probe the unit while the fm head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate while the fm head start is running"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no fm head-start skip line outside the log-rate-limit bucket: "
+        f"{log_messages}"
+    )
 
 
 def test_fused_memory_staleness_pass_commit_grace_suppresses(
