@@ -220,6 +220,7 @@ from orchestrator.verify import (
     run_scoped_verification,
     run_verification,
     seed_main_baseline,
+    seed_main_baseline_skipped,
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import (
@@ -3915,6 +3916,28 @@ async def _run_post_merge_verify(
                 ', '.join(sorted(verify.failing_test_ids)), merge_sha,
             )
         seed_main_baseline(merge_sha, frozenset())
+        # Task 3226 (step-19): seed the SKIPPED baseline from the SAME pass,
+        # inside the SAME guard, so the two caches keep agreeing about which
+        # shas have a baseline at all.  Without this the skipped cache is
+        # cold for every merge-seeded sha while the failing cache is warm,
+        # `cached_main_baseline_skipped_ids` returns None, and the whole
+        # skip-is-not-a-pass guard (verify_failure_is_preexisting_on_main's
+        # unattributable-id fall-through, and the branch-block reason
+        # partition above) is inert in steady state — a cold probe only runs
+        # at process start or after a TTL expiry.
+        #
+        # ASYMMETRY, deliberate: the failing side two lines up is overridden
+        # to the EMPTY set and never trusted verbatim (see the task-2590
+        # amendment comment above — verify.passed is True by construction
+        # here, so main has no live failures, and a rerun-plugin
+        # fail-then-pass would otherwise poison the baseline).  The skipped
+        # side is the opposite and IS trusted verbatim: a passing run
+        # genuinely did skip those tests, and there is no analogous way for a
+        # pass to fabricate a skip.  Overriding it to empty would recreate
+        # exactly the cold-skipped-cache no-op this seed exists to remove.
+        # `or ()` keeps the None-means-empty normalization identical to
+        # main_baseline_failing_ids' own seed call.
+        seed_main_baseline_skipped(merge_sha, verify.skipped_test_ids or ())
 
     return None
 
