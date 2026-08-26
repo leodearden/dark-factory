@@ -1,0 +1,482 @@
+"""Tests for eval_write_triage_judge.py — the judge measured against leaf alpha's labels.
+
+PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
+
+Structure mirrors ``test_calibrate_write_triage.py``: the script is loaded by
+path through importlib (``scripts/`` is not an importable package), and the
+loader is invoked LAZILY via ``_mod()`` so the label-vocabulary tests below
+stay runnable independently of the script's existence.
+
+Every test in this file is free of ``OPENAI_API_KEY``, network and Qdrant —
+the judge is injected as a plain callable, exactly as ``run_calibration``
+injects ``embed_fn``/``search_fn``.
+
+WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT: any accuracy FLOOR. D10 makes
+the committed report the arbiter and the human at the task-3169 flip gate the
+decision-maker. A floor asserted here would silently become that gate,
+pre-empting a decision this task is explicitly told not to make. The
+assertions are about report SHAPE, per-class presence with an explicit ``n``,
+and traceability — never about whether a number is large enough.
+"""
+from __future__ import annotations
+
+import functools
+import importlib.util
+import json
+import types
+from pathlib import Path
+
+import pytest
+
+from fused_memory.server.write_triage import (
+    OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
+    OUTCOME_RESTATED,
+    OUTCOME_STORED,
+    TRIAGE_OUTCOMES,
+)
+
+SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
+CALIBRATE_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
+FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+
+
+def _load_module(path: Path, mod_name: str) -> types.ModuleType:
+    """Load a ``scripts/`` file by path, registered in ``sys.modules``.
+
+    Registration is required for reflection-based decorators, which resolve
+    ``sys.modules.get(cls.__module__)``. Same loader as
+    ``test_calibrate_write_triage.py``.
+    """
+    import sys  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    return _load_module(SCRIPT_PATH, 'eval_write_triage_judge')
+
+
+@functools.cache
+def _calib() -> types.ModuleType:
+    """Leaf alpha's script, loaded INDEPENDENTLY of the eval's own import.
+
+    Loaded separately on purpose: the whole point of the label-vocabulary
+    tests is that the eval does not RE-SPELL alpha's labels, and reading them
+    back through the eval's own re-export could not tell a faithful re-export
+    from a hand-typed copy that happens to agree today.
+    """
+    return _load_module(CALIBRATE_PATH, 'calibrate_write_triage')
+
+
+@pytest.fixture(scope='module')
+def records() -> list[dict]:
+    """The committed curator corpus, parsed with the stdlib.
+
+    Parsed here rather than through either script's loader, so a loader bug
+    cannot mask a data defect (and vice versa) — the discipline the sibling
+    suite's own ``records`` fixture states.
+    """
+    assert FIXTURE_PATH.exists(), f'fixture missing: {FIXTURE_PATH}'
+    return [
+        json.loads(line)
+        for line in FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def _rec(memory_id: str, cluster_id: str, label: str, *, category: str = 'procedural_knowledge') -> dict:
+    """A minimal fixture record — only the keys the eval's pure core reads."""
+    return {
+        'memory_id': memory_id,
+        'content': f'content of {memory_id}',
+        'category': category,
+        'cluster_id': cluster_id,
+        'label': label,
+    }
+
+
+def _corpus() -> list[dict]:
+    """Three clusters, every label represented, deliberately unsorted on input.
+
+    Unsorted so a determinism assertion cannot pass by accident on an input
+    that was already in canonical order.
+    """
+    return [
+        _rec('c2-dup-1', 'c2', 'duplicate'),
+        _rec('c1-canon', 'c1', 'canonical'),
+        _rec('c3-pseudo', 'c3', 'pseudo_contradiction'),
+        _rec('c1-dup-2', 'c1', 'duplicate'),
+        _rec('c2-canon', 'c2', 'canonical'),
+        _rec('c1-dup-1', 'c1', 'duplicate'),
+        _rec('c3-canon', 'c3', 'canonical'),
+        _rec('c2-distinct', 'c2', 'distinct'),
+        _rec('c3-dup-1', 'c3', 'duplicate'),
+    ]
+
+
+def _by_class(cases: list[dict], expected_class: str) -> list[dict]:
+    return [c for c in cases if c['expected_class'] == expected_class]
+
+
+# ---------------------------------------------------------------------------
+# build_judge_cases
+# ---------------------------------------------------------------------------
+
+class TestBuildJudgeCases:
+    """Ground truth derived from alpha's labels — never invented here.
+
+    Each case is one judge call: a submitted entry plus the candidate slate it
+    is shown. The label the curator assigned to the submitted entry is what
+    names the acceptable answers, so every expectation in this class traces
+    back to a human adjudication rather than to a guess about what the judge
+    ought to say.
+    """
+
+    def test_every_non_canonical_record_yields_a_labelled_case(self) -> None:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        labelled = [
+            c for c in cases
+            if c['expected_class'] != _mod().CLASS_DISTRACTOR
+        ]
+        assert {c['memory_id'] for c in labelled} == {
+            'c1-dup-1', 'c1-dup-2', 'c2-dup-1', 'c2-distinct', 'c3-dup-1', 'c3-pseudo',
+        }
+
+    def test_a_canonical_record_is_never_a_submitted_entry(self) -> None:
+        """A canonical IS the attach target; asking the judge to compare it to
+        itself would score the fixture's construction, not the judge.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        canonicals = {'c1-canon', 'c2-canon', 'c3-canon'}
+        assert not (canonicals & {c['memory_id'] for c in cases}), (
+            f'a canonical was submitted as a case: {cases!r}'
+        )
+
+    def test_a_labelled_case_always_shows_the_judge_its_cluster_canonical(self) -> None:
+        """The attach target must be on the slate or the answer is about
+        a different memory than the one an attach would touch.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        for case in cases:
+            if case['expected_class'] == _mod().CLASS_DISTRACTOR:
+                continue
+            cluster = case['memory_id'].split('-')[0]
+            assert f'{cluster}-canon' in case['candidates'], f'{case!r}'
+
+    def test_the_case_carries_the_submitted_content_and_category(self) -> None:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        case = next(c for c in cases if c['memory_id'] == 'c1-dup-1')
+        assert case['content'] == 'content of c1-dup-1'
+        assert case['category'] == 'procedural_knowledge'
+
+    # -- the label -> acceptable-outcomes table ----------------------------
+
+    def test_a_duplicate_accepts_either_attach_and_nothing_else(self) -> None:
+        """BOTH attach outcomes are correct, and that is a measurement
+        decision, not laxity.
+
+        Alpha's labels do not separate a verbatim restatement from a
+        rediscovery that carries a novel fragment — the curator recorded
+        "same claim as the canonical" and stopped there. Scoring one of
+        `restated`/`amended` as WRONG would invent a label the curator never
+        assigned and report a made-up error rate as a measured one. The split
+        between them is reported as a DISTRIBUTION instead (see
+        `TestScoreCases`), which says what the judge did without claiming to
+        know which was right.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        case = next(c for c in cases if c['memory_id'] == 'c1-dup-1')
+        assert set(case['acceptable_outcomes']) == {OUTCOME_RESTATED, OUTCOME_AMENDED}
+        assert OUTCOME_STORED not in case['acceptable_outcomes'], (
+            'a curator-confirmed rediscovery answered `stored` is the exact '
+            'miss triage exists to catch'
+        )
+        assert OUTCOME_CONTESTED not in case['acceptable_outcomes']
+
+    def test_a_distinct_record_accepts_only_stored(self) -> None:
+        """The hard negative: same cluster, same topic, curator-ruled NOT the
+        same claim. Any attach here destroys a distinction a human drew.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        case = next(c for c in cases if c['memory_id'] == 'c2-distinct')
+        assert set(case['acceptable_outcomes']) == {OUTCOME_STORED}
+
+    def test_a_pseudo_contradiction_accepts_everything_but_contested(self) -> None:
+        """These are curator-adjudicated BOTH-CORRECT pairs (esc-5557/esc-5626)
+        — "the contradiction was an omission, not a disagreement".
+
+        So the measurable property is narrow and negative: the judge must not
+        MANUFACTURE a contradiction. Whether it stores or attaches is not
+        something alpha's labels adjudicate, so neither is scored.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        case = next(c for c in cases if c['memory_id'] == 'c3-pseudo')
+        assert set(case['acceptable_outcomes']) == set(TRIAGE_OUTCOMES) - {OUTCOME_CONTESTED}
+        assert OUTCOME_CONTESTED not in case['acceptable_outcomes']
+
+    def test_the_table_is_alphas_vocabulary_imported_not_re_spelled(self) -> None:
+        """A fifth label added to alpha must fail HERE, loudly.
+
+        The failure mode this forbids: a new curator label lands in the
+        fixture, this eval has no entry for it, and it is quietly bucketed as
+        something — producing an accuracy figure computed against an
+        expectation nobody ever set.
+        """
+        calib = _calib()
+        assert set(_mod().ACCEPTABLE_OUTCOMES) == {
+            calib.LABEL_DUPLICATE,
+            calib.LABEL_DISTINCT,
+            calib.LABEL_PSEUDO_CONTRADICTION,
+        }
+        assert _mod().LABEL_CANONICAL == calib.LABEL_CANONICAL
+
+    def test_an_unknown_label_raises_rather_than_being_bucketed(self) -> None:
+        corpus = [*_corpus(), _rec('c1-mystery', 'c1', 'newly_invented_label')]
+        with pytest.raises(Exception, match='newly_invented_label'):
+            _mod().build_judge_cases(corpus, distractors=2)
+
+    def test_every_label_in_the_committed_fixture_is_covered(self, records) -> None:
+        """The live guard against the case above, run on the real corpus."""
+        known = set(_mod().ACCEPTABLE_OUTCOMES) | {_mod().LABEL_CANONICAL}
+        assert {r['label'] for r in records} <= known
+
+    # -- distractors -------------------------------------------------------
+
+    def test_a_distractor_never_comes_from_the_cases_own_cluster(self) -> None:
+        """A same-cluster record on the "unrelated" slate would make an attach
+        to it CORRECT while being scored as a distraction.
+        """
+        corpus = _corpus()
+        by_id = {r['memory_id']: r['cluster_id'] for r in corpus}
+        for case in _mod().build_judge_cases(corpus, distractors=2):
+            own = by_id.get(case['memory_id'])
+            cluster = case['memory_id'].split('-')[0]
+            extras = [
+                cid for cid in case['candidates']
+                if cid != f'{cluster}-canon'
+            ]
+            assert own is not None
+            for cid in extras:
+                assert by_id[cid] != own, f'{case!r} carries a same-cluster distractor'
+
+    def test_the_slate_is_the_canonical_plus_exactly_n_distractors(self) -> None:
+        """PRD C1's "top 3-5" is a WIDTH; a slate that silently narrows makes
+        the measurement easier than the production call it stands in for.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        for case in cases:
+            if case['expected_class'] == _mod().CLASS_DISTRACTOR:
+                continue
+            assert len(case['candidates']) == 3, f'{case!r}'
+            assert len(set(case['candidates'])) == 3, f'duplicated slot: {case!r}'
+
+    def test_selection_is_deterministic_and_seedless(self) -> None:
+        """Committed artifacts must be reproducible from the fixture alone.
+
+        `random` is not merely discouraged here: a seeded shuffle would make
+        the committed report un-reproducible by anyone who did not also know
+        the seed, and an unseeded one un-reproducible by anyone at all.
+        """
+        first = _mod().build_judge_cases(_corpus(), distractors=2)
+        second = _mod().build_judge_cases(list(reversed(_corpus())), distractors=2)
+        assert first == second, 'case construction depends on input ORDER'
+        assert 'import random' not in SCRIPT_PATH.read_text()
+
+    def test_distractors_are_spread_rather_than_the_same_slate_every_time(
+        self, records,
+    ) -> None:
+        """A single globally-smallest slate reused 84 times would measure one
+        arbitrary pair of clusters, not the corpus.
+        """
+        cases = _mod().build_judge_cases(records, distractors=4)
+        slates = {tuple(sorted(c['candidates'])) for c in cases}
+        assert len(slates) > 1, 'every case was shown an identical slate'
+
+    # -- the distractor control class --------------------------------------
+
+    def test_a_distractor_control_case_shows_no_same_cluster_record_at_all(
+        self,
+    ) -> None:
+        """The negative control: nothing on the slate is the right answer.
+
+        Without it the eval cannot tell a judge that classifies from a judge
+        that attaches to whatever it is shown — the labelled cases all carry
+        the correct target, so "always attach" scores well on every one of
+        them.
+        """
+        corpus = _corpus()
+        by_id = {r['memory_id']: r['cluster_id'] for r in corpus}
+        controls = _by_class(_mod().build_judge_cases(corpus, distractors=2), 'distractor')
+        assert controls, 'no distractor-control cases were built'
+        for case in controls:
+            own = by_id[case['memory_id']]
+            for cid in case['candidates']:
+                assert by_id[cid] != own, f'{case!r} shows its own cluster'
+
+    def test_a_distractor_control_accepts_only_stored(self) -> None:
+        controls = _by_class(_mod().build_judge_cases(_corpus(), distractors=2), 'distractor')
+        for case in controls:
+            assert set(case['acceptable_outcomes']) == {OUTCOME_STORED}, f'{case!r}'
+
+    def test_the_control_slate_is_as_wide_as_a_labelled_one(self) -> None:
+        """Same width, so a difference in the answer is about the CONTENT of
+        the slate rather than about how much of it there was.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        controls = _by_class(cases, 'distractor')
+        for case in controls:
+            assert len(case['candidates']) == 3, f'{case!r}'
+
+    def test_the_control_class_is_capped_at_one_case_per_cluster(self) -> None:
+        """Cost control, stated rather than silent: every case is a paid LLM
+        call, and one control per cluster already answers the question the
+        control exists to ask.
+        """
+        controls = _by_class(_mod().build_judge_cases(_corpus(), distractors=2), 'distractor')
+        clusters = [c['memory_id'].split('-')[0] for c in controls]
+        assert sorted(clusters) == ['c1', 'c2', 'c3']
+
+    def test_the_class_name_is_a_module_constant_not_a_literal(self) -> None:
+        assert _mod().CLASS_DISTRACTOR == 'distractor'
+        assert tuple(_mod().EVAL_CLASSES) == (
+            _calib().LABEL_DUPLICATE,
+            _calib().LABEL_DISTINCT,
+            _calib().LABEL_PSEUDO_CONTRADICTION,
+            _mod().CLASS_DISTRACTOR,
+        )
+
+
+# ---------------------------------------------------------------------------
+# score_cases
+# ---------------------------------------------------------------------------
+
+def _cases(*specs: tuple[str, str]) -> list[dict]:
+    """Hand-built cases: ``(memory_id, expected_class)`` pairs.
+
+    Built directly rather than through ``build_judge_cases`` so a scoring bug
+    and a case-construction bug cannot cancel each other out.
+    """
+    out = []
+    for memory_id, expected_class in specs:
+        out.append({
+            'memory_id': memory_id,
+            'content': f'content of {memory_id}',
+            'category': 'procedural_knowledge',
+            'candidates': ['x-canon'],
+            'expected_class': expected_class,
+            'acceptable_outcomes': _mod().ACCEPTABLE_OUTCOMES.get(
+                expected_class, frozenset({OUTCOME_STORED}),
+            ),
+        })
+    return out
+
+
+class TestScoreCases:
+    """Counting only — every judgment call was made in the table above."""
+
+    def test_per_class_reports_n_correct_and_accuracy(self) -> None:
+        cases = _cases(('a', 'duplicate'), ('b', 'duplicate'), ('c', 'distinct'))
+        got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED, OUTCOME_STORED])
+        assert got['per_class']['duplicate'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
+        assert got['per_class']['distinct'] == {'n': 1, 'correct': 1, 'accuracy': 1.0}
+
+    def test_all_four_classes_are_always_present_with_an_explicit_n(self) -> None:
+        """An omitted class reads identically to a perfect one.
+
+        `distinct` (n=3) and `pseudo_contradiction` (n=6) are small enough
+        that a construction bug could empty either without anything looking
+        wrong, so the report must state the population it measured even when
+        that population is zero.
+        """
+        got = _mod().score_cases([], [])
+        assert set(got['per_class']) == set(_mod().EVAL_CLASSES)
+        for name, entry in got['per_class'].items():
+            assert entry['n'] == 0, name
+            assert entry['correct'] == 0, name
+
+    def test_an_empty_class_scores_none_never_zero(self) -> None:
+        """`0.0` reads as "measured, and the judge failed everything"."""
+        got = _mod().score_cases([], [])
+        for name, entry in got['per_class'].items():
+            assert entry['accuracy'] is None, f'{name}: {entry!r}'
+
+    def test_the_confusion_map_is_every_class_by_every_outcome(self) -> None:
+        """Full 4xN, so a systematic failure is visible as a SHAPE.
+
+        "Every duplicate answered `stored`" is a wiring bug and "duplicates
+        split across the two attaches" is a working judge; a per-class
+        accuracy alone cannot tell them apart.
+        """
+        cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'))
+        got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_CONTESTED])
+        assert set(got['confusion']) == set(_mod().EVAL_CLASSES)
+        for name, row in got['confusion'].items():
+            assert set(row) == set(TRIAGE_OUTCOMES), name
+        assert got['confusion']['duplicate'][OUTCOME_STORED] == 1
+        assert got['confusion']['duplicate'][OUTCOME_RESTATED] == 0
+        assert got['confusion']['pseudo_contradiction'][OUTCOME_CONTESTED] == 1
+
+    def test_the_duplicate_split_is_a_distribution_not_an_error_term(self) -> None:
+        """Reported, and deliberately not scored — see the table's rationale."""
+        cases = _cases(('a', 'duplicate'), ('b', 'duplicate'), ('c', 'duplicate'))
+        got = _mod().score_cases(
+            cases, [OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_AMENDED],
+        )
+        assert got['duplicate_outcome_split'] == {'restated': 1, 'amended': 2}
+        assert got['per_class']['duplicate']['correct'] == 3, (
+            'the split must not be charged as error'
+        )
+
+    def test_false_contested_counts_every_contested_verdict(self) -> None:
+        """Every one of them is a false positive, and that is a property of
+        the CORPUS, not a simplification.
+
+        Alpha carries no positively-labelled contradiction anywhere: all six
+        `pseudo_contradiction` records were adjudicated NOT contradictions.
+        So the fixture can measure the judge's contested false-positive rate
+        and nothing else — there is no contested recall to compute, and
+        reporting one would be a number with no measurement behind it.
+        """
+        cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'), ('c', 'distinct'))
+        got = _mod().score_cases(
+            cases, [OUTCOME_CONTESTED, OUTCOME_CONTESTED, OUTCOME_STORED],
+        )
+        assert got['false_contested'] == 2
+
+    def test_no_contested_verdict_scores_zero_not_none(self) -> None:
+        """Unlike an empty class, this one WAS measured — 0 is the finding."""
+        cases = _cases(('a', 'duplicate'))
+        got = _mod().score_cases(cases, [OUTCOME_RESTATED])
+        assert got['false_contested'] == 0
+
+    def test_the_result_round_trips_through_json(self) -> None:
+        """It is written to disk verbatim; a set or a tuple in here is a
+        TypeError at the end of a paid run.
+        """
+        cases = _cases(('a', 'duplicate'), ('b', 'distractor'))
+        got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED])
+        assert json.loads(json.dumps(got)) == got
+
+    def test_a_verdict_count_mismatch_raises(self) -> None:
+        """Silently zipping to the shorter list would drop cases from the
+        denominator and report an accuracy over a population nobody chose.
+        """
+        with pytest.raises(Exception, match='(?i)verdict'):
+            _mod().score_cases(_cases(('a', 'duplicate'), ('b', 'distinct')), [OUTCOME_STORED])
+
+    def test_the_distractor_class_is_scored_like_any_other(self) -> None:
+        cases = _cases(('a', 'distractor'), ('b', 'distractor'))
+        got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_RESTATED])
+        assert got['per_class']['distractor'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
