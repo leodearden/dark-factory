@@ -2981,14 +2981,7 @@ def _regrowth_lines(report: dict[str, Any]) -> list[str]:
     lines: list[str] = ['', '## Regrowth deltas', '']
     regrowth = report['regrowth']
     if regrowth is None:
-        lines.append(
-            '**Not probed in this run.**  The +1-re-emission probe was '
-            'skipped (`--no-regrowth`), so this artifact carries no regrowth '
-            'measurement at all.  The heading is emitted anyway: an ABSENT '
-            'section reads identically to a probe that ran and moved '
-            'nothing, and telling those two apart is the whole reason this '
-            'section exists.'
-        )
+        lines.append(REGROWTH_NOT_PROBED_DISCLOSURE)
         return lines
 
     metrics = _regrowth_metric_keys()
@@ -3627,6 +3620,36 @@ REGROWTH_CREDITED_SEMANTICS_DISCLOSURE = (
     'record-id aliasing did under `b_grouped`.  A credited column that '
     'holds while the stored one falls means the transform is masking '
     'regrowth at read time, not that retrieval survived it.'
+)
+
+
+#: What an EMPTY `## Regrowth deltas` section is allowed to claim, in one
+#: place, so its PRESENCE is executable while its wording stays free — the
+#: convention `REGROWTH_STAMPING_CEILING_DISCLOSURE` below established.
+#:
+#: NEUTRAL about the cause, because the renderer cannot know it.
+#: ``regrowth=None`` has TWO producers: ``--no-regrowth``, and a
+#: ``--clusters N`` subset that retained no injected topic — which
+#: ``probe_regrowth = bool(injections)`` deliberately folds into the same
+#: ``None`` so the live and replay drivers cannot disagree about coverage.
+#: By the time this text renders they are indistinguishable, so naming
+#: either one is a guess published as a fact, in the one section whose
+#: whole purpose is to make "skipped" legible.  What it CAN do is send the
+#: reader to the two descriptors that separate them; a test reads those
+#: names back out of this string and checks them against the committed
+#: artifact's protocol block, so the pointer cannot dangle.
+REGROWTH_NOT_PROBED_DISCLOSURE = (
+    '**Not probed in this run.**  This artifact carries no regrowth '
+    'measurement at all.  Two runs produce that: `--no-regrowth`, and a '
+    '`--clusters N` subset that retained none of the injected topics — the '
+    'driver folds both into the same empty block, so this section cannot '
+    'tell you which one happened and does not guess.  Read '
+    '`protocol.regrowth_probed` and `protocol.regrowth_injections_measured` '
+    'for the run\'s actual coverage: `false` beside a `0` count is either '
+    'case, and the `clusters_measured` descriptor beside them says whether '
+    'this was a subset run.  The heading is emitted anyway: an ABSENT '
+    'section reads identically to a probe that ran and moved nothing, and '
+    'telling those two apart is the whole reason this section exists.'
 )
 
 

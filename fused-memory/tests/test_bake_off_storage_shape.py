@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import re
 import types
 from collections.abc import Container
 from pathlib import Path
@@ -7824,6 +7825,99 @@ class TestRenderMarkdownRegrowthSection:
 
         assert mod.REGROWTH_STAMPING_CEILING_DISCLOSURE not in mod.render_markdown(
             _report())
+
+
+class TestTheNotProbedDisclosure:
+    """What an EMPTY `## Regrowth deltas` section is allowed to claim.
+
+    `regrowth=None` has TWO producers, not one.  `--no-regrowth` is the
+    obvious one; the other is a `--clusters N` subset that retained no
+    injected topic, which the driver anticipates explicitly and which
+    `probe_regrowth = bool(injections)` folds into the same `None`.  The
+    two are INDISTINGUISHABLE by the time the renderer sees them, so a
+    paragraph naming `--no-regrowth` as the cause publishes a false
+    statement about why the section is empty — in the one section whose
+    entire stated purpose is to make "skipped" legible.
+    """
+
+    def test_the_disclosure_appears_verbatim_when_the_probe_did_not_run(self):
+        mod = _mod()
+
+        section = '\n'.join(_section(
+            mod.render_markdown(_report()), '## Regrowth deltas',
+        ))
+
+        assert mod.REGROWTH_NOT_PROBED_DISCLOSURE in section
+
+    def test_it_is_not_emitted_when_the_probe_did_run(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_NOT_PROBED_DISCLOSURE not in mod.render_markdown(
+            _report_with_regrowth())
+
+    def test_every_protocol_key_it_names_exists_in_the_committed_block(self):
+        """The pointer must not dangle — checked against DRIVER output.
+
+        The disclosure sends the reader to the protocol descriptors for the
+        coverage it cannot state itself, and in an empty section that
+        paragraph is the ONLY thing there.  Checked against the COMMITTED
+        artifact rather than a local fixture on purpose: a fixture would
+        agree with a stale copy of the name, whereas the committed block is
+        what `run_bake_off` actually emitted, so a descriptor renamed on
+        the driver side fails here on the next regeneration.
+
+        The names are READ OUT of the constant rather than typed here, so
+        rewording the paragraph cannot silently drop the pointer.
+        """
+        mod = _mod()
+        named = set(re.findall(
+            r'`protocol\.([a-z_]+)`', mod.REGROWTH_NOT_PROBED_DISCLOSURE,
+        ))
+
+        assert named, 'the disclosure names no protocol descriptor at all'
+        assert named <= set(_committed_report()['protocol'])
+
+    def test_it_names_the_coverage_descriptors_a_reader_needs(self):
+        """Not any protocol key — the two that answer "why is this empty".
+
+        `regrowth_probed` is the predicate, `regrowth_injections_measured`
+        is the count that separates "the flag was off" from "the subset
+        retained nothing".  Between them a reader can tell the two skip
+        routes apart, which is precisely what the prose must not assert.
+        """
+        mod = _mod()
+
+        assert '`protocol.regrowth_probed`' in mod.REGROWTH_NOT_PROBED_DISCLOSURE
+        assert '`protocol.regrowth_injections_measured`' in (
+            mod.REGROWTH_NOT_PROBED_DISCLOSURE
+        )
+
+    def test_the_two_skip_routes_render_the_same_empty_section(self):
+        """Why the wording has to be neutral, as an executable fact.
+
+        A `--no-regrowth` run and a subset that retained no injection both
+        reach the renderer as `regrowth=None` with a zero
+        `regrowth_injections_measured`, and NOTHING in the report tells
+        them apart.  If a later change threads the reason through, this
+        test fails — and the wording is then free to name it.
+        """
+        mod = _mod()
+        flag_off = _protocol()
+        flag_off['regrowth_probed'] = False
+        flag_off['regrowth_injections_measured'] = 0
+        subset_kept_none = _protocol()
+        subset_kept_none['regrowth_probed'] = False
+        subset_kept_none['regrowth_injections_measured'] = 0
+        subset_kept_none['clusters_measured'] = 1
+
+        def _section_for(protocol):
+            report = mod.build_report(
+                arms=_all_arms(), audit_recall=_audit_recall(),
+                protocol=protocol,
+            )
+            return _section(mod.render_markdown(report), '## Regrowth deltas')
+
+        assert _section_for(flag_off) == _section_for(subset_kept_none)
 
 
 class TestTheNotBlindAuthoredDisclosure:
