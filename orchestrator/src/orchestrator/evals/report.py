@@ -18,9 +18,17 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
-from .metrics import _rate, blend_composite, produced_a_plan
+from .metrics import (
+    DECLINE_KINDS,
+    _rate,
+    blend_composite,
+    produced_a_plan,
+    terminal_kind_of,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .runner import EvalResult
 
 logger = logging.getLogger(__name__)
@@ -383,6 +391,26 @@ def _mean_plan_quality(scores: list[float]) -> float | None:
     if not scores:
         return None
     return round(sum(scores) / len(scores), 4)
+
+
+def _merge_counts(per_key: Mapping[str, Mapping[str, int]]) -> dict[str, int]:
+    """Fold per-config ``{kind: count}`` tallies into ONE campaign-wide tally.
+
+    THE reduction behind ``build_plan_quality_report``'s report-level
+    ``declined_by_kind`` (task 4760), so that total is summed from the very
+    counters the per-config entries are emitted from rather than re-derived from
+    the rendered ``configs`` list — the :func:`_mean_plan_quality` discipline
+    applied to a histogram: one arithmetic, so the two surfaces cannot disagree
+    about the same quantity.
+
+    Pure: reads the mapping, mutates nothing, and returns insertion-ordered
+    counts the caller key-sorts for determinism.
+    """
+    merged: dict[str, int] = defaultdict(int)
+    for counts in per_key.values():
+        for key, n in counts.items():
+            merged[key] += n
+    return dict(merged)
 
 
 def _plan_rate(n_admitted: int, no_plan: int) -> float | None:
@@ -1436,8 +1464,13 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'no_plan', 'judged_without_reference',
-    'plan_rate', 'mean_plan_quality',
+    # ``declined`` sits IMMEDIATELY AFTER ``no_plan`` (task 4760) because it is
+    # the explanation OF that number — how many of the cells that scored zero
+    # got there by taking an explicit plan-tools decline exit rather than by
+    # failing to plan. Appending it at the far end would separate the count from
+    # the one it qualifies, which is the whole defect this column removes.
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'declined',
+    'judged_without_reference', 'plan_rate', 'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -1548,6 +1581,37 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     ``judged_without_reference_unmeasured`` carrying how many did — an
     unmeasured bound and a measured-clean one are opposite findings and must
     not render alike.
+
+    A FOURTH treatment (task 4760), which — like the third — subtracts nothing
+    and floors nothing, and unlike the third does not even bound a number:
+    ``declined`` / ``declined_by_kind`` / ``no_plan_declined`` are EXPLANATORY.
+    They move no cell between pools and change no existing figure; they say WHY
+    the ``no_plan`` cells are there. ``no_plan`` has always answered HOW MANY
+    architect cells emitted no plan and never WHY, and the two causes it
+    conflates are opposite verdicts on the candidate: a genuine "could not
+    plan" is a content failure, whereas ``report_false_premise`` and its four
+    siblings are the architect CORRECTLY refusing an unplannable task. THE
+    tranche-1 misreading is the case in point: 47 of 47 ``plan_steps = 0``
+    architect cells were explicit, adversarially-verified-true declines, and the
+    campaign readout could not say so — it reported an 89% planning failure that
+    the transcripts flatly contradicted, and separating the two took manual
+    forensics over destroyed-on-cleanup artifacts.
+
+    So: transport refusal → EXCLUDED + ``cap_excluded``; content failure →
+    FLOORED + ``no_plan``; judged blind → KEPT, SCORED, FLAGGED; terminal
+    decline → KEPT, SCORED, UNCHANGED, and EXPLAINED. ``declined`` counts
+    admitted cells whose ``terminal_kind`` is one of the five explicit decline
+    exits — including a PLAN-THEN-DECLINE cell, which is in ``declined`` but not
+    in ``no_plan``, so ``declined - no_plan_declined`` recovers that population
+    exactly. ``declined_by_kind`` is key-sorted for the same reason
+    ``cap_excluded_by_cause`` is: the kinds are not interchangeable.
+    ``terminal_kind_unmeasured`` counts the admitted cells that predate the
+    field, so a PARTIAL split never wears the appearance of a complete one.
+
+    ``plan_rate`` and ``mean_plan_quality`` are DELIBERATELY untouched by all of
+    this: planRate keeps its exact historical derivation (``plan_steps > 0``
+    over the admitted pool) so every campaign artifact already committed stays
+    comparable, and the split is reported ALONGSIDE it.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -1572,6 +1636,16 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'judged_without_reference': _judged_without_reference(
                 result.metrics
             ),
+            # The TERMINAL STATEMENT this cell ended on (task 4760), read
+            # through THE shared accessor rather than a bare ``.get`` for the
+            # same reason ``judged_without_reference`` above is: one expression,
+            # one contract, so the report layer and the campaign driver can
+            # never disagree about what the field means. ``None`` — an
+            # implementer cell (the field does not apply) or a cell persisted
+            # before the field existed — travels through to the aggregate's
+            # ``terminal_kind_unmeasured``, never collapsed to "did not
+            # decline".
+            'terminal_kind': terminal_kind_of(result.metrics),
             # The θ score this cell contributes to the aggregate, through THE
             # shared accessor (task 3302): the persisted float for a real plan,
             # a floored 0.0 for a cell that produced none, None when the cell is
@@ -1606,6 +1680,14 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     judged_blind_unmeasured: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
     by_cause: dict[str, int] = defaultdict(int)
+    # The task-4760 decline split. Four counters, all over the SAME admitted
+    # pool ``scored`` / ``no_plan`` / ``judged_blind`` are over.
+    declined: dict[str, int] = defaultdict(int)
+    declined_by_kind: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    no_plan_declined: dict[str, int] = defaultdict(int)
+    terminal_unmeasured: dict[str, int] = defaultdict(int)
     for row in rows:
         if row['role_under_test'] != 'architect':
             continue
@@ -1632,6 +1714,28 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
                 judged_blind_unmeasured[cfg] += 1
             elif row['judged_without_reference']:
                 judged_blind[cfg] += 1
+            # The decline split (task 4760), counted INSIDE this same branch and
+            # for the same reason the two counts above are: it describes the
+            # ADMITTED pool ``n`` reports. A cap-tainted cell may well carry a
+            # stale terminal kind, but it belongs to ``cap_excluded`` alone —
+            # counting it here would describe a cell the mean beside it never
+            # saw. The keyless case is tallied separately rather than falling
+            # into the "not a decline" arm: absence means the cell's terminal
+            # statement was never measured, and reading it as "did not decline"
+            # is precisely the partial-count-wearing-a-complete-count's-clothes
+            # defect this split exists to remove.
+            kind = row['terminal_kind']
+            if kind is None:
+                terminal_unmeasured[cfg] += 1
+            elif kind in DECLINE_KINDS:
+                declined[cfg] += 1
+                declined_by_kind[cfg][kind] += 1
+                # The INTERSECTION with ``no_plan`` — THE tranche-1 number.
+                # Gated on the same predicate ``no_plan`` above is gated on, so
+                # the two counts cannot describe different cells; a
+                # plan-then-decline cell increments ``declined`` and NOT this.
+                if not row['produced_a_plan']:
+                    no_plan_declined[cfg] += 1
             # THE shared accessor's answer (task 3302), not the raw persisted
             # score: a cell whose architect produced no plan lands here as a
             # floored 0.0, identically to build_composite_report's pool, so
@@ -1647,6 +1751,29 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # floored to 0.0 (task 3302). Disjoint from ``cap_excluded``: those
             # cells are not in ``n`` at all.
             'no_plan': no_plan[cfg],
+            # WHY those cells are there (task 4760). ``declined`` counts the
+            # admitted cells whose terminal statement was one of the five
+            # explicit plan-tools decline exits — a CORRECT refusal, not a
+            # planning failure — and subtracts nothing: every one of them is
+            # still in ``n``, in ``plan_rate`` and in ``mean_plan_quality`` at
+            # the score it earned.
+            'declined': declined[cfg],
+            # …broken out by KIND, key-sorted for determinism, exactly as
+            # ``cap_excluded_by_cause`` is: 'already_done' and 'false_premise'
+            # are opposite findings about the fixture and must not merge.
+            'declined_by_kind': {
+                kind: declined_by_kind[cfg][kind]
+                for kind in sorted(declined_by_kind[cfg])
+            },
+            # The intersection of ``declined`` and ``no_plan`` — THE tranche-1
+            # sentence ("47 of 47 no-plan cells were explicit declines"). A
+            # plan-then-decline cell is in ``declined`` but NOT here, so
+            # ``declined - no_plan_declined`` recovers that population exactly.
+            'no_plan_declined': no_plan_declined[cfg],
+            # How many of those same ``n`` cells predate the field, so a
+            # PARTIAL split is never read as a complete one. Its siblings above
+            # are counts over the MEASURED sub-population only.
+            'terminal_kind_unmeasured': terminal_unmeasured[cfg],
             # How many of those same ``n`` scored cells were judged WITHOUT a
             # reference diff (task 3628). Unlike the two counts above this one
             # subtracts nothing and floors nothing — the cells are in ``n`` and
@@ -1676,6 +1803,20 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         'configs': configs,
         'cap_excluded': sum(excluded.values()),
         'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
+        # Report-level decline totals (task 4760), summed from the very same
+        # per-config counters above so the two surfaces cannot drift. No
+        # absence rule of their own: unlike ``judged_without_reference``, an
+        # unmeasured cell here does not make the campaign-wide count UNKNOWN —
+        # it makes it PARTIAL, and ``terminal_kind_unmeasured`` beside it says
+        # by how much, which is the honest shape for a count whose
+        # sub-population is nameable.
+        'declined': sum(declined.values()),
+        'declined_by_kind': {
+            kind: total
+            for kind, total in sorted(_merge_counts(declined_by_kind).items())
+        },
+        'no_plan_declined': sum(no_plan_declined.values()),
+        'terminal_kind_unmeasured': sum(terminal_unmeasured.values()),
         # Report-level total, with the same absence rule as the per-config
         # counts (task 3628): one keyless admitted cell ANYWHERE makes the
         # campaign-wide bound unknown, so the total is None rather than a
@@ -1703,6 +1844,13 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
     VALIDITY rather than to membership: a mean reported without saying how many
     of its cells were graded with no landed diff to grade against is the same
     silent degradation one layer up. Those cells ARE in ``n`` and in the mean.
+
+    ``declined`` (task 4760) is the same discipline applied to CAUSE: it sits
+    immediately after the ``no_plan`` it explains and says how many of those
+    zero-scoring cells got there by an explicit plan-tools refusal rather than
+    by failing to plan. It adjusts nothing — those cells are in ``n``, in
+    ``plan_rate`` and in the mean exactly as before. A measured zero renders
+    ``0``, not the ``-`` its neighbours use for "unmeasurable".
     """
     configs = report.get('configs', [])
     rendered = [
@@ -1711,6 +1859,12 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
             'no_plan': str(c['no_plan']),
+            # How many of those n cells ended on an explicit decline exit (task
+            # 4760). A measured ZERO renders '0', never the '-' sentinel its
+            # neighbours use: on this surface '-' already means "not an
+            # architect run" / "we could not measure this", and a config that
+            # simply never declined is a MEASURED fact about it.
+            'declined': str(c['declined']),
             # How many of those n cells the judge scored with NO reference diff
             # (task 3628). Rendered here rather than only in JSON because a
             # mean reported without saying how many of its cells were judged
@@ -1752,12 +1906,15 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     ``0.0000``, and must stay distinguishable from the ``-`` a non-architect row
     uses.
 
-    Two sections follow the rows: the exclusion count — how many architect cells
+    Sections follow the rows: the exclusion count — how many architect cells
     were not measurable, BROKEN OUT BY CAUSE so a permanent config error is not
-    read as a transient cap window — and the per-config mean block. Both are
-    computed from the report, so the CLI caller picks the exclusion up with no
-    change of its own. The same report always renders byte-identically (no
-    wall-clock or dict-order dependence).
+    read as a transient cap window — the task-3628 validity bound, the task-4760
+    DECLINE SPLIT (how many of the scored cells ended on an explicit plan-tools
+    refusal, broken out by kind, and how much of the ``no_plan`` band that
+    accounts for), and the per-config mean block. All are computed from the
+    report, so the CLI caller picks them up with no change of its own. The same
+    report always renders byte-identically (no wall-clock or dict-order
+    dependence).
     """
     rows = report.get('rows', [])
 
@@ -1819,6 +1976,43 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
         lines.append(
             f'judged without reference: {judged_blind} of {scored_cells} '
             f'scored cell(s) (plan_quality bounded)'
+        )
+    # The decline split (task 4760), modelled on the ``cap_excluded_by_cause``
+    # section above and stated against ITS OWN pool — the SCORED cells, which is
+    # the population ``terminal_kind`` was resolved over. It explains the
+    # ``no_plan`` count printed below rather than adjusting it: a decline is the
+    # architect CORRECTLY refusing an unplannable task, and the tranche-1
+    # readout could not say so.
+    #
+    # Suppressed only when the split is MEASURED and empty (no declines, nothing
+    # unmeasured) — the judged-without-reference discipline: a campaign where
+    # every candidate planned must not grow a line about refusals it never made,
+    # and that is also what keeps this byte-deterministic.
+    declined_total = report.get('declined', 0) or 0
+    declined_by_kind = report.get('declined_by_kind') or {}
+    no_plan_cells = sum(c['no_plan'] for c in report.get('configs', []))
+    no_plan_declined = report.get('no_plan_declined', 0) or 0
+    terminal_unmeasured = report.get('terminal_kind_unmeasured', 0) or 0
+    if declined_total:
+        kinds = ', '.join(
+            f'{kind}: {n}' for kind, n in sorted(declined_by_kind.items())
+        )
+        lines.append(
+            f'declined: {declined_total} of {scored_cells} scored cell(s) '
+            f'ended on an explicit decline exit'
+            + (f' ({kinds})' if kinds else '')
+            + f' — {no_plan_declined} of {no_plan_cells} no-plan cell(s) were '
+            f'a refusal, not a planning failure'
+        )
+    # An UNMEASURED population is emphatically NOT the suppressible case: a
+    # rebuild over the pre-4760 corpus resolved no terminal kind at all, and a
+    # silent '0 declines' there would read as "every candidate tried and
+    # failed to plan" — the exact reading this split exists to refute.
+    if terminal_unmeasured:
+        lines.append(
+            f'terminal kind: UNMEASURED — {terminal_unmeasured} of '
+            f'{scored_cells} scored cell(s) predate the field, so the decline '
+            f'split is PARTIAL (not measured-clean)'
         )
     lines.append('')
     lines.extend(_format_plan_quality_mean_section(report))
