@@ -1756,6 +1756,146 @@ def test_main_happy_path_writes_valid_jsonl_and_returns_0(tmp_path, monkeypatch,
     assert "failed=0" in captured.err
 
 
+# ---------------------------------------------------------------------------
+# task 4736: main()'s third run-level disposition -- the DEFERRAL
+#
+# Mirrors census.main, which prints "census: deferred -- stage=... -- <reason>"
+# and returns 0 for its own headroom defer.  An operator should read the same
+# shape from both legibility CLIs, and a non-zero exit here would make
+# check_trickle_liveness.sh report a failure for a timer behaving exactly as
+# designed.
+# ---------------------------------------------------------------------------
+
+def _capping_invoke_cli(prompt, model, **kwargs):
+    raise mod.CoderCapExhausted(
+        "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
+        "stdout=\"You've hit your weekly limit - resets 2pm (Europe/London)\" "
+        "stderr=''",
+        marker="you've hit your",
+    )
+
+
+def test_main_all_capped_defers_with_exit_zero(tmp_path, monkeypatch, capsys):
+    """A capped night is not a failed night.
+
+    Exit 0, because an all-accounts-capped night is a normal operating
+    condition (Leo's directive; sibling task 4503).  Before this, the same
+    night exited 1 and epsilon turned that into an ERROR-level escalation --
+    an infra page for expected weather.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-capped-{i}", f"session {i} confusion", f"capped{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+    monkeypatch.setattr(mod, "_invoke_cli", _capping_invoke_cli)
+
+    out_path = tmp_path / "out.jsonl"
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc == 0, (
+        "a capped night must not exit non-zero -- that is what turned "
+        "2026-08-24 into an infra incident for a condition ruled normal"
+    )
+
+    # Zero records, and the --out truncated: exactly the storm arm's
+    # discipline.  A stale file from a prior successful run must never be
+    # left looking like tonight's output.
+    assert out_path.exists()
+    assert out_path.read_text(encoding="utf-8").strip() == "", (
+        "a deferred night writes ZERO records -- nothing was ever coded"
+    )
+
+    err = capsys.readouterr().err
+    assert "DEFERRED" in err, (
+        f"the deferral must be distinguishable AT A GLANCE from the storm "
+        f"branch's 'coder: FAILURE'; got {err!r}"
+    )
+    assert "FAILURE" not in err, (
+        f"a deferral must not be announced as a failure; got {err!r}"
+    )
+    assert "weekly limit" in err.lower(), (
+        f"the banner the CLI actually printed must reach the operator -- "
+        f"'deferred: weekly limit' and 'deferred' are different messages; "
+        f"got {err!r}"
+    )
+
+
+def test_main_deferral_summary_stays_honest_about_the_tally(tmp_path, monkeypatch, capsys):
+    """Exit 0 must not launder the counts.
+
+    The one-line summary still reports status=failure with the true
+    total/succeeded/failed, plus the new capped= count.  "Deferred, nothing
+    coded" must never be readable as "coded fine, found nothing" -- that is
+    the same conflation the never-fabricate contract exists to prevent, just
+    at the run level.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-honest-{i}", f"session {i} confusion", f"honest{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+    monkeypatch.setattr(mod, "_invoke_cli", _capping_invoke_cli)
+
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+    ])
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert "status=failure" in err, (
+        f"the summary must stay honest: nothing was coded tonight; got {err!r}"
+    )
+    assert "total=3" in err, err
+    assert "succeeded=0" in err, err
+    assert "failed=3" in err, err
+    assert "capped=3" in err, (
+        f"the summary must report the cap count, or the tally cannot be "
+        f"reconciled with the exit code; got {err!r}"
+    )
+
+
+def test_main_storm_with_no_caps_still_fails_loudly(tmp_path, monkeypatch, capsys):
+    """REGRESSION guard.  A genuine storm carrying zero caps keeps exiting 1
+    with the existing FAILURE output.
+
+    This is the boundary the whole deferral rests on: if it ever slipped, real
+    coder regressions would exit 0 and be silently deferred forever.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-real-{i}", f"session {i} confusion", f"real{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return "not parseable as json, sorry"
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+    ])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "FAILURE" in err
+    assert "DEFERRED" not in err
+    assert "capped=0" in err
+
+
 def test_main_storm_writes_zero_records_and_returns_nonzero(tmp_path, monkeypatch, capsys):
     digests = [
         _write_main_digest(tmp_path, f"main-storm-{i}", f"session {i} confusion", f"storm{i}")
