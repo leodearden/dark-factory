@@ -583,6 +583,105 @@ class TestWriteTriageLeavesAreGreenTier:
         assert path not in d.restart_required
 
 
+class TestWriteTriageJudgeLeavesAreGreenTier:
+    """The judge knobs (task 3128, PRD leaf gamma) are ALL green tier.
+
+    The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
+    rather than listed by hand, and that inversion is the whole point: a
+    SEVENTH ``judge_*`` leaf added later without a reload registration fails
+    here instead of silently degrading to restart-only. ``config/reload.py``
+    states the rule its own way — "anything absent from this frozenset
+    silently degrades to restart-only" — and a kill switch that quietly needs
+    a restart is no kill switch, because the operator believes they turned it
+    off.
+
+    Follows ``TestTopicAnchoredRecallReloadTier``'s shape: the classification
+    test is paired with the live-read test that EARNS the classification.
+    Green tier is not assertable on its own — a value captured at
+    construction cannot observe an in-place mutation, and would have to stay
+    restart-only however it were registered here.
+    """
+
+    #: Every judge leaf the schema declares, discovered rather than restated.
+    JUDGE_FIELDS = tuple(sorted(
+        name for name in FusedMemoryConfig().write_triage.__class__.model_fields
+        if name.startswith('judge_')
+    ))
+
+    def test_the_schema_actually_declares_judge_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.JUDGE_FIELDS) >= 6, self.JUDGE_FIELDS
+
+    @pytest.mark.parametrize('field', JUDGE_FIELDS)
+    def test_every_judge_leaf_is_allowlisted(self, field):
+        path = f'write_triage.{field}'
+        assert path in RELOADABLE_FIELDS, (
+            f'{path} must be allowlisted for hot-reload — an unregistered leaf '
+            'silently degrades to restart-only, and a restart-only judge kill '
+            'switch is no kill switch'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'new_value'),
+        [
+            ('judge_enabled', False),
+            ('judge_provider', 'anthropic'),
+            ('judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 3.5),
+            ('judge_candidate_count', 3),
+            ('judge_accuracy_report_path', 'calibration/judge_report.json'),
+        ],
+    )
+    def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'write_triage.{field}'
+        old = getattr(live.write_triage, field)
+        assert old != new_value, f'{path} must actually change for this to assert anything'
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    @pytest.mark.parametrize(
+        ('field', 'resolver_name', 'new_value'),
+        [
+            ('judge_enabled', 'resolve_judge_enabled', False),
+            ('judge_provider', 'resolve_judge_provider', 'anthropic'),
+            ('judge_model', 'resolve_judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 'resolve_judge_timeout', 3.5),
+            ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
+        ],
+    )
+    def test_an_applied_reload_is_observed_by_the_live_resolver(
+        self, field, resolver_name, new_value,
+    ):
+        """The live-read property that MAKES the green-tier classification honest.
+
+        `judge_accuracy_report_path` has no resolver by design — it is a
+        traceability pointer read by the operator and the eval's own test, not
+        by the write path — so it is covered by the allowlist and
+        applied-candidate legs above and not by this one.
+        """
+        from fused_memory.server import write_triage_judge
+
+        resolver = getattr(write_triage_judge, resolver_name)
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolver(memory_service) != new_value
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert f'write_triage.{field}' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolver(memory_service) == new_value
+
+
 class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
     """The per-category cutoff map (task 3357), reloaded as ONE leaf.
 
