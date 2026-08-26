@@ -1584,3 +1584,89 @@ class TestEscalationRootCauseVariants:
 
         assert not hasattr(restored, 'not_a_real_field')
         assert restored.root_cause_variants == []
+
+
+class TestCitationShaAndRefileSuppressionFields:
+    """`citation_sha` / `refiles_suppressed` — the auto-dismiss triple (task 4499).
+
+    `citation_sha` is the evidence commit whose landing a
+    `provenance_unattributed` filing could not attribute.  Stamped at FILING
+    time, it survives onto the RESOLUTION, where it becomes the identity half
+    of the `(task_id, category, citation_sha)` triple that suppresses an
+    identical refile — closing the close-then-refile ping-pong an absorbing
+    reject condition otherwise drives forever.  `refiles_suppressed` is that
+    suppression's INV-4 storm counter: how many identical refiles this
+    record's resolution has absorbed, kept as a durable structured fact rather
+    than log-only (INV-2).
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-4499-1',
+            task_id='4499',
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='provenance_unattributed',
+            summary='landing evidence could not be attributed',
+            level=1,
+            **kwargs,
+        )
+
+    def test_citation_and_suppression_fields_default_to_none_and_zero(self):
+        """(a) A record minted today carries no citation and no absorbed refiles."""
+        esc = self._seeded()
+
+        assert esc.citation_sha is None, (
+            f'expected no citation identity, got {esc.citation_sha!r}'
+        )
+        assert esc.refiles_suppressed == 0, (
+            f'expected 0, got {esc.refiles_suppressed!r}'
+        )
+
+    def test_citation_and_counter_roundtrip_verbatim(self):
+        """(b) Both fields survive to_json -> from_json unchanged.
+
+        The suppression decision is made by re-reading the PERSISTED record, so
+        a field that did not round-trip would silently never suppress.
+        """
+        esc = self._seeded(citation_sha='b' * 40, refiles_suppressed=3)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.citation_sha == 'b' * 40, (
+            f'citation identity lost: {restored.citation_sha!r}'
+        )
+        assert restored.refiles_suppressed == 3, (
+            f'storm counter lost: {restored.refiles_suppressed!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(c) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every archived provenance record already on disk predates these fields,
+        so a payload missing both keys must hydrate to the defaults rather than
+        raising.  Those legacy records are exactly what the suppression lookup
+        scans, so a hydration failure here would break the reject path.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['citation_sha']
+        del legacy['refiles_suppressed']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.citation_sha is None, (
+            f'legacy record must default to None: {from_legacy.citation_sha!r}'
+        )
+        assert from_legacy.refiles_suppressed == 0, (
+            f'legacy record must default to 0: {from_legacy.refiles_suppressed!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded(citation_sha='b' * 40).to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.citation_sha == 'b' * 40
