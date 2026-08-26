@@ -1442,6 +1442,49 @@ class ItemLifecycleState(StrEnum):
 
 
 @dataclass
+class VerifyWorktreeHandle:
+    """The worktree ``_run_inflight_verify`` is ACTUALLY verifying in (task 3186).
+
+    A one-field mutable box, and the shape is forced by construction order:
+    ``_dispatch_item`` creates the verify task BEFORE it builds the
+    :class:`InflightEntry` that wraps it, so the coroutine cannot simply be
+    handed the entry to write back into.  The box is created first, passed to
+    the verify as a keyword-only kwarg, and stored on the entry — so both ends
+    hold the same object and the WRITER (the warm-swap block) publishes to the
+    READER (δ's adoption) without either knowing about the other.
+
+    Named fields rather than a bare list or tuple deliberately: the field names
+    ARE the documentation of what gets published, and a positional container
+    would make the ``spec_warm`` half — which decides whether a pooled lane is
+    RELEASED or ``git worktree remove``d — a silently swappable boolean.
+
+    WHY IT EXISTS.  ``InflightEntry.merge_wt`` is the PRE-verify fact.  On the
+    LOCAL warm path ``_acquire_warm_verify_worktree`` replaces that ephemeral
+    ``_merge-<uuid>`` with the persistent ``_merge-verify`` lane (or a pooled
+    ``_spec-`` lane), deregisters the ephemeral from the liveness ledger and
+    removes it from disk — after which the entry's own field names a path that
+    no longer exists.  For an ORDINARY landing that is harmless, because the
+    PASS arm reads ``vr.merge_wt``; but δ's adopted head has NO ``vr`` (its
+    verify was torn down on the tip's authority), so without this handle the
+    adoption would land from the corpse: ``advance_main``'s retry loop would
+    ``git rebase`` against a missing cwd, the D10 ``refresh_warm_base`` gate
+    (keyed on the lane NAME) would never match, and the live lane would never
+    reach the release path at all.
+
+    Fields
+    ------
+    merge_wt  : the worktree the verify is currently using — seeded with the
+                item's own ephemeral at dispatch, overwritten by the warm swap.
+    spec_warm : ``True`` when *merge_wt* is a warm-seeded lane, i.e. the value
+                ``_release_or_cleanup`` needs to return it to the POOL instead
+                of removing it.
+    """
+
+    merge_wt: Path | None = None
+    spec_warm: bool = False
+
+
+@dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
 
@@ -1469,7 +1512,21 @@ class InflightEntry:
     item           : the SpeculativeItem being verified
     lease          : the HostLease held for this verify (None for passthroughs)
     verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
-    merge_wt       : the merge worktree path (may have been warm-swapped by _run_inflight_verify)
+    merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
+                     adoption publishes the post-verify one onto it (task
+                     3186): ``_run_inflight_verify`` never writes this field,
+                     so for every non-adopted entry it stays the ephemeral
+                     ``_merge-<uuid>`` the item was merged in, and the
+                     post-verify path is ``vr.merge_wt``.
+    verify_wt      : the :class:`VerifyWorktreeHandle` the verify task
+                     publishes its CURRENT worktree into (task 3186).  ``None``
+                     for a passthrough entry and for the hand-built entries in
+                     the test suite; readers must tolerate that.
+    spec_warm      : warmth of ``merge_wt`` once adoption has published it —
+                     the value ``_finalize_inflight`` hands
+                     ``_release_or_cleanup`` when there is no ``vr`` to read it
+                     from.  Meaningless (and never read) unless
+                     ``chain_adopted``.
     was_speculative: True if item.speculative was True at dispatch time (for slot release)
     passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
                          that are enqueued without a real verify task so finalize can deliver
@@ -1518,6 +1575,8 @@ class InflightEntry:
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
     chain_adopted: bool = False             # δ (task 3186): this HEAD lands on a green tip's authority
+    verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
+    spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).

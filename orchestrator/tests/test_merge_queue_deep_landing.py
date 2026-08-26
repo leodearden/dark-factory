@@ -70,6 +70,7 @@ from orchestrator.merge_types import (
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
+    VerifyWorktreeHandle,
 )
 
 # ── repo fixtures (cloned from test_merge_queue_deep_dispatch.py:59-112) ──────
@@ -408,12 +409,20 @@ def _spy_post_merge_verify(
     exercise a head that has already been WARM-SWAPPED but has no verdict.
     *parked*, when given, is set the moment such a call is entered, so a test
     can wait for the swap to have happened rather than sleeping for it.
+
+    The park is ONE-SHOT per task id, deliberately: only the in-flight verify δ
+    tears down is unfinished.  A later call for the same task — the post-rebase
+    ``_reverify_rebased_tree`` gate, say — is a fresh verify that really does
+    return, and parking it too would hang the CAS retry loop this module exists
+    to exercise.
     """
     calls: list[dict] = []
+    parked_once: set[str] = set()
 
     async def _recording(git_ops, req, merge_wt, **kwargs):
         calls.append({'task_id': req.task_id, 'merge_wt': merge_wt, **kwargs})
-        if park is not None and req.task_id in park:
+        if park is not None and req.task_id in park and req.task_id not in parked_once:
+            parked_once.add(req.task_id)
             if parked is not None:
                 parked.set()
             # Never completes on its own: δ's teardown is what ends it.
@@ -2078,6 +2087,10 @@ async def _head_and_prefix_scene(
     head_entry = InflightEntry(
         item=head_item, lease=head_lease, verify_task=head_task,  # type: ignore[arg-type]
         merge_wt=head_item.merge_wt, was_speculative=head_speculative,
+        # Mirrors `_dispatch_item`: the box is built alongside the entry and
+        # seeded with the item's own ephemeral, so a scene whose head runs the
+        # REAL `_run_inflight_verify` has somewhere for the warm swap to publish.
+        verify_wt=VerifyWorktreeHandle(merge_wt=head_item.merge_wt),
     )
     worker._note_transition(
         reqs['100'].request_id, ItemLifecycleState.MERGING,
@@ -2701,6 +2714,7 @@ async def _adopted_warm_head_scene(
         task = asyncio.ensure_future(
             scene['worker']._run_inflight_verify(
                 scene['head_item'], scene['head_lease'],
+                verify_wt=scene['head_entry'].verify_wt,
             )
         )
         # Waiting for the PARK (not sleeping) is what makes the swap an

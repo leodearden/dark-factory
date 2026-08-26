@@ -174,6 +174,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     TerminalOutcomeRetention,
     TrainCallbackFactory,
     TrainCallbacks,
+    VerifyWorktreeHandle,
     WaiterRecord,
     _HostUnavailability,
     _InFlightEntry,
@@ -17434,6 +17435,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         *,
         chain_items: int = 1,
         chain: ChainResult | None = None,
+        verify_wt: VerifyWorktreeHandle | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -17761,6 +17763,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
+                # ── task 3186 (PRD δ), review fix #3: PUBLISH the swap ──────
+                # THE one place the verify's worktree changes, so the one place
+                # the handle is written.  `InflightEntry.merge_wt` still holds
+                # the ephemeral this line just deregistered (and
+                # `_acquire_warm_verify_worktree` removed from disk), and an
+                # ADOPTED head has no `vr` to read the live path off — so
+                # without this publish `_finalize_inflight` would land it from
+                # a corpse: `advance_main`'s retry loop rebasing against a
+                # missing cwd, the D10 `refresh_warm_base` lane-name gate never
+                # matching, and the real lane never reaching `_release_or_cleanup`.
+                #
+                # Deliberately NOT mirrored on the chain arm: there `merge_wt`
+                # is the POOL-OWNED chain lane, released through
+                # `release_chain_build_lane` rather than `_release_or_cleanup`,
+                # and that arm's adopting exit returns a real
+                # `InflightVerifyResult` anyway — so the handle is never the
+                # reader's source there.  Publishing it would only offer a
+                # future edit a lane handle it must not release.
+                if verify_wt is not None:
+                    verify_wt.merge_wt = merge_wt
+                    verify_wt.spec_warm = _spec_warm
                 _is_warm_path = (
                     (req.config.git.persistent_merge_worktree and not _due)
                     or (req.config.git.merge_spec_warm_lane_pool and _spec_warm)
@@ -19151,6 +19174,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         head.chain_adopted = True
 
         if not head.verify_task.done():
+            # ── task 3186 (PRD δ), review fix #3: ADOPT THE LIVE WORKTREE ──
+            # `head.merge_wt` is the PRE-verify ephemeral, and on the LOCAL
+            # warm path `_acquire_warm_verify_worktree` already deregistered it
+            # from the liveness ledger and `git worktree remove`d it.  The
+            # cancel below leaves this entry with no `vr`, so `merge_wt` is the
+            # ONLY handle `_finalize_inflight` will have — publish the one the
+            # verify was really sitting in, together with its warmth, or the
+            # head lands from a corpse (see VerifyWorktreeHandle's docstring
+            # for the three concrete harms).
+            #
+            # Written BEFORE the teardown for the same reason `chain_adopted`
+            # is: the cancel can resume a `_finalize_inflight` already parked at
+            # `await entry.verify_task`, and after that point this entry is no
+            # longer ours to mutate.
+            if head.verify_wt is not None and head.verify_wt.merge_wt is not None:
+                head.merge_wt = head.verify_wt.merge_wt
+                head.spec_warm = head.verify_wt.spec_warm
             logger.info(
                 'Task %s: deep tip passed — cancelling head task %s\'s '
                 'in-flight verify and landing it on the tip\'s authority '
@@ -20028,6 +20068,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── PASS: CAS advance_main ───────────────────────────────────────
             # Reached when verify passed (vr.outcome is None) or verify_task=None.
+            # task 3186 (PRD δ): with no `vr` this reads the POST-verify path
+            # `_adopt_head_on_tip_authority` published onto the entry, not the
+            # dead pre-verify ephemeral it was constructed with (review fix #3).
             merge_wt = entry.merge_wt if vr is None else vr.merge_wt
             if merge_wt is None and entry.chain_adopted:
                 # task 3186 (PRD δ) only: a DECLINED fail verdict (above) is
@@ -20054,7 +20097,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # Precompute spec_warm for cleanup routing — True when the verify ran
             # in a warm _spec- lane (not an ephemeral throwaway worktree).
-            _vr_spec_warm = (vr is not None and vr.spec_warm)
+            #
+            # task 3186 (PRD δ), review fix #3: an ADOPTED head has no `vr`, so
+            # the warmth comes from what adoption published alongside the
+            # worktree.  It must travel WITH the path: routing a pooled lane
+            # through the cold arm would `git worktree remove` a pool member —
+            # a permanently lost slot, the hazard `_release_or_cleanup`'s "WHICH
+            # ONE DO I CALL?" rule exists to prevent.  `entry.spec_warm`
+            # defaults False, so every non-adopted `vr is None` entry (the
+            # passthrough / pre-established-PASS compat shim) is unchanged.
+            _vr_spec_warm = vr.spec_warm if vr is not None else entry.spec_warm
 
             # Short-circuit: if abandonment landed while verify completed,
             # skip the expensive CAS loop (mirrors _verify_and_advance :6934).
@@ -20977,10 +21029,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     self._speculation_ledger.release(item_permit)
             raise
+        # task 3186 (PRD δ): the mutable box the verify publishes its
+        # POST-swap worktree into.  Built HERE, before the task, because the
+        # InflightEntry that would otherwise carry the write-back does not
+        # exist yet (it wraps the task, below).  Seeded with the item's own
+        # ephemeral so a round that never warm-swaps still publishes the truth.
+        verify_wt = VerifyWorktreeHandle(merge_wt=item.merge_wt, spec_warm=False)
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
-                chain_items=chain_items, chain=chain,
+                chain_items=chain_items, chain=chain, verify_wt=verify_wt,
             )
         )
 
@@ -20991,12 +21049,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # The item's OWN ephemeral worktree, deliberately, even on the
             # chain arm: _run_inflight_verify disposes of it there and returns
             # merge_wt=None, so nothing downstream double-disposes.  This field
-            # is the pre-verify fact; vr.merge_wt is the post-verify one.
+            # is the pre-verify fact UNTIL δ's adoption publishes the
+            # post-verify one onto it (task 3186, review fix #3); for every
+            # other entry vr.merge_wt stays the post-verify one.
             merge_wt=item.merge_wt,
             was_speculative=item_was_speculative,
             started_at=time.time(),
             permit=item_permit,
             chain=chain,
+            verify_wt=verify_wt,
         )
 
 
