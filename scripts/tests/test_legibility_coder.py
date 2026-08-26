@@ -956,6 +956,150 @@ def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
     )
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 1: a non-zero exit whose output is a cap banner is TYPED
+#
+# The corpus is imported, never restated.  shared.cap_markers is the single
+# home for these strings precisely because a second hand-maintained copy is
+# the drift trap that let a weekly cap through the census preflight (task
+# 3645).  Parametrizing over it also means a future CLI rewording that the
+# markers stop covering turns THIS suite red alongside the two that already
+# derive from it.
+#
+# Importing it here has a second job: it proves coder.py's sys.path bootstrap
+# actually makes `shared` importable under the scripts test harness, which has
+# no orchestrator/shared install of its own.
+# ---------------------------------------------------------------------------
+
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES  # noqa: E402
+
+
+def test_cap_exhausted_is_a_subclass_of_invocation_error():
+    """Every existing `except CoderInvocationError` site keeps working.
+
+    There are three -- code_digest, census._build_default_verify_fn and
+    census.preflight_headroom -- and none of them is touched by this task.  A
+    sibling exception type would have silently escaped all three, converting a
+    typed per-digest failure into an uncaught crash that takes down the whole
+    batch: strictly worse than the storm this task exists to prevent.
+    """
+    assert issubclass(mod.CoderCapExhausted, mod.CoderInvocationError)
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_nonzero_exit_with_cap_banner_on_stdout_is_typed(
+    tmp_path, message,
+):
+    """STDOUT first-class: it is the stream the incident actually used."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=message, stderr_text="", exit_code=1,
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+
+    exc = excinfo.value
+
+    # (d) The matched marker is NAMED, so a deferral reason can quote which
+    # signal fired -- mirroring preflight_headroom's "...carries a banner
+    # marker: {marker!r}".  "deferred: weekly limit" and "deferred" are
+    # different messages to the operator reading the morning journal.
+    assert exc.marker, "the matched marker must be carried, not just the type"
+    assert exc.marker in message.lower(), (
+        f"marker {exc.marker!r} is not actually present in the banner "
+        f"{message!r} it claims to have matched"
+    )
+
+    # (e) Typing the error does not cost the diagnostic: the full step-1/2
+    # context is still there.
+    text = str(exc)
+    assert message in text, text
+    assert "stdout=" in text and "stderr=" in text, text
+    assert "model='haiku'" in text, text
+    assert "cwd=" in text, text
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_nonzero_exit_with_cap_banner_on_stderr_is_typed(
+    tmp_path, message,
+):
+    """The other stream too -- the classification is about what the CLI SAID,
+    not about which pipe it happened to say it on."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text="", stderr_text=message, exit_code=1,
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+    assert excinfo.value.marker
+
+
+def test_invoke_cli_ordinary_failure_is_not_typed_as_a_cap(tmp_path):
+    """NEGATIVE.  A genuine backend failure must stay an ordinary invocation
+    error, or the deferral branch would launder real regressions into "we were
+    capped, nothing to see here" -- fail-quiet, exactly what this module's
+    never-fabricate contract forbids."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing(
+        bin_dir, exit_code=1, stderr_text="boom, the model backend is down",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    assert not isinstance(excinfo.value, mod.CoderCapExhausted), (
+        "an ordinary backend failure was classified as a usage cap; that "
+        "silently converts a real regression into a deferred night"
+    )
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_cap_text_on_a_ZERO_exit_is_returned_verbatim(
+    tmp_path, message,
+):
+    """NEGATIVE, and the load-bearing one: census's split-on-parse-success
+    rule.
+
+    census._build_default_verify_fn records a live defect from scanning
+    arbitrary model output with this loose marker list -- this repo's codebook
+    is dominated by clusters ABOUT usage and weekly limits, so the markers
+    match ordinary HEALTHY content, and the census aborted on cap-THEMED
+    clusters.  A zero-exit reply is a model turn, not a banner; classifying it
+    here would re-open that defect, and would also break
+    census.preflight_headroom, whose entire probe is "call _invoke_cli and
+    scan what comes BACK".
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=message, stderr_text="", exit_code=0,
+    )
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+    )
+    assert raw == message, (
+        "a zero-exit reply must come back verbatim; preflight_headroom scans "
+        "the RETURNED text itself, so raising here would break the very probe "
+        "that gates the census"
+    )
+
+
 def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
