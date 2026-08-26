@@ -739,6 +739,155 @@ def _batch_digests(n):
     return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
 
 
+# ---------------------------------------------------------------------------
+# task 4736: the batch tally and the deferral predicate
+#
+# `status` stays a two-value vocabulary, {"ok","failure"}, and the cap arrives
+# as a COUNT plus one predicate.  That is not squeamishness about enums:
+# census.py computes `saturated = dup_rate >= config.dup_rate and
+# run_result.status != "failure"` and selects storm batches with
+# `s.status == "failure"`, so a third status value would silently make a
+# capped mining batch count as saturated and stop the census early.
+# ---------------------------------------------------------------------------
+
+def _mixed_batch_invoke(*, capped, failed):
+    """Return (digests, invoke) for a batch whose first *capped* digests hit a
+    cap, the next *failed* return unparseable garbage, and the rest code
+    cleanly.  Dispatch is by the session marker the digest carries into the
+    prompt, mirroring the existing batch helpers above."""
+    def fake_invoke(prompt, model):
+        for i in range(capped):
+            if f"batch-sess-{i}" in prompt:
+                raise mod.CoderCapExhausted(
+                    "claude CLI exited 1 (model='haiku', ...): "
+                    "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+                    marker="you've hit your",
+                )
+        for i in range(capped, capped + failed):
+            if f"batch-sess-{i}" in prompt:
+                return "not parseable as json, sorry"
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def _run_mixed(*, capped, failed, ok):
+    digests = _batch_digests(capped + failed + ok)
+    return mod.code_digests(
+        digests, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed),
+    )
+
+
+def test_code_digests_tallies_capped_alongside_the_existing_counts():
+    result = _run_mixed(capped=3, failed=2, ok=5)
+    assert result.total == 10
+    assert result.succeeded == 5
+    # A cap is still a FAILURE of coding this digest -- capped refines the
+    # failure count, it does not carve digests out of it.
+    assert result.failed == 5
+    assert result.capped == 3
+
+
+def test_code_digests_with_no_caps_reports_zero_capped():
+    result = _run_mixed(capped=0, failed=1, ok=3)
+    assert result.capped == 0
+    assert result.status == "ok"
+
+
+@pytest.mark.parametrize(
+    "capped, failed, ok, expected, why",
+    [
+        # The 2026-08-24 shape: every digest capped.
+        (20, 0, 0, True, "an all-accounts-capped night is a deferral"),
+        # A storm whose failures are MAJORITY capped, with genuine failures
+        # mixed in -- still a deferral: 8 of 11 failures were never coded at
+        # all.
+        (8, 3, 0, True, "a majority-capped storm is still a deferral"),
+        # A storm that is majority GENUINE failure.  A coder regression that
+        # merely coincides with a cap must still read as a storm and still
+        # exit non-zero, or the deferral branch becomes a place for real bugs
+        # to hide.
+        (3, 8, 0, False, "a majority-genuine storm is a storm"),
+        # Non-storm: failed/total == 0.1.  Not a deferral, because the night
+        # was overwhelmingly productive.
+        (2, 0, 18, False, "a minority of caps in a healthy run is not a deferral"),
+        (0, 0, 5, False, "an all-ok run is not a deferral"),
+        (0, 5, 0, False, "an all-genuine-failure storm is not a deferral"),
+        # Empty batch: total == 0, and must not ZeroDivisionError anywhere.
+        (0, 0, 0, False, "an empty batch is not a deferral"),
+    ],
+)
+def test_is_cap_deferral_truth_table(capped, failed, ok, expected, why):
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert mod.is_cap_deferral(result) is expected, (
+        f"{why} (capped={capped} failed={failed} ok={ok} -> "
+        f"status={result.status!r} capped={result.capped} "
+        f"failed={result.failed})"
+    )
+
+
+def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
+    """TAINT-AND-EXCLUDE, the shape evals/runner.py already uses for a capped
+    cell: label it and drop it from the reported result, never score it zero
+    and never discard its healthy siblings.
+
+    2 capped of 20 leaves 18 genuine records that cost real tokens to produce.
+    Throwing them away because two digests found no headroom would be its own
+    kind of fabrication -- reporting less than was actually learned.
+    """
+    result = _run_mixed(capped=2, failed=0, ok=18)
+
+    assert result.status == "ok", "2 of 20 is not a storm"
+    assert mod.is_cap_deferral(result) is False
+    assert result.capped == 2
+    assert len(result.records) == 18, (
+        "the 18 genuinely coded records must still merge -- a capped digest is "
+        "excluded from the output, not a reason to discard the batch"
+    )
+    # And the excluded two are not silently gone: they are in `failures`.
+    assert len(result.failures) == 2
+
+
+def test_code_digests_announces_each_cap_through_the_existing_funnel(caplog):
+    """Every capped digest is still announced at WARNING through the ONE
+    append+log funnel, and the line NAMES the cap.
+
+    Naming it is the point: 20 identical cap lines must stay distinguishable
+    from 20 distinct model errors, which is the same property task 4511 added
+    per-digest lines to preserve.  The 2026-08-24 journal had 17 lines that
+    named nothing at all.
+    """
+    with caplog.at_level(logging.WARNING, logger="legibility.coder"):
+        result = _run_mixed(capped=3, failed=0, ok=1)
+
+    assert result.capped == 3
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "legibility.coder"]
+    assert len(lines) == 3, (
+        f"one WARNING per failed digest, through the single funnel; got "
+        f"{lines!r}"
+    )
+    for line in lines:
+        assert "weekly limit" in line.lower(), (
+            f"the announcement must NAME the cap, or the journal reads like "
+            f"three anonymous failures; got {line!r}"
+        )
+
+
+def test_run_result_failures_stay_two_tuples():
+    """`failures` keeps its (session, reason) shape.
+
+    nightly and epsilon both unpack these pairs; widening the tuple to carry
+    the cap flag would break every consumer for a fact the batch-level
+    `capped` count already reports.
+    """
+    result = _run_mixed(capped=2, failed=1, ok=1)
+    for failure in result.failures:
+        assert len(failure) == 2, failure
+        session, reason = failure
+        assert reason
+
+
 def test_code_digests_all_succeed_batch_status_ok():
     digests = _batch_digests(3)
     codebook = _tiny_codebook()
