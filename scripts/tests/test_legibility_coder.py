@@ -486,6 +486,123 @@ def _make_batch_invoke(fail_sessions):
     return fake_invoke
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 1: a capped digest is a DISTINGUISHABLE per-digest outcome
+#
+# It is a strict refinement of ok=False, never a third success state: the
+# never-fabricate contract is untouched and `record` stays None.  What the
+# label buys is that the night's storm arithmetic can tell "the account had no
+# headroom" from "the coder is broken" -- the distinction whose absence made
+# 2026-08-24 read as 17 of 20 hard failures and page an operator for expected
+# weather.
+# ---------------------------------------------------------------------------
+
+def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        raise mod.CoderCapExhausted(
+            "claude CLI exited 1 (model='haiku', ...): "
+            "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+            marker="you've hit your",
+        )
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is True, (
+        "a cap must be DISTINGUISHABLE from a coder failure; without the "
+        "label the night's storm arithmetic cannot tell an account with no "
+        "headroom from a broken coder"
+    )
+    # Still a failure, and still never fabricated -- capped REFINES ok=False,
+    # it does not soften it into a success.
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+    assert "weekly limit" in result.reason, (
+        f"the reason must carry the banner the CLI actually printed, or the "
+        f"morning journal says 'deferred' and nothing else; got "
+        f"{result.reason!r}"
+    )
+    # The digest is still attributable: session comes from the frontmatter,
+    # which was parsed long before the invocation was attempted.
+    assert result.session == _SESSION_ID
+
+
+def _capped_flag_for(invoke):
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    return mod.code_digest(
+        digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=invoke,
+    )
+
+
+def _raise_ordinary_invocation_error(prompt, model):
+    raise mod.CoderInvocationError(
+        "claude CLI exited 1 (model='haiku'): simulated backend outage"
+    )
+
+
+def _return_unparseable(prompt, model):
+    return "I'm sorry, I cannot help with that request."
+
+
+def _return_schema_invalid(prompt, model):
+    return json.dumps({
+        "matches": [{"entry_id": "x", "confidence": "high", "origin_phase": "NOT_A_PHASE"}],
+        "candidates": [],
+    })
+
+
+def _return_empty_judgment(prompt, model):
+    return json.dumps({"matches": [], "candidates": []})
+
+
+@pytest.mark.parametrize(
+    "invoke, label",
+    [
+        (_raise_ordinary_invocation_error, "an ordinary backend outage"),
+        (_return_unparseable, "unparseable model output"),
+        (_return_schema_invalid, "a schema-invalid record"),
+        (_return_empty_judgment, "a legitimately empty SUCCESS"),
+    ],
+)
+def test_code_digest_non_cap_outcomes_are_never_labelled_capped(invoke, label):
+    """The label must not spread.  Every other outcome -- three failure modes
+    and a success -- reports capped=False.
+
+    This is the guard on the deferral branch downstream: a capped label is
+    what buys exit_code=0 and a WARNING instead of a red night, so a label
+    that leaked onto ordinary failures would silently convert a real coder
+    regression into "we were capped, nothing to see here" -- fail-quiet, which
+    is exactly what this module's never-fabricate contract forbids.
+    """
+    result = _capped_flag_for(invoke)
+    assert result.capped is False, (
+        f"{label} was labelled as a usage cap; that silently converts a real "
+        f"regression into a deferred night"
+    )
+
+
+def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
+    """The pre-invocation failure path too -- it returns before `invoke` is
+    ever called, so it has its own construction site to keep honest."""
+    def fake_invoke(prompt, model):
+        raise AssertionError("invoke must never be reached")
+
+    result = mod.code_digest(
+        "no frontmatter here, just prose", _tiny_codebook(),
+        project="dark_factory", model="haiku", invoke=fake_invoke,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.session is None
+
+
 def _batch_digests(n):
     return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
 
