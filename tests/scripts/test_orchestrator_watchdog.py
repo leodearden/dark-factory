@@ -6557,6 +6557,99 @@ def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPat
     assert delegated == [], f"a refreshed unit must self-clear; got {len(delegated)} delegation(s)"
 
 
+def test_fm_staleness_head_start_anchored_on_fm_min_interval_expiry_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """ACCEPTANCE (task 4754, FM tier): the fm head start is measured from fm's
+    OWN min-interval EXPIRY, not from the newest fm-watched commit — with the
+    fm clock read left REAL.
+
+    Written in this block's existing alpha style (direct helper monkeypatching)
+    rather than through an argv-dispatching fake-subprocess harness: there is
+    no _fm_fake_run sibling of _fleet_fake_run, and building one is a larger
+    refactor than this task warrants. The one thing deliberately NOT stubbed is
+    the clock: neither _within_fm_deploy_min_interval nor
+    _within_fm_staleness_head_start is monkeypatched, so both gates evaluate a
+    real on-disk FM_DEPLOY_CLOCK_PATH read in tmp_path (never the live path —
+    tests/scripts/test_deploy_clock_isolation.py and df_pytest_isolation.py
+    guard that file). That is what makes this an anchor test rather than a
+    restatement of a stub.
+
+    The newest fm-watched commit is pinned SIX HOURS old, so the RETAINED
+    commit-age grace is wide open in both halves and only the new anchor can
+    decide the outcome. "now" sits on a SKIP_LOG_INTERVAL_SECS bucket boundary
+    so the skip line is guaranteed; the mid-bucket suppression half lives in
+    test_fm_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket.
+
+    All arithmetic uses fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS), never the
+    fleet's. Half (a) is the KNOWN-RED half before this task lands: today fm's
+    min-interval has expired and the commit is hours old, so the pass delegates
+    an fm redeploy the instant fm's window opens.
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # HOURS old: the commit-age grace is wide open
+
+    def run_pass_with_clock_age(
+        age_secs: float, *, commit_reader_must_not_run: bool
+    ) -> tuple[list[None], list[str]]:
+        """Drive fused_memory_staleness_pass with fm's clock stamped *age_secs* ago."""
+        clock_file = tmp_path / f"fm_clock_{int(age_secs)}.json"
+        clock_file.write_text(
+            json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
+        )
+        monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+
+        delegated: list[None] = []
+        log_messages: list[str] = []
+
+        def commit_reader() -> int:
+            if commit_reader_must_not_run:
+                pytest.fail(
+                    "the fm head-start gate must return BEFORE the git subprocess"
+                )
+            return commit_epoch
+
+        monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", commit_reader)
+        monkeypatch.setattr(wdog.time, "time", lambda: now)
+        monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+        monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+        monkeypatch.setattr(
+            wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch - 100
+        )  # genuinely stale
+        monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+        monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+        wdog.fused_memory_staleness_pass()
+        return delegated, log_messages
+
+    # --- (a) 300s past fm's min-interval expiry: inside the head start, hold off.
+    inside_delegated, inside_logs = run_pass_with_clock_age(
+        wdog.FM_RESTART_MIN_INTERVAL_SECS + 300, commit_reader_must_not_run=True
+    )
+
+    assert inside_delegated == [], (
+        f"must not delegate an fm redeploy 300s after fm's min-interval window "
+        f"opened — the fm coordinator's {wdog.STALENESS_GRACE_SECS}s head start "
+        f"is still running; got {inside_delegated}"
+    )
+    assert any(
+        "skip" in m and str(wdog.STALENESS_GRACE_SECS) in m for m in inside_logs
+    ), f"Expected a skip log line naming the fm head start: {inside_logs}"
+
+    # --- (b) head start elapsed: the fm backstop is released and must act.
+    past_delegated, _past_logs = run_pass_with_clock_age(
+        wdog.FM_RESTART_MIN_INTERVAL_SECS + wdog.STALENESS_GRACE_SECS + 60,
+        commit_reader_must_not_run=False,
+    )
+
+    assert len(past_delegated) == 1, (
+        f"once the fm head start has elapsed the backstop must delegate exactly "
+        f"one fm redeploy; got {past_delegated}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # log() bounding tests (task 3392 — follow-up from task 3308 / commit
 # 87ff5d1870, which fixed the identical unbounded-systemd-cat shape in
