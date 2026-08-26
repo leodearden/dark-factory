@@ -520,7 +520,11 @@ def _fake_judge(answer: str = OUTCOME_RESTATED):
     unnoticed.
     """
     def judge_fn(case, candidates):
-        judge_fn.calls.append((case['memory_id'], [c['memory_id'] for c in candidates]))
+        judge_fn.calls.append((
+            case['memory_id'],
+            case['expected_class'],
+            [c['memory_id'] for c in candidates],
+        ))
         return answer
 
     judge_fn.calls = []
@@ -717,11 +721,19 @@ class TestRunJudgeEval:
         """
         judge = _fake_judge()
         _run(tmp_path, judge=judge)
-        for memory_id, candidate_ids in judge.calls:
+        for memory_id, _class, candidate_ids in judge.calls:
             assert candidate_ids, f'{memory_id} was handed an empty slate'
-        by_case = dict(judge.calls)
-        assert by_case['c1-dup-1'][0] == 'c1-canon', (
+
+        # Keyed on (memory_id, class) because one record produces BOTH a
+        # labelled case and, if it is its cluster's first, a control — and the
+        # whole difference between them is the slate.
+        by_case = {(mid, cls): ids for mid, cls, ids in judge.calls}
+        assert by_case[('c1-dup-1', 'duplicate')][0] == 'c1-canon', (
             'the attach target must lead the resolved slate'
+        )
+        control = by_case[('c1-dup-1', _mod().CLASS_DISTRACTOR)]
+        assert 'c1-canon' not in control, (
+            'the control slate must carry no correct attach target at all'
         )
 
     def test_a_judge_that_is_wrong_on_every_case_still_produces_a_report(

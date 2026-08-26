@@ -77,6 +77,7 @@ Usage
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import types
 from collections.abc import Mapping, Sequence
@@ -374,3 +375,358 @@ def score_cases(
         },
         'false_contested': false_contested,
     }
+
+
+# ---------------------------------------------------------------------------
+# Report assembly
+# ---------------------------------------------------------------------------
+
+#: Why no contested accuracy appears in the report, in alpha's
+#: ``'<code>: <measured detail>'`` reason format so a consumer can branch on
+#: the code without parsing prose.
+CONTESTED_GROUND_TRUTH_REASON = (
+    'no_positive_contested_labels: the fixture carries 6 pseudo_contradiction '
+    'records, every one curator-adjudicated NOT a contradiction, and 0 records '
+    'labelled as a genuine contradiction. Contested recall and precision are '
+    'therefore unmeasurable against this corpus; only the false-positive count '
+    'below is a measurement.'
+)
+
+#: Prose the operator at the task-3169 flip gate has to read BEFORE acting on
+#: any number above it. Held as data rather than inlined into the renderer so
+#: the JSON and the markdown cannot drift apart.
+CAVEATS: tuple[str, ...] = (
+    'No accuracy floor is asserted anywhere in this script or its tests (PRD '
+    'D10). This artifact is evidence for a human decision, not a gate.',
+    'false_contested counts EVERY contested verdict, and every one of them is '
+    'a false positive — see contested_ground_truth. A judge structurally '
+    'incapable of ever answering `contested` would score identically to a '
+    'perfect one here, so a low number is not evidence that the contradiction '
+    'detector works.',
+    'The duplicate class accepts BOTH `restated` and `amended`, because the '
+    "curator's labels do not separate a verbatim restatement from a "
+    'rediscovery carrying a novel fragment. The split between them is '
+    'reported as a distribution and is not scored as error.',
+    'The distractor class is a control this script constructs, not a curator '
+    'label: one case per cluster whose slate carries no correct attach target '
+    'at all. It is what distinguishes a judge that classifies from a judge '
+    'that attaches to whatever it is shown.',
+)
+
+
+def build_report(
+    *,
+    scored: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assemble the JSON-serializable accuracy report.
+
+    Carries ``scored`` verbatim and adds the two things a bare score table
+    cannot say for itself: what the fixture is incapable of measuring
+    (``contested_ground_truth``) and how to read the numbers that are there
+    (``caveats``).
+
+    The provenance keys are ``setdefault``-ed rather than required, the same
+    treatment ``run_calibration`` gives its own: a caller assembling a report
+    from already-scored cases still produces an artifact whose provenance
+    block has every key, with ``None`` where nothing was measured. An ABSENT
+    key cannot be told apart from an artifact predating the field.
+    """
+    per_class = dict(scored['per_class'])
+    run_provenance = dict(provenance)
+    run_provenance.setdefault(
+        'case_count', sum(entry['n'] for entry in per_class.values()),
+    )
+    for key in ('record_count', 'candidate_count', 'distractor_count'):
+        run_provenance.setdefault(key, None)
+
+    return {
+        'per_class': per_class,
+        'confusion': dict(scored['confusion']),
+        'duplicate_outcome_split': dict(scored['duplicate_outcome_split']),
+        'false_contested': scored['false_contested'],
+        'contested_ground_truth': {
+            'available': False,
+            'reason': CONTESTED_GROUND_TRUTH_REASON,
+        },
+        'caveats': list(CAVEATS),
+        'provenance': run_provenance,
+    }
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """Human-readable sibling. The operator reads THIS, not the JSON."""
+    lines = [
+        '# Write-triage judge accuracy report',
+        '',
+        '## Per-class accuracy',
+        '',
+        '| class | n | correct | accuracy |',
+        '|---|---|---|---|',
+    ]
+    for name in EVAL_CLASSES:
+        entry = report['per_class'][name]
+        lines.append(
+            f'| {name} | {entry["n"]} | {entry["correct"]} | {entry["accuracy"]} |',
+        )
+
+    outcomes = list(TRIAGE_OUTCOMES)
+    lines += [
+        '', '## Confusion — expected class by observed verdict', '',
+        '| class | ' + ' | '.join(outcomes) + ' |',
+        '|---' * (len(outcomes) + 1) + '|',
+    ]
+    for name in EVAL_CLASSES:
+        row = report['confusion'][name]
+        lines.append(
+            f'| {name} | ' + ' | '.join(str(row.get(o, 0)) for o in outcomes) + ' |',
+        )
+
+    split = report['duplicate_outcome_split']
+    lines += [
+        '', '## Duplicate attach split (a distribution, not an error term)', '',
+        f'- `restated`: {split["restated"]}',
+        f'- `amended`: {split["amended"]}',
+        '',
+        '## Contested',
+        '',
+        f'- contested verdicts observed: **{report["false_contested"]}**, all of '
+        f'which are FALSE POSITIVES.',
+        f'- ground truth available: `{report["contested_ground_truth"]["available"]}`',
+        f'- `{report["contested_ground_truth"]["reason"]}`',
+        '',
+        '## Caveats',
+        '',
+    ]
+    lines += [f'- {caveat}' for caveat in report['caveats']]
+    lines += ['', '## Provenance', '']
+    for key, value in report['provenance'].items():
+        lines.append(f'- `{key}`: `{value}`')
+    return '\n'.join(lines) + '\n'
+
+
+# ---------------------------------------------------------------------------
+# The runner
+# ---------------------------------------------------------------------------
+
+def run_judge_eval(
+    *,
+    records: Sequence[Mapping[str, Any]],
+    judge_fn: Any,
+    report_path: str | Path,
+    provenance: Mapping[str, Any],
+    distractors: int,
+) -> dict[str, Any]:
+    """Build cases, ask *judge_fn* once each, score, write both artifacts.
+
+    ``judge_fn(case, candidates)`` receives the case and its slate RESOLVED to
+    records — a judge handed bare ids has no text to compare and is answering
+    noise, which is the same defect the production seam's own tests pin.
+
+    Nothing is caught. A judge error propagates exactly as ``run_calibration``
+    lets an ``embed_fn`` error propagate: swallowing it would be
+    indistinguishable from a genuine misclassification, so it would both
+    shrink the measured population and depress the accuracy reported over it.
+
+    A dangling candidate id raises ``KeyError`` for the same reason — a
+    silently-skipped candidate narrows a slate the report claims was 5 wide.
+    """
+    cases = build_judge_cases(records, distractors=distractors)
+    by_id = {str(r['memory_id']): r for r in records}
+    logger.info('Built %d case(s) from %d record(s)', len(cases), len(records))
+
+    verdicts: list[str] = []
+    for index, case in enumerate(cases, 1):
+        candidates = [by_id[cid] for cid in case['candidates']]
+        verdicts.append(judge_fn(case, candidates))
+        if index % 10 == 0:
+            logger.info('Judged %d/%d case(s)', index, len(cases))
+
+    scored = score_cases(cases, verdicts)
+
+    run_provenance = dict(provenance)
+    run_provenance.setdefault('record_count', len(records))
+    run_provenance.setdefault('case_count', len(cases))
+    run_provenance.setdefault('candidate_count', distractors + 1)
+    run_provenance.setdefault('distractor_count', distractors)
+    report = build_report(scored=scored, provenance=run_provenance)
+
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    report_path.with_suffix('.md').write_text(render_markdown(report))
+    logger.info('Wrote %s and its .md sibling', report_path)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Live edge / CLI
+# ---------------------------------------------------------------------------
+
+#: Synthetic per-store cosines stamped on the eval's candidates. The eval
+#: SUPPLIES its slate rather than retrieving it, but ``select_judge_candidates``
+#: orders by ``metadata['store_score']`` and DROPS anything with no numeric
+#: one, so a slate carrying no scores would arrive at the model empty.
+#:
+#: Descending by slate position, which preserves the order
+#: ``build_judge_cases`` chose — the attach target first. These numbers never
+#: reach the model: ``build_judge_prompt`` renders id and text only, no
+#: metadata at all (PRD C1). They exist solely to survive the selector.
+_SYNTHETIC_TOP_SCORE = 0.90
+_SYNTHETIC_SCORE_STEP = 0.01
+
+#: Passed to ``judge_write`` to satisfy its signature. It reaches no prompt —
+#: C1 forbids repo or task context from reaching the judge, and
+#: ``build_judge_prompt`` interpolates no metadata whatsoever.
+_EVAL_PROJECT_ID = 'dark_factory'
+
+#: The answer a ``--dry-run`` gives every case. Chosen as `stored` because it
+#: is the fail-open verdict: a dry run should look like the judge declining to
+#: attach, never like a confident classification.
+_DRY_RUN_VERDICT = OUTCOME_STORED
+
+
+def build_judge_fn(config: Any) -> Any:
+    """The LIVE edge: drive the SHIPPED judge, not a re-implementation.
+
+    ``server/write_triage_judge.judge_write`` is called with a duck-typed
+    service exposing only ``config`` — which is all it reads — so this eval
+    measures the production prompt, the production provider fan-out and the
+    production parser. Re-implementing any of the three here would measure
+    this script instead of the thing the operator is deciding about.
+
+    The band decision is SYNTHESIZED rather than retrieved: the eval supplies
+    its slate directly, so there is no retrieval to derive a winner from. It
+    names the cluster canonical, which is exactly what a correct retrieval
+    would have found, and marks the middle band — the only band that reaches a
+    judge at all.
+
+    ``asyncio.run`` per case, which is why ``_run`` below is synchronous:
+    ``judge_write`` is the only awaitable in the whole pipeline and it needs
+    no initialized ``MemoryService``, so an async ``_run`` would buy nothing
+    and would force a nested-loop bridge around every single call.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from fused_memory.models.enums import SourceStore  # noqa: PLC0415
+    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+    from fused_memory.server.write_triage import OUTCOME_JUDGE, BandDecision  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import judge_write  # noqa: PLC0415
+
+    service = types.SimpleNamespace(config=config)
+
+    def judge_fn(case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> str:
+        slate = [
+            MemoryResult(
+                id=str(record['memory_id']),
+                content=str(record['content']),
+                source_store=SourceStore.MEM0,
+                metadata={
+                    'store_score': _SYNTHETIC_TOP_SCORE - index * _SYNTHETIC_SCORE_STEP,
+                },
+            )
+            for index, record in enumerate(candidates)
+        ]
+        decision = BandDecision(
+            outcome=OUTCOME_JUDGE,
+            canonical_id=slate[0].id if slate else None,
+            similarity=_SYNTHETIC_TOP_SCORE,
+            t_high=None,
+            t_low=None,
+        )
+        return asyncio.run(judge_write(
+            memory_service=service,
+            content=str(case['content']),
+            project_id=_EVAL_PROJECT_ID,
+            decision=decision,
+            candidates=slate,
+        ))
+
+    return judge_fn
+
+
+def _dry_run_judge_fn() -> Any:
+    """A fixed-answer judge that spends nothing. Proves the pipeline."""
+    def judge_fn(case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> str:
+        return _DRY_RUN_VERDICT
+
+    return judge_fn
+
+
+def _run(args: Any) -> int:
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_model,
+        resolve_judge_provider,
+    )
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    service = types.SimpleNamespace(config=config)
+    provider = resolve_judge_provider(service)
+    model = resolve_judge_model(service)
+
+    records = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
+
+    if args.limit:
+        # Truncating RECORDS rather than cases keeps every case's slate
+        # resolvable — a case whose canonical was cut would raise in the
+        # runner, which is the right behaviour there and a useless one here.
+        records = records[: args.limit]
+        logger.info('--limit %d: measuring %d record(s)', args.limit, len(records))
+
+    if args.dry_run:
+        judge_fn = _dry_run_judge_fn()
+        provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
+        logger.info('--dry-run: no provider call will be made')
+    else:
+        # Logged BEFORE the first call, so a mis-resolved model is visible
+        # while the run is still free to abort.
+        logger.info('Judge resolves to provider=%s model=%s', provider, model)
+        judge_fn = build_judge_fn(config)
+
+    report = run_judge_eval(
+        records=records,
+        judge_fn=judge_fn,
+        report_path=args.report_path,
+        provenance={
+            'fixture_path': package_relative(args.fixture),
+            'judge_provider': provider,
+            'judge_model': model,
+        },
+        distractors=args.distractors,
+    )
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def main() -> int:
+    import argparse  # noqa: PLC0415
+
+    repo = Path(__file__).parent.parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fixture', default=str(
+        repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'))
+    parser.add_argument('--report-path', dest='report_path', default=str(
+        repo / 'calibration' / 'write_triage_judge_accuracy_report.json'))
+    parser.add_argument('--config', default=None,
+                        help='Path to fused-memory config file (sets CONFIG_PATH)')
+    parser.add_argument('--distractors', type=int, default=4,
+                        help="cross-cluster candidates per slate; 4 gives PRD C1's "
+                             'top-5 width alongside the attach target (default: 4)')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='measure only the first N records (a cheap live smoke)')
+    parser.add_argument('--dry-run', dest='dry_run', action='store_true',
+                        help='score a fixed-answer judge; makes no provider call')
+    return _run(parser.parse_args())
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
