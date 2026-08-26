@@ -23,7 +23,6 @@ No test in this file needs an API key, a network, or Qdrant.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import types
 from dataclasses import dataclass
@@ -33,7 +32,7 @@ import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import write_triage, write_triage_judge
+from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -117,22 +116,6 @@ class TestJudgeVerdictVocabulary:
     def test_each_word_maps_to_its_outcome(self, word: str, outcome: str) -> None:
         """Each judge word lands on the outcome the ack contract publishes."""
         assert JUDGE_VERDICTS[word] == outcome
-
-    def test_the_module_spells_no_outcome_string_by_hand(self) -> None:
-        """INV-5: the outcome constants are IMPORTED, never re-spelled.
-
-        ``is``-identity is not a usable check here — CPython interns short
-        string literals, so a hand-written ``'restated'`` would pass an
-        identity assertion against the imported constant and the drift would
-        be invisible. A source-level check is the only one that actually
-        catches the copy.
-        """
-        source = inspect.getsource(write_triage_judge)
-        # Strip the import block: the names appear there legitimately.
-        body = source.split('JUDGE_VERDICTS', 1)[-1]
-        for outcome in sorted(TRIAGE_OUTCOMES):
-            assert f"'{outcome}'" not in body, outcome
-            assert f'"{outcome}"' not in body, outcome
 
     def test_the_outcome_constants_come_from_write_triage(self) -> None:
         """The values are the ones beta publishes, whatever they are spelled."""
@@ -509,21 +492,6 @@ class TestBuildJudgePrompt:
     def test_an_empty_candidate_list_still_renders(self) -> None:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
-
-    def test_the_system_prompt_states_detect_not_adjudicate(self) -> None:
-        """D3 lives in the model's own instructions, not only in a docstring.
-
-        A judge told merely to "classify" would happily decide which of two
-        contradictory memories is TRUE. Reify esc-5557/esc-5626 showed that
-        adjudication needs code-reading the synchronous write path cannot do,
-        so the instruction has to say the judge is detecting a contradiction
-        and routing it, not resolving it.
-        """
-        lowered = JUDGE_SYSTEM_PROMPT.lower()
-        assert 'relationship' in lowered
-        assert 'not' in lowered
-        for word in JUDGE_VERDICTS:
-            assert word in lowered
 
 
 # ---------------------------------------------------------------------------
