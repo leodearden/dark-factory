@@ -45,6 +45,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
+    _git_show_name_only,
     _needs_hint_conversion,
     _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
@@ -1385,6 +1386,113 @@ class TestDoneProvenanceSection:
             check=True, capture_output=True, text=True,
         ).stdout.strip()
 
+    @staticmethod
+    def _init_repo_with_merge(path):
+        """Build a repo with a single-parent commit, a clean --no-ff merge,
+        and a --no-ff merge that resolves a real conflict.
+
+        Commit graph on ``main``:
+
+          1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
+             used to pin ``--first-parent -m`` as a no-op on non-merge commits).
+          2. a ``feature`` branch off commit 1 adds feature.py plus
+             extra_1.py..extra_4.py (five files total, so max_files
+             truncation is reachable for merge provenance — see
+             test_merge_commit_file_list_respects_max_files_truncation);
+             main then merges it via ``git merge --no-ff`` — recorded as
+             ``merge``. Plain ``git show --name-only`` reports NOTHING for
+             this commit (git's combined diff is empty for a clean merge);
+             this is the fixture that reproduces the Stage-2 provenance bug.
+          3. a ``conflict`` branch off commit 1 edits a.txt and adds
+             conflict_only.py; main separately edits a.txt after ``merge``.
+             Merging ``conflict`` into main therefore CONFLICTS on a.txt —
+             resolved by hand and committed, recorded as ``conflict_merge``.
+             This pins the OTHER, worse symptom the task's analysis found:
+             plain ``git show --name-only`` on a merge that resolved a
+             conflict reports ONLY the conflict-resolution file(s), silently
+             omitting every non-conflicting file the branch also brought in
+             (measured on this repo's own history: commit a75568bd11 showed
+             1 file under the bare invocation vs. 6 real first-parent files,
+             none of which was that 1 file — see
+             test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list).
+             ``conflict_only.py`` deliberately does NOT reuse the
+             feature/extra_* names from scenario 2: this branch forks off
+             ``single`` (before the feature merge), so those names are free
+             to reuse on disk, but doing so would make feature.py conflict
+             too (both sides would have independently "added" it), muddying
+             the one conflict this scenario needs.
+
+        Mirrors the branch/merge sequence in
+        fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
+        including its defensive ``commit.gpgsign false`` + ``--no-verify`` on
+        every commit, so a developer's global gpgsign setting or a stray hook
+        can't hang or fail this throwaway repo.
+
+        Returns a dict of full 40-char SHAs:
+        ``{'single': ..., 'merge': ..., 'conflict_merge': ...}``.
+        Does NOT modify ``_init_repo`` — five pre-existing tests depend on its
+        exact linear shape and single-SHA return value.
+        """
+        import subprocess
+
+        def _git(*args):
+            return subprocess.run(
+                ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+        _git('config', 'user.email', 't@e.example')
+        _git('config', 'user.name', 'T')
+        _git('config', 'commit.gpgsign', 'false')
+
+        (path / 'a.txt').write_text('a\n')
+        (path / 'b.txt').write_text('b\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
+        single = _git('rev-parse', 'HEAD')
+
+        _git('checkout', '-q', '-b', 'feature')
+        (path / 'feature.py').write_text('feature = 1\n')
+        for i in range(1, 5):
+            (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
+        _git('checkout', '-q', 'main')
+        _git('merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+        merge = _git('rev-parse', 'HEAD')
+
+        # A second branch that edits a.txt independently of main's own later
+        # edit of the same file — merging it conflicts, exercising the
+        # (worse) symptom where a bare `git show` on a resolved-conflict
+        # merge reports only the conflicted path and hides everything else.
+        _git('checkout', '-q', '-b', 'conflict', single)
+        (path / 'a.txt').write_text('a-conflict-branch\n')
+        (path / 'conflict_only.py').write_text('conflict_only = 1\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
+        _git('checkout', '-q', 'main')
+        (path / 'a.txt').write_text('a-main-edit\n')
+        _git('add', '-A')
+        _git('commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
+
+        # Deliberately not using `_git` (check=True): a real conflict makes
+        # `git merge` exit 1 and leave conflict markers instead of a commit.
+        conflict_result = subprocess.run(
+            ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
+             '-m', 'Merge conflict into main', 'conflict'],
+            capture_output=True, text=True,
+        )
+        assert conflict_result.returncode != 0, (
+            'expected a.txt to conflict (both branches edited it since the '
+            'common ancestor); merge unexpectedly succeeded cleanly'
+        )
+        (path / 'a.txt').write_text('a-resolved\n')
+        _git('add', 'a.txt')
+        _git('commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
+        conflict_merge = _git('rev-parse', 'HEAD')
+
+        return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
+
     @pytest.mark.asyncio
     async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
         """Task with commit provenance → git show file list injected."""
@@ -1467,6 +1575,337 @@ class TestDoneProvenanceSection:
         assert f'commit: {bad}' in section
         # git show failed → no files line
         assert 'files:' not in section
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_reports_first_parent_file_list(self, tmp_path):
+        """Merge commits must report the files they actually brought in.
+
+        Plain ``git show --name-only`` on a merge commit shows git's COMBINED
+        diff, which lists only paths differing from ALL parents — empty for a
+        clean (conflict-free) merge. Measured against five real merge commits
+        in this repo's own history: bare ``git show --name-only`` returns 0
+        files where ``git show --name-only --first-parent -m`` returns the
+        real count:
+
+            47780f693d (Merge task/2737 into main): 0 vs 13
+            ca7459b0a9 (Merge task/4293 into main): 0 vs 23
+            c7dcc4f9d4 (Merge task/3543 into main): 0 vs 47
+            24a8729c5f (Merge task/4097 into main): 0 vs 9
+            3765f4587d (Merge task/3369 into main): 0 vs 8
+
+        This matters because the Stage-2 prompt
+        (fused_memory/reconciliation/prompts/stage2.py) gates
+        '"Task N shipped via <file>"' edges on exactly this ``files:`` list —
+        a blind list means Stage-2 either authors no shipped-via edges for a
+        merge, or (worse, when the merge resolved a conflict) authors them
+        against a misleading conflict-only subset naming files the task
+        never actually touched.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
+        )
+
+        assert 'feature.py' in block
+        assert 'files:' in block
+        after_label = block.split('files:', 1)[1]
+        file_lines = [
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        ]
+        # Exact set, not just a membership/lower-bound check — the fixture's
+        # merge brings in exactly these five files, and a partial-list
+        # regression (e.g. a future --diff-filter or path-limiting flag that
+        # silently drops extra_*.py) must fail this test.
+        assert sorted(file_lines) == [
+            'extra_1.py', 'extra_2.py', 'extra_3.py', 'extra_4.py', 'feature.py',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list(
+        self, tmp_path,
+    ):
+        """Pins the WORSE symptom the task's analysis found: a merge that
+        resolved a conflict, not just a clean merge with nothing to resolve.
+
+        Plain ``git show --name-only`` on a merge commit shows git's combined
+        diff — for a clean merge that's empty (see
+        test_merge_commit_reports_first_parent_file_list), but for a merge
+        that resolved a conflict it is NOT empty: it contains exactly the
+        conflict-resolution file(s), silently omitting every non-conflicting
+        file the branch also brought in. Measured on this repo's own
+        history: commit a75568bd11 (task 3368) showed 1 file under the bare
+        invocation (plans/resume-charter-loss-remediation-prd.md) vs. 6 real
+        first-parent files — none of which was that PRD. That mismatch is
+        precisely how a false "Task 3368 shipped via
+        plans/resume-charter-loss-remediation-prd.md" edge got authorised.
+
+        A suite that only exercised the CLEAN-merge case would not catch a
+        regression that fixed clean merges but reintroduced conflict-only
+        reporting — e.g. a future swap of ``--first-parent -m`` for
+        ``--diff-merges=combined``, which looks correct and passes every
+        clean-merge assertion while silently resurrecting this exact
+        under-report on any merge that resolved a conflict.
+
+        The fixture's ``conflict`` branch edits a.txt (which conflicts with
+        main's own later edit of the same file) and adds conflict_only.py
+        (which does not conflict). The first-parent file list for the
+        resolved merge must contain BOTH — not just the conflicted a.txt.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['conflict_merge'], max_files=50, max_chars=2000,
+        )
+
+        after_label = block.split('files:', 1)[1]
+        file_lines = sorted(
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        )
+        assert file_lines == ['a.txt', 'conflict_only.py']
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_header_emitted_once_and_never_leaks_into_file_list(self, tmp_path):
+        """Pins the --first-parent + -m INTERACTION, not either flag alone.
+
+        ``-m`` alone splits a merge into one diff PER PARENT, which would
+        repeat the ``%H%n%ai%n%s`` header once per parent and interleave it
+        with each parent's file list — the downstream parser takes
+        ``lines[:3]`` as the header and everything after as files, so a
+        repeated header would get parsed as bogus file paths and could
+        authorise garbage "shipped via" edges. ``--first-parent`` is what
+        restricts output back down to a single diff (against the first
+        parent only), so the header is emitted exactly once. Verified on git
+        2.43.0 against a real 2-parent merge: header count is exactly 1
+        (grep count 1 of 17 total output lines) under ``--first-parent -m``.
+
+        This is a GREEN pin (not a RED/regression test): it exists to fail
+        loudly if a future edit ever drops ``--first-parent`` while keeping
+        ``-m``, which is exactly the change that would reintroduce
+        per-parent diffs and duplicate/bogus paths.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
+        )
+
+        assert block.count(shas['merge']) == 1
+
+        lines = block.splitlines()
+        header = lines[:3]
+        assert lines[3] == 'files:'
+        files = [
+            ln.strip() for ln in lines[4:]
+            if ln.strip() and not ln.strip().startswith('...')
+        ]
+        for header_value in header:
+            assert header_value not in files
+        assert len(files) == len(set(files))
+
+    @pytest.mark.asyncio
+    async def test_single_parent_commit_file_list_unchanged_by_flag(self, tmp_path):
+        """--first-parent -m is a documented, empirically-verified no-op for an
+        ordinary single-parent commit — which is what makes adding the flags
+        a strict improvement rather than a behaviour trade-off for non-merge
+        provenance citations.
+
+        Asserts the claim through the module under test:
+        _git_show_name_only on the single-parent commit lists exactly a.txt
+        and b.txt under ``files:``, unchanged by the flags. (The byte-for-byte
+        raw-git no-op claim itself was verified by hand during planning —
+        identical md5 for bare vs. ``--first-parent -m`` output, on both this
+        repo's real history and a scratch fixture repo — but is deliberately
+        not re-pinned here as a second, hand-rolled invocation of the argv:
+        that duplicated the helper's own command literal without being
+        derived from it, so it kept passing regardless of what the helper's
+        actual argv was and pinned nothing about the implementation.)
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['single'], max_files=50, max_chars=2000,
+        )
+        after_label = block.split('files:', 1)[1]
+        file_lines = sorted(
+            ln.strip() for ln in after_label.splitlines()
+            if ln.strip() and not ln.strip().startswith('...')
+        )
+        assert file_lines == ['a.txt', 'b.txt']
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_provenance_renders_real_file_list_in_briefing(self, mock_deps, tmp_path):
+        """End-to-end: a done task citing a MERGE commit shows that merge's
+        real file list in the Stage-2 briefing — the artefact the Stage-2 LLM
+        actually reads and gates "shipped via" edge-writing on.
+
+        Integration-level companion to
+        test_merge_commit_reports_first_parent_file_list (which calls the
+        helper directly). Before the argv fix, this section rendered
+        `commit: <sha>` with no `files:` entries at all for a clean merge.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{
+                'id': 13, 'status': 'done', 'title': 'Ship feature via merge',
+                'metadata': {'done_provenance': {'commit': shas['merge']}},
+            }],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        assert '### Done-task Provenance' in payload
+        assert f'commit: {shas["merge"]}' in payload
+        assert 'feature.py' in _extract_section(payload, '### Done-task Provenance')
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_commit_returns_empty_string_and_never_raises(self, tmp_path):
+        """Never-raises contract, pinned directly on the helper's return value.
+
+        Existing coverage (test_invalid_commit_gracefully_omits_file_list)
+        asserts this only indirectly, at the briefing level, via the absence
+        of a `files:` line. This pins it directly: adding argv flags is
+        exactly the kind of change that can turn a graceful-degradation path
+        into a raise, and the helper's docstring promises '' so one broken
+        ref never aborts a whole Stage-2 briefing. Any exception here fails
+        the test naturally — no pytest.raises is used because none should
+        ever fire.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+        bad_sha = 'deadbeef' * 5  # 40 chars but not a real SHA
+
+        # rc != 0 path — well-formed but unresolvable commit against a real repo.
+        result = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), bad_sha, max_files=50, max_chars=2000,
+        )
+        assert result == ''
+
+        # git itself fails — a bad -C root.
+        result = await _git_show_name_only(
+            ProjectRoot(str(tmp_path / 'nonexistent')), shas['merge'], max_files=50, max_chars=2000,
+        )
+        assert result == ''
+
+    @pytest.mark.asyncio
+    async def test_merge_commit_file_list_respects_max_files_truncation(self, tmp_path):
+        """max_files truncation, now REACHABLE for merge commits for the
+        first time — previously a merge yielded zero files, so max_files /
+        max_chars could never fire for one. Real merges are large enough to
+        matter (c7dcc4f9d4 brings 47 files against the caller's defaults of
+        max_files_per_task=50 / max_chars_per_task=2000,
+        _render_done_provenance_section), so the truncation path is now
+        genuinely live for merge provenance and must keep working.
+
+        The merge fixture brings in 5 files (feature.py + extra_1..4.py).
+        With a deliberately small max_files=2, exactly 2 entries must be
+        listed and the block must end with a correctly-counted
+        `... (N more)` marker — pinning that the marker isn't silently
+        dropped now that it can actually fire for a merge.
+        """
+        shas = self._init_repo_with_merge(tmp_path)
+
+        block = await _git_show_name_only(
+            ProjectRoot(str(tmp_path)), shas['merge'], max_files=2, max_chars=2000,
+        )
+
+        after_label = block.split('files:', 1)[1]
+        raw_lines = [ln.strip() for ln in after_label.splitlines() if ln.strip()]
+        more_markers = [ln for ln in raw_lines if ln.startswith('...')]
+        file_lines = [ln for ln in raw_lines if not ln.startswith('...')]
+
+        assert len(file_lines) == 2
+        assert more_markers == ['... (3 more)']
+
+    @pytest.mark.asyncio
+    async def test_section_under_budget_no_truncation_warning(self, caplog):
+        """A handful of small note-only tasks stay well under the default
+        20_000-char section budget — no truncation footer, no warning.
+
+        No git repo needed: note-only provenance never calls
+        _git_show_name_only, so this exercises the section-level budget in
+        isolation from per-task git truncation.
+        """
+        done_tasks = [
+            {
+                'id': i, 'title': f'Task {i}', 'status': 'done',
+                'metadata': {'done_provenance': {'note': f'short note {i}'}},
+            }
+            for i in range(5)
+        ]
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            section = await _render_done_provenance_section(done_tasks, None)
+
+        assert '... and ' not in section, (
+            f'Unexpected truncation footer in section; got:\n{section}'
+        )
+        assert not any(
+            rec.levelno == logging.WARNING and rec.name == _TKS_LOGGER
+            for rec in caplog.records
+        ), (
+            'Expected no WARNING for 5 small note-only tasks; '
+            f'got: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_section_over_budget_truncates_with_footer_and_warning(self, caplog):
+        """Many tasks with long notes exceed a deliberately small section
+        budget: rendering stops early, a truncation footer names the
+        remaining count, and a structured WARNING is logged — mirroring
+        _format_flagged's char-budget pattern (TestFormatFlaggedCharBudget).
+
+        Guards the amendment that gives '### Done-task Provenance' a total
+        char budget: before task 4702's argv fix, a done task citing a merge
+        commit contributed ~0 file lines (git's combined diff is empty for a
+        clean merge), so this section could never grow large in practice.
+        Now a merge can contribute up to max_files_per_task/max_chars_per_task
+        each, times up to MAX_DONE_TASKS_RETAINED (30) done tasks, so an
+        unbounded section could silently crowd out the rest of the Stage-2
+        prompt — this pins that the degradation is loud and bounded instead.
+        """
+        done_tasks = [
+            {
+                'id': i, 'title': f'Task {i}', 'status': 'done',
+                'metadata': {'done_provenance': {'note': 'x' * 200}},
+            }
+            for i in range(20)
+        ]
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            section = await _render_done_provenance_section(
+                done_tasks, None, section_budget_chars=500,
+            )
+
+        assert 'truncated: section char budget' in section, (
+            f'Expected truncation footer in section; got:\n{section}'
+        )
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == _TKS_LOGGER
+            and rec.message == 'reconciliation.done_provenance_section_truncated'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 truncation WARNING; got {len(warning_records)}: '
+            f'{[(r.message, getattr(r, "__dict__", {})) for r in warning_records]}'
+        )
+        rec = warning_records[0]
+        for key in ('total', 'rendered', 'dropped', 'section_budget_chars'):
+            assert hasattr(rec, key), (
+                f'Expected extra key {key!r} on WARNING record; record __dict__: {rec.__dict__}'
+            )
+        assert rec.total == 20, f'total must be 20, got {rec.total}'
+        assert rec.total == rec.rendered + rec.dropped, (
+            f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
+        )
+        assert rec.rendered > 0, f'rendered must be > 0, got {rec.rendered}'
+        assert rec.dropped > 0, f'dropped must be > 0, got {rec.dropped}'
+        assert rec.section_budget_chars == 500, (
+            f'section_budget_chars must be 500, got {rec.section_budget_chars}'
+        )
+        assert f'... and {rec.dropped} more (truncated: section char budget)' in section
 
 
 class BaseStageValidationTest:
