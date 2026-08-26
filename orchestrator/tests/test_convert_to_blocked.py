@@ -890,6 +890,137 @@ class TestConvertToBlockedApplierEnforce:
 
 
 # ---------------------------------------------------------------------------
+# amendment pass, review finding #3 — the MERGE-REMEDIABLE boundary
+#
+# `CONVERT_TO_BLOCKED`'s justification is that `blocked` is a RESTING state for
+# a pinned row.  That is true of a `task_failure` pin (every other test in this
+# file) and NOT of a pin inside `Harness.MERGE_REMEDIABLE_ESC_CATEGORIES`: for
+# those, `_only_merge_remediable` is True, so the blocked-arm upgrade clauses
+# would pick the converted row straight back up on the next sweep — MARK_DONE
+# on main, RE_FILE off it — turning row (f)'s "never second-guess an open
+# escalation" veto into a two-sweep auto-done by a route no one reviewed.
+#
+# The applier therefore holds those rows at their pre-3539 LEAVE.  These tests
+# pin BOTH sides of that boundary: the held population, and (via every other
+# test above) the converted one.
+# ---------------------------------------------------------------------------
+
+#: A pin the blocked arm treats as merge-remediable — the reaper's own record,
+#: read off `Harness.MERGE_REMEDIABLE_ESC_CATEGORIES` rather than hard-coded,
+#: so this suite follows the set instead of drifting from it.  A local import
+#: for the same reason the other cross-module imports in this file are local:
+#: `orchestrator.harness` is heavy and step-1's pure-table tests must stay
+#: importable without it.
+def _remediable_category() -> str:
+    from orchestrator.harness import Harness
+
+    assert Harness.MERGE_REMEDIABLE_ESC_CATEGORIES, (
+        'an empty merge-remediable set would make this whole suite vacuous'
+    )
+    return sorted(Harness.MERGE_REMEDIABLE_ESC_CATEGORIES)[0]
+
+
+_REMEDIABLE_CATEGORY = _remediable_category()
+
+REMEDIABLE_PIN = EscalationRef(
+    id='esc-3539-r', level=1, category=_REMEDIABLE_CATEGORY, severity='blocking',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertIsScopedToNonMergeRemediablePins:
+    """A merge-remediable-pinned strand is HELD, not converted."""
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_no_conversion_even_in_enforce_mode(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """Enforce mode is ON and the table says CONVERT — the applier holds.
+
+        Parametrized over all four branch kinds because the hazard differs by
+        shape (ON_MAIN / GONE_WITH_MERGE_MARKER would become an auto-done,
+        EXISTS_OFF_MAIN a possibly-duplicate escalation filing) and the clause
+        must cover every one of them.
+        """
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        result = await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None, 'a held row returns the LEAVE disposition'
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        assert enforce_harness.scheduler.mark_done.await_count == 0
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_the_emission_is_byte_identical_to_pre_3539(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """A held row must still emit the `recovery_vetoed` it always did.
+
+        `leave_reason` re-derives from the REPORT — which still classifies
+        CONVERT — so without the applier threading the reason explicitly the
+        chokepoint would silently DROP this row's event.  That would make the
+        scoping clause invisible to the exact stream an operator counts the
+        population in.
+        """
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        )
+
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned'
+
+    async def test_a_mixed_pin_set_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """`_only_merge_remediable` is an ``all(...)``, and that is load-bearing.
+
+        One non-remediable record among the pins means the blocked-arm clauses
+        would NOT move the converted row, so `blocked` really is at rest and
+        the conversion is the honest outcome.  Without this case the clause
+        could be written as "any remediable pin holds" and every other test
+        here would still pass.
+        """
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[REMEDIABLE_PIN, PIN_REFS[1]],
+        ))
+
+        assert await enforce_harness._reconcile_one_stranded(
+            _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_log_mode_does_not_report_a_held_row_as_a_candidate(
+        self, applier_harness, kind: BranchStateKind, caplog,
+    ) -> None:
+        """Log mode's whole job is to NAME the population that would move.
+
+        A row this clause holds is not in that population, so counting it
+        would inflate the number an operator uses to decide the promotion —
+        which is why the scoping clause is sited BEFORE the log-mode block.
+        """
+        import logging
+
+        _bind(applier_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await applier_harness._reconcile_one_stranded(
+                _TID, 'in-progress', mid_run=False,
+            )
+
+        assert not [
+            r for r in caplog.records if 'would convert_to_blocked' in r.getMessage()
+        ], 'a held row must not be counted as a conversion candidate'
+
+
+# ---------------------------------------------------------------------------
 # step-7 — `resolve_already_landed_branch` over REAL git fixtures
 #
 # This is the ENTRY half of the loop.  The gate that mints the pin is a

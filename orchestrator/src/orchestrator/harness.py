@@ -5657,6 +5657,62 @@ class Harness:
         # still reports a truthy mock, which is why the suites that drive this
         # path pin the flag explicitly in their fixtures.
         downgraded_reason: LeaveReason | None = None
+
+        # Task 3539 amendment (review finding #3) — CONVERSION APPLIES ONLY TO
+        # A PIN THAT `blocked` ACTUALLY HOLDS.
+        #
+        # The table cannot make this distinction and must not try: `_RECOVERY`
+        # keys on a BOOLEAN `has_open_escalation` and the module is
+        # deliberately pure and config-free, while "which pin categories does
+        # the blocked arm treat as merge-remediable" is THIS class's policy
+        # (`MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping lives here, with
+        # the other two sweep-side adjustments.
+        #
+        # WHY IT IS NEEDED.  `CONVERT_TO_BLOCKED`'s whole justification is that
+        # `blocked` is a RESTING state for a pinned row: not dispatchable, and
+        # `_RECOVERY`'s only BLOCKED row keys `has_open_escalation=False`, so a
+        # converted row can never be recovered out of it by the table.  That
+        # holds for a `task_failure` pin (the measured 3717 population) — but
+        # NOT for a pin the two clauses ABOVE deliberately relax on.  For a row
+        # pinned solely by `stranded_blocked`, `_only_merge_remediable` is
+        # True, so the very next sweep would see status='blocked', classify
+        # LEAVE, and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
+        # RE_FILE_ESCALATION over an escalation that is already open).  That
+        # would turn row (f)'s "never second-guess an open escalation, even
+        # with on-main landing evidence" veto into a two-sweep auto-done, and
+        # (j) into a possible duplicate filing — the exact hazards the rows
+        # exist to avoid, arrived at by a route no one reviewed.
+        #
+        # A merge-remediable-pinned strand therefore keeps EXACTLY its
+        # pre-3539 disposition: a silent LEAVE, byte-identical emission
+        # included.  That leaves a churn population unfixed, and that is the
+        # deliberate trade — those rows churn today too, so this is an
+        # un-widened fix rather than a regression, and PRD leaf delta's
+        # relaxation of the blocked-arm veto is task 4645's territory, not
+        # 3539's.  Sited BEFORE the log-mode block on purpose: log mode's whole
+        # job is to name the population that WOULD move, and a row this clause
+        # holds is not in it.
+        if (
+            action == RecoveryAction.CONVERT_TO_BLOCKED
+            and self._only_merge_remediable(report.open_escalations)
+        ):
+            logger.info(
+                'Reconcile: task %s matches a convert_to_blocked row but is '
+                'pinned only by merge-remediable escalation(s) %s — holding '
+                'as before (a converted row would not be at rest: the '
+                'blocked-arm upgrade clauses would move it again next sweep)',
+                tid,
+                ', '.join(
+                    f'{ref.id}:{ref.category}' for ref in report.open_escalations
+                ) or '-',
+            )
+            # Same explicit threading as log mode below, and for the same
+            # reason: `leave_reason` re-derives from the REPORT (which still
+            # classifies CONVERT), so without this the chokepoint would drop
+            # the `recovery_vetoed` row this shape has always emitted.
+            downgraded_reason = LeaveReason.escalation_pinned
+            action = RecoveryAction.LEAVE
+
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
             and not getattr(self.config, 'convert_to_blocked_enforce', False)
@@ -5735,6 +5791,12 @@ class Harness:
             # filed — the task is already pinned, and a second record would be
             # the duplicate/competing-escalation hazard rows (g)/(h) exist to
             # avoid.
+            #
+            # That invariant is TRUE OF EVERY ROW THAT REACHES HERE because of
+            # the merge-remediable scoping clause above, not by luck: a pin
+            # inside `MERGE_REMEDIABLE_ESC_CATEGORIES` would be picked up again
+            # by the blocked-arm upgrade clauses on the next sweep, so those
+            # rows are held before they ever get here (review finding #3).
             logger.warning(
                 'Reconcile: converting task %s in-progress -> blocked '
                 '(shape=%s, branch=%s, pinned by %s) — pinned and unclaimed, '
