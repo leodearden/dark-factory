@@ -1238,3 +1238,106 @@ class TestTwoWayOracleContractAsync:
 
         req.result.cancel()
         _assert_two_way_quiescent(worker, main_sha, [req])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-03 RED: Row 11 (part 1) — the gate must reach PRD DEPTH 16 --
+#
+# Nothing in the tree builds a chain deeper than THREE links: γ's scenes cap at
+# 6 but seed 5 followers, and δ's `_DeltaScene` is hard-wired to 3 links plus a
+# truncator.  The PRD's row 11 is stated at "16-item chain (cap 32)", the
+# observed maximum reify queue depth — so the cap=32 promotion η2 ships is
+# ENTIRELY unexercised today.  Before any timeout claim can be made about a
+# depth-16 chain, a scene has to be able to BUILD one.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestDeepScaleBuild:
+    """A real 16-item chain at ``chain_cap=32`` — the PRD's stated maximum."""
+
+    async def test_sixteen_queued_items_build_one_fifteen_link_chain(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """16 queued items at cap=32 → ONE chain of 15 links in ONE spec lane.
+
+        Every number here is a unit statement, and the units are the whole
+        hazard.  ``chain_items`` counts ITEMS IN THE TREE with the dispatching
+        item as #1, while ``build_chain`` counts ADDITIONAL LINKS BEYOND the
+        base it is handed — and the base IS the dispatching item's merge
+        commit.  ``_deep_chain_placement`` converts between them with
+        ``cap - 1`` / ``d - 1``, so a 16-item tree is a 15-link build driven by
+        ``cap=31, target_depth=15``.  Pinning the converted kwargs (rather than
+        only the resulting length) is what would catch a conversion that
+        silently landed on 16 links / 17 items — an off-by-one the PRD's
+        ``depth`` field already suffered once.
+
+        ``truncated_at is None`` is the other unit claim: a chain that stopped
+        because it reached its TARGET DEPTH is complete, not truncated;
+        ``truncated_at`` is reserved for the item that did not chain.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=15, db_name='gate-scale-16.db',
+            remote=True,
+        )
+        rec = await scene.round_(tag='scale', head_tid='101')
+
+        chain = rec['chain']
+        assert chain is not None, 'cap=32 with 16 queued items must chain'
+        assert len(chain.links) == 15, (
+            f'expected a 15-LINK chain (16 items incl. the head), got '
+            f'{len(chain.links)}: {[t for t, _ in chain.links]!r}'
+        )
+        assert 1 + len(chain.links) == 16
+        assert chain.truncated_at is None, (
+            f'a DEPTH stop is not a truncation, but truncated_at is '
+            f'{chain.truncated_at!r} (reason {chain.truncated_reason!r})'
+        )
+
+        # ── the unit conversion, pinned at the build_chain boundary ──────────
+        assert len(scene.built) == 1, (
+            f'exactly one build for the round, got {len(scene.built)}'
+        )
+        assert scene.built[0]['cap'] == 31, (
+            f'cap must be converted to LINK units (32 - 1), got '
+            f'{scene.built[0]["cap"]!r}'
+        )
+        assert scene.built[0]['target_depth'] == 15, (
+            f'target_depth must be converted to LINK units (16 - 1), got '
+            f'{scene.built[0]["target_depth"]!r}'
+        )
+
+        # ── the tip is a real descendant of the head's merge commit ──────────
+        assert chain.tip != rec['head_mc'], (
+            'a 15-link chain whose tip equals its base built nothing'
+        )
+        rc, _o, _e = await _run(
+            ['git', 'merge-base', '--is-ancestor', rec['head_mc'], chain.tip],
+            cwd=git_repo,
+        )
+        assert rc == 0, (
+            f'the chain tip {chain.tip[:8]} must descend from the head merge '
+            f'commit {rec["head_mc"][:8]}'
+        )
+
+        # ── ONE scratch lane for the whole build (PRD decision #1) ───────────
+        assert chain.lane is not None and chain.lane.name.startswith('_spec-'), (
+            f'the build must claim a pooled _spec- lane, got {chain.lane!r}'
+        )
+        assert len(scene.lane_releases) == 1, (
+            f'the chain lane is released EXACTLY once per build; got '
+            f'{scene.lane_releases!r}'
+        )
+
+        # ── η1's reader sees a 16-item deep verify ───────────────────────────
+        verify_rows = _verify_rows(scene.db_path)
+        assert len(verify_rows) == 1, (
+            f'ONE merge_verify paid for the whole 16-item tree, got '
+            f'{len(verify_rows)}'
+        )
+        assert verify_rows[0]['chain_items'] == 16, (
+            f'chain_items is in CHAIN-ITEM units (head = #1), so a 15-link '
+            f'chain reports 16; got {verify_rows[0]["chain_items"]!r}'
+        )
