@@ -645,55 +645,46 @@ class TestCountForeignRelationships:
         assert count == scalar
 
     @pytest.mark.asyncio
-    async def test_an_empty_result_set_degrades_to_zero(
-        self, mock_config, make_backend, make_graph_mock,
+    @pytest.mark.parametrize(
+        'unreadable',
+        [
+            pytest.param(None, id='absent-result-set'),
+            pytest.param([], id='empty-result-set'),
+            pytest.param([[]], id='row-with-no-columns'),
+            pytest.param([[None]], id='row-whose-column-is-None'),
+            pytest.param([['not-a-number']], id='row-whose-column-is-not-numeric'),
+        ],
+    )
+    async def test_an_unreadable_response_raises_rather_than_reading_zero(
+        self, mock_config, make_backend, make_graph_mock, unreadable,
     ):
-        """A DEFENSIVE branch, not the primary zero path.
-
-        ``count(r)`` is an ungrouped aggregate, so against a real server a node
-        with no relationships still comes back as one readable ``0`` row — the
-        ``int(rows[0][0])`` path above.  This covers only a driver that hands
-        back an empty ``result_set``.
-        """
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 0
-
-    @pytest.mark.asyncio
-    async def test_an_absent_result_set_returns_zero(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """``result_set = None`` degrades the same way as an empty one."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[])
-        result = MagicMock()
-        result.result_set = None
-        graph.ro_query = AsyncMock(return_value=result)
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        assert await backend.count_foreign_relationships('n-3129', group_id='test') == 0
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('malformed', [[[]], [[None]], [['not-a-number']]])
-    async def test_a_present_but_unreadable_row_raises_rather_than_reading_zero(
-        self, mock_config, make_backend, make_graph_mock, malformed,
-    ):
-        """THE DEFENSIVE ZERO MUST NOT MASK A MALFORMED RESPONSE.
+        """NO UNREADABLE RESPONSE MAY DEGRADE INTO A DELETE-AUTHORISING ZERO.
 
         ``count(r)`` has no grouping key, so against a real server it always
-        yields exactly one readable row.  A row that is PRESENT but unreadable
-        is a broken response, and quietly reading it as ``0`` would AUTHORISE a
-        deletion on the strength of a response nobody understood.  Raising is
-        the safe direction: the single caller wraps this in a per-candidate
-        try/except, so a raise becomes a logged skip — a refusal to delete.
+        yields exactly one readable row — including for a node with no
+        relationships at all, which comes back as a readable ``0``.  Every
+        shape parametrized here is therefore a BROKEN response, and all five
+        are equally uninterpretable: an absent ``result_set``, an empty one,
+        and a row that is present but unreadable say exactly as much about the
+        node's degree, namely nothing.
+
+        Zero is the single value that AUTHORISES the destructive
+        ``delete_entity`` in ``MemoryService._cleanup_emptied_nodes``, so an
+        arm that quietly returned it would be the one FAIL-OPEN branch in a
+        guard whose whole purpose is to prevent irreversible loss of a real
+        entity's temporal history.  Two of these arms used to do exactly that,
+        while the other three raised; the asymmetry was unmotivated, since no
+        legitimate call reaches any of them.  Raising is the safe direction
+        uniformly: the single caller wraps this in a per-candidate try/except,
+        so a raise becomes a logged skip — a refusal to delete.
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[])
         result = MagicMock()
-        result.result_set = malformed
+        result.result_set = unreadable
         graph.ro_query = AsyncMock(return_value=result)
         backend._driver._get_graph = MagicMock(return_value=graph)
-        with pytest.raises((IndexError, TypeError, ValueError)):
+        with pytest.raises((RuntimeError, IndexError, TypeError, ValueError)):
             await backend.count_foreign_relationships('n-3129', group_id='test')
 
     # -- episode_uuid='ep-1' : exclude only THIS episode's own MENTIONS ------

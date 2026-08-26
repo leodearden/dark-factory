@@ -2213,18 +2213,23 @@ class GraphitiBackend:
         READ-ONLY, and must stay so — it runs on ``ro_query``.  A guard that can
         write is a guard that can cause the damage it exists to prevent.
 
-        A note on the zero paths.  ``count(r)`` is an UNGROUPED aggregate — it
-        carries no grouping key — so against a real server it yields exactly one
-        row whether or not the ``MATCH`` found anything, and a node with no
-        relationships at all comes back as a readable ``0``.  ``int(rows[0][0])``
-        is therefore the PRIMARY zero path.  The ``if not rows: return 0`` branch
-        is purely DEFENSIVE — it covers a driver that hands back an empty or
-        ``None`` ``result_set`` — and is not a path a healthy backend takes.
+        THE ONLY ZERO THIS RETURNS IS ONE THE SERVER ACTUALLY SAID.
+        ``count(r)`` is an UNGROUPED aggregate — it carries no grouping key —
+        so against a real server it yields exactly one row whether or not the
+        ``MATCH`` found anything, and a node with no relationships at all comes
+        back as a readable ``0``.  ``int(rows[0][0])`` is therefore the ONLY
+        zero path, and no legitimate call can reach an empty or ``None``
+        ``result_set`` at all.
 
-        A row that is PRESENT but unreadable is the opposite case, and is
-        deliberately allowed to RAISE rather than be read as a delete-authorising
-        ``0``: quietly degrading a response nobody understood into the one value
-        that AUTHORISES a deletion is the unsafe direction.  The caller wraps
+        Every OTHER response shape RAISES, and the arms are deliberately
+        symmetric: an empty ``result_set``, an absent one, and a row that is
+        present but unreadable are all equally uninterpretable, so none of them
+        may be quietly degraded into the single value that AUTHORISES a
+        deletion.  An earlier revision returned ``0`` for the two empty arms;
+        that was the one fail-OPEN branch in a guard whose entire purpose is to
+        prevent irreversible loss of a real entity's temporal history, and the
+        asymmetry with the raising arm was unmotivated.  Raising costs nothing
+        on every real path, because no real path gets here.  The caller wraps
         this in a per-candidate ``try``/``except``, so a raise becomes a logged
         skip — a refusal to delete.
 
@@ -2240,7 +2245,11 @@ class GraphitiBackend:
             to the node, minus this episode's own ``MENTIONS`` link.
 
         Raises:
-            RuntimeError: if the backend is not initialized.
+            RuntimeError: if the backend is not initialized, or if the query
+                came back with no readable row — see above; that is a broken
+                response, never a node with no relationships.
+            IndexError/TypeError/ValueError: if the row is present but its
+                first column cannot be read as an int.
         """
         graph = self._graph_for(group_id)
         cypher = 'MATCH (n:Entity {uuid: $uuid})-[r]-(m) '
@@ -2252,7 +2261,15 @@ class GraphitiBackend:
         result = await graph.ro_query(cypher, params)
         rows = result.result_set or []
         if not rows:
-            return 0
+            # NOT a node with no relationships — that comes back as a readable
+            # `0` row. This is a response nobody can interpret, and reading it
+            # as `0` would authorise a DETACH DELETE on the strength of it.
+            raise RuntimeError(
+                'count_foreign_relationships: empty result_set for node '
+                f'{node_uuid!r} in group {group_id!r}; count(r) is an ungrouped '
+                'aggregate and always yields one row, so this is a broken '
+                'response, not a zero-degree node'
+            )
         return int(rows[0][0])
 
     @_canonicalize_group_args
