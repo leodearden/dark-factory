@@ -755,6 +755,33 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
     return captured
 
 
+def _spy_spec_lane_acquire(git_ops: GitOps, monkeypatch) -> list[tuple]:
+    """Record every ``acquire_spec_lane`` call as ``(base_commit, lane, warm)``.
+
+    Row 7's golden states the kill switch's absences BY NAME, and "no scratch
+    lane was ever claimed" is one of them.  Counting RELEASES would be the
+    inferential version of that claim — release is exactly-once-per-build, so
+    zero releases with zero builds does imply zero acquisitions — but a leak is
+    precisely the case where the two diverge, and a golden that could not tell
+    "never acquired" from "acquired and never given back" would be asserting
+    the wrong absence.
+
+    Spied on the GitOps INSTANCE (test_merge_queue_reachback_patch_guard.py
+    freezes the ``orchestrator.merge_queue.<private>`` reach-back surface) and
+    PASSTHROUGH, so the lane pool stays real.
+    """
+    calls: list[tuple] = []
+    real = git_ops.acquire_spec_lane
+
+    async def _recording(base_commit, *args, **kwargs):
+        lane, warm = await real(base_commit, *args, **kwargs)
+        calls.append((base_commit, lane, warm))
+        return lane, warm
+
+    monkeypatch.setattr(git_ops, 'acquire_spec_lane', _recording)
+    return calls
+
+
 def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
     """Record ``release_chain_build_lane`` calls WITHOUT suppressing them.
 
@@ -906,8 +933,15 @@ def _finalized_rows(db_path: Path) -> list[dict]:
     return [json.loads(r[0]) for r in rows]
 
 
-def _rows_of_type(db_path: Path, event_type: EventType) -> list[dict]:
+def _rows_of_type(
+    db_path: Path, event_type: EventType, *, task_id: str | None = None,
+) -> list[dict]:
     """Return every row of *event_type*'s parsed ``data`` dict, in order.
+
+    *task_id*, when given, restricts the read to that task's rows — which is
+    how :func:`_gate_round_transcript` attributes a ``merge_verify`` /
+    ``merge_finalized`` row to the round whose head owns it, without the
+    extractor having to track rowid watermarks the scene never recorded.
 
     The un-specialised sibling of :func:`_finalized_rows` / :func:`_verify_rows`,
     for the rows a claim is about the ABSENCE of.  Reading the durable tier
@@ -920,10 +954,17 @@ def _rows_of_type(db_path: Path, event_type: EventType) -> list[dict]:
 
     conn = sqlite3.connect(str(db_path))
     try:
-        rows = conn.execute(
-            'SELECT data FROM events WHERE event_type = ? ORDER BY rowid',
-            (event_type.value,),
-        ).fetchall()
+        if task_id is None:
+            rows = conn.execute(
+                'SELECT data FROM events WHERE event_type = ? ORDER BY rowid',
+                (event_type.value,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT data FROM events WHERE event_type = ? AND task_id = ? '
+                'ORDER BY rowid',
+                (event_type.value, task_id),
+            ).fetchall()
     finally:
         conn.close()
     return [json.loads(r[0]) for r in rows]
@@ -1668,6 +1709,7 @@ class _GateScene:
         self.verdicts: list[dict] = []
         self.built: list[dict] = []
         self.lane_releases: list[tuple] = []
+        self.lane_acquires: list[tuple] = []
         self.advance_calls: list[tuple] = []
         self.reqs: dict[str, MergeRequest] = {}
         self.rounds: list[dict] = []
@@ -1746,6 +1788,7 @@ class _GateScene:
         worker._n_failed = False
         worker._remerge_occurred = False
         n_built_before = len(self.built)
+        n_acquires_before = len(self.lane_acquires)
         n_releases_before = len(self.lane_releases)
         n_advances_before = len(self.advance_calls)
         main_before = await _rev_parse(self.repo, 'main')
@@ -1792,6 +1835,7 @@ class _GateScene:
             # Per-round SLICES of the cumulative ledgers, so a multi-round row
             # reads what THIS round did rather than the running total.
             'built': self.built[n_built_before:],
+            'lane_acquires': self.lane_acquires[n_acquires_before:],
             'lane_releases': self.lane_releases[n_releases_before:],
             'advance_calls': self.advance_calls[n_advances_before:],
             'landed': [
@@ -1943,6 +1987,7 @@ async def _make_gate_scene(
         return rec['result']
 
     monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
+    scene.lane_acquires = _spy_spec_lane_acquire(git_ops, monkeypatch)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
     scene.advance_calls = _spy_advance_main(git_ops, monkeypatch)
 
@@ -3240,6 +3285,81 @@ class TestLadderDriverIsNotInert:
             f'a landed round is not a merge failure and must not feed the '
             f'ladder; got {after.consecutive_merge_thrash!r}'
         )
+
+
+# ── the ROUND-SEQUENCE transcript extractor (step-12) ────────────────────────
+
+
+def _gate_round_transcript(scene: _GateScene, idx: int) -> dict:
+    """Normalise ONE round into a repo-independent, comparable dict.
+
+    test_merge_queue_deep_landing.py::_delta_round_transcript widened for a
+    SEQUENCE golden.  EXTRACTOR ONLY — every value is read back off facts
+    ``_GateScene`` already recorded, or off the durable tier; nothing here
+    re-drives the round, so the golden compares ONE run rather than two.
+
+    KEY SET, alphabetical and explicit (adding a field must force a visible
+    golden edit, never a silent widening of the dict):
+
+      ``advanced``          — did ``_finalize_inflight`` advance main.
+      ``build_chain_calls`` — ``build_chain`` invocations in THIS round.
+      ``chain``             — ``None``, or the chained task ids in link order.
+      ``chain_build_ms``    — normalised: ``None``, or ``'<stamped>'`` for any
+                              real cost.  The raw ms is a wall-clock reading and
+                              can never appear in a golden; what the row asserts
+                              is presence/absence.
+      ``chain_items``       — off the round's ``merge_verify`` row, i.e. the
+                              value η1's reader actually sees.  NOT the dispatch
+                              kwarg, which is a literal floor of 1 on every path
+                              and would make the field vacuous.
+      ``events``            — the DISPATCHING task's ordered event-type stream.
+      ``halving_state``     — ``_chain_halving_state`` after the round.
+      ``landed_via_chain``  — off the head's ``merge_finalized`` row.
+      ``main_moved``        — did main's sha change across the round.
+      ``outcome_status``    — the head request's rendered ``MergeOutcome``.
+      ``probe_base``        — normalised to ``'<sha>'``; the raw sha is
+                              repo-dependent.
+      ``result_has_outcome``/``result_has_worktree``/``result_status`` — the
+                              ``InflightVerifyResult`` triple.
+      ``spec_lane_acquisitions`` — ``acquire_spec_lane`` calls in THIS round.
+      ``verified_the_items_own_merge_commit`` — did the verify run against the
+                              item's OWN merge commit (the floor path) rather
+                              than a chain tip.
+    """
+    rec = scene.rounds[idx]
+    item = rec['item']
+    head_tid = rec['req'].task_id
+    chain = rec['chain']
+    verify = _rows_of_type(scene.db_path, EventType.merge_verify, task_id=head_tid)
+    finalized = _rows_of_type(
+        scene.db_path, EventType.merge_finalized, task_id=head_tid,
+    )
+    build_ms = verify[0].get('chain_build_ms') if verify else None
+    outcome = rec['outcome']
+    return {
+        'advanced': rec['advanced'],
+        'build_chain_calls': len(rec['built']),
+        'chain': None if chain is None else [tid for tid, _ in chain.links],
+        'chain_build_ms': None if build_ms is None else '<stamped>',
+        'chain_items': verify[0]['chain_items'] if verify else None,
+        'events': _events_for_task(scene.db_path, head_tid),
+        'halving_state': rec['halving_state'],
+        'landed_via_chain': finalized[0].get('landed_via_chain') if finalized else None,
+        'main_moved': rec['main_after'] != rec['main_before'],
+        'outcome_status': None if outcome is None else outcome.status,
+        'probe_base': None if rec.get('probe_base') is None else '<sha>',
+        'result_has_outcome': rec['result'].outcome is not None,
+        'result_has_worktree': rec['result'].merge_wt is not None,
+        'result_status': None if rec['result'].status is None else rec['result'].status.value,
+        'spec_lane_acquisitions': len(rec.get('lane_acquires', ())),
+        'verified_the_items_own_merge_commit':
+            bool(verify) and verify[0]['merge_sha'] == item.merge_result.merge_commit,
+    }
+
+
+def _gate_sequence_transcript(scene: _GateScene) -> list[dict]:
+    """Every round of *scene*, in order, as :func:`_gate_round_transcript` dicts."""
+    return [_gate_round_transcript(scene, i) for i in range(len(scene.rounds))]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
