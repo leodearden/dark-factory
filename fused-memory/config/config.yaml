@@ -423,7 +423,7 @@ write_triage:
   # t_high/t_low. This is the operator's input at the task-3169 flip gate; no
   # accuracy floor is asserted anywhere in code or tests (PRD D10 makes the
   # report the arbiter and the human the gate).
-  judge_accuracy_report_path: null
+  judge_accuracy_report_path: calibration/write_triage_judge_accuracy_report.json
   # CALIBRATION OUTPUT — do not hand-edit.
   # Derived from measured similarity distributions by
   # scripts/calibrate_write_triage.py; both values are order statistics of

@@ -621,7 +621,7 @@ def build_judge_fn(config: Any) -> Any:
             MemoryResult(
                 id=str(record['memory_id']),
                 content=str(record['content']),
-                source_store=SourceStore.MEM0,
+                source_store=SourceStore.mem0,
                 metadata={
                     'store_score': _SYNTHETIC_TOP_SCORE - index * _SYNTHETIC_SCORE_STEP,
                 },
@@ -676,11 +676,23 @@ def _run(args: Any) -> int:
     logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
 
     if args.limit:
-        # Truncating RECORDS rather than cases keeps every case's slate
-        # resolvable — a case whose canonical was cut would raise in the
-        # runner, which is the right behaviour there and a useless one here.
-        records = records[: args.limit]
-        logger.info('--limit %d: measuring %d record(s)', args.limit, len(records))
+        # Truncating RECORDS rather than cases, plus whatever canonicals those
+        # records point at. A bare head-N slice can cut a cluster's canonical
+        # while keeping its members, and the runner would then KeyError on an
+        # unresolvable slate partway through a paid run — the right behaviour
+        # for a dangling id in the real fixture, a useless one for a smoke.
+        kept = records[: args.limit]
+        wanted = {str(r['cluster_id']) for r in kept}
+        canonicals = [
+            r for r in records
+            if str(r['memory_id']) in wanted and r not in kept
+        ]
+        records = [*kept, *canonicals]
+        logger.info(
+            '--limit %d: measuring %d record(s) (%d canonical(s) pulled in to '
+            'keep every slate resolvable)',
+            args.limit, len(records), len(canonicals),
+        )
 
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
@@ -722,7 +734,8 @@ def main() -> int:
                         help="cross-cluster candidates per slate; 4 gives PRD C1's "
                              'top-5 width alongside the attach target (default: 4)')
     parser.add_argument('--limit', type=int, default=None,
-                        help='measure only the first N records (a cheap live smoke)')
+                        help='measure only the first N records, plus the canonicals their '
+                             'slates need (a cheap live smoke)')
     parser.add_argument('--dry-run', dest='dry_run', action='store_true',
                         help='score a fixed-answer judge; makes no provider call')
     return _run(parser.parse_args())
