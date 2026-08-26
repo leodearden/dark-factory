@@ -1812,6 +1812,84 @@ def test_within_fleet_deploy_min_interval_false_when_clock_absent(
     assert wdog._within_fleet_deploy_min_interval() is False
 
 
+def test_within_fleet_staleness_head_start_true_shortly_after_window_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True when the FLEET deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    The corrected anchor (task 4754): the coordinator's head start is measured
+    from the moment this tier's own min-interval window OPENED
+    (last_fleet_deploy + ORCH_RESTART_MIN_INTERVAL_SECS), not from the age of
+    the newest watched commit. Here the window opened 300s ago, well inside
+    the 1800s head start, so the fleet backstop must still hold off.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 300.0)
+
+    assert wdog._within_fleet_staleness_head_start() is True
+
+
+def test_within_fleet_staleness_head_start_false_once_head_start_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once the fleet window has been open for STALENESS_GRACE_SECS or more.
+
+    The window opened 1801s ago — the polite event-driven coordinator has had
+    its full head start at this boundary, so the backstop is released.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(
+        wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1800.0 + 1.0
+    )
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
+def test_within_fleet_staleness_head_start_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False when the fleet clock is missing/corrupt/unreadable.
+
+    The fail-OPEN direction inherited from _within_min_interval: with no
+    readable clock there is no window-open instant to measure a head start
+    from, so the head start must not apply. Failing the other way would let
+    one unreadable file silence the fleet staleness backstop forever.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: None)
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
+def test_within_fleet_staleness_head_start_false_when_both_caps_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False WITHOUT reading the clock when the summed cap is <=0.
+
+    Both ORCH_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to
+    0, which _within_min_interval short-circuits before touching the reader —
+    a disabled head start must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fleet_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the head start is disabled"),
+    )
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
 # ---------------------------------------------------------------------------
 # staleness_pass core tests
 #
@@ -5825,6 +5903,85 @@ def test_within_fm_deploy_min_interval_false_when_clock_absent(
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
 
     assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_within_fm_staleness_head_start_true_shortly_after_window_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True when the FM deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    fm sibling of test_within_fleet_staleness_head_start_true_shortly_after_
+    window_opens, pinning fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS) and fm's
+    OWN reader (_read_last_fm_deploy_epoch) — never the fleet's. The corrected
+    anchor (task 4754) measures the head start from the moment fm's window
+    OPENED (last_fm_deploy + FM_RESTART_MIN_INTERVAL_SECS); here that was 300s
+    ago, well inside the 1800s head start, so the fm backstop holds off.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 300.0)
+
+    assert wdog._within_fm_staleness_head_start() is True
+
+
+def test_within_fm_staleness_head_start_false_once_head_start_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once fm's window has been open for STALENESS_GRACE_SECS or more.
+
+    fm's window opened 1801s ago — the polite event-driven fm coordinator has
+    had its full head start at this boundary, so the fm backstop is released.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(
+        wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1800.0 + 1.0
+    )
+
+    assert wdog._within_fm_staleness_head_start() is False
+
+
+def test_within_fm_staleness_head_start_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False when fm's clock is missing/corrupt/unreadable.
+
+    The fail-OPEN direction inherited from _within_min_interval: with no
+    readable fm clock there is no window-open instant to measure a head start
+    from, so the head start must not apply. Failing the other way would let
+    one unreadable file silence the fm staleness backstop forever.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    assert wdog._within_fm_staleness_head_start() is False
+
+
+def test_within_fm_staleness_head_start_false_when_both_caps_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False WITHOUT reading fm's clock when the summed cap is <=0.
+
+    Both FM_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to 0,
+    which _within_min_interval short-circuits before touching the reader — a
+    disabled head start must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the head start is disabled"),
+    )
+
+    assert wdog._within_fm_staleness_head_start() is False
 
 
 def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
