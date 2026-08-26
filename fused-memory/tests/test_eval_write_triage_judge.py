@@ -112,17 +112,24 @@ def _corpus() -> list[dict]:
 
     Unsorted so a determinism assertion cannot pass by accident on an input
     that was already in canonical order.
+
+    ``cluster_id`` IS the canonical record's own ``memory_id`` — the fixture's
+    referential-integrity invariant, pinned against the committed corpus by
+    `test_the_synthetic_corpus_uses_the_fixtures_cluster_key` below. A
+    synthetic corpus that named clusters some other way would let the eval
+    build slates out of ids that exist nowhere, and every test here would
+    still pass.
     """
     return [
-        _rec('c2-dup-1', 'c2', 'duplicate'),
-        _rec('c1-canon', 'c1', 'canonical'),
-        _rec('c3-pseudo', 'c3', 'pseudo_contradiction'),
-        _rec('c1-dup-2', 'c1', 'duplicate'),
-        _rec('c2-canon', 'c2', 'canonical'),
-        _rec('c1-dup-1', 'c1', 'duplicate'),
-        _rec('c3-canon', 'c3', 'canonical'),
-        _rec('c2-distinct', 'c2', 'distinct'),
-        _rec('c3-dup-1', 'c3', 'duplicate'),
+        _rec('c2-dup-1', 'c2-canon', 'duplicate'),
+        _rec('c1-canon', 'c1-canon', 'canonical'),
+        _rec('c3-pseudo', 'c3-canon', 'pseudo_contradiction'),
+        _rec('c1-dup-2', 'c1-canon', 'duplicate'),
+        _rec('c2-canon', 'c2-canon', 'canonical'),
+        _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+        _rec('c3-canon', 'c3-canon', 'canonical'),
+        _rec('c2-distinct', 'c2-canon', 'distinct'),
+        _rec('c3-dup-1', 'c3-canon', 'duplicate'),
     ]
 
 
@@ -153,6 +160,25 @@ class TestBuildJudgeCases:
         assert {c['memory_id'] for c in labelled} == {
             'c1-dup-1', 'c1-dup-2', 'c2-dup-1', 'c2-distinct', 'c3-dup-1', 'c3-pseudo',
         }
+
+    def test_the_synthetic_corpus_uses_the_fixtures_cluster_key(
+        self, records,
+    ) -> None:
+        """`cluster_id` is the canonical's own `memory_id`, in BOTH corpora.
+
+        Load-bearing, because `build_judge_cases` puts `cluster_id` straight
+        onto the slate as the attach target. If the synthetic corpus named
+        clusters any other way, every slate here would carry an id that
+        resolves to no record — and nothing else in this file would notice,
+        since none of it dereferences the slate.
+        """
+        by_id = {r['memory_id']: r for r in records}
+        for record in records:
+            canonical = by_id.get(record['cluster_id'])
+            assert canonical is not None, f'dangling cluster_id: {record!r}'
+            assert canonical['label'] == _mod().LABEL_CANONICAL, f'{record!r}'
+        for record in _corpus():
+            assert record['cluster_id'] in {r['memory_id'] for r in _corpus()}
 
     def test_a_canonical_record_is_never_a_submitted_entry(self) -> None:
         """A canonical IS the attach target; asking the judge to compare it to
