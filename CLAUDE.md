@@ -193,12 +193,20 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both funnel through `scripts/restart-all-orchestrators.sh --drain` and
-share one 8h fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
+fleet-deploy clock). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
+
+Two things that section used to claim, and that measurement disproved on
+2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
+passes no arguments, so it restarts mid-merge units ungated), and the two
+tiers **can** both redeploy inside one 8h window — the clock is stamped only
+when a sweep completes, so a long sweep leaves it reading the previous deploy
+throughout. Tasks **4754** and **4755** close this. Until they land, don't
+reason as if a fleet redeploy is at most once per 8h.
 
 ## Working in the main checkout
 

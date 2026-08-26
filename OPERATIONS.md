@@ -952,24 +952,49 @@ restart:
   any fleet-wide clock, and it never stamps that clock. A single
   wedged-unit revive is not a fleet deploy.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
-  is the backstop: capped to at most one fleet-wide redeploy per 8 hours
+  is the backstop: *intended* to cap the fleet at one redeploy per 8 hours
   (`orchestrator_restart_min_interval_secs`, default 28800) via a shared
-  clock file (`data/orchestrator/last_redeploy_orchestrator.json`),
+  clock file (`data/orchestrator/last_redeploy_orchestrator.json`) — see
+  the correction below for why that cap does not currently hold,
   delegating the actual restart to
   `scripts/restart-all-orchestrators.sh --drain` — which is drain-aware
-  (defers a unit that's mid-merge, then force-restarts it after roughly 75
-  minutes of continuous busy) and stamps the clock only once the restart
-  is fully verified (the script exits 0).
+  (defers a unit that's mid-merge, then force-restarts it after
+  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` of continuous busy: 10 minutes
+  since 2026-08-26, 75 minutes before that) and stamps the clock only
+  once the restart is fully verified (the script exits 0). Note this env
+  knob is a *different* setting from the coordinator's
+  `orchestrator_restart_force_fire_after_secs` config field below, despite
+  the near-identical name — one bounds a per-unit drain wait inside the
+  script, the other bounds how long the coordinator stays pending before
+  it force-fires.
 - **Coordinator = the polite, event-driven trigger for that same deploy.**
   It fires on a clean idle window, or force-fires after
   `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min) of
   eligibility — bypassing the idle/debounce gates — but honors the same
-  shared 8-hour clock, so the coordinator and the watchdog backstop never
-  both redeploy inside the same window.
+  shared 8-hour clock.
 
-Both staleness and the coordinator funnel through the single
-`restart-all-orchestrators.sh --drain` chokepoint, so drain behavior and
-clock-stamping are defined once and can't drift between the two triggers.
+Both staleness and the coordinator invoke the same
+`restart-all-orchestrators.sh` chokepoint, so **clock-stamping** is defined
+once: the script is the sole on-disk writer of the shared clock, and only on
+its all-units-verified-fresh exit-0 path.
+
+**Drain behavior is NOT defined once, and the two tiers CAN both redeploy
+inside one 8-hour window.** Two corrections measured 2026-08-24/25:
+
+- Only the staleness backstop passes `--drain`. The coordinator invokes the
+  script with no arguments (`script_args=[]`), so it restarts a mid-merge unit
+  with no drain gate at all. Confirmed from the transient units' own command
+  lines — `orch-fleet-staleness-redeploy.service` carries `--drain`,
+  `orch-selfrestart-on-merge-N.service` does not.
+- Because the clock is stamped only when a sweep *completes*, a long sweep
+  leaves the clock reading the previous deploy for its whole duration, and any
+  other tier's min-interval check then legitimately passes. With one unit stuck
+  reporting `merge_idle:false`, sweeps ran ~81 minutes and the fleet was
+  redeployed twice per window — dark_factory runs of 1.26h / 0.92h / 1.33h.
+  Tasks **4754** (head-start reference point) and **4755** (in-flight lease,
+  which also stops a liveness probe from cancelling the sweep's own restart
+  jobs) close this; until they land, treat "one deploy per 8h" as the intent,
+  not a guarantee, and read the clock file's timestamp rather than assuming it.
 
 ### Reading `--report`
 
