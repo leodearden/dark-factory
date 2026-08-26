@@ -1806,15 +1806,20 @@ def staleness_pass() -> None:
     deploy capstone, or manual operator action) makes the unit read fresh on
     the very next call. No stored state, no flap loop (I6).
 
-    Known limitation: the commit-grace gate below keys on the age of the
-    *newest* watched commit only, not on how far behind any individual unit
-    is. During a burst of continuous landings where a watched-path commit
-    lands more often than every STALENESS_GRACE_SECS, the newest commit is
-    perpetually inside the grace window, so this backstop is inhibited for
-    the whole burst even if some running unit is far behind an older commit.
-    This is an accepted trade-off (never race the event-driven coordinator)
-    rather than a bug; use `--report` to inspect actual per-unit staleness
-    while a burst is in progress.
+    Known limitation (UNCHANGED by task 4754): the commit-grace gate below is
+    RETAINED alongside the min-interval-anchored head start, so the effective
+    head start is the LATER of the two anchors. The commit-grace half still
+    keys on the age of the *newest* watched commit only, not on how far behind
+    any individual unit is. During a burst of continuous landings where a
+    watched-path commit lands more often than every STALENESS_GRACE_SECS, the
+    newest commit is perpetually inside the grace window, so this backstop is
+    inhibited for the whole burst even if some running unit is far behind an
+    older commit. That remains an accepted trade-off rather than a bug, for a
+    reason worth stating: the event-driven coordinator is triggered on exactly
+    those merge landings and is permanently force-fire-pending during a burst,
+    so tier 1 is at its most reachable precisely when this gate is at its most
+    restrictive. Use `--report` to inspect actual per-unit staleness while a
+    burst is in progress.
 
     Shared fleet-deploy clock (task 2396, fleet-redeploy β): checked FIRST,
     ahead of the commit-grace gate below — a top-priority, fleet-wide
@@ -1826,6 +1831,28 @@ def staleness_pass() -> None:
     module-level docstring) — the gate check still runs every tick, only the
     log emission is throttled.
 
+    Coordinator head start (task 4754): a SECOND clock gate, checked
+    immediately after the min-interval cap and still ahead of the commit-grace
+    gate. The head start is now measured from the moment that min-interval
+    window OPENED (last verified deploy + ORCH_RESTART_MIN_INTERVAL_SECS) —
+    see scripts/orchestrator-watchdog.py::_within_fleet_staleness_head_start —
+    rather than from the age of the newest watched commit. The old
+    commit-anchored grace could not order the two tiers at a window boundary:
+    measured 2026-08-25, there were ZERO watched-path commits in the 30
+    minutes before ANY of 12 dark_factory run boundaries over 08-22..08-25, so
+    the newest commit was already outside its grace by construction whenever
+    the 8h window opened and the grace inhibited nothing. The 60s-cadence
+    backstop consequently beat the event-driven coordinator 5 times out of 5
+    across 08-24/25/26, and the fleet was redeployed twice inside one window,
+    truncating runs to 1.26h / 0.92h / 1.33h. With this gate, "never race the
+    event-driven coordinator" is true AT THE WINDOW BOUNDARY for the first
+    time.
+
+    SCOPE: this orders the two TIERS at each clock-open only. It does NOT
+    address the backstop colliding with its OWN in-flight sweep (a tick whose
+    min-interval check passed before an in-flight --drain stamped the clock),
+    which needs in-flight state and is task 4755.
+
     Delegation (task 2396): once ANY eligible unit is found stale, the
     per-unit loop below no longer restarts it directly — instead the whole
     fleet-wide restart is delegated ONCE, after the loop, to
@@ -1834,9 +1861,11 @@ def staleness_pass() -> None:
     brokenness is not a scheduled deploy).
     """
     if _within_fleet_deploy_min_interval():
-        # Bucket on wall-clock time (not elapsed-since-deploy) so this needs
-        # no extra clock-file read beyond the one _within_fleet_deploy_min_
-        # interval() already did — see SKIP_LOG_INTERVAL_SECS above.
+        # Bucket on wall-clock time (not elapsed-since-deploy) — see
+        # SKIP_LOG_INTERVAL_SECS above. The head-start gate below takes a
+        # SECOND small-JSON clock read on ticks where this first gate is open,
+        # deliberately: each gate keeps its own named reader seam rather than
+        # threading one epoch through both (task 4754).
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 "skip: within fleet-deploy min-interval "
@@ -1844,13 +1873,22 @@ def staleness_pass() -> None:
             )
         return
 
+    if _within_fleet_staleness_head_start():
+        log(
+            f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
+            "since the fleet-deploy min-interval opened"
+        )
+        return
+
     commit_epoch = _newest_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
     if time.time() - commit_epoch < STALENESS_GRACE_SECS:
-        # Give the polite event-driven restart coordinator its head start.
-        # NOTE: gates on the newest commit's age alone — see the "Known
-        # limitation" paragraph above for the rapid-landing suppression case.
+        # RETAINED second anchor (task 4754 decision 1): the head start is
+        # the LATER of "since the min-interval window opened" (gate above) and
+        # "since the newest watched commit". Gates on the newest commit's age
+        # alone — see the "Known limitation" paragraph above for the
+        # rapid-landing suppression case.
         return
 
     stale_found = False
