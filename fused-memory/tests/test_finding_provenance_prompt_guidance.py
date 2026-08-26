@@ -35,20 +35,11 @@ from __future__ import annotations
 import pytest
 from shared.task_metadata import parse_metadata
 
-# The call-opener scanners are imported from the drift-guard module that owns
-# them rather than re-implemented, for the same reason step-6 imports
-# DISALLOW_TASK_WRITES from cli_stage_runner: a hand-rolled twin of a guard
-# tracks the original only until one of them is edited.
-from test_recon_report_guidance_drift import (
-    _AGENT_CALLED_REPORT_TOOLS,
-    _extract_call_args_at,
-    _iter_call_openers,
-)
-
 from fused_memory.reconciliation.cli_stage_runner import DISALLOW_TASK_WRITES
 from fused_memory.reconciliation.prompts import (
     FINDING_ID_METADATA_KEY,
     FINDING_MEMORY_IDS_METADATA_KEY,
+    FINDING_PROVENANCE_VOCABULARY_RULE,
     get_recon_report_tool_guidance,
     render_finding_provenance_section,
 )
@@ -79,6 +70,22 @@ _KEY_SAMPLE_VALUES = [
     (FINDING_ID_METADATA_KEY, 'f1'),
     (FINDING_MEMORY_IDS_METADATA_KEY, ['90bd6ecf']),
 ]
+
+# Each assembled prompt paired with the per-stage provenance section it is
+# expected to carry (Stage 3 carries none — it folds DISALLOW_TASK_WRITES and
+# gets only the shared block). Pairing them here is what lets the occurrence
+# assertions below DERIVE their expected counts from the single-sourced
+# renderers instead of hard-coding a magic number that a legitimate reword
+# would have to chase.
+_ASSEMBLED_PROMPTS = [
+    ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT, _STAGE1_SECTION),
+    ('STAGE2_SYSTEM_PROMPT', STAGE2_SYSTEM_PROMPT, _STAGE2_SECTION),
+    ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT, ''),
+]
+
+# Explicit ids are required, not cosmetic: pytest otherwise derives each id from
+# the parametrized value, embedding a whole multi-KB system prompt in every id.
+_PROMPT_IDS = ['stage1', 'stage2', 'stage3']
 
 
 class TestCanonicalKeyConstants:
@@ -144,52 +151,60 @@ class TestSharedGuidanceBlockNamesBothKeys:
             f'found {guidance.count(key)} occurrences.'
         )
 
-    @pytest.mark.parametrize(
-        'name, prompt',
-        [
-            ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT),
-            ('STAGE2_SYSTEM_PROMPT', STAGE2_SYSTEM_PROMPT),
-            ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT),
-        ],
-        # Explicit ids are required, not cosmetic: pytest otherwise derives each
-        # id from the parametrized value, embedding a whole multi-KB system
-        # prompt in every test id.
-        ids=['stage1', 'stage2', 'stage3'],
-    )
-    def test_every_stage_prompt_names_both_keys(self, name: str, prompt: str):
-        """All three assembled prompts carry both canonical names.
+    @pytest.mark.parametrize('name, prompt, section', _ASSEMBLED_PROMPTS, ids=_PROMPT_IDS)
+    def test_every_stage_prompt_names_both_keys(self, name: str, prompt: str, section: str):
+        """All three assembled prompts name both keys, and ONLY via a renderer.
 
         Stage 3 is included deliberately. It is read-only and cannot file
         tasks, but it renders the same shared block, and "all three stages
         agree on the vocabulary" is the property being pinned — agreement about
         what the keys ARE is separable from the license to write them.
+
+        The count is checked, not just membership, and the expected value is
+        DERIVED from the two single-sourced renderers rather than hard-coded.
+        So a stage that grows its own hand-typed mention of a key goes red
+        (INV-5 `no-lockstep-duplication`) while a faithful reword inside either
+        renderer stays green — the count moves on both sides at once.
         """
+        shared = get_recon_report_tool_guidance()
         for key, _ratified in _RATIFIED_SPELLINGS:
             assert key in prompt, (
                 f'{name} must name the canonical provenance key {key!r}; a stage left '
                 'without the name is a stage free to invent a spelling.'
             )
+            expected = shared.count(key) + section.count(key)
+            assert prompt.count(key) == expected, (
+                f'{name} mentions {key!r} {prompt.count(key)}x, but the single-sourced '
+                f'renderers account for only {expected}x. Every mention must come from '
+                'get_recon_report_tool_guidance() or render_finding_provenance_section() '
+                '— a per-stage copy is the lockstep duplication this section exists to '
+                'avoid.'
+            )
 
+    @pytest.mark.parametrize('name, prompt, section', _ASSEMBLED_PROMPTS, ids=_PROMPT_IDS)
+    def test_the_vocabulary_rule_is_stated_at_most_once(
+        self, name: str, prompt: str, section: str
+    ):
+        """The negative rule reaches each stage that can write a key, exactly once.
 
-class TestGuidanceClauseDoesNotReopenTheRunIdHole:
-    """The new clause must not smuggle in a hand-written call example.
+        It was briefly stated twice per prompt — once in the shared
+        recon-report block and once in the provenance section — which is the
+        lockstep duplication INV-5 names: a maintainer rewording one copy would
+        not know about the other. This pins the interpolation TOPOLOGY (a
+        constant counted, never a sentence retyped), following
+        `test_stage2_carries_the_task_filing_branch_exactly_once` below.
 
-    `_render_recon_report_tool_guidance`'s call examples are GENERATED from live
-    tool signatures (task-2559) precisely so they cannot omit a required kwarg.
-    A hand-written example added alongside them would bypass that generator and
-    reopen the exact drift task-2559 closed — so the clause is prose that NAMES
-    the two keys and shows no call.
-    """
-
-    def test_every_call_opener_in_the_guidance_still_carries_run_id(self):
-        guidance = get_recon_report_tool_guidance()
-        for tool_name in _AGENT_CALLED_REPORT_TOOLS:
-            for paren_idx in _iter_call_openers(guidance, tool_name):
-                args_substr = _extract_call_args_at(guidance, paren_idx)
-                assert 'run_id' in args_substr, (
-                    f'A `{tool_name}(...)` example in the shared guidance is missing '
-                    f'`run_id` — got: {tool_name}({args_substr})'
-                )
+        Stage 3 expects zero: it folds DISALLOW_TASK_WRITES, so it cannot mint
+        a variant key, and this package does not tell a stage about an action
+        it is not sanctioned to take.
+        """
+        expected = 1 if section else 0
+        assert prompt.count(FINDING_PROVENANCE_VOCABULARY_RULE) == expected, (
+            f'{name} states FINDING_PROVENANCE_VOCABULARY_RULE '
+            f'{prompt.count(FINDING_PROVENANCE_VOCABULARY_RULE)}x; expected {expected}x. '
+            'A second surface may interpolate the constant, but then this expectation '
+            'is the deliberate decision to move — never a re-typed copy.'
+        )
 
 
 class TestCapabilitySplitOfTheActionableRule:
@@ -258,6 +273,11 @@ class TestCapabilitySplitOfTheActionableRule:
     def test_only_the_task_filing_branch_names_submit_task(self):
         """THE capability contract, and the reason the split exists at all.
 
+        The two halves differ in kind. The POSITIVE half is the contract: Stage
+        2 must say WHERE the keys get set, which requires naming the tool it
+        holds. The NEGATIVE half is a style choice this section makes and
+        `render_source_completion_section` does not — see its failure message.
+
         The tool name is derived from `DISALLOW_TASK_WRITES` at its source
         rather than hard-coded, so this tracks the disallow list as it changes.
         Mirroring an inventory instead of reading it at the source is the exact
@@ -273,9 +293,16 @@ class TestCapabilitySplitOfTheActionableRule:
         bare = qualified.rsplit('__', 1)[-1]
 
         assert bare not in _STAGE1_SECTION, (
-            f'The can_file_tasks=False rendering names {bare!r}, but Stage 1 does not '
-            'hold that tool (DISALLOW_TASK_WRITES is folded into STAGE1_DISALLOWED). '
-            'Naming it there licenses an action Stage 1 cannot take.'
+            f'The can_file_tasks=False rendering names {bare!r}. Stage 1 does not hold '
+            'that tool (DISALLOW_TASK_WRITES is folded into STAGE1_DISALLOWED), and '
+            'this section deliberately withholds the token even in a NEGATION — a name '
+            'surfaced to a model is still a name surfaced. That is a considered style '
+            'choice, recorded as a DIVERGENCE in render_finding_provenance_section\'s '
+            'docstring, not a rule about what Stage 1 may be told: '
+            'render_source_completion_section makes the opposite call for the same '
+            'tool. Harmonising the two is a legitimate edit — but decide it there and '
+            'update this expectation with it, rather than reading this failure as a '
+            'capability violation.'
         )
         assert bare in _STAGE2_SECTION, (
             f'The can_file_tasks=True rendering must name {bare!r} — Stage 2 holds it, '

@@ -237,27 +237,6 @@ work against it.\
 # reaches whenever it files informational / cross_project findings), and cite_task returns
 # it from BOTH in-run cited-task folds (task-2425 project-scoped, task-2432 entity-scoped,
 # the latter with no stage carve-out) — so the salvage protocol has to reach all of them.
-# Canonical finding-provenance metadata keys (esc-3796-1, task 4373).
-#
-# The recon prompts have always mandated CAPTURING a Stage-1 `finding_id`, but
-# never said WHERE to persist it on a task filed from that finding. Neither key
-# has a code writer — the PROMPT is the writer — so an unnamed key is an
-# uninstructed one, and the corpus duly forked into 64 bespoke spellings. These
-# constants are the ratified names, single-sourced: every prompt surface that
-# names a finding-provenance metadata key interpolates them, so the three
-# stages cannot drift apart and a future rename is one edit rather than a hunt.
-#
-# Deliberately plain string literals, NOT imported from
-# `shared.task_metadata`: this module imports stdlib only, and widening the
-# prompt-import path to reach the allowlist would couple prompt rendering to
-# the task-metadata package for a two-token agreement. That agreement is
-# enforced instead by tests/test_finding_provenance_prompt_guidance.py, which
-# cross-checks both constants against `parse_metadata` — where this repo
-# already puts its drift guards.
-FINDING_ID_METADATA_KEY = 'source_finding_id'
-FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
-
-
 # Do NOT re-inline a per-stage copy; reword HERE. Keep the enumeration open-ended rather
 # than counting the paths: an exact count that a real response can contradict tells an
 # agent the shape it just received cannot occur, which is exactly what invites the
@@ -282,6 +261,57 @@ new one, and carry over any detail your finding carried that the surviving one d
 Once purged there is nothing left to recover it from, so do not simply drop the extra \
 detail as redundant.\
 """
+
+
+# Canonical finding-provenance metadata keys (esc-3796-1, task 4373).
+#
+# The recon prompts have always mandated CAPTURING a Stage-1 `finding_id`, but
+# never said WHERE to persist it on a task filed from that finding. Neither key
+# has a code writer — the PROMPT is the writer — so an unnamed key is an
+# uninstructed one, and the corpus duly forked into 64 bespoke spellings. These
+# constants are the ratified names, single-sourced: every prompt surface that
+# names a finding-provenance metadata key interpolates them, so the three
+# stages cannot drift apart and a future rename is one edit rather than a hunt.
+#
+# Deliberately plain string literals, NOT imported from
+# `shared.task_metadata`: this module imports stdlib only, and widening the
+# prompt-import path to reach the allowlist would couple prompt rendering to
+# the task-metadata package for a two-token agreement. That agreement is
+# enforced instead by tests/test_finding_provenance_prompt_guidance.py, which
+# cross-checks both constants against `parse_metadata` — where this repo
+# already puts its drift guards.
+FINDING_ID_METADATA_KEY = 'source_finding_id'
+FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
+
+# The negative half of the vocabulary rule, single-sourced per INV-5
+# `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
+# above is: it was briefly written twice — once in the shared recon-report block
+# and once in the per-stage provenance section — so every Stage 1/2 prompt
+# carried two near-identical paragraphs that a maintainer rewording either copy
+# would not know about. It now lives HERE only; reword HERE.
+#
+# It is interpolated by `render_finding_provenance_section` alone, which is the
+# only ACTIONABLE surface (Stage 1 and Stage 2 — the stages that can cause one
+# of these keys to be written, directly or by relay). The shared block that
+# Stage 3 sees deliberately gets the NAMES without this rule: Stage 3 folds
+# DISALLOW_TASK_WRITES, so it cannot mint a variant key, and this package does
+# not tell a stage about an action it is not sanctioned to take
+# (`render_escalation_boundary_note`). A second interpolation site is not
+# forbidden — but it must interpolate this constant rather than re-type it, and
+# the assembled-prompt occurrence counts in
+# tests/test_finding_provenance_prompt_guidance.py must move with it.
+#
+# NOTE: a PLAIN (non-f) string, so the two key names are appended by the caller
+# rather than interpolated here.
+FINDING_PROVENANCE_VOCABULARY_RULE = (
+    'Those two spellings are the whole vocabulary. Never mint a per-topic '
+    'variant of either name: the corpus already forked into 64 such spellings '
+    '(e.g. `title_count_corrected_source_finding`, '
+    '`stage2_addendum_finding_latest`), which is what made finding provenance '
+    'ungreppable in the first place. A genuinely one-off annotation goes under '
+    'the `x_` namespace — silently allowed — rather than becoming a 65th '
+    'bespoke top-level key.'
+)
 
 
 def render_escalation_boundary_note(*, can_escalate: bool) -> str:
@@ -352,8 +382,11 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
     submit_task in this stage"), whereas this one does not name it at all. The
     relay CHANNEL wording is mirrored so the two sections tell Stage 1 the same
     story about the same channel, but the tool token is withheld — a name
-    surfaced to a model in a negation is still a name surfaced, and the
-    capability test pins its absence from this branch.
+    surfaced to a model in a negation is still a name surfaced. That is a style
+    choice, not a capability rule (the two sections make opposite calls about
+    the same tool and both are safe); tests/test_finding_provenance_prompt_guidance.py
+    pins the token's absence from this branch, so harmonising the two sections
+    means deciding it here and moving that expectation with the edit.
 
     Args:
         can_file_tasks: True for Stage 2, which holds the task-write tools and
@@ -361,8 +394,12 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
             must relay to Stage 2.
 
     Returns:
-        The shared provenance body plus the matching capability clause. Free of
-        literal braces so it drops cleanly into the stage f-strings.
+        The shared provenance body plus the matching capability clause. The
+        value is interpolated into the stage f-strings at runtime, and an
+        interpolated value is never re-scanned for braces (nor is either
+        assembled prompt ever ``.format()``-ed — ``build_stage2_system_prompt``
+        does string injection, not formatting), so unlike the plain-string
+        constants above this text is under no brace-doubling constraint.
     """
     if can_file_tasks:
         capability_clause = (
@@ -376,9 +413,13 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
             'You cannot file tasks in this stage (task writes are disallowed '
             'here), so you cannot persist these keys yourself. Relay the finding '
             'id and its cited memory ids to Stage 2 via the `flag_for_stage2` / '
-            '`flagged_items` channel, so Stage 2 can set them under those same '
-            'two names. A relayed finding id that arrives without its memory ids '
-            'cannot be reconstructed later — carry both.'
+            '`flagged_items` channel, carrying them in the `flagged_items` entry '
+            f'under those same two field names — `{FINDING_ID_METADATA_KEY}` and '
+            f'`{FINDING_MEMORY_IDS_METADATA_KEY}` — so Stage 2 can persist them '
+            'unchanged. `flagged_items` entries are free-form objects, so a '
+            'spelling you invent on this hop forks the vocabulary exactly as a '
+            'bespoke metadata key would. A relayed finding id that arrives '
+            'without its memory ids cannot be reconstructed later — carry both.'
         )
     return (
         '## Finding Provenance\n'
@@ -389,13 +430,9 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         '`## Verifying add_finding responses` rule; never compose or guess one.\n'
         f'- `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — the memory ids that '
         'finding cites.\n\n'
-        'Those two spellings are the WHOLE vocabulary. Never mint a per-topic '
-        'variant of either name: the corpus already forked into 64 such spellings '
-        '(e.g. `title_count_corrected_source_finding`, '
-        '`stage2_addendum_finding_latest`), which is what made finding provenance '
-        'ungreppable in the first place. A genuinely one-off annotation goes under '
-        'the `x_` namespace — silently allowed — rather than becoming a 65th '
-        'bespoke top-level key. ' + capability_clause
+        + FINDING_PROVENANCE_VOCABULARY_RULE
+        + ' '
+        + capability_clause
     )
 
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
@@ -533,14 +570,19 @@ def _render_recon_report_tool_guidance(
         'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
         f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
         ' and capture the `finding_id` from the response.'
+        # Names the two canonical keys for EVERY stage (Stage 3 sees only this
+        # block), and stops there: the vocabulary rule and the actionable
+        # set-them-here instruction live in FINDING_PROVENANCE_VOCABULARY_RULE /
+        # render_finding_provenance_section, which Stage 1 and Stage 2 also get.
+        # Keep this clause free of a hand-written recon-report call example — the
+        # examples around it are GENERATED from live signatures (task-2559), and
+        # test_recon_report_guidance_drift.py fails any call opener in an
+        # assembled prompt that omits `run_id=`.
         ' When that finding\'s provenance is persisted on a task, the canonical'
         f' metadata keys are `metadata.{FINDING_ID_METADATA_KEY}` for the'
         ' `finding_id` captured verbatim above, and'
         f' `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` for the memory ids that'
-        ' finding cites. Those two spellings are the whole vocabulary: never'
-        ' invent a per-topic variant of either name. A genuinely one-off'
-        ' annotation belongs under the `x_` namespace instead, which is'
-        ' silently allowed. Then attach typed citations:\n'
+        ' finding cites. Then attach typed citations:\n'
         f'- `{cite_entity_call}` —'
         ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
         f'- `{cite_edge_call}` —'
