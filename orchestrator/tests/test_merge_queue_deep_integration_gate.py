@@ -983,6 +983,139 @@ def _canary_predicate_items_per(
 # ── the TWO-WAY quiescence oracle (step-2) ───────────────────────────────────
 
 
+def _blocked_signature(outcome) -> str:
+    """The ladder key workflow.py would compute for *outcome*, via the SHIPPED fn.
+
+    workflow.py stashes ``result.reason`` / ``result.failure_category`` /
+    ``result.failure_cause_hint`` off a blocked :class:`MergeOutcome` and later
+    fingerprints exactly that triple.  Transcribing the fingerprint here would
+    make the gate pass through a format change; delegating to
+    ``workflow._compute_merge_outcome_signature`` makes it fail on one.
+    """
+    from orchestrator.workflow import _compute_merge_outcome_signature
+
+    return _compute_merge_outcome_signature(
+        outcome.failure_category, outcome.failure_cause_hint, outcome.reason or '',
+    )
+
+
+_MERGE_THRASH_THRESHOLD = 2
+"""``OrchestratorConfig.max_consecutive_merge_thrash``'s shipped default.
+
+Restated as a literal rather than read off a config, because the threshold is
+what the ROW is about: two identical rendered merge failures in a row is
+exactly 3003's signature class, and this file's whole claim is that a deep
+round can never produce that pair.  A test that read the live default would
+still pass if the default were raised to 5 — and the pair it drives would then
+no longer be the trip input it is written to be.  Kept pinned to the shipped
+value, with :class:`TestLadderDriverIsNotInert` proving the fold reaches it.
+"""
+
+
+def _ladder_after(
+    rounds: list[dict],
+    *,
+    ledger: RetryLedger | None = None,
+    requests: list[MergeRequest] | None = None,
+    threshold: int = _MERGE_THRASH_THRESHOLD,
+) -> RetryLedger:
+    """Fold *rounds*' REAL rendered outcomes through workflow.py's OWN ladder.
+
+    Row 8's other half.  The merge-queue side of the row is a silence claim;
+    this is the driver that carries that silence to the consumer 3003's
+    signature class actually lives in, so the row can assert the ladder is
+    UNMOVED rather than merely that no event was written.
+
+    WHAT WORKFLOW.PY ACTUALLY CONSUMES, and therefore what this reproduces —
+    two inputs, both taken off a rendered blocked :class:`MergeOutcome`:
+
+      1. WHETHER there is one at all.  ``_submit_to_merge_queue``'s generic
+         blocked path stashes ``result.reason`` into
+         ``TaskWorkflow._last_merge_block_reason``, and the merge-phase loop
+         gates the ENTIRE thrash check on that field being non-None.  Every
+         other outcome status — ``done``, and the REQUEUED arm a red deep tip
+         produces — leaves it None and the ladder untouched.  A deep fail
+         requeues WITHOUT rendering a block reason, which is precisely why the
+         row's claim holds.
+      2. Its SIGNATURE, if there is one: ``_compute_merge_outcome_signature``
+         over ``(failure_category, failure_cause_hint, reason)`` — the same
+         triple ``_submit_to_merge_queue`` stashes alongside the reason.
+
+    Both are taken through the SHIPPED functions
+    (:func:`orchestrator.workflow._compute_merge_outcome_signature`,
+    :func:`orchestrator.workflow._evaluate_merge_thrash`) rather than
+    transcribed.  A transcription would let a signature-format change or a
+    counter-arithmetic change pass this gate silently, which for a row whose
+    entire content is "the shipped ladder does not move" would be the one
+    failure mode that matters.
+
+    ONE LEDGER, NOT ONE PER TASK.  workflow.py's ladder is per-task state
+    (``metadata.retry_ledger``), and a scene's rounds are all dispatches of ONE
+    head, so a single ledger IS the head's.  Any additional blocked outcome
+    rendered for a chained LINK is folded in too — *requests*, when given, is
+    the scene's whole registry and is scanned for exactly that.  Folding a
+    link's outcome into the head's ledger is not what production would do (the
+    link has its own workflow and its own ledger); it is deliberately STRICTER,
+    because this row's claim is that no link renders one at all.  A leak
+    anywhere in the queue therefore moves the counter and fails the assertion,
+    instead of being filed to a per-task ledger nobody looks at.
+
+    ORDER.  Rounds first, in round order — the only real chronology available —
+    then any link outcome not already folded, in *requests* order.  The
+    ordering is deterministic rather than arbitrary because the ladder's reset
+    arm is order-sensitive: it compares each signature against the PREVIOUS
+    one, so a driver that shuffled its inputs could turn a genuine
+    increment-to-threshold into a reset and report "unmoved" for the wrong
+    reason.
+
+    Args:
+        rounds: ``_GateScene.rounds`` records (or fabricated ones — the fold
+            reads only ``rec['outcome']``, which is what makes
+            :class:`TestLadderDriverIsNotInert` able to control it).
+        ledger: the starting ledger.  Defaults to a virgin
+            :class:`RetryLedger`; pass a MID-RUN one to make the claim against
+            a task that genuinely blocked sequentially earlier, where a leaked
+            signature would show up as either an increment or a reset.
+        requests: the scene's request registry, scanned for a blocked outcome
+            rendered for any item the rounds do not already account for.
+        threshold: what ``_evaluate_merge_thrash`` escalates at.  Affects only
+            the verdict's ``escalate`` flag, which this helper drops — the
+            counter arithmetic is threshold-independent — but is threaded so
+            the control test can state the number it is asserting against.
+
+    Returns:
+        The ledger that came back out.  Hand it to
+        :func:`_assert_two_way_quiescent` as ``ladder={'before': ..., 'after':
+        ...}`` to make the unmoved claim part of the round-by-round oracle.
+    """
+    from orchestrator.workflow import _evaluate_merge_thrash
+
+    current = RetryLedger() if ledger is None else ledger
+
+    outcomes = [rec.get('outcome') for rec in rounds]
+    if requests:
+        seen = {id(o) for o in outcomes if o is not None}
+        for req in requests:
+            if not req.result.done() or req.result.cancelled():
+                continue
+            outcome = req.result.result()
+            if id(outcome) not in seen:
+                seen.add(id(outcome))
+                outcomes.append(outcome)
+
+    for outcome in outcomes:
+        # Gate 1: workflow.py's `_last_merge_block_reason is not None`.  A
+        # REQUEUED round renders no outcome at all (None here), and a landed
+        # one renders `status='done'` — neither reaches the thrash check.
+        if outcome is None or getattr(outcome, 'status', None) != 'blocked':
+            continue
+        signature = _blocked_signature(outcome)
+        current = _evaluate_merge_thrash(
+            current, current.last_merge_outcome_signature, signature, threshold,
+        ).ledger
+    return current
+
+
 class _LadderClaim(TypedDict):
     """The ``ladder=`` argument's shape: a ledger PAIR, before and after.
 
@@ -2789,22 +2922,6 @@ halved into the floor would be asserting silence about a round that never
 chained."""
 
 _ROW8_FOLLOWERS = 8
-
-
-def _blocked_signature(outcome) -> str:
-    """The ladder key workflow.py would compute for *outcome*, via the SHIPPED fn.
-
-    workflow.py stashes ``result.reason`` / ``result.failure_category`` /
-    ``result.failure_cause_hint`` off a blocked :class:`MergeOutcome` and later
-    fingerprints exactly that triple.  Transcribing the fingerprint here would
-    make the gate pass through a format change; delegating to
-    ``workflow._compute_merge_outcome_signature`` makes it fail on one.
-    """
-    from orchestrator.workflow import _compute_merge_outcome_signature
-
-    return _compute_merge_outcome_signature(
-        outcome.failure_category, outcome.failure_cause_hint, outcome.reason or '',
-    )
 
 
 @pytest.mark.asyncio
