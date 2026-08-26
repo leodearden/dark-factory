@@ -1283,14 +1283,22 @@ directly, not just interactive sessions. Treat it accordingly:
 
 dark-factory and the sibling **reify** repo each carry a copy of the
 lock-charter file-path allowlist (`FILE_EXTENSIONS` /
-`EXTENSIONLESS_FILENAMES`). They must agree, and historically that
-agreement was checked *live, in-suite*, on the merge-verify critical path.
-That is why the 2026-07-29 incident happened: reify widened its allowlist
-36 → 58 with no dark-factory change involved, and every dark-factory
-worktree's full suite went red.
+`EXTENSIONLESS_FILENAMES`). They must agree, and that agreement is checked
+*live, in-suite*, on the merge-verify critical path. That is why the
+2026-07-29 incident happened: reify widened its allowlist 36 → 58 with no
+dark-factory change involved, and every dark-factory worktree's full suite
+went red.
 
-The explicitly-invoked reconciliation moves that comparison **off** the
-critical path. Run it whenever either repo's allowlist changes, and before
+That in-suite check is **still live**, and this section does not retire it:
+the Tier-2 guard in `fused-memory/tests/test_lock_charter_guard.py` still
+shells out to reify's `scripts/lock-charter-guard.sh` and hard-asserts the
+two vectors match, on the merge-verify path. Re-run the 2026-07-29 shape
+today and it reds again — that guard is what you will actually see fail.
+The script below does not replace it. It **adds** an off-critical-path way
+to run the same comparison, so you can answer "did reify move?"
+deliberately: without a suite run, and without attributing the red to
+whatever branch happened to be in the lane (see the attribution contract
+below). Run it whenever either repo's allowlist changes, and before
 believing an in-suite drift failure:
 
 ```bash
