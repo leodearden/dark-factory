@@ -1609,6 +1609,17 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # Always present (task 3084), set before the remediation early-return
+            # beside the task-2312/2229 pre-inits above. All three stay 0 here:
+            # this stage's filtered_task_tree is unset, so the
+            # resolved-curator-gate sweep never runs and no stat is overwritten.
+            # _errors joined the pair in the task-3084 amendment pass (reviewer
+            # finding "observability"): without it, a cycle in which every gate
+            # failed its Qdrant read is byte-identical here to a clean cycle
+            # that found nothing.
+            'curator_gate_resolution_scanned': 0,
+            'curator_gate_resolution_flags_emitted': 0,
+            'curator_gate_resolution_errors': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1721,6 +1732,17 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # Always present (task 3084), set before the remediation early-return
+            # beside the task-2312/2229 pre-inits above. All three stay 0 here:
+            # this stage's filtered_task_tree is unset, so the
+            # resolved-curator-gate sweep never runs and no stat is overwritten.
+            # _errors joined the pair in the task-3084 amendment pass (reviewer
+            # finding "observability"): without it, a cycle in which every gate
+            # failed its Qdrant read is byte-identical here to a clean cycle
+            # that found nothing.
+            'curator_gate_resolution_scanned': 0,
+            'curator_gate_resolution_flags_emitted': 0,
+            'curator_gate_resolution_errors': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at

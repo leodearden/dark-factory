@@ -19,6 +19,10 @@ from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    extract_open_gate_task_ids,
+    sweep_resolved_curator_gates,
+)
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -243,9 +247,120 @@ class MemoryConsolidator(BaseStage):
         # distinction explicit instead of implying "no summary at all".
         report.stats['stage1_cycle_summary_ledger_written'] = 0
 
+        # Always present (task 3084, mirroring the two pre-inits above): set
+        # BEFORE the remediation early-return so no key is ever conditionally
+        # absent — Stage 1's whole report.stats blob is serialized verbatim
+        # into Stage 2's prompt by _format_report (task_knowledge_sync.py), so
+        # a consumer should not need a .get(..., 0) fallback.  Overwritten
+        # below on a full (non-remediation) cycle once the sweep actually runs;
+        # stays 0 on remediation passes (which deliberately skip the sweep, see
+        # that block below) and when filtered_task_tree is unset.
+        #
+        # _errors is reported alongside the other two (reviewer finding
+        # "observability", amendment pass) because without it a cycle in which
+        # EVERY gate failed its Qdrant read is byte-identical, in the report and
+        # therefore in Stage 2's prompt, to a cycle in which every gate was
+        # cleanly checked and none was resolved — both read scanned=N,
+        # flags_emitted=0.  The failure would exist only in the process log,
+        # which is exactly the silent-degradation shape the no-silent-fail-soft
+        # invariant targets.  With all three present, the reader can also spot
+        # the sweep's zero-recall signature (scanned > 0, flags_emitted == 0,
+        # errors == 0 — see the sweep module docstring on source-key drift).
+        report.stats['curator_gate_resolution_scanned'] = 0
+        report.stats['curator_gate_resolution_flags_emitted'] = 0
+        report.stats['curator_gate_resolution_errors'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
+
+        # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
+        # Flag open ``operational_mode == 'gate'`` tasks for which the reify
+        # curator has ALREADY written its ruling to Mem0 (an entry stamped
+        # ``metadata.source == 'curator_gate_{task_id}'``).  Detection was an
+        # ad-hoc Stage-3 spot-check that missed ~25% of cases (run ec45eed0:
+        # gates 5561 and 5563 were resolved-but-stale and went undetected).
+        # Stage 1 runs under DISALLOW_TASK_WRITES, so this only FLAGS; Stage 2
+        # (which holds set_task_status) acts.
+        #
+        # Placement, deliberately unlike the three other Stage-1 sweeps below
+        # (degenerate_task_node / stale_status_snapshot / stale_priority_override,
+        # which all run well after the filter chain): those only mutate Graphiti
+        # and return int stats — none of them touch the flag channel.  This one
+        # EMITS flags, so it must sit ABOVE dedup_flags, for two reasons.
+        # (1) Each appended flag then gets a stage1_flag_marker ledger row keyed
+        #     on (task_id, flag_type), giving cross-cycle recurrence tracking and
+        #     honoring explicit suppression records.  Appending below dedup_flags
+        #     would bypass dedup entirely, so an un-actioned gate flag would
+        #     re-emit unmarked every cycle with no recurrence history and no way
+        #     for an operator to suppress it.  (dedup_flags never DROPS on a hit —
+        #     only filter_suppressed drops — so re-emission until Stage 2 closes
+        #     the gate is preserved, which is the desired behaviour.)
+        # (2) It lets the ``if report.items_flagged:`` guard below fire on a cycle
+        #     where the LLM emitted zero flags of its own but the sweep found a
+        #     resolved gate.
+        #
+        # That placement DOES step over verify_cited_memories (above, right after
+        # super().run()), so the cited_memories these flags carry are the one
+        # citation set that citation_verifier.py's end-to-end "a cited memory id
+        # must resolve" invariant never sees, and stage1_citations_verified /
+        # stage1_phantom_citations_dropped deliberately exclude them (reviewer
+        # finding "architecture", amendment pass).  That exemption is sound
+        # BECAUSE of where these ids come from: the verifier exists to catch
+        # LLM-authored ids that were never real and ids whose queued add_memory
+        # write later failed, whereas these ids are read straight off a Qdrant
+        # scroll microseconds earlier in the same cycle — they resolve by
+        # construction, and sweep_resolved_curator_gates additionally refuses to
+        # emit a flag at all unless that scroll returned at least one row (its
+        # count/scroll-divergence guard), so an uncitable gate flag is impossible
+        # by a different route.  Moving the sweep above the verifier is NOT the
+        # cheap fix it looks like: the verifier sits above the remediation
+        # early-return so that both full and remediation passes are covered, and
+        # this sweep must run on full cycles ONLY, so the move would require
+        # duplicating the remediation guard here.
+        #
+        # Best-effort: a whole-sweep failure must never abort the stage or leave
+        # items_flagged partially mutated — it is logged and swallowed, and all
+        # three stats stay at their pre-early-return 0 for this cycle.
+        if self.filtered_task_tree is not None:
+            gate_ids = extract_open_gate_task_ids(self.filtered_task_tree.active_tasks)
+            # Title-enrichment map (reviewer finding "dead-code", amendment
+            # pass).  extract_open_gate_task_ids deliberately returns bare ids,
+            # so without this the sweep can only name a gate by number and
+            # build_gate_resolution_flag's title branch would be unreachable in
+            # production.  Keyed on the same str(id) coercion the selector uses
+            # and restricted to the swept ids; it is load-bearing for the
+            # description ONLY — selection remains the selector's job alone, so
+            # a partial map can never change which gates are swept or flagged.
+            _gate_id_set = set(gate_ids)
+            gate_tasks_by_id = {
+                str(task.get('id')): task
+                for task in self.filtered_task_tree.active_tasks
+                if isinstance(task, dict) and str(task.get('id')) in _gate_id_set
+            }
+            try:
+                gate_sweep = await sweep_resolved_curator_gates(
+                    self.memory, self.project_id, gate_ids,
+                    tasks_by_id=gate_tasks_by_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    'reconciliation.curator_gate_resolution_sweep_failed',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'gate_id_count': len(gate_ids),
+                    },
+                )
+            else:
+                report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
+                report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
+                report.stats['curator_gate_resolution_flags_emitted'] = len(
+                    gate_sweep['flags'],
+                )
+                report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
