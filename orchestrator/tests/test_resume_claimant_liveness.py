@@ -32,22 +32,30 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import (
+    CLAIMANT_TTL_SECS as TTL_SECS,
+)
+from _orch_helpers import (
+    LIVE_CLAIMANT,
+    wire_scheduler_liveness_mock,
+)
+from _orch_helpers import (
+    claimant_row as _row,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
 
-# The claimant-liveness TTL these fixtures pin onto ``config.claimant_liveness_
-# ttl_secs``.  ``mock_orch_config`` is a spec_set MagicMock and does NOT supply
-# a real numeric default for this field, so ``timedelta(seconds=...)`` against
-# it would raise TypeError.  Mirrors the production default
-# (``OrchestratorConfig.claimant_liveness_ttl_secs`` = 300.0).
-TTL_SECS: float = 300.0
-
-# A well-formed claimant identity in ``compose_claimant_run_id`` shape
-# (``f'{run_id}/{session_id}/pid={owner_pid}'``).
-LIVE_CLAIMANT: str = 'run-abc/sess-def/pid=4242'
+# ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
+# ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in
+# ``test_cascade_unblock.py``; one definition means the fresh/stale/absent
+# branches — and the TTL those ages derive from — cannot diverge between the
+# two suites that drive ``Harness._resume_repend_liveness``.  ``TTL_SECS`` is
+# also what conftest's ``mock_orch_config`` pins onto
+# ``config.claimant_liveness_ttl_secs``, so the knob and the rows agree by
+# construction.
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +72,18 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     - ``scheduler.is_actively_held`` — a bare MagicMock attribute returns a
       TRUTHY child mock, which would make EVERY row read as having a live
       claimant and silently skip EVERY flip (a green suite that tests
-      nothing).  Stubbed to ``False``.
-    - ``config.claimant_liveness_ttl_secs`` — ``mock_orch_config`` is
-      ``spec_set`` against ``OrchestratorConfig`` but supplies no real numeric
-      value for this field; ``timedelta(seconds=<MagicMock>)`` raises
-      TypeError.  Pinned to :data:`TTL_SECS`.
+      nothing).  ``wire_scheduler_liveness_mock`` installs the REAL accessor
+      over the mock's own ``_dispatched`` / ``lock_table`` / cancel-grace
+      state, so it answers ``False`` until a test holds the task and a test
+      can express "actively held" by mutating that state.
     - ``scheduler.get_task`` — returns a FULL row (id/status/claimant_run_id/
       heartbeat_at/metadata), not the ``{'id': 'x', 'metadata': {}}`` stub the
       older suite used: the liveness read and the write-time corroborating read
       both need ``status`` and the claimant columns on the same snapshot.
+
+    ``config.claimant_liveness_ttl_secs`` is deliberately NOT re-pinned here —
+    conftest's ``mock_orch_config`` owns it, sourced from the same
+    :data:`TTL_SECS` the row builder derives its heartbeat ages from.
     """
     with (
         patch('orchestrator.harness.McpLifecycle'),
@@ -81,8 +92,6 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
         patch('orchestrator.harness.BriefingAssembler'),
     ):
         h = Harness(mock_orch_config)
-
-    h.config.claimant_liveness_ttl_secs = TTL_SECS
 
     h.scheduler = MagicMock()
     # Default row: a stranded `blocked` task — no claimant, no heartbeat — so
@@ -93,8 +102,8 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.update_task = AsyncMock(return_value=True)
-    # THE trap: must be an explicit False, never a bare MagicMock attribute.
-    h.scheduler.is_actively_held = MagicMock(return_value=False)
+    # THE trap — see the docstring above.
+    wire_scheduler_liveness_mock(h.scheduler)
 
     # _merge_worker stays None — the unhalt branch is skipped in all tests here.
     return h
@@ -103,46 +112,6 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _row(
-    status: str,
-    *,
-    task_id: str = '3438',
-    claimant: str | None = LIVE_CLAIMANT,
-    heartbeat: str | None = 'fresh',
-    metadata: dict | None = None,
-    ttl_secs: float = TTL_SECS,
-) -> dict:
-    """Build a fused-memory task row for the liveness oracle.
-
-    ``heartbeat`` is a symbolic age, derived from the real config knob rather
-    than a magic literal so a TTL change can never silently invert a fixture:
-
-    - ``'fresh'`` → ``now`` (well inside the TTL → live, given a claimant)
-    - ``'stale'`` → ``now - 2 * ttl_secs`` (outside the TTL → not live)
-    - ``None``    → no ``heartbeat_at`` at all (unparseable → not live)
-
-    ``claimant=None`` means "no claimant at all", which reads as not-live
-    regardless of the heartbeat.
-    """
-    now = datetime.now(UTC)
-    if heartbeat == 'fresh':
-        heartbeat_at: str | None = now.isoformat()
-    elif heartbeat == 'stale':
-        heartbeat_at = (now - timedelta(seconds=2 * ttl_secs)).isoformat()
-    elif heartbeat is None:
-        heartbeat_at = None
-    else:  # pragma: no cover — fixture misuse
-        raise ValueError(f'unknown heartbeat age {heartbeat!r}')
-
-    return {
-        'id': task_id,
-        'status': status,
-        'claimant_run_id': claimant,
-        'heartbeat_at': heartbeat_at,
-        'metadata': dict(metadata or {}),
-    }
-
 
 def _esc(
     *,
@@ -172,58 +141,57 @@ def _esc(
 
 
 # ---------------------------------------------------------------------------
-# Fixture self-checks — these guard the traps above, not production behaviour.
+# Row-builder contract — these drive the REAL liveness oracle, not scaffolding
 # ---------------------------------------------------------------------------
+#
+# Deliberately NOT a "fixture self-check" class. The four assertions that used
+# to live here (is_actively_held is False, the TTL is a float, the _esc builder
+# copies its arguments, worktree_base is under tmp_path) asserted only this
+# file's own scaffolding and passed against an unmodified harness.py; the real
+# tests already fail loudly on each of those breakages — a truthy
+# ``is_actively_held`` breaks every flip assertion below, and a MagicMock TTL
+# raises TypeError inside ``timedelta(seconds=...)``. Removed as part of the
+# task 3540 review amendment.
+#
+# What survives is the pair that exercises ``shared.task_claimant.
+# has_live_claimant`` itself: they pin the mapping from a SYMBOLIC heartbeat
+# age to the production verdict, which is the premise every case below reasons
+# from.
 
-class TestFixtureWiring:
-    """If these fail, every liveness assertion in this module is vacuous."""
+def test_row_ages_map_onto_the_real_liveness_verdict():
+    """'stale' must land outside the TTL and 'fresh' inside it, by
+    construction from :data:`TTL_SECS` rather than by a hardcoded literal —
+    and the mapping is checked against the PRODUCTION oracle, not restated."""
+    from shared.task_claimant import has_live_claimant
 
-    def test_is_actively_held_is_explicitly_false(self, harness: Harness):
-        """A bare MagicMock attribute would be TRUTHY and suppress every flip."""
-        assert harness.scheduler.is_actively_held('anything') is False
+    now = datetime.now(UTC)
+    ttl = timedelta(seconds=TTL_SECS)
 
-    def test_ttl_is_a_real_number(self, harness: Harness):
-        """``timedelta(seconds=<MagicMock>)`` raises TypeError — pin a float."""
-        assert timedelta(seconds=harness.config.claimant_liveness_ttl_secs) == (
-            timedelta(seconds=TTL_SECS)
-        )
+    assert has_live_claimant(
+        _row('blocked', claimant=LIVE_CLAIMANT, heartbeat='fresh'), now, ttl
+    )
+    assert not has_live_claimant(
+        _row('blocked', claimant=LIVE_CLAIMANT, heartbeat='stale'), now, ttl
+    )
+    assert not has_live_claimant(
+        _row('blocked', claimant=LIVE_CLAIMANT, heartbeat=None), now, ttl
+    )
+    assert not has_live_claimant(
+        _row('blocked', claimant=None, heartbeat='fresh'), now, ttl
+    )
 
-    def test_row_ages_derive_from_the_ttl_knob(self):
-        """'stale' must land outside the TTL and 'fresh' inside it, by
-        construction rather than by a hardcoded literal."""
-        from shared.task_claimant import has_live_claimant
 
-        now = datetime.now(UTC)
-        ttl = timedelta(seconds=TTL_SECS)
+def test_default_fixture_row_is_a_stranded_blocked_task(harness: Harness):
+    """The fixture's default ``get_task`` row must read as NOT live under the
+    production oracle, so a test that does not care about liveness still
+    exercises the flip."""
+    from shared.task_claimant import has_live_claimant
 
-        assert has_live_claimant(_row('blocked', heartbeat='fresh'), now, ttl)
-        assert not has_live_claimant(_row('blocked', heartbeat='stale'), now, ttl)
-        assert not has_live_claimant(_row('blocked', heartbeat=None), now, ttl)
-        assert not has_live_claimant(
-            _row('blocked', claimant=None, heartbeat='fresh'), now, ttl
-        )
-
-    def test_default_fixture_row_is_a_stranded_blocked_task(self, harness: Harness):
-        """The fixture's default ``get_task`` row must read as NOT live, so a
-        test that does not care about liveness still exercises the flip."""
-        from shared.task_claimant import has_live_claimant
-
-        row = harness.scheduler.get_task.return_value  # type: ignore[attr-defined]
-        assert row['status'] == 'blocked'
-        assert not has_live_claimant(
-            row, datetime.now(UTC), timedelta(seconds=TTL_SECS)
-        )
-
-    def test_esc_builder_carries_granted_files(self):
-        esc = _esc(task_id='7', level=0, granted_files=['pkg/b.py'])
-        assert esc.level == 0
-        assert esc.task_id == '7'
-        assert esc.granted_files == ['pkg/b.py']
-
-    def test_worktree_base_is_under_tmp_path(self, harness: Harness, tmp_path: Path):
-        """Step-8's on-disk plan.json fixtures resolve through
-        ``git_ops.worktree_base``; it must be inside tmp_path, not the repo."""
-        assert harness.git_ops.worktree_base.is_relative_to(tmp_path)
+    row = harness.scheduler.get_task.return_value  # type: ignore[attr-defined]
+    assert row['status'] == 'blocked'
+    assert not has_live_claimant(
+        row, datetime.now(UTC), timedelta(seconds=TTL_SECS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +309,21 @@ class TestCascadeMemberLivenessFork:
         """
         esc = _esc(task_id='3438')
         _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
-        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+        # Drive the REAL accessor (wired by wire_scheduler_liveness_mock) via
+        # the state it folds, rather than stubbing its return value: that way
+        # this pins `is_actively_held`'s own dispatched-set semantics, not a
+        # mock's.  The row itself stays claimant-free, so the DB oracle alone
+        # would say "stranded" — only the in-memory signal can withhold this.
+        harness.scheduler._dispatched.add('3438')  # type: ignore[attr-defined]
 
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        harness.scheduler.is_actively_held.assert_called_with('3438')
+        assert any(
+            r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
+            for r in caplog.records
+        ), 'Expected the live-claimant DEBUG skip, not some other early return'
 
     async def test_blocked_with_no_claimant_still_flips(self, harness: Harness):
         """[regression] Today's behaviour for the ordinary blocked orphan is
@@ -552,9 +528,12 @@ class TestCorroboratingReadBeforeTheWrite:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(
-            'done' in r.getMessage() and r.levelno >= logging.DEBUG
+            'changed under the resume' in r.getMessage() and 'done' in r.getMessage()
             for r in caplog.records
-        ), 'Expected a record naming the observed late status'
+        ), (
+            'Expected the LATE corroborating skip naming the observed status '
+            '— not merely some record mentioning "done"'
+        )
 
     async def test_late_terminal_cancelled_aborts_the_write(
         self, harness: Harness
@@ -594,8 +573,14 @@ class TestCorroboratingReadBeforeTheWrite:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(
-            'claimant' in r.getMessage() for r in caplog.records
-        ), 'Expected a record naming the claimant that appeared'
+            'changed under the resume' in r.getMessage()
+            and LIVE_CLAIMANT in r.getMessage()
+            for r in caplog.records
+        ), (
+            'Expected the LATE corroborating skip naming the claimant that '
+            'appeared.  A bare "claimant" substring cannot distinguish it from '
+            'the EARLY liveness skip, which is the whole point of this class'
+        )
 
     async def test_unreadable_late_row_aborts_the_write(
         self, harness: Harness, caplog
@@ -620,8 +605,12 @@ class TestCorroboratingReadBeforeTheWrite:
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(
-            r.levelno == logging.WARNING for r in caplog.records
-        ), 'An unreadable row must be operator-visible — WARNING, not DEBUG'
+            r.levelno == logging.WARNING and 'could not re-read' in r.getMessage()
+            for r in caplog.records
+        ), (
+            'An unreadable row must be operator-visible — a WARNING naming the '
+            'failed re-read, not just any WARNING from elsewhere in the drive'
+        )
 
     async def test_agreeing_snapshots_flip_and_the_read_is_last(
         self, harness: Harness
@@ -1258,9 +1247,14 @@ class TestGrantedFilesFoldOnRepend:
             'redispatch and diverges from plan.files in the meantime'
         )
         assert any(
-            r.levelno == logging.WARNING and '3438' in r.getMessage()
+            r.levelno == logging.WARNING
+            and 'granted-files fold' in r.getMessage()
+            and '3438' in r.getMessage()
             for r in caplog.records
-        ), 'a dropped grant must be operator-visible — WARNING, not DEBUG'
+        ), (
+            "a dropped grant must be operator-visible — the FOLD's own WARNING, "
+            'not merely some WARNING mentioning the task id'
+        )
 
     async def test_metadata_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
@@ -1298,8 +1292,13 @@ class TestGrantedFilesFoldOnRepend:
             '3438', _resume_target(esc)
         )
         assert any(
-            r.levelno == logging.WARNING and '3438' in r.getMessage()
+            r.levelno == logging.WARNING
+            and 'granted-files fold' in r.getMessage()
+            and '3438' in r.getMessage()
             for r in caplog.records
+        ), (
+            'Expected the fold\'s own WARNING — a bare "some WARNING mentioning '
+            '3438" would be satisfied by an unrelated warning from the drive'
         )
 
     async def test_a_withheld_flip_performs_no_fold(
@@ -1337,6 +1336,78 @@ class TestGrantedFilesFoldOnRepend:
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
         assert plan_path.read_text() == before, 'a withheld flip must not widen'
         assert _files_updates(harness) == []
+
+    async def test_a_late_aborted_flip_performs_no_fold(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A resume the corroborating read aborts must leave NO partial widen.
+
+        The fold is a read-modify-write of two DURABLE artifacts (plan.json and
+        ``metadata.files``), so it has to be gated by the same authorisation as
+        the status write — otherwise the abort path advertises "skipping the
+        write" while having already mutated both. It matters most in exactly
+        the case this test drives: a claimant appeared, which means a freshly
+        dispatched ``TaskWorkflow`` now owns that plan in memory, and a fold
+        landing underneath it is two writers racing over one file.
+        """
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        before = plan_path.read_text()
+        # Early snapshot authorises the flip; the late one shows a workflow
+        # claimed the row between the gate and the write.
+        _wire_two_snapshots(
+            harness,
+            _row('blocked', claimant=None, heartbeat=None),
+            _row('blocked', claimant=LIVE_CLAIMANT, heartbeat='fresh'),
+        )
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert plan_path.read_text() == before, (
+            'an aborted resume must not have widened plan.json — the write it '
+            'declined to make is the same write the widen was FOR'
+        )
+        assert _files_updates(harness) == [], (
+            'an aborted resume must not have widened metadata.files either'
+        )
+
+    async def test_a_resolution_granting_nothing_never_scans_the_queue(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Cost gate: the resolving record's own ``granted_files`` is checked
+        BEFORE any queue I/O.
+
+        ``EscalationQueue.get_by_task`` globs the queue root AND rglobs the
+        whole dated archive subtree, then JSON-parses every candidate — a scan
+        whose cost grows with the archive and which an L2 cascade pays once per
+        member. The overwhelming majority of resumes grant nothing, so paying
+        it to compute an empty list is pure waste. Asserted on the scan itself,
+        not on the (identical either way) end state.
+        """
+        esc = _esc(task_id='3438')  # no granted_files
+        queue = _wire_queue(harness, tmp_path, esc)
+        queue.get_by_task = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError('the archive must not be scanned')
+        )
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        before = plan_path.read_text()
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        queue.get_by_task.assert_not_called()  # type: ignore[attr-defined]
+        assert plan_path.read_text() == before
+        assert _files_updates(harness) == []
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
 
     async def test_no_escalation_queue_is_a_no_op(self, harness: Harness):
         """Bare-harness path (``_escalation_queue is None``): no fold, no crash.

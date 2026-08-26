@@ -56,6 +56,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
+    CLAIMANT_TTL_SECS,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -1099,8 +1100,11 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     config.claimant_heartbeat_interval_secs = 60.0
     # Task 3540: harness._resume_repend_liveness feeds this straight into
     # timedelta(seconds=...); a spec_set MagicMock attribute raises
-    # TypeError there. Mirrors OrchestratorConfig's real default (300.0).
-    config.claimant_liveness_ttl_secs = 300.0
+    # TypeError there. THIS is the single owner of the value for the suite —
+    # no test should re-pin it locally. Sourced from _orch_helpers so the
+    # knob and the fixture rows built by `claimant_row` (whose fresh/stale
+    # ages are 0.5x/2x this) can never drift apart.
+    config.claimant_liveness_ttl_secs = CLAIMANT_TTL_SECS
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

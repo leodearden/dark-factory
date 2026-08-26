@@ -24,15 +24,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import (
+    LIVE_CLAIMANT as _CLAIMANT,
+)
+from _orch_helpers import (
+    claimant_row as _row,
+)
+from _orch_helpers import (
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
+
+# ``_row`` / ``_CLAIMANT`` are the SHARED builders in ``_orch_helpers`` (task
+# 3540 review amendment), aliased to the names this suite already used.  They
+# were previously cloned here and in ``test_resume_claimant_liveness.py``; one
+# definition means the fresh/stale/absent branches cannot diverge between the
+# two suites that drive ``Harness._resume_repend_liveness``.
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -49,12 +63,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
-    # The claimant-liveness fork (task 3540) reads
-    # ``config.claimant_liveness_ttl_secs`` into ``timedelta(seconds=...)``.
-    # ``mock_orch_config`` is spec_set but supplies no numeric value for it, and
-    # ``timedelta(seconds=<MagicMock>)`` raises TypeError.  Pin the production
-    # default.
-    h.config.claimant_liveness_ttl_secs = 300.0
+    # ``config.claimant_liveness_ttl_secs`` is NOT re-pinned here: conftest's
+    # ``mock_orch_config`` is its single owner (sourced from
+    # ``_orch_helpers.CLAIMANT_TTL_SECS``, the same constant ``_row`` derives
+    # its heartbeat ages from).
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
@@ -69,9 +81,12 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.update_task = AsyncMock(return_value=True)
     # THE trap (task 3540): a bare MagicMock attribute returns a TRUTHY child
     # mock, so every row would read as having a LIVE claimant and EVERY flip
-    # would be silently skipped — a green suite asserting nothing.  Must be an
-    # explicit False.
-    h.scheduler.is_actively_held = MagicMock(return_value=False)
+    # would be silently skipped — a green suite asserting nothing.  The shared
+    # helper wires the REAL accessor over the mock's own ``_dispatched`` /
+    # ``lock_table`` / cancel-grace state (default: nothing held → False), so a
+    # test can express "actively held" by mutating that state rather than by
+    # stubbing a return value.
+    wire_scheduler_liveness_mock(h.scheduler)
 
     # _merge_worker stays None — unhalt branch is skipped in all tests here
     return h
@@ -80,54 +95,6 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-# The claimant-liveness TTL these fixtures pin onto the config knob (task 3540).
-# Mirrors ``OrchestratorConfig.claimant_liveness_ttl_secs``'s production default.
-_TTL_SECS: float = 300.0
-
-# A well-formed claimant identity in ``compose_claimant_run_id`` shape.
-_CLAIMANT: str = 'run-abc/sess-def/pid=4242'
-
-
-def _row(
-    status: str,
-    *,
-    task_id: str = 'x',
-    claimant: str | None = None,
-    heartbeat: str | None = None,
-    metadata: dict | None = None,
-) -> dict:
-    """Build a fused-memory task row for the claimant-liveness oracle.
-
-    Deliberately defaults to a STRANDED row (no claimant, no heartbeat) so a
-    test that says nothing about liveness still exercises the flip — the
-    common production shape for the orphan re-pend this suite covers.
-
-    ``heartbeat`` is a symbolic age derived from :data:`_TTL_SECS` rather than
-    a magic literal, so a TTL change cannot silently invert a fixture:
-    ``'fresh'`` → now (live, given a claimant), ``'stale'`` → outside the TTL,
-    ``None`` → absent.  Structural twin of ``test_resume_claimant_liveness._row``
-    — kept local rather than imported so the two suites stay independently
-    collectable.
-    """
-    now = datetime.now(UTC)
-    if heartbeat == 'fresh':
-        heartbeat_at: str | None = now.isoformat()
-    elif heartbeat == 'stale':
-        heartbeat_at = (now - timedelta(seconds=2 * _TTL_SECS)).isoformat()
-    elif heartbeat is None:
-        heartbeat_at = None
-    else:  # pragma: no cover — fixture misuse
-        raise ValueError(f'unknown heartbeat age {heartbeat!r}')
-
-    return {
-        'id': task_id,
-        'status': status,
-        'claimant_run_id': claimant,
-        'heartbeat_at': heartbeat_at,
-        'metadata': dict(metadata or {}),
-    }
-
 
 def _make_l1_esc(
     task_id: str = '3438',

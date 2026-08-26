@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 from unittest.mock import AsyncMock, MagicMock
@@ -160,6 +161,68 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 # borrowing it would let a future merge-timing retune silently move this
 # ceiling.  Never-narrow.
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 5 * PYPROJECT_DEFAULT_TIMEOUT  # 300s
+
+
+# task 3540: the claimant-liveness TTL the row builder below derives its
+# symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
+# imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
+# fixture row's "fresh"/"stale" age can never drift out of step with the knob
+# `Harness._resume_repend_liveness` actually reads.  Mirrors
+# `OrchestratorConfig.claimant_liveness_ttl_secs`'s production default.
+CLAIMANT_TTL_SECS: float = 300.0
+
+# task 3540: a well-formed claimant identity in `shared.task_claimant.
+# compose_claimant_run_id` shape (`f'{run_id}/{session_id}/pid={owner_pid}'`).
+LIVE_CLAIMANT: str = 'run-abc/sess-def/pid=4242'
+
+
+def claimant_row(
+    status: str,
+    *,
+    task_id: str = 'x',
+    claimant: str | None = None,
+    heartbeat: str | None = None,
+    metadata: dict | None = None,
+    ttl_secs: float = CLAIMANT_TTL_SECS,
+) -> dict:
+    """Build a fused-memory task row for the claimant-liveness oracle (3540).
+
+    Shared by `test_cascade_unblock.py` and `test_resume_claimant_liveness.py`
+    — the two suites that drive `Harness._resume_repend_liveness` — so the
+    fresh/stale/absent branches cannot diverge between them.
+
+    Deliberately defaults to a STRANDED row (no claimant, no heartbeat), the
+    common production shape for the orphan re-pend both suites cover, so a
+    test that says nothing about liveness still exercises the flip.
+
+    `heartbeat` is a SYMBOLIC age derived from `ttl_secs` rather than a magic
+    literal, so a TTL change cannot silently invert a fixture:
+
+      - `'fresh'` -> `now` (well inside the TTL -> live, GIVEN a claimant)
+      - `'stale'` -> `now - 2 * ttl_secs` (outside the TTL -> not live)
+      - `None`    -> no `heartbeat_at` at all (unparseable -> not live)
+
+    `claimant=None` means "no claimant at all", which reads as not-live
+    regardless of the heartbeat.
+    """
+    now = datetime.now(UTC)
+    if heartbeat == 'fresh':
+        heartbeat_at: str | None = now.isoformat()
+    elif heartbeat == 'stale':
+        heartbeat_at = (now - timedelta(seconds=2 * ttl_secs)).isoformat()
+    elif heartbeat is None:
+        heartbeat_at = None
+    else:  # pragma: no cover — fixture misuse
+        raise ValueError(f'unknown heartbeat age {heartbeat!r}')
+
+    return {
+        'id': task_id,
+        'status': status,
+        'claimant_run_id': claimant,
+        'heartbeat_at': heartbeat_at,
+        'metadata': dict(metadata or {}),
+    }
+
 
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
 # oversubscription; never-narrow — only replaces literals <=15 across the

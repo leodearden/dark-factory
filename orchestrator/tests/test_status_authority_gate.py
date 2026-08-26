@@ -36,12 +36,15 @@ import json
 import logging
 import os
 import shutil
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _orch_helpers import (
+    LIVE_CLAIMANT,
+    claimant_row,
+    wire_scheduler_liveness_mock,
+)
 from escalation.action_effects import ACTION_EFFECTS, ANY, effect_for
 from escalation.models import Escalation
 
@@ -55,9 +58,6 @@ from orchestrator.task_status import is_infra_held  # noqa: F401
 _BASE_SHA = 'a' * 40  # branch_base_sha in metadata — non-degenerate-branch fixtures
 _TIP_SHA = 'b' * 40   # tip SHA different from base -> non-degenerate
 
-# Mirrors conftest's ``mock_orch_config.claimant_liveness_ttl_secs`` (and
-# ``OrchestratorConfig``'s real default). Only ``_liveness_row`` reads it.
-_CLAIMANT_TTL_SECS: float = 300.0
 
 
 @pytest.fixture
@@ -124,24 +124,21 @@ def _liveness_row(task_id: str, status: str, *, live: bool) -> dict:
     ``scheduler.is_actively_held`` (wired real by
     ``wire_scheduler_liveness_mock`` above, so False unless a test dispatches
     or locks the id) with ``shared.task_claimant.has_live_claimant`` over these
-    columns. The heartbeat age is derived from the fixture's own
-    ``claimant_liveness_ttl_secs`` rather than a magic literal, so a TTL change
-    cannot silently invert ``live``.
+    columns.
+
+    A thin ``live``-flavoured adapter over ``_orch_helpers.claimant_row`` — the
+    SHARED builder this suite, ``test_cascade_unblock.py`` and
+    ``test_resume_claimant_liveness.py`` all use, so the heartbeat ages (and
+    the TTL they derive from) cannot drift apart between them.
 
     ``live=False`` means NO claimant at all — the stranded shape B2 is about.
     """
-    now = datetime.now(UTC)
-    if not live:
-        return {'id': task_id, 'status': status, 'claimant_run_id': None,
-                'heartbeat_at': None, 'metadata': {}}
-    ttl = timedelta(seconds=_CLAIMANT_TTL_SECS)
-    return {
-        'id': task_id,
-        'status': status,
-        'claimant_run_id': 'run-abc/sess-def/pid=4242',
-        'heartbeat_at': (now - ttl / 10).isoformat(),
-        'metadata': {},
-    }
+    return claimant_row(
+        status,
+        task_id=task_id,
+        claimant=LIVE_CLAIMANT if live else None,
+        heartbeat='fresh' if live else None,
+    )
 
 
 def _make_esc(
