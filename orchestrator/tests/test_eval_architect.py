@@ -1723,25 +1723,20 @@ async def _run_architect_eval_hermetic(
     artifacts_instance.read_plan.return_value = produced_plan
     # Absent-artifact default for every decline reader (see docstring): the
     # real TaskArtifacts returns None when the file does not exist, and a bare
-    # Mock attribute would return a truthy Mock instead.
-    _decline_readers = (
-        'read_already_done', 'read_blocking_dependency', 'read_false_premise',
-        'read_unactionable_task', 'read_ready_to_merge',
-    )
-    for _reader in _decline_readers:
+    # Mock attribute would return a truthy Mock instead. The kind -> reader
+    # mapping is taken from PRODUCTION rather than re-derived as
+    # ``f'read_{kind}'``, which is wrong for ``unactionable``
+    # (``read_unactionable_task``) and would silently stop pinning that kind.
+    from orchestrator.evals.metrics import _DECLINE_READERS
+
+    for _reader in _DECLINE_READERS.values():
         getattr(artifacts_instance, _reader).return_value = None
     for _kind, _artifact in (declines or {}).items():
-        _reader = f'read_{_kind}'
-        assert _reader in _decline_readers, (
-            f'unknown decline kind {_kind!r}: no TaskArtifacts.{_reader}'
-        )
-        getattr(artifacts_instance, _reader).return_value = _artifact
+        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, _DECLINE_READERS[_kind]).return_value = _artifact
     for _kind, _exc in (decline_reader_errors or {}).items():
-        _reader = f'read_{_kind}'
-        assert _reader in _decline_readers, (
-            f'unknown decline kind {_kind!r}: no TaskArtifacts.{_reader}'
-        )
-        getattr(artifacts_instance, _reader).side_effect = _exc
+        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, _DECLINE_READERS[_kind]).side_effect = _exc
 
     briefing_instance = MagicMock()
     briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
