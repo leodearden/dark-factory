@@ -790,3 +790,147 @@ class TestRunJudgeEval:
             r'accuracy[^\n]{0,40}?[<>]=?\s*[0-9]', source,
         ) + re.findall(r'[0-9.]+\s*[<>]=?[^\n]{0,40}?accuracy', source)
         assert not offenders, f'an accuracy floor is being compared: {offenders}'
+
+
+# ---------------------------------------------------------------------------
+# The committed artifact
+# ---------------------------------------------------------------------------
+
+class TestCommittedJudgeAccuracyReportIsTraceable:
+    """A number gating a decision must be a number some run measured.
+
+    Modelled on `test_calibrate_write_triage.py::TestCommittedCalibrationIsTraceable`,
+    and for the same reason: `judge_accuracy_report_path` exists so a reader
+    can get from "the judge was evaluated" back to the run that evaluated it,
+    without taking anyone's word that the figures were not typed in. Committed
+    artifacts only — no network, no script execution, no Qdrant.
+
+    EXPLICITLY NO ASSERTION ON ANY ACCURACY VALUE, and that is the point of
+    this docstring. D10 makes this report the operator's input at the
+    task-3169 flip gate. A floor asserted here would silently BECOME that
+    gate — every future run would have to clear a bar this task invented,
+    pre-empting a judgment it is explicitly told to leave to a human. What is
+    asserted is only that each accuracy is WELL-FORMED: `None`, or a float in
+    [0.0, 1.0]. Never that it is large enough.
+    """
+
+    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+
+    # Decorator order is load-bearing: `staticmethod` OUTERMOST, so
+    # `self._committed()` resolves through the descriptor and calls the cached
+    # function with zero arguments. Stacked the other way, `functools.cache`'s
+    # plain-function wrapper is the class attribute, binds `self` as its first
+    # argument, and raises TypeError on every access. Same note as the
+    # sibling suite's.
+    @staticmethod
+    @functools.cache
+    def _committed():
+        import yaml  # noqa: PLC0415
+
+        cls = TestCommittedJudgeAccuracyReportIsTraceable
+        block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
+        report_path = block.get('judge_accuracy_report_path')
+        report = None
+        resolved = None
+        if report_path is not None:
+            resolved = Path(__file__).parent.parent / report_path
+            if resolved.exists():
+                report = json.loads(resolved.read_text())
+        return block, report, resolved
+
+    def test_the_report_path_is_set_and_relative(self) -> None:
+        block, _report, _resolved = self._committed()
+        assert block.get('judge_accuracy_report_path'), (
+            'a judge shipped without a measurement is an untraceable judge'
+        )
+        assert not Path(block['judge_accuracy_report_path']).is_absolute(), (
+            'the path must not bake in the checkout it was produced in — this '
+            'script runs in per-task worktrees that get reset'
+        )
+
+    def test_the_path_resolves_to_a_committed_report(self) -> None:
+        block, report, resolved = self._committed()
+        assert report is not None, (
+            f'judge_accuracy_report_path '
+            f'{block.get("judge_accuracy_report_path")!r} does not resolve to a '
+            f'committed report (looked at {resolved})'
+        )
+
+    def test_the_report_carries_every_key_the_operator_reads(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        assert set(report) >= {
+            'per_class', 'confusion', 'duplicate_outcome_split', 'false_contested',
+            'contested_ground_truth', 'caveats', 'provenance',
+        }
+
+    def test_all_four_classes_are_present_with_an_integer_n(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        per_class = report['per_class']
+        assert set(per_class) == set(_mod().EVAL_CLASSES)
+        for name, entry in per_class.items():
+            assert isinstance(entry['n'], int), f'{name}: {entry!r}'
+
+    def test_the_small_classes_match_the_fixtures_own_label_census(
+        self, records,
+    ) -> None:
+        """`distinct` and `pseudo_contradiction` are the two the task names by
+        hand — n=3 and n=6 today.
+
+        Recounted from the JSONL rather than hardcoded, so editing the fixture
+        surfaces as a mismatch demanding a re-measurement instead of leaving a
+        stale constant agreeing with a stale report.
+        """
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        for label in (_mod().LABEL_DISTINCT, _mod().LABEL_PSEUDO_CONTRADICTION):
+            expected = sum(1 for r in records if r['label'] == label)
+            assert expected > 0, f'{label} vanished from the fixture'
+            assert report['per_class'][label]['n'] == expected, (
+                f'{label}: report says {report["per_class"][label]["n"]}, the '
+                f'fixture holds {expected} — re-run the eval'
+            )
+
+    def test_every_accuracy_is_well_formed_and_none_is_asserted_to_be_good(
+        self,
+    ) -> None:
+        """The only shape assertion this class makes about a number."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        for name, entry in report['per_class'].items():
+            accuracy = entry['accuracy']
+            if accuracy is None:
+                assert entry['n'] == 0, f'{name}: measured but unscored'
+                continue
+            assert isinstance(accuracy, float), f'{name}: {accuracy!r}'
+            assert 0.0 <= accuracy <= 1.0, f'{name}: {accuracy!r}'
+
+    def test_the_contested_caveat_survived_into_the_artifact(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        ground_truth = report['contested_ground_truth']
+        assert ground_truth['available'] is False
+        assert ground_truth['reason'].split(':')[0].strip(), 'a reason code is required'
+
+    def test_the_markdown_sibling_states_the_caveat_in_prose(self) -> None:
+        """The operator reads the markdown; a caveat only in JSON is unread."""
+        _block, report, resolved = self._committed()
+        assert report is not None and resolved is not None
+        sibling = resolved.with_suffix('.md')
+        assert sibling.exists(), f'no markdown sibling at {sibling}'
+        md = sibling.read_text().lower()
+        assert 'contested' in md
+        assert 'false positive' in md
+
+    def test_provenance_names_the_model_and_the_fixture(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        provenance = report['provenance']
+        for key in ('judge_provider', 'judge_model'):
+            assert isinstance(provenance[key], str) and provenance[key], key
+        fixture = Path(__file__).parent.parent / provenance['fixture_path']
+        assert fixture.resolve() == FIXTURE_PATH.resolve(), (
+            f'the report measured {provenance["fixture_path"]!r}, not the '
+            f'committed fixture'
+        )
