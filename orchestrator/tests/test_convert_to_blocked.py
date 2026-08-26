@@ -1384,6 +1384,201 @@ class TestResolveAlreadyLandedBranch:
             [], parked, parked, git_ops, task_id='907', branch='task/907',
         ) is None
 
+    # --- (8) SIGNAL 4 — the landing must SURVIVE at main's current HEAD -----
+    #
+    # Amendment pass, review finding #1.  Signals 1-3 are all statements about
+    # IMMUTABLE history — an ancestor stays an ancestor, and `M^1..M` keeps
+    # reporting pre-revert content forever — so every one of them still holds
+    # after the landing is reverted on main.  Without a fourth signal the gate
+    # tells an operator to "verify the landing and CLOSE this task" for work
+    # that is no longer there, which is exactly the fail-OPEN this predicate's
+    # contract forbids.
+
+    async def test_a_reverted_landing_is_no_longer_an_already_landed_branch(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """The headline shape, then reverted — the predicate must decline.
+
+        Staged end to end on real git so the three history-shaped signals are
+        genuinely satisfied and ONLY signal 4 can be doing the work: the merge
+        marker is still greppable, the merge commit is still an ancestor of
+        main, and ``M^1..M`` still names every declared file.
+        """
+        plan_files = ['src/pkg/reverted.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/920', {f: f'# {f}\n' for f in plan_files},
+        )
+
+        # Sanity: BEFORE the revert this is a carve-out (so the test cannot
+        # pass for the wrong reason, e.g. a mis-staged fixture).
+        await _reseed(git_repo, 'task/920', merge_sha)
+        pre = await _resolve(
+            plan_files, merge_sha, merge_sha, git_ops,
+            task_id='920', branch='task/920',
+        )
+        assert pre is not None and pre.landed_sha == merge_sha
+
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', '-m', '1', merge_sha], cwd=git_repo,
+        )
+        assert rc == 0, f'revert failed: {err}'
+        reverted_main = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/920', reverted_main)
+
+        assert await _resolve(
+            plan_files, reverted_main, reverted_main, git_ops,
+            task_id='920', branch='task/920',
+        ) is None, (
+            'a landing whose effect was reverted on main is NOT already '
+            'landed — signal 4 is the only one that reads current HEAD'
+        )
+
+    async def test_a_landing_whose_effect_was_removed_fails_signal_4_alone(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """Signal 4 in ISOLATION, with every earlier signal fully satisfied.
+
+        The sibling test above is now caught one step earlier, by the
+        revert-subject attribution guard — which is correct, but it means that
+        test no longer proves signal 4 does anything.  Here the removal is an
+        ORDINARY commit (``impl(924): ...``), so the merge marker is still the
+        attributing commit, its subject is not revert-shaped, and
+        ``M^1..M`` still names the declared file.  The ONLY thing left that
+        can decline is "does the landing's effect survive at current HEAD".
+        """
+        plan_files = ['src/pkg/removed_later.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/924', {f: f'# {f}\n' for f in plan_files},
+        )
+        rc, _, err = await _run(
+            ['git', 'rm', '-q', *plan_files], cwd=git_repo,
+        )
+        assert rc == 0, err
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'impl(924): drop the deliverable again'],
+            cwd=git_repo,
+        )
+        assert rc == 0, err
+        parked = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/924', parked)
+
+        # Guard the guard: attribution really does still resolve to the MERGE
+        # commit, so the decline below cannot be the revert-subject arm.
+        assert await git_ops.find_merge_marker(
+            'task/924', gate_on_existing_ref=False,
+        ) == merge_sha
+
+        assert await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='924', branch='task/924',
+        ) is None, (
+            'the merge is still an ancestor and still names the declared '
+            'file, but its effect is gone from main — signal 4 must decline'
+        )
+
+    # --- (9) SIGNAL 2 PRECISION — a mention is not a delivery ---------------
+    #
+    # Amendment pass, review finding #2.  `DEFAULT_COMMIT_CITATION_PATTERN`
+    # carries UNANCHORED bare-paren alternatives, so any subject that merely
+    # mentions the id qualifies.  Such a commit touches the same paths as the
+    # original landing, so signal 3 passes too — precision of the attribution
+    # probe is the only thing standing between "mentions 3717" and "IS 3717's
+    # delivery".
+
+    async def test_a_revert_subject_citing_the_task_is_not_its_delivery(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """``Revert "impl(921): ..."`` must not attribute a landing to 921.
+
+        Two decoys are staged, both of which the DEFAULT citation template
+        accepts and the strict one rejects: a revert whose subject quotes the
+        original conventional-commit header, and a THIRD task's commit whose
+        subject names ``task/921``.  Neither is 921's own delivery, and
+        because both touch the declared path, coverage cannot save us.
+        """
+        plan_files = ['src/pkg/decoy.py']
+        await _commit_on_main(
+            git_repo, {f: f'# {f}\n' for f in plan_files},
+            'Revert "impl(921): deliver the declared files"',
+        )
+        parked = await _commit_on_main(
+            git_repo, {f: f'# {f} v2\n' for f in plan_files},
+            'fix(4200): back out task/921 changes',
+        )
+        await _reseed(git_repo, 'task/921', parked)
+
+        assert await _resolve(
+            plan_files, parked, parked, git_ops,
+            task_id='921', branch='task/921',
+        ) is None, (
+            'a subject that MENTIONS the task id is not a citation of its '
+            'delivery; only the conventional-commit SCOPE position is'
+        )
+
+    async def test_the_strict_template_still_accepts_a_real_train_member(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """The narrowing must not cost the population TRAP 1 exists for.
+
+        Paired deliberately with the decoy test above: the same predicate, the
+        same declared file, one subject in the conventional-commit SCOPE
+        position — ``impl(922):`` — which is what a real coalesce-train
+        member's own commits carry.  Without this pairing the strict template
+        could be tightened all the way to "match nothing" and the decoy test
+        would still pass.
+        """
+        from orchestrator.merge_gates import ALREADY_LANDED_CITATION_PATTERN
+
+        plan_files = ['src/pkg/member.py']
+        landed = await _commit_on_main(
+            git_repo, {f: f'# {f}\n' for f in plan_files},
+            'impl(922): deliver inside a coalesce train',
+        )
+        await _reseed(git_repo, 'task/922', landed)
+
+        result = await _resolve(
+            plan_files, landed, landed, git_ops,
+            task_id='922', branch='task/922',
+        )
+        assert result is not None
+        assert result.mechanism == 'task_citation'
+        assert result.landed_sha == landed
+        # And the template really is the STRICTER one, not the default —
+        # otherwise the decoy test above would be pinning nothing.
+        from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN
+
+        assert ALREADY_LANDED_CITATION_PATTERN != DEFAULT_COMMIT_CITATION_PATTERN
+
+    # --- (10) TRAP 3 — the rename gap, asserted rather than assumed ---------
+
+    async def test_a_declared_entry_renamed_on_main_is_a_known_gap(
+        self, git_repo: Path, git_ops: GitOps,
+    ) -> None:
+        """KNOWN LIMITATION (review finding #5), pinned like TRAP 2.
+
+        The GATE resolves a declared entry that main has since relocated
+        (``_resolve_renamed_plan_path``, task 3110); this predicate does not.
+        A task whose plan names the OLD path while its landing touched the NEW
+        one therefore fails coverage and falls through to the unchanged
+        ``plan_files_not_touched`` path.  That is fail-CLOSED and safe, but it
+        is a real population — so the gap lives in the suite, not only in a
+        docstring, and this test is the thing that fails if someone later
+        closes it (at which point the docstring's TRAP 3 must go too).
+        """
+        landed = await _commit_on_main(
+            git_repo, {'src/pkg/new_name.py': '# relocated\n'},
+            'impl(923): deliver at the relocated path',
+        )
+        await _reseed(git_repo, 'task/923', landed)
+
+        assert await _resolve(
+            ['src/pkg/old_name.py'], landed, landed, git_ops,
+            task_id='923', branch='task/923',
+        ) is None, (
+            'the predicate has no rename arm: a stale declared path is '
+            'uncovered and must fail CLOSED (TRAP 3)'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-9 — the `_submit_to_merge_queue` carve-out

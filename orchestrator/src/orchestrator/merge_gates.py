@@ -28,6 +28,7 @@ import dataclasses
 import logging
 import os
 import posixpath
+import re
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,10 +158,87 @@ architect through the same dishonest narrowing pass the cross-repo docstring
 names (drop = falsify provenance, confirm = mislabel complete work) and
 escalate straight to a human — the workflow short-circuits to the honest
 ``OutcomeKind.plan_files_already_landed`` terminal outcome on the NORMAL
-ladder, so no ``task_failure`` pin is minted and the loop has no fuel.
+ladder, so this path mints no ``escalate_to_human=True`` L1 pin of its own and
+the ``task_failure`` half of the loop has no fuel.
 
-See :func:`resolve_already_landed_branch` for the three signals required
-before this prefix may be used, and for the two traps a naive version misses.
+SCOPE OF THAT CLAIM, stated precisely (amendment pass, review finding #4).  It
+covers the L1 ``task_failure`` PIN and nothing more.  The terminal outcome
+still routes through ``_mark_blocked`` on the NORMAL ladder, which files an L0
+in ``category='already_landed'`` and starts a steward, exactly as the
+``cross_repo_deliverable`` sibling does.  Two consequences are deliberate and
+pinned by tests rather than claimed away:
+
+  * ``has_open_l1`` dedup is CATEGORY-SCOPED, so a legacy row still carrying a
+    stale ``task_failure`` L1 from a pre-carve-out cycle gets an ADDITIONAL
+    ``already_landed`` record rather than none.  That is the wanted direction:
+    the stale record asserts the branch under-delivered (false); the new one
+    names what is actually true and what to do about it.  Retiring the stale
+    pin is the EXIT half's job (``RecoveryAction.CONVERT_TO_BLOCKED``), not
+    this one's.
+  * A ``StewardResolved`` verdict returns ``REQUEUED`` into
+    ``_run_merge_phase``'s ``for _merge_attempt in
+    range(self.config.max_merge_retries)`` loop, which re-enters the carve-out
+    on the same legitimately-empty branch.  That retry is BOUNDED by
+    ``max_merge_retries`` and then falls through to the terminal BLOCKED arm —
+    a capped re-check, not the unbounded churn this task exists to end.
+
+See :func:`resolve_already_landed_branch` for the four signals required
+before this prefix may be used, and for the three traps a naive version misses.
+"""
+
+
+ALREADY_LANDED_CITATION_PATTERN: str = (
+    r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
+    r'\(#?{tid}\)!?:'
+    r'|^Merge task/{tid} into '
+)
+r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+
+``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
+also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
+and an anchored ``^<token>.*\btask/{tid}\b`` arm, which is right for the
+reconciler's "did anything on main ever mention this task" question.  It is
+wrong for THIS question, which is "is this commit this task's own delivery":
+
+  * ``Revert "impl(3717): ..."`` matches the bare-paren alternative, and
+  * ``fix(4200): back out task/3717 changes`` matches the ``task/{tid}`` arm,
+
+and both touch exactly the paths the original landing touched, so signal 3
+(coverage) passes too and the branch is declared already-landed on a commit
+that is the OPPOSITE of its delivery.  Requiring the id in the
+conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
+AUTHORED delivery from a commit that merely mentions the id.
+
+Measured before narrowing, on this repo's last 4000 main commits: 1298
+subjects match this strict form, and exactly ONE subject matched only the
+dropped arms (itself a body-line false-cite, not a real citation).  So the
+narrowing costs no real attribution and removes the whole false-cite class.
+Anything it does miss falls through to the UNCHANGED
+``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
+
+Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
+``find_task_citation_commit`` requires of any override.
+"""
+
+
+_REVERT_SUBJECT_RE = re.compile(r'^\s*(Revert\b|revert[(:!])', re.IGNORECASE)
+"""Subjects that mean "this commit UNDOES a delivery", not "this IS one".
+
+Applied to the ATTRIBUTING commit in :func:`_resolve_already_landed_branch`,
+uniformly across BOTH attribution mechanisms.  Not redundant with
+:data:`ALREADY_LANDED_CITATION_PATTERN`, which only narrows the citation
+FALLBACK — the merge-marker probe needs its own guard, and the reason is
+measured rather than theoretical:
+
+``git revert -m 1 <M>`` writes the subject ``Revert "Merge task/<id> into
+main"``, which CONTAINS the marker string ``Merge task/<id> into main``
+verbatim.  ``GitOps.find_merge_marker`` greps with ``--fixed-strings
+--max-count=1`` in most-recent-first order, so after a revert it returns the
+REVERT COMMIT rather than the merge.  Every downstream signal then agrees:
+``revert^1..revert`` names exactly the declared files (coverage passes), and
+the revert's OWN effect — the deletion — is genuinely present at main HEAD, so
+even the survival signal says yes.  The attribution is where this has to be
+caught, and it is caught for both mechanisms in one place.
 """
 
 
@@ -1230,7 +1308,7 @@ async def resolve_already_landed_branch(
     ``asyncio.CancelledError`` is re-raised: cancellation is not a git error
     and swallowing it would strand the awaiting task.
 
-    See :func:`_resolve_already_landed_branch` for the three signals.
+    See :func:`_resolve_already_landed_branch` for the four signals.
     """
     try:
         return await _resolve_already_landed_branch(
@@ -1259,7 +1337,7 @@ async def _resolve_already_landed_branch(
 ) -> AlreadyLandedResult | None:
     """Recognize a branch that is empty BECAUSE its work already landed.
 
-    Returns a result only when ALL THREE independent signals hold, and None
+    Returns a result only when ALL FOUR independent signals hold, and None
     on any unmet signal or any git error.  Fails CLOSED by construction: None
     means "carve nothing out", i.e. exactly today's behaviour, so a
     mis-measurement can never excuse real non-delivery.
@@ -1274,10 +1352,20 @@ async def _resolve_already_landed_branch(
 
     **2. ATTRIBUTION** — :meth:`GitOps.find_merge_marker` with
     ``gate_on_existing_ref=False``, falling back to
-    :meth:`GitOps.find_task_citation_commit`.  ``gate_on_existing_ref=False``
-    is not optional here: the parked ref still EXISTS (that is the whole
-    shape), and the default gate would return None for every case this
-    predicate cares about.
+    :meth:`GitOps.find_task_citation_commit` under the STRICTER
+    :data:`ALREADY_LANDED_CITATION_PATTERN` (amendment pass, review finding
+    #2 — the default template also accepts unanchored bare-paren mentions, so
+    ``Revert "impl(3717): ..."`` and ``fix(4200): back out task/3717 changes``
+    would both attribute a landing to task 3717 while touching exactly the
+    paths that make signal 3 pass too).  ``gate_on_existing_ref=False`` is not
+    optional here: the parked ref still EXISTS (that is the whole shape), and
+    the default gate would return None for every case this predicate cares
+    about.
+
+    Whichever probe answers, the attributing commit is then required NOT to
+    have a revert-shaped subject (:data:`_REVERT_SUBJECT_RE`) — see that
+    constant for why the merge-marker probe needs the guard just as much as
+    the citation one, and why no later signal can substitute for it.
 
     **TRAP 1 — the citation fallback is mandatory, not belt-and-braces.**  A
     non-tip coalesce-train member lands with NO per-task merge marker: the
@@ -1291,15 +1379,43 @@ async def _resolve_already_landed_branch(
     touched set, computed as ``get_files_touched_in_branch(f'{sha}^1', sha)``
     against the attributing sha.  For a merge commit ``^1..`` enumerates
     exactly the merged-in commits (the task's own work); for a plain commit
-    ``^1`` is ``^``, so the same call is correct for both.  Comparison uses
-    :func:`_normalize_plan_path` plus the same directory-prefix arm the gate
-    itself uses, so a declared directory is satisfied by a file beneath it.
+    ``^1`` is ``^``, so the same call is correct for both.  Comparison goes
+    through :func:`_entry_covered`, which is the SAME normalization and
+    directory-prefix code the gate itself runs (extracted in the amendment
+    pass, review finding #5, so the two sites cannot drift), so a declared
+    directory is satisfied by a file beneath it.
 
     This is the guard against a task that landed a PARTIAL earlier increment,
     was re-dispatched for the rest, and delivered nothing this time —
     attribution alone would wrongly excuse it.  It matches the measured
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
+
+    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    attributing commit's own effect is STILL PRESENT at main's current HEAD
+    (amendment pass, review finding #1).  Signals 1-3 are all statements about
+    IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
+    ``M^1..M`` keeps reporting the pre-revert content, so a landing that was
+    subsequently REVERTED on main satisfies every one of them and the gate
+    would tell an operator to "verify the landing and CLOSE this task" for
+    work that is no longer there.  This is the exact same post-hoc-revert
+    blind spot the reconcile sweep closes before MARK_DONE (task 2500/2678),
+    closed here by REUSING that sweep's primitive rather than re-deriving a
+    weaker one: it diffs every merged-in parent against current main and
+    requires each one's added lines to survive, so it covers both the merge
+    and the plain-commit (train-member) attribution shapes.
+
+    **TRAP 3 — the rename gap, documented rather than silently closed.**  The
+    gate itself has a rename-resolution arm (:func:`_resolve_renamed_plan_path`,
+    task 3110) for a declared entry that main has since relocated; this
+    predicate deliberately does NOT.  A plan entry whose path was renamed on
+    main BEFORE the task landed (so the landing touched the NEW path while
+    plan.json still names the old one) therefore fails signal 3 and falls
+    through to the UNCHANGED ``plan_files_not_touched`` path.  That is
+    fail-closed and safe, but it is a real population (measured on
+    reify-5196), and the honest reading is that this carve-out does not cover
+    it yet — not that it cannot happen.  Stated here, and pinned by a test,
+    for the same loud-over-silent reason as TRAP 2.
 
     **TRAP 2 — a knowingly invisible class.**  A rebase landing with no merge
     commit and no task-id citation anywhere (specimen: task 3916, findable
@@ -1361,7 +1477,9 @@ async def _resolve_already_landed_branch(
     )
     if not landed_sha:
         mechanism = 'task_citation'
-        landed_sha = await git_ops.find_task_citation_commit(task_id)
+        landed_sha = await git_ops.find_task_citation_commit(
+            task_id, pattern_template=ALREADY_LANDED_CITATION_PATTERN,
+        )
     if not landed_sha:
         # TRAP 2 — no marker and no citation.  Invisible here by design.
         logger.info(
@@ -1373,6 +1491,31 @@ async def _resolve_already_landed_branch(
         )
         return None
     landed_sha = landed_sha.strip()
+
+    # ATTRIBUTION, part 2: the commit that answered must be a DELIVERY, not a
+    # revert of one.  See `_REVERT_SUBJECT_RE` — a `git revert -m 1 <M>`
+    # subject quotes the merge marker verbatim, so the marker probe returns
+    # the revert, and every later signal then agrees with it.
+    rc, subject, err = await _run(
+        ['git', 'log', '-1', '--format=%s', landed_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'already-landed: could not read the subject of attributing '
+            'commit %s (mechanism=%s) task_id=%s rc=%s stderr=%s — failing '
+            'closed',
+            landed_sha, mechanism, task_id, rc, (err or '').strip()[:400],
+        )
+        return None
+    if _REVERT_SUBJECT_RE.match(subject.strip()):
+        logger.warning(
+            'already-landed: the commit attributing task_id=%s is %s, whose '
+            'subject %r is a REVERT — that undoes a delivery rather than '
+            'being one, so the work is not on main; failing closed',
+            task_id, landed_sha, subject.strip()[:200],
+        )
+        return None
 
     # --- signal 3: the landing COVERS every declared entry -----------------
     touched = await git_ops.get_files_touched_in_branch(
@@ -1395,16 +1538,11 @@ async def _resolve_already_landed_branch(
         if not entry:
             continue
         norm = _normalize_plan_path(entry)
-        if norm in touched_set:
-            matched.append(entry)
-            continue
-        # Same directory arm as the gate itself (arm (b)): a declared
-        # directory is covered when a touched path sits beneath it.  Done by
-        # prefix alone rather than by an ls-tree object-type probe, because
-        # a landed directory's contents ARE the evidence — if nothing beneath
-        # it was touched, the entry is uncovered whatever its object type is.
-        prefix = norm.rstrip('/') + '/'
-        if any(t.startswith(prefix) for t in touched_set):
+        # `_entry_covered` IS the gate's own exact-hit + directory-prefix
+        # pair, shared rather than re-spelled (review finding #5).  See
+        # TRAP 3 above for the one arm this site deliberately does not
+        # inherit: rename resolution.
+        if _entry_covered(norm, touched_set):
             matched.append(entry)
             continue
         # One uncovered entry is enough: a PARTIAL earlier landing must not
@@ -1417,6 +1555,22 @@ async def _resolve_already_landed_branch(
         return None
 
     if not matched:
+        return None
+
+    # --- signal 4: the landing SURVIVES at main's current HEAD -------------
+    # Signals 1-3 are all claims about immutable history and stay true after
+    # a revert; this is the only one that reads CURRENT main.  Same primitive
+    # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
+    # effect-present refinement), so the two seams answer "is it still there"
+    # identically instead of drifting.
+    if not await git_ops.commit_effect_present_in_main(landed_sha):
+        logger.warning(
+            'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
+            'ancestor of main but its effect is NOT present at current HEAD '
+            '(post-hoc revert) — failing closed rather than telling an '
+            'operator to close a task whose work is no longer on main',
+            landed_sha, mechanism, task_id,
+        )
         return None
 
     logger.info(
@@ -1457,6 +1611,49 @@ def _normalize_plan_path(entry: str) -> str:
     # Empty entries are already filtered by the caller; guard '.' so it
     # can't spuriously match the repo root prefix.
     return entry if norm == '.' else norm
+
+
+def _entry_touched_exactly(norm: str, touched_set: set[str]) -> bool:
+    """Does a NORMALIZED plan entry name a path the landing touched outright?
+
+    Extracted (amendment pass, review finding #5) so
+    :func:`_check_plan_files_touched_in_branch` and
+    :func:`_resolve_already_landed_branch` cannot drift on what "touched"
+    means.  Both sides are already git-canonical here: *touched_set* is raw
+    git output and *norm* has been through :func:`_normalize_plan_path`.
+    """
+    return norm in touched_set
+
+
+def _entry_touched_beneath(norm: str, touched_set: set[str]) -> bool:
+    """Does the landing touch any path BENEATH a declared directory entry?
+
+    The directory arm, single-sourced for the same reason as its sibling
+    above.  Prefix-matching alone, with no ls-tree object-type probe: a
+    directory's touched CONTENTS are the evidence, so if nothing beneath it
+    was touched the entry is uncovered whatever its object type is.  The
+    ``rstrip('/')`` + ``'/'`` re-append is what keeps ``src/pkg`` from
+    matching ``src/pkgx/a.py``.
+
+    Callers that DO care about the object type (the gate itself, which must
+    not let a blob prefix-match) gate this call on their own ls-tree probe.
+    """
+    prefix = norm.rstrip('/') + '/'
+    return any(t.startswith(prefix) for t in touched_set)
+
+
+def _entry_covered(norm: str, touched_set: set[str]) -> bool:
+    """Exact hit OR a hit beneath a declared directory.
+
+    The whole coverage question for :func:`_resolve_already_landed_branch`,
+    which — unlike the gate — has no separate existence probe to gate the
+    directory arm on: it is asking about a LANDING that already happened, so
+    the touched set is the only evidence there is.
+    """
+    return (
+        _entry_touched_exactly(norm, touched_set)
+        or _entry_touched_beneath(norm, touched_set)
+    )
 
 
 _MAX_RENAME_HOPS = 8
@@ -1816,7 +2013,7 @@ async def _check_plan_files_touched_in_branch(
         # Keep the original `entry` for diagnostics so the escalation message
         # reflects exactly what the architect wrote in plan.json.
         norm = _normalize_plan_path(entry)
-        if norm in touched_set:
+        if _entry_touched_exactly(norm, touched_set):
             continue
 
         # Existence probe: ask the branch tree what kind of object the
@@ -1849,11 +2046,16 @@ async def _check_plan_files_touched_in_branch(
             # TAB-separated metadata half only — sniffing the whole line for
             # the substring ' tree ' misreads any blob whose path contains
             # it (e.g. 'docs/my tree notes.md').
-            if _ls_tree_object_type(ls_out) == 'tree':
-                # Directory: prefix-match against the touched set.
-                prefix = norm.rstrip('/') + '/'
-                if any(t.startswith(prefix) for t in touched_set):
-                    continue
+            # Directory: prefix-match against the touched set.  The prefix
+            # arm is shared with the already-landed predicate (review
+            # finding #5) so the two sites cannot drift on it; the
+            # object-type gate stays HERE, because only this site has an
+            # existence probe to gate on.
+            if (
+                _ls_tree_object_type(ls_out) == 'tree'
+                and _entry_touched_beneath(norm, touched_set)
+            ):
+                continue
             not_touched.append(entry)
             continue
 
