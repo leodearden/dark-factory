@@ -1684,3 +1684,329 @@ class TestDeepScaleBuild:
             f'chain_items is in CHAIN-ITEM units (head = #1), so a 15-link '
             f'chain reports 16; got {verify_rows[0]["chain_items"]!r}'
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-05 RED: Row 11 — TIMEOUT MARGIN --
+#
+# The ONE boundary row with zero coverage anywhere in the tree: a repo-wide
+# search for the merge-verify cold budget, for a 16-item chain, or for a
+# verify timeout on a deep round returns nothing in either upstream deep
+# module.  The only build-side deadline that IS tested is the 120 s
+# CHAIN_BUILD_TIMEOUT_SECS, and only as a unit.
+#
+# The row's claim, stated as three separate ones so a failure names WHICH:
+#
+#   (a) BUDGET  — a deep tip verify is priced by ``is_merge_verify``, NOT by
+#       how many items are in the tree.  A 16-item tip and a 1-item always-on
+#       verify are handed the SAME merge-verify cold budget; deep chaining
+#       does not silently reprice the verify in either direction.
+#   (b) MARGIN  — the build that produces that tree finishes inside its own
+#       (much smaller) deadline with orders of magnitude to spare, and stamps
+#       what it cost where η1's dispatch-stall reader can find it.
+#   (c) CLEAN TIMEOUT — when a deep tip verify DOES time out, it degrades
+#       through the EXISTING timeout path and no new one: the loop-breaker
+#       counter advances, nothing lands, no blocked outcome is rendered for
+#       any chained item, and the bisector halves rather than resets.
+#
+# NONE of the three may elapse real wall clock.  (a) asserts the BUDGET the
+# code hands down — captured at the ``_run_cmd`` seam, the shape
+# test_verify.py::TestRunVerificationColdFirstUse uses — and (c) INJECTS a
+# timed-out verdict rather than waiting for one.  A test that actually waited
+# out a 7200 s budget could never run in CI, and one that waited out a short
+# substitute budget would be pinning the substitute.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestRow11TimeoutMargin:
+    """Row 11: a 16-item chain (cap 32) fits inside the merge-verify budget."""
+
+    async def test_a_depth_sixteen_tip_verify_is_handed_the_merge_cold_budget(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) Every command in a 16-item tip verify gets the 7200 s cold budget.
+
+        The resolution being pinned is
+        ``verify._resolve_verify_timeout``'s cascade **step 0**: with
+        ``is_merge_verify=True`` (which ``run_scoped_verification`` also forces
+        ``is_cold=True`` for, merge worktrees having no warm cargo cache and no
+        ``.task/`` marker to detect one by) the merge-specific knob wins BEFORE
+        the general cold knob.  So the negative control matters as much as the
+        positive one: 5400.0 — the general cold budget, which is what a
+        merge-verify would silently fall back to if the merge knob were ever
+        dropped from the threading — must never appear.
+
+        This runs the REAL ``_run_post_merge_verify`` → ``LocalRunner`` →
+        ``run_scoped_verification`` → ``run_verification`` stack, with only the
+        subprocess launcher stubbed.  Nothing else reaches the resolver: the
+        conftest autouse ``_mock_merge_queue_verification`` short-circuits at
+        ``run_scoped_verification``, which is above it.
+        """
+        captured = _capture_verify_timeouts(monkeypatch)
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=15, db_name='gate-row11-budget.db',
+            real_local=True,
+        )
+        rec = await scene.round_(tag='budget16', head_tid='101')
+
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 15, (
+            'the budget claim is about a DEPTH-16 tip; got '
+            f'{None if chain is None else 1 + len(chain.links)} items'
+        )
+        # The two knobs this test's whole claim is a routing statement about.
+        config = scene.config
+        assert config.merge_verify_cold_command_timeout_secs == 7200.0, (
+            'the shipped merge-verify cold budget moved: expected 7200.0, got '
+            f'{config.merge_verify_cold_command_timeout_secs!r}'
+        )
+        assert config.verify_cold_command_timeout_secs == 5400.0, (
+            'the shipped GENERAL cold budget moved, so the negative control '
+            f'below is no longer the right one: got '
+            f'{config.verify_cold_command_timeout_secs!r}'
+        )
+
+        assert captured, (
+            'no verify command was dispatched at all — the capture is vacuous '
+            '(the autouse run_scoped_verification stub was probably still in '
+            'place, short-circuiting above the resolver)'
+        )
+        assert set(captured) == {7200.0}, (
+            f'every command in a merge verify is handed the merge-verify cold '
+            f'budget; got {sorted(set(captured))!r} across {len(captured)} '
+            f'commands'
+        )
+        assert 5400.0 not in captured, (
+            f'the GENERAL cold budget leaked into a merge verify: {captured!r}'
+        )
+
+    async def test_the_same_budget_is_handed_to_a_one_item_verify(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a, control) chain_items=1 is priced identically to chain_items=16.
+
+        The hazard this rules out is a repricing that only LOOKS right at one
+        end of the range: a deep tip is a bigger tree and takes longer, so a
+        future change that scaled the budget with ``chain_items`` (or, worse,
+        one that made the deep arm miss the ``is_merge_verify`` threading and
+        fall back to the general cold budget) would be invisible to a test that
+        only ever measured one depth.
+
+        Same scene, same config, one queued item — ``select_chain_depth``
+        declines at ``queue_len < 2``, so this is the ALWAYS-ON arm.
+        """
+        captured = _capture_verify_timeouts(monkeypatch)
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=0, db_name='gate-row11-budget1.db',
+            real_local=True,
+        )
+        rec = await scene.round_(tag='budget1', head_tid='101')
+
+        assert rec['chain'] is None, (
+            'a single queued item must not chain (queue_len < 2), but a chain '
+            f'of {1 + len(rec["chain"].links)} items was built'
+        )
+        assert captured, 'no verify command was dispatched at all'
+        assert set(captured) == {7200.0}, (
+            f'the always-on arm must be priced the same as the deep arm; got '
+            f'{sorted(set(captured))!r}'
+        )
+
+    async def test_the_sixteen_item_build_finishes_far_inside_its_deadline(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) A real 15-link build costs milliseconds against a 120 s deadline.
+
+        ``CHAIN_BUILD_TIMEOUT_SECS`` bounds the WHOLE build, and the build is a
+        synchronous stall on the dispatch path — no other item can dispatch
+        while it runs — so the margin is the claim, not the wall clock.  The
+        assertion is deliberately an ORDER-OF-MAGNITUDE one (30 s against a
+        120 s deadline, for a build the replay study measured at ~1–2 s per
+        6-chain): a tight bound here would be a flake generator on a loaded
+        box, while a loose one still catches the regression that matters — a
+        build that went superlinear in depth and started eating the deadline.
+
+        ``build_ms`` is stamped by the builder itself, so this is also the
+        assertion that the stamp EXISTS on a real deep build rather than being
+        dropped somewhere between the build and the ChainResult.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=15, db_name='gate-row11-margin.db',
+            remote=True,
+        )
+        rec = await scene.round_(tag='margin', head_tid='101')
+
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 15, (
+            f'expected a 15-link build, got '
+            f'{None if chain is None else len(chain.links)}'
+        )
+        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS == 120.0, (
+            f'the build deadline moved: {merge_queue.CHAIN_BUILD_TIMEOUT_SECS!r}'
+        )
+        assert isinstance(chain.build_ms, int) and chain.build_ms > 0, (
+            f'a real build must stamp a positive integer build_ms, got '
+            f'{chain.build_ms!r}'
+        )
+        assert chain.build_ms < 30_000, (
+            f'a 15-link build took {chain.build_ms} ms against a '
+            f'{merge_queue.CHAIN_BUILD_TIMEOUT_SECS} s deadline — the margin '
+            f'this row asserts is gone'
+        )
+
+    async def test_chain_build_ms_reaches_the_reader_exactly_when_deep(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b) The stall stamp is on the deep row and ABSENT on the shallow one.
+
+        η1 reads ``chain_build_ms`` out of the durable ``merge_verify`` row
+        alongside drain-time, so the presence rule is part of the contract and
+        not an implementation detail: non-None means "this verify paid for a
+        build", and ``None`` — not ``0`` — means it paid for none.  A ``0``
+        would be a lie rather than an absence, and would land in the reader's
+        histogram as a free build.
+
+        Two scenes, because the two arms cannot coexist in one round.
+        """
+        deep = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=15, db_name='gate-row11-stampd.db',
+            remote=True,
+        )
+        await deep.round_(tag='stamp16', head_tid='101')
+        deep_rows = _verify_rows(deep.db_path)
+        assert len(deep_rows) == 1, f'one row per verify, got {len(deep_rows)}'
+        assert deep_rows[0]['chain_items'] == 16, (
+            f'expected a 16-item row, got {deep_rows[0]["chain_items"]!r}'
+        )
+        assert deep_rows[0]['chain_build_ms'] is not None, (
+            'a deep verify paid for a build and must stamp what it cost; row '
+            f'is {deep_rows[0]!r}'
+        )
+        assert deep_rows[0]['chain_build_ms'] == deep.rounds[0]['chain'].build_ms, (
+            f'the emitted stall stamp must be the ChainResult\'s own, not a '
+            f're-derivation: row {deep_rows[0]["chain_build_ms"]!r} vs chain '
+            f'{deep.rounds[0]["chain"].build_ms!r}'
+        )
+
+    async def test_a_one_item_verify_stamps_no_build_cost(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(b, control) The always-on arm reports chain_items=1, build_ms None."""
+        shallow = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=0, db_name='gate-row11-stamps.db',
+            remote=True,
+        )
+        rec = await shallow.round_(tag='stamp1', head_tid='101')
+        assert rec['chain'] is None, 'a single queued item must not chain'
+
+        rows = _verify_rows(shallow.db_path)
+        assert len(rows) == 1, f'one row per verify, got {len(rows)}'
+        assert rows[0]['chain_items'] == 1, (
+            f'the always-on arm verifies exactly one item, got '
+            f'{rows[0]["chain_items"]!r}'
+        )
+        assert rows[0]['chain_build_ms'] is None, (
+            f'a verify that paid for no build must stamp ABSENCE, not 0; got '
+            f'{rows[0]["chain_build_ms"]!r}'
+        )
+
+    async def test_a_clean_verify_timeout_degrades_through_the_existing_path(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(c) A timed-out deep tip takes the ORDINARY timeout path, not a new one.
+
+        Four things must all hold at once, and each is a different mechanism —
+        which is why they are asserted together rather than in four scenes:
+
+        1. ``_post_merge_verify_timeouts`` bumps by exactly one.  That counter
+           is the loop-breaker's, and it advances ONLY on ``verify.timed_out``
+           (a real red must not feed it), so a deep timeout being invisible to
+           it would let a deterministically-hanging task re-queue forever.
+        2. NOTHING lands.  Main is byte-identical, and the durable ledger has
+           no ``merge_finalized`` row at all — the chain's whole prefix stays
+           on the queue.
+        3. NO blocked ``MergeOutcome`` is rendered for any chained item.  The
+           blocked outcome ``_run_post_merge_verify`` builds internally is
+           SWALLOWED into a REQUEUED status by the chain arm, precisely because
+           a red tip names no culprit; every request future stays pending.
+           This is also what keeps a timeout out of workflow.py's thrash ladder
+           (Row 8's claim, which this row must not quietly violate).
+        4. The bisector HALVES rather than resetting: ``next_halving_state``
+           folds a non-pass at the BUILT depth, so a 16-item tree leaves the
+           ceiling at 8 — not ``None`` (which would be a reset, i.e. a timeout
+           being read as a clean bill of health) and not the floor.
+
+        The verdict is INJECTED below ``_run_post_merge_verify`` so the real
+        function does its own ``timeouts``/``enospc`` bookkeeping — a stub in
+        its place would be asserting the test's own arithmetic.
+        """
+        from orchestrator.merge_queue import next_halving_state
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=32, n_followers=15, db_name='gate-row11-timeout.db',
+            remote=True, script=[_timed_out_verify_result()],
+        )
+        rec = await scene.round_(tag='timeout16', head_tid='101')
+        worker = scene.worker
+
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 15, (
+            'the timeout claim is about a DEPTH-16 tip; got '
+            f'{None if chain is None else 1 + len(chain.links)} items'
+        )
+
+        # 1 — the loop-breaker counter saw it.
+        assert dict(worker._post_merge_verify_timeouts) == {'101': 1}, (
+            f'a timed-out deep tip must bump the dispatching task\'s timeout '
+            f'counter exactly once; got '
+            f'{dict(worker._post_merge_verify_timeouts)!r}'
+        )
+
+        # 2 — nothing landed, on either tier.
+        assert rec['main_after'] == rec['main_before'], (
+            f'main moved on a timed-out round: {rec["main_before"][:8]} -> '
+            f'{rec["main_after"][:8]}'
+        )
+        assert rec['advanced'] is False, (
+            f'_finalize_inflight must not advance on a timeout, got '
+            f'{rec["advanced"]!r}'
+        )
+        assert _finalized_rows(scene.db_path) == [], (
+            f'a timed-out round lands nothing, so it emits no merge_finalized; '
+            f'got {_finalized_rows(scene.db_path)!r}'
+        )
+        assert rec['landed'] == [], (
+            f'no request may resolve as done on a timeout; got {rec["landed"]!r}'
+        )
+
+        # 3 — no blocked outcome reached ANY chained item.
+        assert rec['outcome'] is None, (
+            f'the dispatching request must stay unresolved (REQUEUED), not '
+            f'carry a blocked outcome; got {rec["outcome"]!r}'
+        )
+        unresolved = [
+            tid for tid, req in scene.reqs.items() if not req.result.done()
+        ]
+        assert sorted(unresolved, key=int) == sorted(scene.reqs, key=int), (
+            f'every chained request stays pending on a red tip; these '
+            f'resolved: {sorted(set(scene.reqs) - set(unresolved), key=int)!r}'
+        )
+
+        # 4 — the bisector halved off the BUILT depth.
+        assert worker._chain_halving_state == next_halving_state(False, 16), (
+            f'a timed-out 16-item tip must halve the ceiling to '
+            f'{next_halving_state(False, 16)}, got '
+            f'{worker._chain_halving_state!r}'
+        )
+        assert worker._chain_halving_state is not None, (
+            'a timeout is not a pass — resetting the bisector would read a '
+            'hung verify as a clean bill of health'
+        )
