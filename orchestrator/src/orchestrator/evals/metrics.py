@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,8 @@ from shared.invocation_outcome import (
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from shared.cli_invoke import AgentResult
 
     from orchestrator.workflow import TaskWorkflow
@@ -373,6 +376,107 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
     Pure: no I/O, no mutation.
     """
     return metrics.get('terminal_kind')
+
+
+def _parse_terminal_stamp(value: object) -> datetime | None:
+    """Parse one ISO-8601 terminal-call stamp, or ``None`` if it cannot order.
+
+    Both producers write ``datetime.now(UTC).isoformat()`` — the five
+    ``artifacts.TaskArtifacts.write_*`` decline artifacts stamp ``reported_at``
+    and ``plan_tools._confirm_plan`` stamps ``_finalized_at`` — so the two are
+    directly comparable and no inference is needed. Anything else (absent,
+    empty, not a string, unparseable) returns ``None``, which
+    :func:`resolve_terminal_kind` reads as UNORDERABLE.
+
+    A NAIVE stamp is normalised to UTC rather than rejected: both producers
+    write UTC, so that is the faithful reading, and it keeps the comparison
+    TOTAL — an aware-vs-naive ``>`` raises ``TypeError``, which inside
+    ``run_architect_eval``'s ``finally`` would cost an already-scored cell.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _stamp_of(artifact: object, field: str) -> datetime | None:
+    """``_parse_terminal_stamp`` of ``artifact[field]``, tolerating a non-dict."""
+    if not isinstance(artifact, dict):
+        return None
+    return _parse_terminal_stamp(artifact.get(field))
+
+
+def resolve_terminal_kind(
+    plan: dict | None,
+    declines: Mapping[str, dict | None],
+) -> str:
+    """Resolve the architect's TERMINAL STATEMENT to one ``TERMINAL_KINDS`` member.
+
+    PURE: plain dicts in, a string out. No I/O, and neither argument is
+    mutated. ``plan`` is what ``artifacts.read_plan`` returned; ``declines`` is
+    what :func:`read_decline_artifacts` returned (a possibly-partial map of
+    kind -> artifact-or-``None``).
+
+    **LAST TERMINAL CALL WINS** — the policy, and why it is this one. A cell can
+    carry BOTH a plan and a decline: on reify_task_4026 / run e522b1b0 the
+    architect confirmed a 6-step plan and then, at turn 176, called
+    ``report_already_done``. Scoring that as a planning success reports the
+    OPPOSITE of what the model itself concluded, so the LAST of the two
+    statements is the one this function returns. It is decided from timestamps
+    both producers already write (``reported_at`` vs ``_finalized_at``, same
+    format — see :func:`_parse_terminal_stamp`), so it is an exact comparison
+    rather than an inference, and it needs no new plumbing.
+
+    **AMBIGUITY RESOLVES TOWARD THE DECLINE.** A decline artifact exists only
+    because the architect made an explicit, server-accepted terminal tool call
+    that the prompt tells it to make INSTEAD of planning; a plan without
+    ``_finalized_at`` is, by ``workflow._plan``'s own rule, not a terminal
+    statement at all. So the plan wins ONLY when it is confirmed AND provably
+    later. Concretely, the decline side wins whenever: the plan is not scorable,
+    the plan carries no parseable ``_finalized_at``, the winning decline carries
+    no parseable ``reported_at``, or the two stamps are equal.
+
+    Winner selection among SEVERAL declines: the one with the greatest
+    ``reported_at``, with an UNORDERABLE stamp sorting last (i.e. winning),
+    because a decline nobody can place in time is exactly the ambiguity the rule
+    above resolves toward. Ties, and the all-unorderable case, break by the
+    fixed :data:`DECLINE_KINDS` order, so the same input always resolves the
+    same way.
+
+    This changes NO existing metric. ``plan_steps`` still counts the plan's
+    steps and ``produced_a_plan`` still derives planRate from it, so a
+    plan-then-decline cell persists BOTH facts and a downstream reader can
+    bucket it either way. See :attr:`EvalMetrics.terminal_kind`.
+    """
+    # judge.py imports THIS module lazily (inside judge_plan_quality), so a
+    # module-level import here would turn a deliberate one-way function
+    # coupling into a real cycle. Same reason band_for_cell imports
+    # produced_a_plan function-locally.
+    from orchestrator.evals.judge import is_scorable_plan  # noqa: PLC0415
+
+    # Built in DECLINE_KINDS order, so every fallback below (`[0]`, and the
+    # first-match scan) applies the fixed precedence rather than dict order.
+    present = [kind for kind in DECLINE_KINDS if declines.get(kind)]
+    if not present:
+        return 'planned' if is_scorable_plan(plan) else 'none'
+
+    stamps = {k: _stamp_of(declines.get(k), 'reported_at') for k in present}
+    orderable = {k: at for k, at in stamps.items() if at is not None}
+    if len(orderable) < len(present):
+        # At least one present decline cannot be placed in time: it sorts last,
+        # so it wins, and the plan can never be shown to be later than it.
+        winner, winner_at = next(k for k in present if stamps[k] is None), None
+    else:
+        winner_at = max(orderable.values())
+        winner = next(k for k in present if stamps[k] == winner_at)
+
+    if not is_scorable_plan(plan) or winner_at is None:
+        return winner
+    finalized_at = _stamp_of(plan, '_finalized_at')
+    return 'planned' if finalized_at is not None and finalized_at > winner_at else winner
 
 
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
