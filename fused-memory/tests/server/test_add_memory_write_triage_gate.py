@@ -1536,6 +1536,7 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
             await _call(server)
 
         judge.assert_awaited_once()
+        assert judge.await_args is not None
         kwargs = judge.await_args.kwargs
         assert kwargs['content'] == _CONTENT, f'{kwargs!r}'
         assert kwargs['project_id'] == _PROJECT_ID, f'{kwargs!r}'

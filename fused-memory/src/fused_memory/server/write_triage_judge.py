@@ -591,7 +591,7 @@ async def _call_llm(
             ),
             timeout=timeout,
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ''
 
     if provider == 'anthropic':
         import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
@@ -610,8 +610,8 @@ async def _call_llm(
         )
         # First TEXT block, not first block: a leading thinking/tool_use block
         # must not be read as the answer.
-        texts = [b.text for b in response.content if getattr(b, 'type', None) == 'text']
-        return texts[0] if texts else ''
+        text_blocks = [b for b in response.content if b.type == 'text']
+        return text_blocks[0].text if text_blocks else ''
 
     raise ValueError(
         f'unknown judge provider {provider!r}; implemented arms are '
