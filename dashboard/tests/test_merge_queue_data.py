@@ -1598,6 +1598,122 @@ class TestLoadTaskTitles:
         assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
         assert all(r == {'1': 'A'} for r in results)
 
+    # --- Whole-operation budget -------------------------------------------
+    #
+    # ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
+    # connect/read/write and pool acquisition and nothing else. The incident
+    # that motivated these two tests hung inside httpcore's connection lock,
+    # where no outbound socket is ever opened and that timeout never fires —
+    # so /merge-queue wedged for 19.8 h with the per-request budget fully in
+    # place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+    #
+    # Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
+    # ever sets, deliberately NOT a sleep: a sleep shorter than the budget
+    # passes against the pre-fix code too and would prove nothing. Since that
+    # would otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
+    # ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only
+    # trip on a real regression, never on scheduling jitter.
+
+    async def test_a_hanging_fetch_tasks_does_not_hang_load_task_titles(
+        self, monkeypatch, dummy_client, dummy_config
+    ):
+        """A fetch that never returns degrades to {} and is not cached."""
+        import asyncio
+
+        import dashboard.data.merge_queue as _mq
+
+        # A warm entry would be served without ever reaching the hang.
+        _mq._task_titles_cache_clear()
+
+        call_count = 0
+
+        async def hang_fetch_tasks(client, config, project_root):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.Event().wait()  # nothing ever sets it
+
+        monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', 0.05)
+
+        with patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks):
+            result = await asyncio.wait_for(
+                _mq.load_task_titles(
+                    client=dummy_client, config=dummy_config,
+                    project_root='/proj/HANG',
+                ),
+                timeout=2.0,
+            )
+            assert result == {}, (
+                'the shape load_task_titles already promises for an MCP '
+                'failure — the merge-queue tab still renders, with titles '
+                'falling back to empty strings'
+            )
+            assert call_count == 1
+
+            # A timeout must not pin an empty title map for the TTL window:
+            # nothing was written to the cache, so the next poll re-attempts.
+            await asyncio.wait_for(
+                _mq.load_task_titles(
+                    client=dummy_client, config=dummy_config,
+                    project_root='/proj/HANG',
+                ),
+                timeout=2.0,
+            )
+        assert call_count == 2, (
+            'the second call must re-enter the stub — a timeout that cached '
+            'its {} would blank the tab for the whole TTL window'
+        )
+
+    async def test_a_concurrent_caller_on_the_same_root_is_bounded_too(
+        self, monkeypatch, dummy_client, dummy_config
+    ):
+        """Both callers are bounded, not just the one that wins the lock.
+
+        This pins the wrap PLACEMENT. ``TTLCache.get_or_refresh`` serializes
+        cold callers for one key behind a per-key lock and runs the refresh
+        WHILE HOLDING it. If the ``wait_for`` enclosed the inner
+        ``fetch_tasks`` instead of the outer ``get_or_refresh``, caller B
+        would queue on that lock UNBOUNDED for caller A's whole budget and
+        then run its own full-budget refresh — the pair costs 2x the budget
+        and N waiters cost N x. The dashboard polls every 3 s, so waiters are
+        the routine case, not a corner.
+        """
+        import asyncio
+
+        import dashboard.data.merge_queue as _mq
+
+        _mq._task_titles_cache_clear()
+
+        async def hang_fetch_tasks(client, config, project_root):
+            await asyncio.Event().wait()
+
+        budget = 0.05
+        monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', budget)
+        loop = asyncio.get_running_loop()
+
+        with patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks):
+            started = loop.time()
+            results = await asyncio.wait_for(
+                asyncio.gather(*[
+                    _mq.load_task_titles(
+                        client=dummy_client, config=dummy_config,
+                        project_root='/proj/SHARED',
+                    )
+                    for _ in range(2)
+                ]),
+                timeout=2.0,
+            )
+            elapsed = loop.time() - started
+
+        assert results == [{}, {}]
+        # The assertion is about SERIALIZATION, not merely about returning:
+        # an inner-only wrap costs 2 x budget here and scales with waiters.
+        assert elapsed < 2 * budget, (
+            f'two concurrent callers took {elapsed:.3f}s against a {budget}s '
+            f'budget — that is the serialized cost of an inner-only wrap; '
+            'the wait_for must enclose get_or_refresh so a caller QUEUED on '
+            'the per-key lock is bounded too'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)
