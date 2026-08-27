@@ -173,6 +173,115 @@ class TestFactReferents:
         ) == frozenset({Referent(kind='task', project_id='dark_factory', number='2500')})
 
 
+def _regex_literals_mentioning_task(source: str) -> list[str]:
+    """Regex PATTERN literals in *source* that mention 'task', case-insensitively.
+
+    Extracted out of the assertion it serves so a meta-test can feed it
+    synthetic sources and prove it actually flags things — see
+    :class:`TestTheVocabularyGuardHasTeeth`.
+
+    AST-based, deliberately, not a substring scan: the script's module
+    docstring must stay free to NAME this hazard in order to warn against it.
+    """
+    tree = ast.parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, 'attr', None) or getattr(node.func, 'id', None)
+        if name != 'compile':
+            continue
+        for arg in node.args:
+            if (
+                isinstance(arg, ast.Constant)
+                and isinstance(arg.value, str)
+                and 'task' in arg.value.lower()
+            ):
+                offenders.append(f'{arg.value!r} (line {node.lineno})')
+    return offenders
+
+
+class TestTheVocabularyGuardHasTeeth:
+    """Meta-test: prove the INV-5 guard can FAIL before trusting it to pass.
+
+    ``test_no_compiled_regex_mentions_the_word_task`` advertises that it pins
+    the absence of a second task-label vocabulary in the script. Verified
+    2026-08-27: the script contains ZERO ``re.compile`` calls — its only
+    regex construction anywhere is the ``rf'\\b{...}\\b'`` pattern inside
+    ``bare_id_present`` — so a scan restricted to ``compile`` + plain string
+    constants returns ``[]`` no matter what the file says, and the assertion
+    is vacuous.
+
+    Two independent blind spots, and the second is the sharper one:
+
+      * only the callee ``compile`` is matched, so ``re.search``,
+        ``re.findall``, ``re.sub`` and friends are invisible;
+      * only ``ast.Constant`` arguments are inspected, so an f-string pattern
+        (``ast.JoinedStr``) is invisible — which is EXACTLY the form the
+        script's one real pattern already takes, i.e. the blind spot is not
+        hypothetical, it is the shape a next editor would naturally reach
+        for.
+
+    A future edit adding ``re.search(r'task[\\s#:]+(\\d+)', fact)`` — the
+    precise INV-5 violation the guard advertises — would leave it green.
+    The cases below are the failing test that fixes that.
+    """
+
+    @pytest.mark.parametrize(
+        'source,why',
+        [
+            (
+                "import re\nm = re.search(r'task[\\s#:]+(\\d+)', fact)\n",
+                'plain callee, plain constant — the canonical violation',
+            ),
+            (
+                "import re\np = re.compile(rf'Task {sep}(\\d+)')\n",
+                'f-string pattern: an ast.JoinedStr, invisible to a '
+                'Constant-only scan',
+            ),
+            (
+                "import re\nm = re.findall('TASK (\\\\d+)', fact)\n",
+                'case-insensitivity, and a callee that is not compile',
+            ),
+        ],
+        ids=['re.search-constant', 're.compile-fstring', 're.findall-uppercase'],
+    )
+    def test_a_second_vocabulary_is_flagged(self, source: str, why: str) -> None:
+        assert _regex_literals_mentioning_task(source) != [], (
+            f'the guard did not flag a second task-label vocabulary ({why}); '
+            f'it would pass this file unchanged:\n{source}'
+        )
+
+    def test_the_scripts_own_pattern_is_not_flagged(self) -> None:
+        """``bare_id_present``'s real pattern carries no vocabulary.
+
+        Its JoinedStr constant parts are just ``\\b`` and ``\\b``; the
+        interpolated value is an id the SHARED parser already produced. That
+        distinction — containment check over an already-parsed id, versus a
+        compiled description of what a task label is — is the whole reason
+        the script is allowed to touch ``re`` at all, and it must survive the
+        widening.
+        """
+        source = (
+            'import re\n'
+            "def bare_id_present(referent, fact):\n"
+            "    return re.search(rf'\\b{re.escape(referent.number)}\\b', "
+            'fact) is not None\n'
+        )
+        assert _regex_literals_mentioning_task(source) == []
+
+    def test_a_non_re_call_named_compile_is_not_flagged(self) -> None:
+        """Only the ``re`` module's own functions are pattern-consuming.
+
+        A template engine, a query builder, or a schema object may perfectly
+        well expose ``.compile(...)`` and be handed a string mentioning a
+        task. Flagging it would make the guard cry wolf, and a guard that
+        cries wolf gets narrowed back into vacuity.
+        """
+        source = "template = engine.compile('the task summary block')\n"
+        assert _regex_literals_mentioning_task(source) == []
+
+
 class TestNoSecondVocabulary:
     """INV-5, as a test: the script compiles NO task-label pattern of its own.
 
@@ -192,27 +301,19 @@ class TestNoSecondVocabulary:
     """
 
     def test_no_compiled_regex_mentions_the_word_task(self) -> None:
-        """Structural: no ``re.compile(...)`` literal contains 'task'.
+        """Structural: no regex literal in the script contains 'task'.
 
         Asserted over the AST rather than as a substring scan, so the module
         docstring may name the hazard in order to warn against it — the same
         reason the precedent's mutation-call test went AST-based.
+
+        The scan itself lives in :func:`_regex_literals_mentioning_task` so
+        that its POWER can be asserted directly rather than assumed — see
+        :class:`TestTheVocabularyGuardHasTeeth`. A guard whose only
+        observation is "the real file is clean" is indistinguishable from a
+        guard that cannot flag anything.
         """
-        tree = ast.parse(SCRIPT_PATH.read_text())
-        offenders: list[str] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = getattr(node.func, 'attr', None) or getattr(node.func, 'id', None)
-            if name != 'compile':
-                continue
-            for arg in node.args:
-                if (
-                    isinstance(arg, ast.Constant)
-                    and isinstance(arg.value, str)
-                    and 'task' in arg.value.lower()
-                ):
-                    offenders.append(f'{arg.value!r} (line {node.lineno})')
+        offenders = _regex_literals_mentioning_task(SCRIPT_PATH.read_text())
         assert offenders == [], (
             f'the script compiles a task-label pattern of its own: {offenders}. '
             'The vocabulary lives at exactly one site — '
