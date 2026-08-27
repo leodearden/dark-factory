@@ -751,54 +751,6 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
     return sanitized or None
 
 
-def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
-    """Merge a flag's *current* ``cited_tasks`` with the *prior* persisted anchor.
-
-    Both sides are run through the same validation as
-    :func:`_sanitize_cited_tasks` (each is wrapped as a flag-shaped dict), so a
-    malformed value on either side — a bare string, a dict, a list of
-    non-dicts, ``None`` — degrades to "no citations from that side" rather
-    than raising.  This matters most for *prior*, which is free-form JSON read
-    back off a ledger row that may predate this key or have been written by an
-    older/other producer.
-
-    Entries are de-duplicated on the ``(str(project_id), str(task_id))``
-    identity — the same ``"project_id:task_id"`` convention
-    ``server/recon_report`` uses for citation fingerprints — with first-seen
-    order preserved and *current* taking precedence, so a task cited by BOTH
-    sides is looked up exactly once.  An entry lacking either identity field
-    is kept (it is harmless; the resolver skips it) but never collapses with
-    another.
-
-    Pure, sync, no I/O — never raises.
-    """
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for side in (current, prior):
-        for entry in _sanitize_cited_tasks({'cited_tasks': side}) or []:
-            project_id = entry.get('project_id')
-            task_id = entry.get('task_id')
-            if project_id is None or task_id is None:
-                merged.append(entry)
-                continue
-            key = (str(project_id), str(task_id))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(entry)
-    return merged
-
-
-#: Hard ceiling on the number of ``cited_tasks`` entries carried in a
-#: ``stage1_flag_marker`` payload (task 4381 review fix).  This is a bound on
-#: ledger ROW GROWTH, not a functional limit: realistic ``cited_tasks`` lists
-#: are 1-5 entries, so it never bites in normal operation.  It exists solely
-#: because the persisted anchor round-trips through the payload every cycle
-#: (persisted -> read back as ``prior_cited`` -> re-merged by
-#: :func:`_union_cited_tasks` -> re-persisted), so an LLM emitting fresh
-#: distinct citations every cycle would otherwise grow the row without limit.
-_MAX_PERSISTED_CITED_TASKS: int = 32
-
 #: Payload key carrying the number of CONSECUTIVE cycles a ``stage1_flag_marker``
 #: has been suppressed by a cross-project fix task that is already ``done``
 #: (task 4381 amendment).  Written only while that count is non-zero, so a
@@ -845,67 +797,6 @@ def _prior_done_suppression_count(prior_payload: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
-
-
-def _persistable_cited_tasks(entries: Any) -> list[dict[str, Any]] | None:
-    """Project :func:`_union_cited_tasks`' output down to what may be PERSISTED.
-
-    This is the persistence projection of the cross-cycle anchor, applied ONLY
-    to the value written into the ``stage1_flag_marker`` payload — never to the
-    in-memory list handed to :func:`_resolve_live_cross_project_fix_task`.
-
-    Two narrowings, both forced by the fact that the persisted value
-    round-trips back into the union on the very next cycle:
-
-    * **Identity-bearing entries only.**  An entry lacking ``project_id`` or
-      ``task_id`` cannot be de-duplicated — :func:`_union_cited_tasks`
-      deliberately appends such an entry without collapsing it against
-      ``seen`` — so persisting one would add a fresh copy every cycle, forever.
-      It is also dead weight as an anchor: the resolver skips any entry it
-      cannot resolve to a project.  An explicit ``None`` counts as absent; the
-      check is ``is None``, NOT truthiness, so a legitimate ``task_id=0`` or
-      ``project_id=''`` survives.
-    * **Capped at** :data:`_MAX_PERSISTED_CITED_TASKS`.  Truncation keeps the
-      FIRST N: ``_union_cited_tasks`` orders the current cycle's citations
-      ahead of the prior anchor's, so the freshest entries are the retained
-      ones.
-
-    Returns ``None`` (never ``[]``) when nothing is persistable, so the
-    caller's ``if persistable:`` gate omits the payload key exactly as it does
-    for ``deduped_against`` and a citation-less flag keeps the historical
-    six-key payload verbatim.
-
-    *entries* is typed ``Any`` for the same reason :func:`_union_cited_tasks`
-    is: although the only production caller hands it that function's
-    ``list[dict]`` return value, the body validates defensively — a non-list,
-    or a list carrying non-dict members, degrades to "nothing to persist"
-    rather than raising — and that contract is pinned by tests.  A narrower
-    annotation would advertise a guarantee the callers of a sanitizer over
-    LLM-authored data cannot make.
-
-    Input order is preserved and the input is never mutated (a new list is
-    returned).  Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(entries, list) or not entries:
-        return None
-    kept: list[dict[str, Any]] = [
-        entry
-        for entry in entries
-        if isinstance(entry, dict)
-        and entry.get('project_id') is not None
-        and entry.get('task_id') is not None
-    ]
-    if not kept:
-        return None
-    if len(kept) > _MAX_PERSISTED_CITED_TASKS:
-        logger.debug(
-            'flag_dedup: cited_tasks anchor truncated to %d of %d entries'
-            ' for the persisted marker payload',
-            _MAX_PERSISTED_CITED_TASKS,
-            len(kept),
-        )
-        return kept[:_MAX_PERSISTED_CITED_TASKS]
-    return kept
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
@@ -1239,21 +1130,9 @@ async def dedup_flags(
         ledger = getattr(memory_service, 'recon_ledger', None)
         flag = dict(flag)
         persisted_from_run: str | None = None
-        # The prior row's cited_tasks is the CROSS-CYCLE anchor (task 4381):
-        # it survives a cycle whose LLM output re-emits no citation at all.
-        # Free-form JSON off a ledger row — validated by _union_cited_tasks,
-        # never trusted for shape.
-        prior_cited: Any = None
         # Consecutive cycles this marker has already been suppressed by an
         # already-``done`` cross-project fix task (task 4381 amendment).
         prior_done_suppressions: int = 0
-        # The single merged anchor: computed ONCE and used by BOTH the payload
-        # written below and the suppression gate further down, so the gate
-        # provably resolves against exactly the set that was just persisted.
-        # Initialised to the current-cycle-only union, which is the correct
-        # value for the no-ledger path and for a ledger read that raises
-        # before any prior row is seen.
-        merged_cited: list[dict[str, Any]] = _union_cited_tasks(cited_tasks, None)
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -1286,7 +1165,6 @@ async def dedup_flags(
                 if prior is not None:
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
-                    prior_cited = prior_payload.get('cited_tasks')
                     prior_done_suppressions = _prior_done_suppression_count(prior_payload)
                     if persisted_from_run == 'unknown':
                         logger.debug(
@@ -1294,9 +1172,6 @@ async def dedup_flags(
                             tid,
                             ftype,
                         )
-                # Outside the `if prior is not None` branch on purpose: a MISS
-                # must still end up with the current-cycle-only union.
-                merged_cited = _union_cited_tasks(cited_tasks, prior_cited)
                 ledger_read_ok = True
             except Exception as e:
                 logger.warning(
@@ -1324,7 +1199,7 @@ async def dedup_flags(
                 taskmaster,
                 known_projects,
                 project_id,
-                merged_cited,
+                cited_tasks,
                 cache=fix_task_cache,
             )
         if fix_task is not None:
@@ -1358,17 +1233,6 @@ async def dedup_flags(
 
         if ledger is not None and ledger_read_ok:
             try:
-                # The UNION is what gets persisted — not the current cycle
-                # alone.  Persisting only the current cycle would erase the
-                # anchor on the very cycle it did its job, making it
-                # single-use.  Projected through _persistable_cited_tasks
-                # precisely BECAUSE it round-trips through this payload every
-                # cycle and must be bounded by construction.  Assigned only
-                # when non-empty, mirroring the `deduped_against` idiom, so a
-                # citation-less flag persists the six-key literal verbatim.
-                persistable = _persistable_cited_tasks(merged_cited)
-                if persistable:
-                    payload['cited_tasks'] = persistable
                 if done_suppressions:
                     # Same optional-key idiom: a marker never suppressed by a
                     # done fix task keeps the historical payload shape.
