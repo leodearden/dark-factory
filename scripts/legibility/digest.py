@@ -376,6 +376,18 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
     attempt was truncated off the front of the transcript window) degrades
     to None attempt fields rather than raising.
 
+    That id is also EXPOSED on each neighborhood as ``tool_use_id``: it is
+    the stable join key letting a caller relate a classified result back to
+    the assistant attempt that produced it WITHOUT a second scan. It is
+    what :func:`find_retry_loops` joins on to annotate a retry group with
+    how many of its calls ended in a DESIGNED outcome
+    (``plans/confusion-census-2026-08-26.md`` §1.1 / R1, task 4751) --
+    a retry group's ``indices`` are tool_use record positions while a
+    neighborhood's ``index`` is the tool_result one, so record index cannot
+    serve as that key. Because it is read off the RESULT block it survives
+    an unmatched attempt, the same degradation contract the None attempt
+    fields above already document.
+
     Returns EVERY structured error -- this is the single scan and the single
     source of truth. Each neighborhood is enriched with ``exit_code`` and
     ``designed_outcome`` (see :func:`classify_error_content`) so callers
@@ -400,6 +412,7 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
         exit_code, designed_outcome = classify_error_content(error_content)
         neighborhoods.append({
             'index': index,
+            'tool_use_id': block.get('tool_use_id'),
             'attempt_tool': attempt.get('name') if attempt else None,
             'attempt_input_summary': (
                 _summarize_input(attempt.get('input')) if attempt else None
