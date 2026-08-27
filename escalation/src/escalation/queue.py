@@ -740,6 +740,86 @@ class EscalationQueue:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
         return bool(open_l1s)
 
+    def find_terminal_by_citation(
+        self, task_id: str, category: str, citation_sha: str | None,
+    ) -> Escalation | None:
+        """Newest TERMINAL record matching ``(task_id, category, citation_sha)``, or None.
+
+        A PURE READ with no side effects.  It answers one question: *was this
+        exact evidence already adjudicated?*  ``has_open_l1`` above answers the
+        complementary one — *is a duplicate still OPEN?* — and reads PENDING
+        records only.  The two are deliberately disjoint: a PENDING match is
+        NOT reported here, because that case is already ``has_open_l1``'s
+        contract and reporting it in both places would blur which guard fired.
+
+        Why a terminal-record read exists at all (task 4499): the
+        ``provenance_unattributed`` reject condition is ABSORBING — main only
+        moves forward, so evidence that stopped surviving stays gone.  Once the
+        auto-watcher resolves the L1, the pending-only guard goes False and the
+        next tick refiles the identical finding, forever: a close-then-refile
+        ping-pong.  Matching the citation sha carried on the RESOLUTION makes
+        "already adjudicated" answerable from the archive, so the refile can be
+        suppressed while genuine NEW evidence (a different sha, or none at all)
+        still gets through.
+
+        A falsy *citation_sha* short-circuits to None — the
+        ``find_dedupe_parent`` falsy-key convention.  An absent identity is not
+        an identity, and suppressing on one would collapse unrelated findings.
+
+        Cost — why the TARGETED per-task glob (``esc-{task_id}-*.json`` over
+        the queue root plus ``_iter_archive_paths``, the shape
+        ``_recover_seq_from_disk`` already uses) rather than
+        ``get_by_task``'s full-archive ``esc-*.json`` rglob: this runs on the
+        REJECT path, which is exactly the path that recurs every tick in the
+        storm case being fixed, over an archive shared across 7+ projects.  An
+        O(whole-archive) parse per tick would be the wrong bound.
+
+        The ``.json`` suffix is load-bearing for the same three reasons
+        ``_recover_seq_from_disk`` lists: it excludes the
+        ``esc-{task_id}{SEQ_COUNTER_SUFFIX}`` counter, the ``{id}.json.lock``
+        sidecars, and submit's ``{id}.tmp`` staging files.  The glob
+        OVER-matches sibling hyphenated task ids (``esc-1-2-3-9.json`` when
+        scanning task ``'1-2'``), so the record's own ``task_id`` field — never
+        a filename parse — is the authoritative filter.
+        """
+        if not citation_sha:
+            return None
+
+        pattern = f'esc-{task_id}-*.json'
+        newest: Escalation | None = None
+        newest_ts = datetime.min.replace(tzinfo=UTC)
+        for path in itertools.chain(
+            self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
+        ):
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse {path}: {e}')
+                continue
+            # task_id is authoritative — the glob over-matches hyphenated siblings.
+            if esc.task_id != task_id:
+                continue
+            if esc.category != category:
+                continue
+            if esc.citation_sha != citation_sha:
+                continue
+            if esc.status not in ('resolved', 'dismissed'):
+                continue
+            # Malformed stamps sort OLDEST (never dropped, never displacing a
+            # well-formed newer match) and are logged loudly, not swallowed.
+            ts, _ = parse_timestamp_or_warn(
+                esc.resolved_at,
+                fallback=datetime.min.replace(tzinfo=UTC),
+                context='queue.find_terminal_by_citation',
+            )
+            # Strictly-newer displaces, so a TIE keeps the incumbent — and the
+            # queue root is scanned first, matching get_by_task's "queue_dir
+            # copy takes precedence" rule for a root/archive duplicate pair.
+            if newest is None or ts > newest_ts:
+                newest, newest_ts = esc, ts
+
+        return newest
+
     def get_pending(self) -> list[Escalation]:
         """Get all pending escalations."""
         results = []
