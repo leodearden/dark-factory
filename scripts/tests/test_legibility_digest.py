@@ -2960,6 +2960,99 @@ class TestRetryLoopAnnotationRendering:
         assert 'x4' in line
         assert '2 designed-outcome results' in line
 
+    def test_annotation_names_the_rule_that_fired(self):
+        # Mirrors test_designed_outcome_line_names_the_rule_that_fired:
+        # ONE vocabulary across both sections, so a reader (and the nightly
+        # trickle coder) never re-derives the classification from the raw
+        # command to learn WHY these calls were designed.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        line = mod._render_retry_loops([loops[mod._input_signature(_REARM)]])[0]
+
+        assert '[exit 124]' in line
+        assert '[watcher-rearm-declared]' in line
+
+    def test_annotation_survives_the_per_item_byte_cap(self):
+        # _cap_item truncates from the RIGHT, so an annotation placed after
+        # the signature would be the first thing lost on exactly the
+        # long-command groups that most need explaining -- the hazard
+        # _exit_marker was introduced to solve for exit codes. 160 bytes is
+        # below the ~242 the annotated re-arm line needs, so the signature
+        # is eaten and the annotation must remain.
+        sections, _ = mod._build_sections(
+            _watcher_rotation_records(), item_max_bytes=160,
+        )
+
+        line = next(
+            ln for ln in sections['retry_loops'] if 'watcher-rearm' in ln
+        )
+
+        assert mod.ITEM_TRUNCATION_MARKER in line  # the signature WAS eaten
+        assert 'x3' in line
+        assert 'designed-outcome' in line
+        assert '[exit 124]' in line
+
+
+class TestRetryLoopAnnotationEndToEnd:
+    def _retry_block(self, records):
+        digest = mod.render_digest(records, agent_class='interactive')
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        assert '## Retry Loops' in body
+        block = body.split('## Retry Loops', 1)[1].split('\n##', 1)[0]
+        return yaml.safe_load(frontmatter_yaml), block
+
+    def test_rearm_line_is_annotated_and_the_date_line_is_not(self):
+        # The whole point of the census finding: one healthy rotation, two
+        # groups, and only the one whose results were classified designed
+        # says so. The date-check group's calls never errored at all.
+        _, block = self._retry_block(_watcher_rotation_records())
+
+        rearm_line = next(ln for ln in block.splitlines() if 'watcher-rearm' in ln)
+        date_line = next(ln for ln in block.splitlines() if 'date -u' in ln)
+
+        assert '3 designed-outcome results' in rearm_line
+        assert '[exit 124]' in rearm_line
+        assert 'designed-outcome' not in date_line
+        assert date_line.endswith(f': {mod._input_signature(_DATE_CHECK)}')
+
+    def test_instrument_version_is_not_bumped(self):
+        # PRD Sec 7.2.2's own test, applied deliberately (census R1 asks the
+        # implementer to DECIDE rather than default): the annotation adds no
+        # signal_counts key and no detector hit, changes no gold section and
+        # no section partition -- textbook renderer cosmetics, which the
+        # policy says does NOT bump. Bumping would falsely tell a future
+        # census that signal semantics moved, corrupting the pre-fix /
+        # live-regression discriminator the version exists to provide.
+        meta, _ = self._retry_block(_watcher_rotation_records())
+
+        assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION == 2
+
+    def test_signal_counts_are_unchanged_by_the_annotation(self):
+        records = _watcher_rotation_records()
+        meta, _ = self._retry_block(records)
+
+        assert meta['signal_counts'] == mod.signal_counts(records)
+        assert meta['signal_counts']['tool_error'] == 0
+        assert meta['signal_counts']['designed_outcome'] == 3
+        assert meta['signal_counts']['self_correct'] == 0
+
+    def test_section_partition_is_unchanged_by_the_annotation(self):
+        # The same groups appear in the same section at the same counts --
+        # only their rendered line TEXT grows.
+        records = _watcher_rotation_records()
+
+        groups = {
+            (loop['tool'], loop['signature'], loop['count'])
+            for loop in mod.find_retry_loops(records)
+        }
+
+        assert groups == {
+            ('Bash', mod._input_signature(_DATE_CHECK), 3),
+            ('Bash', mod._input_signature(_REARM), 3),
+        }
+        assert mod.SECTION_PRIORITY.index('retry_loops') == 1
+        assert 'retry_loops' not in mod.SIGNAL_WEIGHTS
+
 
 # ---------------------------------------------------------------------------
 # _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
