@@ -23,6 +23,7 @@ appears verbatim in the file text. Leave it escaped.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,7 @@ from shared.toolcall_markup import (
     Repair,
     closer_for,
     detect,
+    detect_for,
     markup_override_requested,
     repair,
     strip_markup_override,
@@ -139,6 +141,164 @@ class TestDetect:
     )
     def test_returns_none_without_raising(self, value):
         assert detect(value) is None
+
+
+
+class TestParameterAwareDetection:
+    """``detect_for`` — the FOURTH named predicate, and the one the GATES need.
+
+    Task **4696**. :func:`detect` scans a FIXED six-literal union that echoes
+    no INVOKED TOOL'S OWN parameter names, while :func:`repair` has always
+    qualified a candidate on ``X == param`` / ``X in schema_params``. That
+    asymmetry — a schema-aware repairer behind a schema-blind detector — WAS
+    the silent write path: a value mis-closed with its own parameter's tag
+    matched no literal, every gate that asked ``detect`` first returned
+    ``None``, and the corrupt value went straight to disk unrepaired even
+    though the repairer standing behind the gate could already fix it.
+
+    Measured over ``.worktrees/.task-meta/*/plan.json`` (2026-08-25): 444
+    corrupted entries, of which **212 (48%) are invisible to the fixed literal
+    set** — and **212 of 212** of those are caught by the SELF-NAME closer
+    alone. That measurement is why the new predicate takes ``param``
+    positionally and ``schema_params`` optionally: the self-name half is what
+    the dominant population needs, and the schema half is free at the two
+    call sites that already hold a schema.
+
+    ``detect`` is deliberately NOT changed and NOT given a keyword argument:
+    three call sites legitimately have no parameter in hand (``repair``'s own
+    diagnostic, the sweep's bare list items, prose scans), and an optional
+    keyword would make each site's blindness ungreppable. The predicates split
+    by NAME so a reader can see which gates are parameter-aware.
+    """
+
+    #: The dominant real dialect, as it lands on disk today: plan-tools writes
+    #: ``rationale``, and the model closes it with its own name-echoing tag.
+    _SILENT_RATIONALE = (
+        'Both mechanisms partition rather than race.' + closer_for('rationale') + '\n'
+    )
+    #: The second-commonest, 129 specimens: ``add_reuse_item``'s ``how``.
+    _SILENT_HOW = 'Reuse the declared table directly.' + closer_for('how')
+
+    def test_the_silent_write_specimen_is_invisible_to_detect(self):
+        """The defect itself, pinned before the fix so it cannot be re-argued.
+
+        ``rationale`` is a parameter of ``add_design_decision`` but not a
+        member of ``PARAMETER_CLOSER_NAMES``, so its closer is in no literal
+        the blanket predicate scans.
+        """
+        assert closer_for('rationale') not in ENVELOPE_LITERALS
+        assert detect(self._SILENT_RATIONALE) is None
+
+    def test_detect_for_sees_the_self_name_closer(self):
+        assert detect_for(self._SILENT_RATIONALE, 'rationale') == closer_for('rationale')
+
+    def test_the_how_dialect_is_the_same_shape(self):
+        assert detect(self._SILENT_HOW) is None
+        assert detect_for(self._SILENT_HOW, 'how') == closer_for('how')
+
+    def test_a_foreign_param_does_not_widen_onto_the_self_name_closer(self):
+        """Only the INVOKED parameter's own closer is added, not every name."""
+        assert detect_for(self._SILENT_RATIONALE, 'title') is None
+
+    @pytest.mark.parametrize('literal', ENVELOPE_LITERALS)
+    def test_is_a_strict_superset_of_detect(self, literal):
+        """Every fixed literal detect() reports is still reported, unchanged.
+
+        Widening may only ADD needles. A parameter name unrelated to any
+        literal must not shadow, reorder or suppress the existing set.
+        """
+        value = 'lead ' + literal + ' tail'
+        assert detect(value) == literal
+        assert detect_for(value, 'unrelated_param') == detect(value)
+        assert detect_for(value, 'unrelated_param', ('other', 'names')) == detect(value)
+
+    def test_earliest_by_text_position_when_the_self_name_closer_LEADS(self):
+        """The added needle wins when it comes first, exactly as detect()'s rule says."""
+        value = 'a ' + closer_for('rationale') + ' b ' + INVOKE_CLOSER
+        assert detect(value) == INVOKE_CLOSER
+        assert detect_for(value, 'rationale') == closer_for('rationale')
+
+    def test_earliest_by_text_position_when_the_fixed_literal_LEADS(self):
+        """...and loses when it comes second. Position, never tuple order."""
+        value = 'a ' + INVOKE_CLOSER + ' b ' + closer_for('rationale')
+        assert detect_for(value, 'rationale') == INVOKE_CLOSER
+
+    def test_a_param_whose_closer_is_ALREADY_a_literal_is_unchanged(self):
+        """``content`` is both a plan-tools field and PREFILTER_NEEDLES[3]."""
+        value = 'body' + closer_for('content')
+        assert detect_for(value, 'content') == detect(value) == closer_for('content')
+
+    def test_schema_params_widens_the_set(self):
+        """A CROSS-FIELD misclose: the closer names a SIBLING parameter."""
+        value = 'Chose X.' + closer_for('decision')
+        assert detect(value) is None
+        assert detect_for(value, 'rationale') is None
+        assert detect_for(value, 'rationale', ()) is None
+        assert detect_for(
+            value, 'rationale', ('task_id', 'decision', 'rationale')
+        ) == closer_for('decision')
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            None,
+            '',
+            0,
+            17,
+            {'content': 'x'},
+            ['\x3c/invoke>'],
+            b'\x3c/invoke>',
+            'ordinary prose with no envelope markup at all',
+        ],
+    )
+    def test_totality_matches_detect_for_non_text(self, value):
+        assert detect_for(value, 'rationale') is None
+        assert detect_for(value, 'rationale', ('decision',)) is None
+
+    @pytest.mark.parametrize('schema_params', [None, 0, 17, object(), b'decision'])
+    def test_a_non_iterable_schema_params_degrades_to_the_param_alone(self, schema_params):
+        assert detect_for(self._SILENT_RATIONALE, 'rationale', schema_params) == closer_for(
+            'rationale'
+        )
+        assert detect_for('Chose X.' + closer_for('decision'), 'rationale', schema_params) is None
+
+    def test_a_bare_str_schema_params_never_iterates_into_CHARACTERS(self):
+        """The same fail-safe ``_as_name_set`` gives ``repair``.
+
+        A caller passing the parameter NAME where a collection belongs is a
+        bug; reading it as one-letter names would manufacture needles like the
+        closer for ``r`` out of the string ``rationale``.
+        """
+        assert detect_for('text' + closer_for('r'), 'rationale', 'rationale') is None
+        assert detect_for(self._SILENT_RATIONALE, 'rationale', 'rationale') == closer_for(
+            'rationale'
+        )
+
+    @pytest.mark.parametrize('param', [None, '', 0, 17, b'rationale', {'a': 1}])
+    def test_a_missing_or_non_string_param_degrades_to_exactly_detect(self, param):
+        """Never to a DEGENERATE EMPTY-NAME TAG, which would match prose."""
+        assert detect_for('\x3c/>', param) is None
+        assert detect_for('body ' + INVOKE_CLOSER, param) == INVOKE_CLOSER
+        assert detect_for('plain prose', param) is None
+        assert detect_for(self._SILENT_RATIONALE, param) is None
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
+
+    The mechanical half of the authoring-hazard note in the module docstring
+    above, promoted here from ``scripts/tests/test_sweep_toolcall_markup.py``
+    by task **4696** so every file this containment work touches carries the
+    same guard. Computed at runtime from :func:`chr` so the needle itself is
+    not spelled here either — a test that had to write the literal to check
+    for it would be the very hazard it guards.
+    """
+    needle = chr(60) + '/'
+    source = Path(__file__).read_text(encoding='utf-8')
+    assert needle not in source, (
+        'A raw envelope literal was written into this test file. Spell it with '
+        'the \\x3c escape instead — see this module\'s docstring for why.'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +700,118 @@ _HOSTILE_VALUES = [
 ]
 
 
+class TestQuotationIsNotATruncation:
+    """The QUOTATION GUARD (task 4696 review). Prose that ENDS by quoting a
+    sibling's tag pair must come back BYTE-IDENTICAL, never truncated.
+
+    ``detect_for`` widened the gate with *param*'s own closer AND every
+    ``schema_params`` sibling's, and ``repair`` accepts an EMPTY tail (a
+    candidate closer at end-of-string recovers ``{}`` and still returns
+    ``clean_value = value[:candidate.start()]``). Composed, those two facts made
+    any value legitimately ending in a sibling's closing tag a silent
+    TRUNCATION reported as ``repaired`` — in a repo whose plans and escalation
+    records routinely quote this very markup.
+
+    The discriminator is EVIDENCE, not breadth: an empty tail recovers nothing,
+    so there is no absorbed argument and the "repair" is pure text loss. It
+    stays legal for a SELF-NAME closer (PRD boundary row B4, and the whole
+    212-of-212 population the 2026-08-25 census measured) and for the fixed
+    literal set, which has always been repaired here. It is refused only for a
+    name the WIDENING contributed — whose genuine cross-field population that
+    same census puts at ZERO.
+    """
+
+    def test_prose_ending_in_a_sibling_closer_is_returned_unrepaired(self):
+        """THE NEGATIVE CONTROL. A value quoting a sibling's pair is not a leak.
+
+        Reproduced end-to-end before the fix: this returned a Repair whose
+        ``clean_value`` dropped the trailing closer AND the closing half of the
+        author's quotation, with ``recovered == {}`` — i.e. it destroyed text
+        and recovered nothing, while reporting success.
+        """
+        value = (
+            'The harness emits '
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        assert repair(
+            value,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        ) is None
+
+    def test_the_widened_gate_still_SEES_it_so_it_reaches_adjudication(self):
+        """Refusing is not narrowing DETECTION. The value still trips the gate,
+        so the caller reports it (plan-tools ``unrepairable``, the sweep
+        ``refused``) into the human queue rather than silently rewriting it."""
+        value = (
+            'The harness emits '
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        assert detect_for(value, 'title', _SUBMIT_TASK_PARAMS) is not None
+
+    def test_a_self_name_closer_at_end_of_string_is_still_repaired(self):
+        """PRD boundary row B4 is UNCHANGED — the guard is scoped to ``name !=
+        param``. This is the dialect the whole task exists to repair."""
+        clean = 'The reconciler re-reads the plan on every pass.'
+
+        result = repair(
+            clean + _closer('description'),
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {}
+
+    def test_a_fixed_literal_at_end_of_string_is_still_repaired(self):
+        """The guard exempts :data:`ENVELOPE_LITERALS`, so nothing this task
+        touched changed for the set ``detect`` already spelled.
+
+        DELIBERATELY SCOPED. Prose ending in a fixed literal (``\x3c/content>``,
+        ``\x3c/description>``, ...) has been truncated here since long before
+        task 4696, under the blanket ``detect`` gate. Exempting the fixed set
+        keeps this fix to the surface THIS task introduced; re-litigating the
+        fixed set's calibration is PRD section 7 out-of-scope."""
+        clean = 'Only the escalation-watcher path is scoped).'
+
+        result = repair(
+            clean + _CANONICAL_CLOSER,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+
+    def test_a_REAL_cross_field_leak_with_a_tail_is_still_repaired(self):
+        """The guard keys on the EMPTY tail, not on cross-field-ness. A genuine
+        absorbed argument carries a tail, parses, and is recovered as before —
+        so this is not option (a)'s blanket narrowing of the gate."""
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        result = repair(
+            value,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {'priority': 'high'}
+
+
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
 
@@ -624,15 +896,26 @@ class TestNoSilentPartialRepair:
     earlier closers is an envelope literal:
 
     * :meth:`test_earlier_candidate_rejected_then_a_later_one_accepted` — the
-      earlier closer is ``priority``, a schema parameter but NOT one of
-      ``PARAMETER_CLOSER_NAMES``, so the prefix stays clean and the scan's
-      advance-and-accept behaviour must SURVIVE the new condition;
+      earlier closer is a BLEND-dialect ``priority``, which no predicate can
+      spell, so the prefix stays clean and the scan's advance-and-accept
+      behaviour must SURVIVE the condition;
     * :meth:`test_the_same_shape_with_an_envelope_literal_prefix_is_refused` —
       the earlier closer is ``details``, which IS an envelope literal, so every
       later candidate's prefix is poisoned and the only honest answer is None.
 
     Without the first case the post-condition could be "fixed" by refusing
     every value with more than one qualifying closer, which would gut the scan.
+
+    NARROWED BY TASK **4696**, and the narrowing is the point of that task. The
+    condition now asks :func:`detect_for`, so a skipped CANONICAL closer naming
+    *param* or a *schema_params* member poisons the prefix too — which is
+    exactly the double-self-name-misclose hole
+    :class:`TestNoSilentPartialRepairOfSelfNameMisclose` below pins. The first
+    case above was written with a canonical ``priority`` closer and passed only
+    because ``priority`` sat outside the FIXED literal set — i.e. because of
+    the same blindness 4696 exists to end, one layer in. It is preserved here
+    in the blend dialect so the advance-and-accept path keeps a live pin
+    instead of quietly ceasing to be exercised.
     """
 
     def test_the_regression_returns_none_rather_than_a_partial_repair(self):
@@ -669,15 +952,22 @@ class TestNoSilentPartialRepair:
         ``priority`` is in the schema so its closer qualifies as a candidate,
         but its tail is the leftover text ``junk B...`` and the candidate is
         rejected. The scan advances to the ``description`` closer, whose tail
-        parses. The prefix ``A\\x3c/priority>junk B`` carries a closing tag —
-        but ``priority`` is not one of the four ``PARAMETER_CLOSER_NAMES``, so
-        it is not an envelope literal and the prefix is clean. The repair must
-        still be returned: the post-condition REFINES the scan, it does not
-        kill it.
+        parses. The prefix ``A\\x3c/priority">junk B`` carries a closing tag —
+        but it is the DIALECT BLEND form, with the stray quote PRD section
+        2.1's first specimen carries, and no predicate spells that: every
+        needle :func:`detect_for` adds is built by ``closer_for``, which emits
+        no quote. So the prefix is clean under both the fixed literal set and
+        the widened one, and the repair must still be returned: the
+        post-condition REFINES the scan, it does not kill it.
+
+        The blend form is what keeps this pin ALIVE after task 4696 (see the
+        class docstring). Written with a canonical ``priority`` closer it
+        passed only because ``priority`` sat outside the fixed literal set —
+        the very blindness that task closes — and would now, correctly, refuse.
         """
         value = (
             'A'
-            + _closer('priority') + 'junk B'
+            + _blend_closer('priority') + 'junk B'
             + _closer('description')
             + _opener('task_id') + '7' + _closer('task_id')
         )
@@ -691,13 +981,42 @@ class TestNoSilentPartialRepair:
 
         assert result is not None
         assert result == Repair(
-            clean_value='A' + _closer('priority') + 'junk B',
+            clean_value='A' + _blend_closer('priority') + 'junk B',
             recovered={'task_id': '7'},
             pattern=_closer('description'),
             misclose=_closer('description'),
         )
         assert detect(result.clean_value) is None
+        assert detect_for(
+            result.clean_value, 'description', {'description', 'priority', 'task_id'}
+        ) is None
         assert_repair_invariants(value, result)
+
+    def test_a_canonical_schema_closer_in_the_prefix_is_now_refused(self):
+        """The same shape with the stray quote removed. Task **4696**.
+
+        The counterpart of the case above, kept beside it so the ONE-CHARACTER
+        difference that separates accept from refuse is visible on one screen.
+        ``\\x3c/priority>`` is a canonical closer for a real parameter of this
+        tool, so under :func:`detect_for` the prefix is poisoned and the honest
+        answer is ``None`` — the same verdict
+        :meth:`test_the_same_shape_with_an_envelope_literal_prefix_is_refused`
+        already reached for ``details``, now reached for the same STRUCTURAL
+        reason rather than by the accident of set membership.
+        """
+        value = (
+            'A'
+            + _closer('priority') + 'junk B'
+            + _closer('description')
+            + _opener('task_id') + '7' + _closer('task_id')
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params={'description', 'priority', 'task_id'},
+            supplied={'description'},
+        ) is None
 
     def test_the_same_shape_with_an_envelope_literal_prefix_is_refused(self):
         """Same shape, one substitution: the skipped closer is now a literal.
@@ -720,6 +1039,122 @@ class TestNoSilentPartialRepair:
             schema_params={'description', 'details', 'task_id'},
             supplied={'description'},
         ) is None
+
+
+class TestNoSilentPartialRepairOfSelfNameMisclose:
+    """The DOUBLE SELF-NAME MISCLOSE — the last member of the 4696 family.
+
+    :func:`repair`'s prefix-clean accept-time condition exists so an accepted
+    ``clean_value`` can never still trip the detector; its own docstring calls
+    a violation "the exact failure this module exists to end, reintroduced by
+    its own repairer". But that guard called the PARAM-BLIND :func:`detect`, so
+    it was blind in exactly the way every other gate was: a value mis-closed
+    TWICE with its own parameter's name sailed straight through it.
+
+    MEASURED CURRENT BEHAVIOUR on the specimen below, reproduced live at base
+    ``dc5c9356``. :func:`repair` ACCEPTS it, returning::
+
+        clean_value = 'Part one.' + closer_for('rationale') + 'GARBAGE PROSE'
+        recovered   = {'decision': 'Chose X.'}
+
+    The scan steps over the FIRST candidate, whose tail does not parse, which
+    leaves that closer sitting inside the second candidate's prefix — and
+    ``detect`` does not spell the ``rationale`` closer, so the poison passes.
+    A value written back from that is STILL CORRUPT and has silently swallowed
+    ``GARBAGE PROSE`` for good.
+
+    THIS CANNOT REGRESS THE COMMITTED CORPUS, and that is measured rather than
+    hoped. Replaying every record of
+    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` at this HEAD: **504
+    records, 443 accepted by repair(), and ZERO of those 443 produce a
+    clean_value carrying a qualifying closer** — under the self-name-only
+    widening AND under the full ``param + schema_params`` widening alike. So no
+    per-specimen expectation flips and the corpus fixture is NOT edited by task
+    4696.
+    """
+
+    #: The tool the specimen was captured against: ``add_design_decision``.
+    _SCHEMA = ('task_id', 'decision', 'rationale')
+    _SUPPLIED = ('task_id', 'rationale')
+
+    #: Two ``rationale`` closers, prose stranded between them, and a canonical
+    #: ``decision`` opener in the tail that DOES parse — so every accept-time
+    #: condition except prefix-clean is satisfied and the guard is the only
+    #: thing standing between this value and disk.
+    _DOUBLE = (
+        'Part one.'
+        + _closer('rationale')
+        + 'GARBAGE PROSE'
+        + _closer('rationale')
+        + '\n'
+        + _canonical_opener('decision')
+        + 'Chose X.'
+    )
+
+    def test_the_double_self_name_misclose_is_unrepairable(self):
+        assert repair(self._DOUBLE, 'rationale', self._SCHEMA, self._SUPPLIED) is None
+
+    def test_the_poisoned_prefix_is_what_makes_it_unrepairable(self):
+        """Names the mechanism, so a future reader cannot mistake this for B8/B9.
+
+        The tail parses, its one recovered name IS in the schema, and that name
+        is NOT already supplied — so the candidate clears every other
+        accept-time condition. Only the prefix disqualifies it.
+        """
+        poisoned_prefix = 'Part one.' + _closer('rationale') + 'GARBAGE PROSE'
+        assert self._DOUBLE.startswith(poisoned_prefix)
+        assert detect(poisoned_prefix) is None
+        assert detect_for(poisoned_prefix, 'rationale') == _closer('rationale')
+        assert 'decision' in self._SCHEMA
+        assert 'decision' not in self._SUPPLIED
+
+    def test_refusing_it_never_silently_swallows_the_stranded_prose(self):
+        """The half of the defect that outlives the corruption itself.
+
+        Accepting would have dropped ``GARBAGE PROSE`` permanently — it lands
+        in neither ``clean_value`` nor ``recovered``. Refusing keeps the value
+        byte-identical on disk, which is visible damage rather than invisible
+        loss, and the unrepairable flag says so out loud.
+        """
+        assert repair(self._DOUBLE, 'rationale', self._SCHEMA, self._SUPPLIED) is None
+        assert 'GARBAGE PROSE' in self._DOUBLE
+
+    @pytest.mark.parametrize('param', ['rationale', 'how'])
+    def test_the_SINGLE_misclose_population_still_repairs(self, param):
+        """The tightening is SCOPED. This is the 212-specimen dominant class.
+
+        A single self-name misclose has a clean prefix by construction, so the
+        widened guard never fires on it and the value repairs exactly as it did
+        before. If this ever went red, task 4696 would have turned the very
+        population it exists to rescue into permanent damage.
+        """
+        value = 'The intended prose.' + _closer(param)
+        result = repair(value, param, ('task_id', param), ('task_id', param))
+        assert result is not None
+        assert result == Repair(
+            clean_value='The intended prose.',
+            recovered={},
+            pattern=_closer(param),
+            misclose=_closer(param),
+        )
+        assert detect_for(result.clean_value, param, ('task_id', param)) is None
+        assert_repair_invariants(value, result)
+
+    def test_the_single_misclose_still_repairs_with_a_recovered_sibling(self):
+        """The same, but with a tail that actually carries a dropped argument."""
+        value = (
+            'The intended prose.'
+            + _closer('rationale')
+            + '\n'
+            + _canonical_opener('decision')
+            + 'Chose X.'
+        )
+        result = repair(value, 'rationale', self._SCHEMA, self._SUPPLIED)
+        assert result is not None
+        assert result.clean_value == 'The intended prose.'
+        assert result.recovered == {'decision': 'Chose X.'}
+        assert detect_for(result.clean_value, 'rationale', self._SCHEMA) is None
+        assert_repair_invariants(value, result)
 
 
 class TestMarkupOverrideLifecycle:

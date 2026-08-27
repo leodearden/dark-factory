@@ -54,6 +54,7 @@ from shared.toolcall_markup import (  # noqa: E402
     CANONICAL_OPENER_PREFIX,
     PREFILTER_NEEDLES,
     detect,
+    detect_for,
 )
 from shared.toolcall_markup import INVOKE_CLOSER as SHARED_INVOKE_CLOSER  # noqa: E402
 
@@ -427,13 +428,20 @@ def _discovered(root):
     }
 
 
-def test_discovery_yields_exactly_the_two_pinned_path_sets(sweep_root):
-    """Discovery is an allowlist of two shapes, not a repo-wide .json walk.
+def test_discovery_yields_exactly_the_three_pinned_path_sets(sweep_root):
+    """Discovery is an allowlist of three shapes, not a repo-wide .json walk.
 
     Pinning the WHOLE mapping (rather than asserting membership of a few
     interesting paths) is deliberate: the hazard this sweep carries is
     over-reach onto files it was never meant to rewrite, and a membership-only
     assertion cannot fail when a new path is wrongly swept in.
+
+    The third shape is the durable meta-root store (task 4696). Note that the
+    9002 plan appears TWICE here, once per direction — as the orphaned lane's
+    symlink and as the meta-root file it points at. Discovery is deliberately
+    the wrong place to collapse that: ``dedupe_by_realpath`` owns it, so a
+    target dropped for sharing a realpath is dropped where the report can
+    account for it rather than silently at the glob.
     """
     assert _discovered(sweep_root) == {
         'data/escalations/esc-1-1.json': sweep.LANE_ESCALATIONS,
@@ -442,6 +450,7 @@ def test_discovery_yields_exactly_the_two_pinned_path_sets(sweep_root):
         'data/escalations/archive/2026-08-08/esc-3-1.json': sweep.LANE_ESCALATIONS,
         '.worktrees-orphaned/9001-2026/.task/plan.json': sweep.LANE_PLANS,
         '.worktrees-orphaned/9002-2026/.task/plan.json': sweep.LANE_PLANS,
+        '.worktrees/.task-meta/9002/plan.json': sweep.LANE_META_PLANS,
     }
 
 
@@ -953,33 +962,46 @@ def test_repair_leaves_quoting_prose_alone_when_it_cannot_be_repaired():
     assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
 
 
-def test_echo_dialect_falls_through_to_a_later_candidate():
-    """MEASURED asymmetry between the two dialects. Documented, not asserted away.
+def test_echo_dialect_no_longer_half_repairs_past_its_own_misclose():
+    """MEASURED asymmetry between the two dialects — now CLOSED by task 4696.
 
-    When the tail names a sibling that is NOT a legal target, what repair()
-    does next depends on which dialect the tail is written in:
+    When the tail names a sibling that is NOT a legal target, repair() steps
+    over that candidate and tries the next one. What used to happen next
+    depended on which dialect the tail was written in:
 
     * CANONICAL — the later candidate is the ``parameter`` closer, and the
       clean prefix it would produce still contains the opener prefix, which IS
       an enumerated literal. repair()'s prefix-clean accept condition therefore
       rejects it and the whole value is refused. This is the live corpus's
       shape and the source of the 37 measured refusals.
-    * NAME-ECHOING — the later candidate is the pseudo-parameter's own closer,
+    * NAME-ECHOING — the later candidate was the pseudo-parameter's OWN closer,
       and neither it nor its opener is an enumerated literal, so the prefix
-      comes back clean and repair() ACCEPTS a truncation at that point.
+      came back "clean" to the param-BLIND ``detect`` and repair() ACCEPTED a
+      truncation there.
 
-    The echo outcome is cosmetic — it strips the trailing invoke terminator and
-    leaves the earlier mis-close sitting in the value as prose. It is still
-    LOSSLESS (invariant D5: the result is a prefix of the input, so no byte of
-    the swallowed text is destroyed), and the result no longer trips detect(),
-    so the second-run-zero invariant is unaffected.
+    That acceptance was the same defect task 4696 exists to end, merely wearing
+    the repairer's own clothes: the accepted ``clean_value`` still carried the
+    field's own ``detail`` mis-close, AND the ``evidence`` value the tail
+    declared was silently dropped on the floor. A caller reading the result
+    would see a value that is still corrupt and a sibling that was never told
+    anything went missing.
 
-    This sweep does NOT add a second policy layer to override it. repair() is
-    the gate by design (decision 7), and re-deciding its verdict here would
-    mean re-implementing the matching this module deliberately owns none of
-    (INV-5). The behaviour belongs to ``shared.toolcall_markup`` (task 3688);
-    this test pins what the sweep actually inherits so a future change there is
-    visible here rather than silent.
+    Now that the prefix-clean condition asks the parameter-AWARE predicate, the
+    field's own closer disqualifies that prefix, no later candidate qualifies,
+    and the whole value is REFUSED — visible, byte-identical residue instead of
+    a cosmetic half-repair. The reason is :data:`REASON_NO_STRING_HOLE_TARGET`
+    rather than :data:`REASON_UNREPAIRABLE`, and that distinction is
+    load-bearing: it says the tail DID parse and named a real field, and the
+    only thing blocking the repair is that ``evidence`` is a list holding no
+    string hole. An operator reading the report can therefore see the
+    recoverable value is still in there.
+
+    This sweep still adds NO second policy layer. repair() is the gate by
+    design (decision 7), and re-deciding its verdict here would mean
+    re-implementing the matching this module deliberately owns none of (INV-5).
+    The behaviour belongs to ``shared.toolcall_markup``; this row pins what the
+    sweep actually inherits so a future change there is visible rather than
+    silent.
     """
     record = make_escalation(
         'esc-7-7', 'resolved', _swallowed_echo('Detail.', 'detail', 'evidence', 'some text')
@@ -988,11 +1010,78 @@ def test_echo_dialect_falls_through_to_a_later_candidate():
 
     repaired, outcomes = sweep.repair_document(record)
 
-    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
-    assert outcomes[0].recovered_names == (), 'nothing was restored — a truncation'
-    assert original_detail.startswith(repaired['detail']), 'D5 still holds: a PREFIX'
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].reason == sweep.REASON_NO_STRING_HOLE_TARGET
+    assert outcomes[0].residue == sweep.RESIDUE_LEAK, (
+        'this dialect DOES carry the invoke terminator, so it is real leak '
+        'residue rather than prose that merely quotes a literal'
+    )
+    assert repaired['detail'] == original_detail, (
+        'a refusal leaves the value byte-identical — the earlier mis-close is '
+        'no longer left sitting inside a value the sweep called repaired'
+    )
     assert repaired['evidence'] == [], 'the list-typed field is still NOT displaced'
-    assert detect(repaired['detail']) is None, 'and the result no longer trips detect()'
+    assert detect_for(repaired['detail'], 'detail') is not None, (
+        'and the residue is still VISIBLE to the gate, so a later run that '
+        'gains a legal target for it will find it again'
+    )
+
+
+def test_a_value_quoting_a_SIBLING_KEYS_tag_pair_comes_back_by_IDENTITY():
+    """The sweep's per-object widening must not truncate prose (4696 review).
+
+    ``_repair_dict`` widens the gate by EVERY SIBLING KEY of the containing
+    object (``schema = set(working.keys())``) — a far wider name set than any
+    tool's real parameter vocabulary. Composed with ``repair()``'s acceptance
+    of an EMPTY tail, a value that legitimately ENDS with a sibling key's
+    closing tag was flagged, reached ``repair()``, matched with an empty tail,
+    and was TRUNCATED and reported ``repaired`` with ``recovered_names=()`` —
+    i.e. text destroyed, nothing recovered, nothing surfaced.
+
+    That is not a hand-reviewable handful under ``--apply``: the ``meta-plans``
+    lane targets ~1124 dead meta-root plans on the live repo.
+
+    ``\x3c/summary>`` is the right specimen precisely because ``summary`` is a
+    real sibling key here AND is not one of the fixed ``ENVELOPE_LITERALS``, so
+    it is a name the widening contributed and nothing else. The fix lives at
+    the shared ``repair()`` chokepoint, so this row pins what the sweep
+    INHERITS — this module still adds no second policy layer (decision 7,
+    INV-5).
+    """
+    doc = {
+        'summary': 'Guard leak',
+        'detail': 'The record wraps it in ' + '\x3csummary>' + 'Title' + _closer('summary'),
+    }
+    original_detail = doc['detail']
+
+    repaired, outcomes = sweep.repair_document(doc)
+
+    assert repaired is doc, (
+        'copy-on-write: nothing changed, so the document must come back by '
+        'IDENTITY — a copy here is what makes the sweep rewrite the file'
+    )
+    assert repaired['detail'] == original_detail
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].residue == sweep.RESIDUE_QUOTED_ONLY, (
+        'no invoke terminator and no canonical opener: this is prose quoting a '
+        'tag, so it lands in the adjudication queue as quoted-only residue '
+        'rather than being rewritten'
+    )
+
+
+def test_a_REAL_sibling_key_leak_with_a_tail_is_still_repaired():
+    """The guard keys on the EMPTY tail, not on cross-key-ness — so the sweep
+    keeps repairing genuine absorbed arguments across sibling keys."""
+    doc = {
+        'summary': '',
+        'detail': _swallowed('The real detail.', 'detail', 'summary', 'Recovered title'),
+    }
+
+    repaired, outcomes = sweep.repair_document(doc)
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
+    assert repaired['detail'] == 'The real detail.'
+    assert repaired['summary'] == 'Recovered title'
 
 
 # ---------------------------------------------------------------------------
@@ -2033,3 +2122,360 @@ def test_the_did_not_converge_path_does_not_duplicate_refusals(monkeypatch):
     assert len([o for o in outcomes if o.action == sweep.ACTION_REPAIRED]) == (
         sweep._MAX_REPAIR_ROUNDS
     ), 'repairs still ACCUMULATE across rounds — one per round'
+
+
+# ---------------------------------------------------------------------------
+# task 4696 — the SELF-NAME dialect the per-field gate could not see.
+# ---------------------------------------------------------------------------
+
+#: The dominant written-corruption shape, measured 2026-08-25 over
+#: ``.worktrees/.task-meta/*/plan.json``: a field mis-closed with its OWN
+#: name-echoing tag and NOTHING else — no invoke terminator, no canonical
+#: opener. 212 of the 444 corrupted entries (48%) are invisible to the fixed
+#: literal set for exactly this reason, and 212 of those 212 are caught by the
+#: field's own closer alone.
+_SELF_NAME_RATIONALE_PROSE = 'Both mechanisms partition rather than race.'
+_SELF_NAME_RATIONALE = _SELF_NAME_RATIONALE_PROSE + _closer('rationale')
+
+_SELF_NAME_HOW_PROSE = 'Reuse the declared table directly.'
+_SELF_NAME_HOW = _SELF_NAME_HOW_PROSE + _closer('how')
+
+#: The DOUBLE mis-close: two self-name closers with prose stranded between
+#: them. repair() declines it structurally — the first candidate's tail does
+#: not parse, and the second would leave a clean_value still carrying the
+#: first — so the sweep must REFUSE rather than write a half-repair that
+#: silently swallowed the stranded prose.
+_DOUBLE_SELF_NAME = (
+    'Part one.' + _closer('rationale') + 'Stranded prose.' + _closer('rationale')
+)
+
+
+def _self_name_plan(rationale: str, how: str) -> dict:
+    """A plan-shaped document carrying BOTH dominant victims.
+
+    ``make_plan`` above is shared with the byte-fixture and discovery rows and
+    declares no ``reuse`` collection, so this builder is local rather than a
+    widening of it. The nesting is the real artifact's: a list of objects under
+    a named collection, each object holding only its own sibling keys.
+    """
+    return {
+        'task_id': '4696',
+        'title': 'fixture plan 4696',
+        'design_decisions': [{'decision': 'Widen the gate.', 'rationale': rationale}],
+        'reuse': [{'what': 'the declared table', 'how': how, 'where': 'plan_tools'}],
+        '_schema_version': 1,
+    }
+
+
+def test_the_self_name_specimen_is_invisible_to_the_blanket_predicate():
+    """Otherwise these rows would be re-testing an already-caught dialect.
+
+    The non-circular control: both specimens must be INVISIBLE to ``detect``
+    and VISIBLE to ``detect_for`` when it is told the name the value was
+    received as. If a future widening of the fixed literal set caught them
+    anyway, this row fails and the rows below stop proving anything.
+    """
+    for value, param in (
+        (_SELF_NAME_RATIONALE, 'rationale'),
+        (_SELF_NAME_HOW, 'how'),
+        (_DOUBLE_SELF_NAME, 'rationale'),
+    ):
+        assert detect(value) is None, 'the blanket predicate must NOT see it'
+        assert detect_for(value, param) == _closer(param)
+
+
+def test_repair_document_repairs_a_self_name_closer_in_a_dict_field():
+    """The gate widening, asserted where the sweep actually writes.
+
+    Today ``_repair_dict``'s per-field gate asks the param-free ``detect``, so
+    both fields are skipped, the document round-trips UNCHANGED and the sweep
+    reports nothing at all — the corruption is not even counted as residue.
+    """
+    document = _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW)
+    original = json.loads(json.dumps(document))
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert repaired['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
+    assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
+
+    # D5, asserted rather than assumed: the result is a PREFIX of the input, so
+    # no byte of authored text was destroyed and nothing was fabricated.
+    assert original['design_decisions'][0]['rationale'].startswith(
+        repaired['design_decisions'][0]['rationale']
+    )
+    assert original['reuse'][0]['how'].startswith(repaired['reuse'][0]['how'])
+
+    # Every sibling key untouched, by value AND type.
+    assert repaired['design_decisions'][0]['decision'] == 'Widen the gate.'
+    assert repaired['reuse'][0]['what'] == 'the declared table'
+    assert repaired['reuse'][0]['where'] == 'plan_tools'
+    assert sorted(repaired['reuse'][0]) == ['how', 'what', 'where'], (
+        'a repair may never add a key'
+    )
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED] * 2
+    assert [o.json_path for o in outcomes] == [
+        'design_decisions[0].rationale',
+        'reuse[0].how',
+    ]
+    assert [o.field for o in outcomes] == ['rationale', 'how']
+    assert [o.recovered_names for o in outcomes] == [(), ()], (
+        'the B4 last-parameter shape: the mis-closed field was the final '
+        'argument, so nothing was dropped and nothing is recovered'
+    )
+    assert [o.reason for o in outcomes] == ['', '']
+
+
+def test_a_clean_plan_shaped_document_still_comes_back_by_identity():
+    """Copy-on-write must survive the widening.
+
+    The sweep decides whether to rewrite a file by whether the document
+    changed, so a gate that started copying on the clean path would make the
+    whole corpus look dirty. Pinned on the SAME shape the row above corrupts,
+    so the two differ in exactly one thing: the closer.
+    """
+    document = _self_name_plan(_SELF_NAME_RATIONALE_PROSE, _SELF_NAME_HOW_PROSE)
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert outcomes == []
+    assert repaired is document, 'no copy churn on the clean path'
+
+
+def test_a_double_self_name_misclose_is_refused_and_classified():
+    """The paired refusal control: newly VISIBLE is not newly REPAIRABLE.
+
+    Widening the gate must make this string reach the residue counters, not
+    make it repairable. repair() declines it structurally, so the sweep reports
+    :data:`REASON_UNREPAIRABLE` and leaves the bytes alone.
+
+    The residue class is asserted explicitly rather than assumed, because it is
+    the reporting semantics of a population that could not previously be
+    reported at all: a self-name-closer-only value carries neither the invoke
+    terminator nor the canonical opener prefix, which are the only two needles
+    ``has_leak_signature`` looks for — so it classifies
+    :data:`RESIDUE_QUOTED_ONLY` even though it IS real corruption. That is a
+    measured consequence of the widening, recorded here so a future change to
+    the residue split is visible rather than silent.
+    """
+    document = _self_name_plan(_DOUBLE_SELF_NAME, _SELF_NAME_HOW_PROSE)
+    before = json.dumps(document, indent=2)
+
+    repaired, outcomes = sweep.repair_document(document)
+
+    assert json.dumps(repaired, indent=2) == before, (
+        'a refusal must leave the document byte-identical — a rewrite here '
+        'would mean the stranded prose was silently swallowed'
+    )
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].json_path == 'design_decisions[0].rationale'
+    assert outcomes[0].field == 'rationale'
+    assert outcomes[0].reason == sweep.REASON_UNREPAIRABLE
+    assert not sweep.has_leak_signature(_DOUBLE_SELF_NAME)
+    assert outcomes[0].residue == sweep.RESIDUE_QUOTED_ONLY
+
+
+# ---------------------------------------------------------------------------
+# task 4696 — the meta-plans lane over the DURABLE per-lane plan store.
+# ---------------------------------------------------------------------------
+#
+# The worktree-lane-lifecycle W11 relocation moved plan state OUT of the lane
+# and into ``<root>/.worktrees/.task-meta/<id>/plan.json``, which is what a live
+# lane's ``.task/plan.json`` symlinks into. The orphaned-lane glob reaches that
+# store only through a lane that still exists to hold the link — so once a lane
+# is reclaimed AND its link is gone, its plan was unreachable by this sweep
+# while remaining the durable artifact. That is where the 2026-08-25
+# measurement found the corruption.
+
+
+@pytest.fixture
+def meta_plans_root(tmp_path) -> Path:
+    """A root holding three meta-root plans: DEAD-corrupt, LIVE-corrupt, clean.
+
+    The liveness axis is the whole point of the lane: ``7002`` still has a
+    ``.worktrees/7002`` directory, so a running task may be reading its plan
+    through the symlink and this sweep must refuse it. ``7001`` has no live
+    lane and no orphaned link either — unreachable by the plans glob, which is
+    exactly the population this lane exists to reach.
+    """
+    root = tmp_path / 'repo'
+    meta = root / '.worktrees' / '.task-meta'
+    write_plan(
+        meta / '7001' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    write_plan(
+        meta / '7002' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE),
+    )
+    write_plan(
+        meta / '7003' / 'plan.json',
+        _self_name_plan(_SELF_NAME_RATIONALE_PROSE, _SELF_NAME_HOW_PROSE),
+    )
+    (root / '.worktrees' / '7002').mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _meta_plan(root: Path, lane_id: str) -> Path:
+    return root / '.worktrees' / '.task-meta' / lane_id / 'plan.json'
+
+
+def _fingerprint(root: Path) -> dict:
+    """Every file's bytes AND st_mtime_ns — the "nothing was written" pin.
+
+    Bytes alone would pass an atomic rewrite that produced identical content,
+    which is still a write: it races the reader this sweep refuses to race.
+    """
+    return {
+        path.relative_to(root).as_posix(): (
+            path.read_bytes(), path.stat().st_mtime_ns
+        )
+        for path in sorted(root.rglob('*'))
+        if path.is_file()
+    }
+
+
+def test_discovery_tags_the_meta_root_plans_with_the_new_lane(meta_plans_root):
+    """(a) The glob is the exact ``<id>/plan.json`` tail under the meta-root."""
+    targets = sweep.discover_targets(meta_plans_root)
+    found = [t for t in targets if t.lane == sweep.LANE_META_PLANS]
+
+    assert [t.path for t in found] == [
+        _meta_plan(meta_plans_root, lane_id) for lane_id in ('7001', '7002', '7003')
+    ]
+    assert sweep.LANE_META_PLANS in sweep._LANE_CHOICES
+
+
+def test_the_meta_plans_lane_selects_the_same_files_as_all(meta_plans_root):
+    """(a, continued) ``--lane meta-plans`` and ``--lane all`` agree here.
+
+    This root holds nothing but meta-root plans, so the two runs must produce
+    identical summaries. A lane constant that discovery tagged but the CLI
+    could not select would be a lane in name only.
+    """
+    scoped, _ = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+    everything, _ = sweep.run_sweep(meta_plans_root, lane='all')
+
+    assert scoped.files_scanned == 3
+    assert scoped.as_dict() == everything.as_dict()
+
+
+def test_the_default_dry_run_reports_the_dead_lane_and_writes_nothing(meta_plans_root):
+    """(b) Dry run IS the periodic detector this task owes.
+
+    One invocation, exit 1, and not one byte written. That is what makes the
+    lane a check rather than a sixth script that would have to re-enumerate the
+    literals (INV-5).
+    """
+    before = _fingerprint(meta_plans_root)
+
+    summary, diffs = sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS)
+
+    assert _fingerprint(meta_plans_root) == before, 'a DRY run writes NOTHING'
+    assert summary.repaired == 1, 'only the dead lane is repairable'
+    assert summary.pending == 1
+    assert summary.exit_code() == sweep.EXIT_REPAIRABLE_REMAINS
+    assert len(diffs) == 1 and '7001' in diffs[0]
+
+
+def test_apply_repairs_the_dead_lane_and_refuses_the_live_one(meta_plans_root):
+    """(c) The corpus is PARTITIONED with plan-tools, never raced over it.
+
+    ``7002`` is skipped under the existing REASON_LIVE_LANE_PRESENT, which the
+    lane inherits rather than re-deriving: a live lane's plan belongs to
+    plan-tools' lazy read-back (PRD D4), and that read-back is atomic. Two
+    writers converging on one file is the one shape this split exists to
+    prevent.
+    """
+    live_before = _meta_plan(meta_plans_root, '7002').read_bytes()
+    clean_before = _meta_plan(meta_plans_root, '7003').read_bytes()
+
+    summary, _ = sweep.run_sweep(
+        meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True
+    )
+
+    dead = json.loads(_meta_plan(meta_plans_root, '7001').read_text(encoding='utf-8'))
+    assert dead['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
+
+    assert _meta_plan(meta_plans_root, '7002').read_bytes() == live_before, (
+        'a running task must never have its plan rewritten under it'
+    )
+    assert _meta_plan(meta_plans_root, '7003').read_bytes() == clean_before
+
+    assert summary.skipped == {sweep.REASON_LIVE_LANE_PRESENT: 1}
+    assert summary.repaired == 1
+    assert summary.failed == 0
+
+
+def test_a_second_apply_run_over_the_same_tree_exits_clean(meta_plans_root):
+    """(e) The acceptance invariant delta already uses: second run reports 0."""
+    sweep.run_sweep(meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True)
+
+    summary, diffs = sweep.run_sweep(
+        meta_plans_root, lane=sweep.LANE_META_PLANS, apply=True
+    )
+
+    assert summary.pending == 0
+    assert diffs == []
+    assert summary.exit_code() == sweep.EXIT_CLEAN
+
+
+def test_never_touch_still_fires_for_a_meta_plans_shaped_target(meta_plans_root):
+    """(d) The committed-evidence guard is checked BEFORE any location gate."""
+    evidence = (
+        meta_plans_root / '.worktrees' / '.task-meta' / '7004'
+        / 'docs' / 'task-recovery-2026-05-13' / 'worktree-inventory.json'
+    )
+    target = sweep.Target(path=evidence, lane=sweep.LANE_META_PLANS)
+
+    refusal = sweep.resolve_write_target(target, meta_plans_root)
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_NEVER_TOUCH
+
+
+def test_a_meta_plan_resolving_outside_the_root_is_refused(meta_plans_root, tmp_path):
+    """(d, continued) The location gate binds this lane exactly as it binds plans.
+
+    Discovery follows symlinked FILES, so without the containment check the
+    realpath resolution that makes the write land on the right file would just
+    as happily land it outside the repo.
+    """
+    outside = tmp_path / 'elsewhere' / 'plan.json'
+    write_plan(outside, _self_name_plan(_SELF_NAME_RATIONALE, _SELF_NAME_HOW_PROSE))
+    link = _meta_plan(meta_plans_root, '7005')
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(outside), str(link))
+
+    refusal = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_META_PLANS), meta_plans_root
+    )
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_UNSANCTIONED_PLAN_LOCATION
+
+
+def test_an_orphaned_link_and_its_meta_root_target_dedupe_to_one(meta_plans_root):
+    """(f) The same realpath must never be swept twice in one run.
+
+    Both globs now reach the same file whenever an orphaned lane still holds
+    the link. Writing it twice is not merely wasteful — the second pass would
+    re-read the first pass's output, and any asymmetry between them would
+    surface as churn an operator cannot account for.
+    """
+    link = meta_plans_root / '.worktrees-orphaned' / '7001' / '.task' / 'plan.json'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(_meta_plan(meta_plans_root, '7001')), str(link))
+
+    discovered = sweep.discover_targets(meta_plans_root)
+    deduped = sweep.dedupe_by_realpath(discovered)
+
+    assert len([t for t in discovered if '7001' in str(t.path)]) == 2
+    survivors = [t for t in deduped if '7001' in str(t.path)]
+    assert [t.lane for t in survivors] == [sweep.LANE_META_PLANS], (
+        'the meta-root target sorts first and claims the realpath'
+    )
+
+    summary, _ = sweep.run_sweep(meta_plans_root, lane='all', apply=True)
+    assert summary.repaired == 1, 'one repair, not two passes over one file'
