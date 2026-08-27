@@ -1688,6 +1688,63 @@ class EscalationQueue:
         self._atomic_write_path(path, esc.to_json())
         return esc
 
+    def note_suppressed_refile(self, escalation_id: str) -> Escalation | None:
+        """Record that this record's resolution absorbed one identical refile.
+
+        The INV-4 storm counter for the auto-dismiss path (task 4499).  When
+        ``find_terminal_by_citation`` matches, the refile is dropped without a
+        record being filed — so without this bump the suppression would be
+        LOG-ONLY, and "this adjudication has silently absorbed 900 refiles"
+        would be unobservable from the record itself (INV-2
+        ``structured-facts-at-failure``).  ``refiles_suppressed`` plays the
+        same role for suppression that ``dedupe_count`` plays for the fold
+        path: a durable, bounded recurrence signal on the surviving record.
+
+        Deliberately UNTHRESHOLDED — it never escalates at a count.  Escalating
+        on repeated suppression would file the very escalation the suppression
+        exists to stop, recreating the close-then-refile storm one level up.
+        INV-4's applicable house pattern here is the storm COUNTER, not a
+        threshold escalation.
+
+        Locking: unlike ``patch_resolution_metadata`` above (a last-write-wins
+        field SET) this is a genuine INCREMENT, so the whole read-modify-write
+        runs under ``escalation_id_lock`` — a concurrent same-id bump from
+        another harness/worker process must not be lost.  The lock sidecar
+        lives in ``queue_dir`` and is stable regardless of whether the record
+        currently sits in the root or the archive.
+
+        Patches the record IN PLACE wherever it lives, via ``_locate_path`` +
+        ``_atomic_write_path`` — NOT ``_rewrite``/``_atomic_write``, which
+        always target the queue root and would resurrect an archived record
+        out of the archive.
+
+        Returns None (writing nothing) when the record is missing, unparseable,
+        or still pending — a pending record has absorbed nothing, since it is
+        its own open-L1 veto that suppresses the refile.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
+
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status not in ('resolved', 'dismissed'):
+                return None
+
+            esc.refiles_suppressed += 1
+            self._atomic_write_path(path, esc.to_json())
+
+        logger.info(
+            f'Escalation {escalation_id} has now absorbed '
+            f'{esc.refiles_suppressed} identical refile(s)'
+        )
+        return esc
+
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
         """Atomically rewrite an escalation's JSON file."""
         self._atomic_write(escalation_id, escalation.to_json())
