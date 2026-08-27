@@ -937,3 +937,141 @@ class TestTTLCacheKeepsLocksWithQueuedWaiters:
         assert 'cold-key' not in cache._locks, (
             'an unheld, unawaited lock for an absent key is still reclaimable'
         )
+
+
+class TestTTLCacheBoundedLockAcquisition:
+    """A never-returning refresh must not wedge every later caller of that key.
+
+    Regression for the 2026-08-27 incident: a refresh that never returned
+    (parked forever inside httpcore) held the
+    ``/home/leo/src/reify|s=*|p=*|o=0`` key's lock for 19.8h with 7 waiters
+    queued behind it, while the other 8 TTLCache-backed roots stayed healthy
+    throughout.
+
+    Every test here monkeypatches the new ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``
+    module constant down to a short REAL value and relies on the real clock —
+    no fake clock anywhere in this class. The wedging refresh stub parks on a
+    genuinely unresolved ``asyncio.Event`` that is NEVER set; a sleep-based
+    stub would pass against the current (unbounded) code and prove nothing.
+    """
+
+    @staticmethod
+    def _wedging_refresh():
+        """Counting refresh stub: call #1 wedges forever, call #2+ returns 'value'."""
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+        calls = {'n': 0}
+
+        async def _refresh():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                entered.set()
+                await wedged.wait()  # never set — genuinely unresolved
+                raise AssertionError('unreachable: the wedged event is never set')
+            return 'value'
+
+        return _refresh, entered, calls
+
+    async def _wedge_key(self, cache, key='k'):
+        """Start a caller that wedges *key* forever; return (task, refresh, calls)."""
+        refresh, entered, calls = self._wedging_refresh()
+        task = asyncio.create_task(cache.get_or_refresh(key, refresh))
+        await entered.wait()
+        return task, refresh, calls
+
+    @staticmethod
+    async def _unwedge(task):
+        """Cancel a still-parked wedging task and confirm no orphaned task remains."""
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_a_never_returning_refresh_does_not_wedge_the_next_caller_of_that_key(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        first_task, refresh, calls = await self._wedge_key(cache)
+
+        try:
+            # No exception -- in particular no bare TimeoutError -- may escape
+            # to the caller. On current (unbounded) code this outer wait_for is
+            # the RED harness: it fires after 5s because get_or_refresh itself
+            # never returns (the lock is never released).
+            second = await asyncio.wait_for(
+                cache.get_or_refresh('k', refresh), timeout=5.0
+            )
+        finally:
+            await self._unwedge(first_task)
+
+        assert second == 'value'
+        assert calls['n'] == 2, 'expected the wedged call plus exactly one bypass call'
+
+    async def test_the_bypassed_refresh_is_cached_so_later_callers_never_touch_the_lock(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        first_task, refresh, calls = await self._wedge_key(cache)
+
+        try:
+            await asyncio.wait_for(cache.get_or_refresh('k', refresh), timeout=5.0)
+
+            assert cache.get_fresh('k') is not None, (
+                'the bypassed refresh must be stored -- nothing was ever stored '
+                'for the wedged key during the incident, which is why every '
+                'later caller kept queueing'
+            )
+
+            third = await cache.get_or_refresh('k', refresh)
+            assert third == 'value'
+            assert calls['n'] == 2, (
+                'a later caller must be served from the store, not touch the '
+                'still-wedged lock or run another refresh'
+            )
+        finally:
+            await self._unwedge(first_task)
+
+    async def test_a_wedged_key_degrades_only_itself(self, monkeypatch):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        first_task, refresh_a, _ = await self._wedge_key(cache, key='a')
+
+        b_calls = {'n': 0}
+
+        async def refresh_b():
+            b_calls['n'] += 1
+            return 'b-value'
+
+        try:
+            b_result = await asyncio.wait_for(
+                cache.get_or_refresh('b', refresh_b), timeout=5.0
+            )
+            a_second = await asyncio.wait_for(
+                cache.get_or_refresh('a', refresh_a), timeout=5.0
+            )
+        finally:
+            await self._unwedge(first_task)
+
+        assert b_result == 'b-value'
+        assert b_calls['n'] == 1, (
+            "an unrelated key must resolve normally, with no bypass, while "
+            "key 'a' is wedged"
+        )
+        assert a_second == 'value', "key 'a''s second caller must still return"
+
+    def test_lock_acquire_timeout_is_a_finite_named_module_constant(self):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        timeout = fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+        assert isinstance(timeout, float)
+        assert 0 < timeout < 120, (
+            'a future None (or non-positive/unbounded) value would silently '
+            'restore the unbounded wait this task exists to remove'
+        )
