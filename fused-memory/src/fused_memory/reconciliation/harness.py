@@ -2293,9 +2293,18 @@ class ReconciliationHarness:
 
         *threshold* and *window_seconds* are passed PER CALL, never captured, so
         a caller reading them live off ``self.config`` keeps observing in-place
-        reloads (``config/reload.py``'s reload-safety rule).  *key* is the
-        distinct-count dimension used only by
-        :meth:`_record_dead_owner_suppression`.
+        reloads (``config/reload.py``'s reload-safety rule).
+
+        *key* is the distinct-count dimension, used only by
+        :meth:`_record_dead_owner_suppression` and only meaningful against a
+        counter built with ``count_distinct=True``.  This adapter deliberately
+        does NOT screen it: ``StormCounter.record`` raises ``ValueError`` on a
+        non-``None`` key handed to a default-mode counter, so a future recorder
+        wired to the wrong counter fails loudly on its first call instead of
+        silently reverting to raw-event thresholding — the pre-2039
+        (esc-recon-50da2482-1) behaviour.  Screening here would only re-hide it
+        for this one caller.  ``key=None`` stays valid in either mode, which is
+        what lets the two per-event recorders share this bridge unchanged.
         """
         effective_now = now if now is not None else datetime.now(UTC)
         summary = counter.record(

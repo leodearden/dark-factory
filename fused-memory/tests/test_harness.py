@@ -18514,47 +18514,51 @@ async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
 # ── INV-5: the storm counters delegate to shared.storm_counter (task 3259) ────
 
 
-def test_placeholder_drop_counter_is_the_shared_storm_counter(
+def test_all_three_storm_counters_are_the_shared_storm_counter(
     journal, event_buffer, mock_memory_service,
 ):
-    """The INV-5 acceptance criterion, made executable.
+    """The INV-5 acceptance criterion, made executable — once, for all three.
 
     Task 3088 extracted the append-prune-count-ratelimit body into one home
     (since promoted to ``shared.storm_counter`` by task 3689) precisely so no
-    module outside it carries its own copy. ``_record_placeholder_finding_drop``
-    was one of the three original copies this class was extracted FROM, so it
-    delegating back is what closes the loop.
+    module outside it carries its own copy. Two of the three counters here
+    (``_record_placeholder_finding_drop``, ``_record_dead_owner_suppression``)
+    were among the copies that class was extracted FROM; the third,
+    ``_record_resume_failure``, was added by task σ/2717 AFTER task 3259 was
+    filed, with the identical body and a docstring saying so outright ("Same
+    rolling-window per-event counter + rate-limited single-fire shape as
+    _record_placeholder_finding_drop"). Leaving any of them behind re-opens
+    the gap this task closes, so all three are asserted together rather than
+    in three near-identical tests.
 
     Structural rather than behavioural on purpose: a hand-rolled deque can
     reproduce every behaviour below and still be a fourth copy, which is the
-    thing INV-5 forbids.
+    thing INV-5 forbids. The behavioural halves live in the half-open-window
+    tests that follow.
+
+    The dead-owner counter additionally asserts its MODE, via StormCounter's
+    public ``count_distinct`` property. That is not decoration: a default-mode
+    counter there would silently restore pre-2039 raw-event thresholding and
+    re-fire on the benign multi-project restart esc-recon-50da2482-1 was about
+    (the regression
+    ``test_record_dead_owner_suppression_single_dead_owner_multi_project_no_storm``
+    guards behaviourally).
     """
     from shared.storm_counter import StormCounter
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
-    assert isinstance(harness._placeholder_drop_storm, StormCounter), (
-        'the placeholder-drop counter must BE a shared StormCounter, not a '
-        'local deque reproducing its body (INV-5)'
-    )
+    for attr in ('_placeholder_drop_storm', '_resume_failure_storm', '_dead_owner_storm'):
+        assert isinstance(getattr(harness, attr), StormCounter), (
+            f'{attr} must BE a shared StormCounter, not a local deque '
+            'reproducing its body (INV-5)'
+        )
 
-
-def test_resume_failure_counter_is_the_shared_storm_counter(
-    journal, event_buffer, mock_memory_service,
-):
-    """The third copy, added after task 3259 was filed.
-
-    Task σ/2717 added ``_record_resume_failure`` with the identical body and a
-    docstring saying so outright ("Same rolling-window per-event counter +
-    rate-limited single-fire shape as _record_placeholder_finding_drop").
-    Leaving it behind would re-open the very gap this task closes.
-    """
-    from shared.storm_counter import StormCounter
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-    assert isinstance(harness._resume_failure_storm, StormCounter), (
-        'the resume-failure counter must BE a shared StormCounter (INV-5)'
+    assert harness._dead_owner_storm.count_distinct is True, (
+        'the dead-owner counter must be in DISTINCT-KEY mode — default mode '
+        'would threshold on raw suppression events and re-fire on a benign '
+        'multi-project restart, the esc-recon-50da2482-1 regression task 2039 '
+        'fixed'
     )
 
 
@@ -18641,10 +18645,13 @@ def test_migrated_per_event_counters_keep_the_three_key_return_shape(
     """The return dict stays EXACTLY {count, window_seconds, projects}.
 
     ``StormCounter.record`` returns count/threshold/window_seconds/labels; the
-    harness contract is count/window_seconds/projects, read at harness.py:
-    1766-1769, 2039-2042 and 4593-4596. The adapter remaps rather than passing
-    the shared shape through, so a migrated counter cannot leak a renamed key
-    (``labels`` for ``projects``) or an extra one into an escalation payload.
+    harness contract is count/window_seconds/projects, as read at the three
+    sites that fold a summary into an escalation payload —
+    ``reconciliation/harness.py::_recover_stale_runs`` (dead-owner),
+    ``::_resume_interrupted_runs`` (resume-failure) and ``::_maybe_remediate``
+    (placeholder-drop). The adapter remaps rather than passing the shared shape
+    through, so a migrated counter cannot leak a renamed key (``labels`` for
+    ``projects``) or an extra one into an escalation payload.
     """
     from fused_memory.reconciliation.harness import _PLACEHOLDER_DROP_STORM_THRESHOLD
 
@@ -18674,34 +18681,6 @@ def test_migrated_per_event_counters_keep_the_three_key_return_shape(
         f'exact 3-key harness shape expected, got {sorted(resume_storm)}'
     )
     assert resume_storm['projects'] == ['dark_factory', 'reify']
-
-
-def test_dead_owner_counter_is_a_distinct_key_shared_storm_counter(
-    journal, event_buffer, mock_memory_service,
-):
-    """The last of the three copies INV-5 forbids (task 3259).
-
-    ``_record_dead_owner_suppression`` is the counter that could NOT delegate
-    to StormCounter as it stood: it thresholds on distinct dead-owner
-    ``instance_id`` values (task 2039) while attributing to distinct
-    ``project_id`` values, and the class only had one label dimension.
-    ``count_distinct=True`` plus the per-call ``key`` is what closes that gap,
-    so this asserts the MODE, not merely the type — a default-mode counter here
-    would silently restore the pre-2039 raw-event threshold and re-fire on the
-    benign multi-project restart that esc-recon-50da2482-1 was about.
-    """
-    from shared.storm_counter import StormCounter
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-    assert isinstance(harness._dead_owner_storm, StormCounter), (
-        'the dead-owner counter must BE a shared StormCounter (INV-5)'
-    )
-    assert harness._dead_owner_storm._count_distinct is True, (
-        'it must be in DISTINCT-KEY mode — default mode would threshold on raw '
-        'suppression events and re-fire on a benign multi-project restart, the '
-        'esc-recon-50da2482-1 regression task 2039 fixed'
-    )
 
 
 def test_record_dead_owner_suppression_window_is_half_open(
@@ -18781,4 +18760,59 @@ def test_record_dead_owner_suppression_keeps_both_label_dimensions_after_migrati
     )
     assert len(storm['projects']) < storm['count'], (
         'this scenario is only meaningful if the two dimensions differ'
+    )
+
+
+def test_record_resume_failure_reads_its_threshold_live_off_config(
+    journal, event_buffer, mock_memory_service,
+):
+    """The harness-level analogue of ``TestLiveReadContract`` (task 3259).
+
+    The migrated docstrings make a load-bearing claim — threshold and window
+    are read LIVE off ``self.config`` on EVERY call rather than captured, so
+    promoting ``resume_failure_storm_*`` (or ``dead_owner_suppression_storm_*``)
+    into ``RELOADABLE_FIELDS`` would work with no further edits. Nothing at the
+    harness level pinned it: ``shared/tests/test_storm_counter.py::
+    TestLiveReadContract`` covers the CLASS, which takes the knobs per call and
+    cannot help but honour them, not the ADAPTER that supplies them. A refactor
+    that captured ``self.config.resume_failure_storm_threshold`` into
+    ``_storm_summary`` at construction — the exact mistake ``config/reload.py``'s
+    reload-safety rule warns about, and one that turns a green-tier leaf into a
+    restart-only one in disguise — would pass every other test in this section.
+
+    So: record below the ORIGINAL threshold, retune the config in place, and
+    assert the very next call decides against the NEW value.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.config.resume_failure_storm_threshold == 6
+
+    base = datetime(2026, 7, 18, 0, 0, 0, tzinfo=UTC)
+
+    # Three failures — comfortably below the configured threshold of 6.
+    early = [
+        harness._record_resume_failure('reify', now=base + timedelta(seconds=i))
+        for i in range(3)
+    ]
+    assert all(r is None for r in early), f'below threshold 6; got {early!r}'
+
+    # An operator retunes the alarm downward. The counter's existing window is
+    # untouched: the same three events are now AT the new threshold.
+    harness.config.resume_failure_storm_threshold = 4
+
+    storm = harness._record_resume_failure('reify', now=base + timedelta(seconds=3))
+
+    assert storm is not None, (
+        'the 4th failure must fire against the RETUNED threshold of 4 — a '
+        'captured threshold of 6 would still be waiting for two more'
+    )
+    assert storm['count'] == 4
+
+    # The window leaf is read live on the same terms: narrowing it prunes on
+    # the NEXT call, not at some later construction.
+    harness.config.resume_failure_storm_window_seconds = 1.0
+    after = harness._record_resume_failure('reify', now=base + timedelta(seconds=600))
+
+    assert after is None, (
+        'the narrowed 1s window must have pruned every earlier failure on this '
+        'very call, leaving a count of 1'
     )
