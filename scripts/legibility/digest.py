@@ -1520,9 +1520,35 @@ def _render_self_corrections(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
-    return [
-        f"- {item['tool']} x{item['count']}: {item['signature']}" for item in items
-    ]
+    """Render each retry group, annotating it with how many of its calls
+    ended in a DESIGNED outcome (census 2026-08-26 R1, task 4751).
+
+    Two contracts this locks:
+
+    * A group with ZERO designed results takes an explicit early branch
+      emitting exactly the pre-4751 format -- byte-identity is a contract,
+      not an accident of an annotation that happens to render empty, and
+      it is what makes "genuine retry storms are untouched" a testable
+      literal-f-string assertion.
+    * The annotation sits to the LEFT of the stable ``": {signature}"``
+      terminator, so :func:`_cap_item` byte-truncates the signature first
+      and leaves the annotation legible -- exactly the reason
+      :func:`_exit_marker` promotes an exit code out of raw prose. The
+      groups that most need explaining are the ones with the longest
+      commands, i.e. precisely those the cap would otherwise eat.
+
+    The count is always rendered ALONGSIDE the group's full ``count``,
+    never in place of it: the annotation explains churn, it never hides
+    how much churn there was.
+    """
+    lines = []
+    for item in items:
+        head = f"- {item['tool']} x{item['count']}"
+        designed = item['designed_outcome_count']
+        if designed:
+            head += f' ({designed} designed-outcome results)'
+        lines.append(f"{head}: {item['signature']}")
+    return lines
 
 
 def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
