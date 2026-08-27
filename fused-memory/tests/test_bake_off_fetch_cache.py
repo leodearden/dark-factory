@@ -615,9 +615,18 @@ class TestFetchCacheProvenance:
 
 
 class TestFetchCacheRefusesAStaleCorpus:
-    """Three named refusals, so an operator can tell them apart WITHOUT
-    reading code: the fixtures moved, the cache is truncated, or the cache is
-    too shallow for the requested depth."""
+    """Four named refusals, so an operator can tell them apart WITHOUT
+    reading code: the fixtures moved, the QUERIES half is truncated, the
+    PROBES half is truncated, or the cache is too shallow for the requested
+    depth.
+
+    The two truncations are separate refusals rather than one because they
+    are separately repairable and separately consequential: a missing query
+    scores an arm over a subset of the query set, a missing probe cluster
+    scores the neighbourhood metrics over a subset of the clusters.  Naming
+    which half is short is the whole reason these are named refusals rather
+    than bare raises.
+    """
 
     def _dump(self, mod, tmp_path, records, *, queries, probes=None,
               search_limit=10):
@@ -700,6 +709,49 @@ class TestFetchCacheRefusesAStaleCorpus:
             expect_query_ids=['q1', 'q2'],
         )
         assert set(loaded['c_peers']['queries']) == {'q1', 'q2'}
+
+    def test_a_probe_cluster_absent_from_the_cache_is_refused(self, tmp_path):
+        """The PROBES half of the same failure, and the reason it is a NAMED
+        refusal: `measure_arm` indexes `fetched['probes'][cluster_id]` bare,
+        so a truncated probes half that is not refused here surfaces as an
+        unnamed `KeyError` from inside the metric code — naming neither the
+        cache nor how to re-dump it, and escaping the documented
+        FetchCacheError -> exit-3 contract entirely.
+        """
+        mod = _mod()
+        records = [_record('rec-1')]
+        path = self._dump(
+            mod, tmp_path, records,
+            queries={'q1': [(records[0], 0.9)]},
+            probes={'cl1': [(records[0], 0.8)]},
+        )
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(
+                path, {'c_peers': _seeded('c_peers', records)},
+                expect_probe_ids=['cl1', 'cl2-never-cached'],
+            )
+        message = str(excinfo.value)
+        assert 'cl2-never-cached' in message
+        assert 'c_peers' in message
+        # The point of the test: an operator must be able to tell a truncated
+        # PROBES half from a truncated QUERIES half without reading code.
+        assert 'probes' in message
+
+    def test_the_full_requested_probe_set_loads(self, tmp_path):
+        """The converse, so the refusal above is not vacuously always-on."""
+        mod = _mod()
+        records = [_record('rec-1'), _record('rec-2')]
+        path = self._dump(
+            mod, tmp_path, records,
+            queries={'q1': [(records[0], 0.9)]},
+            probes={'cl1': [(records[0], 0.8)], 'cl2': [(records[1], 0.3)]},
+        )
+        loaded = mod.load_fetches(
+            path, {'c_peers': _seeded('c_peers', records)},
+            expect_probe_ids=['cl1', 'cl2'],
+        )
+        assert set(loaded['c_peers']['probes']) == {'cl1', 'cl2'}
 
     def test_a_cache_shallower_than_the_requested_limit_is_refused(self, tmp_path):
         """A limit-5 cache replayed at --limit 10 measures every arm over a
