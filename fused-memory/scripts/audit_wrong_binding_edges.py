@@ -678,3 +678,233 @@ class EdgeReader:
             if referent is not None and not referent.project_id:
                 ids.add(referent.number)
         return ids, read
+
+
+# --------------------------------------------------------------------------- #
+# The report
+# --------------------------------------------------------------------------- #
+
+KNOWN_GAPS: tuple[dict[str, Any], ...] = (
+    {
+        'sub_class': 'direction_reversal',
+        'description': (
+            'The edge points the wrong way: BOTH endpoints are correctly '
+            'named in the fact, only the subject/object roles are swapped.'
+        ),
+        'specimen_edge_uuids': ['1cf19488', '01e3e75e'],
+        'specimens': [
+            '1cf19488 (Task 6346)->(Task 6347): "The recurring-attention task '
+            '#6347 depends on task #6346."',
+            '01e3e75e (Task 5997)->(Task 6014): "Task 6014 carries task 5997 '
+            'as a hard dependency."',
+        ],
+        'why_out_of_reach': (
+            'Set-membership is SATISFIED at both ends, so no text rule can '
+            'separate a reversal from correct grammatical voice.'
+        ),
+        'cheap_heuristic_measured_and_rejected': {
+            'rule': 'leftmost task id named in the fact == object id != subject id',
+            'flagged': 85,
+            'population': 7131,
+            'verdict': 'NOT SHIPPED — precision far too low',
+            'worked_false_positives': [
+                '"Task 2660 depends on Task 2659 landing" on edge (2659)->(2660)',
+                '"Task 846 is the companion task to Task 839" on edge (839)->(846)',
+                '"Themes addressed by follow-up Task 2083 are related to Task '
+                '394" on edge (394)->(2083)',
+            ],
+            'what_would_be_needed': (
+                'The AUTHORITATIVE task dependency graph. The two true '
+                'specimens are indistinguishable from the benign majority by '
+                'fact text alone, because both of their endpoints are named.'
+            ),
+        },
+    },
+    {
+        'sub_class': 'fact_contradicts_source_episode',
+        'description': (
+            'The fact is bound to plausible endpoints and names them both, '
+            'but disagrees with the episode it was extracted from.'
+        ),
+        'specimen_edge_uuids': ['993a9a7b'],
+        'specimens': [
+            '993a9a7b (Task 6004)->(Task 5997): "Task 6004\'s rulings were '
+            'ported verbatim into task 5997."',
+        ],
+        'why_out_of_reach': (
+            'Reachable by NO text or topology rule: adjudicating it requires '
+            're-reading the source episode body and comparing meaning. That '
+            'is the fact-CONTENT family esc-4639-1 separates from this one.'
+        ),
+    },
+)
+"""The two sub-classes this Class-A detector provably does NOT cover.
+
+Shipped as a first-class report key, not as a comment, because the artifact
+travels: a reader who finds 192 findings and no statement of scope will read
+"the sweep found no reversals" as "the corpus holds no reversals". The
+measured refutation of the cheap direction heuristic is recorded here so
+nobody re-proposes it from first principles — it looks obviously correct and
+is not.
+"""
+
+CAVEATS: tuple[str, ...] = (
+    'CANDIDATES, NOT VERDICTS: every finding is a candidate for HUMAN '
+    'adjudication. Some are legitimate cross-task relations that merely hang '
+    'off a task-shaped node — e.g. "BOOKMARK task 4043 tracks the ... work '
+    'surfaced by esc-3437-13" on node "task 3443". Auto-reassigning on a '
+    'regex verdict is exactly what this task\'s scope note forbids, and this '
+    'script has no path to do it.',
+    'DETECTION BOUND, RECALL: endpoints and facts are read with the SHARED '
+    'vocabulary in fused_memory.utils.canonical_labels, which is documented '
+    'precision-over-recall. A node named with bare digits, a reference made '
+    'by task TITLE, an alias/codename, and a hard-wrapped qualified ref are '
+    'all invisible by design. The rate reported here is therefore a LOWER '
+    'BOUND on Class A.',
+    'DENOMINATOR: "rate" divides by "population" — edges with at least one '
+    'task-shaped endpoint AND at least one task id named in the fact. Edges '
+    'whose fact names no task id are UNVERIFIABLE, not clean, and are '
+    'counted separately; they are never folded into the denominator and '
+    'never summed with the findings.',
+    'COVERAGE, CLASS: this sweep covers ONE sub-class — an endpoint the fact '
+    'does not name. See known_gaps for the two it provably does not cover.',
+    'LIVE CORPUS: both graphs are written to continuously, so every count '
+    'here is a snapshot at swept_at, not a fixed population.',
+)
+"""The report's caveats, as DATA rather than docstring prose — they travel
+with the committed artifact into investigation.md and into whatever reads it
+next. Deliberately not pinned word for word by a test: that would be
+tautological, and substring-matching prose pins cosmetics."""
+
+
+def _tally(findings: list[Finding], key, seed: tuple[str, ...]) -> dict[str, int]:
+    """Count *findings* by *key*, with every *seed* value present at 0.
+
+    The seed is the no-silent-absence half: a bucket that appeared only when
+    non-zero would read as NOT MEASURED rather than as measured-and-none.
+    """
+    counts = dict.fromkeys(seed, 0)
+    for finding in findings:
+        k = key(finding)
+        counts[k] = counts.get(k, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_report(
+    findings: list[Finding],
+    *,
+    swept_at: str,
+    graphs: list[str],
+    scanned: int,
+    population: int,
+    unverifiable: int = 0,
+    reads: object = (),
+    limit_listing: int | None = None,
+) -> dict[str, Any]:
+    """Build the machine-readable report.
+
+    THE DENOMINATOR IS ``population``, NOT ``scanned``. An edge whose fact
+    names no task id offers nothing to compare an endpoint against, so it is
+    UNVERIFIABLE — a third state, neither finding nor clean. Dividing by
+    ``scanned`` would fold that whole population into the denominator and
+    understate the rate by roughly the ratio of the two. ``unverifiable`` is
+    reported alongside and is never summed with ``findings``.
+
+    NO SILENT CAPS, in both directions. An incomplete :class:`PagedRead`
+    publishes its own ``reason`` VERBATIM into ``truncated_by`` and
+    ``caveats`` — re-wording it would hide the store's own account of what
+    went wrong, and every denominator here depends on the read being
+    complete, so an incomplete one does not footnote the numbers, it
+    invalidates them. A bounded listing likewise names what it withheld while
+    still COUNTING it.
+
+    ``families`` (nodes carrying more than one finding) is a first-class
+    summary key because it is the strongest single signal in the artifact:
+    five findings on one node is a systematic mis-resolution event, and five
+    findings on five nodes is not, and a reader must not have to recompute
+    that distinction by hand.
+
+    Pure: *swept_at* is an argument rather than a ``datetime.now()`` call,
+    which is what makes the output byte-stable across two runs on one input.
+
+    Args:
+        reads: ``(graph, kind, PagedRead)`` triples — one per read performed.
+    """
+    findings = sorted(
+        findings,
+        key=lambda f: (f.graph, _id_sort_key(f.node_referent.number), f.edge_uuid),
+    )
+
+    incomplete = [
+        {
+            'graph': graph,
+            'kind': kind,
+            'rows_seen': read.rows_seen,
+            'expected_rows': read.expected_rows,
+            'incomplete_kind': read.incomplete_kind,
+            'reason': read.reason,
+        }
+        for graph, kind, read in reads  # type: ignore[misc]
+        if not read.complete
+    ]
+
+    listed = findings if limit_listing is None else findings[:limit_listing]
+    withheld = len(findings) - len(listed)
+
+    truncated_by: dict[str, Any] | None = None
+    if incomplete or withheld:
+        truncated_by = {}
+        if incomplete:
+            truncated_by['incomplete_reads'] = incomplete
+        if withheld:
+            truncated_by['listing'] = {
+                'withheld': withheld,
+                'flag': '--limit-listing',
+                'note': (
+                    f'{withheld} finding(s) were COUNTED in summary.findings '
+                    f'but not listed. Re-run without --limit-listing to see '
+                    f'them.'
+                ),
+            }
+
+    # A node carrying MORE THAN ONE finding — the Task 6165 shape.
+    by_node: dict[tuple[str, str], list[str]] = {}
+    for finding in findings:
+        by_node.setdefault((finding.graph, finding.node_name), []).append(
+            finding.edge_uuid
+        )
+    families = [
+        {'graph': graph, 'node_name': name, 'findings': len(uuids),
+         'edge_uuids': sorted(uuids)}
+        for (graph, name), uuids in sorted(by_node.items())
+        if len(uuids) > 1
+    ]
+
+    return {
+        'swept_at': swept_at,
+        'graphs': list(graphs),
+        'scanned': scanned,
+        'population': population,
+        'unverifiable': unverifiable,
+        'summary': {
+            'findings': len(findings),
+            'rate': (len(findings) / population) if population else 0.0,
+            'by_graph': _tally(findings, lambda f: f.graph, tuple(graphs)),
+            'by_end': _tally(findings, lambda f: f.end, ('subject', 'object')),
+            'by_proximity': _tally(
+                findings, lambda f: f.proximity or 'unrelated', PROXIMITY_BUCKETS
+            ),
+            'correct_node_present': _tally(
+                findings,
+                lambda f: 'true' if f.correct_node_present else 'false',
+                ('true', 'false'),
+            ),
+            'families': families,
+        },
+        'truncated_by': truncated_by,
+        # The store's own account of any incomplete read, verbatim, so the
+        # caveats a reader skims already carry it.
+        'caveats': list(CAVEATS) + [e['reason'] for e in incomplete if e['reason']],
+        'known_gaps': [dict(gap) for gap in KNOWN_GAPS],
+        'findings': [f.to_json() for f in listed],
+    }
