@@ -1939,3 +1939,89 @@ class TestEffectDivergenceGateSurvivesTheStrEnum:
         _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
         assert 'diverged paths' not in detail
         assert 'Unrecognized reason code' not in detail
+
+
+class TestFileUnattributedLandingEscalationStampsCitationSha:
+    """The filed record carries the evidence identity it could not attribute (task 4499).
+
+    ``citation_sha`` is written at FILING time so that, once the record is
+    resolved, the archived resolution still answers "which evidence was this?".
+    That read-after-resolve is the identity half of the
+    ``(task_id, category, citation_sha)`` triple that suppresses an identical
+    refile — without the stamp there is nothing to match on, and the
+    close-then-refile ping-pong cannot be closed.
+
+    Driven against a REAL ``EscalationQueue`` and asserted on the PERSISTED
+    record, not the in-memory object: an unserialised field would look correct
+    here and match nothing in production.
+    """
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    def _only_pending(self, queue, task_id: str = '42'):
+        pending = queue.get_by_task(task_id, status='pending')
+        assert len(pending) == 1, f'expected exactly one pending record; got {[e.id for e in pending]}'
+        return pending[0]
+
+    def test_discovery_mode_citation_is_stamped(self, tmp_path) -> None:
+        """(1) A DISCOVERY-mode reject stamps the discovered citation sha."""
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='harness-reconcile',
+        )
+
+        assert self._only_pending(queue).citation_sha == 'a' * 40, (
+            'the discovered citation must survive onto the persisted record'
+        )
+
+    def test_candidate_mode_citation_is_stamped(self, tmp_path) -> None:
+        """(2) CANDIDATE mode — citation == effect_check_sha == the candidate sha."""
+        queue = self._queue(tmp_path)
+        candidate = 'd' * 40
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42',
+            _verdict('effect_absent', citation=candidate, effect_check_sha=candidate),
+            agent_role='orchestrator-merge-worker',
+        )
+
+        assert self._only_pending(queue).citation_sha == candidate
+
+    def test_no_citation_verdict_stamps_none(self, tmp_path) -> None:
+        """(3) A no_citation reject has no evidence identity — and must never gain one.
+
+        ``_reject('no_citation')`` returns BEFORE the citation is assigned, so
+        this arm is None by construction and can never be suppressed.
+        """
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42',
+            _verdict('no_citation', citation=None, effect_check_sha=None),
+            agent_role='harness-reconcile',
+        )
+
+        assert self._only_pending(queue).citation_sha is None, (
+            'a no_citation reject must carry no evidence identity'
+        )
+
+    def test_the_rest_of_the_record_is_unchanged(self, tmp_path) -> None:
+        """(4) The stamp is additive — every other field files exactly as before."""
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', _verdict('effect_absent'),
+            agent_role='orchestrator-merge-worker',
+        )
+
+        esc = self._only_pending(queue)
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'provenance_unattributed'
+        assert esc.suggested_action == 'investigate_unattributed_landing_evidence'
+        assert esc.agent_role == 'orchestrator-merge-worker'
