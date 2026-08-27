@@ -2184,6 +2184,20 @@ def file_unattributed_landing_escalation(
     open L1 per category rather than one overall — in exchange for not hiding
     provenance defects behind unrelated escalations. Do not widen it back.
 
+    **The filed record carries its evidence identity** (task 4499). The
+    rejected verdict's ``probe['citation']`` — the commit whose landing could
+    not be attributed — is stamped onto the record as ``citation_sha``, so
+    that after the auto-watcher resolves it the ARCHIVED resolution still
+    answers "which evidence was this?". That read-after-resolve is what makes
+    an identical refile recognisable. ``.get`` rather than ``[...]``: this is
+    a best-effort helper and a caller passing a hand-built probe without the
+    key must degrade to ``None`` (no identity, never suppressed) rather than
+    raise. ``probe['citation']`` is populated in BOTH validation modes
+    (CANDIDATE = the candidate sha; DISCOVERY = the discovered citation) and
+    stays ``None`` for a ``no_citation`` reject, which returns before the
+    citation is ever assigned — so that arm carries no identity by
+    construction.
+
     Args:
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
         task_id: The task (or coalesce member) id the escalation is filed for.
@@ -2200,6 +2214,7 @@ def file_unattributed_landing_escalation(
             task_id, category='provenance_unattributed',
         ):
             return
+        citation_sha = verdict.probe.get('citation')
         from escalation.models import Escalation  # noqa: PLC0415
 
         summary, detail = format_unattributed_landing_detail(task_id, branch, verdict)
@@ -2213,6 +2228,15 @@ def file_unattributed_landing_escalation(
             detail=detail,
             suggested_action='investigate_unattributed_landing_evidence',
             level=1,
+            # The evidence identity this filing could not attribute — the
+            # identity half of the ``(task_id, category, citation_sha)``
+            # triple read back AFTER this record is resolved to suppress an
+            # identical refile.  Without the stamp there is nothing to match
+            # on and the close-then-refile ping-pong cannot be closed.
+            # ``.get``, not ``[...]``: a caller passing a hand-built probe
+            # without the key must degrade to None (= never suppress) rather
+            # than raise inside this best-effort helper.
+            citation_sha=citation_sha,
         )
         escalation_queue.submit(esc)
         logger.warning(
