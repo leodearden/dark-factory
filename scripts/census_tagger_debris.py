@@ -53,7 +53,8 @@ via ``python -m``. Its CLI tests drive ``main()`` by shelling out
 processes: they resolve ``import audit_wiped_metadata_files`` and
 ``import _task_db_scan`` solely because a DIRECTLY-EXECUTED script places its
 own directory at ``sys.path[0]``. Either change breaks every CLI test at once.
-Same contract, same reasons, as ``_task_db_scan.py:93-103``.
+Same contract, same reasons, as the "IMPORT-RESOLUTION CONTRACT" section of
+``scripts/_task_db_scan.py``'s module docstring.
 """
 from __future__ import annotations
 
@@ -84,7 +85,8 @@ from _task_db_scan import (
 # record's current scope" is BYTE-IDENTICAL to the audit's and the repair's
 # — the three scripts can then never disagree about the same record (INV-5).
 # Precedent for importing audit internals including underscore names:
-# repair_wiped_metadata_files.py:65-74.
+# ``scripts/repair_wiped_metadata_files.py``'s module-level
+# ``from audit_wiped_metadata_files import`` block.
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
     FIDELITY_LOCK_LEVEL,
@@ -122,14 +124,14 @@ STATUS_NON_TERMINAL = "non_terminal"
 #
 # THREE VALUES, NOT TWO — and the correction is the whole point of schema v2.
 # v1 counted ANY post-stamp ``lock_acquired`` as proof the guess had been
-# superseded. It is not. ``Scheduler._get_modules``
-# (orchestrator/src/orchestrator/scheduler.py:8797-8801) computes the locked
-# module set as ``derive_modules(metadata["files"], depth)`` — STRAIGHT FROM
-# ``metadata.files``, which for a never-reconciled tagger-stamped record IS the
-# tagger's guess. A post-stamp lock is therefore an ECHO of the guess, not an
-# independent scope assertion, for exactly the population this census exists to
-# flag. Measured on the v1 artifact: 278 of 286 plan_reconciled verdicts (97%)
-# rested on a lock alone, and 267 of 507 records were called reconciled while
+# superseded. It is not.
+# ``orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules``
+# computes the locked module set as ``derive_modules(metadata["files"], depth)``
+# — STRAIGHT FROM ``metadata.files``, which for a never-reconciled
+# tagger-stamped record IS the tagger's guess. A post-stamp lock is therefore an
+# ECHO of the guess, not an independent scope assertion, for exactly the
+# population this census exists to flag. Measured on the v1 artifact: 278 of
+# 286 plan_reconciled verdicts (97%) rested on a lock alone, and 267 of 507 records were called reconciled while
 # still carrying a non-empty ``metadata.files``.
 #
 #   plan_reconciled  — a set_to_plan / phase_skipped{plan_files} event
@@ -147,8 +149,10 @@ STATUS_NON_TERMINAL = "non_terminal"
 # THE ASSUMPTION never_reconciled RESTS ON, STATED PLAINLY.
 # ``_lock_echoes_guess`` — and the whole never_reconciled class — treats a
 # stamped record's ``metadata.files`` as the tagger's guess. For a large
-# sub-population that is FALSE. harness.py:3029-3051 stamps ``files_tagged_at``
-# onto EVERY task in the untagged batch, but writes the ``files`` key only when
+# sub-population that is FALSE.
+# ``orchestrator/src/orchestrator/harness.py::Harness._tag_task_modules`` stamps
+# ``files_tagged_at`` onto EVERY task in the untagged batch, but writes the
+# ``files`` key only when
 # the prediction sanitizes to a non-empty file-level list; otherwise the
 # sentinel goes in alone and ``update_task``'s default merge mode "preserves
 # any pre-existing real files rather than clobbering them". Such a record
@@ -392,10 +396,11 @@ def _files_match_prior_plan(
     "nothing superseded the current scope" — NOT "the current scope is the
     tagger's guess". The tagger stamped ``files_tagged_at`` on every task in
     its batch but wrote ``files`` only when its prediction sanitized to a
-    non-empty file-level list (harness.py:3029-3051), and ``update_task``'s
-    default merge preserves pre-existing real files. So a stamped record may be
-    carrying a genuine pre-tagger scope that was never damaged, and a repair
-    acting on the strict live-victim cell could "fix" it.
+    non-empty file-level list
+    (``orchestrator/src/orchestrator/harness.py::Harness._tag_task_modules``),
+    and ``update_task``'s default merge preserves pre-existing real files. So a
+    stamped record may be carrying a genuine pre-tagger scope that was never
+    damaged, and a repair acting on the strict live-victim cell could "fix" it.
 
     True here is evidence that this is such a record: a plan event that PREDATES
     the stamp already named every path ``metadata.files`` currently holds, so
@@ -503,8 +508,10 @@ def classify_record(
     # exactly the wipe signal this census exists to surface.
     #
     # THAT REASONING ASSUMES A RECORD IS STAMPED ONCE, and under the tagger's
-    # DEFAULT path it is: harness.py:2920 skips any task already carrying
-    # ``files`` or ``files_tagged_at``. A FORCE-RETAG (harness.py:2929) breaks
+    # DEFAULT path it is:
+    # ``orchestrator/src/orchestrator/harness.py::Harness._tag_task_modules``
+    # skips any task already carrying ``files`` or ``files_tagged_at``. A
+    # FORCE-RETAG (that same function's ``force=True`` path) breaks
     # the assumption — ``files_tagged_at`` is a single mutable field overwritten
     # in place, so a lock derived from the FIRST guess predates the SECOND stamp
     # and is counted here as authoritative prior scope, yielding a false
@@ -537,7 +544,8 @@ def classify_record(
 def _connect_readonly(path: str) -> sqlite3.Connection:
     """Open *path* through a read-only SQLite URI.
 
-    The IDENTICAL spelling as audit_wiped_metadata_files.load_task_records:492.
+    The IDENTICAL spelling as
+    ``scripts/audit_wiped_metadata_files.py::load_task_records``.
     Kept as a single named helper so every corpus connection this module opens
     is provably the same one, and so the "cannot write" property is testable
     against the opener itself rather than re-asserted per call site.
@@ -847,8 +855,8 @@ def census_project(project_root: str) -> ProjectCensus:
 # The report.
 #
 # Bump this and record what changed right here, the way
-# census_memory_metadata.py:446-458 does, so a consumer reading an older
-# artifact can tell what it is looking at.
+# ``fused-memory/scripts/census_memory_metadata.py::build_report`` does, so a
+# consumer reading an older artifact can tell what it is looking at.
 #
 # v1 — the initial shape: schema_version, params, projects (per-project totals
 #      plus per-axis and eight-cell counts), records (the COMPLETE population,
@@ -879,8 +887,10 @@ def census_project(project_root: str) -> ProjectCensus:
 #      ``metadata.files`` IS the tagger's guess, and for a large sub-population
 #      that is false: the tagger stamped every task in its batch but wrote the
 #      ``files`` key only when its prediction sanitized to a non-empty
-#      file-level list (harness.py:3029-3051), so a record can carry a GENUINE
-#      pre-tagger scope the sentinel-only write preserved. Such a record can
+#      file-level list
+#      (``orchestrator/src/orchestrator/harness.py::Harness._tag_task_modules``),
+#      so a record can carry a GENUINE pre-tagger scope the sentinel-only write
+#      preserved. Such a record can
 #      land in the strict live-victim cell without ever having been damaged.
 #      What changed:
 #        * every record gained ``metadata_files_match_prior_plan`` (bool): a
@@ -1044,7 +1054,7 @@ def build_report(
 # Resolved __file__-relatively, never as a hardcoded absolute path, so a copy
 # of this script running from a task worktree writes into ITS OWN tree rather
 # than the main checkout. Same reasoning and same form as
-# repair_wiped_metadata_files.py:79-82 (tasks 2881/2882).
+# ``scripts/repair_wiped_metadata_files.py::_SHARED_SRC`` (tasks 2881/2882).
 # ---------------------------------------------------------------------------
 
 _PLANS_DIR = Path(__file__).resolve().parent.parent / "plans"
@@ -1261,9 +1271,9 @@ def render_markdown(report: dict) -> str:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via a same-directory tempfile plus os.replace.
 
-    Mirrors bake_off_storage_shape._atomic_write_text:2590-2606. A reader can
-    never observe a half-written artifact, and a failed write leaves the
-    previous file intact rather than truncated.
+    Mirrors ``fused-memory/scripts/bake_off_storage_shape.py::_atomic_write_text``.
+    A reader can never observe a half-written artifact, and a failed write
+    leaves the previous file intact rather than truncated.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(suffix=".tmp", prefix=f"{path.name}.", dir=str(path.parent))
@@ -1307,10 +1317,10 @@ def write_artifacts(report: dict, json_path: Path, md_path: Path) -> tuple[Path,
 # through it would make task 4525's mandated user-observable signal,
 # "re-running the script reproduces the counts (exit 0)", structurally
 # unreachable. That is the identical exit-1 SEMANTIC collision
-# _task_db_scan.py:66-72 already records as one of the four reasons
-# repair_wiped_metadata_files.py keeps its own ladder. run_audit_cli
-# additionally prints its rendered report unconditionally and has nowhere to
-# write artifacts.
+# ``scripts/_task_db_scan.py``'s module docstring (reason 3) already records as
+# one of the four reasons repair_wiped_metadata_files.py keeps its own ladder.
+# run_audit_cli additionally prints its rendered report unconditionally and has
+# nowhere to write artifacts.
 #
 # sweep_project_roots carries none of that and IS adopted: it is a pure
 # synchronous warn-and-continue loop whose one-result-per-root-or-raise

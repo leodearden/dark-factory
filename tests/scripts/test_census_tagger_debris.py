@@ -9,9 +9,9 @@ machine-readable candidate set instead of a prose claim.
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 This norm is inherited verbatim from both sibling suites —
 scripts/tests/test_audit_wiped_metadata_files.py and
-tests/scripts/test_repair_wiped_metadata_files.py:11-21, the latter citing a
-candidate count that moved 40 -> 43 -> 45 across a single task's planning
-sessions with one id changing signature class in between. The six corpora are
+tests/scripts/test_repair_wiped_metadata_files.py's module docstring, the
+latter citing a candidate count that moved 40 -> 43 -> 45 across a single
+task's planning sessions with one id changing signature class in between. The six corpora are
 mutated continuously by six running orchestrators, so a test pinning "the live
 DB yields N stamped records" would be a guessed threshold that goes red the
 moment any task merges. Every assertion below runs against synthetic tuples or
@@ -275,8 +275,8 @@ def test_absent_evidence_is_explicitly_null_not_a_missing_key():
 #
 # THE DEFECT THESE TESTS PIN SHUT. v1 treated ANY post-stamp lock_acquired as
 # proof that a real derivation superseded the tagger's guess. It is not:
-# Scheduler._get_modules (orchestrator/src/orchestrator/scheduler.py:8797-8801)
-# computes the locked module set as derive_modules(metadata["files"], depth) —
+# orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules computes
+# the locked module set as derive_modules(metadata["files"], depth) —
 # straight from metadata.files, which for a never-reconciled tagger-stamped
 # record IS the guess. A post-stamp lock is therefore an ECHO of the guess, not
 # evidence against it, and v1 was reporting the majority of live victims to
@@ -576,12 +576,14 @@ def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
 # ---------------------------------------------------------------------------
 # Synthetic corpus fixtures.
 #
-# Copied in SHAPE from tests/scripts/test_repair_wiped_metadata_files.py:946-1051
-# rather than imported: scripts/tests/conftest.py's ``make_tasks_db`` fixture
+# Copied in SHAPE from tests/scripts/test_repair_wiped_metadata_files.py's
+# ``_make_tasks_db`` / ``_make_runs_db`` / ``_make_project`` helpers rather than
+# imported: scripts/tests/conftest.py's ``make_tasks_db`` fixture
 # does not reach this directory (tests/scripts/conftest.py is sys.path wiring
 # only), and the two test directories cannot share imports for the same reason
-# recorded at orchestrator/tests/test_deterministic_runner.py:31-32. The schemas
-# mirror the live ones so the census exercises real column shapes.
+# recorded in the header comment above
+# orchestrator/tests/test_deterministic_runner.py::POLLUTED_PREDICATE_OUTPUT.
+# The schemas mirror the live ones so the census exercises real column shapes.
 #
 # Two deliberate departures from that sibling:
 #   * ``_make_runs_db`` honours an explicit per-event ``timestamp``, falling
@@ -911,7 +913,9 @@ def test_scope_event_sources_are_derived_from_the_audits_table_not_re_spelled():
 
 def test_set_to_plan_and_phase_skipped_carry_their_audit_fidelities(tmp_path):
     """(a) A set_to_plan payload is DELIBERATELY lock-level (it carries the
-    module set, per event_store.py:77-82), while phase_skipped.plan_files is
+    module set, per
+    orchestrator/src/orchestrator/event_store.py::EventType.set_to_plan), while
+    phase_skipped.plan_files is
     true file-level. Fidelity stays load-bearing here for the same reason it is
     in the audit: a module path must never be mistaken for a plan.files entry."""
     db_path = _make_runs_db(
@@ -1103,8 +1107,9 @@ def test_an_empty_task_id_set_returns_nothing(tmp_path):
 
 def test_census_project_reports_only_stamped_records_sorted_numerically(tmp_path):
     """(a) 100 must FOLLOW 20, not precede it. Same reason the audit sorts on
-    int(task_id) at _candidate_sort_key:573-578: a lexical id order makes an
-    operator scanning the artifact lose their place."""
+    int(task_id) at scripts/audit_wiped_metadata_files.py::_candidate_sort_key:
+    a lexical id order makes an operator scanning the artifact lose their
+    place."""
     root = _make_project(
         tmp_path,
         tasks=[
@@ -1739,8 +1744,9 @@ def test_default_output_paths_are_the_tasks_user_observable_signal():
 # Driven by SUBPROCESS, never `python -m`: a directly-executed script places
 # its own directory at sys.path[0], which is the only reason the child resolves
 # `import audit_wiped_metadata_files` and `import _task_db_scan`. That is the
-# flat-sibling import contract at _task_db_scan.py:93-103, and `python -m`
-# would break every test below at once.
+# flat-sibling import contract in the "IMPORT-RESOLUTION CONTRACT" section of
+# scripts/_task_db_scan.py's module docstring, and `python -m` would break every
+# test below at once.
 #
 # Not one test here points at a live corpus.
 # ---------------------------------------------------------------------------
@@ -1963,7 +1969,7 @@ def test_json_flag_prints_the_report_instead_of_writing(tmp_path):
 # instead of adopting _task_db_scan.run_audit_cli. The shared constants are
 # IMPORTED, never re-spelled as 0/2/3 literals, or the guard would drift
 # exactly as the thing it guards against. Same shape as
-# test_repair_wiped_metadata_files.py:1685.
+# tests/scripts/test_repair_wiped_metadata_files.py::test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder.
 # ---------------------------------------------------------------------------
 
 
