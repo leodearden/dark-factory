@@ -1987,36 +1987,44 @@ class TestPytestXdistSerialOverrideCluster:
     def _cluster(cls):
         return _seeded_cluster(cls.TOPIC_ID)
 
-    def test_hint_returned_to_a_non_curator_names_all_three_outcomes(self):
+    def test_rendered_hint_names_all_three_outcomes(self):
         """The rendered hint -- not the bare cluster field -- must name all three.
 
         Asserted through ``build_topic_cluster_block`` (not ``cluster.hint``
-        alone) with a real non-curator, non-recon ``agent_id``, because
-        ``build_topic_cluster_block`` resolves ``cluster.hint or
-        _TOPIC_CLUSTER_DEFAULT_HINT`` -- asserting on the module default here
+        alone), because ``build_topic_cluster_block`` resolves ``cluster.hint
+        or _TOPIC_CLUSTER_DEFAULT_HINT`` -- asserting on the module default here
         would pass vacuously, since this cluster always sets its own hint.
         The explicit ``!= _TOPIC_CLUSTER_DEFAULT_HINT`` assertion guards
         against exactly that vacuous-pass mode, which is how the previous
         dead-end hint survived four rounds of triage undetected.
+
+        Reviewer (test-quality, task 4738 amendment): renamed from
+        ``..._returned_to_a_non_curator_...`` -- ``build_topic_cluster_block``
+        never reads ``agent_id`` to select the hint, only echoes it into the
+        block, so this was never actually an agent-conditional test; the name
+        no longer claims a discrimination it can't make. ``matched_phrases``
+        is now derived from ``find_matching_topic_cluster`` on the realistic
+        excerpt below (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention), rather than hand-supplied, so the content string is
+        load-bearing rather than decorative.
 
         Each outcome is pinned by the literal the writer must ACT on, not by
         surrounding prose (the ``TestNpxPyrightEaccesAgentSandboxCluster``
         convention): ``allow_near_duplicate`` for the override, ``skip`` +
         ``curate-fused-memories`` for the sanctioned no-write outcome (the
         skill name is what makes "skip" a real answer rather than an implied
-        failure -- it names who DOES own consolidation), and ``escalate`` for
-        the unsure/contradicts outcome.
+        failure -- it names who DOES own consolidation), and
+        ``escalate_blocker`` -- the actual tool name, not just the bare word
+        "escalate" -- for the unsure/contradicts outcome.
         """
         content = (
             'Hit the pytest-xdist -n0 serial-override workaround again: '
             'fused-memory/pyproject.toml hardcodes --dist loadgroup in addopts.'
         )
-        block = build_topic_cluster_block(
-            'claude-merge-3875',
-            content,
-            self._cluster(),
-            ['--dist loadgroup', '-p no:xdist', 'pytest-xdist'],
-        )
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
         hint = block['hint']
         assert block['topic_id'] == self.TOPIC_ID
         assert block['error_type'] == 'ProceduralKnowledgeKnownTopicClusterWriteRejected'
@@ -2027,32 +2035,42 @@ class TestPytestXdistSerialOverrideCluster:
         # is attributed to the interactive curation skill, not to this agent.
         assert 'skip' in hint.lower()
         assert 'curate-fused-memories' in hint
-        # Outcome 3: unsure / contradicts -> escalate, don't retry.
-        assert 'escalate' in hint.lower()
+        # Outcome 3: unsure / contradicts -> escalate, naming the actual tool.
+        assert 'escalate_blocker' in hint
 
-    def test_hint_does_not_route_a_non_curator_to_a_refused_amend(self):
-        """Pins that the IMPERATIVE is gone, not the word 'consolidate'.
+    def test_rendered_hint_does_not_route_to_a_refused_amend(self):
+        """Pins that the IMPERATIVE is gone, and that the authz reason survives.
 
-        The new hint legitimately uses 'consolidating ... belongs to a
-        curation sitting' when attributing that work to a different actor,
-        so this asserts the specific dead-end imperative phrase and the raw
-        tool name are both absent -- not the topic word alone.
+        Reviewer (test-quality, task 4738 amendment): this used to also
+        assert ``'update/consolidate canonical memory' not in hint`` -- the
+        exact wording of the phrase that had just been deleted. That pins one
+        2026-08 rephrasing, not the contract: it would stay green even if a
+        future hint reintroduced the same dead-end imperative in different
+        words ('amend the canonical entry in place'). Dropped in favour of
+        the tool-name pin below plus a positive, behavioural pin: the hint
+        must still STATE why the amend arm is refused, so a future edit that
+        quietly reroutes this audience back toward an amend -- without
+        removing that explanation -- is caught too.
+
         ``update_memory``'s content-amend arm is authz-gated to
         ``recon-stage-`` / ``curator-`` agent_id prefixes
         (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``, esc-3524-1
         ruling (b) 2026-08-11 + the 2026-08-12 all-deployments schema-default
         ruling), so routing this audience to call it directly reproduces the
         exact defect this task fixes.
+
+        Also renamed from ``..._a_non_curator_...``, for the same reason as
+        the sibling test above: ``agent_id`` is inert for hint rendering.
         """
-        block = build_topic_cluster_block(
-            'claude-merge-3875',
-            'pytest-xdist -n0 --dist loadgroup workaround again',
-            self._cluster(),
-            ['--dist loadgroup', '-n0'],
-        )
+        content = 'pytest-xdist -n0 --dist loadgroup workaround again'
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
         hint = block['hint']
-        assert 'update/consolidate canonical memory' not in hint
         assert 'update_memory' not in hint
+        assert 'authz-gated' in hint
+        assert 'recon-stage-' in hint
 
     def test_cluster_phrases_and_threshold_are_unchanged(self):
         """Characterization: step-2's hint-only edit must not touch the matcher.
