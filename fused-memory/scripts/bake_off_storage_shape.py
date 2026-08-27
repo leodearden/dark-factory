@@ -4332,7 +4332,57 @@ def _read_fetch_cache(path: str | Path) -> tuple[Path, dict[str, Any]]:
     return target, doc
 
 
-def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
+@dataclass(frozen=True)
+class FetchCache:
+    """One decode of a cache document, carried to every consumer that needs it.
+
+    The committed E2 fixture is a 32k-line JSON document, and the replay path
+    has several consumers that each want a different piece of it — the
+    provenance block for the live-only protocol values, the ``arms`` block
+    for the rankings, and the provenance block AGAIN for the fingerprint,
+    depth and fixture guards.  Threading the decoded document is what keeps
+    that one read rather than one read per consumer.
+
+    Deliberately NOT a path-keyed memo: several tests rewrite the same file
+    between calls, and a cache keyed on the path would serve them stale bytes
+    and silently invert what they assert.  Freshness stays the caller's
+    decision — a new :func:`read_fetch_cache` on a path always re-reads.
+    """
+
+    path: Path
+    doc: dict[str, Any]
+    provenance: dict[str, Any]
+
+
+def _extract_provenance(target: Path, doc: dict[str, Any]) -> dict[str, Any]:
+    """The provenance block of an already-decoded cache document."""
+    provenance = doc.get('provenance')
+    if not isinstance(provenance, dict):
+        raise FetchCacheError(
+            f'fetch cache at {target} carries no provenance block, so the '
+            f'guard threshold and embedder model this run was measured at are '
+            f'unknown. Defaulting either would feed the threshold replay a '
+            f'number the store never produced.'
+        )
+    return provenance
+
+
+def read_fetch_cache(path: str | Path | FetchCache) -> FetchCache:
+    """Decode a cache document once, or pass an already-decoded one through.
+
+    Idempotent on a :class:`FetchCache` so threading one through a second
+    consumer cannot double-read it — that is the whole point of the type, and
+    a consumer that re-read what it was handed would quietly undo it.
+    """
+    if isinstance(path, FetchCache):
+        return path
+    target, doc = _read_fetch_cache(path)
+    return FetchCache(
+        path=target, doc=doc, provenance=_extract_provenance(target, doc),
+    )
+
+
+def load_fetch_provenance(path: str | Path | FetchCache) -> dict[str, Any]:
     """The dump's provenance block — the live-only half of a replayed report.
 
     Separate from :func:`load_fetches` because the driver needs it BEFORE it
@@ -4340,16 +4390,7 @@ def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
     into the protocol block), and because reading it must not require the
     caller to have already built every arm.
     """
-    _, doc = _read_fetch_cache(path)
-    provenance = doc.get('provenance')
-    if not isinstance(provenance, dict):
-        raise FetchCacheError(
-            f'fetch cache at {Path(path)} carries no provenance block, so the '
-            f'guard threshold and embedder model this run was measured at are '
-            f'unknown. Defaulting either would feed the threshold replay a '
-            f'number the store never produced.'
-        )
-    return provenance
+    return read_fetch_cache(path).provenance
 
 
 def _check_kind_coverage(
@@ -4464,7 +4505,7 @@ def _check_fixture_digests(
 
 
 def load_fetches(
-    path: str | Path,
+    path: str | Path | FetchCache,
     seeded_by_shape: dict[str, SeededArm],
     *,
     expect_query_ids: list[str] | None = None,
@@ -4495,9 +4536,13 @@ def load_fetches(
     ``fetched['probes'][cluster_id]`` bare, so a probes half checked only via
     the queries guard would fail as an unnamed ``KeyError`` inside the metric
     code rather than as this module's named refusal.
+
+    *path* accepts an already-read :class:`FetchCache` as well as a path, so
+    a driver with several consumers decodes the document once and threads it
+    rather than re-parsing it per guard.
     """
-    target, doc = _read_fetch_cache(path)
-    provenance = load_fetch_provenance(path)
+    cache = read_fetch_cache(path)
+    target, doc, provenance = cache.path, cache.doc, cache.provenance
     cached_arms = doc.get('arms')
     if not isinstance(cached_arms, dict):
         raise FetchCacheError(
@@ -5748,7 +5793,12 @@ async def _replay_bake_off(
     the two pass keys are then never requested, which is what keeps a cache
     dumped before this probe existed replayable for the six arms.
     """
-    provenance = load_fetch_provenance(cache_path)
+    # ONE decode of the cache document, threaded to every consumer below.
+    # Its refusals — missing file, bad JSON, wrong schema version, no
+    # provenance block — still fire FIRST and unchanged; they simply fire from
+    # here rather than from inside the first `load_fetches`.
+    cache = read_fetch_cache(cache_path)
+    provenance = cache.provenance
     for key in ('guard_threshold', 'embedder_model'):
         if provenance.get(key) is None:
             raise FetchCacheError(
@@ -5780,7 +5830,7 @@ async def _replay_bake_off(
     # list rather than a skipped guard — do NOT convert `[]` to `None`.
     expect_probe_ids = [cluster_id for cluster_id, _probe in probes]
     replayed = load_fetches(
-        cache_path, seeded_by_shape,
+        cache, seeded_by_shape,
         expect_query_ids=[query.query_id for query in queries],
         expect_probe_ids=expect_probe_ids,
         expect_limit=limit,
@@ -5827,7 +5877,7 @@ async def _replay_bake_off(
         # which `read_transform_selection` reads) carries no injection digest,
         # and a merged list would make it unloadable for the E2 arms.
         replayed_passes = load_fetches(
-            cache_path, seeded_by_pass,
+            cache, seeded_by_pass,
             expect_query_ids=[query.query_id for query in queries],
             # For the same reason the fixture expectation is repeated here:
             # the two calls guard two different sets of rankings and each has
