@@ -1156,3 +1156,189 @@ class TestTTLCacheBypassRechecksFreshness:
             'the re-check must not be "fixed" into an unconditional cache '
             'read that starves a genuinely cold key'
         )
+
+
+async def _named_refresh() -> str:
+    """Module-level refresh stub whose ``__qualname__`` is a stable, asserted string.
+
+    All eight live TTLCache call sites pass a locally-defined closure
+    (``fetch_tasks.<locals>._refresh``, ...), so the qualname is what
+    disambiguates *which* cache instance bypassed without a ``name=``
+    constructor argument. This module-level stand-in gives the tests below a
+    fixed, predictable qualname to assert against.
+    """
+    return 'value'
+
+
+class TestTTLCacheLockBypassLogging:
+    """A lock-acquisition bypass must be VISIBLE, but not a log flood.
+
+    A silent bypass would hide the next occurrence — the same invisibility
+    that let the 2026-08-27 incident run 19.8h unnoticed. Mirrors the
+    transition-only WARNING policy already established for fan-out failures
+    (see TestFanoutFailureThrottling above): WARNING on the first bypass of a
+    streak and every ``_LOCK_BYPASS_REWARN_EVERY``-th thereafter, DEBUG for
+    the repeats, WARNING again on recovery.
+    """
+
+    @staticmethod
+    async def _force_bypass(cache, key, refresh):
+        """Force exactly one bypass for *key*: hold its lock, call get_or_refresh, release.
+
+        Always passes ``cache_ok=False`` so the key never actually warms up —
+        a ``cache_ok=True`` bypass would store a value and let the very next
+        call take the lock-free warm fast path, never touching the lock (or
+        this logging) again.
+        """
+        lock = cache._locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        try:
+            return await asyncio.wait_for(
+                cache.get_or_refresh(key, refresh, cache_ok=lambda v: False), 5.0
+            )
+        finally:
+            lock.release()
+
+    async def test_first_bypass_warns_naming_the_key_and_the_refresh(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._force_bypass(cache, 'my-key', _named_refresh)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'my-key' in message, f'warning must name the key, got: {message}'
+        assert _named_refresh.__qualname__ in message, (
+            f'warning must name the refresh callable, got: {message}'
+        )
+
+    async def test_repeated_bypasses_for_one_key_do_not_flood_warning(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            for _ in range(5):
+                await self._force_bypass(cache, 'k', _named_refresh)
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        debugs = [r for r in records if r.levelno == logging.DEBUG]
+
+        assert len(warnings) == 1, (
+            f'a sustained bypass streak must warn exactly once, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        assert len(debugs) == 4, (
+            f'the 4 repeats must still be recorded at DEBUG, got '
+            f'{[r.getMessage() for r in debugs]}'
+        )
+
+    async def test_a_long_bypass_streak_still_heartbeats_at_warning(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(fanout_mod, '_LOCK_BYPASS_REWARN_EVERY', 3)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            for _ in range(3):
+                await self._force_bypass(cache, 'k', _named_refresh)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 2, (
+            f'an outage outliving log rotation must still heartbeat, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_streaks_are_tracked_per_key(self, monkeypatch, caplog):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._force_bypass(cache, 'a', _named_refresh)
+            await self._force_bypass(cache, 'a', _named_refresh)  # demoted to DEBUG
+            await self._force_bypass(cache, 'b', _named_refresh)  # independent streak
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 2, (
+            f"each key's streak reports independently, got "
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_a_recovered_key_logs_a_closing_warning_and_re_arms(
+        self, monkeypatch, caplog
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        key = 'recovering-key'
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._force_bypass(cache, key, _named_refresh)
+            await self._force_bypass(cache, key, _named_refresh)  # demoted to DEBUG
+
+            # Nobody holds the lock now, so this acquires NORMALLY. cache_ok
+            # stays False so the key remains cold and the NEXT call also
+            # goes through the lock rather than the warm fast path.
+            await cache.get_or_refresh(key, _named_refresh, cache_ok=lambda v: False)
+
+            # A further normal acquisition logs nothing more (streak already closed).
+            await cache.get_or_refresh(key, _named_refresh, cache_ok=lambda v: False)
+
+            # A later bypass re-arms the opening WARNING.
+            await self._force_bypass(cache, key, _named_refresh)
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(messages) == 3, f'expected open + recovery + re-open, got {messages}'
+        assert key in messages[1] and 'recovered' in messages[1], (
+            f'the streak needs a visible closing bracket naming the key, got {messages[1]}'
+        )
+
+    async def test_clear_resets_bypass_streak_state(self, monkeypatch, caplog):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        await self._force_bypass(cache, 'k', _named_refresh)
+        cache.clear()
+        caplog.clear()  # drop the opening WARNING captured above
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._force_bypass(cache, 'k', _named_refresh)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            'clear() must drop open bypass streaks so a later bypass warns '
+            f'again, got {[r.getMessage() for r in warnings]}'
+        )
