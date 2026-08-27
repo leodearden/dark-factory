@@ -15441,6 +15441,29 @@ class Harness:
             the MERGE-entry ``_check_scope_invariant`` divergence tripwire
             fires on.
 
+        The two halves are written DIFFERENTLY, and the asymmetry is the same
+        one ``workflow.py::TaskWorkflow._set_task_scope`` already has: plan.json
+        takes the RAW union (it is allowed directory charters, which
+        ``module_charter.derive_modules`` strips again at derive time), while
+        ``metadata.files`` goes through ``sanitize_files_for_persist`` per that
+        function's stated whole-repo contract — every ``metadata.files`` write
+        path must call it so the field only ever holds genuine file-level
+        paths. The hazard here is concrete, not theoretical: ``granted_files``
+        reaches this method UNVALIDATED (``escalation/server.py::resolve_issue``
+        and ``escalation/queue.py::EscalationQueue.resolve`` both write whatever
+        the steward typed through verbatim), and a single unsanitized
+        directory entry makes the ``lock_charter_guard`` middleware reject the
+        ENTIRE payload as a ``LockCharterViolation`` — which
+        ``scheduler.py::Scheduler.update_task`` classifies as a failure — so
+        the VALID file-level entries in the same grant are silently dropped
+        alongside it. That is the incident class of commit 54ec90fefc.
+        A grant that sanitizes down to what ``metadata.files`` already holds
+        (e.g. an all-directory one) skips the ``update_task`` round-trip
+        entirely rather than re-writing an unchanged list: same rule as
+        ``_tag_task_modules``' "an all-directory prediction … is treated
+        exactly like an empty/omitted one (sentinel alone, no clobber)". The
+        flip and the plan write are unaffected.
+
         Deliberately does NOT call ``handle_blast_radius_expansion``: the slot
         exit already released every module lock this task held, so there is no
         live lock to expand. The next dispatch acquires from the widened
@@ -15544,18 +15567,48 @@ class Harness:
                 or plan.get('_revalidated_by_session')
                 or f'harness-repend:{task_id}',
             )
+            # metadata.files takes only the FILE-LEVEL entries — see "The two
+            # halves are written differently" above. plan.json keeps the raw
+            # union written just now.
+            honest = sanitize_files_for_persist(union)
+            dropped = sorted(set(union) - set(honest))
+            if dropped:
+                # Mirrors _persist_files_metadata's dropped-entry diagnostic.
+                logger.debug(
+                    'granted-files fold: task %s — %d directory-shaped entr%s '
+                    '(%s) have no file-level representation in metadata.files '
+                    'and were stripped before the persist; they survive in '
+                    'plan.json and are α-stripped again at derive time by '
+                    'module_charter.derive_modules',
+                    task_id, len(dropped), 'ies' if len(dropped) > 1 else 'y',
+                    dropped,
+                )
+            if honest == sanitize_files_for_persist(current):
+                # An all-directory grant widens plan.json but has nothing NEW
+                # to persist to metadata — the same rule _tag_task_modules
+                # applies ("an all-directory prediction sanitizes to [] and is
+                # treated exactly like an empty/omitted one (sentinel alone, no
+                # clobber)"). The flip and the plan write still happen.
+                logger.info(
+                    'granted-files fold: widened task %s plan.files %s → %s '
+                    'before the re-pend; metadata.files unchanged (%s — the '
+                    'grant carries no file-level entry) (grant %s)',
+                    task_id, current, union, honest, granted,
+                )
+                return
             # Same call shape as _check_reblock_guard's persist.
             # metadata_mode='merge': shallow last-write-wins, so the files key
             # is replaced wholesale while sibling metadata keys survive.
             # 'additive' resolves scalar conflicts OLD-wins and would not
             # replace the list.
             await self.scheduler.update_task(
-                task_id, {'files': union}, metadata_mode='merge',
+                task_id, {'files': honest}, metadata_mode='merge',
             )
             logger.info(
                 'granted-files fold: widened task %s scope %s → %s before the '
-                're-pend (grant %s)',
-                task_id, current, union, granted,
+                're-pend — plan.files got the raw union, metadata.files the '
+                'sanitized %s (grant %s)',
+                task_id, current, union, honest, granted,
             )
         except Exception:
             # Warn-and-continue by design — see the docstring. The plan write
