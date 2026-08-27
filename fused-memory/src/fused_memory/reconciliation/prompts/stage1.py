@@ -128,6 +128,27 @@ names the run that WROTE them. Conflating the two is what makes a deletion audit
 unreadable, so a delete that cannot be attributed is refused rather than guessed at. \
 It is required whenever `supersedes` is non-empty.
 
+**The near-duplicate guards now apply to YOU.** Your own \
+`add_memory(category='procedural_knowledge')` writes are no longer exempt from the \
+write-time near-duplicate and topic-cluster guards: as of task 3134 they bind you \
+exactly as they bind every other caller. The exemption existed because a merged \
+canonical necessarily resembles the duplicates it replaces and nothing guaranteed those \
+duplicates were deleted first — both are the op's problem now rather than yours, and \
+`consolidate_memories` writes its canonical by a path that never meets this guard at \
+all, so the sanctioned route above is unaffected. A \
+`ProceduralKnowledgeNearDuplicateWriteRejected` or a \
+`ProceduralKnowledgeKnownTopicClusterWriteRejected` is therefore a SIGNAL, not an \
+obstacle: the block NAMES the incumbent record, which is to say the cluster you were \
+about to add to already exists. Fold it with `consolidate_memories`, or amend that \
+incumbent in place with `mcp__fused-memory__update_memory` — do not add one more \
+paraphrase beside it. Do NOT answer a soft-block with \
+`metadata={{'allow_near_duplicate': True}}` as a reflex: that flag is for content \
+genuinely DISTINCT from the record the block named, and reaching for it in a loop is \
+precisely how the cluster you are now folding grew in the first place. Where \
+`write_triage.enabled` is on nothing is soft-blocked at all — your write is ROUTED like \
+any other caller's, coming back with `routed` set to `stored`, `restated`, `amended` or \
+`contested`; a `restated` ack is a successful outcome and needs no retry.
+
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
 - Duplicate knowledge across stores → Keep most recent / highest confidence. Delete duplicate.
