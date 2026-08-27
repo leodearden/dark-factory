@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
@@ -3305,6 +3306,107 @@ class TestApplyCitationVerification:
         assert state.delete_finding(run_id, finding_id).get('error') == 'report_already_completed'
         # flagged_count is untouched — only citation lists changed.
         assert len(state.get_findings_for_run(run_id)) == flagged_count_before
+
+    @pytest.mark.asyncio
+    async def test_repeat_pass_does_not_duplicate_citation_failure_markers(self):
+        """A second pass over the same (run_id, stage) is IDEMPOTENT.
+
+        The caller sends the FULL citation_failures list off the assembled
+        projection, not the delta it appended — and get_assembled_report
+        projects the already-persisted markers straight back out. A plain
+        extend therefore re-appended every prior marker on every repeat. A
+        repeat is architecturally reachable: start_report is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke stage.run() under the same run_id.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+        # Second pass sends exactly what get_assembled_report now projects: the
+        # surviving citation AND the marker the first pass persisted.
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert durable['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ], 'a repeat pass must not duplicate the marker it already persisted'
+        assert [c['memory_id'] for c in durable['cited_memories']] == [self._GOOD]
+
+    @pytest.mark.asyncio
+    async def test_repeat_verification_error_dedupes_across_error_types(self):
+        """The dedupe key is (memory_id, store, reason) — error_type excluded.
+
+        Two verification errors for the same citation record the same fact
+        ("this id could not be resolved") whichever exception class surfaced
+        it. Keying on error_type would let a flapping backend grow the list
+        without bound across repeat passes.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        def _err_result(error_type):
+            return [
+                {
+                    'finding_id': finding_id,
+                    'cited_memories': [
+                        {'memory_id': self._GOOD, 'store': 'mem0'},
+                        {'memory_id': self._PHANTOM, 'store': 'mem0'},
+                    ],
+                    'citation_failures': [
+                        {
+                            'memory_id': self._PHANTOM,
+                            'store': 'mem0',
+                            'reason': 'verification_error',
+                            'error_type': error_type,
+                        },
+                    ],
+                },
+            ]
+
+        state.apply_citation_verification(run_id, _err_result('TimeoutError'))
+        state.apply_citation_verification(run_id, _err_result('ConnectionError'))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert len(durable['citation_failures']) == 1, (
+            f'error_type must not split the dedupe key, got '
+            f'{durable["citation_failures"]!r}'
+        )
+        assert durable['citation_failures'][0]['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_no_op_result_does_not_repersist_the_run(self):
+        """A result that changes nothing must not drive a _persist_run.
+
+        _persist_run re-serialises and upserts EVERY entry of the run, and the
+        overwhelmingly common case is a clean verification pass where every
+        citation resolved. Recording "nothing moved" at the cost of a full-run
+        rewrite, once per stage per cycle, is pure waste.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        # Echo back exactly what the projection carries — which is what
+        # BaseStage.run() sends after a pass that dropped nothing. Built from
+        # the projection rather than hand-written so the no-op stays a no-op if
+        # cite_memory's entry shape ever gains a field.
+        projected = state.get_findings_for_run(run_id)[0]
+        no_op = [
+            {
+                'finding_id': finding_id,
+                'cited_memories': projected['cited_memories'],
+                'citation_failures': projected['citation_failures'],
+            },
+        ]
+        with patch.object(state, '_persist_run') as persist:
+            result = state.apply_citation_verification(run_id, no_op)
+
+        assert result['findings_updated'] == 1, 'the finding still RESOLVED'
+        assert result['findings_changed'] == 0, 'but nothing about it moved'
+        assert persist.call_count == 0, 'a no-op write-back must not re-persist the run'
 
     @pytest.mark.asyncio
     async def test_unknown_finding_id_is_skipped_not_raised(self):

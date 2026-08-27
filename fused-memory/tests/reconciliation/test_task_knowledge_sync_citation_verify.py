@@ -25,6 +25,7 @@ cite-time existence check — i.e. precisely the unchecked path this task closes
 
 from __future__ import annotations
 
+import logging
 from contextlib import ExitStack
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -299,3 +300,203 @@ async def test_stage2_graphiti_citation_preserved_and_never_resolved():
 
     assert report.stats['stage2_citations_verified'] == 1
     assert report.stats['stage2_phantom_citations_dropped'] == 0
+
+
+# ---------------------------------------------------------------------------
+# The two BaseStage branches this task adds that the tests above cannot reach:
+# the write-back through an ACTIVE ReconReportState from a NON-Stage-1 run, and
+# the write-back's degradation path. Everything above constructs the stage with
+# recon_report_state=None (the JSON-fallback branch), so without these the
+# write-back would only ever be covered for Stage 1.
+# ---------------------------------------------------------------------------
+
+
+class _CiteTimeMemoryService:
+    """recon_report.cite_memory's cite-time existence check — passes for EVERY
+    id, exactly as it does in production.
+
+    Load-bearing for these tests: the phantom must survive cite time and be
+    caught only by the later ``get_memory_by_id`` re-resolution, which is the
+    TOCTOU a cite-time-only check structurally cannot catch. A stub that
+    rejected the phantom here would never let it reach verification at all.
+    """
+
+    async def get_memory(self, memory_id, project_id, store):
+        return {'category': 'observations_and_summaries', 'agent_id': 'x', 'created_at': 'n'}
+
+
+def _make_rrs():
+    from fused_memory.server.recon_report import ReconReportState
+
+    return ReconReportState(
+        ttl_seconds=300, clock=lambda: 0.0, memory_service=_CiteTimeMemoryService()
+    )
+
+
+_RRS_RUN_ID = 'run-stage2-rrs-cite'
+_GOOD_ID = 'aaaaaaaa-1111-4111-8111-111111111111'
+_PHANTOM_ID = 'bbbbbbbb-2222-4222-8222-222222222222'
+
+
+async def _run_stage2_with_rrs(deps: dict, state, cited: tuple[str, ...]):
+    """Drive TaskKnowledgeSync.run() with *state* ACTIVE (the RRS path).
+
+    The mocked CLI files the finding and its citations into recon_report state
+    and completes — the real ordering, all strictly BEFORE BaseStage.run()
+    assembles and verifies.
+    """
+    from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+    stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps, recon_report_state=state)
+    stage._current_run_id = _RRS_RUN_ID
+
+    async def _fake_cli(**_kwargs):
+        finding_id = state.add_finding(
+            run_id=_RRS_RUN_ID,
+            severity='moderate',
+            category='task_knowledge_drift',
+            description='a stage-2 finding citing memories',
+            suggested_action='reconcile them',
+            actionable=True,
+            task_id='42',
+            flag_type='knowledge_drift',
+        )['finding_id']
+        for memory_id in cited:
+            await state.cite_memory(_RRS_RUN_ID, finding_id, memory_id, 'mem0')
+        state.complete(_RRS_RUN_ID, summary='s')
+        return StageResult(report={}, success=True)
+
+    stack = [
+        patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(side_effect=_fake_cli),
+        ),
+        patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+        patch.object(
+            stage, '_maybe_queue_briefing_refresh_tasks', new=AsyncMock(return_value=None)
+        ),
+        patch.object(stage, '_apply_post_flight_guards', new=AsyncMock(return_value=None)),
+        patch.object(
+            stage, '_run_entity_standing_decision_growth_sweep', new=AsyncMock(return_value=None)
+        ),
+    ]
+    stack += [
+        patch(
+            f'fused_memory.reconciliation.stages.task_knowledge_sync.{name}',
+            new=AsyncMock(return_value=0),
+        )
+        for name in _STAGE2_POST_RUN_HELPERS
+    ]
+
+    with ExitStack() as patches:
+        for manager in stack:
+            patches.enter_context(manager)
+        return await stage.run(
+            [], Watermark(project_id='test_project'), [], run_id=_RRS_RUN_ID
+        )
+
+
+@pytest.mark.asyncio
+async def test_stage2_writeback_corrects_the_durable_recon_report_finding():
+    """A Stage-2 run with an ACTIVE ReconReportState corrects the AUTHORITATIVE
+    finding, not just the throwaway projection.
+
+    ``get_assembled_report`` builds a fresh dict per finding carrying a NEW
+    ``cited_memories`` list, so verification alone leaves the durable _Finding
+    (and its persisted row) holding the phantom, and the two stores disagree
+    about the same finding forever. This pins that the write-back reaches a
+    NON-Stage-1 run — ``apply_citation_verification`` resolves the finding via
+    ``_resolve_finding``, whose cross-stage lookup every other test here leaves
+    uncovered because they all build the stage with recon_report_state=None.
+    """
+    deps = _deps()
+    _resolving_memory_service(deps, resolving={_GOOD_ID})
+    state = _make_rrs()
+
+    report = await _run_stage2_with_rrs(deps, state, (_GOOD_ID, _PHANTOM_ID))
+
+    # The returned report is corrected...
+    assert [c['memory_id'] for c in report.items_flagged[0]['cited_memories']] == [_GOOD_ID]
+    assert report.stats['stage2_phantom_citations_dropped'] == 1
+    assert report.stats['stage2_citations_verified'] == 1
+
+    # ...and so is the authoritative record the harness leaves behind.
+    durable = state.get_findings_for_run(_RRS_RUN_ID)
+    assert len(durable) == 1
+    assert [c['memory_id'] for c in durable[0]['cited_memories']] == [_GOOD_ID], (
+        'the authoritative _Finding still carries the phantom — verification '
+        'corrected only the projection'
+    )
+    assert durable[0]['citation_failures'] == [
+        {'memory_id': _PHANTOM_ID, 'store': 'mem0', 'reason': 'memory_not_found'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stage2_writeback_failure_degrades_without_failing_the_stage(caplog):
+    """When ``apply_citation_verification`` raises, run() still returns the
+    CORRECTED report and logs the failure loudly — it never fails the stage.
+
+    The whole point of the write-back's try/except is that a citation-hygiene
+    miss degrades to "report is correct, durable record is stale" rather than
+    to a failed reconciliation stage. Nothing else pins that, so a refactor
+    that let the exception propagate would go undetected.
+    """
+    deps = _deps()
+    _resolving_memory_service(deps, resolving={_GOOD_ID})
+    state = _make_rrs()
+
+    with (
+        patch.object(
+            state,
+            'apply_citation_verification',
+            side_effect=RuntimeError('sqlite is on fire'),
+        ),
+        caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.stages.base'),
+    ):
+        report = await _run_stage2_with_rrs(deps, state, (_GOOD_ID, _PHANTOM_ID))
+
+    # The stage completed and its report is still corrected.
+    assert [c['memory_id'] for c in report.items_flagged[0]['cited_memories']] == [_GOOD_ID]
+    assert report.stats['stage2_phantom_citations_dropped'] == 1
+
+    # Loud, not silent: the structured warning names the run and the stage.
+    records = [r for r in caplog.records if r.msg == 'reconciliation.citation_writeback_failed']
+    assert len(records) == 1, (
+        f'expected exactly one citation_writeback_failed warning, got {caplog.records!r}'
+    )
+    assert records[0].run_id == _RRS_RUN_ID
+    assert records[0].stage == StageId.task_knowledge_sync.value
+    assert records[0].finding_ids, 'the warning must name the affected finding_ids'
+    assert 'sqlite is on fire' in records[0].error
+
+
+@pytest.mark.asyncio
+async def test_stage2_clean_pass_never_touches_the_durable_record():
+    """A pass with zero drops and zero verification errors does NOT call
+    ``apply_citation_verification`` at all.
+
+    ``apply_citation_verification``'s ``_persist_run`` re-serialises and
+    upserts EVERY entry of the run, and with nothing dropped the corrections
+    would be byte-identical rewrites. This is the common case, so the skip is
+    the difference between one wasted full-run write per stage per cycle and
+    none.
+    """
+    deps = _deps()
+    _resolving_memory_service(deps, resolving={_GOOD_ID})
+    state = _make_rrs()
+
+    with patch.object(
+        state, 'apply_citation_verification', wraps=state.apply_citation_verification
+    ) as writeback:
+        report = await _run_stage2_with_rrs(deps, state, (_GOOD_ID,))
+
+    assert report.stats['stage2_citations_verified'] == 1
+    assert report.stats['stage2_phantom_citations_dropped'] == 0
+    assert writeback.call_count == 0, (
+        'a clean verification pass must not drive a full-run re-persist'
+    )
+    # And the durable record is untouched and still correct.
+    durable = state.get_findings_for_run(_RRS_RUN_ID)
+    assert [c['memory_id'] for c in durable[0]['cited_memories']] == [_GOOD_ID]
+    assert durable[0]['citation_failures'] == []

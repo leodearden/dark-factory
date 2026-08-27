@@ -377,6 +377,108 @@ def test_stage_stat_prefix_covers_every_stage_id():
 
 
 # --------------------------------------------------------------------------- #
+# per-call lookup memoisation (task 2979 amendment)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_repeated_memory_id_is_resolved_once_per_call():
+    """A memory_id cited by N findings costs ONE get_memory_by_id, not N.
+
+    get_memory_by_id is a Qdrant point read on the stage's critical path, and
+    task 2979 put this pass on all three stages — so the repeat-citation case
+    got three times as common. The counters must stay per-CITATION though: they
+    count what the report claims, not how many round trips it took to check.
+    """
+    findings = [
+        {'description': f'finding {i}', 'cited_memories': [{'memory_id': 'm1', 'store': 'mem0'}]}
+        for i in range(3)
+    ]
+    # A fourth citation of the same id, this time alongside a distinct one.
+    findings.append(
+        {
+            'description': 'finding 3',
+            'cited_memories': [
+                {'memory_id': 'm1', 'store': 'mem0'},
+                {'memory_id': 'm2', 'store': 'mem0'},
+            ],
+        },
+    )
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(
+        side_effect=lambda _pid, mid: {'id': mid, 'content': 'x', 'metadata': {}},
+    )
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    resolved = [c.args[1] for c in memory_service.get_memory_by_id.await_args_list]
+    assert sorted(resolved) == ['m1', 'm2'], (
+        f'each distinct id must be resolved exactly once, got {resolved!r}'
+    )
+    # Counters follow the CITATIONS (4x m1 + 1x m2), not the 2 lookups.
+    assert stats['stage1_citations_verified'] == 5
+    assert stats['stage1_phantom_citations_dropped'] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_phantom_is_marked_on_every_finding_from_one_lookup():
+    """The memo must not swallow the MARKERS: a phantom cited by two findings
+    is looked up once and marked on both, so neither silently keeps it."""
+    findings = [
+        {
+            'description': 'first',
+            'cited_memories': [{'memory_id': 'gone', 'store': 'mem0'}],
+        },
+        {
+            'description': 'second',
+            'cited_memories': [{'memory_id': 'gone', 'store': 'mem0'}],
+        },
+    ]
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(return_value=None)
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    assert memory_service.get_memory_by_id.await_count == 1
+    for finding in findings:
+        assert finding['cited_memories'] == []
+        assert finding['citation_failures'] == [
+            {'memory_id': 'gone', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+    assert stats['stage1_phantom_citations_dropped'] == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_erroring_id_is_not_re_raised_per_citation():
+    """A backend error is memoised too — one failed lookup, the same marker on
+    every citation of that id, and the entries all KEPT (an error is 'unknown',
+    not 'absent'). Re-raising per citation only hammers a store that just
+    failed while producing the identical marker."""
+    findings = [
+        {'description': 'first', 'cited_memories': [{'memory_id': 'sick', 'store': 'mem0'}]},
+        {'description': 'second', 'cited_memories': [{'memory_id': 'sick', 'store': 'mem0'}]},
+    ]
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timeout'))
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    assert memory_service.get_memory_by_id.await_count == 1
+    for finding in findings:
+        assert finding['cited_memories'] == [{'memory_id': 'sick', 'store': 'mem0'}]
+        assert finding['citation_failures'] == [
+            {
+                'memory_id': 'sick',
+                'store': 'mem0',
+                'reason': 'verification_error',
+                'error_type': 'TimeoutError',
+            },
+        ]
+    assert stats['stage1_citation_verification_errors'] == 2
+    assert stats['stage1_phantom_citations_dropped'] == 0
+
+
+# --------------------------------------------------------------------------- #
 # find_citation_occurrences — the mechanical all-keys metadata scan (task 3108)
 # --------------------------------------------------------------------------- #
 
