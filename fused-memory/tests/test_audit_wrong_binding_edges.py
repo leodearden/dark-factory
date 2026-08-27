@@ -771,6 +771,119 @@ class _FakeGraph:
         raise AssertionError('this sweep is read-only: it may never issue query()')
 
 
+_RETURN_RE = re.compile(r'RETURN\s+(.*?)\s+ORDER BY\s+(\S+)', re.IGNORECASE)
+
+
+class _FakeTieShufflingGraph:
+    """A store that exercises the freedom a NON-TOTAL ``ORDER BY`` gives it.
+
+    Same census/cap contract as :class:`_FakeGraph`, but it holds NODE RECORDS
+    (``{'n.uuid': ..., 'n.name': ...}``) rather than pre-projected rows, and
+    projects whatever columns the query's RETURN clause actually asks for. So
+    the SAME corpus can be read through the old ``RETURN n.name ORDER BY
+    n.name`` template and the corrected ``RETURN n.uuid, n.name ORDER BY
+    n.uuid`` one, and the only thing that varies between them is the property
+    under test.
+
+    Between successive PAGE queries it PERMUTES rows that share the query's
+    ORDER BY key — rotating each tie group by the page index. That is exactly
+    and only the freedom a store has when the sort key is not unique: rows
+    with distinct keys keep their relative order, ties do not. A real engine
+    gets that freedom from parallel scans, index choice, or a partial top-K
+    heap; the mechanism does not matter, the licence does.
+
+    It also RECORDS which corpus records it emitted (``emitted_uuids``), which
+    is the only way to observe the damage — see
+    ``test_a_tie_straddling_a_page_boundary_drops_a_node`` for why the
+    harvested id set cannot.
+    """
+
+    def __init__(
+        self,
+        nodes: list[dict],
+        *,
+        resultset_cap: int = 10,
+        census_override: int | None = None,
+    ):
+        self.nodes = nodes
+        self.resultset_cap = resultset_cap
+        self.census_override = census_override
+        self.queries: list[str] = []
+        self.emitted_uuids: list[str] = []
+        self._page_calls = 0
+
+    def _ordered(self, sort_key: str, rotation: int) -> list[dict]:
+        """The corpus under one legal ordering for *sort_key*.
+
+        Stable by key, then each equal-key run rotated by *rotation*. With a
+        unique key every run has length 1 and the rotation is the identity —
+        which is the whole point: the fix makes this double harmless.
+        """
+        ordered = sorted(self.nodes, key=lambda n: str(n.get(sort_key)))
+        out: list[dict] = []
+        run: list[dict] = []
+        for node in ordered:
+            if run and str(run[0].get(sort_key)) == str(node.get(sort_key)):
+                run.append(node)
+                continue
+            if run:
+                shift = rotation % len(run)
+                out.extend(run[shift:] + run[:shift])
+            run = [node]
+        if run:
+            shift = rotation % len(run)
+            out.extend(run[shift:] + run[:shift])
+        return out
+
+    async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
+        self.queries.append(cypher)
+        if _CENSUS_RE.search(cypher.strip()):
+            count = (
+                self.census_override
+                if self.census_override is not None
+                else len(self.nodes)
+            )
+            return _FakeResult([[count]])
+
+        clause = _RETURN_RE.search(cypher)
+        assert clause is not None, f'unparseable page query: {cypher!r}'
+        columns = [c.strip() for c in clause.group(1).split(',')]
+        sort_key = clause.group(2)
+
+        rotation = self._page_calls
+        self._page_calls += 1
+        ordered = self._ordered(sort_key, rotation)
+
+        bounds = _SKIP_LIMIT_RE.search(cypher)
+        assert bounds is not None, f'page query without SKIP/LIMIT: {cypher!r}'
+        skip, limit = int(bounds.group(1)), int(bounds.group(2))
+        page = ordered[skip: skip + limit][: self.resultset_cap]
+
+        self.emitted_uuids.extend(str(n['n.uuid']) for n in page)
+        return _FakeResult([[n.get(col) for col in columns] for n in page])
+
+    async def query(self, cypher: str, params: dict | None = None):
+        raise AssertionError('this sweep is read-only: it may never issue query()')
+
+
+def _tie_straddling_nodes() -> list[dict]:
+    """12 Entity records whose only duplicate NAME straddles a page boundary.
+
+    Read in pages of 5, positions 4 and 5 under a name ordering are the two
+    'Task 7004' rows — one on each side of the first page break. Under a uuid
+    ordering there are no ties at all, and the same corpus reads losslessly.
+    """
+    names = [
+        'Task 7000', 'Task 7001', 'Task 7002', 'Task 7003',
+        'Task 7004', 'Task 7004',
+        'Task 7005', 'Task 7006', 'Task 7007', 'Task 7008',
+        'Task 7009', 'Task 7010',
+    ]
+    return [
+        {'n.uuid': f'node-{i:02d}', 'n.name': name} for i, name in enumerate(names)
+    ]
+
+
 def _edge_rows(n: int) -> list[list]:
     """``(a.name, b.name, r.uuid, r.fact, r.episodes)`` rows, the live shape."""
     return [
@@ -836,20 +949,54 @@ class TestEdgeReader:
         assert read.expected_rows == 99
 
     @pytest.mark.parametrize(
-        'template', [EDGE_PAGE_CYPHER, NODE_PAGE_CYPHER], ids=['edges', 'nodes']
+        'template,sort_key',
+        [(EDGE_PAGE_CYPHER, 'r.uuid'), (NODE_PAGE_CYPHER, 'n.uuid')],
+        ids=['edges', 'nodes'],
     )
-    def test_page_templates_are_orderable_and_pageable(self, template: str) -> None:
-        """Both placeholders AND a total ORDER BY.
+    def test_page_templates_sort_on_a_projected_unique_key(
+        self, template: str, sort_key: str
+    ) -> None:
+        """Both placeholders AND an ORDER BY on a column that is UNIQUE.
 
         The ORDER BY is load-bearing, not cosmetic: every page is a separate
         query, and SKIP/LIMIT with no total order gives the store no
         obligation to return rows in the same order twice — so SKIP n on page
         2 can skip rows page 1 never returned, dropped silently and
-        permanently.
+        permanently. ``_paged_ro_query``'s docstring makes a TOTAL order an
+        explicit precondition of the API.
+
+        Asserting merely that the string contains 'ORDER BY' does not pin
+        that precondition — ``ORDER BY n.name`` satisfies it and is NOT a
+        total order. Measured on the live store 2026-08-27: dark_factory
+        holds 17260 Entity nodes against 17210 distinct names, reify 24344
+        against 24193. So the expected key is named per template, and both
+        must be a uuid.
+
+        The key must also be PROJECTED. Two reasons: a driver may reject
+        ordering on a property the query does not return, and — the reason
+        that bites here — a test double (and a human reader) can only verify
+        which row a page actually returned if the identifying column is in
+        the result set. The in-tree precedent
+        ``graphiti_client.py::_ENTITY_NODES_PAGE_TEMPLATE`` already spells it
+        this way: ``RETURN n.uuid, n.name, n.summary ORDER BY n.uuid``.
         """
         assert '{skip}' in template
         assert '{limit}' in template
-        assert 'ORDER BY' in template
+
+        ordered_on = re.search(r'ORDER BY\s+(\S+)', template)
+        assert ordered_on is not None, f'no ORDER BY in {template!r}'
+        assert ordered_on.group(1) == sort_key, (
+            f'{template!r} pages on {ordered_on.group(1)!r}, which is not a '
+            f'unique column; SKIP/LIMIT over a non-total order silently drops '
+            f'rows. Expected {sort_key!r}.'
+        )
+
+        projected = re.search(r'RETURN\s+(.*?)\s+ORDER BY', template)
+        assert projected is not None
+        columns = [c.strip() for c in projected.group(1).split(',')]
+        assert sort_key in columns, (
+            f'{template!r} orders on {sort_key!r} without returning it'
+        )
 
     @pytest.mark.parametrize(
         'query',
@@ -914,6 +1061,56 @@ class TestReadTaskNodeIds:
         )
         ids, _ = await reader.read_task_node_ids()
         assert ids == {'133'}
+
+    @pytest.mark.asyncio
+    async def test_a_tie_straddling_a_page_boundary_drops_a_node(self) -> None:
+        """The node page must survive a store that permutes equal-key rows.
+
+        This is the property ``ORDER BY n.name`` does not have. 12 records
+        read in pages of 5, with the single duplicate name sitting at
+        positions 4 and 5 — one on each side of the first page break. A store
+        free to order that tie either way returns one of the pair TWICE and
+        the other NEVER, and the loss is INVISIBLE: ``rows_seen`` is still 12,
+        so guard 4 (``rows_seen < expected_rows``) never fires, ``complete``
+        is True, and ``truncated_by`` stays null. That is the whole hazard —
+        a truncation that reports itself as a clean read.
+
+        Two assertions, and the ORDER matters:
+
+        1. The harvested ID SET is full. This is the assertion the reader's
+           consumer (``correct_node_present``) actually depends on — and on
+           its own it CANNOT fail here, which is worth stating plainly rather
+           than leaving as a trap for the next editor. Tie permutation can
+           only ever drop a row whose sort key EQUALS a row it returned, and
+           when the sort key is ``n.name`` two tied rows carry the same name
+           and therefore the same task id. So the ids survive a defect the
+           rows do not. Kept because it pins the consumer-facing contract,
+           not because it discriminates.
+
+        2. Every corpus record was emitted exactly once. THIS is the
+           assertion with teeth, and it fails against ``ORDER BY n.name``.
+           It is only checkable because the double records which records it
+           returned — which is also why the corrected template must PROJECT
+           its sort key: an identifying column that never reaches the result
+           set cannot be audited by anyone, test double or human.
+        """
+        nodes = _tie_straddling_nodes()
+        graph = _FakeTieShufflingGraph(nodes, resultset_cap=10)
+        reader = EdgeReader(
+            graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10
+        )
+        ids, read = await reader.read_task_node_ids()
+
+        assert read.complete is True
+        assert read.rows_seen == len(nodes)
+        assert ids == {str(7000 + i) for i in range(11)}
+
+        assert sorted(graph.emitted_uuids) == sorted(n['n.uuid'] for n in nodes), (
+            'the paged node read did not visit every node exactly once: '
+            f'emitted {sorted(graph.emitted_uuids)}. A tie in the ORDER BY key '
+            'straddling a page boundary dropped a row and duplicated another, '
+            'and rows_seen==expected_rows hid it.'
+        )
 
 
 def _finding(**over) -> object:
