@@ -886,6 +886,119 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
 
 
+# ---------------------------------------------------------------------------
+# task-4788: _load_task_cards whole-operation budget
+#
+# ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
+# connect/read/write and pool acquisition and nothing else. The incident that
+# motivated these two tests hung inside httpcore's connection lock, where no
+# outbound socket is ever opened and that timeout never fires — so
+# /api/v2/dashboard/escalations wedged for 19.8 h with the per-request budget
+# fully in place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+#
+# Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
+# ever sets, deliberately NOT a sleep: a sleep shorter than the budget passes
+# against the pre-fix code too and would prove nothing. Since that would
+# otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
+# ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only trip
+# on a real regression, never on scheduling jitter.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
+    monkeypatch, dummy_client, dummy_config
+):
+    """A fetch that never returns degrades to [] and is not cached."""
+    import asyncio
+
+    import dashboard.app as _app
+    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+
+    # A warm entry would be served without ever reaching the hang.
+    _task_cards_cache_clear()
+
+    call_count = 0
+
+    async def hang_fetch_tasks(client, config, project_root):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.Event().wait()  # nothing ever sets it
+
+    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', 0.05)
+
+    with patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks):
+        result = await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+        assert result == [], (
+            'the shape _load_task_cards already promises for an offline '
+            'marker or MCP failure — the escalation tab renders cardless '
+            'rather than hanging'
+        )
+        assert call_count == 1
+
+        # A timeout must not pin an empty card list for the TTL window:
+        # nothing was written to the cache, so the next poll re-attempts.
+        await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+    assert call_count == 2, (
+        'the second call must re-enter the stub — a timeout that cached its '
+        '[] would blank the tab for the whole TTL window'
+    )
+
+
+async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
+    monkeypatch, dummy_client, dummy_config
+):
+    """Both callers are bounded, not just the one that wins the lock.
+
+    This pins the wrap PLACEMENT, mirroring the merge_queue.load_task_titles
+    test. ``TTLCache.get_or_refresh`` serializes cold callers for one key
+    behind a per-key lock and runs the refresh WHILE HOLDING it, so an
+    inner-only wrap would leave caller B queued UNBOUNDED for caller A's whole
+    budget and then running its own full-budget refresh — the pair costs 2x
+    the budget and N waiters cost N x. The dashboard polls every 3 s, so
+    waiters are the routine case, not a corner.
+    """
+    import asyncio
+
+    import dashboard.app as _app
+    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+
+    _task_cards_cache_clear()
+
+    async def hang_fetch_tasks(client, config, project_root):
+        await asyncio.Event().wait()
+
+    budget = 0.05
+    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', budget)
+    loop = asyncio.get_running_loop()
+
+    with patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks):
+        started = loop.time()
+        results = await asyncio.wait_for(
+            asyncio.gather(*[
+                _load_task_cards(dummy_client, dummy_config, '/proj/SHARED')
+                for _ in range(2)
+            ]),
+            timeout=2.0,
+        )
+        elapsed = loop.time() - started
+
+    assert results == [[], []]
+    # The assertion is about SERIALIZATION, not merely about returning:
+    # an inner-only wrap costs 2 x budget here and scales with waiters.
+    assert elapsed < 2 * budget, (
+        f'two concurrent callers took {elapsed:.3f}s against a {budget}s '
+        'budget — that is the serialized cost of an inner-only wrap; the '
+        'wait_for must enclose get_or_refresh so a caller QUEUED on the '
+        'per-key lock is bounded too'
+    )
+
+
 def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
     from dashboard.app import _task_cards_cache_clear
