@@ -1712,6 +1712,68 @@ def test_check_mode_treats_a_missing_artifact_as_stale(tmp_path):
     assert not (tmp_path / "absent.json").exists()
 
 
+def test_check_mode_also_compares_the_markdown_twin(tmp_path):
+    """(e) THE MARKDOWN IS HALF THE ARTIFACT, and the half an operator reads.
+
+    Checking only the JSON let a hand-edited or stale .md report "reproduces",
+    contradicting write_artifacts' own invariant that a stale .md can never
+    accompany a fresh .json. Here the JSON is left byte-identical and ONLY the
+    markdown is disturbed, so nothing but the markdown comparison can turn this
+    red.
+    """
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out, md_out = tmp_path / "c.json", tmp_path / "c.md"
+    args = ("--project-root", str(root), "--json-out", str(json_out), "--md-out", str(md_out))
+    assert _run_cli(*args).returncode == EXIT_OK
+
+    json_before = json_out.read_text()
+    md_out.write_text("hand-edited, and no longer the twin of that JSON\n")
+
+    result = _run_cli(*args, "--check")
+
+    assert result.returncode == EXIT_STALE
+    assert str(md_out) in result.stderr, result.stderr
+    assert str(json_out) not in result.stderr, "only the markdown diverged"
+    assert json_out.read_text() == json_before, "--check must never write"
+
+
+def test_check_mode_names_a_missing_markdown_twin(tmp_path):
+    """(e) An absent .md is a divergence too — a JSON published without its
+    readable twin is a half-published artifact, which is exactly what the
+    committed-pair contract further down refuses to accept."""
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+    json_out, md_out = tmp_path / "c.json", tmp_path / "c.md"
+    args = ("--project-root", str(root), "--json-out", str(json_out), "--md-out", str(md_out))
+    assert _run_cli(*args).returncode == EXIT_OK
+    md_out.unlink()
+
+    result = _run_cli(*args, "--check")
+
+    assert result.returncode == EXIT_STALE
+    assert str(md_out) in result.stderr, result.stderr
+
+
+def test_check_and_json_are_mutually_exclusive(tmp_path):
+    """(e) `--check --json` USED TO EXIT 0 WITHOUT CHECKING ANYTHING.
+
+    json_stdout was tested first, so the combination printed the report and
+    returned EXIT_OK — reporting success for an artifact nobody compared. The
+    two flags ask for incompatible things, so argparse now refuses the pair
+    outright rather than silently honouring one.
+    """
+    root = _make_project(tmp_path, tasks=[_stamped(1)])
+
+    result = _run_cli(
+        "--project-root", str(root),
+        "--json-out", str(tmp_path / "c.json"), "--md-out", str(tmp_path / "c.md"),
+        "--check", "--json",
+    )
+
+    assert result.returncode != EXIT_OK, result.stdout
+    assert "not allowed with" in result.stderr, result.stderr
+    assert not result.stdout.strip(), "a refused invocation must publish nothing"
+
+
 def test_json_flag_prints_the_report_instead_of_writing(tmp_path):
     root = _make_project(tmp_path, tasks=[_stamped(1)])
     json_out = tmp_path / "c.json"

@@ -1147,6 +1147,14 @@ def write_artifacts(report: dict, json_path: Path, md_path: Path) -> tuple[Path,
 # 0/2/3 stay in NUMERIC LOCKSTEP with AUDIT_EXIT_*, enforced by a test that
 # imports those constants, so renumbering either copy fails CI instead of
 # drifting silently. 1 deliberately diverges in MEANING, as described above.
+#
+# ONE CODE IS SHARED WITH argparse, KNOWINGLY: a usage error (an unknown flag,
+# or --check combined with --json) exits 2 too, because that is argparse's
+# universal convention and overriding it would make this script's CLI behave
+# unlike every other one in scripts/. EXIT_NO_ROOT and a usage error are
+# distinguished by their stderr message, never by the code, and the epilog says
+# so. Adding a fifth code for usage errors would buy a distinction no caller
+# has asked for at the cost of diverging from the convention.
 # ---------------------------------------------------------------------------
 
 EXIT_OK = 0                  # swept; artifacts written (or --check agreed)
@@ -1160,7 +1168,12 @@ structurally incapable of mutating a task record, an event record or a plan.
 
 Exit codes: 0 swept ok; 1 --check found the artifact stale; 2 no project root
 resolved to a readable tasks.db; 3 roots resolved but every one was unreadable
-(NOT a clean run - nothing was examined, and no artifact is written).
+(NOT a clean run - nothing was examined, and no artifact is written). A usage
+error (including --check with --json, which are mutually exclusive) also exits
+2, by argparse's universal convention; the stderr message distinguishes them.
+
+--check compares BOTH halves of the artifact pair against a fresh render and
+names whichever diverged, so a hand-edited or stale .md cannot report clean.
 
 --check WARNING: it compares the committed artifact against a LIVE, continuously
 drifting corpus. Six orchestrators mutate these databases, and a stamped task
@@ -1181,15 +1194,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json-out", default=str(DEFAULT_JSON_OUT), help="JSON artifact path.")
     parser.add_argument("--md-out", default=str(DEFAULT_MD_OUT), help="Markdown artifact path.")
-    parser.add_argument(
+    # MUTUALLY EXCLUSIVE, enforced by argparse rather than by branch order in
+    # main(). The two ask for incompatible things — "verify the committed
+    # artifact" and "do not look at the committed artifact at all" — and
+    # whichever main() tested first would silently ignore the other. A silent
+    # EXIT_OK from `--check --json` would report success for an artifact that
+    # was never checked, which is precisely the no-silent-fail-soft failure the
+    # rest of this module guards against.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check", action="store_true",
-        help="Compare against the existing artifact WITHOUT writing. See the --check warning above.",
+        help="Compare BOTH artifacts against a fresh sweep WITHOUT writing. See the warning above.",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--json", action="store_true", dest="json_stdout",
         help="Print the report to stdout instead of writing the artifacts.",
     )
     return parser
+
+
+def _check_divergences(expected: dict[Path, str]) -> list[str]:
+    """Describe every path in *expected* whose contents differ from the value.
+
+    Returns one human-readable phrase per divergence, NAMING THE PATH, so a
+    --check failure says which half of the artifact pair went stale rather than
+    leaving the operator to diff both. An absent file is a divergence too: an
+    artifact that does not exist cannot be reproducing anything.
+
+    Ordering follows the caller's dict, which is insertion-ordered, so the
+    message is deterministic.
+    """
+    divergences: list[str] = []
+    for path, text in expected.items():
+        if not path.exists():
+            divergences.append(f"{path} does not exist")
+            continue
+        actual = path.read_text(encoding="utf-8")
+        if actual != text:
+            divergences.append(
+                f"{path} does not match a fresh sweep "
+                f"({len(actual)} bytes on disk vs {len(text)} freshly rendered)"
+            )
+    return divergences
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1224,17 +1270,21 @@ def main(argv: list[str] | None = None) -> int:
     md_path = Path(args.md_out)
 
     if args.check:
-        expected = json.dumps(report, indent=2, sort_keys=False) + "\n"
-        if not json_path.exists():
-            print(f"stale: {json_path} does not exist", file=sys.stderr)
-            return EXIT_STALE
-        actual = json_path.read_text(encoding="utf-8")
-        if actual != expected:
+        # BOTH HALVES ARE CHECKED. Checking only the JSON would let a
+        # hand-edited or stale .md — the half an operator actually reads —
+        # report "reproduces", contradicting write_artifacts' own invariant
+        # that a stale .md can never accompany a fresh .json. A change to
+        # render_markdown alone was likewise invisible before this.
+        divergences = _check_divergences(
+            {
+                json_path: json.dumps(report, indent=2, sort_keys=False) + "\n",
+                md_path: render_markdown(report),
+            }
+        )
+        if divergences:
             print(
-                f"stale: {json_path} does not match a fresh sweep "
-                f"({len(actual)} bytes on disk vs {len(expected)} freshly rendered). "
-                "The corpus drifts continuously; regenerate rather than treating "
-                "this as a defect.",
+                f"stale: {'; '.join(divergences)}. The corpus drifts "
+                "continuously; regenerate rather than treating this as a defect.",
                 file=sys.stderr,
             )
             return EXIT_STALE
