@@ -165,6 +165,22 @@ class TestDropVectorIndicesLive:
             assert all(set(d) == {'label', 'field'} for d in dropped)
             assert all(isinstance(d['field'], str) for d in dropped)
 
+            # MANDATORY (task 4748) — do NOT delete this as redundant with the
+            # fixture's barrier. DROP re-opens the window the fixture's barrier
+            # closed: dropping a VECTOR field from a label whose merged index
+            # carries other fields makes FalkorDB BUILD A REPLACEMENT index, and
+            # until that build finishes CALL db.indexes() returns BOTH rows in
+            # one result set — the new ['name'] row reading '[Indexing] N/M:
+            # UNDER CONSTRUCTION' and the OLD row still advertising the dropped
+            # name_embedding VECTOR as OPERATIONAL. Without this barrier `after`
+            # can capture the stale row and the `_vector_properties(after) ==
+            # set()` assertion below fails with "vector indices survived
+            # drop_vector_indices()". Measured against FalkorDB v41800; not a
+            # read-path artifact — RO_QUERY and QUERY agree at every instant.
+            # (RELATES_TO is never the phantom: its index has only the one
+            # field, so dropping it removes the whole index and opens no window.)
+            await await_index_operational(live_vector_graph)
+
             after = await backend.list_indices(group_id=TEST_GRAPH)
             # THE lock-in: no 'VECTOR' survives anywhere in any record's types.
             assert _vector_properties(after) == set(), (
