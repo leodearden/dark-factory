@@ -813,25 +813,43 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # forbids. The structural fix -- stopping a per-cluster hint from
             # shadowing the guard's escape hatches at all -- is the sibling
             # fix-B task, deliberately not done here.
+            #
+            # Amendment (reviewer, task 4738): the first cut told the reader
+            # to SEARCH the bare uuid, but `search` is semantic/vector, not
+            # an id lookup -- a bare-uuid query returns noise, not that
+            # record. Reworded to a topic-phrase query with the uuid kept as
+            # a verification target, and escalate named as the fallback when
+            # it still can't be confirmed that way. Outcome (3) now names
+            # escalate_blocker/escalate_info explicitly (previously only the
+            # bare word "escalate"), matching how outcomes (1)/(2) already
+            # name an exact literal to act on.
             hint=(
                 'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
                 'pyproject.toml). The canonical entry is memory '
-                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51 -- SEARCH it and read it to '
-                'decide which of these three applies to your write. Do not try to '
-                'amend it: content amends are authz-gated to recon-stage- / '
-                'curator- agent_ids, so that call will refuse you. '
-                '(1) Your content is genuinely DISTINCT from that entry -- re-send '
-                "this write with metadata={'allow_near_duplicate': True}, which is "
-                'open to every agent and bypasses this block. '
-                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping is a '
-                'sanctioned outcome here, not a failure: consolidating this '
-                'cluster belongs to an interactive curation sitting running '
-                'skills/curate-fused-memories, not to you, and renaming yourself '
-                'into that role to get past this block is forbidden by that '
-                'skill. '
-                '(3) You are unsure, or your content CONTRADICTS the canonical '
-                'entry -- escalate. Do not retry the refused call.'
+                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51. To check it, run '
+                "search(query='pytest-xdist -n0 serial-override workaround', "
+                'project_id=...) and look for the result whose id matches that '
+                'uuid -- a bare-uuid query will not find it, since search is '
+                'semantic, not an id lookup. If you cannot confirm it that way, '
+                'treat that as case (3) below and escalate rather than guessing. '
+                'Do not try to amend it either way: content amends are '
+                'authz-gated to recon-stage- / curator- agent_ids, so that '
+                'call will refuse you. '
+                '(1) Your content is genuinely DISTINCT from that entry -- '
+                're-send this write with metadata='
+                "{'allow_near_duplicate': True}, which is open to every agent "
+                'and bypasses this block. '
+                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping '
+                'is a sanctioned outcome here, not a failure: consolidating '
+                'this cluster belongs to an interactive curation sitting '
+                'running skills/curate-fused-memories, not to you, and '
+                'renaming yourself into that role to get past this block is '
+                'forbidden by that skill. '
+                '(3) You are unsure, your content CONTRADICTS the canonical '
+                'entry, or you could not confirm it above -- escalate with '
+                'escalate_blocker (or escalate_info if you are merely '
+                'unsure). Do not retry the refused call.'
             ),
         ),
         ProceduralTopicCluster(
