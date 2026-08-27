@@ -189,3 +189,167 @@ class TestDropVectorIndicesLive:
             assert second == []
         finally:
             await backend.close()
+
+
+@pytest_asyncio.fixture
+async def bulk_vector_graph():
+    """Seed a throwaway 50,000-node graph with a mixed VECTOR+RANGE Entity index.
+
+    Backs TestDropRebuildWindow below — see its docstring for the measurement
+    table that fixed 50,000 as the seed size. The mixed index (``name_embedding``
+    VECTOR merged with ``name`` RANGE, both on ``:Entity``) is what makes the
+    class's ``DROP VECTOR INDEX`` a REBUILD rather than a removal: FalkorDB keeps
+    the label's index record alive to carry the surviving RANGE field, and that
+    rebuild is what opens the window under test. A single-field vector index —
+    like the module fixture's ``live_vector_graph`` RELATES_TO index — never
+    opens this window, because dropping its only field removes the whole record
+    outright.
+    """
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    graph_name = unique_graph_name('4748_drop_rebuild_window')
+    # Best-effort delete any stale graph from a prior run.
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+
+    graph = client.select_graph(graph_name)
+    await graph.query(
+        'UNWIND range(1, 50000) AS i '
+        'CREATE (:Entity {name: "n"+i, name_embedding: vecf32([1.0, 2.0, 3.0, 4.0])})'
+    )
+    await graph.query(
+        'CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) '
+        "OPTIONS {dimension: 4, similarityFunction: 'cosine'}"
+    )
+    # The RANGE half of the merged index. Without this, dropping the VECTOR
+    # field below removes the Entity index record entirely instead of
+    # rebuilding it, and the window this fixture exists to open never opens.
+    await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
+    # MANDATORY (task 4748, in the voice of the task-3377 barrier comment on
+    # live_vector_graph above) — do NOT lower timeout_s when copying this
+    # fixture. The default 10s budget is NOT enough at this seed size: the
+    # initial HNSW build over 50,000 vectors measured 8.5-9.2s at loadavg ~96
+    # on 32 cores.
+    await await_index_operational(graph, timeout_s=60.0)
+    try:
+        yield graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+def _entity_index_rows(result) -> list[tuple[dict, str]]:
+    """Return (types, status) for every 'Entity'-labeled row in a raw db.indexes() result.
+
+    Resolves the label/types/status columns BY NAME from ``result.header``,
+    deliberately independent of ``list_indices()`` / ``resolve_header_positions``
+    — the code path this module's barriers protect — for the same reason
+    ``_vector_properties`` above hand-rolls its own read: a bug in the helper
+    under test must not be able to make its own verification pass.
+    """
+    header_names = [col[1] for col in result.header]
+    label_idx = header_names.index('label')
+    types_idx = header_names.index('types')
+    status_idx = header_names.index('status')
+    return [
+        (row[types_idx], row[status_idx])
+        for row in result.result_set
+        if row[label_idx] == 'Entity'
+    ]
+
+
+def _row_has_vector(types: dict) -> bool:
+    """True if any property in a raw db.indexes() 'types' dict carries VECTOR."""
+    return any(
+        'VECTOR' in ([raw] if isinstance(raw, str) else raw)
+        for raw in types.values()
+    )
+
+
+@pytest.mark.timeout(120)
+class TestDropRebuildWindow:
+    """PREMISE PIN for the post-DROP rebuild window — task 4748.
+
+    This is NOT a red-first TDD test; it is expected to PASS on introduction.
+    A timing race cannot be reliably RED-tested: at small seed sizes the
+    phantom this test pins only shows up in a fraction of runs (see the
+    measurement table below), so a test built to fail without the fix would
+    itself be a new flake — the exact defect this task removes. This mirrors
+    test_list_indices_integration.py::TestCallDbIndexesOverRoQuery
+    .test_db_indexes_result_shape_matches_the_barriers_assumptions (task
+    3377's build-side pin), which rejects the same idea for the same reason.
+
+    Its durable job: fail loudly if a future FalkorDB upgrade either (a)
+    removes the drop-side rebuild transient that every barrier task 4748 added
+    exists to close — making them dead weight — or (b) changes the column
+    names or the exact 'OPERATIONAL' ready sentinel await_index_operational
+    depends on.
+
+    MEASURED (task 4748, nice -n 19, loadavg ~96 on 32 cores, FalkorDB module
+    v41800): after ``DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)``
+    on a graph whose Entity index merges ``name_embedding`` VECTOR with
+    ``name`` RANGE, the very next ``CALL db.indexes()`` can return TWO Entity
+    rows — a fresh ``['name']`` row still ``'[Indexing] N/M: UNDER
+    CONSTRUCTION'`` beside the stale ``['name_embedding', 'name']`` row still
+    reporting ``'OPERATIONAL'`` and still advertising the just-dropped VECTOR
+    type. Phantom rate on the FIRST post-drop read, by seed size:
+
+        nodes      phantom rate              window
+        1          ~1 in 40-70 (tight loop)   ~4 ms
+        1,000      1/3 (3/3 when polled)      40-64 ms
+        10,000     1/3 (3/3 when polled)      52-135 ms
+        50,000     7/7                        0.21-0.75s
+        200,000    3/3                        ~0.73s
+
+    50,000 is the smallest measured size that is deterministic (7/7); that is
+    what bulk_vector_graph seeds. Initial index build measured 8.5-9.2s at
+    50,000 nodes vs 32-36s at 200,000 — this class's own
+    @pytest.mark.timeout(120) leaves generous headroom over either, and keeps
+    the module-wide budget (see pytestmark above) tight for the two fast tests
+    in TestDropVectorIndicesLive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drop_vector_index_opens_a_rebuild_window_the_barrier_closes(
+        self, bulk_vector_graph,
+    ):
+        """DROP opens the phantom window; await_index_operational closes it."""
+        graph = bulk_vector_graph
+        await graph.query('DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)')
+
+        # (a) The phantom is real: MORE THAN ONE Entity row survives the very
+        # next catalog read, and one of them still lists name_embedding VECTOR.
+        result = await graph.query('CALL db.indexes()')
+        entity_rows = _entity_index_rows(result)
+        assert len(entity_rows) > 1, (
+            f'expected the drop-side rebuild phantom (>1 Entity row immediately '
+            f'after DROP VECTOR INDEX) but got {len(entity_rows)}: {entity_rows!r}. '
+            'If FalkorDB has stopped rebuilding the merged index in place, every '
+            'post-drop barrier this task (4748) added is dead weight -- see this '
+            'class docstring before deleting them.'
+        )
+        assert any(_row_has_vector(types) for types, _ in entity_rows), (
+            f'expected one stale Entity row still advertising a VECTOR type: '
+            f'{entity_rows!r}'
+        )
+
+        # (b) await_index_operational has a signal to wait on: at least one row
+        # is not exactly 'OPERATIONAL'.
+        assert any(status != 'OPERATIONAL' for _, status in entity_rows), (
+            f'expected at least one Entity row not yet OPERATIONAL: {entity_rows!r}'
+        )
+
+        # (c) The barrier is SUFFICIENT: once satisfied, the phantom is gone.
+        await await_index_operational(graph)
+
+        result = await graph.query('CALL db.indexes()')
+        entity_rows = _entity_index_rows(result)
+        assert len(entity_rows) == 1, (
+            f'expected exactly one Entity row once the barrier is satisfied but '
+            f'got {len(entity_rows)}: {entity_rows!r}'
+        )
+        assert not _row_has_vector(entity_rows[0][0]), (
+            f'expected no VECTOR type to survive the barrier: {entity_rows[0]!r}'
+        )
