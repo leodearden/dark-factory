@@ -763,7 +763,11 @@ class TestAddMemoryTopicClusterGate:
 
     @pytest.mark.asyncio
     async def test_non_procedural_category_leaves_topic_gate_inert(self):
-        """The topic gate is scoped to category='procedural_knowledge' only."""
+        """The topic gate is inert for a category outside _TOPIC_GUARD_GATED_CATEGORIES.
+
+        (Task 3430 widened that set to also include preferences_and_norms;
+        observations_and_summaries stays outside it, per sibling task 4729.)
+        """
         mock_service = AsyncMock()
         _configure_reconciliation(
             mock_service,
@@ -785,7 +789,8 @@ class TestAddMemoryTopicClusterGate:
         )
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
-            f'Topic gate must be inert for a non-procedural_knowledge category; got: {result!r}'
+            f'Topic gate must be inert for a category outside _TOPIC_GUARD_GATED_CATEGORIES; '
+            f'got: {result!r}'
         )
         mock_service.search.assert_not_called()
         mock_service.add_memory.assert_called_once()
