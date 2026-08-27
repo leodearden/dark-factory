@@ -173,31 +173,117 @@ class TestFactReferents:
         ) == frozenset({Referent(kind='task', project_id='dark_factory', number='2500')})
 
 
+#: The ``re`` functions that CONSUME a pattern. Restricting to ``compile``
+#: alone was the guard's first blind spot: every one of these is an equally
+#: good place to hide a second task-label vocabulary, and ``re.search`` — not
+#: ``re.compile`` — is the form a one-off scan naturally takes.
+_RE_PATTERN_CONSUMERS = frozenset(
+    {'compile', 'search', 'match', 'fullmatch', 'findall', 'finditer',
+     'sub', 'subn', 'split'}
+)
+
+
+def _string_literal_parts(node: ast.AST) -> list[str]:
+    """The LITERAL text a pattern expression contributes, if any.
+
+    Handles both shapes a pattern can take in source:
+
+    * ``ast.Constant`` — a plain or raw string literal, contributing itself;
+    * ``ast.JoinedStr`` — an f-string, contributing ONLY its ``ast.Constant``
+      segments. An ``ast.FormattedValue`` interpolates a runtime value and
+      carries no literal vocabulary, so it must contribute nothing. That is
+      not a convenience: it is the exact line between the script's legitimate
+      ``rf'\\b{re.escape(referent.number)}\\b'`` (constants ``\\b`` and
+      ``\\b``, id supplied by the SHARED parser) and a genuine violation
+      like ``rf'Task {sep}(\\d+)'`` (constant ``Task `` — a vocabulary).
+
+    Anything else (a Name, a call, a concatenation of non-literals) is opaque
+    at parse time and contributes nothing.
+    """
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else []
+    if isinstance(node, ast.JoinedStr):
+        return [
+            part.value
+            for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        ]
+    return []
+
+
+def _re_names_imported_from_re(tree: ast.AST) -> set[str]:
+    """Local names bound by ``from re import ...``, so bare calls resolve.
+
+    ``import re`` + ``re.search(...)`` is the attribute form; ``from re import
+    search`` + ``search(...)`` is the bare form. Both are pattern-consuming
+    and both must be seen — but ONLY when the name genuinely came from ``re``,
+    which is what keeps ``engine.compile(...)`` and a local helper named
+    ``split`` from being flagged.
+    """
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == 're':
+            for alias in node.names:
+                if alias.name in _RE_PATTERN_CONSUMERS:
+                    bound.add(alias.asname or alias.name)
+    return bound
+
+
+def _pattern_argument(call: ast.Call) -> ast.AST | None:
+    """The PATTERN argument of a ``re`` call — position 0, or ``pattern=``.
+
+    Only this position is inspected. For ``sub``/``subn`` the SECOND argument
+    is the replacement string, not a pattern, and scanning it would
+    false-positive on a perfectly legitimate replacement that mentions a task.
+    """
+    for kw in call.keywords:
+        if kw.arg == 'pattern':
+            return kw.value
+    return call.args[0] if call.args else None
+
+
 def _regex_literals_mentioning_task(source: str) -> list[str]:
     """Regex PATTERN literals in *source* that mention 'task', case-insensitively.
 
     Extracted out of the assertion it serves so a meta-test can feed it
     synthetic sources and prove it actually flags things — see
-    :class:`TestTheVocabularyGuardHasTeeth`.
+    :class:`TestTheVocabularyGuardHasTeeth`. A guard whose only evidence is
+    "the real file is clean" cannot be distinguished from a guard that flags
+    nothing at all, and this one was the latter.
 
     AST-based, deliberately, not a substring scan: the script's module
     docstring must stay free to NAME this hazard in order to warn against it.
+
+    The callee must resolve to the ``re`` module — ``re.<f>(...)`` or a name
+    bound by ``from re import <f>``. Matching a bare attribute called
+    ``compile`` would flag a template engine or query builder that merely
+    exposes one, and a guard that cries wolf gets narrowed back into vacuity.
     """
     tree = ast.parse(source)
+    bare_names = _re_names_imported_from_re(tree)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        name = getattr(node.func, 'attr', None) or getattr(node.func, 'id', None)
-        if name != 'compile':
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            is_re_call = (
+                func.attr in _RE_PATTERN_CONSUMERS
+                and isinstance(func.value, ast.Name)
+                and func.value.id == 're'
+            )
+        elif isinstance(func, ast.Name):
+            is_re_call = func.id in bare_names
+        else:
+            is_re_call = False
+        if not is_re_call:
             continue
-        for arg in node.args:
-            if (
-                isinstance(arg, ast.Constant)
-                and isinstance(arg.value, str)
-                and 'task' in arg.value.lower()
-            ):
-                offenders.append(f'{arg.value!r} (line {node.lineno})')
+        pattern = _pattern_argument(node)
+        if pattern is None:
+            continue
+        for text in _string_literal_parts(pattern):
+            if 'task' in text.lower():
+                offenders.append(f'{text!r} (line {node.lineno})')
     return offenders
 
 

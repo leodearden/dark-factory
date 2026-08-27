@@ -203,7 +203,15 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     SUPPRESS a flag, never to create one, which is the conservative direction
     for a report whose every row a human adjudicates by hand.
     ``tests/test_audit_wrong_binding_edges.py::TestNoSecondVocabulary`` pins
-    the distinction structurally: the pattern below contains no 'task'.
+    the distinction structurally: the pattern below contains no 'task'. That
+    guard inspects EVERY pattern-consuming ``re`` function, not just
+    ``compile``, and reads f-string patterns through their literal segments —
+    so it sees the pattern below (whose only constants are ``\b`` and
+    ``\b``) and would flag it the moment a 'task' appeared in one. Its
+    companion ``TestTheVocabularyGuardHasTeeth`` proves that by feeding it
+    synthetic violations; before those two landed the check matched only
+    ``re.compile`` with a plain-string argument, which this script has none
+    of, and was therefore vacuous.
 
     WHY IT IS NEEDED. ``scan_content`` is documented "precision over recall",
     and two of its blind spots bite this detector specifically: the bare-hash
