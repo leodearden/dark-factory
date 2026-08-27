@@ -89,6 +89,50 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
     )
 
 
+# The Environment= variables that are HOST-LOCAL and must therefore SURVIVE a
+# re-render. This is the host-local SUBSET of
+# check_dashboard_unit_parity.DIVERGENCE_ALLOWLIST — NOT that allowlist itself,
+# and the difference is the whole design.
+#
+# That allowlist has two entries, on it for OPPOSITE reasons:
+#
+#   * DASHBOARD_KNOWN_PROJECT_ROOTS — the declared HOLE. The committed unit's
+#     own comment says "additional project roots are LOCAL settings, added to
+#     the installed unit, not committed here", and the checker's entry calls it
+#     "A HOLE IN THE GATE". Genuinely host-local; preserving it is the point.
+#   * DASHBOARD_PROJECT_ROOT — NOT host-local, despite sitting on the same list.
+#     Its value is RENDERED from __REPO_ROOT__ per host, and the checker still
+#     CHECKS it — intra-copy, against the SAME file's WorkingDirectory=
+#     (UnitSpec.env_matches_directive). Preserving a PREVIOUS host's value would
+#     pin the dashboard's data root at the OLD repo root while WorkingDirectory=
+#     moved to the new one, manufacturing precisely the intra-copy drift
+#     _compare_env_matches_directive exists to report — on a host that had just
+#     been correctly reinstalled.
+#
+# So: adding a name here that is NOT on DIVERGENCE_ALLOWLIST turns the parity
+# gate permanently red (the checker would value-compare a variable this
+# installer deliberately makes differ), and adding DASHBOARD_PROJECT_ROOT
+# specifically breaks the unit in the way just described. Neither failure is
+# hypothetical and neither is visible in this file alone.
+#
+# THE SUBSET RELATION AND THE EXCLUSION ARE HELD BY TESTS, NOT BY AN IMPORT:
+# tests/scripts/test_render_dashboard_unit.py::
+# test_host_local_environment_is_a_subset_of_the_divergence_allowlist and
+# ::test_host_local_environment_excludes_project_root, plus a staleness guard
+# asserting every name here is really declared in the committed template.
+#
+# The concrete obstacle to importing the checker instead — do not "tidy" this
+# into a cross-module import: tests/scripts/test_check_dashboard_unit_parity.py's
+# section-8 harness builds a tmp repo where write_checker(body=...) REPLACES
+# check_dashboard_unit_parity.py with an argparse stub, and with_checker=False
+# omits it and its siblings entirely. An import here would ImportError under
+# test_section_8_missing_checker_does_not_read_as_not_yet_installed and
+# test_section_8_usage_error_does_not_read_as_not_yet_installed, turning both
+# red for a reason unrelated to what they assert. This is the same
+# held-by-a-test-rather-than-shared-code arrangement the checker's own UNITS
+# registry has with setup-host.sh's _orch_units array.
+HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
+
 # The section every dashboard Environment= directive lives in. Named rather
 # than searched: check_dashboard_unit_parity's UnitSpec pins the same
 # `environment_section="Service"`, and the two must agree or the installer
