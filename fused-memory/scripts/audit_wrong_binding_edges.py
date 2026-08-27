@@ -60,13 +60,37 @@ SERVER-enforced rather than client-promised — never through ``MemoryService``
 or ``GraphitiBackend``, whose handles can write, and never through
 ``graphiti_core.driver.falkordb_driver.FalkorDriver``, whose ``__init__``
 fire-and-forgets ``build_indices_and_constraints()``.
+
+Usage
+-----
+The two-graph sweep this task's artifact was produced by::
+
+    uv run python scripts/audit_wrong_binding_edges.py \\
+        --graph dark_factory --graph reify --json \\
+        --out-dir ../docs/wrong-binding-edge-sweep-2026-08-27
+
+As a cron gate, exiting non-zero when anything is found::
+
+    uv run python scripts/audit_wrong_binding_edges.py --fail-on-finding
+
+Exit codes: ``0`` ran, ``1`` infra failure (NOTHING is emitted — a truncated
+report that looks complete is worse than none), ``2`` ``--fail-on-finding``
+with at least one finding.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import difflib
+import json
+import logging
+import os
 import re
+import sys
 from collections.abc import Collection
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fused_memory.backends.graphiti_client import (
@@ -908,3 +932,230 @@ def build_report(
         'known_gaps': [dict(gap) for gap in KNOWN_GAPS],
         'findings': [f.to_json() for f in listed],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Wiring
+# --------------------------------------------------------------------------- #
+
+logger = logging.getLogger('audit_wrong_binding_edges')
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    Factored out precisely so ``TestReadOnlyByConstruction`` can enumerate
+    ``parser._actions`` and assert that NO mutation affordance exists. There
+    is deliberately no ``--apply``, no ``--invalidate``, no ``--delete``, no
+    ``--repair`` and no ``--reassign``: this script reports, and a human
+    adjudicates.
+    """
+    parser = argparse.ArgumentParser(
+        prog='audit_wrong_binding_edges',
+        description=(
+            'Read-only retrospective sweep for wrong-binding RELATES_TO edges '
+            '(task 4717, esc-4639-1). Reports only — it never mutates the graph.'
+        ),
+    )
+    parser.add_argument(
+        '--graph', action='append', metavar='GRAPH',
+        help=(
+            'Graph to sweep. Repeatable — the artifact run sweeps both '
+            f'dark_factory and reify. Default: {DEFAULT_GRAPH}.'
+        ),
+    )
+    parser.add_argument(
+        '--graph-uri', default=None,
+        help='FalkorDB URI (redis://host:port). Default: env, then config.',
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit the full JSON report on stdout instead of a short summary.',
+    )
+    parser.add_argument(
+        '--out-dir', default=None, metavar='DIR',
+        help='Also write DIR/report.json (byte-identical to the --json output).',
+    )
+    parser.add_argument(
+        '--include-unverifiable', action='store_true',
+        help=(
+            'List the edges whose fact names NO task id. They are always '
+            'COUNTED under the top-level "unverifiable" key; this adds the '
+            'listing.'
+        ),
+    )
+    parser.add_argument(
+        '--limit-listing', type=int, default=None, metavar='N',
+        help=(
+            'List at most N findings. All are still COUNTED, and '
+            'truncated_by names what was withheld.'
+        ),
+    )
+    parser.add_argument(
+        '--fail-on-finding', action='store_true',
+        help='Exit 2 when at least one finding is found (for a CI/cron gate).',
+    )
+    return parser
+
+
+def _resolve_uri(args: argparse.Namespace) -> str | None:
+    """Resolve the FalkorDB URI from --graph-uri, then the env, then config."""
+    if args.graph_uri:
+        return str(args.graph_uri)
+    env_uri = os.environ.get('FALKORDB_URI')
+    if env_uri:
+        return env_uri
+    try:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        return getattr(getattr(config.graphiti, 'falkordb', None), 'uri', None)
+    except Exception:
+        logger.warning(
+            'could not resolve a FalkorDB uri from config; falling back to '
+            'the client default', exc_info=True,
+        )
+        return None
+
+
+async def _sweep_graph(
+    reader: Any, graph: str
+) -> tuple[list[Finding], int, int, int, list[dict[str, Any]], list[tuple]]:
+    """Sweep one graph. Returns findings, scanned, population, unverifiable,
+    unverifiable rows, and the (graph, kind, PagedRead) triples."""
+    node_ids, node_read = await reader.read_task_node_ids()
+    rows, edge_read = await reader.fetch_edges()
+    logger.info(
+        '%s: %d live RELATES_TO row(s) (complete=%s), %d task node(s)',
+        graph, edge_read.rows_seen, edge_read.complete, len(node_ids),
+    )
+
+    findings: list[Finding] = []
+    population = 0
+    unverifiable = 0
+    unverifiable_rows: list[dict[str, Any]] = []
+    for row in rows:
+        subject, obj, uuid, fact, episodes = (list(row) + [None] * 5)[:5]
+        # An edge with no task-shaped endpoint asks no question this sweep can
+        # answer, so it is outside BOTH the population and the unverifiable
+        # count — it is simply not about tasks.
+        if endpoint_referent(subject) is None and endpoint_referent(obj) is None:
+            continue
+        if not fact_referents(fact, graph):
+            unverifiable += 1
+            unverifiable_rows.append(
+                {'edge_uuid': uuid, 'graph': graph, 'subject': subject,
+                 'object': obj, 'fact': fact}
+            )
+            continue
+        population += 1
+        findings.extend(
+            classify_edge(subject, obj, fact, uuid, graph, episodes=episodes)
+        )
+
+    # Cause attribution, once the graph's whole task-node census is in hand.
+    enriched: list[Finding] = []
+    for finding in findings:
+        named = {r.number for r in finding.fact_referents if not r.project_id}
+        bucket, nearest = id_proximity(finding.node_referent.number, named)
+        enriched.append(
+            Finding(**{
+                **vars_of(finding),
+                'proximity': bucket,
+                'nearest_id': nearest,
+                'correct_node_present': correct_node_present(nearest, node_ids),
+            })
+        )
+    reads = [(graph, 'nodes', node_read), (graph, 'edges', edge_read)]
+    return enriched, len(rows), population, unverifiable, unverifiable_rows, reads
+
+
+async def _run(
+    args: argparse.Namespace, *, reader_factory: object | None = None
+) -> int:
+    """Sweep every requested graph and emit one report.
+
+    Exit codes: ``0`` ran, ``1`` infra failure (NOTHING is emitted — a
+    truncated report that looks complete is worse than none), ``2``
+    ``--fail-on-finding`` and at least one finding was found.
+    """
+    if reader_factory is None:
+        logging.basicConfig(
+            level=logging.INFO, format='%(levelname)s %(name)s: %(message)s',
+            stream=sys.stderr,
+        )
+    graphs = list(args.graph) if args.graph else [DEFAULT_GRAPH]
+
+    try:
+        if reader_factory is None:
+            uri = _resolve_uri(args)
+
+            def make_reader(name: str) -> Any:
+                return EdgeReader(graph_name=name, uri=uri)
+        else:
+            make_reader = reader_factory  # type: ignore[assignment]
+
+        findings: list[Finding] = []
+        scanned = population = unverifiable = 0
+        unverifiable_rows: list[dict[str, Any]] = []
+        reads: list[tuple] = []
+        for graph in graphs:
+            found, n, pop, unv, unv_rows, gr = await _sweep_graph(
+                make_reader(graph), graph
+            )
+            findings.extend(found)
+            scanned += n
+            population += pop
+            unverifiable += unv
+            unverifiable_rows.extend(unv_rows)
+            reads.extend(gr)
+    except Exception:
+        logger.error(
+            'could not read the edge population — no report is emitted rather '
+            'than a partial one that would read as complete', exc_info=True,
+        )
+        return 1
+
+    report = build_report(
+        findings,
+        swept_at=datetime.now(UTC).isoformat(),
+        graphs=graphs,
+        scanned=scanned,
+        population=population,
+        unverifiable=unverifiable,
+        reads=reads,
+        limit_listing=args.limit_listing,
+    )
+    if args.include_unverifiable:
+        report['unverifiable_edges'] = unverifiable_rows
+
+    blob = json.dumps(report, indent=2, sort_keys=False, default=str)
+    if args.out_dir:
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'report.json').write_text(blob + '\n')
+        logger.info('wrote %s', out / 'report.json')
+
+    if args.json:
+        print(blob)
+    else:
+        summary = report['summary']
+        print(
+            f"scanned={report['scanned']} population={report['population']} "
+            f"unverifiable={report['unverifiable']} "
+            f"findings={summary['findings']} rate={summary['rate']:.4f} "
+            f"truncated_by={'yes' if report['truncated_by'] else 'no'}"
+        )
+
+    if args.fail_on_finding and report['summary']['findings']:
+        return 2
+    return 0
+
+
+def main() -> int:
+    """Entry point: parse argv and run the sweep."""
+    return asyncio.run(_run(_build_parser().parse_args()))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
