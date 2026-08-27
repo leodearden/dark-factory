@@ -799,11 +799,39 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 '-p no:xdist',
             ],
             min_phrase_hits=2,
+            # The previous hint's sole instruction -- amend the canonical
+            # memory in place -- is authz-refused for every orchestrator-
+            # dispatched agent: update_memory's content-amend arm is gated to
+            # recon-stage- / curator- agent_id prefixes
+            # (Mem0UpdateConfig.content_amend_allowed_agent_prefixes), and no
+            # dispatched task/merge agent carries either. That made the block
+            # a dead end for its actual audience. Replaced with the
+            # three-outcome shape ratified 2026-08-25 (task 4738, fix A):
+            # override / skip / escalate, naming only tools this audience
+            # actually holds (search, escalate_*) and never suggesting the
+            # self-rename into curator- that skills/curate-fused-memories
+            # forbids. The structural fix -- stopping a per-cluster hint from
+            # shadowing the guard's escape hatches at all -- is the sibling
+            # fix-B task, deliberately not done here.
             hint=(
                 'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
-                'pyproject.toml). Do NOT add another entry -- update/consolidate '
-                'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+                'pyproject.toml). The canonical entry is memory '
+                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51 -- SEARCH it and read it to '
+                'decide which of these three applies to your write. Do not try to '
+                'amend it: content amends are authz-gated to recon-stage- / '
+                'curator- agent_ids, so that call will refuse you. '
+                '(1) Your content is genuinely DISTINCT from that entry -- re-send '
+                "this write with metadata={'allow_near_duplicate': True}, which is "
+                'open to every agent and bypasses this block. '
+                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping is a '
+                'sanctioned outcome here, not a failure: consolidating this '
+                'cluster belongs to an interactive curation sitting running '
+                'skills/curate-fused-memories, not to you, and renaming yourself '
+                'into that role to get past this block is forbidden by that '
+                'skill. '
+                '(3) You are unsure, or your content CONTRADICTS the canonical '
+                'entry -- escalate. Do not retry the refused call.'
             ),
         ),
         ProceduralTopicCluster(
