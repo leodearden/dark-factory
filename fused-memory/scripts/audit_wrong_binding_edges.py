@@ -69,6 +69,12 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.backends.graphiti_client import (
+    _DEFAULT_READ_PAGE_SIZE,
+    _RESULTSET_SIZE,
+    PagedRead,
+    _paged_ro_query,
+)
 from fused_memory.utils.canonical_labels import (
     Referent,
     parse_node_name,
@@ -496,3 +502,179 @@ def correct_node_present(nearest_id: str, task_node_ids: Collection[str]) -> boo
     if not nearest_id:
         return False
     return nearest_id in task_node_ids
+
+
+# --------------------------------------------------------------------------- #
+# The read seam — GRAPH.RO_QUERY, paged, no graphiti driver
+# --------------------------------------------------------------------------- #
+
+DEFAULT_GRAPH = 'dark_factory'
+"""The graph swept when --graph is not given."""
+
+RO_COMMAND = 'GRAPH.RO_QUERY'
+"""The only FalkorDB command this script is permitted to issue.
+
+Read-only here is SERVER-enforced, not client-promised: a ``CREATE`` issued
+through this command path is refused by a live FalkorDB and materializes
+nothing. For a sweep whose entire premise is "do not reassign an edge on a
+regex verdict", that is the difference between a promise and a guarantee.
+
+Which is why this reads over Cypher rather than through ``MemoryService`` /
+``GraphitiBackend`` (both reach the store through a handle that CAN write) and
+never constructs ``graphiti_core.driver.falkordb_driver.FalkorDriver``, whose
+``__init__`` fire-and-forgets ``build_indices_and_constraints()`` — a WRITE,
+issued before a read-only sweep had read anything.
+"""
+
+_EDGE_MATCH = (
+    'MATCH (a)-[r:RELATES_TO]->(b) '
+    'WHERE r.invalid_at IS NULL AND r.expired_at IS NULL '
+)
+
+EDGE_PAGE_CYPHER = (
+    _EDGE_MATCH
+    + 'RETURN a.name, b.name, r.uuid, r.fact, r.episodes '
+    'ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
+)
+"""One page of LIVE ``RELATES_TO`` edges.
+
+``r.fact_embedding`` is deliberately NOT projected: ~1500 floats per edge over
+15256 edges, for a text detector that never looks at them.
+
+``ORDER BY r.uuid`` is a TOTAL order over the matched population, and is
+load-bearing rather than cosmetic — see ``_paged_ro_query``'s docstring: each
+page is a separate query, so without a total order SKIP n on page 2 can skip
+rows page 1 never returned, silently and permanently.
+"""
+
+EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(*)'
+"""The identical MATCH/WHERE as a single-row count, so the two numbers
+describe the same population. A single-row aggregate can never be truncated by
+the row cap it is being used to detect."""
+
+_NODE_MATCH = 'MATCH (n:Entity) '
+
+NODE_PAGE_CYPHER = _NODE_MATCH + 'RETURN n.name ORDER BY n.name SKIP {skip} LIMIT {limit}'
+"""One page of Entity names, filtered to task labels in Python.
+
+The filter cannot run in Cypher: "is this name a task label" is the imported
+anchored parser's question, and re-expressing it as a Cypher predicate would
+be exactly the second vocabulary INV-5 forbids.
+"""
+
+NODE_CENSUS_CYPHER = _NODE_MATCH + 'RETURN count(*)'
+
+
+class EdgeReader:
+    """Reads one graph's live ``RELATES_TO`` edges and task-node ids.
+
+    Constructed either with an explicit *graph* handle (the tests pass a
+    double) or with a uri + graph name, in which case a ``falkordb.asyncio``
+    client is opened lazily on first use. ``falkordb.FalkorDB`` — the DB
+    client — is categorically distinct from graphiti's ``FalkorDriver``; see
+    :data:`RO_COMMAND` for why the latter must never be constructed here.
+
+    BOTH READS ARE PAGED, and that is a DELIBERATE DIVERGENCE from
+    ``audit_unverified_completion_claims.py``, which issues one unpaginated
+    ``MATCH (e:Episodic)``. That is correct THERE — its population (2976
+    dark_factory / 4547 reify) sits under the server's 10000-row
+    ``RESULTSET_SIZE``. It is wrong HERE: reify holds 15256 live RELATES_TO
+    rows, so an unpaginated read returns exactly 10000 of them, silently, and
+    every denominator in the report would be wrong. Verified during planning
+    against the live store — a bare MATCH returned 10000 while
+    ``_paged_ro_query`` returned ``rows_seen=15256 expected_rows=15256
+    complete=True``.
+
+    *page_size* and *resultset_size* are injectable so a test can exercise the
+    paging behaviour against a small cap; the defaults are the module-level
+    constants ``_paged_ro_query`` itself uses, so production runs cannot drift
+    from the shared primitive's tuning.
+    """
+
+    def __init__(
+        self,
+        *,
+        graph: Any | None = None,
+        graph_name: str = DEFAULT_GRAPH,
+        uri: str | None = None,
+        page_size: int = _DEFAULT_READ_PAGE_SIZE,
+        resultset_size: int = _RESULTSET_SIZE,
+    ) -> None:
+        self._graph = graph
+        self.graph_name = graph_name
+        self.uri = uri
+        self.page_size = page_size
+        self.resultset_size = resultset_size
+
+    @staticmethod
+    def assert_read_only_command(command: str) -> None:
+        """Raise unless *command* is :data:`RO_COMMAND`.
+
+        A client-side guard layered on the server-side one, so a violation is
+        a typed error at the seam that owns the guarantee rather than a redis
+        error surfacing three layers down.
+        """
+        if command != RO_COMMAND:
+            raise RuntimeError(
+                f'this sweep may only issue {RO_COMMAND}, refused {command!r} '
+                f'— it is strictly read-only'
+            )
+
+    def _resolve_graph(self) -> Any:
+        """Return the graph handle, opening a client on first use.
+
+        The import is local so that merely importing this module — which the
+        tests do, with a double in hand — never requires falkordb to be
+        installed or a store to be running.
+        """
+        if self._graph is None:
+            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
+
+            client = FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
+            self._graph = client.select_graph(self.graph_name)
+        return self._graph
+
+    async def _read(self, page: str, census: str) -> PagedRead:
+        self.assert_read_only_command(RO_COMMAND)
+        return await _paged_ro_query(
+            self._resolve_graph(),
+            page,
+            census,
+            page_size=self.page_size,
+            resultset_size=self.resultset_size,
+        )
+
+    async def fetch_edges(self) -> tuple[list[list], PagedRead]:
+        """Every live ``RELATES_TO`` row, plus the completeness proof.
+
+        The PagedRead is returned ALONGSIDE the rows rather than folded into
+        them, so a caller can never infer completeness from a row count. An
+        incomplete read is a fact the report must publish (``truncated_by``),
+        not an exception — a census disagreeing by a handful of rows is the
+        expected signature of a live graph being written to mid-read.
+        """
+        read = await self._read(EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER)
+        return list(read.rows), read
+
+    async def read_task_node_ids(self) -> tuple[set[str], PagedRead]:
+        """The task ids named by this graph's ``Entity`` nodes.
+
+        Feeds :func:`correct_node_present`. Names are parsed with the IMPORTED
+        anchored parser, so a FOREIGN 'reify:132' node inside dark_factory
+        contributes NOTHING to the local id set — harvesting its bare number
+        would make ``correct_node_present`` claim a local ``Task 132`` exists
+        when it does not.
+
+        Paged for the same reason the edge read is: dark_factory measured
+        16083 Entity nodes and reify 23616 (2026-08-17), both far above the
+        10000 cap, and a truncated node census makes this column answer False
+        for every node past the cut — manufacturing exactly the "the correct
+        node was missing" conclusion it exists to test.
+        """
+        read = await self._read(NODE_PAGE_CYPHER, NODE_CENSUS_CYPHER)
+        ids: set[str] = set()
+        for row in read.rows:
+            referent = endpoint_referent(row[0] if row else None)
+            if referent is not None and not referent.project_id:
+                ids.add(referent.number)
+        return ids, read
