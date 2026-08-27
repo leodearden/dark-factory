@@ -1644,6 +1644,19 @@ def create_mcp_server(
             'temporal_facts',
         }
     )
+    # Categories the deterministic topic-cluster pre-check covers (task 3430).
+    # ENUMERATED rather than composed from MEM0_PRIMARY the way _TRIAGED_CATEGORIES
+    # is: observations_and_summaries is deliberately excluded here — extending to
+    # it is sibling task 4729's call, with its own false-positive analysis this
+    # task has not done. This frozenset is the one-line widening point for 4729.
+    # Built from `.value` (not string literals) so a category rename cannot
+    # silently break the gate.
+    _TOPIC_GUARD_GATED_CATEGORIES = frozenset(
+        {
+            MemoryCategory.procedural_knowledge.value,
+            MemoryCategory.preferences_and_norms.value,
+        }
+    )
 
     async def _premature_completion_block(
         content: str, agent_id: str, project_id: str
@@ -3298,27 +3311,54 @@ def create_mcp_server(
         # pins the retirement of the soft-block, not the outcome `stored`.
         if (
             not triage_enabled
-            and category == 'procedural_knowledge'
+            and category in _TOPIC_GUARD_GATED_CATEGORIES
             and not allow_near_duplicate
             and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
-            # Deterministic topic-keyed pre-check (task 2845): if the content
-            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # Deterministic topic-keyed pre-check (task 2845; widened in task
+            # 3430 to also gate preferences_and_norms): if the content matches
+            # a known-contradictory topic cluster, soft-block BEFORE the
             # cosine search. This is strictly cheaper (no embedding round-trip)
             # and catches same-topic paraphrases the cosine guard misses. On no
-            # match (or an empty/unconfigured clusters list) fall through to the
-            # existing cosine path unchanged. Shares the allow_near_duplicate /
-            # recon-stage exemptions and the enabled kill-switch above with the
-            # cosine guard.
+            # match (or an empty/unconfigured clusters list) fall through — to
+            # the cosine path below for procedural_knowledge, or straight
+            # through to the write for any other _TOPIC_GUARD_GATED_CATEGORIES
+            # member. Shares the allow_near_duplicate / recon-stage exemptions
+            # and the enabled kill-switch with the cosine guard below.
+            #
+            # TOPIC-keyed rather than category-keyed: unlike the cosine guard
+            # below, this check is not scoped to a single category — it covers
+            # every category in _TOPIC_GUARD_GATED_CATEGORIES.
             topic_clusters = resolve_topic_guard_clusters(memory_service)
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
                     matched_cluster, matched_phrases = topic_match
-                    return build_topic_cluster_block(
-                        agent_id, content, matched_cluster, matched_phrases
-                    )
+                    return {
+                        **build_topic_cluster_block(
+                            agent_id, content, matched_cluster, matched_phrases
+                        ),
+                        'category': category,
+                    }
+        # Cosine near-duplicate search — kept procedural_knowledge-only. Unlike
+        # the topic pre-check above (task 3430 widened that one to also cover
+        # preferences_and_norms), this path stays scoped to procedural_knowledge:
+        # the search(categories=['procedural_knowledge'], stores=['mem0'])
+        # round-trip below and find_near_duplicate_memory's category filter are
+        # both procedural-specific, and deciding whether/how to compare a
+        # preferences_and_norms write against procedural (or preferences)
+        # entries is a separate cost/semantics decision this task does not
+        # make. The full conjunct chain is spelled out again here (rather than
+        # hoisting a shared boolean out of the block above) so this block's
+        # behaviour for procedural_knowledge is provably unchanged by the split.
+        if (
+            not triage_enabled
+            and category == 'procedural_knowledge'
+            and not allow_near_duplicate
+            and not is_recon_stage_agent
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
