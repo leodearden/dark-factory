@@ -57,6 +57,7 @@ class TestGetValidEdgesForNodeUuidDedup:
         assert 'WITH DISTINCT' not in cypher
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
+        assert 'expired_at IS NULL' in cypher  # task 4714: both retirement markers
         params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'u'
         graph.ro_query.assert_awaited_once()
@@ -147,6 +148,7 @@ class TestGetAllValidEdgesUuidDedup:
         assert 'WITH DISTINCT' not in cypher
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
+        assert 'expired_at IS NULL' in cypher  # task 4714: both retirement markers
         # The read is paginated (task 4340): one census probe plus N pages, so
         # "exactly one query" is no longer the shape. The load-bearing half of
         # that original assertion — this stays on the read-only path — is kept.

@@ -248,6 +248,7 @@ class TestGroupIdScopingAmendment:
         assert 'n.group_id = $group_id' in cypher
         assert '(n:Entity {name: $name})' in cypher  # pre-existing substring, unchanged
         assert 'invalid_at IS NULL' in cypher  # pre-existing substring, unchanged
+        assert 'expired_at IS NULL' in cypher  # task 4714: both retirement markers
         assert params.get('group_id') == 'home'
 
     @pytest.mark.asyncio

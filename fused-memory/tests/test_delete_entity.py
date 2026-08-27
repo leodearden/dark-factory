@@ -67,6 +67,7 @@ class TestGetConnectedEntityUuids:
         cypher = extract_cypher(graph.ro_query.call_args)
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
+        assert 'expired_at IS NULL' in cypher  # task 4714: both retirement markers
         assert 'm.uuid <> $uuid' in cypher or "m.uuid <>" in cypher
 
     @pytest.mark.asyncio

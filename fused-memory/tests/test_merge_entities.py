@@ -559,6 +559,7 @@ class TestDedupValidEdgesForNode:
         cypher = extract_cypher(graph.ro_query.call_args)
         assert '-[e:RELATES_TO]-' in cypher
         assert 'invalid_at IS NULL' in cypher
+        assert 'expired_at IS NULL' in cypher  # task 4714: both retirement markers
         params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'A-uuid'
         backend.bulk_remove_edges.assert_awaited_once_with(['e-2'], group_id='test')
@@ -620,6 +621,9 @@ class TestFindDuplicateEntityNodes:
         assert '(n:Entity {name: $name})' in cypher
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
+        # task 4714: the survivor-ranking edge_count must count only LIVE edges,
+        # so a node whose degree is mostly retired history cannot outrank a peer.
+        assert 'expired_at IS NULL' in cypher
         assert 'count(DISTINCT e)' in cypher
         params = extract_params(graph.ro_query.call_args)
         assert params.get('name') == 'Reify'

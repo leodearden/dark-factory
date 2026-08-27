@@ -3053,3 +3053,70 @@ class TestStructuralRefusalNeverBlanksSummaries:
 
         backend.update_node_summary.assert_not_awaited()
         assert backend.update_node_summary.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4714: the bulk rebuild and the single-entity refresh read the SAME
+# population — otherwise the two summary generators diverge for one entity
+# ---------------------------------------------------------------------------
+
+class TestBulkAndSingleRefreshShareTheEdgePopulation:
+    """Both summary generators must select edges by the same predicate.
+
+    ``rebuild_entity_summaries`` (bulk, via ``get_all_valid_edges``) and
+    ``refresh_entity_summary`` (single, via ``get_valid_edges_for_node``) write
+    to the SAME ``summary`` property.  If their WHERE clauses drift apart, which
+    facts an entity's summary contains depends on which code path last touched
+    it — the bulk pass and a targeted refresh would disagree about the same
+    entity, and each would silently overwrite the other.
+    """
+
+    @staticmethod
+    def _predicates(queries: list[str]) -> list[str]:
+        """The WHERE clause of every RELATES_TO read, page queries included."""
+        out = []
+        for q in queries:
+            if 'RELATES_TO' not in q or 'WHERE' not in q:
+                continue
+            where = q.split('WHERE', 1)[1]
+            # Stop at whatever follows the predicate in each query shape.
+            for terminator in ('RETURN', 'OPTIONAL MATCH', 'WITH'):
+                where = where.split(terminator, 1)[0]
+            out.append(' '.join(where.split()))
+        return out
+
+    @pytest.mark.asyncio
+    async def test_both_reads_use_the_same_retirement_predicate(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _DualCorpusGraph(
+            node_rows=[['u1', 'Task 99', 'stale']],
+            edge_rows=[['u1', 'e1', 'Task 99 depends on Task 98', 'DEPENDS_ON']],
+        )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.update_node_summary = AsyncMock()
+
+        # The bulk path's whole-graph edge read...
+        await backend.get_all_valid_edges(group_id='test')
+        bulk = self._predicates(graph.queries)
+
+        graph.queries.clear()
+        # ...and the single-entity refresh.  _DualCorpusGraph's edge corpus is
+        # 4-column (bulk shape); get_valid_edges_for_node reads columns 0..2, so
+        # the rows are harmless here — the claim under test is the WHERE clause.
+        await backend.refresh_entity_summary(
+            'u1', group_id='test', name='Task 99', old_summary='stale'
+        )
+        single = self._predicates(graph.queries)
+
+        assert bulk, f'no RELATES_TO read recorded for the bulk path: {bulk}'
+        assert single, f'no RELATES_TO read recorded for the refresh path: {single}'
+        assert set(bulk) == set(single), (
+            'the bulk rebuild and the single-entity refresh write the same '
+            'summary property, so they must select edges by the same predicate '
+            f'— bulk={sorted(set(bulk))} single={sorted(set(single))}'
+        )
+        for predicate in bulk + single:
+            assert 'e.invalid_at IS NULL' in predicate, predicate
+            assert 'e.expired_at IS NULL' in predicate, predicate
