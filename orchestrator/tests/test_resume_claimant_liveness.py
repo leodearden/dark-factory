@@ -47,6 +47,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
+from orchestrator.module_charter import sanitize_files_for_persist
 
 # ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
 # ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in
@@ -930,6 +931,19 @@ def _files_updates(harness: Harness) -> list:
     return out
 
 
+# A DIRECTORY-shaped grant entry, and a real one: `escalation/server.py::
+# resolve_issue` and `EscalationQueue.resolve` both write `granted_files`
+# through VERBATIM with no validation, so whatever a steward types arrives
+# here unfiltered.  Chosen to be `is_file_path`-HONEST rather than merely
+# extension-less: its final segment (`orchestrator`) carries no recognised
+# extension AND is not in `shared.locking.EXTENSIONLESS_FILENAMES`, because
+# since #3248 "no recognised extension" has NOT been the criterion —
+# `LICENSE` / `Dockerfile` / the hook paths are retained as real files.  Every
+# test below re-derives the verdict from the production predicate rather than
+# trusting this comment.
+_DIR_GRANT = 'orchestrator/src/orchestrator/'
+
+
 @pytest.mark.asyncio
 class TestGrantedFilesFoldOnRepend:
     """A scope grant resolved against a task with NO live workflow is actually
@@ -978,6 +992,113 @@ class TestGrantedFilesFoldOnRepend:
         assert writes[0].kwargs.get('metadata_mode') == 'merge', (
             "metadata_mode='merge' is required — 'additive' resolves scalar "
             'conflicts OLD-wins and would not replace the files list'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_a_directory_grant_is_stripped_from_the_metadata_half(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A directory-shaped grant reaches plan.json RAW and ``metadata.files``
+        SANITIZED — the same asymmetry ``workflow.py::TaskWorkflow.
+        _set_task_scope`` already has.
+
+        ``granted_files`` arrives here UNVALIDATED: ``escalation/server.py::
+        resolve_issue`` and ``escalation/queue.py::EscalationQueue.resolve``
+        both write it through verbatim, and this task's own
+        ``skills/escalation-watcher-auto/SKILL.md`` already tells the watcher
+        that "a directory entry is stripped before the metadata write".  Passed
+        through unsanitized, that entry makes the ``lock_charter_guard``
+        middleware reject the ENTIRE ``update_task`` payload as a
+        ``LockCharterViolation`` — silently dropping the VALID file-level
+        entries alongside it (the incident class of commit 54ec90fefc).
+
+        plan.json keeps the raw entry deliberately: it is the durable half and
+        is allowed directory charters, which ``module_charter.derive_modules``
+        strips again at derive time.
+        """
+        assert sanitize_files_for_persist([_DIR_GRANT]) == [], (
+            'fixture premise: _DIR_GRANT must classify as a DIRECTORY under '
+            'the production predicate, or this test asserts nothing'
+        )
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=[_DIR_GRANT, 'pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        union = ['pkg/a.py', _DIR_GRANT, 'pkg/b.py']
+        assert json.loads(plan_path.read_text())['files'] == union, (
+            'plan.json takes the RAW union — it is allowed directory entries, '
+            'exactly as _set_task_scope writes set_plan_files(new_files) raw'
+        )
+        writes = _files_updates(harness)
+        assert len(writes) == 1, f'Expected exactly one files write; got {writes}'
+        assert writes[0].args[0] == '3438'
+        # By value AND against the predicate: the literal documents the
+        # expectation for a reader, the derived form makes a future
+        # `is_file_path` / FILE_EXTENSIONS change propagate here instead of
+        # leaving this test asserting a stale hand-written list.
+        assert writes[0].args[1] == {'files': ['pkg/a.py', 'pkg/b.py']}
+        assert writes[0].args[1]['files'] == sanitize_files_for_persist(union)
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '3438', _resume_target(esc)
+        )
+
+    async def test_an_all_directory_grant_widens_the_plan_and_writes_no_metadata(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """An ALL-directory grant widens plan.json and costs no metadata write.
+
+        Sanitizing it leaves exactly what ``metadata.files`` already holds, so
+        there is nothing new to persist — matching ``_tag_task_modules``' rule
+        that "an all-directory prediction sanitizes to [] and is treated
+        exactly like an empty/omitted one (sentinel alone, no clobber)".  The
+        skip is the STRONGEST form of the two properties that actually matter
+        here, both of which are asserted independently of it below: the guard
+        is never handed a payload it would reject wholesale, and the existing
+        file-level entries are never clobbered by a narrower list.  The flip
+        and the plan write still happen — the grant is not withheld, it simply
+        has no file-level representation in metadata.
+        """
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=[_DIR_GRANT], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        union = ['pkg/a.py', _DIR_GRANT]
+        assert json.loads(plan_path.read_text())['files'] == union, (
+            'plan.json IS widened by a directory grant — it is the durable '
+            'half and the entry is stripped again at derive time'
+        )
+        honest = sanitize_files_for_persist(union)
+        assert honest == ['pkg/a.py'], (
+            'fixture premise: the grant must sanitize away entirely, leaving '
+            'metadata.files exactly as it already was'
+        )
+        writes = _files_updates(harness)
+        for w in writes:
+            assert w.args[1]['files'] == honest, (
+                'a metadata.files payload may never carry a directory-shaped '
+                'entry (the lock-charter guard rejects the WHOLE payload as a '
+                'LockCharterViolation, dropping the valid entries with it), '
+                'and may never clobber the existing file-level entries'
+            )
+        assert writes == [], (
+            'nothing new to persist: the sanitized union equals the sanitized '
+            'current scope, so the update_task round-trip is skipped entirely'
         )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             '3438', _resume_target(esc)
