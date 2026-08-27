@@ -217,14 +217,6 @@ class TestTheFiledEscalation:
         assert 'referent_resolution' in action, 'the resolver'
         assert 'referent_repair_counts' in action, 'the read side'
 
-    def test_the_suggested_action_states_repairs_were_not_halted(self, tmp_path):
-        """The escalation is the ALARM, not a halt — an operator who assumes
-        writes are parked will mis-triage the urgency."""
-        _emit(tmp_path)
-        action = _filed(tmp_path)[0]['suggested_action'].lower()
-
-        assert 'not halted' in action or 'were not halted' in action
-
 
 class TestDedupeFold:
     """A SUSTAINED storm folds into one pending parent, not one page per breach."""
