@@ -23,6 +23,7 @@
     "seed": 3631,
     "plan_source": "unavailable",
     "baseline_source": "merge_first_parent",
+    "base_is_approximated": false,
     "task_status": "done",
     "eval_branch_pinned": false,
     "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_3834) failed: Command git update-ref refs/heads/evals/reify_task_3834 d8cbc8f156d0f8e1e69e49ce180c8e3c9ec96a03 failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_3834': cannot lock ref 'refs/heads/evals/reify_task_3834': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_3834.lock': Permission denied",

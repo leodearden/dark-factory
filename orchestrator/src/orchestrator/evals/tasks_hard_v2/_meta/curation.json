@@ -67,8 +67,8 @@
   "curation_criterion": "Exclude a candidate when its brief fails to state an implementable goal. Never a length threshold: brief_chars is recorded per row as evidence for the judgement, not as the rule.",
   "adversarial_scan": "No candidate in the census is an adversarial/red-team fixture \u2014 all 41 are real product tasks from the three checkouts' task trees. The PRD's skip-adversarial rule therefore excludes nothing here; the scan is recorded so its emptiness is a finding rather than an omission.",
   "merge_sha_availability": {
-    "referenced": 17,
-    "planrate_only": 22,
+    "referenced": 20,
+    "planrate_only": 19,
     "finding": "SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean \"Merge task/<id> into main\" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for \u03b31, though it does not block \u03b21 \u2014 D9's planRate-only mechanism handles it."
   },
   "ceilings": {
@@ -189,10 +189,10 @@
       "brief_chars": 139,
       "decision": "include",
       "reason": "INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit.",
-      "merge_sha": null,
-      "baseline_sha": "7d2ed24d28946576e638517d3c2e6feb22045c00",
-      "baseline_source": "status_autocommit",
-      "mint_mode": "planrate_only"
+      "merge_sha": "f46855b4ea58bc327c9efcccf57097334ff82a0d",
+      "baseline_sha": "3d054455139d3dc8f0c7dba044846acf7b3357ab",
+      "baseline_source": "merge_first_parent",
+      "mint_mode": "referenced"
     },
     {
       "task_id": "2384",
@@ -231,10 +231,10 @@
       "brief_chars": 299,
       "decision": "include",
       "reason": "INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` \u2014 the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded).",
-      "merge_sha": null,
-      "baseline_sha": "4e12e7a06d3d74ee51098b739a6d124dd03cf909",
-      "baseline_source": "status_autocommit",
-      "mint_mode": "planrate_only"
+      "merge_sha": "69b4969f238f7d93476310bceb89f744b67c37fa",
+      "baseline_sha": "1be35605564b61bbaf12161dd0bfbc76795874d4",
+      "baseline_source": "merge_first_parent",
+      "mint_mode": "referenced"
     },
     {
       "task_id": "2654",
@@ -552,10 +552,10 @@
       "brief_chars": 1577,
       "decision": "include",
       "reason": "INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit.",
-      "merge_sha": null,
-      "baseline_sha": "e21d0470260076a7655114a765e1266cdbf74a9d",
-      "baseline_source": "timestamp_walk",
-      "mint_mode": "planrate_only"
+      "merge_sha": "3613bea2241360128b8f3b66af6fb457ab7086d5",
+      "baseline_sha": "794d32159604a3058998d63c7a033354e1dd7d08",
+      "baseline_source": "merge_first_parent",
+      "mint_mode": "referenced"
     },
     {
       "task_id": "4086",
@@ -567,7 +567,7 @@
       "decision": "include",
       "reason": "INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit.",
       "merge_sha": null,
-      "baseline_sha": "a18a30657416a4cbcfefbb58cbed314b0fddffbb",
+      "baseline_sha": "743a0e2e9a1912f31691c757bce4dd0538f0af54",
       "baseline_source": "timestamp_walk",
       "mint_mode": "planrate_only"
     },

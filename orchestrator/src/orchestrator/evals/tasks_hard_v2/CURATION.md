@@ -54,10 +54,10 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 | 2325 | reify | 137 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2330 | reify | 750 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2336 | reify | 119 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 2379 | reify | 139 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
+| 2379 | reify | 139 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2384 | reify | 285 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2531 | reify | 116 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 2573 | reify | 299 | done | include | planrate_only | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
+| 2573 | reify | 299 | done | include | referenced | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
 | 2654 | reify | 195 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2655 | reify | 162 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2656 | reify | 100 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
@@ -80,7 +80,7 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 | 3834 | reify | 3862 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 3845 | reify | 2201 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 3883 | reify | 2631 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 4026 | reify | 1577 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
+| 4026 | reify | 1577 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 4086 | reify | 1298 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 4370 | reify | 9422 | done | include | referenced | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
 | 4832 | reify | 2627 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
@@ -109,8 +109,8 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 
 SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean "Merge task/<id> into main" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for γ1, though it does not block β1 — D9's planRate-only mechanism handles it.
 
-- `referenced` (single clean merge commit): **17**
-- `planrate_only` (SPLIT / direct-landed): **22**
+- `referenced` (single clean merge commit): **20**
+- `planrate_only` (SPLIT / direct-landed): **19**
 
 A `planrate_only` fixture carries NO `reference` key at all and instead stamps `provenance.reference_unavailable` with the cause plus `provenance.baseline_source` with the ladder rung that produced its `pre_task_commit`. An empty `reference: {}` block would be indistinguishable from a capture that silently failed; omitting the key and recording why makes it a positive, auditable fact.
 

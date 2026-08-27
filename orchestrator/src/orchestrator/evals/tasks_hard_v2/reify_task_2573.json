@@ -3,8 +3,8 @@
   "name": "[v0.2] persistent-naming-v2 task 5a: extrude + revolve (standard OCCT hooks)",
   "project": "reify",
   "project_root": "/home/leo/src/reify",
-  "pre_task_commit": "4e12e7a06d3d74ee51098b739a6d124dd03cf909",
-  "post_task_commit": "",
+  "pre_task_commit": "1be35605564b61bbaf12161dd0bfbc76795874d4",
+  "post_task_commit": "69b4969f238f7d93476310bceb89f744b67c37fa",
   "task_definition": {
     "title": "[v0.2] persistent-naming-v2 task 5a: extrude + revolve (standard OCCT hooks)",
     "description": "Wire attribute attachment for extrude (`BRepPrimAPI_MakePrism`) and revolve (`BRepPrimAPI_MakeRevol`). Both expose standard `BRepAlgoAPI_*`-style `Modified`/`Generated`/`IsDeleted` history maps, so this task uses the standard hooks established by task 2590 \u2014 no custom history mappers required here."
@@ -32,23 +32,33 @@
   "complexity": null,
   "cohort": "fable-trial-v2-hard",
   "provenance": {
-    "merge_sha": "",
+    "merge_sha": "69b4969f238f7d93476310bceb89f744b67c37fa",
     "sampled_at": "2026-08-08T00:00:00+00:00",
     "seed": 3631,
     "plan_source": "unavailable",
-    "baseline_source": "status_autocommit",
+    "baseline_source": "merge_first_parent",
+    "base_is_approximated": false,
     "task_status": "done",
-    "reference_unavailable": "No single \"Merge task/2573 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_2573) failed: Command git update-ref refs/heads/evals/reify_task_2573 69b4969f238f7d93476310bceb89f744b67c37fa failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_2573': cannot lock ref 'refs/heads/evals/reify_task_2573': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_2573.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "69b4969f238f7d93476310bceb89f744b67c37fa",
+    "diff_stat": {
+      "files": 15,
+      "insertions": 3638,
+      "deletions": 25
+    }
   },
   "verify_outcome": {
-    "source": "unavailable",
-    "passed": null,
+    "source": "landed",
+    "passed": true,
     "commands": {
       "test": "cargo test --workspace",
       "lint": "cargo clippy --workspace",
       "typecheck": ""
-    },
-    "reason": "No landed post-commit is available for task 2573 (terminal status 'done'), so there is no commit at which these gates can be claimed to have passed. This fixture is planRate-only and is never scored against a landed verify outcome; the commands are carried for provenance only."
+    }
   },
   "plan": null,
   "max_architect_turns": 120,
