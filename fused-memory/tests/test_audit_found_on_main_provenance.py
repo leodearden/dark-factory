@@ -290,7 +290,7 @@ class TestExtractCitedTaskIdsParenForms:
         assert extract_cited_task_ids('impl(2870): body cites (#123)') == {'2870', '123'}
 
     def test_bare_paren_incidental_numbers_are_not_citations(self):
-        """Documents an accepted false-positive tradeoff (see plan.json's
+        """Recorded history of a now-reversed tradeoff (see plan.json's
         "False-positive tradeoff" section for task 2872): unlike `(#N)` and
         `(task N)`, the bare `(N)` form used to match ANY parenthesized
         integer — a step reference, a year, a count — not just genuine task
@@ -309,40 +309,43 @@ class TestExtractCitedTaskIdsParenForms:
 class TestExtractCitedTaskIdsBareParenRegressions:
     """Real bare-paren shapes (task 4705) that must NOT be read as citations.
 
-    Each fixture is prose containing a parenthesized integer that is not a
-    citation — a count, an enumerated list, a lock-row id, a timeout — drawn
-    from commit messages that were observed misclassifying found_on_main
-    tasks before the bare `(N)` form was retired.
+    Consolidated to one parametrized test (review remediation, task 4705
+    amendment pass): every case pins the same fact already established
+    above by test_bare_paren_form_is_not_a_citation and
+    test_bare_paren_incidental_numbers_are_not_citations — a parenthesized
+    integer in prose is not a citation — so what each case adds is its
+    real-world grounding, not new behavior. Only `task_3869_lock_row_prose`
+    is a VERBATIM quote (from commit a20fbae0286a7da2419625bd8dc92b33e1a11e53);
+    the other three are paraphrased illustrations of shapes that were
+    observed misclassifying found_on_main tasks before the bare `(N)` form
+    was retired. `task_3924_enumerated_review_findings`'s paraphrase
+    intentionally cites only `(1)` and `(8)` (omitting a third incidental
+    number) so it reproduces exactly the {'1', '8'} set the module comment
+    records as measured for that commit, rather than a different set.
     """
 
-    def test_task_4265_literal_zero_is_not_a_citation(self):
-        """Task 4265: a literal `(0)` count is not a citation."""
-        message = 'amend: guard the zero case\n\nThe count is (0) when the queue drains.'
-        assert extract_cited_task_ids(message) == set()
-
-    def test_task_3924_enumerated_review_findings_are_not_citations(self):
-        """Task 3924: an enumerated review-remediation body is not a citation list."""
-        message = (
+    @pytest.mark.parametrize('message', [
+        pytest.param(
+            'amend: guard the zero case\n\nThe count is (0) when the queue drains.',
+            id='task_4265_literal_zero',
+        ),
+        pytest.param(
             'amend: review remediation\n\n'
-            'Addressed findings (1), (2) and (8) from the review.'
-        )
-        assert extract_cited_task_ids(message) == set()
-
-    def test_task_3869_lock_row_prose_is_not_a_citation(self):
-        """Task 3869: genuine prose from commit a20fbae0286a7da2419625bd8dc92b33e1a11e53
-        — lock-row timestamps in parens, not citations."""
-        message = (
+            'Addressed findings (1) and (8) from the review.',
+            id='task_3924_enumerated_review_findings',
+        ),
+        pytest.param(
             "...a skip at 1450 in the gap between run-a's last lock row (1400) "
-            "and run-b's first (1500) must leave the truncated span at 100.0s."
-        )
-        assert extract_cited_task_ids(message) == set()
-
-    def test_task_3977_timeout_and_count_values_are_not_citations(self):
-        """Task 3977: timeout/count values in parens are not citations."""
-        message = (
+            "and run-b's first (1500) must leave the truncated span at 100.0s.",
+            id='task_3869_lock_row_prose',
+        ),
+        pytest.param(
             'impl: retune the poll loop\n\n'
-            'Budget went (20) -> (40) with a (180) second ceiling.'
-        )
+            'Budget went (20) -> (40) with a (180) second ceiling.',
+            id='task_3977_timeout_and_count_values',
+        ),
+    ])
+    def test_bare_paren_shape_is_not_a_citation(self, message):
         assert extract_cited_task_ids(message) == set()
 
 
@@ -448,6 +451,14 @@ class TestClassifyMisattributed:
         true-positive citations like
         test_hash_paren_citation_of_a_different_task_is_misattributed above
         — not because that case was desired.
+
+        Post-4705 caveat (review remediation): "a real self-citation still
+        short-circuits it" is now only true for the three surviving forms
+        (hash-paren, task-word-paren, conventional-commit/task-branch) — a
+        self-citation written ONLY in bare-paren form no longer short-
+        circuits anything, since it is no longer part of `cited` at all.
+        See test_self_citation_only_in_bare_paren_form_now_flags_misattributed
+        below for the resulting (accepted) new edge case.
         """
         audit = _audit(
             task_id='50', is_ancestor=True,
@@ -455,7 +466,33 @@ class TestClassifyMisattributed:
         )
         verdict, reasons = classify(audit)
         assert verdict != 'misattributed'
-        assert not any('3' in r for r in reasons)
+        assert extract_cited_task_ids(audit.commit_message) == set()
+
+    def test_self_citation_only_in_bare_paren_form_now_flags_misattributed(self):
+        """New edge case from retiring the bare `(N)` form (review
+        remediation, task 4705 amendment pass): the form used to double as
+        a self-citation SUPPRESSION path, not just an other-task DETECTION
+        path. A message citing the audited task ONLY via bare-paren, while
+        citing a *different* task in one of the three surviving forms, used
+        to have its own id land in `cited` too (via the bare-paren match)
+        — enough to short-circuit the misattribution guard. Now the bare-
+        paren self-citation is invisible to `cited`, so the other task's
+        citation alone is enough to flag this task misattributed, even
+        though the message also (bare-paren) cites this task.
+
+        Accepted as rare for this corpus rather than fixed: self-citation
+        is overwhelmingly written in the conventional-commit subject form
+        (`impl(<id>): ...`), so relying SOLELY on a bare-paren self-
+        citation was already an unusual shape before this task retired
+        the form.
+        """
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='impl(77): backfill\n\nAlso closes (50).',
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert any('77' in r for r in reasons)
 
     def test_mixed_citation_does_not_flag_misattributed(self):
         """A message citing BOTH this task and another task is not misattribution."""
