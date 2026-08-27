@@ -898,8 +898,12 @@ def effective_merge_module_configs(
     The local runner, the wire spec (and hence the remote's reconstruction of
     it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
     suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
-    than by an assertion that two sites independently agree. Before this
-    helper the expansion was reimplemented inline at two sites inside
+    than by an assertion that two sites independently agree. The parenthetical
+    REMOTE leg was only made true by task 4536, which installs the spec's set
+    as that reconstructed config's registry — see
+    ``verify_runner.run_merge_verify_on_worktree``; until then it was
+    aspirational. Before this helper the expansion was
+    reimplemented inline at two sites inside
     ``run_scoped_verification``, each rebinding a local that never propagated
     out: the run executed the full registry while the suppression gate still
     mapped failing node-ids against the task's own modules, so a red in an
@@ -913,10 +917,19 @@ def effective_merge_module_configs(
     inside ``run_scoped_verification`` stay in place once the boundary has
     already resolved the set.
 
+    WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
+    answers are the dispatching side's by construction — which is which, and
+    why there is deliberately no third answer, is documented once at
+    ``verify_runner.run_merge_verify_on_worktree`` (task 4536).
+
     The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
     no registered modules returns the passed set rather than ``[]``, so the
     broad gate degrades to today's scoped coverage instead of silently
     verifying nothing at the very breadth that exists to verify everything.
+    Post-4536 it also serves direct-instantiated configs in tests/evals, which
+    never run discovery and whose registry is therefore empty; a zero-module
+    SPEC installs ``{}`` deliberately (the documented "discovery ran and found
+    no subprojects" value), routing that case to the INV-1 global gate.
 
     Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
     from ``config`` here, so there stays exactly one breadth predicate in the

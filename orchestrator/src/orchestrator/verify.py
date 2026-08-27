@@ -6309,7 +6309,28 @@ def _reverse_dependency_module_configs(
         if dependent in already_scoped:
             continue
         base = config.module_configs_or_empty.get(dependent)
-        if base is None or not base.test_command:
+        if base is None:
+            # The map named a dependent this config's registry does not
+            # register, so there is no base command to narrow. Log rather
+            # than drop silently (amendment, review suggestion 1) — the
+            # silent-coverage-loss shape task 2607 exists to prevent.
+            # Two ways to land here: (1) a stale _REVERSE_TEST_DEPENDENTS
+            # entry naming a package this project doesn't have; (2) the
+            # CLI/remote merge leg under merge_verify_breadth='scoped',
+            # where verify_runner.run_merge_verify_on_worktree installs the
+            # dispatcher's spec set as the registry (task 4536) and that set
+            # is exactly `already_scoped` — see that function's KNOWN
+            # CONSEQUENCE note for why the trade is deliberate.
+            logger.warning(
+                'Reverse-dependency widening: %s is a mapped dependent of the '
+                'changed files but is absent from this config\'s module registry '
+                '(registered: %s) — skipping widening for this dependent; its '
+                '%d coupled test file(s) are NOT covered by this run',
+                dependent, sorted(config.module_configs_or_empty) or '<none>',
+                len(coupled),
+            )
+            continue
+        if not base.test_command:
             continue
         scoped_test_command = _scope_to_keyword(base.test_command, 'pytest', coupled)
         if scoped_test_command == base.test_command:
@@ -6438,7 +6459,9 @@ async def run_scoped_verification(
             # bypassed-scoping path executes, not WHETHER it executes.
             # role=='merge' + breadth=='full' replaces the single OPAQUE
             # global command below with a per-module full-suite fan-out
-            # across every REGISTERED module (config.module_configs_or_empty),
+            # across every REGISTERED module (config.module_configs_or_empty
+            # — whose registry that is on each leg:
+            # see verify_runner.run_merge_verify_on_worktree, task 4536),
             # reusing the SAME _derive_full_suite_runs /
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
@@ -6540,6 +6563,13 @@ async def run_scoped_verification(
             # direct-instantiated config in most unit tests) falls back to
             # the passed module_configs unchanged — degrades safely rather
             # than silently verifying nothing.
+            #
+            # THIS is the site dark_factory's production merge gate actually
+            # takes: dark-factory-orchestrator.yaml sets
+            # merge_verify_breadth: "full" but leaves merge_verify_workspace
+            # at its False default, so the force_workspace fan-out above is
+            # NOT the live routing. Whose registry the read here is on each
+            # leg: see verify_runner.run_merge_verify_on_worktree, task 4536.
             #
             # The expansion lives in verify_plan.effective_merge_module_configs
             # (flake-ledger PRD §8.2 / task 3787 γ), which also owns the
