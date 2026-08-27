@@ -29,7 +29,9 @@ boundary.
 from __future__ import annotations
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
 # The MCP-prefixed tool id, as an agent must actually type it.  The BARE name
 # `consolidate_memories` already appears in the prompt (inside task 3112's
@@ -196,3 +198,54 @@ class TestStage1DoesNotCiteTheRetiredExemption:
 
     def test_the_delete_discipline_section_names_no_recon_stage_exemption(self) -> None:
         assert 'recon-stage' not in _section('## UUID Resolution Discipline')
+
+
+class TestSharedNormNamesTheSanctionedPath:
+    """The SHARED stale-knowledge norm must not prescribe the hand-rolled fold.
+
+    ``STALE_KNOWLEDGE_ANNOTATION_NORM`` renders verbatim into BOTH stage
+    prompts, so its clause (d) — "amend the SURVIVOR in place ... and only
+    THEN delete the redundant siblings" — is a second normative instruction
+    for the very choreography ``## Executing a Cluster Fold`` supersedes.  Two
+    contradictory instructions inside one assembled prompt is the INV-5
+    failure, and an inference-time reader resolves it arbitrarily.
+
+    The norm may name the op because BOTH stages hold it: neither
+    ``STAGE1_DISALLOWED`` nor ``STAGE2_DISALLOWED`` folds
+    DISALLOW_MEMORY_WRITES, which is the standing precondition for anything
+    this constant says.
+    """
+
+    def test_the_norm_names_the_consolidation_op(self) -> None:
+        assert 'consolidate_memories' in STALE_KNOWLEDGE_ANNOTATION_NORM
+
+    def test_it_still_renders_exactly_once_into_both_stage_prompts(self) -> None:
+        # Same exactly-once shape as
+        # tests/test_stages.py::test_boundary_note_rendered_verbatim_into_all_three_stage_prompts.
+        # A shared constant that renders twice states its rule twice.
+        assert STAGE1_SYSTEM_PROMPT.count(STALE_KNOWLEDGE_ANNOTATION_NORM) == 1
+        assert build_stage2_system_prompt('dark_factory').count(STALE_KNOWLEDGE_ANNOTATION_NORM) == 1
+
+    def test_it_keeps_the_must_nots_its_own_comment_block_demands(self) -> None:
+        # Each of these is a live wiring constraint on this constant, not
+        # style: build_stage2_system_prompt RAISES unless '## Available Tools'
+        # appears exactly once in STAGE2_SYSTEM_PROMPT, and
+        # test_recon_report_guidance_drift.py requires every
+        # `mcp__recon-report__` example in an assembled prompt to carry
+        # `run_id=`.
+        assert '## Available Tools' not in STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert 'mcp__recon-report__' not in STALE_KNOWLEDGE_ANNOTATION_NORM
+
+    def test_it_does_not_cross_reference_a_stage1_only_heading(self) -> None:
+        # `## Executing a Cluster Fold` exists in stage1.py only; stage2.py
+        # has no such section, so the SHARED norm must refer to the op by
+        # tool name — a fact true in both stages — never by that heading.
+        # Same rule the constant's comment block already states for
+        # "## UUID Resolution Discipline".
+        assert '## Executing a Cluster Fold' not in STALE_KNOWLEDGE_ANNOTATION_NORM
+
+    def test_it_keeps_the_survivor_naming_rule(self) -> None:
+        # Anti-over-correction: `replacement_memory_id` stays right for the
+        # SINGLE-record supersede case the norm still covers, and for
+        # hand-finishing a `partial` consolidation.
+        assert 'replacement_memory_id' in STALE_KNOWLEDGE_ANNOTATION_NORM
