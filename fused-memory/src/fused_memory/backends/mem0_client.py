@@ -996,11 +996,31 @@ class Mem0Backend:
                 requested it would hand a sweep a plausible-looking undercount
                 carrying a flag it was not told to expect.
 
-                The numbers plainly: at the default ``page_size=256`` and
-                ``max_pages=200`` the ceiling is 51,200 points, against a
-                ~19,321-point live corpus — 2.6x headroom, so it is not
-                reachable today. *max_pages* is the escape hatch for when the
-                corpus outgrows it.
+                The numbers plainly, re-measured against live Qdrant on
+                2026-08-27 (exact per-collection counts, not the older
+                single-collection reading): at the default ``page_size=256``
+                and ``max_pages=200`` the ceiling is 51,200 points walked.
+                The BINDING collection is ``fused_reify`` at 33,163 points —
+                1.54x headroom, i.e. one exhaustive sweep of it already
+                consumes 65% of the budget. ``fused_dark_factory``, the sweep
+                script's default scope, is 25,635 (2.0x). So the backstop is
+                still not reachable today, but the margin is roughly HALF
+                what the stale ~19,321-point/2.6x figure implied, and a
+                further ~1.5x growth of the largest collection reaches it.
+                (The prefiltered mode bounds only MATCHING points, so it is
+                the ``exhaustive=True`` walk that meets this ceiling first.)
+
+                *max_pages* is the escape hatch for when the corpus outgrows
+                it, but it is a PYTHON-API-level override ONLY: it is not
+                exposed by
+                ``services/memory_service.py::MemoryService.scan_memory_content``,
+                by the ``scan_memory_content`` MCP tool
+                (``server/tools.py::scan_memory_content``), or by
+                ``scripts/sweep_toolcall_xml_leak.py``, which has no
+                ``--max-pages`` flag. The operational sweep therefore always
+                runs at the default ceiling; raising it there is a plumbing
+                change to those three surfaces, not a flag an operator can
+                pass today.
         """
         if limit is not None and limit <= 0:
             raise ValueError(

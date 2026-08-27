@@ -2269,10 +2269,21 @@ class TestMem0BackendScanPayloadText:
         """The page budget scan inherits from the shared pager is steerable.
 
         At the default page_size=256 and max_pages=200 the ceiling is 51,200
-        points against a ~19,321-point live corpus (2.6x headroom), so the
-        default is not reachable today — but it is a real ceiling, and a
-        caller that outgrows it needs an escape hatch that is not "copy the
-        walk back out".
+        points walked. Re-measured against live Qdrant on 2026-08-27, the
+        BINDING collection is fused_reify at 33,163 points — 1.54x headroom,
+        i.e. one exhaustive sweep of it already consumes 65% of the budget;
+        fused_dark_factory (the sweep script's default scope) is 25,635, 2.0x.
+        The default is not reachable today, but that margin is roughly half
+        what the stale ~19,321-point/2.6x figure implied, so it is a real
+        ceiling a caller can outgrow.
+
+        The override is Python-API-level ONLY: neither
+        services/memory_service.py::MemoryService.scan_memory_content nor
+        scripts/sweep_toolcall_xml_leak.py (no --max-pages flag) forwards or
+        exposes max_pages, so the operational sweep runs at the default
+        ceiling. What this test pins is that the kwarg reaches the pager at
+        all, which keeps wiring it through a plumbing change rather than
+        "copy the walk back out".
         """
         from fused_memory.backends.mem0_client import DEFAULT_SCROLL_MAX_PAGES
 
