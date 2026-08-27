@@ -3883,6 +3883,43 @@ class TestGetEntity:
             'branch (task 2726)'
         )
 
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_drops_expired_edges(self, service):
+        """FUZZY branch must also drop edges retired via ``expired_at`` (task 4714).
+
+        ``invalid_at`` is the marker fused-memory writes itself; ``expired_at``
+        is written independently by graphiti_core's contradiction resolution
+        (graphiti_core/utils/maintenance/edge_operations.py::resolve_extracted_edge).
+        The task-2726 filter checks only the former, so a fact graphiti_core has
+        already retired still leaks through get_entity's fuzzy fallback.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        # Empty exact-name result forces the FUZZY fallback.  search_nodes and
+        # search are awaited concurrently through gather_or_raise, so both must
+        # be stubbed or the gather raises.
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None, expired_at=None),
+            MockEdge(
+                fact='Svc contradicted fact',
+                uuid='e-expired',
+                invalid_at=None,
+                expired_at=datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC),
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-valid']
+        assert 'e-expired' not in {e['uuid'] for e in result['edges']}, (
+            'FUZZY branch must drop edges retired by expired_at, not just those '
+            'retired by invalid_at (task 4714)'
+        )
+
     # ------------------------------------------------------------------
     # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
     # ------------------------------------------------------------------
