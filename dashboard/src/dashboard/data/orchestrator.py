@@ -392,6 +392,32 @@ async def discover_orchestrators(
 
     Returns [] if no orchestrator processes are running.
     Per-project task fetches that hit MCP errors degrade to an empty list.
+
+    **Bounded as a whole, not merely per root.** The per-root walk below is
+    SEQUENTIAL, so without a deadline the worst case is the SUM of every
+    root's worst case — on a machine with several roots that overruns
+    ``data.js``'s 30 000 ms fetch abort and throws away the very degraded
+    payload the bound exists to deliver. Hence both layers, matching
+    ``active_tasks.collect_tasks_with_counts``: a per-root
+    ``_ORCHESTRATORS_PER_ROOT_BUDGET`` and a whole-loop
+    ``_ORCHESTRATORS_TOTAL_BUDGET`` deadline.
+
+    Both degraded outcomes — a root that TIMED OUT and a root that never got
+    its TURN — surface through this module's existing offline marker, because
+    that is the honest fact available here: the entry contract carries one
+    boolean and no separate degraded channel, and ``redux_api.shape_orchestrators``
+    projects only ``offline``/``error``. The cause is therefore carried in
+    ``error`` (two distinct messages, so an operator can tell a
+    proven-unreachable root from a merely-unmeasured one) and in a WARNING,
+    rather than being silently dropped. The alternative — leaving ``offline``
+    False with empty tasks — would render a starved root as a healthy project
+    with zero tasks, which is exactly the invisible-failure class this bound
+    exists to close.
+
+    The two-layer bound is complementary, not redundant: ``fetch_tasks``'
+    ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
+    connect/read/write and pool acquisition, and never bounds the operation as
+    a whole; only this ``wait_for`` does.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -425,19 +451,50 @@ async def discover_orchestrators(
     project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
 
     result: list[dict] = []
+    # Taken BEFORE the loop so every root's cost is inside the budget rather
+    # than being free time the later roots then pay for.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _ORCHESTRATORS_TOTAL_BUDGET
     for project_root, group in groups.items():
         if project_root not in project_cache:
-            fetched = await fetch_tasks(client, config, project_root)
-            if isinstance(fetched, list):
-                tasks = fetched
-                offline = False
-                fetch_error: str | None = None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn. Reported through the offline marker
+                # rather than silently omitted or rendered as zero tasks.
+                message = (
+                    f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
+                    'orchestrators budget was already spent before this root '
+                    'was reached; its task tree is UNKNOWN for this render '
+                    '(not zero)'
+                )
+                logger.warning('project %s: %s', project_root, message)
+                project_cache[project_root] = ([], True, message)
             else:
-                # Offline marker: {'offline': True, 'error': ...}
-                tasks = []
-                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-            project_cache[project_root] = (tasks, offline, fetch_error)
+                try:
+                    fetched = await asyncio.wait_for(
+                        fetch_tasks(client, config, project_root),
+                        timeout=min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET),
+                    )
+                except TimeoutError:
+                    message = (
+                        f'exceeded its {_ORCHESTRATORS_PER_ROOT_BUDGET:.1f}s '
+                        f'share of the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
+                        f'orchestrators budget ({remaining:.1f}s remained); '
+                        'its task tree is UNKNOWN for this render (not zero)'
+                    )
+                    logger.warning('project %s: %s', project_root, message)
+                    project_cache[project_root] = ([], True, message)
+                else:
+                    if isinstance(fetched, list):
+                        tasks = fetched
+                        offline = False
+                        fetch_error: str | None = None
+                    else:
+                        # Offline marker: {'offline': True, 'error': ...}
+                        tasks = []
+                        offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
+                        fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
+                    project_cache[project_root] = (tasks, offline, fetch_error)
 
         tasks, offline, fetch_error = project_cache[project_root]
         summary = {
