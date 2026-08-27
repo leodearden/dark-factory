@@ -132,9 +132,16 @@ class TestJcodemunchLaunchPinned:
     def test_mcp_config_json_carries_git_root_identity_lever(self, mock_orch_config):
         """The identity lever reaches the generated per-agent mcp_config_json.
 
-        Asserted against a literal, not against JCODEMUNCH_ENV: comparing to
-        the same constant the config is built from would be tautological and
-        would pass unchanged even if the lever were absent from both.
+        Asserted against a literal, not against JCODEMUNCH_ENV — but this is
+        defense-in-depth, not a coverage gap this test alone closes. The
+        neighbouring pair already fails if the lever is dropped from either
+        side: test_env_sets_git_root_identity_lever pins the literal on the
+        constant, and test_mcp_config_json_uses_constants asserts
+        jc['env'] == JCODEMUNCH_ENV (full dict equality), which breaks if the
+        constant and the generated config ever diverge. This test instead
+        guards against that equality assert being loosened to a subset check
+        later, by pinning the user-observable value directly on the
+        generated config, independent of how it got there.
         """
         from orchestrator.mcp_lifecycle import McpLifecycle
 
