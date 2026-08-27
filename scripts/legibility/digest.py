@@ -774,15 +774,18 @@ def find_retry_loops(
     # None here and always has. The declared type is corrected to match rather
     # than the value coerced, which would change what a nameless block renders
     # as in the report for no benefit.
-    groups: dict[tuple[str | None, str], list[int]] = {}
-    # Member tool_use ids, accumulated in lockstep with the record indices:
-    # the indices are tool_use RECORD positions, so they cannot address a
-    # neighborhood (whose own `index` is the tool_result position).
-    group_ids: dict[tuple[str | None, str], list[Any]] = {}
+    #
+    # A member is one (record index, tool_use id) PAIR, accumulated once:
+    # the two are needed for different things -- the index is a tool_use
+    # RECORD position and so cannot address a neighborhood (whose own
+    # `index` is the tool_result position), while the id is the only key
+    # that can -- and keeping them in ONE list makes drifting them apart
+    # structurally impossible rather than a lockstep invariant a later
+    # edit could quietly break.
+    groups: dict[tuple[str | None, str], list[tuple[int, Any]]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
-        groups.setdefault(key, []).append(index)
-        group_ids.setdefault(key, []).append(block.get('id'))
+        groups.setdefault(key, []).append((index, block.get('id')))
 
     # Only the DESIGNED half is indexed: a genuine failure needs no
     # annotation here (it has its own section), and restricting the map is
@@ -795,13 +798,13 @@ def find_retry_loops(
     }
 
     loops = []
-    for (name, signature), indices in groups.items():
-        if len(indices) < RETRY_MIN:
+    for (name, signature), members in groups.items():
+        if len(members) < RETRY_MIN:
             continue
         designed_count = 0
         pairs: list[tuple[int | None, str]] = []
         seen: set[tuple[int | None, str]] = set()
-        for tool_use_id in group_ids[(name, signature)]:
+        for _index, tool_use_id in members:
             hit = designed_by_id.get(tool_use_id)
             if hit is None:
                 continue
@@ -813,8 +816,8 @@ def find_retry_loops(
         loops.append({
             'tool': name,
             'signature': signature,
-            'count': len(indices),
-            'indices': indices,
+            'count': len(members),
+            'indices': [index for index, _id in members],
             'designed_outcome_count': designed_count,
             'designed_outcomes': pairs,
         })
@@ -1534,10 +1537,11 @@ def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
     Two contracts this locks:
 
     * A group with ZERO designed results takes an explicit early branch
-      emitting exactly the pre-4751 format -- byte-identity is a contract,
-      not an accident of an annotation that happens to render empty, and
-      it is what makes "genuine retry storms are untouched" a testable
-      literal-f-string assertion.
+      (``if not designed: ... continue``) that emits the pre-4751 f-string
+      verbatim -- byte-identity is a contract, not an accident of an
+      annotation that happens to render empty, and spelling it as its own
+      branch is what makes "genuine retry storms are untouched" a testable
+      literal-f-string assertion rather than a claim about interpolation.
     * The annotation sits to the LEFT of the stable ``": {signature}"``
       terminator, so :func:`_cap_item` byte-truncates the signature first
       and leaves the annotation legible -- exactly the reason
@@ -1555,15 +1559,19 @@ def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
     """
     lines = []
     for item in items:
-        head = f"- {item['tool']} x{item['count']}"
         designed = item['designed_outcome_count']
-        if designed:
-            rules = ', '.join(
-                f'{_exit_marker(code)}[{label}]'
-                for code, label in item['designed_outcomes']
-            )
-            head += f' ({designed} designed-outcome results: {rules})'
-        lines.append(f"{head}: {item['signature']}")
+        if not designed:
+            lines.append(f"- {item['tool']} x{item['count']}: {item['signature']}")
+            continue
+        rules = ', '.join(
+            f'{_exit_marker(code)}[{label}]'
+            for code, label in item['designed_outcomes']
+        )
+        lines.append(
+            f"- {item['tool']} x{item['count']}"
+            f' ({designed} designed-outcome results: {rules})'
+            f": {item['signature']}"
+        )
     return lines
 
 
