@@ -45,7 +45,18 @@ TEST_GRAPH: str = unique_graph_name('3769_drop_vector_indices')
 
 pytestmark = [
     falkor_skipif(),
-    pytest.mark.timeout(15),
+    # 30, not 15 (task 4748): pytest-timeout runs with func_only=False here, so
+    # this budget covers fixture setup too, and each test below can now hold TWO
+    # 10s barrier budgets -- live_vector_graph's build-side barrier (task 3377)
+    # plus the post-drop barrier added by task 4748 -- so 15 would make that
+    # pathological worst case (10s + 10s) a CERTAIN timeout instead of a rare
+    # flake. fused-memory/pyproject.toml sets timeout_method='thread', whose
+    # handler ends in os._exit(1) and kills the whole xdist worker, which is why
+    # this headroom is not optional. 30 stays well under the pyproject default
+    # of 60. Expected real cost of the added barrier is ~0.2ms on this module's
+    # 1-node fixture graph (one CALL db.indexes() round-trip) -- this is
+    # headroom, not spend.
+    pytest.mark.timeout(30),
     pytest.mark.integration,
 ]
 
@@ -98,7 +109,7 @@ async def live_vector_graph():
     # without this barrier these tests are a false-green generator.  On this
     # single-node graph the build finishes before the first poll, so it costs one
     # CALL db.indexes() round-trip in practice.  If this fixture is ever widened
-    # to seed bulk data, raise the module-wide @pytest.mark.timeout(15) alongside
+    # to seed bulk data, raise the module-wide @pytest.mark.timeout(30) alongside
     # it — the barrier's own budget is 10s.
     await await_index_operational(graph)
     try:
