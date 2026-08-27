@@ -71,6 +71,7 @@ NODE_PAGE_CYPHER = _mod.NODE_PAGE_CYPHER
 NODE_CENSUS_CYPHER = _mod.NODE_CENSUS_CYPHER
 build_report = _mod.build_report
 PROXIMITY_BUCKETS = _mod.PROXIMITY_BUCKETS
+_build_parser = _mod._build_parser
 
 GRAPH = 'reify'
 
@@ -1075,3 +1076,124 @@ class TestBuildReport:
         report = self._build([_finding()])
         assert report['unverifiable'] == 1200
         assert report['summary']['rate'] == pytest.approx(1 / 7131)
+
+
+class TestReadOnlyByConstruction:
+    """The scope note, turned into a test.
+
+    "read-only report first; do NOT auto-reassign edges on a regex verdict" —
+    asserted mechanically so it survives a later editor who never reads the
+    task description. ``audit_duplicate_memories.py`` and
+    ``invalidate_fabricated_shipping_edges.py`` both HAVE an ``--apply``; this
+    script deliberately has none, and the ABSENCE is what must be asserted.
+    """
+
+    #: Any option whose dest or option string contains one of these is a
+    #: mutation affordance this script must never grow. 'reassign' and
+    #: 'merge' are ON TOP of the precedent's list and are the load-bearing
+    #: additions: they name the lossless remediation primitives a later
+    #: editor would reach for on THIS defect class specifically.
+    FORBIDDEN = (
+        'apply', 'invalidate', 'delete', 'repair', 'fix', 'write', 'mutate',
+        'reassign', 'merge',
+    )
+
+    #: Callee names that would mutate a store. ``query`` is FalkorDB's
+    #: writable command (this sweep issues ``ro_query``); the rest are the
+    #: memory-service and graphiti mutators — again including the two
+    #: remediation primitives for this defect class.
+    FORBIDDEN_CALLS = frozenset({
+        'query', 'update_edge', 'reassign_edge', 'merge_entities',
+        'bulk_remove_edges', 'remove_edge', 'delete_entity',
+        'delete_entity_node', 'redirect_node_edges', 'add_memory',
+        'add_episode', 'rename_entity_node',
+    })
+
+    def test_parser_exposes_no_mutation_option(self) -> None:
+        offenders = []
+        for action in _build_parser()._actions:
+            for name in [str(action.dest or '')] + [
+                str(s) for s in action.option_strings
+            ]:
+                if any(word in name.lower() for word in self.FORBIDDEN):
+                    offenders.append(name)
+        assert offenders == [], f'mutation affordance(s) present: {offenders}'
+
+    def test_ro_command_is_the_only_falkordb_command(self) -> None:
+        assert RO_COMMAND == 'GRAPH.RO_QUERY'
+
+    def test_no_mutation_call_in_the_source_ast(self) -> None:
+        """Asserted over the AST, not as a substring scan.
+
+        A substring test cannot tell a CALL from a docstring that NAMES the
+        hazard in order to warn against it — and this script's docstrings
+        name reassign_edge deliberately, as the primitive remediation would
+        use and that this task does not.
+        """
+        offenders = []
+        for node in ast.walk(ast.parse(SCRIPT_PATH.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, 'attr', None) or getattr(node.func, 'id', None)
+            if name in self.FORBIDDEN_CALLS:
+                offenders.append(f'{name} (line {node.lineno})')
+        assert offenders == [], f'mutation call(s) present: {offenders}'
+
+    def test_no_cypher_write_keyword_in_any_query_constant(self) -> None:
+        write_keyword_re = re.compile(
+            r'\b(?:CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP)\b', re.IGNORECASE
+        )
+        constants = [
+            v for n, v in vars(_mod).items()
+            if n.endswith('_CYPHER') and isinstance(v, str)
+        ]
+        assert constants, 'expected at least one *_CYPHER constant'
+        for query in constants:
+            hit = write_keyword_re.search(query)
+            assert hit is None, f'write keyword {hit and hit.group()!r} in {query!r}'
+
+    def test_the_reader_constructs_no_graphiti_driver(self) -> None:
+        """graphiti's FalkorDriver.__init__ fire-and-forgets a WRITE.
+
+        AST-based for the same reason as above: the module docstring names
+        FalkorDriver precisely in order to forbid it.
+        """
+        offenders = [
+            f'line {node.lineno}'
+            for node in ast.walk(ast.parse(SCRIPT_PATH.read_text()))
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, 'attr', None) or getattr(node.func, 'id', None))
+            == 'FalkorDriver'
+        ]
+        assert offenders == []
+
+    @pytest.mark.asyncio
+    async def test_the_writable_query_is_never_issued(self) -> None:
+        """Behavioural, not merely structural: the double raises if it is."""
+        graph = _FakeGraph(_edge_rows(3), resultset_cap=10)
+        reader = EdgeReader(
+            graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10
+        )
+        await reader.fetch_edges()
+        await reader.read_task_node_ids()
+        assert graph.queries
+
+    def test_graph_is_repeatable_and_the_gate_flag_exists(self) -> None:
+        args = _build_parser().parse_args(
+            ['--graph', 'dark_factory', '--graph', 'reify', '--fail-on-finding']
+        )
+        assert args.graph == ['dark_factory', 'reify']
+        assert args.fail_on_finding is True
+        defaults = _build_parser().parse_args([])
+        assert defaults.graph is None
+        assert defaults.fail_on_finding is False
+
+    def test_volume_flags_exist(self) -> None:
+        args = _build_parser().parse_args(
+            ['--json', '--include-unverifiable', '--limit-listing', '5',
+             '--out-dir', '/tmp/x']
+        )
+        assert args.json is True
+        assert args.include_unverifiable is True
+        assert args.limit_listing == 5
+        assert args.out_dir == '/tmp/x'
