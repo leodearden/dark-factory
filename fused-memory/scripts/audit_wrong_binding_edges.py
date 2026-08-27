@@ -63,7 +63,9 @@ fire-and-forgets ``build_indices_and_constraints()``.
 """
 from __future__ import annotations
 
+import difflib
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -367,3 +369,130 @@ def classify_edge(
             )
         )
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# Cause attribution
+# --------------------------------------------------------------------------- #
+
+PROXIMITY_BUCKETS: tuple[str, ...] = (
+    'one_digit_diff',
+    'prefix',
+    'similar',
+    'unrelated',
+)
+"""The four buckets, in PRECEDENCE order (closest first).
+
+Load-bearing rather than documentation: :func:`id_proximity` ranks candidates
+by index into this tuple, and :func:`build_report` seeds ``by_proximity`` from
+it so every bucket is present with a 0 rather than absent when empty.
+"""
+
+_SIMILAR_RATIO = 0.75
+"""``difflib.SequenceMatcher`` ratio above which a pair counts as 'similar'.
+
+STRICTLY ABOVE, not at-or-above, and that is a measured decision rather than
+a style choice. ``SequenceMatcher(None, '3443', '4043').ratio()`` is EXACTLY
+0.75, and that pair is a live specimen — "BOOKMARK task 4043 tracks the ...
+work surfaced by esc-3437-13" on node ``task 3443`` — which is a legitimate
+cross-task relation, not a near-miss id neighbour. A ``>=`` comparison would
+sweep it, and the rest of the equal-length two-digits-apart population, into
+the near-miss buckets and inflate the very cause evidence this column exists
+to supply. The planning figure ("13 more at >=0.75") was measured before that
+boundary case was adjudicated.
+"""
+
+
+def _id_sort_key(task_id: str) -> tuple[int, str]:
+    """Numeric-then-lexicographic order, for deterministic tie-breaking.
+
+    Ids are digit strings, so ``int()`` is the order a human means by "the
+    lowest id" — '99' before '100', which string order gets backwards. The
+    string tail keeps the key TOTAL, so '0132' and '132' (different referents
+    by design; digits are never int-normalized) still order deterministically.
+    Non-numeric input cannot arrive from the shared parser, but is ordered
+    last rather than raising into a whole-corpus sweep.
+    """
+    return (int(task_id) if task_id.isdigit() else 1 << 62, task_id)
+
+
+def _pair_bucket(node_task_id: str, candidate: str) -> str:
+    """Which bucket ONE (mis-bound id, named id) pair falls in."""
+    if len(node_task_id) == len(candidate):
+        if sum(a != b for a, b in zip(node_task_id, candidate, strict=True)) == 1:
+            return 'one_digit_diff'
+    elif node_task_id.startswith(candidate) or candidate.startswith(node_task_id):
+        return 'prefix'
+    if difflib.SequenceMatcher(None, node_task_id, candidate).ratio() > _SIMILAR_RATIO:
+        return 'similar'
+    return 'unrelated'
+
+
+def id_proximity(
+    node_task_id: str, named_ids: Collection[str]
+) -> tuple[str, str]:
+    """How close is the MIS-BOUND id to the nearest id the fact names?
+
+    Returns ``(bucket, nearest_id)``. The buckets, in precedence order:
+
+    * ``one_digit_diff`` — equal length, exactly ONE differing character.
+      The signature of a near-miss neighbour, e.g. ``Task 6165`` carrying a
+      fact about task 6164.
+    * ``prefix`` — one id is a strict prefix of the other ('430' / '4302').
+      A DIFFERENT mechanism from one_digit_diff (a truncated id rather than a
+      mistyped digit), which is why the two are not collapsed.
+    * ``similar`` — ``difflib.SequenceMatcher`` ratio strictly above
+      :data:`_SIMILAR_RATIO`; read that constant before changing the
+      comparison.
+    * ``unrelated`` — everything else, including legitimate cross-task
+      relations that merely happen to hang off a task-shaped node.
+
+    WHY THIS LIVES IN THE SCRIPT rather than in a one-off notebook: it is the
+    EVIDENCE that separates "resolution grabbed a near-miss id neighbour"
+    from "unrelated mis-attachment", and the report's whole cause argument
+    rests on its distribution. The planning measurement put 120/192 (62.5%)
+    of flags in the one_digit_diff + prefix + similar buckets — against a
+    chance baseline near zero over ~2090 (reify) / ~1452 (dark_factory)
+    task-shaped nodes. A number that load-bearing has to be reproducible by
+    re-running the committed script, not by trusting a transcript.
+
+    Ties are broken on the numerically LOWEST id, so the report is
+    byte-stable across runs and cannot depend on set iteration order. An
+    empty *named_ids* yields ``('unrelated', '')`` — defensive only:
+    :func:`classify_edge` never emits a finding for a fact naming nothing.
+    """
+    best: tuple[int, tuple[int, str], str] | None = None
+    for candidate in named_ids:
+        bucket = _pair_bucket(node_task_id, candidate)
+        key = (PROXIMITY_BUCKETS.index(bucket), _id_sort_key(candidate), candidate)
+        if best is None or key < best:
+            best = key
+    if best is None:
+        return ('unrelated', '')
+    return (PROXIMITY_BUCKETS[best[0]], best[2])
+
+
+def correct_node_present(nearest_id: str, task_node_ids: Collection[str]) -> bool:
+    """Does a node for the id the fact ACTUALLY names already exist?
+
+    True when *nearest_id* is among the task ids harvested from this graph's
+    ``Entity`` node names (built by :meth:`EdgeReader.read_task_node_ids`).
+
+    THE MEASUREMENT THIS COLUMN EXISTS FOR: it separates "the correct node
+    was missing, so resolution had nothing right to pick" from ACTIVE
+    mis-resolution — resolution choosing a wrong node over an available
+    correct one. The planning sweep found the correct node ALREADY PRESENT in
+    124/194 (64%) of endpoint checks, which is what makes the cause a
+    resolution defect rather than a coverage gap.
+
+    The canonical specimen is the OTHER 36%: node ``Task 6164`` does not
+    exist in reify, while ``Task 6165`` — created three days before the
+    episode — does. So the specimen everyone quotes is not representative of
+    the population, and the report has to carry both counts for that to be
+    visible.
+
+    An empty *nearest_id* names no node and is False: nothing can be present.
+    """
+    if not nearest_id:
+        return False
+    return nearest_id in task_node_ids
