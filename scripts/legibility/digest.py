@@ -1468,7 +1468,15 @@ retry_loops -- because it is explicitly NOT confusion: a declared
 bounded-poll ceiling is a designed loop-continuation (task 3610, 07-31
 census cluster 1.3), reported for visibility and deliberately unweighted
 in SIGNAL_WEIGHTS. When a digest must shed bytes, that is the first
-thing a reader can afford to lose."""
+thing a reader can afford to lose.
+
+That ordering was once a hazard: a byte-pressured digest shed the section
+EXPLAINING that churn was designed before it shed the section PRESENTING
+that churn as loops, stranding the explanation (census 2026-08-26 §1.1).
+It no longer is -- 'retry_loops' lines are now SELF-disambiguating,
+carrying their own designed-outcome count and the rules that fired (see
+:func:`_render_retry_loops`), so the fix is in place rather than in the
+priority order and no re-prioritisation is needed."""
 
 
 def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
@@ -1539,14 +1547,22 @@ def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
 
     The count is always rendered ALONGSIDE the group's full ``count``,
     never in place of it: the annotation explains churn, it never hides
-    how much churn there was.
+    how much churn there was. Each distinct ``(exit_code, label)`` pair is
+    then named with the SAME ``[exit N] [label]`` spelling
+    :func:`_render_designed_outcomes` uses, so a reader meets one
+    vocabulary in both sections instead of re-deriving the classification
+    from the raw command.
     """
     lines = []
     for item in items:
         head = f"- {item['tool']} x{item['count']}"
         designed = item['designed_outcome_count']
         if designed:
-            head += f' ({designed} designed-outcome results)'
+            rules = ', '.join(
+                f'{_exit_marker(code)}[{label}]'
+                for code, label in item['designed_outcomes']
+            )
+            head += f' ({designed} designed-outcome results: {rules})'
         lines.append(f"{head}: {item['signature']}")
     return lines
 
