@@ -1023,6 +1023,141 @@ class TestFindRetryLoops:
 
 
 # ---------------------------------------------------------------------------
+# find_retry_loops designed-outcome ANNOTATION -- confusion-census-2026-08-26
+# §1.1 / R1 (task 4751). A healthy 4-hour escalation-watcher rotation makes
+# one date-check and one re-arm call per ~3600s cycle, so ANY rotation of
+# >= RETRY_MIN cycles necessarily crosses the threshold and renders under
+# '## Retry Loops' -- while the SAME digest's signal_counts correctly report
+# tool_error=0 and tally the ceilings under designed_outcome. Two layers of
+# one instrument told contradictory stories about one session. The fix joins
+# the retry groups against task 3610's EXISTING classification on
+# tool_use_id and ANNOTATES; it never suppresses, so a genuine retry storm
+# interleaved with ceilings stays fully visible (PRD Sec 7.2.1's
+# fail-toward-genuine principle).
+# ---------------------------------------------------------------------------
+
+_DATE_CHECK = {'command': 'date -u +"%Y-%m-%dT%H:%M:%S%z"'}
+_REARM = {
+    'command': (
+        'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
+        '--queue-dir /home/leo/src/dark-factory/data/escalations '
+        '--level 1 --timeout 3600'
+    ),
+    'timeout': 3660000,
+}
+
+
+def _watcher_rotation_records():
+    """The 631e7374 sighting shape: 3 healthy watcher cycles, each a
+    non-error `date -u` check plus a re-arm that ends in a DECLARED
+    bounded-wait CEILING. Nothing here is confusion."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _DATE_CHECK, id=f'tu-d{i}')))
+        records.append(_tool_result(f'tu-d{i}', '2026-08-26T12:00:00+0000'))
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-r{i}')))
+        records.append(_tool_result(f'tu-r{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+def _mixed_rotation_records():
+    """One 4-call re-arm group whose results split 2 designed / 2 GENUINE."""
+    records = []
+    for i in range(4):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-m{i}')))
+        content = (
+            _CEILING_DECLARATION if i < 2
+            else 'DARK_FACTORY_ROOT unset, exit code 2'
+        )
+        records.append(_tool_result(f'tu-m{i}', content, is_error=True))
+    return records
+
+
+def _by_signature(loops):
+    return {loop['signature']: loop for loop in loops}
+
+
+class TestRetryLoopDesignedOutcomeJoin:
+    def test_both_rotation_groups_are_still_returned_at_their_true_count(self):
+        # Annotation, never suppression: the date-check and the re-arm
+        # groups both survive at x3 exactly as before the join.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        assert len(loops) == 2
+        assert loops[mod._input_signature(_DATE_CHECK)]['count'] == 3
+        assert loops[mod._input_signature(_REARM)]['count'] == 3
+
+    def test_rearm_group_reports_its_designed_outcome_count(self):
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcome_count'] == 3
+
+    def test_rearm_group_names_the_distinct_rules_that_fired(self):
+        # DISTINCT (exit_code, label) pairs -- 3 identical ceilings collapse
+        # to one pair, so the annotation stays one line long however many
+        # cycles the rotation ran.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcomes'] == [(124, 'watcher-rearm-declared')]
+        assert rearm['designed_outcomes'] == [
+            mod.classify_error_content(_CEILING_DECLARATION)
+        ]
+
+    def test_group_with_no_error_results_annotates_nothing(self):
+        # The zero-cost default: the date-check group's results are not
+        # is_error at all, so it joins to no neighborhood.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        date_check = loops[mod._input_signature(_DATE_CHECK)]
+
+        assert date_check['designed_outcome_count'] == 0
+        assert date_check['designed_outcomes'] == []
+
+    def test_mixed_group_fails_toward_genuine(self):
+        # 2 of 4 designed: the group keeps its FULL x4 count and is not
+        # dropped. Suppressing a partly-designed group would hide a genuine
+        # retry storm interleaved with bounded-wait ceilings -- the
+        # detector lying in the opposite direction.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 4
+        assert loops[0]['designed_outcome_count'] == 2
+
+    def test_accepts_a_precomputed_scan(self):
+        # Mirrors test_partition_accepts_a_precomputed_scan: a caller
+        # holding a scan annotates from it instead of paying for a fresh
+        # one -- what keeps render_digest at two scans, not three.
+        records = _watcher_rotation_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert (
+            mod.find_retry_loops(records, neighborhoods=neighborhoods)
+            == mod.find_retry_loops(records)
+        )
+
+    def test_preexisting_group_fields_are_unchanged(self):
+        # Backward compat: the positional call still works and every field
+        # a pre-4751 caller read is byte-identical.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-3')),
+        ]
+
+        loop = mod.find_retry_loops(records)[0]
+
+        assert loop['tool'] == 'Bash'
+        assert loop['signature'] == json.dumps({'command': 'pytest'}, sort_keys=True)
+        assert loop['count'] == 3
+        assert loop['indices'] == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
 # Decoy-FAIL suppression contract (PRD Sec 13.2, owned by alpha) -- a
 # dedicated test locking the tactical decision explicitly, distinct from the
 # per-detector native-carrier-scoping tests above:
