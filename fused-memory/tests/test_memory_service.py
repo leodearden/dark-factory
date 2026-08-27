@@ -7265,6 +7265,71 @@ class TestSearchGraphitiInvalidatedFiltering:
             'RRF scores must be strictly decreasing in rank order'
         )
 
+    # Task 4714: `expired_at` is the OTHER retirement marker.  `invalid_at` is
+    # written by fused-memory itself (recon Stage 1 / update_edge); `expired_at`
+    # is written independently by graphiti_core's contradiction resolution
+    # (graphiti_core/utils/maintenance/edge_operations.py::resolve_extracted_edge).
+    # Filtering only one leaves the other's retirees served as current facts.
+    @pytest.mark.asyncio
+    async def test_edge_retired_by_expired_at_alone_excluded(self, service):
+        """An edge with only ``expired_at`` set is retired and must not surface.
+
+        Three edges go in: one fully active, one retired via ``invalid_at``
+        (characterization pin on the task-312 behaviour), and one retired via
+        ``expired_at`` ALONE with ``invalid_at=None``.  Only the active fact
+        may come back, and ``store_rank`` must stay contiguous over survivors —
+        an edge dropped for EITHER marker does not consume a rank.
+        """
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_retired = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Current fact',
+                uuid='edge-active',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Superseded fact',
+                uuid='edge-invalid-at',
+                valid_at=dt_valid,
+                invalid_at=dt_retired,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Contradicted fact',
+                uuid='edge-expired-at',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=dt_retired,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        result_ids = {r.id for r in results}
+        assert 'edge-expired-at' not in result_ids, (
+            'An edge retired by graphiti_core via expired_at is no longer a '
+            'current fact and must be excluded, exactly like an invalid_at one'
+        )
+        assert 'edge-invalid-at' not in result_ids, (
+            'Superseded edge must not appear in results (task 312)'
+        )
+        assert [r.id for r in results] == ['edge-active']
+        assert [r.content for r in results] == ['Current fact']
+
+        assert [r.metadata['store_rank'] for r in results] == [1], (
+            'store_rank must be contiguous over survivors — an edge dropped '
+            'for a retirement marker must not consume a rank'
+        )
+
 
 class TestSearchRrfMerge:
     """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
