@@ -459,6 +459,81 @@ class TestMintedPool:
         assert rec['verify_outcome']['passed'] is not True
 
 
+    def test_every_fixture_declares_base_approximation(
+        self, pool: list[dict],
+    ) -> None:
+        # A readout that cannot tell a true branch point from a guess silently
+        # averages the two together. Only `merge_first_parent` (and a
+        # continuity base MEASURED equal to M^1) is the real thing; everything
+        # else must SAY it is an approximation so a readout can exclude it.
+        for f in pool:
+            prov = f['provenance']
+            flag = prov.get('base_is_approximated')
+            assert isinstance(flag, bool), \
+                f'{f["id"]}: base_is_approximated is {flag!r}, not a bool'
+            if flag:
+                assert prov.get('base_approximation_reason', '').strip(), \
+                    f'{f["id"]}: approximated with no reason'
+
+    def test_merge_derived_bases_are_not_marked_approximated(
+        self, pool: list[dict],
+    ) -> None:
+        for f in pool:
+            if f['provenance']['baseline_source'] == 'merge_first_parent':
+                assert f['provenance']['base_is_approximated'] is False, f['id']
+
+    def test_reference_unavailable_only_when_no_landing_merge_exists(
+        self, pool: list[dict],
+    ) -> None:
+        # The DEFECT-2 invariant. A fixture may only claim its reference is
+        # unavailable when no single landing merge exists under EITHER
+        # accepted subject spelling — the same check that produced the claim.
+        driver = _load_driver()
+        for f in pool:
+            if 'reference_unavailable' not in f['provenance']:
+                continue
+            root = Path(f['project_root'])
+            if not (root / '.git').exists():
+                pytest.skip(f'{root} is not checked out on this machine')
+            task_id = f['id'].split('_task_', 1)[1]
+            assert driver.find_merge_sha(root, task_id) is None, (
+                f'{f["id"]} claims reference_unavailable but a single landing '
+                f'merge resolves in {root}'
+            )
+
+    def test_task_4026_resolves_its_landing_merge(
+        self, pool: list[dict],
+    ) -> None:
+        # Acceptance criterion 3, pinned by name: reify_task_4026's landing
+        # merge is 3613bea224, spelled with a colon, and was invisible to the
+        # single-spelling matcher.
+        by_id = {f['id']: f for f in pool}
+        fixture = by_id['reify_task_4026']
+        assert 'reference_unavailable' not in fixture['provenance']
+        assert fixture.get('reference'), 'reify_task_4026 carries no reference'
+        assert fixture['provenance']['merge_sha'].startswith('3613bea224')
+        assert fixture['provenance']['baseline_source'] == 'merge_first_parent'
+        assert fixture['provenance']['base_is_approximated'] is False
+
+
+def _load_driver():
+    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
+
+    Same loader shape as ``test_mint_hard_v2_driver.py``: the pool invariants
+    below must be checked with the SAME matcher that stamped the claims, not
+    with a second copy that could drift from it.
+    """
+    import importlib.util
+    import sys
+    path = REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py'
+    spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _mint_modes(manifest: dict) -> dict[str, str]:
     return {
         _fixture_id(c): c['mint_mode']
