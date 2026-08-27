@@ -254,10 +254,12 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 from orchestrator.merge_types import (
     CapPermit,
+    InflightEntry,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
+    VerifyWorktreeHandle,
 )
 
 # ── repo fixtures (cloned from test_merge_queue_deep_landing.py) ──────────────
@@ -518,6 +520,79 @@ async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
     return sha
 
 
+async def _merge_commit_onto(
+    repo: Path, branch: str, base_sha: str, label: str,
+) -> str:
+    """A REAL ``--no-ff`` merge commit of *branch* onto *base_sha*.
+
+    The speculative-stacking twin of :func:`_merge_commit_off_main`: slot 2's
+    item is merged onto the HEAD's merge commit, not onto main, which is
+    exactly what makes the head's tree a SUBSET of the chain tip's — and
+    therefore what makes landing the head on the tip's authority sound rather
+    than merely convenient.
+    """
+    await _run(['git', 'checkout', '-b', f'_tmp-{label}', base_sha], cwd=repo)
+    await _run(['git', 'merge', '--no-ff', '-m', f'merge {branch}', branch], cwd=repo)
+    sha = await _rev_parse(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return sha
+
+
+async def _external_main_bump(repo: Path) -> str:
+    """Land an unrelated commit directly on main; return its SHA.
+
+    Written with ``commit-tree`` + ``update-ref`` rather than a checkout and a
+    ``git commit`` so the bump does NOT disturb the working tree — by the time
+    a scenario calls this, ``advance_main`` has already moved ``refs/heads/main``
+    out from under the checkout, and a plumbing bump is the only way to model
+    "another writer got there first" without also rewriting that state.
+
+    The new commit carries main's CURRENT tree, so the bump is a pure ref move:
+    the resulting abort is attributable to the moved ref alone, never to a
+    content conflict the next link would have hit anyway.
+    """
+    cur = await _rev_parse(repo, 'main')
+    tree = await _rev_parse(repo, 'main^{tree}')
+    _, new, _ = await _run(
+        ['git', 'commit-tree', tree, '-p', cur, '-m', 'external writer'], cwd=repo,
+    )
+    new = new.strip()
+    await _run(['git', 'update-ref', 'refs/heads/main', new, cur], cwd=repo)
+    return new
+
+
+def _abort_hook_at(call_no: int, *, outcome=None, raises=None, bump_repo=None):
+    """Build an :func:`_spy_advance_main` hook that disrupts call *call_no*.
+
+    Exactly one of *outcome* (return a synthetic
+    :class:`~orchestrator.git_ops.AdvanceOutcome` instead of advancing),
+    *raises*, or *bump_repo* (move main for REAL via
+    :func:`_external_main_bump`, then fall through to the real
+    ``advance_main``, which then refuses at its descendant check).
+
+    *bump_repo* is the shape Row 6 uses, deliberately: a synthetic
+    ``AdvanceOutcome`` states the abort's CLASS, while a real ref move also
+    leaves the repository in the state the NEXT round has to rebuild against —
+    which is the half of decision #9 the composition sweep exists to reach.
+
+    The ordinal is CUMULATIVE across the whole scene, because
+    :func:`_spy_advance_main`'s ledger is: a hook armed at call 3 fires inside
+    the first round's walk and never again, so a later round runs clean without
+    the caller having to disarm anything.
+    """
+    async def _hook(n: int):
+        if n != call_no:
+            return None
+        if bump_repo is not None:
+            await _external_main_bump(bump_repo)
+            return None
+        if raises is not None:
+            raise raises
+        return outcome
+
+    return _hook
+
+
 # ── verify-lease / runner helpers ────────────────────────────────────────────
 
 
@@ -755,6 +830,45 @@ def _capture_verify_timeouts(monkeypatch) -> list[float]:
     return captured
 
 
+def _spy_teardown_pair(
+    worker: SpeculativeMergeWorker, monkeypatch,
+) -> list[str]:
+    """Record the SANCTIONED verify-teardown pair, in call order.
+
+    Hand-rolling ``verify_task.cancel()`` / ``_abort_remote_verify`` is what the
+    AST ratchet in
+    test_merge_queue_concurrent_verify.py::TestVerifyTeardownChokepoint
+    forbids, so "the head verify was cancelled" is not the claim worth making —
+    "it went through the chokepoint, in the order the head-failure-cascade
+    template uses" is.  Entries read ``teardown:<task_id>`` then
+    ``cancel_release:<lease name>``.
+
+    PASSTHROUGH and INSTANCE-level (test_merge_queue_reachback_patch_guard.py
+    freezes the ``orchestrator.merge_queue.<private>`` reach-back surface), so
+    the real teardown genuinely runs and the lease is genuinely released while
+    the call ledger stays observable.
+
+    The EMPTY list is a meaningful reading, not merely the absence of one: the
+    adoption gates its whole teardown block on ``not head.verify_task.done()``,
+    so a head whose verdict already arrived records nothing here by design.
+    """
+    calls: list[str] = []
+    real_teardown = worker._teardown_verify_task
+    real_cancel = worker._cancel_and_release_tracked
+
+    async def _recording_teardown(lease, verify_task, task_id, **kwargs):
+        calls.append(f'teardown:{task_id}')
+        return await real_teardown(lease, verify_task, task_id, **kwargs)
+
+    async def _recording_cancel(lease):
+        calls.append(f'cancel_release:{getattr(lease, "name", None)}')
+        return await real_cancel(lease)
+
+    monkeypatch.setattr(worker, '_teardown_verify_task', _recording_teardown)
+    monkeypatch.setattr(worker, '_cancel_and_release_tracked', _recording_cancel)
+    return calls
+
+
 def _spy_spec_lane_acquire(git_ops: GitOps, monkeypatch) -> list[tuple]:
     """Record every ``acquire_spec_lane`` call as ``(base_commit, lane, warm)``.
 
@@ -906,6 +1020,22 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
                 req.result.cancel()
             worker._retire_item(req.request_id)
     return drained
+
+
+def _lane_of(worker: SpeculativeMergeWorker, task_id: str) -> str | None:
+    """Return the lane whose buffer currently holds *task_id*, or ``None``.
+
+    MEMBERSHIP, not position — the composition rows that care about position
+    compare the whole ``[r.task_id for r in buffer]`` list instead, because
+    submission order inside a lane IS the next round's ``chain_snapshot`` and a
+    membership check cannot see a reorder.  This is for the weaker claim that
+    still needs saying: the item is on the queue at all, in the lane it was
+    submitted to, rather than having been silently promoted or dropped.
+    """
+    for lane in ('high', 'normal'):
+        if any(r.task_id == task_id for r in worker._lane_buffers[lane]):
+            return lane
+    return None
 
 
 # ── durable-tier readers ─────────────────────────────────────────────────────
@@ -1171,6 +1301,70 @@ class _LadderClaim(TypedDict):
 
     before: RetryLedger
     after: RetryLedger
+
+
+def _assert_midrun_conserved(
+    worker: SpeculativeMergeWorker,
+    main_sha: str,
+    permits_before: _PermitCensus,
+    *,
+    where: str,
+) -> None:
+    """The MID-RUN half of the two-way contract, callable BETWEEN rounds.
+
+    :func:`_assert_two_way_quiescent` cannot be called between the rounds of a
+    run that is deliberately mid-flight, and the reason is a property of the
+    run rather than a gap in the oracle: its surfaces (a), (d) and (f) are
+    WHOLE-REGISTRY claims — every request resolved, the request-liveness ledger
+    empty, no non-terminal lifecycle entry — and a mid-flight run has queued
+    items with pending futures at every checkpoint.  Asserting them there would
+    either fail honestly or force the caller to pass an empty request list,
+    which is the vacuum the full oracle's guard clauses exist to refuse.
+
+    What DOES hold at every instant is CONSERVATION, so that is what this
+    checks: the three fail-safe audits plus the token-level permit census.  The
+    full oracle then runs once, at the end, after :func:`_drain_residue` has
+    confirmed the run left exactly the residue it promised.
+
+    *where* is interpolated into every failure message, because this is called
+    several times inside one test and "which round" is the first thing a reader
+    needs.
+
+    NOTE the same ``_running`` fail-open hazard the full oracle guards:
+    ``speculation_accounting_violations`` and ``worktree_ledger_violations``
+    both short-circuit to ``[]`` on a stopped worker.  A mid-run caller has a
+    live worker by construction (it is between rounds of a run it is driving),
+    so this is asserted rather than merely documented.
+    """
+    assert worker._running is True, (
+        f'_assert_midrun_conserved requires a worker with _running=True {where}, '
+        f'got {worker._running!r}: both audits below short-circuit to [] on a '
+        f'stopped worker and would pass vacuously'
+    )
+    spec_violations = worker.speculation_accounting_violations()
+    assert spec_violations == [], (
+        f'speculation_accounting_violations() non-empty {where}: '
+        f'{spec_violations!r}'
+    )
+    wt_violations = worker.worktree_ledger_violations()
+    assert wt_violations == [], (
+        f'worktree_ledger_violations() non-empty {where}: {wt_violations!r}'
+    )
+    tli = worker.two_layer_invariants(main_sha)
+    assert tli == [], (
+        f'two_layer_invariants({main_sha[:8]!r}) non-empty {where}: {tli!r}'
+    )
+    now = _permit_census(worker)
+    assert now['spec_live'] == permits_before['spec_live'], (
+        f'spec_live moved {where}: gained '
+        f'{set(now["spec_live"]) - set(permits_before["spec_live"])!r}, lost '
+        f'{set(permits_before["spec_live"]) - set(now["spec_live"])!r}'
+    )
+    assert now['cap_live'] == permits_before['cap_live'], (
+        f'cap_live moved {where}: gained '
+        f'{set(now["cap_live"]) - set(permits_before["cap_live"])!r}, lost '
+        f'{set(permits_before["cap_live"]) - set(now["cap_live"])!r}'
+    )
 
 
 def _assert_two_way_quiescent(
@@ -1675,6 +1869,51 @@ def _verify_rows(db_path: Path) -> list[dict]:
     return [json.loads(r[0]) for r in rows]
 
 
+def _gate_head_verify_task(
+    order: list[str] | None = None,
+    *,
+    lease_ctx=None,
+    started: asyncio.Event | None = None,
+):
+    """A live SLOT-1 head verify task that never finishes on its own.
+
+    Cloned from test_merge_queue_deep_landing.py::_head_verify_task.  The
+    never-finishing part is the point: production's head is still verifying
+    when the speculative tip's verdict arrives, and δ's whole head-cancel
+    contract is about what happens to a verify that has NOT concluded.  A task
+    that resolved on its own would model the uninteresting case.
+
+    *lease_ctx*, when given, is an async context manager entered for the whole
+    (never-ending) span — hand it ``git_ops.merge_verify_lease()`` and the head
+    holds the REAL ``_merge-verify`` lane lock, which is what makes Row 9's
+    staging check ("both axes read BUSY beforehand") measure a genuinely-held
+    lane rather than an empty one.
+
+    *started*, when given, is set once the lease is actually held, so a caller
+    waits on the fact instead of sleeping for it.  *order*, when given, records
+    ``'cancelled'`` at teardown — the remote-abort-before-cancel ordering claim
+    reads it alongside the lease's own recorder.
+    """
+    async def _body():
+        try:
+            if lease_ctx is None:
+                if started is not None:
+                    started.set()
+                await asyncio.Event().wait()
+            else:
+                async with lease_ctx:
+                    if started is not None:
+                        started.set()
+                    await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if order is not None:
+                order.append('cancelled')
+            raise
+        return None
+
+    return asyncio.get_running_loop().create_task(_body())
+
+
 class _GateScene:
     """One repo + worker + queue, driven round after round THROUGH finalize.
 
@@ -1714,6 +1953,12 @@ class _GateScene:
         self.reqs: dict[str, MergeRequest] = {}
         self.rounds: list[dict] = []
         self._round_no = 0
+        # Slot 1, when a scenario opts into the two-slot topology via
+        # `attach_head`.  `None` for the single-slot rounds every other row
+        # drives — `round_` is untouched by this, deliberately: four landed
+        # rows depend on its exact behaviour.
+        self.head_entry: InflightEntry | None = None
+        self.head_mc: str | None = None
 
     @property
     def depths(self) -> list[int | None]:
@@ -1849,6 +2094,227 @@ class _GateScene:
             await worker._host_allocator.release(entry.lease)
         return rec
 
+    # ── the TWO-SLOT topology (step-14): rows 5 and 9 ───────────────────────
+
+    async def attach_head(
+        self, head_tid: str, *, task_factory=None, lease=None,
+        speculative: bool = False,
+    ) -> InflightEntry:
+        """Register *head_tid* as a live SLOT-1 verify, the way dispatch would.
+
+        Production's topology, which :meth:`round_` alone cannot express::
+
+            main <- I0 (head, non-speculative, base = REAL main)
+                      <- I1 (speculative, base = I0's merge commit, chains)
+                         <- I2 ... Ik (links, built on I1's merge commit)
+
+        The head is appended through the real ``_inflight_append`` chokepoint
+        after a real ``_note_transition``, so it is genuinely registered at
+        VERIFYING and genuinely visible to ``_finalizing_head_entry`` /
+        ``_inflight[0]`` — which is what ``_adopt_head_on_tip_authority``
+        reads.  Stuffing the deque directly would leave the ItemLifecycle
+        registry disagreeing with it, and the conservation oracle would then be
+        auditing a state production never produces.
+
+        *task_factory* is called with the scene's OWN ``GitOps`` and returns the
+        head's verify task; the default never finishes on its own (see
+        :func:`_gate_head_verify_task`).  Passing the scene's GitOps rather
+        than letting the factory build one is what lets a factory hold the same
+        ``_merge-verify`` lane lock the worker will later release, with no
+        module-attribute patching.
+
+        *lease* defaults to a LOCAL one, because ``lease.is_local`` is the axis
+        δ's cleanliness argument splits on: a local head frees BOTH lease axes
+        by construction when its task is cancelled, while a remote one SIGKILLs
+        and must clear the holder-pgid rendezvous explicitly.
+        """
+        from orchestrator.merge_types import ItemLifecycleState
+
+        assert self.head_entry is None, (
+            'a scene has ONE slot-1 head; attaching a second would leave the '
+            'first unfinalized in the deque and every ordering claim below it '
+            'ambiguous'
+        )
+        worker = self.worker
+        main_sha = await _rev_parse(self.repo, 'main')
+        head_mc = await _merge_commit_off_main(
+            self.repo, f'task/{head_tid}', f'head-{head_tid}',
+        )
+        popped = worker._pop_next_pickable()
+        assert popped is not None and popped.task_id == head_tid, (
+            f'expected {head_tid} to be the pickable head, got '
+            f'{None if popped is None else popped.task_id}'
+        )
+        wt = _ephemeral_merge_wt(self.git_ops, f'head-{head_tid}')
+        head_item = RealMergeItem(
+            request=popped,
+            merge_result=MergeResult(
+                success=True, merge_commit=head_mc, merge_worktree=wt,
+            ),
+            merge_wt=wt,
+            base_sha=main_sha,      # slot 1 CASes against REAL main
+            speculative=speculative,    # the trust anchor — never chained
+        )
+        entry = InflightEntry(
+            item=head_item,
+            lease=lease if lease is not None else _local_lease(),
+            verify_task=(
+                task_factory(self.git_ops) if task_factory is not None
+                else _gate_head_verify_task()
+            ),  # type: ignore[arg-type]
+            merge_wt=wt,
+            was_speculative=speculative,
+            # Mirrors `_dispatch_item`: the box is built alongside the entry and
+            # seeded with the item's own ephemeral, so a head running the REAL
+            # `_run_inflight_verify` has somewhere for a warm swap to publish.
+            verify_wt=VerifyWorktreeHandle(merge_wt=wt),
+        )
+        worker._note_transition(
+            popped.request_id, ItemLifecycleState.MERGING,
+            ItemLifecycleState.DISPATCHING, live_obj=head_item,
+        )
+        worker._inflight_append(entry)
+        self.head_entry = entry
+        self.head_mc = head_mc
+        return entry
+
+    async def adopting_round_(self, *, tag: str, spec_tid: str) -> dict:
+        """Drive one round STACKED on the attached head, then finalize both.
+
+        The two-slot twin of :meth:`round_`.  Three differences, all forced by
+        the topology rather than chosen:
+
+          * the dispatching item is merged onto the HEAD's merge commit
+            (``base_sha=self.head_mc``), not onto main — that is what makes the
+            head's tree a subset of the tip's;
+          * the head is finalized FIRST.  That order is the deque's, not this
+            method's: the head was appended before the spec entry, so
+            FINALIZE-HEAD reaches it first, which is exactly what makes the
+            spec item's ``expected_main`` (= the head's merge commit) correct
+            without any coordination;
+          * the head finalize is BOUNDED, and the bound is part of the
+            contract.  The head's verify never completes on its own in these
+            scenes, so an adoption that failed to tear it down would leave
+            ``_finalize_inflight`` parked on ``await entry.verify_task``
+            FOREVER, with the whole queue stalled behind it on a verdict it no
+            longer needs.  A timeout makes that a fast, legible RED instead of
+            a hung suite.
+
+        Records the same per-round facts :meth:`round_` does, plus
+        ``'head_advanced'`` and ``'head_entry'``, so the composition rows read
+        one uniform ``scene.rounds`` regardless of which driver produced it.
+        """
+        assert self.head_entry is not None, (
+            'adopting_round_ requires attach_head() first — without a slot-1 '
+            'entry there is nothing to adopt and this is just round_'
+        )
+        assert self.head_mc is not None
+        self._round_no += 1
+        worker = self.worker
+        head_entry = self.head_entry
+        # Slot-1 steady state, for the reason documented at length in `round_`.
+        worker._n_failed = False
+        worker._remerge_occurred = False
+        n_built_before = len(self.built)
+        n_acquires_before = len(self.lane_acquires)
+        n_releases_before = len(self.lane_releases)
+        n_advances_before = len(self.advance_calls)
+        main_before = await _rev_parse(self.repo, 'main')
+        spec_mc = await _merge_commit_onto(
+            self.repo, f'task/{spec_tid}', self.head_mc,
+            f'{tag}-r{self._round_no}',
+        )
+        popped = worker._pop_next_pickable()
+        assert popped is not None and popped.task_id == spec_tid, (
+            f'expected {spec_tid} to be the pickable spec item, got '
+            f'{None if popped is None else popped.task_id}'
+        )
+        wt = _ephemeral_merge_wt(self.git_ops, f'{tag}-r{self._round_no}')
+        item = RealMergeItem(
+            request=popped,
+            merge_result=MergeResult(
+                success=True, merge_commit=spec_mc, merge_worktree=wt,
+            ),
+            merge_wt=wt,
+            base_sha=self.head_mc,  # stacked on the head's merge commit
+            speculative=True,       # slot 2 — the only kind that chains
+        )
+        entry = await worker._dispatch_item(item)
+        assert entry is not None, 'dispatch must not decline: a host is free'
+        assert entry.verify_task is not None
+        await entry.verify_task
+        # `_finalize_inflight` does NOT pop — the real `_verifier_loop` calls
+        # `_inflight_popleft()` and hands it the entry it took.  Mirror that,
+        # or the head stays in `_inflight` forever and `frozen_prefix()` keeps
+        # reporting a landed item against a base main has long since passed.
+        # Conditional because the ADOPTING arm may already have removed it:
+        # a head that was still verifying is torn down and retired by the
+        # adoption itself, and popping again would take the wrong entry.
+        if worker._inflight and worker._inflight[0] is head_entry:
+            assert worker._inflight_popleft() is head_entry
+        head_advanced = await asyncio.wait_for(
+            worker._finalize_inflight(head_entry), timeout=60,
+        )
+        advanced = await worker._finalize_inflight(entry)
+        await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
+
+        rec = self.calls[-1]
+        outcome = popped.result.result() if popped.result.done() else None
+        rec.update({
+            'round': self._round_no,
+            'tag': tag,
+            'item': item,
+            'req': popped,
+            'advanced': advanced,
+            'head_advanced': head_advanced,
+            'head_entry': head_entry,
+            'main_before': main_before,
+            'main_after': await _rev_parse(self.repo, 'main'),
+            'head_mc': self.head_mc,
+            'halving_state': worker._chain_halving_state,
+            'outcome': outcome,
+            'built': self.built[n_built_before:],
+            'lane_acquires': self.lane_acquires[n_acquires_before:],
+            'lane_releases': self.lane_releases[n_releases_before:],
+            'advance_calls': self.advance_calls[n_advances_before:],
+            'landed': [
+                tid for tid, r in self.reqs.items()
+                if r.result.done() and not r.result.cancelled()
+                and r.result.result().status == 'done'
+            ],
+        })
+        self.rounds.append(rec)
+        if entry.lease is not None:
+            await worker._host_allocator.release(entry.lease)
+        return rec
+
+    # ── the hot-reload seam (step-14): row 10 ───────────────────────────────
+
+    def reload_cap(self, chain_cap: int) -> dict:
+        """Flip ``merge_deep.chain_cap`` through the REAL ``config.apply_reload``.
+
+        Returns the reload disposition dict verbatim, so the caller asserts on
+        ``reloaded`` / ``applied`` / ``restart_required`` rather than on this
+        helper's summary of them — "reloaded is not everything took effect" is
+        an operational rule in this repo, and a helper that collapsed the three
+        would hide exactly the tier regression Row 10 is written to catch.
+
+        Mutates the scene's LIVE config object in place, which is what makes
+        the flip observable to already-enqueued requests: ``OrchestratorConfig``
+        and ``MergeDeepConfig`` are plain mutable ``BaseModel``s, every
+        ``MergeRequest`` holds ``self.config`` by REFERENCE, and the worker
+        reads the cap off the dispatching request's config at dispatch time.
+        Rebuilding the config instead would leave every queued request pointing
+        at the old one and the row would silently be testing nothing.
+        """
+        from orchestrator.config import apply_reload
+
+        result = apply_reload(self.config, _make_config(self.repo, chain_cap=chain_cap))
+        assert isinstance(result, dict), (
+            f'apply_reload must return a disposition dict; got {result!r}'
+        )
+        return result
+
 
 def _scripted_remote_runner(scene: _GateScene, script, name='gate-runner'):
     """A RemoteRunner-shaped fake whose verdicts come from *script*, in order.
@@ -1908,6 +2374,7 @@ async def _make_gate_scene(
     heads: tuple[str, ...] = ('101',),
     remote: bool = False,
     real_local: bool = False,
+    advance_hook=None,
 ) -> _GateScene:
     """Build an n-follower, finalize-capable scene over a REAL git repo.
 
@@ -1944,6 +2411,14 @@ async def _make_gate_scene(
     a scene that stated its verdicts BOTH by position and by content would
     have two answers for the same round.  Every call is recorded on
     ``scene.verdicts``.
+
+    *advance_hook* is threaded to :func:`_spy_advance_main`, and it is the ONLY
+    way a scene can disrupt the CAS walk from the inside: the walk's abort is a
+    VALUE ``advance_main`` returns rather than an exception it raises, so a
+    scenario about the abort has to answer that one call differently.  Build it
+    with :func:`_abort_hook_at`; the call ordinal it arms on is cumulative
+    across the whole scene, so a hook armed inside round 1's walk leaves every
+    later round running clean.
 
     Module-level monkeypatching is confined to the four names
     test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
@@ -1989,7 +2464,7 @@ async def _make_gate_scene(
     monkeypatch.setattr(worker, '_run_inflight_verify', _recording)
     scene.lane_acquires = _spy_spec_lane_acquire(git_ops, monkeypatch)
     scene.lane_releases = _spy_chain_lane_release(monkeypatch)
-    scene.advance_calls = _spy_advance_main(git_ops, monkeypatch)
+    scene.advance_calls = _spy_advance_main(git_ops, monkeypatch, hook=advance_hook)
 
     real_build = merge_queue.build_chain
 
@@ -2563,31 +3038,15 @@ class TestRow3HalvingIsolatesTheBadItem:
         what this checks — the three fail-safe audits plus the token-level
         permit census.  The full oracle runs once at the end, after
         :func:`_drain_residue` reports the run left no residue at all.
+
+        Kept as a method purely for call-site brevity inside this row's walk;
+        the body it delegates to is the module-level
+        :func:`_assert_midrun_conserved`, which step-13's composition sweep
+        also drives.  ONE implementation, because a second copy of a
+        conservation oracle is exactly the kind of duplicate that goes quietly
+        out of step with the surfaces it audits.
         """
-        spec_violations = worker.speculation_accounting_violations()
-        assert spec_violations == [], (
-            f'speculation_accounting_violations() non-empty {where}: '
-            f'{spec_violations!r}'
-        )
-        wt_violations = worker.worktree_ledger_violations()
-        assert wt_violations == [], (
-            f'worktree_ledger_violations() non-empty {where}: {wt_violations!r}'
-        )
-        tli = worker.two_layer_invariants(main_sha)
-        assert tli == [], (
-            f'two_layer_invariants({main_sha[:8]!r}) non-empty {where}: {tli!r}'
-        )
-        now = _permit_census(worker)
-        assert now['spec_live'] == permits_before['spec_live'], (
-            f'spec_live moved {where}: gained '
-            f'{set(now["spec_live"]) - set(permits_before["spec_live"])!r}, lost '
-            f'{set(permits_before["spec_live"]) - set(now["spec_live"])!r}'
-        )
-        assert now['cap_live'] == permits_before['cap_live'], (
-            f'cap_live moved {where}: gained '
-            f'{set(now["cap_live"]) - set(permits_before["cap_live"])!r}, lost '
-            f'{set(permits_before["cap_live"]) - set(now["cap_live"])!r}'
-        )
+        _assert_midrun_conserved(worker, main_sha, permits_before, where=where)
 
     async def _walk(
         self, git_repo: Path, tmp_path: Path, monkeypatch, *,
@@ -3955,26 +4414,7 @@ class TestBoundaryRowsComposed:
         worker = scene.worker
         permits_before = _permit_census(worker)
 
-        # The SANCTIONED teardown pair, spied on the INSTANCE.  Hand-rolling
-        # `verify_task.cancel()` is what the AST ratchet in
-        # test_merge_queue_concurrent_verify.py::TestVerifyTeardownChokepoint
-        # forbids, so "was cancelled" is not the claim — "went through the
-        # chokepoint, in order" is.
-        teardown: list[str] = []
-        _real_td = worker._teardown_verify_task
-        _real_cr = worker._cancel_and_release_tracked
-
-        async def _td(lease, verify_task, task_id, **kw):
-            teardown.append(f'teardown:{task_id}')
-            return await _real_td(lease, verify_task, task_id, **kw)
-
-        async def _cr(lease):
-            teardown.append(f'cancel_release:{getattr(lease, "name", None)}')
-            return await _real_cr(lease)
-
-        monkeypatch.setattr(worker, '_teardown_verify_task', _td)
-        monkeypatch.setattr(worker, '_cancel_and_release_tracked', _cr)
-
+        teardown = _spy_teardown_pair(worker, monkeypatch)
         head_entry = await scene.attach_head('100', task_factory=_red_head_task)
         await asyncio.sleep(0)   # let the red verdict actually land
         assert head_entry.verify_task.done(), (
@@ -3991,8 +4431,10 @@ class TestBoundaryRowsComposed:
             f'{head_outcome!r}'
         )
         chain = rec['chain']
-        assert chain is not None and len(chain.links) == 3, (
-            f'the whole remaining queue must chain behind the head; got '
+        assert chain is not None and len(chain.links) == 4, (
+            f'the whole remaining queue must chain behind the head — cap '
+            f'{_HEAD_CAP} over four followers means nothing truncates and '
+            f'nothing is left over; got '
             f'{None if chain is None else 1 + len(chain.links)} items'
         )
         assert await _rev_parse(git_repo, 'main') == chain.tip, (
@@ -4017,14 +4459,31 @@ class TestBoundaryRowsComposed:
         for tid in ('101', *[t for t, _mc in chain.links]):
             assert by_branch[tid]['landed_via_chain'] == 1
 
-        # ── and the head's in-flight verify went through the chokepoint ─────
-        assert teardown == ['teardown:100', 'cancel_release:local'], (
-            f'the head verify must be torn down through the sanctioned pair, '
-            f'in order; got {teardown!r}'
+        # ── the DELIVERED-verdict arm tears NOTHING down, and must not ──────
+        #
+        # Measured, and it is a real distinction rather than an omission: the
+        # adoption gates its whole teardown block on
+        # ``not head.verify_task.done()``, and this head's verdict had already
+        # arrived.  There is no in-flight verify to cancel, no lease to
+        # reclaim early, and no worktree to re-publish — the entry's lease and
+        # worktree stay on ``_finalize_inflight``'s ORDINARY release path.
+        # What still happens is the part the row is about: ``chain_adopted``
+        # is set BEFORE that branch, so the red verdict is DECLINED either way.
+        #
+        # The other arm — a head still verifying when the tip passes, which
+        # DOES go through ``_teardown_verify_task`` then
+        # ``_cancel_and_release_tracked`` — is asserted in Row 9, where the
+        # cancel is the mechanism the lease-release claim rests on.  Splitting
+        # them is not a convenience: one scene has ONE head, so a single test
+        # cannot state both, and asserting the live-head chokepoint here would
+        # be asserting a branch this scene provably does not enter.
+        assert head_entry.chain_adopted is True, (
+            'the tip must DECLINE the head\'s red verdict — that flag is set '
+            'before the done/not-done split, so it holds on both arms'
         )
-        assert head_entry.lease is None, (
-            'entry.lease must be cleared after the release so no later path '
-            'double-releases it'
+        assert teardown == [], (
+            f'a head whose verdict already arrived has nothing to tear down; '
+            f'got {teardown!r}'
         )
 
         assert _drain_residue(worker) == set(), (
@@ -4170,7 +4629,8 @@ class TestBoundaryRowsComposed:
         worker, git_ops = scene.worker, scene.git_ops
         permits_before = _permit_census(worker)
 
-        await scene.attach_head('100', task_factory=_leased_head_task)
+        teardown = _spy_teardown_pair(worker, monkeypatch)
+        head_entry = await scene.attach_head('100', task_factory=_leased_head_task)
         await asyncio.wait_for(started.wait(), timeout=30)
 
         lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
@@ -4200,6 +4660,25 @@ class TestBoundaryRowsComposed:
         assert git_ops._merge_verify_lease_active() is False, (
             'the combined predicate the admission guard consumes must agree '
             'with both axes'
+        )
+        # ── ...and it got there through the SANCTIONED chokepoint ───────────
+        #
+        # The LIVE-head arm, which Row 5's delivered-verdict head provably
+        # cannot enter: the head here is still verifying when the tip passes,
+        # so the adoption really does tear it down — and the teardown IS the
+        # mechanism the two idle readings above rest on.  Asserted as an
+        # ordered pair because the order is load-bearing: the verify
+        # coroutine's finally clears ``_inflight_request_id`` on cancellation,
+        # which would turn a later ``cancel_verify()`` into a silent no-op that
+        # orphans a remote verify-merge process.
+        assert teardown == ['teardown:100', 'cancel_release:local'], (
+            f'the head verify must be released through _teardown_verify_task '
+            f'then _cancel_and_release_tracked, in that order; got '
+            f'{teardown!r}'
+        )
+        assert head_entry.lease is None, (
+            'entry.lease must be cleared after the release so no later path '
+            'double-releases it'
         )
         # And the round really did adopt — an idle lane after a round that
         # never ran would prove nothing.
