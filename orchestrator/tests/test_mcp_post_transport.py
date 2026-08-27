@@ -27,10 +27,12 @@ failure from a silent 307 no-op to a silent 406 no-op — still a lost write.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from _mcp_url_scan import find_trailing_slash_mcp_urls
 
 from orchestrator.workflow import TaskWorkflow
 
@@ -488,24 +490,39 @@ SWEEP_DIRS = (
     'fused-memory/scripts',
 )
 
-#: The URL-BUILDING form, not bare ``/mcp/``.  Measured before choosing: bare
-#: ``/mcp/`` also matches unrelated prose in merge_queue.py docstrings (the
-#: phrase ``scheduler/mcp/usage_gate/cost_store`` at :1163 and :2467), which
-#: would make this assertion permanently unsatisfiable and would mark a
-#: perfectly correct fix as undelivered.  This form measured 4 hits in
-#: workflow.py + 1 in merge_queue.py + 3 in scripts before the fix and 0 after
-#: — non-vacuous in both directions, which is the property an anchor needs.
-SLASHED_URL_ANCHOR = "}/mcp/'"
+#: Worktree root.  Same expression as ``conftest.py:38`` and restated here per
+#: that file's conftest-collision note — resolving from ``__file__`` is what
+#: makes the sweep check THIS worktree, the copy the task's verify run gates on.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Files that legitimately contain the anchor and are NOT raw POSTs.
+#: Files that legitimately build a slashed URL and are NOT raw POSTs.
 #: Each is a deliberate exclusion, not an oversight — see the reasons.
 SWEEP_EXCLUSIONS = {
     # An MCP *config* entry consumed by the Claude CLI's own MCP client, which
     # follows redirects natively.  A different risk class from a raw POST.
     'fused-memory/src/fused_memory/reconciliation/stages/base.py',
-    # A log string, not a URL that is ever fetched.
+    # Display/log strings, not URLs that are ever fetched.
     'fused-memory/src/fused_memory/server/main.py',
 }
+
+
+def _sweep_hits() -> dict[str, list[tuple[int, str]]]:
+    """Return ``{relpath: hits}`` for every swept file that builds a slashed URL.
+
+    Shared by the guard and the stale-exclusion check below so both read the
+    same walk — an exclusion list and the sweep it applies to must never be
+    able to disagree about what the tree contains.
+    """
+    found: dict[str, list[tuple[int, str]]] = {}
+    for rel_dir in SWEEP_DIRS:
+        for path in sorted((REPO_ROOT / rel_dir).rglob('*.py')):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            hits = find_trailing_slash_mcp_urls(
+                path.read_text(encoding='utf-8'), filename=rel
+            )
+            if hits:
+                found[rel] = hits
+    return found
 
 
 def test_no_raw_post_builds_a_trailing_slash_mcp_url():
@@ -524,22 +541,30 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     follows redirects natively, so those sites carry no silent-discard risk.
     Rewriting live fixtures to chase a cosmetic match would risk breaking
     readiness gating for zero benefit.
+
+    DETECTION IS BY PARSING, NOT SUBSTRING.  This guard originally matched the
+    text ``}/mcp/'``, chosen over a bare ``/mcp/`` because that also matches
+    the phrase ``scheduler/mcp/usage_gate/cost_store`` in merge_queue.py
+    docstrings (:1163, :2467) and would have been permanently unsatisfiable.
+    But the narrow anchor bought that immunity by hard-coding one spelling —
+    it required a brace immediately before the slash and a single quote after,
+    so double-quoted, plain-literal, percent-format and concatenated URLs all
+    passed silently.  ``_mcp_url_scan`` matches the parsed literal's TAIL
+    instead, which catches every spelling and is still immune to the prose.
+
+    MEASURED both directions, against real historical source: run over
+    ``git show 2633a244a6:<path>`` the detector fires on exactly the 8 pre-fix
+    defect sites (workflow.py 15173/15215/15247/15286, merge_queue.py 16031,
+    and the three operator scripts); run over this tree it flags only the two
+    excluded files below.  A guard that cannot fail on the defect it was
+    written for is worth nothing.
     """
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[2]
-
-    offenders = []
-    for rel_dir in SWEEP_DIRS:
-        for path in sorted((repo_root / rel_dir).rglob('*.py')):
-            rel = path.relative_to(repo_root).as_posix()
-            if rel in SWEEP_EXCLUSIONS:
-                continue
-            for lineno, line in enumerate(
-                path.read_text(encoding='utf-8').splitlines(), start=1
-            ):
-                if SLASHED_URL_ANCHOR in line:
-                    offenders.append(f'{rel}:{lineno}: {line.strip()}')
+    offenders = [
+        f'{rel}:{lineno}: {text}'
+        for rel, hits in sorted(_sweep_hits().items())
+        if rel not in SWEEP_EXCLUSIONS
+        for lineno, text in hits
+    ]
 
     assert offenders == [], (
         'these build an MCP URL with a trailing slash; the server 307-redirects '
@@ -548,12 +573,25 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     )
 
 
-def test_the_sweep_anchor_is_not_vacuous():
-    """The guard must be able to FAIL — a typo'd anchor would pass forever.
+def test_every_sweep_exclusion_still_earns_its_place():
+    """An exclusion that outlives its offending line must fail, not lurk.
 
-    Pins that the anchor still matches the exact string the defect produced,
-    so the assertion above is testing something real rather than searching for
-    a form that can no longer occur under any spelling.
+    Each entry in ``SWEEP_EXCLUSIONS`` is a hole in the guard above.  If the
+    line that justified one is fixed or deleted, the hole stays open and
+    silently covers whatever a future edit puts in that file.  Requiring every
+    exclusion to still produce a hit turns that into a failing test the moment
+    it goes stale — the entry gets removed instead of masking a regression.
+
+    Measured today: ``stages/base.py:439`` and ``server/main.py`` :1083 and
+    :1149 all still hit, so this is satisfiable now and is a real check on
+    repo state.
     """
-    assert SLASHED_URL_ANCHOR in "await client.post(f'{self.mcp.url}/mcp/', json=payload)"
-    assert SLASHED_URL_ANCHOR not in "await client.post(mcp_endpoint_url(self.mcp.url))"
+    found = _sweep_hits()
+
+    stale = sorted(rel for rel in SWEEP_EXCLUSIONS if rel not in found)
+
+    assert stale == [], (
+        'these files no longer build a slashed MCP URL, so excluding them from '
+        'the sweep guard now only hides future regressions. Delete the entry '
+        'from SWEEP_EXCLUSIONS:\n  ' + '\n  '.join(stale)
+    )
