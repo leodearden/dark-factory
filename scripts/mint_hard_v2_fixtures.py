@@ -323,23 +323,61 @@ def _git(args: list[str], cwd: Path | str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ''
 
 
-_MERGE_SUBJECT = 'Merge task/{task_id} into main'
+# The two subject spellings a landing merge is written under. BOTH are in live
+# use — censused over reify's main: 2741 x "Merge task/N into main" and 74 x
+# "Merge task/N: <subject>" — and matching only the first is what stamped a
+# false `reference_unavailable` on fixtures that DO have a landing merge
+# (measured: reify_task_4026, reify_task_2379, reify_task_2573).
+_MERGE_SUBJECT_SPELLINGS = (
+    # Fully-anchored: the whole subject is known.
+    '^Merge task/{escaped_id} into main$',
+    # Prefix-anchored: the subject tail is free text, so only the head can be
+    # matched. The trailing space is load-bearing — see the docstring below.
+    '^Merge task/{escaped_id}: ',
+)
+
+
+def _merge_subject_patterns(task_id: str) -> list[str]:
+    """Return the anchored EREs matching *task_id*'s landing-merge subjects.
+
+    ONE derivation, shared by every reader, mirroring the discipline of
+    ``orchestrator/src/orchestrator/git_ops.py::_merge_subject`` — whose
+    single-source-of-truth subject is consumed by ``git_ops.py::GitOps
+    .find_merge_marker``, ``merge_to_main`` and ``advance_main`` so writer and
+    reader can never silently drift. This driver only ever READS history, so
+    it derives the accepted patterns rather than the written subject, but the
+    property is the same: adding or amending a spelling happens here, once.
+    """
+    escaped = re.escape(task_id)
+    return [s.format(escaped_id=escaped) for s in _MERGE_SUBJECT_SPELLINGS]
 
 
 def find_merge_sha(repo_root: Path | str, task_id: str) -> str | None:
-    """Return the single ``Merge task/<id> into main`` SHA, else ``None``.
+    """Return the task's single landing-merge SHA, else ``None``.
+
+    Two subject spellings are accepted, per ``_merge_subject_patterns``:
+    ``Merge task/<id> into main`` and ``Merge task/<id>: <subject>``.
 
     ``None`` means planRate-only: either the task landed SPLIT/direct (no merge
-    commit at all) or several merges carry the same id, in which case picking
-    one would silently invent a reference for the judge to grade against.
+    commit at all) or several merges carry the same id — across the UNION of
+    both spellings — in which case picking one would silently invent a
+    reference for the judge to grade against.
 
-    The grep is anchored on the full subject so ``Merge task/8030 into main``
-    cannot answer a query for task ``803``.
+    Both patterns are ``^``-anchored, which is what preserves substring-safety:
+    ``Merge task/8030 …`` cannot answer a query for task ``803`` because the
+    ``0`` after ``task/803`` falls where the pattern requires a space or a
+    colon. ``git_ops.py::GitOps.find_merge_marker`` gets the same property from
+    ``--fixed-strings``; that is not available here because the colon form's
+    subject tail is unknown, so only a PREFIX can be matched and git's
+    ``--grep`` has no anchoring under ``--fixed-strings``. Hence ERE plus
+    ``^``, which also makes the trailing space in the colon pattern
+    load-bearing: ``Merge task/803:no-space`` is not the landing-merge shape.
     """
-    subject = _MERGE_SUBJECT.format(task_id=task_id)
+    # git ORs multiple --grep args by default, so one invocation covers the
+    # union and `len(shas) == 1` keeps its across-spellings ambiguity meaning.
+    greps = [f'--grep={pattern}' for pattern in _merge_subject_patterns(task_id)]
     out = _git(
-        ['log', '--all', f'--grep=^{re.escape(subject)}$', '--extended-regexp',
-         '--pretty=%H'],
+        ['log', '--all', *greps, '--extended-regexp', '--pretty=%H'],
         repo_root,
     )
     shas = [line.strip() for line in out.splitlines() if line.strip()]
@@ -405,7 +443,9 @@ def resolve_baseline(
 
     raise BaselineUnresolved(
         f'resolve_baseline: no baseline commit for task {task_id!r} in '
-        f'{repo_root} — no single "Merge task/{task_id} into main", no '
+        f'{repo_root} — no single landing merge under either accepted '
+        f'spelling ("Merge task/{task_id} into main" / '
+        f'"Merge task/{task_id}: <subject>"), no '
         f'set_task_status({task_id}=in-progress) auto-commit on main, and no '
         f'main commit before first_invocation_ts={first_invocation_ts!r}. '
         f'A fixture with an empty pre_task_commit would fail inside '
@@ -1326,13 +1366,15 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
         # exactly the degradation D9 exists to abolish.
         record.pop('reference', None)
         record['provenance']['reference_unavailable'] = (
-            f'No single "Merge task/{row["task_id"]} into main" commit exists '
-            f'in {row["project_root"]} (SPLIT / direct-landed, or several '
-            f'merges carry this id), so no landed post-commit is available to '
-            f'diff against. This fixture is planRate-only: it is scored on '
-            f'plan production, never on reference-diff similarity. Its '
-            f'pre_task_commit came from baseline rung '
-            f'{row["baseline_source"]!r}.'
+            f'No single landing merge for task {row["task_id"]} exists in '
+            f'{row["project_root"]} under EITHER accepted subject spelling — '
+            f'"Merge task/{row["task_id"]} into main" or '
+            f'"Merge task/{row["task_id"]}: <subject>" (SPLIT / direct-landed, '
+            f'or several merges carry this id across the two spellings) — so '
+            f'no landed post-commit is available to diff against. This fixture '
+            f'is planRate-only: it is scored on plan production, never on '
+            f'reference-diff similarity. Its pre_task_commit came from '
+            f'baseline rung {row["baseline_source"]!r}.'
         )
         # build_fixture_record stamps landed_verify_outcome unconditionally,
         # and its contract is "the task merged to main => its gates passed at
