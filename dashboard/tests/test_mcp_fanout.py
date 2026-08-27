@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import types
 
 import httpx
@@ -1074,4 +1075,84 @@ class TestTTLCacheBoundedLockAcquisition:
         assert 0 < timeout < 120, (
             'a future None (or non-positive/unbounded) value would silently '
             'restore the unbounded wait this task exists to remove'
+        )
+
+
+class TestTTLCacheBypassRechecksFreshness:
+    """A timed-out waiter must re-check freshness BEFORE spending a bypass refresh.
+
+    The timeout window is exactly when another caller can have filled the
+    entry — a bypass that skipped the re-check would spend a duplicate MCP
+    round trip (and clobber a newer value with an older one) for no benefit.
+    This mirrors the post-lock double-check on the normal acquisition path:
+    freshness first, refresh second, never reordered.
+    """
+
+    async def test_a_timed_out_waiter_serves_a_value_that_landed_while_it_waited(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        # Guarantee the acquisition times out — the same reach-into-privates
+        # idiom TestTTLCacheKeepsLocksWithQueuedWaiters already uses.
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        calls = {'n': 0}
+
+        async def _refresh():
+            calls['n'] += 1
+            return 'refreshed'
+
+        # The key must be COLD when the waiter starts, so its own
+        # top-of-function freshness check misses and it genuinely reaches the
+        # bounded lock wait rather than being served by the pre-existing
+        # lock-free fast path (which would make this test pass vacuously,
+        # regardless of the re-check under test). Seeding only after it is
+        # parked is what stands in for "a third party stored while this
+        # caller was parked".
+        waiter = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        await asyncio.sleep(0)  # let it reach the lock and start waiting
+        cache._store['k'] = (time.monotonic(), 'landed')
+
+        try:
+            result = await asyncio.wait_for(waiter, 5.0)
+        finally:
+            lock.release()
+
+        assert result == 'landed'
+        assert calls['n'] == 0, (
+            'a timed-out waiter must serve the value already in hand rather '
+            'than issuing another MCP round trip'
+        )
+
+    async def test_a_timed_out_waiter_with_no_stored_value_still_runs_its_own_refresh(
+        self, monkeypatch
+    ):
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        calls = {'n': 0}
+
+        async def _refresh():
+            calls['n'] += 1
+            return 'refreshed'
+
+        try:
+            result = await asyncio.wait_for(cache.get_or_refresh('k', _refresh), 5.0)
+        finally:
+            lock.release()
+
+        assert result == 'refreshed'
+        assert calls['n'] == 1, (
+            'the re-check must not be "fixed" into an unconditional cache '
+            'read that starves a genuinely cold key'
         )
