@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mint the fable-architect-trial-v2 curated hard fixture pool (β1, task 3631).
 
-Four modes:
+Modes:
 
 ``--census``
     Re-run the architect-exhaustion census across the three source checkouts'
@@ -24,6 +24,13 @@ Four modes:
     overlay the v2 ceilings, and write the fixture JSONs plus the generated
     ``CURATION.md``.
 
+``--redrive``
+    Re-derive ``merge_sha`` / ``baseline_sha`` / ``baseline_source`` /
+    ``mint_mode`` on the COMMITTED manifest's existing ``include`` rows and
+    write it back. The regeneration path after a provenance-RESOLUTION fix,
+    where ``--author`` would re-census against dbs that have moved on and so
+    change pool membership as a side effect. See ``redrive_provenance``.
+
 Nothing in this script writes to ``orchestrator/src/orchestrator/evals/tasks/``
 — the standing eval corpus is out of scope for β1 and stays byte-unchanged.
 """
@@ -31,6 +38,7 @@ Nothing in this script writes to ``orchestrator/src/orchestrator/evals/tasks/``
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sqlite3
@@ -1127,6 +1135,118 @@ def run_render() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --redrive — re-derive provenance on the COMMITTED manifest's existing rows
+# ---------------------------------------------------------------------------
+#
+# Why this exists rather than re-running --author: `author_manifest` re-runs
+# CENSUS_SQL against the LIVE runs.db in each source checkout. The recorded
+# census date is 2026-08-08 and those dbs have moved on since, so a re-author
+# would change pool membership, ceilings and per-row curation reasons as a
+# SIDE EFFECT of a provenance bug fix — silently invalidating the adjudicated
+# 42-fixture pool and every test that pins it. (It also refuses outright on
+# any census drift, which is why `run_render` exists for the same reason.)
+# `redrive_provenance` mutates only the four provenance fields on rows that
+# already exist, and by construction cannot add or drop a fixture.
+
+_REDRIVEN_FIELDS = ('merge_sha', 'baseline_sha', 'baseline_source', 'mint_mode')
+
+
+def redrive_provenance(manifest: dict, resolve) -> tuple[dict, list[dict]]:
+    """Re-derive provenance on *manifest*'s ``include`` rows; never re-censusing.
+
+    *resolve* is injected — ``resolve(project_root, task_id)`` returns
+    ``(merge_sha | None, baseline_sha, baseline_source)`` — following the same
+    dependency-injection discipline as
+    ``orchestrator/src/orchestrator/evals/task_sampler.py::audit_fixture_corpus``
+    so the rule itself is testable with no checkout present. ``mint_mode`` is
+    derived HERE (``'referenced'`` iff a single landing merge resolved) rather
+    than by the resolver, so the one invariant tying the two together lives in
+    one place.
+
+    Returns ``(new_manifest, changes)``. The input manifest is not mutated;
+    *changes* lists one entry per row whose provenance moved, in manifest
+    order, carrying the before/after of every redriven field so an operator
+    sees exactly what shifted and nothing has to be diffed by eye.
+    """
+    new = copy.deepcopy(manifest)
+    changes: list[dict] = []
+
+    for row in new['candidates']:
+        if row.get('decision') != 'include':
+            continue
+        merge_sha, baseline_sha, baseline_source = resolve(
+            row['project_root'], row['task_id'],
+        )
+        after = {
+            'merge_sha': merge_sha,
+            'baseline_sha': baseline_sha,
+            'baseline_source': baseline_source,
+            'mint_mode': 'referenced' if merge_sha else 'planrate_only',
+        }
+        before = {key: row.get(key) for key in _REDRIVEN_FIELDS}
+        if before == after:
+            continue
+        row.update(after)
+        changes.append({
+            'task_id': row['task_id'],
+            'project': row['project'],
+            'before': before,
+            'after': after,
+        })
+
+    # The availability summary is a COUNT over the rows this function just
+    # rewrote; leaving it stale would make the manifest disagree with itself.
+    availability = new.get('merge_sha_availability')
+    if isinstance(availability, dict):
+        modes = [r.get('mint_mode') for r in new['candidates']
+                 if r.get('decision') == 'include']
+        availability['referenced'] = sum(1 for m in modes if m == 'referenced')
+        availability['planrate_only'] = sum(
+            1 for m in modes if m == 'planrate_only')
+
+    return new, changes
+
+
+def _production_redrive_resolver(row_project_root: str, task_id: str):
+    """The real resolver: the dual-spelling matcher plus the baseline ladder."""
+    merge_sha = find_merge_sha(row_project_root, task_id)
+    ts = first_architect_invocation_ts(
+        Path(row_project_root) / 'data' / 'orchestrator' / 'runs.db', task_id,
+    )
+    baseline_sha, baseline_source = resolve_baseline(
+        row_project_root, task_id, ts,
+    )
+    return merge_sha, baseline_sha, baseline_source
+
+
+def run_redrive() -> int:
+    """Re-derive provenance on the committed manifest and write it back."""
+    if not CURATION_JSON.exists():
+        raise RuntimeError(
+            f'run_redrive: no manifest at {CURATION_JSON}. --redrive '
+            f're-derives provenance on the rows an EXISTING manifest already '
+            f'carries; there is nothing to redrive. Author it first '
+            f'(--author).'
+        )
+    manifest = json.loads(CURATION_JSON.read_text())
+    new, changes = redrive_provenance(manifest, _production_redrive_resolver)
+    CURATION_JSON.write_text(json.dumps(new, indent=2) + '\n')
+
+    for change in changes:
+        print(f'  {change["project"]}/{change["task_id"]}:')
+        for key in _REDRIVEN_FIELDS:
+            was, now = change['before'][key], change['after'][key]
+            if was != now:
+                print(f'    {key}: {was} -> {now}')
+    availability = new.get('merge_sha_availability') or {}
+    print(f'redrove {len(changes)} row(s) in {CURATION_JSON} '
+          f'(referenced={availability.get("referenced")}, '
+          f'planrate_only={availability.get("planrate_only")}); '
+          f'no row was added, dropped or re-adjudicated')
+    return 0
+
+
 def run_author(census_date: str) -> int:
     manifest = author_manifest(census_date)
     CURATION_JSON.parent.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1705,18 @@ def main(argv: list[str] | None = None) -> int:
                            'manifest edit')
     mode.add_argument('--mint', action='store_true',
                       help='Mint the fixture JSONs from the manifest include rows')
+    mode.add_argument('--redrive', action='store_true',
+                      help='Re-derive merge_sha / baseline_sha / '
+                           'baseline_source / mint_mode on the COMMITTED '
+                           'manifest\'s existing include rows, then write it '
+                           'back. Use this — NOT --author — after a '
+                           'provenance-resolution fix: --author re-censuses '
+                           'against the live runs.db files, which have moved '
+                           'on since the recorded census date, so it would '
+                           'silently change pool membership and re-adjudicate '
+                           'rows as a side effect. --redrive touches only '
+                           'those four fields and cannot add or drop a '
+                           'fixture')
     parser.add_argument('--census-date', default=None,
                         help='ISO date stamped into the manifest (required with '
                              '--author; passed in rather than read from the '
@@ -1608,6 +1740,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_author(args.census_date)
     if args.render:
         return run_render()
+    if args.redrive:
+        return run_redrive()
     if args.mint:
         if not args.sampled_at:
             parser.error('--mint requires --sampled-at')
