@@ -4,28 +4,30 @@ module-level ``pytest.mark.timeout`` (task 4215).
 THE FAILURE MODE, END TO END.  A dozen guard tests under ``orchestrator/tests/``
 sweep the ENTIRE repo -- ``rglob('*.py')`` over ~500 files -- and ``ast.parse``
 each one.  Unloaded and serial that costs 6-9s per call here; the orchestrator
-suite however runs under ``-n auto`` (``orchestrator/pyproject.toml:178``), so on
-a 32-core box those sweeps run concurrently with everything else and the same
-call has been MEASURED at 17.85 / 21.32 / 30.75s at loadavg 120-176 -- a ~4.8x
-load inflation.  Worker deaths were then observed at loadavg 250-423, one
-further inflation step past the 60s default at ``pyproject.toml:152``.
+suite however runs under ``-n auto`` (``[tool.pytest.ini_options].addopts`` in
+``orchestrator/pyproject.toml``), so on a 32-core box those sweeps run
+concurrently with everything else and the same call has been MEASURED at
+17.85 / 21.32 / 30.75s at loadavg 120-176 -- a ~4.8x load inflation.  Worker
+deaths were then observed at loadavg 250-423, one further inflation step past
+the 60s ``[tool.pytest.ini_options].timeout`` default.
 
 What makes the breach so expensive is the two settings around it:
 
-* ``timeout_method = "thread"`` (``pyproject.toml:153``) means a breach does NOT
-  fail the test -- pytest-timeout's thread method ``os._exit()``s the whole xdist
-  worker ("node down: Not properly terminated");
-* ``--max-worker-restart=0`` (``pyproject.toml:178``, task 1907) then declines to
-  replace that worker, degrading the run to a TRUNCATED whole-suite session whose
-  surviving failure names some innocent guard that merely happened to share the
-  dead worker.
+* ``[tool.pytest.ini_options].timeout_method = "thread"`` means a breach does
+  NOT fail the test -- pytest-timeout's thread method ``os._exit()``s the whole
+  xdist worker ("node down: Not properly terminated");
+* ``--max-worker-restart=0`` (in ``[tool.pytest.ini_options].addopts``, task
+  1907) then declines to replace that worker, degrading the run to a TRUNCATED
+  whole-suite session whose surviving failure names some innocent guard that
+  merely happened to share the dead worker.
 
 So a single slow tree-scan does not cost one red test -- it costs the whole
 verify run, and it misattributes the blame.  Escalations esc-3980-1 and
 esc-3787-1 are both instances.
 
 THE FIX the pyproject itself sanctions ("Slow tests opt out with
-``@pytest.mark.timeout(N)``", ``pyproject.toml:154``) is a module-level
+``@pytest.mark.timeout(N)``", the comment on
+``[tool.pytest.ini_options].timeout``) is a module-level
 ``pytestmark`` on each scanner.  This module pins the two constants that mark
 uses, and (from step-5 on) recomputes the census of scanners from source on
 every run so the Nth new scanner is caught at commit time rather than by another
@@ -73,15 +75,16 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 # merge-verify runs pytest from the orchestrator/ cwd while a plain
 # `pytest orchestrator/tests` runs from the repo root, and the census must come
 # out identical under both.  Same idiom as
-# test_marker_registration_drift.py:597-601.
+# test_marker_registration_drift.py::TESTS_DIR.
 _TESTS_DIR = Path(__file__).resolve().parent
 
 # Anti-vacuity FLOORS, not equalities -- 535 files and 12 scanners measured at
 # authorship time -- so the guard survives the tree growing while still failing
 # loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a read that
 # silently yields nothing, a detector rotted to always-False).  The house
-# pattern for exactly this risk: test_marker_registration_drift.py:602-604's
-# _MIN_EXPECTED_TEST_FILES, test_killpg_frozen_pgid_guard.py's measured file
+# pattern for exactly this risk:
+# test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES,
+# test_killpg_frozen_pgid_guard.py's measured file
 # floor, test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
@@ -241,7 +244,7 @@ def _scans_whole_tree_py(source: str) -> bool:
     DELIBERATE SCOPE, and why each half of it is drawn where it is:
 
     * **AST, not a text grep** -- the same justification the sibling guards
-      give (test_raw_semaphore_access_guard.py:52-54,
+      give (test_raw_semaphore_access_guard.py::_raw_semaphore_accesses,
       test_prune_chokepoint_guard.py). A docstring or comment merely
       MENTIONING ``rglob('*.py')`` cannot trip it, which matters more here
       than usual: this module's own docstring is full of such mentions, and so
@@ -257,11 +260,11 @@ def _scans_whole_tree_py(source: str) -> bool:
       per directory; the hazard being guarded is ``ast.parse`` over hundreds
       of modules, not a lookup.
 
-    * **``.py`` suffix required.** ``glob('*/src/*')`` (a real pattern, at
-      test_killpg_frozen_pgid_guard.py:433-434) walks directories, not Python
-      sources. Restricting to ``.py`` is what keeps that file's genuine
-      ``rglob('*.py')`` at :447 caught without its directory walks being
-      misread as three more scans.
+    * **``.py`` suffix required.** ``glob('*/src/*')`` (a real pattern, in
+      test_killpg_frozen_pgid_guard.py::_root_glob_python) walks directories,
+      not Python sources. Restricting to ``.py`` is what keeps that same
+      function's genuine ``rglob('*.py')`` caught without its directory walks
+      being misread as three more scans.
 
     KNOWN LIMITATION, stated rather than papered over: an f-string, a
     variable, or a pattern built at runtime is NOT matched, and neither is a
@@ -273,9 +276,10 @@ def _scans_whole_tree_py(source: str) -> bool:
     concession from quietly becoming total.
 
     Fails SOFT: an unparseable *source* yields ``False`` rather than raising,
-    matching test_prune_chokepoint_guard.py:138-141 and
-    test_raw_semaphore_access_guard.py:76-79. A file mid-edit, or a fixture
-    that is malformed on purpose, must not turn this guard red.
+    matching test_prune_chokepoint_guard.py::_find_prune_argv_literals and
+    test_raw_semaphore_access_guard.py::_raw_semaphore_accesses. A file
+    mid-edit, or a fixture that is malformed on purpose, must not turn this
+    guard red.
     """
     try:
         tree = ast.parse(source)
@@ -434,10 +438,11 @@ def test_detector_flags_glob_py() -> None:
 def test_detector_ignores_non_py_directory_sweep() -> None:
     """``glob('*/src/*')`` is NOT a Python-source sweep.
 
-    This is the real pattern at test_killpg_frozen_pgid_guard.py:433-434, and
-    it is what stops the detector reading that file's directory walks as the
-    thing being guarded -- while its genuine ``rglob('*.py')`` at :447 is still
-    caught by the case above.
+    This is the real pattern in
+    test_killpg_frozen_pgid_guard.py::_root_glob_python, and it is what stops
+    the detector reading that function's directory walks as the thing being
+    guarded -- while its genuine ``rglob('*.py')`` is still caught by the case
+    above.
     """
     source = (
         "def packages(root):\n"
@@ -520,8 +525,10 @@ def test_detector_ignores_docstring_mention() -> None:
 def test_detector_fails_soft_on_syntax_error() -> None:
     """An unparseable file yields False rather than propagating.
 
-    Deliberately the polarity of the sibling guards (test_prune_chokepoint_guard.py:138-141,
-    test_raw_semaphore_access_guard.py:76-79 both ``except SyntaxError: return []``)
+    Deliberately the polarity of the sibling guards
+    (test_prune_chokepoint_guard.py::_find_prune_argv_literals and
+    test_raw_semaphore_access_guard.py::_raw_semaphore_accesses both
+    ``except SyntaxError: return []``)
     and deliberately NOT test_marker_registration_drift.py's loud polarity: a
     mid-edit or intentionally-malformed fixture file under this directory must
     not turn a timeout-coverage guard red.
@@ -750,9 +757,11 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     acts purely as a FLOOR and narrows nothing.
 
     NO SKIP-SELF, deliberately, and stated here because it inverts a convention
-    a reviewer will expect. Five sibling guards (test_prune_chokepoint_guard.py:164,
-    test_event_loop_antipattern_guard.py:81, and the serial-merge-worker,
-    reachback and lock-release guards) carry a ``_THIS_FILE``/``continue``
+    a reviewer will expect. Five sibling guards
+    (test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
+    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests,
+    and the serial-merge-worker, reachback and lock-release guards) carry a
+    ``_THIS_FILE``/``continue``
     skip-self because their forbidden pattern necessarily appears in their own
     detector code, making self-inclusion a guaranteed false positive. The
     opposite holds here: this module genuinely IS a whole-tree AST scanner and

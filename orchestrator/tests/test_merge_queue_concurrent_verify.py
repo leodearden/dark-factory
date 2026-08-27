@@ -44,7 +44,7 @@ from _orch_helpers import (
     # `tomllib` read of orchestrator/pyproject.toml now pins it against the
     # real `[tool.pytest.ini_options].timeout`
     # (test_whole_tree_scan_timeout_guard.py).  It is re-exported through this
-    # module's namespace, which is how test_merge_speculation.py:64 keeps
+    # module's namespace, which is how test_merge_speculation.py keeps
     # importing it from here unchanged.
     PYPROJECT_DEFAULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,

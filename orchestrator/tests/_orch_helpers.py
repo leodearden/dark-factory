@@ -116,7 +116,8 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 # multiple, or revising the measurements is one edit rather than fourteen.
 #
 # It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
-# with `@pytest.mark.timeout(N)`" (orchestrator/pyproject.toml:154) -- applied
+# with `@pytest.mark.timeout(N)`", the comment on
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- applied
 # at MODULE level, which is the only form that is a sound LOWER bound on every
 # collected item (a per-test decorator leaves any test added later at the
 # default).  A tighter decorator still WINS where one is present, so the
@@ -126,13 +127,13 @@ PYPROJECT_DEFAULT_TIMEOUT = 60
 # this ceiling.
 #
 # MECHANISM -- why a breach here is far more expensive than a red test:
-#   * `timeout_method = "thread"` (pyproject.toml:153) means pytest-timeout
+#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
 #     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
 #     Not properly terminated"), NOT by failing the offending test;
-#   * `--max-worker-restart=0` (pyproject.toml:178, task 1907) then declines to
-#     replace that worker, degrading the run to a TRUNCATED whole-suite session
-#     whose surviving failure names some innocent guard that merely shared the
-#     dead worker.
+#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
+#     1907) then declines to replace that worker, degrading the run to a
+#     TRUNCATED whole-suite session whose surviving failure names some innocent
+#     guard that merely shared the dead worker.
 #   So one slow tree-scan costs a whole verify run AND misattributes the blame.
 #
 # MEASURED basis for 5x rather than a tuned literal:
