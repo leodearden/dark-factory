@@ -313,6 +313,32 @@ class TestGetValidEdgesForNode:
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
+    async def test_filters_both_retirement_markers(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Query excludes edges retired by EITHER marker (task 4714).
+
+        ``invalid_at`` is written by fused-memory (recon Stage 1 / update_edge);
+        ``expired_at`` is written independently by graphiti_core's own
+        contradiction resolution.  Filtering one and not the other means the
+        other's retirees are served as current facts.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        assert 'e.invalid_at IS NULL' in cypher, (
+            f'Cypher must still exclude superseded edges: {cypher}'
+        )
+        assert 'e.expired_at IS NULL' in cypher, (
+            f'Cypher must also exclude graphiti_core-expired edges: {cypher}'
+        )
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """Uses ro_query (read-only) — graph.query must NOT be called."""
         backend = make_backend(mock_config)
@@ -762,6 +788,40 @@ class TestRefreshEntitySummary:
         assert result['new_summary'] == 'Alice knows Bob'
         assert result['edge_count'] == 1
         backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_regenerates_from_a_population_excluding_both_markers(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """The regenerated summary is built from actively-valid edges only (task 4714).
+
+        Unlike its siblings above, this drives the REAL get_valid_edges_for_node
+        rather than stubbing it, because the point is which population the
+        refresh reads: an entity whose summary is rebuilt must not have
+        graphiti_core-expired facts re-concatenated back into it, merely
+        non-superseded ones.
+        """
+        backend = make_backend(mock_config)
+        # Only the surviving rows come back — the retired ones are the query's
+        # job to exclude, which is exactly what the Cypher assertion below pins.
+        graph = make_graph_mock([['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.update_node_summary = AsyncMock()
+
+        result = await backend.refresh_entity_summary(
+            'n-99', group_id='test', name='Task 99', old_summary='stale'
+        )
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'e.invalid_at IS NULL' in cypher, (
+            f'refresh must keep excluding superseded edges: {cypher}'
+        )
+        assert 'e.expired_at IS NULL' in cypher, (
+            'refresh must regenerate from a population that also excludes '
+            f'graphiti_core-expired facts: {cypher}'
+        )
+        assert result['new_summary'] == 'Task 99 depends on Task 98'
+        assert result['edge_count'] == 1
 
 
 # ---------------------------------------------------------------------------
