@@ -467,6 +467,71 @@ class TestFetchCacheRoundTrip:
         assert 'rec-nope' in str(excinfo.value)
 
 
+def _count_cache_reads(monkeypatch, mod) -> list:
+    """Install a counting proxy over `_read_fetch_cache` and return the log.
+
+    Delegates to the real function — the point is to count decodes of a
+    32k-line JSON document, not to stub the read out and change what the
+    guards see.
+    """
+    real = mod._read_fetch_cache
+    reads: list = []
+
+    def counting(path):
+        reads.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod, '_read_fetch_cache', counting)
+    return reads
+
+
+class TestTheCacheDocumentIsReadOnce:
+    """One decode of the cache document, threaded — not re-parsed per guard.
+
+    The committed E2 fixture is a 32k-line JSON document, and the replay path
+    reads it once per consumer that needs a piece of it.
+    """
+
+    def test_load_fetches_accepts_an_already_read_cache_without_re_reading(
+        self, tmp_path, monkeypatch,
+    ):
+        """The threading seam itself, pinned by a fast pure test.
+
+        Without this, only the CLI-level count below would catch a refactor
+        that reverted to re-reading — and that one is slow and indirect.
+        """
+        mod = _mod()
+        records = [_record('rec-1'), _record('rec-2')]
+        path = tmp_path / 'cache.json'
+        mod.dump_fetches(
+            path,
+            {'c_peers': _fetched(
+                {'q1': [(records[0], 0.9)], 'q2': [(records[1], 0.4)]},
+                {'cl1': [(records[0], 0.8)]},
+            )},
+            provenance=_provenance(mod, {'c_peers': records}),
+        )
+
+        from_path = mod.load_fetches(path, {'c_peers': _seeded('c_peers', records)})
+
+        cache = mod.read_fetch_cache(path)
+        reads = _count_cache_reads(monkeypatch, mod)
+        from_cache = mod.load_fetches(cache, {'c_peers': _seeded('c_peers', records)})
+
+        assert reads == []
+        # Equal rankings, so the seam is a pure threading change and not a
+        # different join that merely happens to avoid a read.
+        assert from_cache.keys() == from_path.keys()
+        for kind in ('queries', 'probes'):
+            assert sorted(from_cache['c_peers'][kind]) == \
+                sorted(from_path['c_peers'][kind])
+            for key, hits in from_cache['c_peers'][kind].items():
+                assert [(h.record.record_id, h.relevance_score) for h in hits] == [
+                    (h.record.record_id, h.relevance_score)
+                    for h in from_path['c_peers'][kind][key]
+                ]
+
+
 # ===========================================================================
 # step-3 — the cache must refuse to silently measure a stale corpus
 # ===========================================================================
@@ -1399,6 +1464,29 @@ class TestReplayFetchesFlag:
         assert 'fetch cache error:' in message
         assert cluster_id in message
         assert not (tmp_path / 'replay.json').exists()
+
+    def test_a_replay_reads_the_cache_document_exactly_once(
+        self, tmp_path, monkeypatch,
+    ):
+        """EXACTLY once, not "fewer than before".
+
+        A `<= 2` assertion would still pass a fix that removed only one of
+        the redundant reads, and the point of the item is that the 32k-line
+        document is decoded once and threaded.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        # The counter goes in AFTER the live leg: only the REPLAY's parses
+        # are being measured.
+        _install_driver_doubles(monkeypatch)
+        reads = _count_cache_reads(monkeypatch, mod)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 0
+        assert len(reads) == 1, reads
 
 
 # ===========================================================================
