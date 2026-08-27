@@ -3652,3 +3652,628 @@ class TestRow7KillSwitchByteIdentity:
                     f'{select_chain_depth(0, queue_len, state)!r} — the kill '
                     f'switch must be unconditional'
                 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-13 RED: THE COMPOSITION SWEEP — rows 1, 2, 5, 6, 9 and 10 --
+#
+# These six rows are the ones the module's SUBSUMPTION table marks FULLY
+# SUBSUMED: every one of them already has a unit-level owner in
+# test_merge_queue_deep_landing.py, and re-cloning those units here would buy
+# nothing but a second copy that rots in step with the first.
+#
+# What is NOT covered upstream is the COMPOSITION.  Every upstream owner is a
+# single-round scene built by a purpose-shaped fixture, torn down before the
+# next assertion:
+#
+#   * ``TestDeepLandingEndToEnd`` drives at most TWO rounds, and its
+#     ``_assert_quiescent`` calls are all terminal — nothing samples the
+#     conservation surfaces BETWEEN rounds;
+#   * ``TestHeadCancelOnAdoption`` / ``TestHeadCancelLeavesTheLaneIdle`` build
+#     the two-slot topology by hand and stop at ``_run_inflight_verify`` — the
+#     head is never carried through a finalize INSIDE a scene that also has a
+#     queue, a permit census and a lane pool to conserve;
+#   * ``TestStaleCasAbortLeavesTheRestAlone`` asserts the abort leaves the rest
+#     alone, but never runs the NEXT round that has to rebuild on the moved
+#     main — which is the half of decision #9 an operator actually feels.
+#
+# So each test below states its row's claim ONCE, inside a continuous run over
+# ONE worker, ONE queue, ONE repo and ONE permit census, and pairs it with the
+# conservation oracle: :func:`_assert_midrun_conserved` after every round that
+# leaves the pipeline deliberately mid-flight, and the full
+# :func:`_assert_two_way_quiescent` once :func:`_drain_residue` has confirmed
+# the run left exactly the residue it promised.
+#
+# WHY THE MID-RUN ORACLE IS A SUBSET, restated here because it is the one
+# design choice a reader will question: surfaces (a), (d) and (f) of the full
+# oracle are WHOLE-REGISTRY claims (every request resolved, the liveness
+# ledger empty, no non-terminal lifecycle entry), and a run that is
+# deliberately mid-flight has queued items with pending futures at every
+# checkpoint.  Asserting them between rounds would either fail honestly or
+# force an empty request list — the exact vacuum the oracle's guard clauses
+# refuse.  Conservation, by contrast, holds at EVERY instant, so that is what
+# the between-rounds oracle checks.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_COMPOSED_CAP = 4
+"""The cap rows 1, 2 and 6 share.
+
+Four is the smallest cap that makes all three rows non-degenerate at once: a
+4-item chain has a head plus THREE links, so row 6's abort can land a proper
+prefix (head + 1) and still leave two unlanded links behind, and row 2's
+halving step is ``4 -> 2`` rather than straight to the floor."""
+
+_COMPOSED_FOLLOWERS = 5
+"""Five followers, so the cap BINDS rather than the queue running out.
+
+With six queued items and a cap of four, a short chain is the code's doing and
+never the fixture's — and rows 1 and 6 are both left with genuine residue,
+which is what makes their ``_drain_residue`` assertions load-bearing."""
+
+_HEAD_CAP = 6
+"""Rows 5 and 9 chain the WHOLE queue behind the adopted head.
+
+Their claim is about the head — that a red one does not block the prefix, and
+that its lease is released — so the prefix must be long enough that "the whole
+prefix landed" is a real statement.  Cap 6 over four followers means nothing
+truncates and nothing is left over: the chain is exactly the queue."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestBoundaryRowsComposed:
+    """Rows 1, 2, 5, 6, 9 and 10, each inside ONE continuous multi-round run."""
+
+    async def test_row_1_a_green_tip_lands_the_whole_prefix_in_order(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 1: ONE verify pays for a 4-item prefix, and the canary says so.
+
+        The PRD's headline row.  Upstream owns the landing itself; what is
+        added here is the READER's view of it — the claim is checked through
+        ``scripts/merge-deep-canary-predicate.sh``'s own arithmetic
+        (:func:`_canary_predicate_items_per`) over the REAL durable rows, so a
+        stamp that landed correctly but encoded the wrong unit still fails.
+
+        ``landed_via_chain`` ships as ONE PER LANDED ITEM, never as the chain
+        size k — so the PRD's "landed_via_chain=4" is the SUM over the walk's
+        four ``merge_finalized`` rows, which is exactly what the shipped
+        predicate computes.  Stated both ways below (the sum, and the ratio the
+        predicate derives from it) because they fail differently: a k-per-item
+        stamp would give a sum of 16 and a ratio of 16.0, while a positional
+        stamp would give 10 and 10.0.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_COMPOSED_CAP, n_followers=_COMPOSED_FOLLOWERS,
+            db_name='gate-row1-prefix.db', remote=True, script=[True],
+        )
+        # The remote cross-check of a remote green is run-to-run
+        # nondeterministic in a fixture repo (measured; see Row 7's banner) and
+        # has nothing to do with this row's claim, so it is off.
+        scene.config.verify_cross_check_remote_green = False
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        rec = await scene.round_(tag='row1', head_tid='101')
+
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 3, (
+            f'cap={_COMPOSED_CAP} must bind into a 4-item chain; got '
+            f'{None if chain is None else 1 + len(chain.links)} items'
+        )
+
+        # ── ONE verify for the whole prefix ─────────────────────────────────
+        verify_rows = _verify_rows(scene.db_path)
+        assert len(verify_rows) == 1, (
+            f'a green deep round pays for exactly ONE verify — that is the '
+            f'whole PRD — got {len(verify_rows)}: {verify_rows!r}'
+        )
+        assert verify_rows[0]['chain_items'] == 4, (
+            f'the reader must see a FOUR-item verify; got '
+            f'{verify_rows[0]["chain_items"]!r}'
+        )
+
+        # ── four in-order landings, through the real CAS walk ───────────────
+        landed = ['101', *[tid for tid, _mc in chain.links]]
+        assert [c[0] for c in rec['advance_calls']] == [
+            rec['head_mc'], *[mc for _tid, mc in chain.links],
+        ], (
+            f'advance_main must run once per chain item, in LAND order; got '
+            f'{[c[0][:8] for c in rec["advance_calls"]]!r}'
+        )
+        assert rec['landed'] == landed, (
+            f'expected {landed!r} to land; got {rec["landed"]!r}'
+        )
+        for tid in landed:
+            outcome = scene.reqs[tid].result.result()
+            assert outcome.status == 'done', f'task {tid} did not land: {outcome!r}'
+
+        # ── main's first-parent history is LINEAR, in land order ────────────
+        _rc, out, _err = await _run(
+            ['git', 'rev-list', '--first-parent', 'main'], cwd=git_repo,
+        )
+        expected = [rec['head_mc'], *[mc for _tid, mc in chain.links]]
+        assert out.split()[:len(expected)] == list(reversed(expected)), (
+            "main's first-parent history must be exactly the land order"
+        )
+
+        # ── the SHIPPED canary's arithmetic, over the REAL rows ─────────────
+        finalized = _finalized_rows(scene.db_path)
+        assert len(finalized) == 4, (
+            f'four items landed, so four merge_finalized rows; got '
+            f'{len(finalized)}'
+        )
+        assert sum(row['landed_via_chain'] for row in finalized) == 4, (
+            f'landed_via_chain is ONE PER LANDED ITEM, so a 4-item walk sums '
+            f'to 4; got {[row["landed_via_chain"] for row in finalized]!r}'
+        )
+        assert _canary_predicate_items_per(verify_rows, finalized) == 4.0, (
+            f'the shipped predicate must read 4 items landed per deep verify; '
+            f'got {_canary_predicate_items_per(verify_rows, finalized)!r}'
+        )
+
+        # ── conservation, then the full two-way oracle ──────────────────────
+        _assert_midrun_conserved(
+            worker, rec['main_after'], permits_before, where='after row 1',
+        )
+        assert _drain_residue(worker) == {'105', '106'}, (
+            'the two items past the cap must still be queued, untouched'
+        )
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_row_2_a_red_tip_leaves_the_queue_intact_and_lands_later(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 2: a red tip is a NON-EVENT, and the same requests land later.
+
+        The composition this adds over the upstream owner is the SECOND round:
+        upstream re-dispatches the requeued head and stops, while this run
+        carries the halving state the red round armed into the next round's
+        depth selection and then drains the whole scene through the two-way
+        oracle.  A red tip that quietly consumed a permit, or that left the
+        bisector armed after landing, is invisible to a one-round scene.
+        """
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_COMPOSED_CAP, n_followers=_COMPOSED_FOLLOWERS,
+            db_name='gate-row2-intact.db', script=[False, True],
+        )
+        worker = scene.worker
+        followers = list(_gate_followers(_COMPOSED_FOLLOWERS))
+        permits_before = _permit_census(worker)
+
+        red = await scene.round_(tag='row2', head_tid='101')
+
+        assert red['chain'] is not None and len(red['chain'].links) == 3, (
+            f'the red round must really have been deep; got '
+            f'{None if red["chain"] is None else 1 + len(red["chain"].links)}'
+        )
+        # ── zero landings via the chain, on BOTH tiers ──────────────────────
+        assert red['main_after'] == red['main_before'], 'a red tip moved main'
+        assert red['advanced'] is False, f'advanced on a red tip: {red!r}'
+        assert red['landed'] == [], f'a red tip landed something: {red["landed"]!r}'
+        assert _finalized_rows(scene.db_path) == [], (
+            f'nothing landed, so nothing may be finalized; got '
+            f'{_finalized_rows(scene.db_path)!r}'
+        )
+
+        # ── every item still queued, at its ORIGINAL lane index ─────────────
+        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+            f'the chain mutated the queue on a red tip: '
+            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+        )
+        for tid in followers:
+            assert _lane_of(worker, tid) == 'normal', (
+                f'task {tid} left its lane on a red tip'
+            )
+            assert not scene.reqs[tid].result.done(), (
+                f'task {tid} was handed a verdict no verify produced'
+            )
+
+        # ── the bisector halved to 2, off the DISPATCHED depth ──────────────
+        assert worker._chain_halving_state == 2, (
+            f'a red 4-item tip must halve the ceiling to 2; got '
+            f'{worker._chain_halving_state!r}'
+        )
+        assert worker._chain_halving_state == next_halving_state(
+            False, _COMPOSED_CAP,
+        ), 'the halving state must be the policy function\'s own answer'
+        _assert_midrun_conserved(
+            worker, red['main_after'], permits_before, where='after the red round',
+        )
+
+        # ── and the SAME requests land on a later round's own verdict ───────
+        assert worker._queue.qsize() == 1, (
+            f'the head must go back on _queue unresolved; qsize='
+            f'{worker._queue.qsize()}'
+        )
+        requeued = worker._queue.get_nowait()
+        assert requeued is scene.reqs['101'] and not requeued.result.done()
+
+        green = await scene.round_(tag='row2', head_tid='101', req=requeued)
+        assert scene.reqs['101'].result.result().status == 'done', (
+            'the very same request must land on the next round'
+        )
+        assert green['main_after'] != green['main_before']
+        # The armed ceiling really bound the second round's depth.
+        assert green['chain'] is not None and len(green['chain'].links) == (
+            select_chain_depth(_COMPOSED_CAP, 1 + len(followers), 2) - 1
+        ), (
+            f'the second round must chain at the HALVED depth; got '
+            f'{None if green["chain"] is None else 1 + len(green["chain"].links)}'
+        )
+        chained = {tid for tid, _mc in green['chain'].links}
+        for tid in chained:
+            assert scene.reqs[tid].result.result().landed_via_chain == 1
+
+        assert _drain_residue(worker) == set(followers) - chained
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_row_5_a_red_head_verdict_never_blocks_a_green_prefix(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 5: head verify RED (a flake), tip GREEN — the prefix still lands.
+
+        A red head verdict is a statement about a SUBSET of the tree the green
+        tip has strictly better evidence for.  Acting on it would fail an item
+        the tip just proved good and strand the whole prefix behind it, so the
+        red verdict resolves no blocked ``MergeOutcome`` at all.
+
+        Composed rather than cloned: this runs the head through a REAL
+        ``_finalize_inflight`` inside a scene that also has a queue, a permit
+        census and a lane pool — the upstream owner stops at
+        ``_run_inflight_verify`` — and it pins the head's landing as an
+        ORDINARY advance (``landed_via_chain`` absent), which is what keeps the
+        canary's ratio honest.
+        """
+        from orchestrator.merge_types import InflightVerifyResult, MergeOutcome
+
+        def _red_head_task(_git_ops):
+            """A head verify that ALREADY came back red, before δ looks at it."""
+            async def _body():
+                return InflightVerifyResult(
+                    outcome=MergeOutcome('blocked', reason='head verify red (flake)'),
+                    merge_wt=None,
+                    spec_warm=False,
+                )
+            return asyncio.get_running_loop().create_task(_body())
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_HEAD_CAP, n_followers=4, db_name='gate-row5-headred.db',
+            heads=('100', '101'), script=[True],
+        )
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        # The SANCTIONED teardown pair, spied on the INSTANCE.  Hand-rolling
+        # `verify_task.cancel()` is what the AST ratchet in
+        # test_merge_queue_concurrent_verify.py::TestVerifyTeardownChokepoint
+        # forbids, so "was cancelled" is not the claim — "went through the
+        # chokepoint, in order" is.
+        teardown: list[str] = []
+        _real_td = worker._teardown_verify_task
+        _real_cr = worker._cancel_and_release_tracked
+
+        async def _td(lease, verify_task, task_id, **kw):
+            teardown.append(f'teardown:{task_id}')
+            return await _real_td(lease, verify_task, task_id, **kw)
+
+        async def _cr(lease):
+            teardown.append(f'cancel_release:{getattr(lease, "name", None)}')
+            return await _real_cr(lease)
+
+        monkeypatch.setattr(worker, '_teardown_verify_task', _td)
+        monkeypatch.setattr(worker, '_cancel_and_release_tracked', _cr)
+
+        head_entry = await scene.attach_head('100', task_factory=_red_head_task)
+        await asyncio.sleep(0)   # let the red verdict actually land
+        assert head_entry.verify_task.done(), (
+            'the head must be RED before the tip is adopted, or this row is '
+            'just the ordinary head-cancel row'
+        )
+
+        rec = await scene.adopting_round_(tag='row5', spec_tid='101')
+
+        # ── the red verdict did not survive the green tip ───────────────────
+        head_outcome = scene.reqs['100'].result.result()
+        assert head_outcome.status == 'done', (
+            f'a red head verdict must not survive a green tip; got '
+            f'{head_outcome!r}'
+        )
+        chain = rec['chain']
+        assert chain is not None and len(chain.links) == 3, (
+            f'the whole remaining queue must chain behind the head; got '
+            f'{None if chain is None else 1 + len(chain.links)} items'
+        )
+        assert await _rev_parse(git_repo, 'main') == chain.tip, (
+            'the full prefix must land, up to and including the verified tip'
+        )
+        for tid in ('101', *[t for t, _mc in chain.links]):
+            assert scene.reqs[tid].result.result().status == 'done', (
+                f'task {tid} was stranded behind a red head'
+            )
+        assert len(scene.posted) == 1, (
+            f'ONE verify paid for the head AND the prefix; got '
+            f'{len(scene.posted)}'
+        )
+
+        # ── the head landed by the ORDINARY advance, not by the walk ────────
+        by_branch = {row['branch']: row for row in _finalized_rows(scene.db_path)}
+        assert by_branch['100']['landed_via_chain'] is None, (
+            f'the head carries no chain of its own — stamping it would inflate '
+            f"the canary's ratio by one every deep round; got "
+            f'{by_branch["100"]["landed_via_chain"]!r}'
+        )
+        for tid in ('101', *[t for t, _mc in chain.links]):
+            assert by_branch[tid]['landed_via_chain'] == 1
+
+        # ── and the head's in-flight verify went through the chokepoint ─────
+        assert teardown == ['teardown:100', 'cancel_release:local'], (
+            f'the head verify must be torn down through the sanctioned pair, '
+            f'in order; got {teardown!r}'
+        )
+        assert head_entry.lease is None, (
+            'entry.lease must be cleared after the release so no later path '
+            'double-releases it'
+        )
+
+        assert _drain_residue(worker) == set(), (
+            'cap 6 over four followers chains the whole queue — nothing may '
+            'be left behind'
+        )
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_row_6_a_stale_cas_aborts_and_the_next_round_rebuilds(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 6: main moves mid-walk → abort, then REBUILD on the new main.
+
+        The upstream owner proves the abort itself: the walk stops at the first
+        non-``'advanced'`` result, the landed prefix stays landed, and every
+        unlanded link goes back to its exact lane index unresolved.  What it
+        never does is run the next round — and "the unlanded items land on a
+        later round, on the moved main" is the half an operator actually feels,
+        because it is what makes decision #9 a DEFERRAL rather than a loss.
+        """
+        from orchestrator.merge_types import ItemLifecycleState
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_COMPOSED_CAP, n_followers=_COMPOSED_FOLLOWERS,
+            db_name='gate-row6-stale.db', script=[True, True],
+            advance_hook=_abort_hook_at(3, bump_repo=git_repo),
+        )
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        first = await scene.round_(tag='row6', head_tid='101')
+
+        chain = first['chain']
+        assert chain is not None and len(chain.links) == 3, (
+            f'the aborting round must really have been deep; got '
+            f'{None if chain is None else 1 + len(chain.links)}'
+        )
+        # ── the walk stopped at the FIRST non-'advanced' result ─────────────
+        assert [c[0] for c in first['advance_calls']] == [
+            first['head_mc'], chain.links[0][1], chain.links[1][1],
+        ], (
+            f'the walk must stop at the first failure and never skip ahead; '
+            f'got {[c[0][:8] for c in first["advance_calls"]]!r}'
+        )
+
+        # ── the already-landed prefix STAYS landed ──────────────────────────
+        for tid in ('101', '102'):
+            assert scene.reqs[tid].result.result().status == 'done', (
+                f'task {tid} was un-landed by the abort'
+            )
+        for sha in (first['head_mc'], chain.links[0][1]):
+            rc, _out, _err = await _run(
+                ['git', 'merge-base', '--is-ancestor', sha, 'main'], cwd=git_repo,
+            )
+            assert rc == 0, f'{sha[:8]} is no longer on main after the abort'
+
+        # ── every unlanded link is back at its EXACT lane index, unresolved ─
+        assert [r.task_id for r in worker._lane_buffers['normal']] == [
+            '103', '104', '105', '106',
+        ], (
+            f'submission order must survive the abort — it is the next round\'s '
+            f'chain_snapshot; got '
+            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+        )
+        for tid in ('103', '104', '105', '106'):
+            req = scene.reqs[tid]
+            assert not req.result.done(), f'task {tid} was handed a verdict'
+            assert worker._lifecycle.current(req.request_id) is (
+                ItemLifecycleState.LANE_BUFFERED
+            ), f'task {tid} left LANE_BUFFERED'
+        _assert_midrun_conserved(
+            worker, first['main_after'], permits_before, where='after the abort',
+        )
+
+        # ── the NEXT round rebuilds on the MOVED main and lands them ────────
+        second = await scene.round_(tag='row6', head_tid='103')
+        assert second['main_before'] != first['main_before'], (
+            'the second round must build against the EXTERNALLY moved main'
+        )
+        assert second['chain'] is not None and len(second['chain'].links) == 3, (
+            f'the deferred items must rebuild into a full chain; got '
+            f'{None if second["chain"] is None else 1 + len(second["chain"].links)}'
+        )
+        assert second['landed'] == [
+            '101', '102', '103', '104', '105', '106',
+        ], (
+            f'every deferred item must land on the rebuild; got '
+            f'{second["landed"]!r}'
+        )
+
+        assert _drain_residue(worker) == set(), (
+            'the rebuild drains the queue — nothing may be left behind'
+        )
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_row_9_both_lease_axes_read_idle_within_one_round(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 9: after the tip-pass head cancel, BOTH lease axes read IDLE.
+
+        The PRD's postcondition names ``warm-lane-lock-guard.sh``, which is
+        REIFY-side and does not exist in this repo; the equivalent in-process
+        oracle is the two axes that script and
+        ``GitOps._merge_verify_lease_active`` read between them — the kernel
+        flock on the ``_merge-verify`` lane, and the fixed-key holder-pgid
+        rendezvous file.
+
+        The STAGING check is what makes this non-vacuous: the head's verify
+        holds the REAL ``merge_verify_lease`` for the whole span, and both axes
+        are measured BUSY before δ acts.  Without it the post-cancel assertions
+        would pass over a lane nothing ever touched.
+        """
+        import os
+
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids_strict,
+            lane_lock_path,
+            read_lock_holder_pgid,
+        )
+
+        started = asyncio.Event()
+
+        def _leased_head_task(git_ops):
+            # The scene hands its OWN GitOps to the factory, so the head's
+            # verify holds the same `_merge-verify` lane lock a real local
+            # verify would — no module-attribute patching needed.
+            return _gate_head_verify_task(
+                lease_ctx=git_ops.merge_verify_lease(), started=started,
+            )
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_HEAD_CAP, n_followers=4, db_name='gate-row9-lease.db',
+            heads=('100', '101'), script=[True],
+        )
+        worker, git_ops = scene.worker, scene.git_ops
+        permits_before = _permit_census(worker)
+
+        await scene.attach_head('100', task_factory=_leased_head_task)
+        await asyncio.wait_for(started.wait(), timeout=30)
+
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        # ── STAGING: the lane really IS busy, on BOTH axes ──────────────────
+        assert git_ops._merge_verify_lease_active() is True, (
+            'the head must genuinely hold the lease, or the idle assertions '
+            'below are vacuous'
+        )
+        assert os.getpid() in lane_lock_holder_pids_strict(lock_path), (
+            f'the kernel flock axis must read BUSY before the cancel; got '
+            f'{lane_lock_holder_pids_strict(lock_path)!r}'
+        )
+
+        rec = await scene.adopting_round_(tag='row9', spec_tid='101')
+
+        # ── ...and IDLE within the same round, on both axes independently ───
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'the fixed-key holder rendezvous must be cleared — '
+            'reset_persistent_merge_worktree reads it FAIL-CLOSED'
+        )
+        assert (not lock_path.exists()) or lane_lock_holder_pids_strict(
+            lock_path
+        ) == [], (
+            f'the kernel flock axis must be free after the head cancel; got '
+            f'{lane_lock_holder_pids_strict(lock_path)!r}'
+        )
+        assert git_ops._merge_verify_lease_active() is False, (
+            'the combined predicate the admission guard consumes must agree '
+            'with both axes'
+        )
+        # And the round really did adopt — an idle lane after a round that
+        # never ran would prove nothing.
+        assert rec['chain'] is not None and rec['advanced'] is True
+        assert scene.reqs['100'].result.result().status == 'done'
+
+        assert _drain_residue(worker) == set()
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_row_10_flipping_the_cap_mid_run_starts_landing_chains(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Row 10: cap 0 -> 6 through the REAL ``apply_reload``, no restart.
+
+        ``merge_deep.chain_cap`` is a green-tier ``RELOADABLE_FIELDS`` leaf and
+        the worker reads it LIVE off the dispatching request's config, so the
+        operator-facing claim is that the round AFTER the flip builds and lands
+        a chain against the very same worker, queue and repo.
+
+        Driven through ``config.apply_reload`` rather than by assigning the
+        attribute, because the claim is about the RELOAD PATH — an attribute
+        assignment would still pass if ``chain_cap`` were demoted to the
+        restart-only tier tomorrow, which is precisely the regression this row
+        exists to catch.
+        """
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=0, n_followers=_COMPOSED_FOLLOWERS,
+            db_name='gate-row10-reload.db', heads=('101', '107'),
+            script=[True, True],
+        )
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        cold = await scene.round_(tag='row10', head_tid='101')
+        assert cold['chain'] is None and cold['built'] == [], (
+            f'the kill switch must hold before the flip; got {cold["chain"]!r}'
+        )
+        assert cold['advanced'] is True, 'the cold round still lands, ordinarily'
+        _assert_midrun_conserved(
+            worker, cold['main_after'], permits_before, where='before the reload',
+        )
+
+        result = scene.reload_cap(6)
+        assert result['reloaded'] is True, f'apply_reload refused: {result!r}'
+        assert 'merge_deep.chain_cap' in result['applied'], (
+            f'chain_cap must be a GREEN-tier leaf; got {result!r}'
+        )
+        assert result['restart_required'] == {}, (
+            f'no restart may be required for a green-tier leaf; got {result!r}'
+        )
+        assert scene.config.merge_deep.chain_cap == 6, (
+            'the live config object every enqueued request holds by reference '
+            'must observe the new value'
+        )
+
+        hot = await scene.round_(tag='row10', head_tid='107')
+        assert hot['chain'] is not None and len(hot['chain'].links) == 5, (
+            f'the very NEXT round must build a chain — no restart; got '
+            f'{None if hot["chain"] is None else 1 + len(hot["chain"].links)}'
+        )
+        landed = ['107', *[tid for tid, _mc in hot['chain'].links]]
+        for tid in landed:
+            assert scene.reqs[tid].result.result().status == 'done'
+            assert scene.reqs[tid].result.result().landed_via_chain == 1
+        # SAME worker across the flip — the "no restart" claim, stated as an
+        # object identity rather than inferred from the landing.
+        assert scene.worker is worker
+
+        assert _drain_residue(worker) == set()
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
