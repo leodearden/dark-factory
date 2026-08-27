@@ -893,6 +893,20 @@ elif python3 "$_dash_render_script" \
        --uv-path   "$UV_PATH" \
        --output    "$UNIT_DIR/dark-factory-dashboard.service"; then
   ok "Dashboard service unit rendered (host-local Environment= values preserved — see the [dashboard_unit_render] lines above)"
+else
+  # The renderer RAN and refused. Without this branch the `elif` chain simply
+  # falls through with status 0 and says nothing — while the section's closing
+  # "Dashboard units installed" line still prints, which reads as confirmation
+  # that the unit was written. That is the same reports-green-because-it-never-
+  # ran failure the parity gate above exists to remove, one construct over.
+  fail "Dashboard service unit render FAILED — see the [dashboard_unit_render]"
+  fail "  report above for which step refused and why."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service was left UNTOUCHED: this"
+  fail "  host's local Environment= values (DASHBOARD_KNOWN_PROJECT_ROOTS)"
+  fail "  survived, and the unit is at worst STALE — which the pre-install"
+  fail "  parity gate reports on the next run. Re-run this script once the"
+  fail "  cause is fixed. The watchdog units below still install: one"
+  fail "  un-renderable service unit must not take its supervision with it."
 fi
 
 # Watchdog service + timer (no templating needed — no repo-specific paths)
