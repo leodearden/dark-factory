@@ -64,6 +64,8 @@ fire-and-forgets ``build_indices_and_constraints()``.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Any
 
 from fused_memory.utils.canonical_labels import (
     Referent,
@@ -195,3 +197,173 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     if not fact:
         return False
     return re.search(rf'\b{re.escape(referent.number)}\b', fact) is not None
+
+
+# --------------------------------------------------------------------------- #
+# The detector
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class Finding:
+    """One endpoint the fact hanging off it does not name.
+
+    Frozen for the same reason :class:`Referent` is: a finding is evidence a
+    human adjudicates and, if they act, evidence for destructive edge surgery.
+    A consumer must not be able to rewrite which edge or which end it names.
+
+    ``end`` is ``'subject'`` or ``'object'`` — WHICH endpoint is mis-bound,
+    not merely that the edge is. Specimen ``8a51e13b`` is why the distinction
+    is a first-class column: its subject is correctly named and its OBJECT is
+    the mis-bound end, so a report that only said "this edge is suspect"
+    would send a reader to the wrong node.
+
+    ``fact_referents`` is a sorted TUPLE, not the frozenset
+    :func:`fact_referents` returns: tuples are ordered (so the report is
+    byte-stable across runs) and hashable (so ``frozen=True`` is not
+    advertising an immutability the field does not have).
+
+    ``episodes`` carries ``r.episodes`` verbatim. It is the re-derivation
+    path, and load-bearing: anyone who read "the Task 6165 ruling" out of the
+    graph was reading task 6164's ruling, so re-deriving the truth means
+    going back to the SOURCE episode rather than to the node.
+
+    The three CAUSE-ATTRIBUTION columns default to None because the pure
+    layer cannot compute them: ``proximity``/``nearest_id`` need the fact's
+    id set (available, but computed by :func:`id_proximity` as a separate,
+    separately-testable concern) and ``correct_node_present`` needs the
+    graph's whole task-node census, which only the reader can supply. None
+    means NOT COMPUTED, and is distinct from a computed 'unrelated'/False.
+    """
+
+    edge_uuid: str
+    graph: str
+    end: str
+    node_name: str
+    node_referent: Referent
+    fact_referents: tuple[Referent, ...]
+    fact: str
+    episodes: tuple[str, ...] = ()
+    proximity: str | None = None
+    nearest_id: str | None = None
+    correct_node_present: bool | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        """The report row: referents rendered as their canonical node names.
+
+        ``node_referent`` serializes as BOTH its rendered name and its bare
+        number: the name is what a reader greps the graph for, the number is
+        what :func:`id_proximity` compares. Rendering only one would make the
+        artifact answer only half the questions asked of it.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'graph': self.graph,
+            'end': self.end,
+            'node_name': self.node_name,
+            'node_task_id': self.node_referent.number,
+            'node_referent': self.node_referent.node_name,
+            'fact_referents': [r.node_name for r in self.fact_referents],
+            'fact': self.fact,
+            'episodes': list(self.episodes),
+            'proximity': self.proximity,
+            'nearest_id': self.nearest_id,
+            'correct_node_present': self.correct_node_present,
+        }
+
+
+def vars_of(finding: Finding) -> dict[str, Any]:
+    """Field dict for a slots dataclass (``vars()`` does not work on slots).
+
+    The same accommodation ``audit_unverified_completion_claims.py`` makes,
+    and for the same reason: the enrichment pass rebuilds each finding with
+    ``Finding(**{**vars_of(f), 'proximity': ...})``, which needs a field dict.
+    """
+    return {
+        f: getattr(finding, f)
+        for f in Finding.__dataclass_fields__  # type: ignore[attr-defined]
+    }
+
+
+def _sorted_referents(referents: frozenset[Referent]) -> tuple[Referent, ...]:
+    """Referents in a deterministic order, so the report diffs cleanly.
+
+    Sorted on (project_id, number-as-int-when-numeric, number) rather than on
+    the rendered name: 'Task 132' and 'Task 6165' sort the wrong way as
+    strings, and a report a human diffs run to run should read in id order.
+    """
+    return tuple(
+        sorted(referents, key=lambda r: (r.project_id, len(r.number), r.number))
+    )
+
+
+def classify_edge(
+    subject_name: str | None,
+    object_name: str | None,
+    fact: str | None,
+    edge_uuid: str,
+    graph: str,
+    *,
+    episodes: list[str] | tuple[str, ...] | None = None,
+) -> list[Finding]:
+    """Every endpoint of one edge that the *fact* fails to name.
+
+    THE RULE, mirroring the write-time guard's ``set-membership`` check at
+    ``memory_service.py:3524-3529`` deliberately, so the retrospective and
+    live views of one defect cannot drift into two different verdicts: for
+    EACH endpoint whose name parses as a task label, if the fact names at
+    least one referent and that endpoint's referent is NOT among them (and
+    its bare id does not appear in the fact either), emit a Finding for that
+    end.
+
+    THREE PROPERTIES A READER MUST NOT MISREAD:
+
+    (a) A fact naming ZERO referents is UNVERIFIABLE, not clean. There is
+        nothing to compare the endpoint against, so no verdict is possible in
+        either direction. :func:`build_report` excludes that population from
+        the DENOMINATOR for the same reason — folding it in would understate
+        the rate by dividing by a population most of which was never
+        adjudicated.
+
+    (b) BOTH endpoints are checked, not just the subject. Specimen
+        ``8a51e13b`` is ``(Task 6080) -> (Task 6128)`` with a fact naming
+        6126 and 6080: the subject is correctly named and the OBJECT is the
+        mis-bound end. A subject-only rule — the one the task description
+        proposes — reports that edge clean.
+
+    (c) Referents are compared in FULL, never by bare number, so a foreign
+        ``reify:132`` never satisfies a local ``Task 132``. Collapsing them
+        is the cross-project bug ``utils/cross_project_refs.py`` exists to
+        detect, and a detector that made the same collapse could not see it.
+
+    Subject is examined before object so a two-finding edge lists its ends in
+    graph order rather than in whatever order a set iterated.
+    """
+    named = fact_referents(fact, graph)
+    if not named:
+        return []
+
+    sorted_named = _sorted_referents(named)
+    episode_uuids = tuple(episodes or ())
+    findings: list[Finding] = []
+    for end, name in (('subject', subject_name), ('object', object_name)):
+        referent = endpoint_referent(name)
+        if referent is None:
+            continue
+        if referent in named:
+            continue
+        if bare_id_present(referent, fact):
+            continue
+        findings.append(
+            Finding(
+                edge_uuid=edge_uuid,
+                graph=graph,
+                end=end,
+                node_name=str(name),
+                node_referent=referent,
+                fact_referents=sorted_named,
+                fact=fact or '',
+                episodes=episode_uuids,
+            )
+        )
+    return findings
