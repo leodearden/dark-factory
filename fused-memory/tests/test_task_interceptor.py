@@ -4777,6 +4777,41 @@ async def test_done_provenance_accepts_deterministic_gate(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_deterministic_gate_persists_escalation_id(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-gate' with escalation_id survives to the persisted blob.
+
+    DeterministicRunner cites the resolving gate escalation via
+    escalation_id on this kind (deterministic_runner.py, `_build_done_provenance(
+    'deterministic-gate', ..., escalation_id=_gate_esc_id)`), and the
+    _validate_done_provenance docstring promises the same. The field is
+    optional (unlike 'operational-verified', where it is required), but when
+    supplied it must not be silently dropped at the persistence chokepoint —
+    Stage-2 audit and any operator reading the stored blob rely on it to
+    find the gate record.
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+            'escalation_id': 'esc-4064-gate',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    assert persisted['kind'] == 'deterministic-gate'
+    assert persisted['escalation_id'] == 'esc-4064-gate'
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
@@ -4935,6 +4970,65 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
     assert err is not None
     assert err['error'] == 'done_provenance_invalid'
     assert 'recon' in err['reason'].lower()
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
+    """Every kind declared by DoneProvenance.kind is ACCEPTED given its
+    minimal valid payload (behavioral acceptance, not message wording).
+
+    The rejection paths are covered elsewhere
+    (test_done_provenance_rejects_missing_kind, the invalid-kind repair
+    test), and 'merged'/'found_on_main'/'operational-verified' each have
+    dedicated tests, but nothing previously asserted that
+    'deterministic-gate' and 'deterministic-milestone' — commitless,
+    runner-stamped kinds with no dedicated acceptance test at this boundary
+    — are actually accepted. The lockstep assertion below means an 8th kind
+    added to the Literal without a matching entry here fails loudly (a
+    KeyError-free, explicit mismatch) instead of being silently skipped;
+    a conditional-requirement branch that accidentally rejects an
+    already-covered kind fails just as loudly via the per-kind assertion.
+    """
+    from typing import get_args
+
+    from shared.task_metadata import DoneProvenance
+
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)  # backs the 'merged'/'found_on_main' commit field
+
+    minimal_payloads = {
+        'merged': {'kind': 'merged', 'commit': sha},
+        'found_on_main': {
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'covered by a sibling task',
+        },
+        'deterministic-deploy': {'kind': 'deterministic-deploy'},
+        'deterministic-deploy-scheduled': {'kind': 'deterministic-deploy-scheduled'},
+        'deterministic-gate': {'kind': 'deterministic-gate'},
+        'deterministic-milestone': {'kind': 'deterministic-milestone'},
+        'operational-verified': {
+            'kind': 'operational-verified',
+            'escalation_id': 'esc-123',
+            'note': 'restarted fused-memory',
+        },
+    }
+
+    declared_kinds = get_args(DoneProvenance.model_fields['kind'].annotation)
+    assert set(minimal_payloads) == set(declared_kinds), (
+        'minimal_payloads must stay in lockstep with the DoneProvenance.kind '
+        f'Literal; declared={sorted(declared_kinds)} vs covered='
+        f'{sorted(minimal_payloads)}'
+    )
+
+    for kind in declared_kinds:
+        err, resolved = await _validate_done_provenance(
+            '1', minimal_payloads[kind], str(tmp_path), require=True,
+        )
+        assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
+        assert resolved is not None, f'kind={kind!r} resolved to None with no error'
+        assert resolved['kind'] == kind
 
 
 # ── Task 3455: honest git-probe rejection wording ───────────────────────

@@ -5260,20 +5260,23 @@ async def _validate_done_provenance(
 
     Schema:
         {
-            "kind": "merged" | "found_on_main" | "deterministic-deploy"
-                    | "deterministic-deploy-scheduled" | "operational-verified",
-                                                 # required
+            "kind": <one of shared.task_metadata.DoneProvenance.kind>,
+                                                 # required; that Literal is the
+                                                 # SINGLE source of truth (I2) and
+                                                 # feeds _DONE_PROVENANCE_KINDS_TEXT.
+                                                 # Per-kind table: docs/task-authoring.md
             "commit": <sha-or-ref>,              # required for "merged"/"found_on_main"
-            "note":   <free text>,               # required if kind="found_on_main" or
-                                                 # kind="operational-verified"; optional
-                                                 # for "deterministic-deploy" and
-                                                 # "deterministic-deploy-scheduled"
+            "note":   <free text>,               # required for "found_on_main" and
+                                                 # "operational-verified"; optional
+                                                 # for the deterministic-* kinds
             "pid":    <int>,                     # deterministic-deploy: new MainPID
             "unit":   <str>,                     # deterministic-deploy(-scheduled): target unit name
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
             "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
             "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
-            "escalation_id": <str>,              # required for "operational-verified"
+            "escalation_id": <str>,              # required for "operational-verified";
+                                                 # optional for "deterministic-gate" (cites
+                                                 # the resolving gate escalation)
         }
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
@@ -5302,6 +5305,17 @@ async def _validate_done_provenance(
       ``transient_unit`` (str) is the scheduled restart unit's name, and
       ``fire_delay_secs`` (int) is its ``--on-active`` delay; ``note`` may
       carry a human-readable annotation (e.g. the crash-resume path).
+    - ``kind="deterministic-gate"``: a PURE deterministic gate (a gate task
+      with no ``before_done`` action) resolved. There is no deploy evidence
+      and no ``commit`` — the kind exists precisely so such a close passes
+      ``require_done_provenance`` without claiming a deploy happened (task
+      2331). ``note`` carries the gate-resolution text and ``escalation_id``
+      may cite the resolving gate escalation. Stamped by DeterministicRunner
+      (deterministic_runner.py), never supplied by hand.
+    - ``kind="deterministic-milestone"``: a ``before_done`` ``kind="predicate"``
+      milestone check exited 0. No ``commit`` is required or expected; ``note``
+      carries a bounded structured verdict summarizing the predicate's stdout.
+      Stamped by DeterministicRunner, never supplied by hand.
     - ``kind="operational-verified"``: the task was a no-code operational ask
       (e.g. a restart/redeploy/confirm) closed out via a resolved escalation
       rather than a code merge or a DeterministicRunner action. No ``commit``
@@ -5338,8 +5352,8 @@ async def _validate_done_provenance(
             'set_task_status(%s, done) called without done_provenance; '
             'Stage-2 reconciliation will treat this task as provenance-unknown. '
             'Pass done_provenance={"kind": "merged", "commit": "..."} or '
-            '{"kind": "found_on_main", "note": "..."} to record verified '
-            'evidence.',
+            '{"kind": "found_on_main", "commit": "...", "note": "..."} to '
+            'record verified evidence.',
             task_id,
         )
         return None, None
@@ -5375,17 +5389,15 @@ async def _validate_done_provenance(
     if kind is None:
         return _done_provenance_error(
             task_id,
-            'done_provenance.kind is required (must be "merged", '
-            '"found_on_main", "deterministic-deploy", or '
-            '"deterministic-deploy-scheduled"). Use kind="merged" '
-            'with commit=<merge-sha> after a successful merge_request, '
-            'kind="found_on_main" with note=<explanation> when the '
-            'implementation is already on main from a sibling task, '
-            'kind="deterministic-deploy" for a cross-unit service-restart '
-            'deploy (no commit required), or '
-            'kind="deterministic-deploy-scheduled" for an own-unit '
-            'self-restart that was scheduled but not yet verified (no '
-            'commit required).',
+            f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
+            'Use kind="merged" with commit=<merge-sha> after a successful '
+            'merge_request; kind="found_on_main" with commit=<sha> and '
+            'note=<explanation> when the implementation is already on main '
+            'from a sibling task; or kind="operational-verified" with '
+            'escalation_id=<id> and note=<text> for a no-code operational ask '
+            'closed via a resolved escalation. The deterministic-* kinds are '
+            'stamped by DeterministicRunner, not supplied by hand — see the '
+            'per-kind table in docs/task-authoring.md.',
         ), None
     if kind not in _DONE_PROVENANCE_KINDS:
         return _done_provenance_error(
@@ -5398,7 +5410,10 @@ async def _validate_done_provenance(
             task_id,
             'done_provenance with kind="merged" requires commit=<sha-or-ref> '
             '(the merge commit on main). Use kind="found_on_main" instead '
-            'when no single commit applies.',
+            'when this branch did not supply the merge but the work is '
+            'already on main under a different commit — it also requires '
+            'commit=<sha-or-ref> (ancestor-checked) plus note=<explanation> '
+            'citing the impl-providing task/commit.',
         ), None
     if kind == 'found_on_main' and commit_input is None:
         return _done_provenance_error(
@@ -5471,7 +5486,10 @@ async def _validate_done_provenance(
             ), None
     if note is not None:
         resolved['note'] = note
-    if kind == 'operational-verified':
+    if kind in ('operational-verified', 'deterministic-gate') and escalation_id is not None:
+        # Required (and already validated non-None above) for
+        # 'operational-verified'; optional for 'deterministic-gate', which
+        # may cite the resolving gate escalation but need not (task 2331).
         resolved['escalation_id'] = escalation_id
 
     if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
