@@ -893,6 +893,113 @@ class TestRedriveProvenance:
 
 
 # ---------------------------------------------------------------------------
+# base_distance_rows — REPORT the measured distances, never assert them
+# ---------------------------------------------------------------------------
+
+def _row(task_id: str, baseline_sha: str, baseline_source: str,
+         merge_sha: str | None, mint_mode: str) -> dict:
+    return {
+        'task_id': task_id, 'project': 'reify',
+        'project_root': '/home/leo/src/reify', 'decision': 'include',
+        'baseline_sha': baseline_sha, 'baseline_source': baseline_source,
+        'merge_sha': merge_sha, 'mint_mode': mint_mode,
+    }
+
+
+_BEFORE_ROWS = [
+    _row('4026', 'e21d047026', 'timestamp_walk', None, 'planrate_only'),
+    _row('3883', '2ceaf9ec17', 'timestamp_walk', None, 'planrate_only'),
+]
+_AFTER_ROWS = [
+    _row('4026', '794d321596', 'merge_first_parent', '3613bea224', 'referenced'),
+    _row('3883', '2ceaf9ec17', 'timestamp_walk', None, 'planrate_only'),
+]
+
+
+def _fake_distance(table: dict[tuple[str, str], int | None]):
+    """Injected ``distance(project_root, a, b) -> int | None``."""
+    def distance(project_root: str, a: str, b: str) -> int | None:
+        return table.get((a, b))
+    return distance
+
+
+_DISTANCES = {
+    ('794d321596', 'e21d047026'): 245,
+    ('794d321596', '794d321596'): 0,
+}
+
+
+class TestBaseDistanceReport:
+    def test_reports_before_and_after_for_each_fixture(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        upgraded = rows[0]
+        assert upgraded['fixture_id'] == 'reify_task_4026'
+        assert upgraded['before']['baseline_source'] == 'timestamp_walk'
+        assert upgraded['after']['baseline_source'] == 'merge_first_parent'
+        assert upgraded['before']['baseline_sha'] == 'e21d047026'
+        assert upgraded['after']['baseline_sha'] == '794d321596'
+        assert upgraded['before']['distance_from_branch_point'] == 245
+        assert upgraded['after']['distance_from_branch_point'] == 0
+
+    def test_carries_the_shared_approximation_flag(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        # From the step-6 helper, so the report and the minted fixtures can
+        # never disagree about which bases a readout should exclude.
+        assert rows[0]['before']['base_is_approximated'] is True
+        assert rows[0]['after']['base_is_approximated'] is False
+        assert rows[1]['after']['base_is_approximated'] is True
+
+    def test_an_unknowable_distance_is_reported_not_omitted(self) -> None:
+        # reify_3883's real case: no landing merge under either spelling, so
+        # the true branch point is not derivable from git at all. Dropping the
+        # row would let the report read as full coverage when it is not.
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert [r['fixture_id'] for r in rows] == \
+            ['reify_task_4026', 'reify_task_3883']
+        unknown = rows[1]
+        assert unknown['before']['distance_from_branch_point'] is None
+        assert unknown['after']['distance_from_branch_point'] is None
+        assert unknown['branch_point'] is None
+        assert 'no landing merge' in unknown['note'].lower()
+        assert 'approximated' in unknown['note'].lower()
+
+    def test_names_the_branch_point_it_measured_against(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert rows[0]['branch_point'] == '794d321596'
+
+    def test_is_deterministic_and_wall_clock_free(self) -> None:
+        first = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        second = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert first == second
+        assert json.dumps(first, sort_keys=True) == \
+            json.dumps(second, sort_keys=True)
+
+    def test_a_distance_the_measurement_could_not_resolve_stays_none(
+        self,
+    ) -> None:
+        # An empty `git rev-list --count` (an unresolvable SHA in this
+        # checkout) must read as "not measured", never as 0.
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance({}))
+        assert rows[0]['before']['distance_from_branch_point'] is None
+        assert rows[0]['branch_point'] == '794d321596'
+
+    def test_refuses_rows_that_do_not_line_up(self) -> None:
+        # A before/after pair that disagrees on which fixtures it covers would
+        # silently mis-attribute every distance in the table.
+        with pytest.raises(ValueError):
+            driver.base_distance_rows(
+                _BEFORE_ROWS, list(reversed(_AFTER_ROWS)),
+                _fake_distance(_DISTANCES))
+
+
+# ---------------------------------------------------------------------------
 # (d) --render — the documented regeneration path, with no db access
 # ---------------------------------------------------------------------------
 
