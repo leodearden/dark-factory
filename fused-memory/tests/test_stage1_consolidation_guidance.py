@@ -249,3 +249,56 @@ class TestSharedNormNamesTheSanctionedPath:
         # SINGLE-record supersede case the norm still covers, and for
         # hand-finishing a `partial` consolidation.
         assert 'replacement_memory_id' in STALE_KNOWLEDGE_ANNOTATION_NORM
+
+
+class TestStage1IsToldTheGuardNowAppliesToIt:
+    """Stage 1 must be told the near-duplicate guards now bind it too.
+
+    Retiring the `recon-stage-*` exemption at both sites (the `add_memory`
+    reject guard and the write-triage force-store arm) changes what Stage 1
+    EXPERIENCES at write time, and the system prompt is the stage's only
+    channel for that.  Left unstated, a soft-block is illegible: the agent
+    sees a write it has always been allowed to make suddenly refused, and the
+    refusal itself advertises `allow_near_duplicate` as the way through — so
+    the reflex is to set the override and carry on, re-creating the very
+    +1-per-pass ratchet this task closes.
+
+    The pins are on the DIRECTIVE as much as the mechanism: naming the flag is
+    not enough if the prompt does not, in the same breath, route a soft-block
+    to `consolidate_memories` instead of to the override.
+    """
+
+    def test_the_override_flag_is_named_in_the_fold_section(self) -> None:
+        # It must be named where the fold is executed, not left to be
+        # discovered from a refusal envelope — by then the agent is choosing
+        # between "set the flag" and "give up", with no third option stated.
+        assert 'allow_near_duplicate' in _section('## Executing a Cluster Fold')
+
+    def test_the_soft_block_is_named_by_its_wire_identity(self) -> None:
+        # `server/near_duplicate_guard.py` emits this exact `error_type`.
+        # Naming it lets the agent recognise the response it actually
+        # receives, rather than pattern-matching an English paraphrase.
+        assert (
+            'ProceduralKnowledgeNearDuplicateWriteRejected'
+            in _section('## Executing a Cluster Fold')
+        )
+
+    def test_a_soft_block_is_routed_to_the_op_not_to_the_override(self) -> None:
+        # The load-bearing assertion: both tokens in the SAME slice, so the
+        # prompt cannot name the escape hatch in one place and the sanctioned
+        # path in another and leave the agent to connect them.  A soft-block
+        # means the cluster already exists — which is a FOLD signal.
+        section = _section('## Executing a Cluster Fold')
+        assert 'allow_near_duplicate' in section
+        assert 'consolidate_memories' in section
+
+    def test_the_override_is_never_advertised_outside_this_section(self) -> None:
+        # Whole-prompt companion.  The flag may be shown at most once, and
+        # only inside the section that also states when NOT to use it, so the
+        # prompt can never come to instruct the override unconditionally
+        # somewhere else.  (Zero occurrences is fine — this bounds where it
+        # may appear, it does not require the payload example to exist.)
+        literal = "metadata={'allow_near_duplicate': True}"
+        assert STAGE1_SYSTEM_PROMPT.count(literal) <= 1
+        if literal in STAGE1_SYSTEM_PROMPT:
+            assert literal in _section('## Executing a Cluster Fold')
