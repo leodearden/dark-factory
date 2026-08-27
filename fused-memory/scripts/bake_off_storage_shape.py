@@ -5771,9 +5771,18 @@ async def _replay_bake_off(
         )
         for shape in ARM_SHAPES
     }
+    # *probes* is a PARAMETER of this function, so the probe expectation was
+    # available here all along — the queries/probes asymmetry was an omission,
+    # not a missing capability.  An EMPTY *probes* list (no cluster yielded a
+    # probing write) makes this a VACUOUS check rather than a refusal: no
+    # cluster can be missing from an empty expectation.  That is correct, and
+    # is the same shape as `--no-regrowth` rendering an empty `injections`
+    # list rather than a skipped guard — do NOT convert `[]` to `None`.
+    expect_probe_ids = [cluster_id for cluster_id, _probe in probes]
     replayed = load_fetches(
         cache_path, seeded_by_shape,
         expect_query_ids=[query.query_id for query in queries],
+        expect_probe_ids=expect_probe_ids,
         expect_limit=limit,
         # The same five paths, in the same order, that the protocol block
         # stamps below (:4197-4199) and that the live dump records.
@@ -5820,6 +5829,12 @@ async def _replay_bake_off(
         replayed_passes = load_fetches(
             cache_path, seeded_by_pass,
             expect_query_ids=[query.query_id for query in queries],
+            # For the same reason the fixture expectation is repeated here:
+            # the two calls guard two different sets of rankings and each has
+            # to verify on its own.  `measure_regrowth_arms` forwards the same
+            # *probes* list into `measure_arm`, so an unguarded regrowth pass
+            # has the identical bare-index failure.
+            expect_probe_ids=expect_probe_ids,
             expect_limit=limit,
             expect_fixtures=[DEFAULT_REGROWTH_INJECTION_PATH],
         )
