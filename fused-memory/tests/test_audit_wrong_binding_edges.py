@@ -58,6 +58,8 @@ classify_edge = _mod.classify_edge
 Finding = _mod.Finding
 # vars() does not work on a slots dataclass — the script's own accessor does.
 vars_of = _mod.vars_of
+id_proximity = _mod.id_proximity
+correct_node_present = _mod.correct_node_present
 
 GRAPH = 'reify'
 
@@ -580,3 +582,117 @@ class TestOutOfReachByConstruction:
         which only a re-read of the episode body could show.
         """
         assert _classify(SPEC_993A9A7B) == []
+
+
+class TestIdProximity:
+    """Cause attribution: how CLOSE is the mis-bound id to the named one?
+
+    This is the evidence that separates "resolution grabbed a near-miss id
+    neighbour" from "unrelated mis-attachment". The planning measurement put
+    120/192 (62.5%) of flags in the one_digit_diff + prefix + similar buckets,
+    against a chance baseline near zero over ~2090/~1452 task-shaped nodes per
+    graph.
+    """
+
+    @pytest.mark.parametrize(
+        ('node_id', 'named', 'bucket', 'nearest'),
+        [
+            # The canonical specimen: Task 6165 bound to a fact about 6164.
+            ('6165', {'6164'}, 'one_digit_diff', '6164'),
+            ('1042', {'2042'}, 'one_digit_diff', '2042'),
+            ('430', {'4302'}, 'prefix', '4302'),
+            ('319', {'3191'}, 'prefix', '3191'),
+            # "BOOKMARK task 4043 tracks the work surfaced by esc-3437-13" on
+            # node 'task 3443' — a legitimate cross-task relation, not a
+            # near-miss. See test_the_similarity_threshold_is_strict.
+            ('3443', {'4043'}, 'unrelated', '4043'),
+        ],
+    )
+    def test_buckets(
+        self, node_id: str, named: set[str], bucket: str, nearest: str
+    ) -> None:
+        assert id_proximity(node_id, named) == (bucket, nearest)
+
+    def test_the_similarity_threshold_is_strict(self) -> None:
+        """0.75 is a BOUNDARY the pinned specimens land exactly on.
+
+        ``difflib.SequenceMatcher(None, '3443', '4043').ratio()`` is exactly
+        0.75, and that pair is a legitimate unrelated relation — so the
+        'similar' bucket is ratio STRICTLY ABOVE the threshold, not >=.
+        Recorded as its own test because the boundary is the whole decision:
+        a >= comparison would silently reclassify that specimen (and the
+        rest of the equal-length two-digits-apart population) as a near-miss
+        and inflate the cause evidence.
+        """
+        import difflib  # noqa: PLC0415
+
+        assert difflib.SequenceMatcher(None, '3443', '4043').ratio() == 0.75
+        assert id_proximity('3443', {'4043'})[0] == 'unrelated'
+        # The other side of the boundary: 0.8889, comfortably above it. A
+        # digit INSERTED mid-id — neither a prefix of the named id nor one
+        # digit off it at equal length, so 'similar' is the only bucket that
+        # can carry it.
+        assert (
+            difflib.SequenceMatcher(None, '61065', '6165').ratio()
+            == pytest.approx(0.8889, abs=1e-4)
+        )
+        assert id_proximity('61065', {'6165'}) == ('similar', '6165')
+
+    def test_one_digit_diff_requires_equal_length(self) -> None:
+        """'616' vs '6165' is not one digit off — it is a PREFIX.
+
+        The two buckets describe different mechanisms (a transposed/mistyped
+        digit versus a truncated id), so collapsing them would blur the cause
+        evidence this column exists to supply.
+        """
+        assert id_proximity('616', {'6165'}) == ('prefix', '6165')
+
+    def test_one_digit_diff_means_exactly_one(self) -> None:
+        assert id_proximity('6165', {'6234'}) == ('unrelated', '6234')
+
+    def test_the_best_bucket_wins_across_candidates(self) -> None:
+        """A fact naming several ids is scored on its CLOSEST one."""
+        assert id_proximity('6165', {'4043', '6164', '3191'}) == (
+            'one_digit_diff',
+            '6164',
+        )
+
+    def test_ties_break_on_the_lowest_id(self) -> None:
+        """Deterministic, so successive runs of the sweep diff cleanly.
+
+        '6165' is one digit from BOTH '6164' and '6166'; the report must not
+        depend on set iteration order.
+        """
+        assert id_proximity('6165', {'6166', '6164'}) == ('one_digit_diff', '6164')
+        assert id_proximity('6165', {'6164', '6166'}) == ('one_digit_diff', '6164')
+
+    def test_lowest_id_is_numeric_not_lexicographic(self) -> None:
+        """'99' sorts before '100' as a string; as an id it does not."""
+        assert id_proximity('5000', {'100', '99'}) == ('unrelated', '99')
+        assert id_proximity('5000', {'99', '100'}) == ('unrelated', '99')
+
+    def test_no_named_ids_yields_unrelated_and_no_nearest(self) -> None:
+        """Defensive: classify_edge never produces this, build_report may."""
+        assert id_proximity('6165', set()) == ('unrelated', '')
+
+
+class TestCorrectNodePresent:
+    """Does a node for the id the fact ACTUALLY names already exist?
+
+    This is what separates "the correct node was missing, so resolution had
+    nothing right to pick" from ACTIVE mis-resolution. The planning
+    measurement found the correct node already present in 124/194 (64%) of
+    endpoint checks — so this is predominantly active mis-resolution, not a
+    missing node.
+    """
+
+    def test_the_canonical_specimen_has_no_correct_node(self) -> None:
+        """Node 'Task 6164' does NOT exist in reify; 'Task 6165' does."""
+        assert correct_node_present('6164', {'6165', '6166', '6080'}) is False
+
+    def test_a_present_node_reads_true(self) -> None:
+        assert correct_node_present('6126', {'6080', '6126', '6128'}) is True
+
+    def test_no_nearest_id_reads_false(self) -> None:
+        """An empty nearest id names no node, so nothing can be present."""
+        assert correct_node_present('', {'6165'}) is False
