@@ -116,9 +116,15 @@ are split by CLASS, because one rule cannot fit all of them:
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
 ``scripts/dashboard.service.template`` (``__REPO_ROOT__`` / ``__UV_PATH__``
-substitution), and only ``cp``s the two watchdog units verbatim — so the
-committed ``dashboard/dark-factory-dashboard.service`` this checker treats as
-truth is not the source of the copy it compares against.  The two repo-side
+substitution, performed by ``scripts/render_dashboard_unit.py`` since task
+4793 — no longer an inline ``sed``), and only ``cp``s the two watchdog units
+verbatim — so the committed ``dashboard/dark-factory-dashboard.service`` this
+checker treats as truth is not the source of the copy it compares against.
+That renderer also PRESERVES the installed copy's host-local ``Environment=``
+values across a re-install, which is why the remediation this report prints
+("run scripts/setup-host.sh") is now safe to follow on a host carrying nine
+aggregation roots; see the DASHBOARD_KNOWN_PROJECT_ROOTS entry in
+``DIVERGENCE_ALLOWLIST`` below.  The two repo-side
 files are held in lockstep by
 ``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
 which renders the template with setup-host.sh's own substitutions and asserts
@@ -190,7 +196,19 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "committed one carries this repo only. Value-comparing it would "
         "therefore report drift on every run of a correctly-configured host, "
         "and a gate that is always red gets switched off — taking the "
-        "accidental drift it exists to catch with it."
+        "accidental drift it exists to catch with it. "
+        "SECOND CONSUMER (task 4793): scripts/render_dashboard_unit.py now "
+        "PRESERVES this variable's installed value when setup-host.sh "
+        "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
+        "SUBSET of this allowlist, not the allowlist itself — the two entries "
+        "here are on it for opposite reasons, and preserving the other one "
+        "would pin the data root at the previous checkout. Held by "
+        "tests/scripts/test_render_dashboard_unit.py::"
+        "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
+        "and ::test_host_local_environment_excludes_project_root. So editing "
+        "THIS dict has a second blast radius: adding a name here does not make "
+        "it preserved, but removing one that the renderer preserves turns this "
+        "gate red on every correctly-configured host."
     ),
     "DASHBOARD_PROJECT_ROOT": (
         "The dashboard's data root. The committed unit hardcodes "
