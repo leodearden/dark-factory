@@ -6969,6 +6969,14 @@ class MemoryService:
             edges = []
             for edge_list in edge_lists:
                 for e in edge_list:
+                    # Defence in depth over the Cypher predicate (task 4714): a
+                    # retired edge must neither be returned nor consume the
+                    # dedup slot for its uuid — otherwise a duplicate-name node
+                    # contributing the same uuid as a LIVE edge would have that
+                    # live edge suppressed by its retired twin.  Hence the skip
+                    # sits ahead of the `seen` bookkeeping, not after it.
+                    if _edge_is_retired(e):
+                        continue
                     edge_uuid = e.get('uuid')
                     if edge_uuid is not None:
                         if edge_uuid in seen:
