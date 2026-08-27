@@ -760,3 +760,202 @@ def test_render_unit_defaults_its_preserve_set_to_the_policy_constant():
     defaulted, _p2, _s2 = _reinstall_over_a_configured_host()
 
     assert explicit == defaulted
+
+
+# ---------------------------------------------------------------------------
+# main(argv) — the CLI  (step-11 / step-12)
+# ---------------------------------------------------------------------------
+# All trees here are tmp_path. Nothing reads or writes ~/.config/systemd/user.
+
+_TAG = "[dashboard_unit_render]"
+
+
+def _main(argv):
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.main(argv)
+
+
+def _cli(tmp_path, *, template_text=None, output_text=None, repo_root=_NEW_ROOT):
+    """A tmp template (+ optional pre-existing --output) and the argv to render it."""
+    template = tmp_path / "dashboard.service.template"
+    template.write_text(
+        TEMPLATE_PATH.read_text(encoding="utf-8")
+        if template_text is None
+        else template_text,
+        encoding="utf-8",
+    )
+    output = tmp_path / "unit" / "dark-factory-dashboard.service"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output_text is not None:
+        output.write_text(output_text, encoding="utf-8")
+    argv = [
+        "--template", str(template),
+        "--repo-root", repo_root,
+        "--uv-path", _NEW_UV,
+        "--output", str(output),
+    ]
+    return argv, output
+
+
+def test_main_renders_to_output_and_returns_zero(tmp_path, capsys):
+    """(a) The happy path: --output is written, exit 0."""
+    argv, output = _cli(tmp_path)
+
+    assert _main(argv) == 0
+    text = output.read_text(encoding="utf-8")
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text
+    assert _directive(text, "WorkingDirectory") == _NEW_ROOT
+    capsys.readouterr()
+
+
+def test_main_preserves_the_installed_value_it_reads_from_output(tmp_path, capsys):
+    """(b) SELF-READ — and this is WHY the renderer owns --output.
+
+    The obvious shape, `python3 render.py ... > "$UNIT_DIR/<unit>"`, is silently
+    fatal: bash TRUNCATES a redirect target BEFORE the command runs, so the
+    installed value would be gone before python could open the file. The tool
+    would find nothing to preserve, take the rendered default, and REPORT
+    SUCCESS — the same clobber one level up, now invisible because the thing
+    that did it said it had preserved. Owning --output makes the read-then-write
+    ordering structural rather than the caller's responsibility.
+    """
+    argv, output = _cli(
+        tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT)
+    )
+
+    assert _main(argv) == 0
+    assert _env_line(output.read_text(encoding="utf-8"), _KNOWN_ROOTS) == NINE_ROOTS
+    capsys.readouterr()
+
+
+def test_main_is_idempotent(tmp_path, capsys):
+    """(b, continued) Running it twice in a row still leaves nine roots.
+
+    Not a restatement of the test above: the SECOND run reads a file this tool
+    itself wrote, so a renderer that preserved correctly only from a
+    hand-configured unit — and not from its own output — would pass that one
+    and fail this.
+    """
+    argv, output = _cli(
+        tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT)
+    )
+
+    assert _main(argv) == 0
+    first = output.read_text(encoding="utf-8")
+    assert _main(argv) == 0
+    second = output.read_text(encoding="utf-8")
+
+    assert first == second
+    assert _env_line(second, _KNOWN_ROOTS) == NINE_ROOTS
+    capsys.readouterr()
+
+
+def test_main_greenfield_writes_the_single_root_default(tmp_path, capsys):
+    """(d) No pre-existing --output → the rendered default, exit 0."""
+    argv, output = _cli(tmp_path)
+
+    assert _main(argv) == 0
+    assert _env_line(output.read_text(encoding="utf-8"), _KNOWN_ROOTS) == _NEW_ROOT
+    capsys.readouterr()
+
+
+def test_main_leaves_output_byte_unchanged_when_the_template_is_unreadable(
+    tmp_path, capsys
+):
+    """(c) ATOMICITY: a failed render must never truncate the host's unit.
+
+    Degrading to "stale but working" is recoverable — the pre-install parity
+    gate reports it on the next run. Degrading to "no unit at all", or to a
+    half-written one, is not.
+    """
+    installed = _installed_with_nine_roots(_OLD_ROOT)
+    argv, output = _cli(tmp_path, output_text=installed)
+    (tmp_path / "dashboard.service.template").unlink()
+
+    assert _main(argv) != 0
+    assert output.read_text(encoding="utf-8") == installed
+    out = capsys.readouterr()
+    assert _TAG in (out.out + out.err)
+
+
+def test_main_leaves_output_byte_unchanged_when_preservation_cannot_apply(
+    tmp_path, capsys
+):
+    """(c, second shape) A template that no longer declares a preserved name.
+
+    The value would be read off the installed unit and dropped on the floor.
+    That must be a LOUD non-zero exit with the file untouched, never a silent
+    success — it is the original defect, one layer in.
+    """
+    installed = _installed_with_nine_roots(_OLD_ROOT)
+    shrunk = "\n".join(
+        line
+        for line in TEMPLATE_PATH.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith(f"Environment={_KNOWN_ROOTS}=")
+    )
+    argv, output = _cli(tmp_path, template_text=shrunk, output_text=installed)
+
+    assert _main(argv) != 0
+    assert output.read_text(encoding="utf-8") == installed
+    out = capsys.readouterr()
+    assert _KNOWN_ROOTS in (out.out + out.err)
+
+
+def test_main_every_emitted_line_carries_the_log_tag(tmp_path, capsys):
+    """(e) On stdout AND stderr, success AND failure.
+
+    Load-bearing the same way test_main_every_emitted_line_carries_the_log_tag
+    is for the parity checker: a shell caller routes an operator to a report BY
+    TAG, and setup-host.sh's own gates treat the tag's ABSENCE as conclusive
+    proof a tool never ran. An untagged line makes that reasoning unsound.
+    """
+    argv, _output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+    _main(argv)
+    ok = capsys.readouterr()
+
+    (tmp_path / "dashboard.service.template").unlink()
+    _main(argv)
+    bad = capsys.readouterr()
+
+    emitted = [
+        line
+        for chunk in (ok.out, ok.err, bad.out, bad.err)
+        for line in chunk.splitlines()
+        if line.strip()
+    ]
+    assert emitted, "main() emitted nothing at all, so the tag claim is vacuous"
+    for line in emitted:
+        assert line.startswith(_TAG), f"untagged line: {line!r}"
+
+
+def test_main_reports_what_was_preserved(tmp_path, capsys):
+    """(f) The install leaves a RECORD naming the variable and its value.
+
+    This is the property the post-install parity check structurally cannot
+    supply: DASHBOARD_KNOWN_PROJECT_ROOTS is on DIVERGENCE_ALLOWLIST, so that
+    gate is incapable of saying anything about its value. A tagged line naming
+    what was preserved is the ONLY evidence the variable was handled at all.
+    """
+    argv, _output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+
+    _main(argv)
+
+    report = capsys.readouterr().out
+    assert _KNOWN_ROOTS in report, report
+    assert NINE_ROOTS in report, report
+
+
+def test_main_reports_a_fallback_to_the_rendered_default(tmp_path, capsys):
+    """(f, second shape) A greenfield fallback is REPORTED, not taken silently.
+
+    Both outcomes are legitimate; only one of them is legitimate to take without
+    saying so, and nothing downstream can tell the operator which happened.
+    """
+    argv, _output = _cli(tmp_path)
+
+    _main(argv)
+
+    report = capsys.readouterr().out
+    assert _KNOWN_ROOTS in report, report
+    assert "absent" in report.lower(), report
