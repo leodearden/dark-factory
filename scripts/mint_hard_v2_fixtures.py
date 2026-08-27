@@ -414,8 +414,8 @@ def resolve_baseline(
        prior main.
     2. ``status_autocommit`` — the taskmaster ``set_task_status(<id>=in-progress)``
        auto-commit on main. A real, timestamped anchor at task start.
-    3. ``timestamp_walk`` — the newest main commit strictly before the task's
-       first architect invocation.
+    3. ``timestamp_walk`` — the newest FIRST-PARENT main commit strictly
+       before the task's first architect invocation.
 
     The rung is returned alongside the SHA so the caller can stamp
     ``provenance.baseline_source`` and the weaker provenance stays visible
@@ -434,8 +434,18 @@ def resolve_baseline(
         return start, 'status_autocommit'
 
     if first_invocation_ts:
+        # --first-parent is load-bearing. Without it rev-list traverses
+        # EVERYTHING reachable from main, including commits that only ever
+        # lived on a merged-in side branch, and returns a tree state that was
+        # never a state of main. Measured: task 4026's base resolved to
+        # e21d047026, a side-branch commit 245 commits from its true branch
+        # point (3613bea224^1 = 794d321596) and absent from
+        # `git rev-list --first-parent main`. Task 4086 had the same defect.
+        # This rung is an approximation either way (see `base_approximation`),
+        # but an approximation must at minimum name a real state of main.
         walked = _git(
-            ['rev-list', '-n1', f'--before={first_invocation_ts}', 'main'],
+            ['rev-list', '-n1', '--first-parent',
+             f'--before={first_invocation_ts}', 'main'],
             repo_root,
         )
         if walked:
