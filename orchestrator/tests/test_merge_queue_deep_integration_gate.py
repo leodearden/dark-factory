@@ -68,56 +68,71 @@ reads.
 
 SUBSUMPTION TABLE — what each row OWES that upstream does not already pay
 -------------------------------------------------------------------------
-Measured against the two upstream modules read in full.  A row marked FULLY
-SUBSUMED is deliberately NOT re-cloned as a unit assertion here; it appears
-only at COMPOSITION level (inside a multi-round run, with the two-way oracle
-asserted after every round).  Filled in per row as each is written; the
-verdict column is re-confirmed in step-16.
+Measured against the two upstream modules read in full, and re-confirmed in
+step-16 now that all eleven rows are written.  A row marked FULLY SUBSUMED is
+deliberately NOT re-cloned as a unit assertion here; it appears only at
+COMPOSITION level (inside a multi-round run, with the conservation oracle
+asserted after every round).
 
-  row | verdict vs upstream        | upstream owner (node id)
+  row | verdict vs upstream        | upstream owner → where it lives here
   ----+----------------------------+------------------------------------------
    1  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_landing.py::
       |   → composition only       |   TestDeepLandingEndToEnd::
-      |                            |   test_one_passing_tip_lands_the_whole_
+      |   TestBoundaryRowsComposed |   test_one_passing_tip_lands_the_whole_
       |                            |   prefix_in_order; ::TestInOrderCasWalk
    2  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_dispatch.py (fail
       |   → composition only       |   arm) + ::TestDeepLandingEndToEnd::
-      |                            |   test_a_failing_tip_lands_nothing_and_
+      |   TestBoundaryRowsComposed |   test_a_failing_tip_lands_nothing_and_
       |                            |   the_item_still_lands_later
    3  | PARTIAL — policy only      | test_merge_queue_deep_dispatch.py
       |   → ORIGINAL: isolation    |   (the depths [6,3,None,6] walk, driven by
       |   (step-07/08, class       |   a POSITIONAL pass/fail script)
       |   TestRow3HalvingIsolates- |
       |   TheBadItem)              |
-   4  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_dispatch.py +
-      |   → composition only       |   test_merge_queue_deep_landing.py
-      |                            |   (truncator 105 vs link 102)
+   4  | PARTIAL — truncation at    | test_merge_queue_deep_dispatch.py +
+      |   position > 0 only        |   test_merge_queue_deep_landing.py
+      |   → ORIGINAL: the POS-0    |   (truncator 105 vs LINK 102, so `links`
+      |   decline + NO-SKIP-AHEAD  |   is non-empty and nothing is queued past
+      |   (step-15, class          |   the truncator — neither the
+      |   TestRow4ConflictTrun-    |   `if not result.links` decline nor the
+      |   catesSilently)           |   contiguous-prefix property is reachable)
    5  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_landing.py::
       |   → composition only       |   TestHeadCancelOnAdoption
+      |   TestBoundaryRowsComposed |
    6  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_landing.py::
       |   → composition only       |   TestStaleCasAbortLeavesTheRestAlone
+      |   TestBoundaryRowsComposed |
    7  | PARTIAL — single round     | test_merge_queue_deep_dispatch.py
       |   → ORIGINAL: round-seq    |   (transcript compare) +
-      |                            |   ::TestDeepLandingEndToEnd::
-      |                            |   test_the_shipped_kill_switch_reaches_
-      |                            |   no_delta_code (golden dict, ONE round)
+      |   (step-11/12, class       |   ::TestDeepLandingEndToEnd::
+      |   TestRow7KillSwitch-      |   test_the_shipped_kill_switch_reaches_
+      |   ByteIdentity)            |   no_delta_code (golden dict, ONE round)
    8  | PARTIAL — one-way          | test_merge_queue_deep_landing.py
       |   → ORIGINAL: the LADDER   |   (merge-queue half: event SILENCE)
+      |   (step-09/10, class       |
+      |   TestRow8DeepFailsNever-  |
+      |   FeedTheThrashLadder)     |
    9  | FULLY SUBSUMED (unit)      | test_merge_queue_deep_landing.py::
       |   → composition only       |   TestHeadCancelLeavesTheLaneIdle
+      |   TestBoundaryRowsComposed |
    10 | FULLY SUBSUMED (unit)      | test_merge_queue_deep_landing.py::
       |   → composition only       |   test_flipping_the_cap_in_place_starts_
-      |                            |   landing_chains
+      |   TestBoundaryRowsComposed |   landing_chains
    11 | NOT COVERED ANYWHERE       | (none — no test in the tree builds a
       |   → ORIGINAL, in full      |   chain deeper than 3 links, and there
-      |                            |   are zero hits for the 7200 s budget on
-      |                            |   any deep path)
+      |   (step-03/05, classes     |   are zero hits for the 7200 s budget on
+      |   TestDeepScaleBuild +     |   any deep path)
+      |   TestRow11TimeoutMargin)  |
 
 Plus one CROSS-CUTTING gap this gate owns outright: CONSERVATION across a
 MIXED multi-round run that actually lands.  deep_dispatch's conservation test
 never finalizes (it lands nothing) and every deep_landing ``_assert_quiescent``
 call is single- or two-round, so nothing upstream asserts the six worker
-surfaces plus the CAS/ledger surfaces stay green round after round.
+surfaces plus the CAS/ledger surfaces stay green round after round.  Owned by
+:class:`TestDeepGateCapstone` (step-15/16): six rounds over one worker, one
+queue and one permit census, with the run's landings re-derived from main's
+first-parent history (:func:`_chain_landed_from_git`) so the shipped canary is
+checked against GIT rather than against its own arithmetic.
 
 PROVENANCE — every helper below is a PORT, not an original
 -----------------------------------------------------------
@@ -182,6 +197,17 @@ file AND its origin red, and the origin is where the unit-level contract lives.
                                  |   `run_scoped_verification` name conftest's
                                  |   autouse stub uses.
   -------------------------------+-------------------------------------------
+  _conflicting_branch_content,   | ORIGINAL.  Every follower in both upstream
+  _make_gate_scene(              |   deep modules edits a DISJOINT file, so no
+      branch_content=...)        |   scene there can express a conflicting
+                                 |   PAIR; deep_landing hard-codes its one
+                                 |   truncator's content inline instead.
+  -------------------------------+-------------------------------------------
+  _chain_landed_from_git         | ORIGINAL.  Nothing upstream re-derives the
+                                 |   landings from git — both deep modules
+                                 |   check telemetry against telemetry, which
+                                 |   a self-consistent wrong unit would pass.
+  -------------------------------+-------------------------------------------
   _canary_predicate_items_per    | a verbatim transcription of the SHIPPED
                                  |   scripts/merge-deep-canary-predicate.sh,
                                  |   re-cloned from
@@ -242,7 +268,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import pytest
 from shared.task_metadata import RetryLedger
@@ -261,6 +287,15 @@ from orchestrator.merge_types import (
     SpecPermit,
     VerifyWorktreeHandle,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
+    # Imported for annotations alone: every RUNTIME use in this file is a local
+    # import inside the helper that needs it, matching the upstream deep
+    # modules' idiom.  `from __future__ import annotations` is what lets the
+    # `script=` vocabulary below name it without paying for the import.
+    from orchestrator.verify import VerifyResult
 
 # ── repo fixtures (cloned from test_merge_queue_deep_landing.py) ──────────────
 
@@ -504,6 +539,33 @@ def _shared_txt_with(line_no: int, text: str) -> str:
     lines = [f'line{i}\n' for i in range(1, 21)]
     lines[line_no - 1] = f'{text}\n'
     return ''.join(lines)
+
+
+def _conflicting_branch_content(
+    *task_ids: str, line: int = 5,
+) -> dict[str, tuple[str, str]]:
+    """``branch_content`` overrides making every id in *task_ids* CONFLICT.
+
+    Each named task edits the SAME line of ``shared.txt`` to a different value,
+    so any two of them conflict textually wherever git tries to merge them into
+    one tree — which is the only way to express Row 4's premise in a fixture
+    whose followers are otherwise disjoint by construction (see
+    :func:`_gate_followers`).
+
+    Returned as a mapping rather than applied directly because
+    :func:`_make_gate_scene` owns branch creation: a scenario states WHICH
+    items conflict, and the scene decides when the branches come into being.
+
+    *line* defaults to 5 — a line in the middle of the 20-line seed.  git's
+    three-line diff context window makes edits near a file boundary conflict
+    with edits nominally several lines away (the gotcha :func:`_setup_repo`
+    documents), so a boundary default would hand callers accidental conflicts
+    between items this helper never named.
+    """
+    return {
+        tid: ('shared.txt', _shared_txt_with(line, f'from-{tid}'))
+        for tid in task_ids
+    }
 
 
 async def _merge_commit_off_main(repo: Path, branch: str, label: str) -> str:
@@ -1113,6 +1175,80 @@ def _events_for_task(db_path: Path, task_id: str) -> list[str]:
     finally:
         conn.close()
     return [r[0] for r in rows]
+
+
+# ── GIT-DERIVED ground truth ─────────────────────────────────────────────────
+
+
+async def _chain_landed_from_git(
+    repo: Path, main_sha_before: str, main_sha_after: str,
+) -> list[str]:
+    """Which task ids landed on main between the two shas, in LAND ORDER.
+
+    Derived from ``main``'s FIRST-PARENT history alone, so the capstone can
+    check the telemetry against git rather than against itself.  That
+    distinction is the whole point of the helper: the shipped canary
+    (:func:`_canary_predicate_items_per`) divides a ``merge_finalized`` sum by a
+    ``merge_verify`` count, and comparing those two to each other proves only
+    that the emitter is SELF-CONSISTENT — an emitter that stamped the wrong
+    unit on both sides would agree with itself perfectly.  This is the same
+    discipline ε's reader signal will need ("reader output matches git-derived
+    truth on fixtures").
+
+    HOW THE ATTRIBUTION IS MADE, and why not by commit message: every landed
+    commit here is a ``--no-ff`` merge whose SECOND parent is the task branch's
+    tip, and each ``task/<id>`` branch in these fixtures is a single commit
+    merged exactly once — so the second parent is an exact, unambiguous key
+    into ``refs/heads/task/``.  Parsing the ``merge <branch>`` subject would
+    instead be reading a string this file's own helpers wrote, which is not
+    ground truth at all: ``build_chain``'s links are merged by
+    ``GitOps.merge_branch_into_worktree`` and carry ITS subject, not one of
+    ours.
+
+    Commits with fewer than two parents are skipped, which is what makes the
+    helper correct across a stale-CAS round: :func:`_external_main_bump` lands
+    a single-parent commit directly on main, and it is a ref move by another
+    writer rather than an item landing.
+
+    Args:
+        repo: the fixture repo.
+        main_sha_before: exclusive lower bound — the sha main held BEFORE.
+        main_sha_after: inclusive upper bound — the sha main holds after.
+
+    Returns:
+        Bare task ids (``'101'``), oldest first, i.e. in the order main
+        actually received them.  Empty when main did not move.
+    """
+    _rc, refs, _err = await _run(
+        ['git', 'for-each-ref', '--format=%(objectname) %(refname:short)',
+         'refs/heads/task/'],
+        cwd=repo,
+    )
+    tip_to_task: dict[str, str] = {}
+    for line in refs.splitlines():
+        sha, _, ref = line.partition(' ')
+        if ref.startswith('task/'):
+            tip_to_task[sha] = ref[len('task/'):]
+
+    # `--parents` prints `<commit> <parent>...`; `--first-parent` keeps the walk
+    # on the mainline so a chained link is counted once, at the position main
+    # received it, rather than again through its own side history.
+    _rc, out, _err = await _run(
+        ['git', 'rev-list', '--first-parent', '--parents',
+         f'{main_sha_before}..{main_sha_after}'],
+        cwd=repo,
+    )
+    landed: list[str] = []
+    for line in out.splitlines():     # rev-list prints NEWEST first
+        fields = line.split()
+        parents = fields[1:]
+        if len(parents) < 2:
+            continue                  # not a merge — an external ref move
+        task_id = tip_to_task.get(parents[1])
+        if task_id is not None:
+            landed.append(task_id)
+    landed.reverse()                  # ...so reverse into LAND order
+    return landed
 
 
 # ── the SHIPPED canary arithmetic, transcribed ───────────────────────────────
@@ -2369,12 +2505,13 @@ async def _make_gate_scene(
     chain_cap: int,
     n_followers: int,
     db_name: str,
-    script: list[bool] | None = None,
+    script: Sequence[bool | VerifyResult] | None = None,
     verdict=None,
     heads: tuple[str, ...] = ('101',),
     remote: bool = False,
     real_local: bool = False,
     advance_hook=None,
+    branch_content: dict[str, tuple[str, str]] | None = None,
 ) -> _GateScene:
     """Build an n-follower, finalize-capable scene over a REAL git repo.
 
@@ -2385,7 +2522,13 @@ async def _make_gate_scene(
       * neither — replace ``orchestrator.merge_queue._run_post_merge_verify``
         outright (δ's shape).  Cheapest, and the right seam for a row whose
         claim is about LANDING or about queue state.  No ``merge_verify`` event
-        is emitted on this path.
+        is emitted on this path.  NOTE its red is a raw
+        :class:`~orchestrator.verify.VerifyResult`, which only the CHAIN arm
+        can consume (it reads "not None -> red" without touching a field); the
+        un-chained arm dereferences ``out.verify_skipped`` and expects the
+        :class:`MergeOutcome` the real function renders.  A red on a round
+        where the chain DECLINED therefore has to be injected lower down —
+        ``remote=True``.
       * ``remote=True`` — install a ``_StubRemoteAllocator`` over a REMOTE
         ``HostLease`` whose runner answers the script, and let the real
         ``_run_post_merge_verify`` run.  The right seam for a row whose claim
@@ -2420,6 +2563,15 @@ async def _make_gate_scene(
     across the whole scene, so a hook armed inside round 1's walk leaves every
     later round running clean.
 
+    *branch_content* overrides what a task's branch EDITS, as
+    ``{task_id: (filename, content)}``.  Every unnamed task keeps the default —
+    its own ``f<tid>.txt``, disjoint from every other by construction, which is
+    what lets a depth claim be about the code rather than about the fixture
+    (see :func:`_gate_followers`).  Naming two tasks the same file and line is
+    therefore the ONLY way a scene can express a chain conflict; build it with
+    :func:`_conflicting_branch_content` rather than by hand, so the "which line
+    of shared.txt is safe" reasoning lives in one place.
+
     Module-level monkeypatching is confined to the four names
     test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
     ``_run_post_merge_verify``, ``release_chain_build_lane`` and
@@ -2430,8 +2582,10 @@ async def _make_gate_scene(
     followers = _gate_followers(n_followers)
     git_ops = _make_git_ops(repo, size=2)
     config = _make_config(repo, chain_cap=chain_cap)
+    content = branch_content or {}
     for tid in (*heads, *followers):
-        await _create_branch_editing(repo, f'task/{tid}', f'f{tid}.txt', f'edit-{tid}\n')
+        filename, body = content.get(tid, (f'f{tid}.txt', f'edit-{tid}\n'))
+        await _create_branch_editing(repo, f'task/{tid}', filename, body)
     db_path = tmp_path / db_name
     store = EventStore(db_path, f'run-{db_name}')
     worker = _make_worker(git_ops)
@@ -2442,11 +2596,17 @@ async def _make_gate_scene(
         from orchestrator.verify_runner import HostLease
 
         # Installed BEFORE first use so `_ensure_host_allocator`'s cache check
-        # short-circuits on it rather than building a real one.
-        worker._host_allocator = _StubRemoteAllocator(HostLease(
-            name='laptop', runner=_scripted_remote_runner(scene, script),
-            is_local=False,
-        ))
+        # short-circuits on it rather than building a real one.  Through
+        # monkeypatch rather than a bare assignment: INSTANCE-level patching is
+        # this file's convention (see the note below), and it also restores the
+        # real allocator at teardown rather than leaving a stub on a worker a
+        # later fixture might reuse.
+        monkeypatch.setattr(
+            worker, '_host_allocator', _StubRemoteAllocator(HostLease(
+                name='laptop', runner=_scripted_remote_runner(scene, script),
+                is_local=False,
+            )),
+        )
 
     await scene.enqueue((*heads, *followers))
 
@@ -4361,8 +4521,13 @@ class TestBoundaryRowsComposed:
         )
         assert green['main_after'] != green['main_before']
         # The armed ceiling really bound the second round's depth.
+        halved = select_chain_depth(_COMPOSED_CAP, 1 + len(followers), 2)
+        assert halved is not None, (
+            'the halved ceiling must still leave a chainable depth, or this '
+            'round is testing the floor rather than the halving'
+        )
         assert green['chain'] is not None and len(green['chain'].links) == (
-            select_chain_depth(_COMPOSED_CAP, 1 + len(followers), 2) - 1
+            halved - 1
         ), (
             f'the second round must chain at the HALVED depth; got '
             f'{None if green["chain"] is None else 1 + len(green["chain"].links)}'
@@ -4417,7 +4582,7 @@ class TestBoundaryRowsComposed:
         teardown = _spy_teardown_pair(worker, monkeypatch)
         head_entry = await scene.attach_head('100', task_factory=_red_head_task)
         await asyncio.sleep(0)   # let the red verdict actually land
-        assert head_entry.verify_task.done(), (
+        assert head_entry.verify_task is not None and head_entry.verify_task.done(), (
             'the head must be RED before the tip is adopted, or this row is '
             'just the ordinary head-cancel row'
         )
@@ -4887,9 +5052,12 @@ class TestRow4ConflictTruncatesSilently:
             f'the caller converts ITEMS to LINKS-BEYOND-THE-BASE; got '
             f'{built["cap"]!r}'
         )
-        assert built['target_depth'] == select_chain_depth(
-            _HEAD_CAP, 1 + len(followers), None,
-        ) - 1, (
+        target = select_chain_depth(_HEAD_CAP, 1 + len(followers), None)
+        assert target is not None, (
+            'the policy must want a chain here, or the truncation below is '
+            'not what declined the round'
+        )
+        assert built['target_depth'] == target - 1, (
             f'the target depth must be the policy function\'s own answer, '
             f'converted; got {built["target_depth"]!r}'
         )
