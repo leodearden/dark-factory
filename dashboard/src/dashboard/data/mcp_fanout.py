@@ -69,6 +69,25 @@ _FANOUT_REWARN_EVERY = 500
 _failure_streaks: dict[tuple[str, str], int] = {}
 
 
+# ── bounded per-key lock acquisition (task 4789) ────────────────────
+#
+# TTLCache.get_or_refresh used to acquire its per-key lock with a bare
+# `async with lock:` — unbounded. On 2026-08-27 a refresh that never
+# returned (parked forever inside httpcore) held one key's lock for 19.8h
+# with 7 waiters queued behind it: because the holder never returned,
+# `cache_ok` never ran and nothing was ever stored, so every later caller
+# missed the warm fast path and queued on a latch that would only have
+# released at process exit.
+#
+# _LOCK_ACQUIRE_TIMEOUT_SECONDS bounds that wait. It must exceed every
+# observed HEALTHY refresh so happy-path single-flight is never disturbed —
+# post-restart the incident's own endpoints returned in 0.22s / 0.3s /
+# 4.2s, and tasks.fetch_tasks documents a cold-session worst case of
+# roughly 3 * DEFAULT_PER_CALL_TIMEOUT (~6s) per URL — while converting an
+# UNBOUNDED wedge (19.8h measured) into a bounded one.
+_LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
+
+
 class PreformattedFanoutError(ValueError):
     """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
 
@@ -333,6 +352,17 @@ class TTLCache(Generic[V]):
     is intentional: a non-cacheable result must not be handed to every other
     waiter when a subsequent attempt might succeed.
 
+    **Single-flight is bounded, not guaranteed.** Lock acquisition on the cold
+    path waits at most ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``; a refresh that
+    outlives the bound is bypassed — run without the lock — rather than left
+    to wedge every later caller of that key forever. This is the same
+    duplicate-concurrent-refreshes trade the ``cache_ok``-is-False paragraph
+    above already accepts, now also reachable when a *cacheable* refresh
+    simply runs too long, not only when it fails outright. The alternative, a
+    permanent latch, is not acceptable: on 2026-08-27 one refresh that never
+    returned held a key's lock for 19.8h with 7 waiters queued behind it,
+    leaving 3 of 14 endpoints dead for the duration.
+
     **Key space is bounded by disuse, not by cardinality.** A key that stops
     being requested is reclaimed: :meth:`_evict_expired` drops store entries
     older than ``_EVICTION_TTL_MULTIPLE`` times the TTL, along with their
@@ -390,7 +420,13 @@ class TTLCache(Generic[V]):
           dropped only when it is neither held nor awaited. A coroutine that
           has taken a lock object from ``_locks`` reaches ``lock.acquire()``
           with no intervening await (see ``get_or_refresh``), so it cannot be
-          suspended between ``setdefault`` and entering ``acquire()``.
+          suspended between ``setdefault`` and entering ``acquire()``. This
+          invariant survives the bounded acquisition (task 4789):
+          ``await asyncio.wait_for(lock.acquire(), ...)`` delegates into
+          ``lock.acquire()`` as a coroutine, and neither ``wait_for``'s
+          preamble nor ``Timeout.__aenter__`` contains an await, so control
+          still never returns to the event loop before ``acquire()``'s body
+          runs.
 
           ``locked()`` alone would NOT be enough, which is why the predicate
           below also checks for waiters. ``asyncio.Lock.release()`` clears
@@ -430,6 +466,25 @@ class TTLCache(Generic[V]):
             del self._locks[key]
         return len(stale)
 
+    async def _refresh_and_store(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        cache_ok: Callable[[V], bool],
+    ) -> V:
+        """Sweep, run ``refresh()``, and store the result iff ``cache_ok``.
+
+        Shared verbatim by the normal (locked) cold path and the bounded-
+        acquisition bypass path in :meth:`get_or_refresh`, so there is exactly
+        one definition of "sweep, refresh, store iff cache_ok" for both to
+        stay in sync with.
+        """
+        self._evict_expired()
+        value = await refresh()
+        if cache_ok(value):
+            self._store[key] = (time.monotonic(), value)
+        return value
+
     async def get_or_refresh(
         self,
         key: str,
@@ -439,33 +494,52 @@ class TTLCache(Generic[V]):
     ) -> V:
         """Return a fresh cached value for *key*, refreshing at most once.
 
-        Fast path: a warm entry is returned with no lock. Otherwise acquires
-        a per-key lock, re-checks freshness (another waiter may have just
-        filled it), and — if still cold — runs ``refresh()`` and stores the
-        result iff ``cache_ok(value)``.
+        Fast path: a warm entry is returned with no lock. Otherwise lock
+        acquisition is BOUNDED to ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` (task
+        4789). On a NORMAL (within-bound) acquisition, freshness is re-checked
+        (another waiter may have just filled it), and — if still cold —
+        :meth:`_refresh_and_store` runs ``refresh()`` and stores the result
+        iff ``cache_ok(value)``.
 
-        The cold path also sweeps expired entries (:meth:`_evict_expired`).
-        That is deliberately the ONLY sweep site: a cold miss is exactly when
-        a new key can be minted, so reclamation runs at the same rate as
-        growth and a hot warm-path hit stays lock-free and O(1). The sweep is
-        O(store size) but happens only when an ``await refresh()`` — a
-        network round trip — is about to run, which dwarfs it.
+        On a TIMED-OUT acquisition, ``refresh()`` still runs — WITHOUT the
+        lock — rather than raising: a caller that could never previously see
+        a ``TimeoutError`` from this method still cannot. The bypassed result
+        is stored under the same ``cache_ok`` rule as the locked path, which
+        is what lets a wedged key self-heal for every later caller — during
+        the 2026-08-27 incident nothing was ever stored for the wedged key,
+        which is exactly why every later caller kept queueing on a latch that
+        would only release at process exit. See the class docstring's
+        "bounded single-flight" paragraph for the accepted trade.
+
+        Both the locked cold path and the bypass path sweep expired entries
+        (:meth:`_evict_expired`, via :meth:`_refresh_and_store`). That is
+        deliberately the ONLY sweep site: a cold miss is exactly when a new
+        key can be minted, so reclamation runs at the same rate as growth and
+        a hot warm-path hit stays lock-free and O(1). The sweep is O(store
+        size) but happens only when an ``await refresh()`` — a network round
+        trip — is about to run, which dwarfs it. Running it on the bypass
+        path too matters because a bypass is the ONLY traffic a wedged key
+        sees — skipping the sweep there would create a sweep-starved regime
+        during exactly the outage the eviction work (task 3857) was added
+        for.
         """
         fresh = self.get_fresh(key)
         if fresh is not None:
             return fresh
 
         lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            fresh = self.get_fresh(key)
-            if fresh is not None:
-                return fresh
-
-            self._evict_expired()
-            value = await refresh()
-            if cache_ok(value):
-                self._store[key] = (time.monotonic(), value)
-            return value
+        try:
+            await asyncio.wait_for(lock.acquire(), _LOCK_ACQUIRE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            return await self._refresh_and_store(key, refresh, cache_ok)
+        else:
+            try:
+                fresh = self.get_fresh(key)
+                if fresh is not None:
+                    return fresh
+                return await self._refresh_and_store(key, refresh, cache_ok)
+            finally:
+                lock.release()
 
     def clear(self) -> None:
         """Reset the store and all per-key locks (test/admin hook)."""
