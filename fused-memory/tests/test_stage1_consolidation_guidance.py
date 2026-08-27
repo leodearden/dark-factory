@@ -70,3 +70,70 @@ class TestStage1AdvertisesTheConsolidationOp:
         # split: the safety classification belongs with the tool, "Stage 1's
         # ADVERTISEMENT of the op is task 3134's".
         assert _CONSOLIDATE_TOOL_ID not in STAGE1_DISALLOWED
+
+
+def _section(heading: str) -> str:
+    """Return *heading*'s slice of the prompt, up to the next top-level one.
+
+    Slicing keeps every assertion below scoped to the section under test, so a
+    token that happens to appear elsewhere in a 60k-char prompt cannot make a
+    section-level claim pass vacuously.
+    """
+    start = STAGE1_SYSTEM_PROMPT.index(heading)
+    rest = STAGE1_SYSTEM_PROMPT[start + len(heading) :]
+    end = rest.find('\n## ')
+    return rest if end == -1 else rest[:end]
+
+
+class TestStage1ExecutionContract:
+    """`## Executing a Cluster Fold` must carry what 3112's gate section omits.
+
+    Task 3112 owns the TARGET END STATE; this section owns HOW the fold is
+    executed.  Every token pinned below is one a caller cannot succeed without
+    and which the gate section does not supply: the two id arms, the run
+    attribution, and the outcome field that decides whether the fold actually
+    closed.
+    """
+
+    def test_the_section_exists_exactly_once(self) -> None:
+        assert '## Executing a Cluster Fold' in STAGE1_SYSTEM_PROMPT
+        assert STAGE1_SYSTEM_PROMPT.count('## Executing a Cluster Fold') == 1
+
+    def test_the_load_bearing_call_and_outcome_names_are_present(self) -> None:
+        section = _section('## Executing a Cluster Fold')
+        for token in ('supersedes', 'retain', 'run_id', 'survivors'):
+            assert token in section, token
+
+    def test_the_canonical_is_written_before_any_delete(self) -> None:
+        # The ordering directive is the whole reason this rewrite exists: an
+        # unordered canonical-write-plus-deletes with no verification is the
+        # +1-per-pass ratchet `consolidate_memories` was built to end.
+        section = _section('## Executing a Cluster Fold')
+        assert 'before' in section
+        assert 'delete' in section
+
+    def test_partial_is_stated_as_a_no_resume_outcome(self) -> None:
+        # `server/consolidation.py::_PARTIAL_RECOVERY_HINT` says it on the
+        # response; the prompt must say it where the caller reads it BEFORE
+        # calling, because re-running for the same (project, topic) writes a
+        # SECOND canonical rather than resuming.
+        section = _section('## Executing a Cluster Fold')
+        assert 'partial' in section
+        assert 'consolidate_memories' in section
+
+    def test_the_target_end_state_brief_is_not_restated_here(self) -> None:
+        # INV-5 no-lockstep-duplication.  `render_end_state_brief` (task 3112)
+        # owns that text and renders it into this same assembled prompt; a
+        # second normative copy is a contradiction an inference-time reader
+        # resolves arbitrarily.  This section CROSS-REFERENCES it instead.
+        assert 'TARGET END STATE' not in _section('## Executing a Cluster Fold')
+
+    def test_no_doubled_brace_survives_into_the_rendered_prompt(self) -> None:
+        # `STAGE1_SYSTEM_PROMPT` is an f-string, so literal braces in its
+        # source must be doubled — and a doubled brace SURVIVING into the
+        # rendered text means the source over-escaped, shipping a malformed
+        # payload example to the agent silently.  (A single-brace slip fails
+        # loudly at import instead, taking the whole stage down, so only the
+        # quiet direction needs a pin.)
+        assert '{{' not in STAGE1_SYSTEM_PROMPT
+        assert '}}' not in STAGE1_SYSTEM_PROMPT
