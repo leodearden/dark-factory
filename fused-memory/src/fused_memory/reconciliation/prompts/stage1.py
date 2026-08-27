@@ -42,6 +42,10 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
+- `mcp__fused-memory__consolidate_memories` — the SANCTIONED path for folding a \
+duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
+`add_memory`/`update_memory` plus N `delete_memory` sequence; see \
+## Executing a Cluster Fold below for the contract.
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 {AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
