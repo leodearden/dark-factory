@@ -656,7 +656,7 @@ _ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL AND e.expired_at IS NULL'
 # reshuffle at a boundary drops rows permanently and silently.
 _ALL_VALID_EDGES_MATCH = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
+    f'WHERE {_ACTIVE_EDGE_PREDICATE} '
 )
 _ALL_VALID_EDGES_PAGE_TEMPLATE = (
     _ALL_VALID_EDGES_MATCH
@@ -2311,7 +2311,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL AND m.uuid <> $uuid '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
@@ -2519,7 +2519,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
@@ -3103,7 +3103,7 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity {name: $name}) '
             'WHERE n.group_id = $group_id '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+            f'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE {_ACTIVE_EDGE_PREDICATE} '
             'WITH n, count(DISTINCT e) AS edge_count '
             'RETURN n.uuid, n.created_at, edge_count '
             'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
