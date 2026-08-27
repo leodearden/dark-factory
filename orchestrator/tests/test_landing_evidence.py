@@ -917,6 +917,11 @@ class TestFileUnattributedLandingEscalationDedup:
     def test_dedup_call_is_category_scoped(self) -> None:
         """(a) The dedup probe must name the category, not pass a bare id."""
         queue = MagicMock()
+        # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+        # record on this citation, so "nothing was previously adjudicated" must
+        # be STATED, not inherited from MagicMock's truthy auto-child — which
+        # would suppress the filing and silently undo task 3116's fix.
+        queue.find_terminal_by_citation.return_value = None
         queue.has_open_l1.return_value = False
 
         file_unattributed_landing_escalation(
@@ -934,6 +939,11 @@ class TestFileUnattributedLandingEscalationDedup:
         repeated ticks re-observing the same evidence don't stack L1s.
         """
         queue = MagicMock()
+        # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+        # record on this citation, so "nothing was previously adjudicated" must
+        # be STATED, not inherited from MagicMock's truthy auto-child — which
+        # would suppress the filing and silently undo task 3116's fix.
+        queue.find_terminal_by_citation.return_value = None
         queue.has_open_l1.side_effect = (
             lambda task_id, *, category=None: category == 'provenance_unattributed'
         )
@@ -951,6 +961,11 @@ class TestFileUnattributedLandingEscalationDedup:
         defect.  Today's bare call suppresses this filing entirely.
         """
         queue = MagicMock()
+        # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+        # record on this citation, so "nothing was previously adjudicated" must
+        # be STATED, not inherited from MagicMock's truthy auto-child — which
+        # would suppress the filing and silently undo task 3116's fix.
+        queue.find_terminal_by_citation.return_value = None
         queue.has_open_l1.side_effect = (
             lambda task_id, *, category=None: category is None
         )
@@ -977,6 +992,12 @@ class TestFileUnattributedLandingEscalationDedup:
         an escalation filer must never break its caller.
         """
         queue = MagicMock()
+        # Explicit (task 4499): stated so the ABSENCE of a filing below is
+        # unambiguously the raising has_open_l1 being contained, and not the
+        # auto-dismiss guard suppressing on MagicMock's truthy auto-child.
+        # (has_open_l1 raises first, so this is never reached — which is the
+        # point: the precondition is stated, never inherited.)
+        queue.find_terminal_by_citation.return_value = None
         queue.has_open_l1.side_effect = RuntimeError('queue exploded')
 
         file_unattributed_landing_escalation(

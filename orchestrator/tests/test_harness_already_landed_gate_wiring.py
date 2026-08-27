@@ -625,6 +625,11 @@ def _wired_marker_harness(
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
+    # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+    # record on this citation, so "nothing was previously adjudicated" must be
+    # STATED, not inherited from MagicMock's truthy auto-child — which would
+    # silently suppress every filing these tests assert on.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 
@@ -801,6 +806,11 @@ def _wired_content_harness(
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
+    # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+    # record on this citation, so "nothing was previously adjudicated" must be
+    # STATED, not inherited from MagicMock's truthy auto-child — which would
+    # silently suppress every filing these tests assert on.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 

@@ -166,10 +166,27 @@ the ``Harness._branch_is_degenerate`` delegation), ``escalation/server.py``
 Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
 a rejected verdict into a human-facing ``(summary, detail)`` pair, and
 :func:`file_unattributed_landing_escalation` is the dedup-guarded L1 filing
-boilerplate (queue-None guard, ``has_open_l1`` dedup, ``Escalation``
-construction) that both ``Harness._file_unattributed_landing_escalation``
-and ``SpeculativeMergeWorker._file_unattributed_landing_escalation``
-delegate to — the two differ only in the ``agent_role`` they pass.
+boilerplate (queue-None guard, ``has_open_l1`` dedup, the terminal-record
+auto-dismiss, ``Escalation`` construction) that both
+``Harness._file_unattributed_landing_escalation`` and
+``SpeculativeMergeWorker._file_unattributed_landing_escalation`` delegate
+to — the two differ only in the ``agent_role`` they pass.
+
+That filer carries TWO complementary dedup guards, and the pair is what
+closes the close-then-refile ping-pong for an ABSORBING reject condition —
+the same failure shape task 2870 hit with ``lineage_mismatch`` and
+documented above (task 4499). ``has_open_l1`` asks *is a duplicate still
+OPEN?* and reads PENDING records only, so it necessarily goes False the
+moment the auto-watcher resolves the L1 — and the next tick refiles the
+identical finding, forever. ``EscalationQueue.find_terminal_by_citation``
+asks the complementary question, *was this exact evidence already
+ADJUDICATED?*, against RESOLVED and DISMISSED records carrying the same
+``citation_sha`` this filing would stamp. The asymmetry is deliberate: a
+filing is suppressed ONLY against a terminal record with an identical
+citation sha, so genuine new evidence — a different sha, no sha at all, a
+different task, a different category — always gets through. Suppression is
+the only outcome that LOSES an escalation, so every uncertain path resolves
+toward filing.
 """
 
 from __future__ import annotations
@@ -2198,6 +2215,28 @@ def file_unattributed_landing_escalation(
     citation is ever assigned — so that arm carries no identity by
     construction.
 
+    **An identical refile is auto-dismissed** (task 4499). ``has_open_l1``
+    above cannot close the close-then-refile ping-pong, and never could: it
+    reads PENDING records, so it goes False by design the moment the
+    auto-watcher resolves the L1 — and because this reject condition is
+    ABSORBING (main only moves forward, so evidence that stopped surviving
+    stays gone) the next tick re-observes the identical finding and refiles
+    it, forever. The second guard therefore consults
+    ``find_terminal_by_citation`` for a RESOLVED or DISMISSED record on this
+    task carrying the same ``citation_sha``, and returns without filing when
+    one exists. The two guards are complementary — *is a duplicate still
+    OPEN?* versus *was this exact evidence already ADJUDICATED?* — and the
+    category scoping on the first one is task 3116's, load-bearing, and not
+    re-derived here.
+
+    The asymmetry is deliberate and is the safety property: suppression
+    applies ONLY against a terminal record with an IDENTICAL citation sha, so
+    genuine new evidence always gets through — a different sha, no sha at all
+    (a ``no_citation`` reject can never suppress, by the falsy-key
+    short-circuit), a different task, or a different category. Suppression is
+    the only outcome that LOSES an escalation, so it is the narrowest of the
+    two guards by construction.
+
     Args:
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
         task_id: The task (or coalesce member) id the escalation is filed for.
@@ -2215,6 +2254,23 @@ def file_unattributed_landing_escalation(
         ):
             return
         citation_sha = verdict.probe.get('citation')
+        # AUTO-DISMISS an identical refile (task 4499).  Sits AFTER the pending
+        # guard above — the two are complementary, not redundant: that one asks
+        # "is a duplicate still OPEN?" (pending-only), this one asks "was this
+        # exact evidence already ADJUDICATED?" (terminal-only).  It must run
+        # BEFORE make_id below, so a suppressed refile burns no sequence number.
+        prior = escalation_queue.find_terminal_by_citation(
+            task_id, 'provenance_unattributed', citation_sha,
+        )
+        if prior is not None:
+            logger.warning(
+                'Suppressing provenance_unattributed refile for task %s '
+                '(branch %s, citation %s): already adjudicated by %s '
+                '(%s by %s)',
+                task_id, branch, citation_sha, prior.id, prior.status,
+                prior.resolved_by,
+            )
+            return
         from escalation.models import Escalation  # noqa: PLC0415
 
         summary, detail = format_unattributed_landing_detail(task_id, branch, verdict)
