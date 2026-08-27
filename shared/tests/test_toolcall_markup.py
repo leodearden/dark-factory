@@ -700,6 +700,118 @@ _HOSTILE_VALUES = [
 ]
 
 
+class TestQuotationIsNotATruncation:
+    """The QUOTATION GUARD (task 4696 review). Prose that ENDS by quoting a
+    sibling's tag pair must come back BYTE-IDENTICAL, never truncated.
+
+    ``detect_for`` widened the gate with *param*'s own closer AND every
+    ``schema_params`` sibling's, and ``repair`` accepts an EMPTY tail (a
+    candidate closer at end-of-string recovers ``{}`` and still returns
+    ``clean_value = value[:candidate.start()]``). Composed, those two facts made
+    any value legitimately ending in a sibling's closing tag a silent
+    TRUNCATION reported as ``repaired`` — in a repo whose plans and escalation
+    records routinely quote this very markup.
+
+    The discriminator is EVIDENCE, not breadth: an empty tail recovers nothing,
+    so there is no absorbed argument and the "repair" is pure text loss. It
+    stays legal for a SELF-NAME closer (PRD boundary row B4, and the whole
+    212-of-212 population the 2026-08-25 census measured) and for the fixed
+    literal set, which has always been repaired here. It is refused only for a
+    name the WIDENING contributed — whose genuine cross-field population that
+    same census puts at ZERO.
+    """
+
+    def test_prose_ending_in_a_sibling_closer_is_returned_unrepaired(self):
+        """THE NEGATIVE CONTROL. A value quoting a sibling's pair is not a leak.
+
+        Reproduced end-to-end before the fix: this returned a Repair whose
+        ``clean_value`` dropped the trailing closer AND the closing half of the
+        author's quotation, with ``recovered == {}`` — i.e. it destroyed text
+        and recovered nothing, while reporting success.
+        """
+        value = (
+            'The harness emits '
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        assert repair(
+            value,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        ) is None
+
+    def test_the_widened_gate_still_SEES_it_so_it_reaches_adjudication(self):
+        """Refusing is not narrowing DETECTION. The value still trips the gate,
+        so the caller reports it (plan-tools ``unrepairable``, the sweep
+        ``refused``) into the human queue rather than silently rewriting it."""
+        value = (
+            'The harness emits '
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        assert detect_for(value, 'title', _SUBMIT_TASK_PARAMS) is not None
+
+    def test_a_self_name_closer_at_end_of_string_is_still_repaired(self):
+        """PRD boundary row B4 is UNCHANGED — the guard is scoped to ``name !=
+        param``. This is the dialect the whole task exists to repair."""
+        clean = 'The reconciler re-reads the plan on every pass.'
+
+        result = repair(
+            clean + _closer('description'),
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {}
+
+    def test_a_fixed_literal_at_end_of_string_is_still_repaired(self):
+        """The guard exempts :data:`ENVELOPE_LITERALS`, so nothing this task
+        touched changed for the set ``detect`` already spelled.
+
+        DELIBERATELY SCOPED. Prose ending in a fixed literal (``\x3c/content>``,
+        ``\x3c/description>``, ...) has been truncated here since long before
+        task 4696, under the blanket ``detect`` gate. Exempting the fixed set
+        keeps this fix to the surface THIS task introduced; re-litigating the
+        fixed set's calibration is PRD section 7 out-of-scope."""
+        clean = 'Only the escalation-watcher path is scoped).'
+
+        result = repair(
+            clean + _CANONICAL_CLOSER,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+
+    def test_a_REAL_cross_field_leak_with_a_tail_is_still_repaired(self):
+        """The guard keys on the EMPTY tail, not on cross-field-ness. A genuine
+        absorbed argument carries a tail, parses, and is recovered as before —
+        so this is not option (a)'s blanket narrowing of the gate."""
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'high' + _closer('priority')
+        )
+
+        result = repair(
+            value,
+            param='title',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset(),
+        )
+
+        assert result is not None
+        assert result.clean_value == clean
+        assert result.recovered == {'priority': 'high'}
+
+
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
 

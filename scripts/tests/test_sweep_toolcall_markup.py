@@ -1027,6 +1027,63 @@ def test_echo_dialect_no_longer_half_repairs_past_its_own_misclose():
     )
 
 
+def test_a_value_quoting_a_SIBLING_KEYS_tag_pair_comes_back_by_IDENTITY():
+    """The sweep's per-object widening must not truncate prose (4696 review).
+
+    ``_repair_dict`` widens the gate by EVERY SIBLING KEY of the containing
+    object (``schema = set(working.keys())``) — a far wider name set than any
+    tool's real parameter vocabulary. Composed with ``repair()``'s acceptance
+    of an EMPTY tail, a value that legitimately ENDS with a sibling key's
+    closing tag was flagged, reached ``repair()``, matched with an empty tail,
+    and was TRUNCATED and reported ``repaired`` with ``recovered_names=()`` —
+    i.e. text destroyed, nothing recovered, nothing surfaced.
+
+    That is not a hand-reviewable handful under ``--apply``: the ``meta-plans``
+    lane targets ~1124 dead meta-root plans on the live repo.
+
+    ``\x3c/summary>`` is the right specimen precisely because ``summary`` is a
+    real sibling key here AND is not one of the fixed ``ENVELOPE_LITERALS``, so
+    it is a name the widening contributed and nothing else. The fix lives at
+    the shared ``repair()`` chokepoint, so this row pins what the sweep
+    INHERITS — this module still adds no second policy layer (decision 7,
+    INV-5).
+    """
+    doc = {
+        'summary': 'Guard leak',
+        'detail': 'The record wraps it in ' + '\x3csummary>' + 'Title' + _closer('summary'),
+    }
+    original_detail = doc['detail']
+
+    repaired, outcomes = sweep.repair_document(doc)
+
+    assert repaired is doc, (
+        'copy-on-write: nothing changed, so the document must come back by '
+        'IDENTITY — a copy here is what makes the sweep rewrite the file'
+    )
+    assert repaired['detail'] == original_detail
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].residue == sweep.RESIDUE_QUOTED_ONLY, (
+        'no invoke terminator and no canonical opener: this is prose quoting a '
+        'tag, so it lands in the adjudication queue as quoted-only residue '
+        'rather than being rewritten'
+    )
+
+
+def test_a_REAL_sibling_key_leak_with_a_tail_is_still_repaired():
+    """The guard keys on the EMPTY tail, not on cross-key-ness — so the sweep
+    keeps repairing genuine absorbed arguments across sibling keys."""
+    doc = {
+        'summary': '',
+        'detail': _swallowed('The real detail.', 'detail', 'summary', 'Recovered title'),
+    }
+
+    repaired, outcomes = sweep.repair_document(doc)
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
+    assert repaired['detail'] == 'The real detail.'
+    assert repaired['summary'] == 'Recovered title'
+
+
 # ---------------------------------------------------------------------------
 # step-7 — convergence, and the bound.
 # ---------------------------------------------------------------------------

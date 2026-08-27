@@ -2953,3 +2953,87 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
 
         flagged = [f for f in facts if f['field'] == 'rationale']
         assert flagged[0]['pattern'] == _close('rationale')
+
+
+#: A ``rationale`` whose prose legitimately ENDS by quoting a SIBLING field's
+#: tag pair. ``decision`` is a real sibling parameter of ``add_design_decision``
+#: and its closer is NOT one of the fixed ``ENVELOPE_LITERALS``, so it is a name
+#: the task-4696 widening contributed and nothing else.
+_QUOTED_SIBLING_PROSE = (
+    'The harness emits ' + _LT + 'decision>X' + _close('decision')
+)
+
+
+class TestQuotedSiblingTagIsNeverTruncated:
+    """A plan that TALKS ABOUT the markup must not be rewritten by the reader.
+
+    The widening at ``_carries_markup`` / ``_repair_one_field`` added every
+    sibling ``record.schema_params`` name to the gate, and ``repair`` accepts an
+    EMPTY tail — a candidate closer at end-of-string recovers ``{}`` and still
+    returns ``clean_value = value[:candidate.start()]``. Composed, a rationale
+    ending in ``\x3c/decision>`` was TRUNCATED, reported ``repaired``, and
+    persisted atomically by ``_read_plan_repaired``, with nothing left to
+    surface the loss. Pre-4696 the blanket ``detect`` returned None and the
+    value was left alone, so the loss surface was introduced by that change.
+
+    This is not hypothetical in a repo whose plans discuss tool-call markup —
+    the containment PRD itself quotes these tags. And the widening bought
+    nothing measured: the PRD's 2026-08-25 census puts the CROSS-FIELD
+    population at ZERO (212/212 invisible specimens are self-name).
+
+    The fix is at the shared ``repair`` chokepoint, so the sweep's own
+    sibling-key widening is closed by the same mechanism (INV-5).
+    """
+
+    def test_the_specimen_was_invisible_before_the_widening(self):
+        """Otherwise this class would be pinning pre-existing behaviour."""
+        assert detect(_QUOTED_SIBLING_PROSE) is None
+
+    def test_the_value_comes_back_byte_identical(self, plan_artifacts):
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        repaired, _facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE
+
+    def test_no_repaired_fact_is_emitted_for_it(self, plan_artifacts):
+        """``repaired`` would be an outright false report: nothing was
+        recovered, so the only change would have been text DESTROYED."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        _repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        flagged = [f for f in facts if f['field'] == 'rationale']
+        assert [f['outcome'] for f in flagged] == ['unrepairable']
+        assert flagged[0]['recovered_params'] == []
+
+    def test_the_file_is_never_rewritten(self, plan_artifacts):
+        """The all-refusals branch of ``_read_plan_repaired`` must hold, or the
+        truncation would be durable and the mtime would churn under watchers."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+        before = (plan_artifacts.root / 'plan.json').read_bytes()
+
+        plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert (plan_artifacts.root / 'plan.json').read_bytes() == before
+
+    def test_a_self_name_closer_in_the_same_plan_is_still_repaired(
+        self, plan_artifacts
+    ):
+        """The guard is scoped to ``name != param``, so the dialect this task
+        exists to fix is untouched — the fix narrows REPAIR, not DETECTION."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
+        plan['reuse'][0]['how'] = _SELF_NAME_HOW
+        plan_artifacts.write_plan(copy.deepcopy(plan))
+
+        repaired, _facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
+        assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE

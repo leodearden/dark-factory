@@ -469,6 +469,15 @@ def repair(
     itself envelope-free. Otherwise ``None`` — never a guess, and never a
     PARTIAL repair.
 
+    ONE FURTHER ACCEPT-TIME CONDITION, THE QUOTATION GUARD (task **4696**
+    review). A candidate whose tail is EMPTY, whose ``X != param``, and whose
+    closer is not one of the fixed :data:`ENVELOPE_LITERALS` is REFUSED: it
+    recovers nothing, so accepting it would merely truncate the caller's text
+    at a sibling's closing tag — prose QUOTING that tag, not an argument
+    absorbed by it. See the guard at the accept site for the census that says
+    the cross-field leak population is zero. Never a TRUNCATION dressed up as
+    a repair.
+
     NO SILENT PARTIAL REPAIR. The returned ``clean_value`` is guaranteed to
     satisfy ``detect_for(clean_value, param, schema_params) is None`` — and
     therefore ``detect(clean_value) is None`` too, since the parameter-aware
@@ -526,6 +535,38 @@ def repair(
 
         recovered = _parse_tail(value[candidate.end():])
         if recovered is None:
+            continue
+        # THE QUOTATION GUARD (task 4696 review). An EMPTY tail means the
+        # candidate closer sits at end-of-string with NOTHING after it, so there
+        # is no absorbed argument to recover and the "repair" degenerates to a
+        # pure TRUNCATION of the caller's own text at that tag.
+        #
+        # That truncation is right for a SELF-NAME closer (``name == param``):
+        # the value was mis-closed with its own tag and was the tool's last
+        # parameter, which is PRD boundary row B4 and the entire 212-of-212
+        # population the 2026-08-25 census measured. It is also right for the
+        # FIXED literal set, whose members trip ``detect`` and have therefore
+        # always been repaired here — this task changed nothing for them.
+        #
+        # It is WRONG for a name contributed by the WIDENING, i.e. a sibling
+        # parameter's closer that ``detect_for`` only started spelling at this
+        # task. Prose that legitimately ENDS by quoting a sibling's tag pair —
+        # ubiquitous in a repo whose plans and escalation records discuss this
+        # very markup — is not an absorbed argument, and the same census puts
+        # the genuine CROSS-FIELD leak population at ZERO. Truncating it would
+        # destroy authored text and, worse, report ``repaired`` while doing so,
+        # so nothing would ever surface it for adjudication.
+        #
+        # Refusing (rather than accepting) leaves the value BYTE-IDENTICAL and
+        # lets the caller report it — ``plan_tools`` as ``unrepairable``, the
+        # sweep as ``refused`` — into the human queue. Detection breadth is
+        # deliberately NOT narrowed: a real cross-field leak still carries a
+        # non-empty tail, still parses, and is still repaired here.
+        if (
+            not recovered
+            and name != param
+            and closer_for(name) not in ENVELOPE_LITERALS
+        ):
             continue
         # Accept-time conditions, so a rejected candidate simply advances the
         # scan. Boundary rows B8 (recovered name not in the tool's schema) and
