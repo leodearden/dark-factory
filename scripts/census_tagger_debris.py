@@ -464,6 +464,16 @@ def load_stamped_records(tasks_db_path: str) -> dict[tuple[str, int], StampedRec
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
+    THE EVENT AND MERGE JOINS CANNOT HONOUR THAT KEY, and ``census_project``
+    says so at the lookup sites: ``events`` has no ``tag`` column at all (its
+    columns are id, timestamp, run_id, task_id, event_type, phase, role, data,
+    cost_usd, duration_ms), so a scope event and a merge verdict can only be
+    keyed by numeric id. The full key is therefore load-bearing HERE — it keeps
+    two same-id records DISTINCT ROWS in the artifact — and presentational
+    there: two such rows would receive the same event list. Unreachable on
+    today's single-``master``-tag corpora, and it would take a tag column on
+    ``events`` to make it fixable rather than merely documented.
+
     A row whose ``metadata`` is NULL, malformed JSON, a non-dict payload, or
     carries no/empty ``files_tagged_at`` is SKIPPED rather than raising: one
     corrupt row must never abort a sweep over 12,000+ records. That is the same
@@ -624,17 +634,23 @@ def project_id_for(project_root: str) -> str:
     return Path(project_root).name.replace("-", "_")
 
 
-def _record_sort_key(record: CensusRecord) -> tuple[str, int, str]:
-    """Sort by (tag, NUMERIC task id) so 100 follows 20 rather than preceding it.
+def _sort_key(record: CensusRecord, lead: str) -> tuple[str, int, str]:
+    """Sort by (*lead*, NUMERIC task id) so 100 follows 20 rather than preceding it.
+
+    ONE helper for BOTH orderings, parameterized by the leading field. A
+    ProjectCensus orders its records by ``tag`` (a single project, possibly
+    several tags); the cross-project report orders by ``project_id``. The two
+    differ in nothing else, and the near-identical copies this replaces invited
+    drift in the FALLBACK — the part that actually carries the risk.
 
     Same shape and same fallback as audit_wiped_metadata_files._candidate_sort_key
     :573-578 — a non-numeric id sorts first under its own string rather than
     raising, so one odd id cannot abort a whole sweep's rendering.
     """
     try:
-        return (record.tag, int(record.task_id), "")
+        return (lead, int(record.task_id), "")
     except (TypeError, ValueError):
-        return (record.tag, 0, str(record.task_id))
+        return (lead, 0, str(record.task_id))
 
 
 def census_project(project_root: str) -> ProjectCensus:
@@ -689,6 +705,14 @@ def census_project(project_root: str) -> ProjectCensus:
 
     records: list[CensusRecord] = []
     for record in stamped.values():
+        # KEYED BY NUMERIC ID, NOT BY (tag, id) — deliberately, and not an
+        # oversight against load_stamped_records' emphatic full-key docstring:
+        # the ``events`` table carries NO tag column, so neither this lookup nor
+        # the merge_signature one below can be disambiguated by tag. Two records
+        # sharing an id under different tags stay distinct ROWS (the stamped
+        # dict is keyed on the full primary key) but would share an event list
+        # and a merge verdict. Not reachable on today's single-``master``-tag
+        # corpora; fixing it would take a tag column on ``events``.
         events = scope_events.get(str(record.task_id), [])
         verdict = classify_record(
             record.files_tagged_at, record.status, events, record.metadata_files
@@ -713,7 +737,7 @@ def census_project(project_root: str) -> ProjectCensus:
                 ),
             )
         )
-    records.sort(key=_record_sort_key)
+    records.sort(key=lambda record: _sort_key(record, record.tag))
 
     return ProjectCensus(
         project_root=project_root,
@@ -802,14 +826,6 @@ def _record_to_dict(record: CensusRecord) -> dict:
     }
 
 
-def _report_sort_key(record: CensusRecord) -> tuple[str, int, str]:
-    """(project_id asc, NUMERIC task id asc), with a fallback that cannot raise."""
-    try:
-        return (record.project_id, int(record.task_id), "")
-    except (TypeError, ValueError):
-        return (record.project_id, 0, str(record.task_id))
-
-
 def build_report(
     censuses: list[ProjectCensus], unreadable: Sequence[str] = ()
 ) -> dict:
@@ -862,9 +878,14 @@ def build_report(
             "cells": cells,
         }
 
+    # Re-sorted under a DIFFERENT leading field: census_project already ordered
+    # each project's records by (tag, id) for its own ProjectCensus.records
+    # consumers, and the artifact needs (project_id, id) across all of them. The
+    # per-project sort is therefore not redundant work this could drop — it is a
+    # separate ordering with a separate consumer.
     records = sorted(
         (record for census in ordered for record in census.records),
-        key=_report_sort_key,
+        key=lambda record: _sort_key(record, record.project_id),
     )
     roots = [census.project_root for census in ordered]
 
