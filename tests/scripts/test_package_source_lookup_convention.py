@@ -406,10 +406,13 @@ def test_documented_import_provenance_check_resolves_to_a_checkout_source_tree()
     a first-party workspace member is installed EDITABLE, so it lands in a
     checkout's source tree, which is the exact inverse of the third-party
     assertion above. That is also the concrete mechanism behind the OPERATIONS.md
-    Troubleshooting symptom "a task blocks at VERIFY with ``AttributeError`` for
-    code it just wrote" — from a worktree shell that inherited main's
+    Troubleshooting row for an agent reporting an ``AttributeError`` in its OWN
+    shell for code it just wrote — from a worktree shell that inherited main's
     ``VIRTUAL_ENV``, a first-party import gives you MAIN's source, not the
-    worktree edits.
+    worktree edits. It is NOT a verify-stage mechanism:
+    ``verify._target_subprocess_env`` strips ``VIRTUAL_ENV`` from every verify
+    subprocess (see the ``sys.executable`` hazard note in the module docstring),
+    so verify reads the worktree's own ``.venv``.
 
     DELIBERATELY NOT ASSERTED: that the resolved path is under ``REPO_ROOT``. In
     a cold-verified worktree running its own ``.venv`` the editable install

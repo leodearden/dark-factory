@@ -100,8 +100,16 @@ First-party workspace members do NOT: they are installed **editable**, so they
 resolve into a checkout's `src/` tree instead. WHICH checkout is the question
 that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
 `import <member>` hands you MAIN's source, not the code you just edited in your
-worktree. That is the mechanism behind the `OPERATIONS.md` Troubleshooting row
-for a task blocking at VERIFY with an `AttributeError` for code it just wrote.
+worktree. That inheritance is real for **your own Bash session and only there**
+— the orchestrator hands an agent subprocess a plain copy of its own environment
+(`orchestrator/src/orchestrator/agents/invoke.py`), `VIRTUAL_ENV` included. It is
+NOT how verify runs: every verify command is spawned through
+`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips
+`VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its
+OWN `.venv`. So a hand-run import in your shell can disagree with verify — when
+it does, verify is the one reading your worktree. That asymmetry is the mechanism
+behind the `OPERATIONS.md` Troubleshooting row for an agent reporting an
+`AttributeError` in its own shell for code it just wrote.
 
 <!-- import-provenance-check:begin
      Also EXECUTED verbatim by
