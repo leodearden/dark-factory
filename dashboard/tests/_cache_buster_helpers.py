@@ -23,7 +23,10 @@ case has to be constructed.
 from __future__ import annotations
 
 import re
+import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 # Repo-root-relative, which is the form both `git show <sha>:<path>` and
 # `git diff -- <pathspec>` require.  Pinned in the contract file so moving the
@@ -142,3 +145,96 @@ def cache_buster_violation(head_version: int, base: ReduxBaseState) -> str | Non
         )
 
     return None
+
+
+def _git(
+    repo_root: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run git in *repo_root*, never inheriting the process cwd.
+
+    The cwd matters: the verify lane runs `cd dashboard && uv run pytest
+    tests/`, so the process cwd is the SUBPROJECT, not the repo root, and a
+    git call that inherited it would resolve pathspecs against the wrong
+    directory.  Follows the `_git` convention at
+    `scripts/tests/test_lms_marker_contract.py::_git`, minus `check=True` —
+    callers here decide what a non-zero exit means, and the two answers
+    differ (see `resolve_redux_base_state`).
+    """
+    return subprocess.run(
+        ['git', *args],
+        cwd=repo_root, capture_output=True, text=True, timeout=60,
+    )
+
+
+def resolve_redux_base_state(
+    repo_root: Path,
+    base_refs: Sequence[str] = ('main', 'origin/main'),
+) -> ReduxBaseState | None:
+    """What the merge base says about the redux assets, or `None` if unmeasurable.
+
+    Returns `None` — do NOT raise — when no candidate ref resolves.  "No main
+    ref" means an sdist install or a shallow clone, i.e. "not measurable
+    here", not "the tree is bad"; failing there would be a false red, so the
+    caller degrades to a visible pytest skip instead.
+
+    The asymmetry after that point is deliberate: once `merge-base` has
+    succeeded we know we are in a real checkout, so a subsequent `git diff`
+    failure is a BROKEN tree and raises with the captured stderr rather than
+    degrading into an exempt state — loud over silent fail-soft.
+
+    `changed_assets` is measured against the WORKING TREE, not HEAD, so an
+    implementer sees the demand during the edit/verify loop rather than only
+    after committing.  `--diff-filter=M` restricts it to a path that existed
+    at base and now holds different bytes, which is precisely "an asset URL
+    browsers already cached now serves something else": an ADDED asset has a
+    URL no browser has cached and must not force a bump.  `--no-renames`
+    keeps a rename reported as add+delete so it cannot masquerade as a
+    modification.
+    """
+    base_sha = None
+    base_ref = None
+    for ref in base_refs:
+        proc = _git(repo_root, 'merge-base', ref, 'HEAD')
+        if proc.returncode == 0 and proc.stdout.strip():
+            base_sha = proc.stdout.strip()
+            base_ref = ref
+            break
+    if base_sha is None or base_ref is None:
+        return None
+
+    shown = _git(repo_root, 'show', f'{base_sha}:{INDEX_HTML_REL}')
+    base_version: int | None = None
+    if shown.returncode == 0:
+        try:
+            base_version = sole_cache_buster_version(shown.stdout)
+        except ValueError:
+            # The base predates the `?v=` scheme, or was mid-bump.  There is no
+            # single number to compare against, which is not a violation.
+            base_version = None
+
+    diffed = _git(
+        repo_root,
+        'diff', '--name-only', '--no-renames', '--diff-filter=M',
+        base_sha, '--', REDUX_ASSET_DIR,
+    )
+    if diffed.returncode != 0:
+        raise RuntimeError(
+            f'git diff against merge base {base_sha} failed in {repo_root} after '
+            f'merge-base({base_ref}, HEAD) had already succeeded, so this is a '
+            f'broken checkout rather than an unmeasurable one: {diffed.stderr.strip()}'
+        )
+
+    changed_assets = tuple(
+        sorted(
+            line
+            for line in diffed.stdout.splitlines()
+            if line and line != INDEX_HTML_REL
+        )
+    )
+
+    return ReduxBaseState(
+        base_ref=base_ref,
+        base_commit=base_sha,
+        base_version=base_version,
+        changed_assets=changed_assets,
+    )
