@@ -32,6 +32,7 @@ import types
 import pytest
 from setup_host_sections import (
     checker_repo,
+    enabled_units,
     run_section,
     setup_host_text,
     slice_section,
@@ -2747,6 +2748,138 @@ def test_section_8_greenfield_installs_the_single_root_default(
         "With no installed unit to read, the rendered single-root default is "
         "what must land."
     )
+
+
+# The renderer's OWN failure shape, in stub form: a tagged error line on stderr,
+# a non-zero exit, and nothing written to --output. Same manoeuvre as
+# `usage_error_checker` above — a real script whose only behaviour is the
+# failure being simulated — because the property under test is what the
+# INSTALLER does with a non-zero renderer, not how the renderer got there.
+_FAILING_RENDERER = (
+    "import sys\n"
+    "sys.stderr.write('[dashboard_unit_render] FAILED: cannot read template\\n')\n"
+    "sys.exit(1)\n"
+)
+
+
+def _seeded_with_nine_roots(
+    tmp_path: pathlib.Path, mod: types.ModuleType, repo: pathlib.Path
+) -> pathlib.Path:
+    """An installed dir at parity except for this host's nine aggregation roots."""
+    return _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={
+            _DASHBOARD_SERVICE: (
+                "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory",
+                f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS={_NINE_ROOTS}",
+            )
+        },
+    )
+
+
+def _assert_render_degraded_loudly(
+    tmp_path: pathlib.Path,
+    repo: pathlib.Path,
+    unit_dir: pathlib.Path,
+    before: bytes,
+    result: subprocess.CompletedProcess,
+) -> None:
+    """The whole loud-degradation contract, asserted in one place for both branches.
+
+    Both ways the render can fail — the script missing, and the script running
+    and returning non-zero — must land on the SAME operator-visible outcome, so
+    they are asserted through one helper rather than two drifting copies.
+    """
+    # 1. The installer does not abort. `fail` is a printf, not an exit: one
+    #    un-renderable service unit must not take the rest of section 8 with it.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    # 2. It says so, loudly.
+    assert "FAIL " in result.stdout, (
+        f"A render that did not happen must be reported.\n{result.stdout}"
+    )
+
+    # 3. And it does NOT claim otherwise. A green line about the render, next to
+    #    a FAIL about the render, is the reports-green-because-it-never-ran
+    #    failure this whole gate family exists to remove.
+    ok_lines = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
+    assert not any("render" in line.lower() for line in ok_lines), (
+        f"An OK line claims the render succeeded.\n{result.stdout}"
+    )
+
+    # 4. The host's unit is BYTE-UNCHANGED — not truncated, not half-written,
+    #    not silently re-rendered by a fallback that would have stripped the
+    #    very values this preserves. Stale-but-intact is the recoverable
+    #    direction, and section 12's gate reports the staleness next run.
+    after = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+    assert after == before, (
+        "The installed dashboard unit was modified by a render that failed."
+    )
+    assert _NINE_ROOTS.encode() in after, "this host's nine roots did not survive"
+
+    # 5. The REST of section 8 still ran. One un-renderable service unit must
+    #    not take the watchdog supervision with it — the same reasoning
+    #    setup_host_parsing.INSTALL_LOOP_CP records for the orchestrator copy
+    #    loop.
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        assert (unit_dir / name).read_text(encoding="utf-8") == (
+            repo / "dashboard" / name
+        ).read_text(encoding="utf-8"), f"{name} was not copied"
+    assert enabled_units(tmp_path) == [
+        "dark-factory-dashboard",
+        "dark-factory-dashboard-watchdog.timer",
+    ], enabled_units(tmp_path)
+    assert "OK Dashboard units installed" in result.stdout, (
+        f"section 8 did not reach its closing line.\n{result.stdout}"
+    )
+
+
+def test_section_8_render_failure_leaves_the_installed_unit_intact(
+    tmp_path: pathlib.Path,
+):
+    """A renderer that RAN and returned non-zero must not pass for a success.
+
+    This is the `elif ...; then ok` construct's blind spot: with no else branch,
+    a failing render falls out of the if-chain with status 0 and the operator is
+    told nothing at all about the unit that did not get written — while the
+    section's closing "Dashboard units installed" line still prints, which reads
+    as confirmation that it did.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+        _FAILING_RENDERER, encoding="utf-8"
+    )
+    unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
+    before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    _assert_render_degraded_loudly(tmp_path, repo, unit_dir, before, result)
+
+
+def test_section_8_missing_renderer_does_not_clobber_host_local_values(
+    tmp_path: pathlib.Path,
+):
+    """The `[ ! -f ]` branch: a renamed or missing renderer is not a licence to sed.
+
+    Deleting the file AFTER _gate_repo, rather than adding a `with_renderer=`
+    flag to it, is deliberate: the unconditional copy in that helper is itself
+    an invariant (a stub checker body must never shadow the renderer), and a
+    flag would give a future reader two reasons a renderer might be absent.
+    Here it is absent because this test removed it, on the line that says so.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").unlink()
+    unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
+    before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    _assert_render_degraded_loudly(tmp_path, repo, unit_dir, before, result)
 
 
 # ---------------------------------------------------------------------------
