@@ -183,6 +183,24 @@ def _cited_task_key(project_id: str, task_id: str) -> str:
     return f'{project_id}:{task_id}'
 
 
+def _citation_failure_key(marker: Any) -> tuple[Any, Any, Any]:
+    """Identity of a ``citation_failures`` marker for dedupe (task 2979).
+
+    ``(memory_id, store, reason)`` — deliberately EXCLUDING ``error_type``.
+    Two ``verification_error`` markers for the same citation record the same
+    fact ("this id could not be resolved") no matter which exception class
+    surfaced it, and including ``error_type`` would let a flapping backend
+    append an unbounded run of near-identical markers across repeat passes.
+
+    Tolerates a non-dict marker (returns a key derived from its repr) so a
+    malformed entry that somehow reached the durable record can still be
+    compared instead of raising inside the write-back.
+    """
+    if not isinstance(marker, dict):
+        return (repr(marker), None, None)
+    return (marker.get('memory_id'), marker.get('store'), marker.get('reason'))
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -1400,8 +1418,21 @@ class ReconReportState:
         failure markers that ``citation_verifier.verify_cited_memories``
         produced for that finding. ``cited_memories`` REPLACES the finding's
         list (the verifier returns the kept set, not a delta);
-        ``citation_failures`` is EXTENDED, so markers from an earlier pass are
-        never lost.
+        ``citation_failures`` is EXTENDED — so markers from an earlier pass are
+        never lost — but the extend is DEDUPED on ``(memory_id, store,
+        reason)``, which is what makes a repeat pass idempotent.
+
+        The dedupe is load-bearing, not belt-and-braces. Callers send the FULL
+        marker list off the assembled projection, not the delta this pass
+        appended, and ``get_assembled_report`` projects the already-persisted
+        ``citation_failures`` back out — so a plain extend would duplicate
+        every prior marker on any second pass over the same (run_id, stage).
+        A repeat is architecturally reachable: ``start_report`` is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke ``stage.run()`` under the same ``run_id``. ``error_type`` is
+        NOT part of the key: two verification errors for the same citation are
+        the same failure regardless of which exception class surfaced it, and
+        keying on it would let a flapping backend grow the list without bound.
 
         Why this exists: ``get_assembled_report`` builds a fresh dict per
         finding with ``'cited_memories': list(f.cited_memories)`` — a NEW list
@@ -1425,15 +1456,24 @@ class ReconReportState:
         never adds or removes a finding, so the cached ``flagged_count`` stays
         accurate.
 
+        ``_persist_run`` — which re-serialises and upserts EVERY entry of the
+        run — fires only when a finding's citation lists actually changed. The
+        common case by far is a clean run where verification resolved every
+        citation and dropped nothing; re-writing the whole run's rows to record
+        "nothing moved" is pure cost.
+
         Never raises, and never returns an error for an unresolvable
         ``run_id``/``finding_id`` — this is a post-hoc hygiene pass, and turning
         a citation-hygiene miss into a failed reconciliation stage would be a
         far worse outcome than a stale marker. Skips are logged (WARNING,
         structured) rather than swallowed silently. Returns
-        ``{'status': 'applied', 'findings_updated': int, 'findings_skipped':
-        int}``.
+        ``{'status': 'applied', 'findings_updated': int, 'findings_changed':
+        int, 'findings_skipped': int}`` — ``findings_updated`` counts the
+        results that RESOLVED to a finding, ``findings_changed`` the subset
+        that actually mutated it (and so drove the persist).
         """
         updated = 0
+        changed = 0
         skipped = 0
         for result in results:
             finding_id = (result or {}).get('finding_id')
@@ -1452,20 +1492,31 @@ class ReconReportState:
                 skipped += 1
                 continue
             _owning_entry, finding = resolved
-            finding.cited_memories = list(result.get('cited_memories') or [])
-            failures = result.get('citation_failures') or []
-            if failures:
-                finding.citation_failures.extend(failures)
+            new_cited = list(result.get('cited_memories') or [])
+            finding_changed = new_cited != finding.cited_memories
+            finding.cited_memories = new_cited
+            seen = {_citation_failure_key(m) for m in finding.citation_failures}
+            for marker in result.get('citation_failures') or []:
+                key = _citation_failure_key(marker)
+                if key in seen:
+                    continue
+                seen.add(key)
+                finding.citation_failures.append(marker)
+                finding_changed = True
             updated += 1
+            changed += 1 if finding_changed else 0
 
         # One persist for the whole batch — _persist_run upserts every entry of
-        # the run, so a per-finding call would re-write the same rows N times.
-        if updated:
+        # the run, so a per-finding call would re-write the same rows N times —
+        # and only when something actually moved, so a clean verification pass
+        # (no drops, no errors, no new markers) costs zero writes.
+        if changed:
             self._persist_run(run_id)
 
         return {
             'status': 'applied',
             'findings_updated': updated,
+            'findings_changed': changed,
             'findings_skipped': skipped,
         }
 

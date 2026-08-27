@@ -136,8 +136,19 @@ async def verify_cited_memories(
     Stage-1 key names, and every consumer and assertion pinned to them, stay
     byte-identical to the task-2978 shape.
 
-    All three keys are ALWAYS present, on every path, so consumers never need
-    a ``.get(..., 0)`` fallback.
+    All three keys are ALWAYS present in the dict THIS function returns, on
+    every path, so a caller merging it into ``report.stats`` never needs a
+    ``.get(..., 0)`` fallback. Scoped deliberately to this return value rather
+    than to "every ``StageReport``": whether a given report carries the triple
+    is ``BaseStage.run()``'s contract, not this function's — see the
+    zeroed-triple stamp on its ``start_report_failed`` early return, which is
+    what makes the report-level claim hold on the one path that never calls
+    this function at all.
+
+    Each distinct ``memory_id`` is resolved AT MOST ONCE per call: outcomes are
+    memoised in a per-call cache, so an id cited by N findings costs one point
+    read, not N. The counters are unaffected — they count CITATIONS, not
+    lookups, so a memoised hit increments exactly as a fresh one does.
     """
     # Why re-verify at all, at report-assembly time? Two root causes this pass
     # closes that a cite-time check cannot:
@@ -155,6 +166,35 @@ async def verify_cited_memories(
     verified_key = f'{stat_prefix}_citations_verified'
     errors_key = f'{stat_prefix}_citation_verification_errors'
     stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
+
+    # Per-call memo of each mem0 id's resolution OUTCOME, so an id cited by N
+    # findings costs ONE Qdrant point read instead of N. get_memory_by_id is a
+    # network round trip on the stage's critical path, and task 2979 put this
+    # pass on ALL THREE stages, so the repeat-citation case is now three times
+    # as common as it was.  Values: ('found', None) | ('missing', None) |
+    # ('error', '<ExcTypeName>').
+    #
+    # Scoped to the CALL, never module-level: a longer-lived cache would
+    # reintroduce exactly the stale-read TOCTOU this pass exists to close.
+    # Caching the 'error' outcome too is deliberate — a backend that just
+    # failed for this id will almost certainly fail again within the same
+    # assembly, and re-raising it per citation only hammers a sick store while
+    # producing the identical marker.
+    resolution_cache: dict[Any, tuple[str, str | None]] = {}
+
+    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
+        cached = resolution_cache.get(memory_id)
+        if cached is not None:
+            return cached
+        try:
+            record = await memory_service.get_memory_by_id(project_id, memory_id)
+        except Exception as exc:  # noqa: BLE001
+            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
+        else:
+            outcome = ('found', None) if record else ('missing', None)
+        resolution_cache[memory_id] = outcome
+        return outcome
+
     for finding in findings:
         cited = finding.get('cited_memories') or []
         if not cited:
@@ -183,10 +223,9 @@ async def verify_cited_memories(
                 continue
             memory_id = entry.get('memory_id')
             store = entry.get('store')
-            try:
-                record = await memory_service.get_memory_by_id(project_id, memory_id)
-            except Exception as exc:
-                # A raised backend error is 'unknown', not 'absent': dropping the
+            outcome, error_type = await _resolve(memory_id)
+            if outcome == 'error':
+                # A backend error is 'unknown', not 'absent': dropping the
                 # citation here would itself be a silent-fail (the exact
                 # anti-pattern this fix forbids). KEEP it, surface the
                 # uncertainty via a marker, and never propagate — the stage must
@@ -197,12 +236,12 @@ async def verify_cited_memories(
                         'memory_id': memory_id,
                         'store': store,
                         'reason': 'verification_error',
-                        'error_type': type(exc).__name__,
+                        'error_type': error_type,
                     },
                 )
                 stats[errors_key] += 1
                 continue
-            if record:
+            if outcome == 'found':
                 kept.append(entry)
                 stats[verified_key] += 1
             else:

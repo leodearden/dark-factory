@@ -25,6 +25,7 @@ cite-time existence check — i.e. precisely the unchecked path this task closes
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -129,7 +130,13 @@ async def _run_stage2(deps: dict, flagged: list[dict[str, Any]]):
         for name in _STAGE2_POST_RUN_HELPERS
     ]
 
-    with _nested(stack):
+    # ExitStack, not a hand-rolled nested-enter loop: it unwinds the managers
+    # it already entered if a later __enter__ raises. A loop that just enters
+    # in sequence leaks every patch it had installed when one blows up, and a
+    # leaked mock.patch stays installed for the rest of the pytest session.
+    with ExitStack() as patches:
+        for manager in stack:
+            patches.enter_context(manager)
         return await stage.run(
             [], Watermark(project_id='test_project'), [], run_id='run-stage2-cite'
         )
@@ -159,27 +166,16 @@ async def _run_stage3(deps: dict, flagged: list[dict[str, Any]]):
         for name in _STAGE3_FINDING_FILTERS
     ]
 
-    with _nested(stack):
+    # ExitStack, not a hand-rolled nested-enter loop: it unwinds the managers
+    # it already entered if a later __enter__ raises. A loop that just enters
+    # in sequence leaks every patch it had installed when one blows up, and a
+    # leaked mock.patch stays installed for the rest of the pytest session.
+    with ExitStack() as patches:
+        for manager in stack:
+            patches.enter_context(manager)
         return await stage.run(
             [], Watermark(project_id='test_project'), [], run_id='run-stage3-cite'
         )
-
-
-class _nested:
-    """Enter a list of context managers as one — keeps the patch stacks flat."""
-
-    def __init__(self, managers):
-        self._managers = managers
-
-    def __enter__(self):
-        for manager in self._managers:
-            manager.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        for manager in reversed(self._managers):
-            manager.__exit__(*exc)
-        return False
 
 
 @pytest.mark.asyncio

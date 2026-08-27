@@ -273,7 +273,10 @@ class TestReconStateFallbackToEmpty:
         # assembly, and it sets its three counters unconditionally (the
         # explicit-zero convention) so downstream consumers never need a
         # .get(..., 0) fallback — including on this empty-report path, where
-        # there are no findings to verify.
+        # there are no findings to verify. The claim is report-level, not just
+        # function-level: the only return that bypasses this assembly, the
+        # start_report_failed short-circuit, stamps the same zeroed triple
+        # itself (pinned in TestStartReportErrorHandling).
         assert report.stats == {
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
@@ -448,7 +451,16 @@ class TestStartReportErrorHandling:
         assert report.items_flagged == [], (
             'Degraded stage must produce empty items_flagged, not the assembled report'
         )
-        assert report.stats == {}
+        # The degraded early return still stamps the zeroed citation triple: it
+        # is the one path that never reaches BaseStage.run's shared assembly,
+        # so without the stamp it would be the one StageReport missing the
+        # counters, and a consumer indexing report.stats['stage1_*'] would
+        # KeyError on exactly the degraded run it most needs to account for.
+        assert report.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }
         # get_assembled_report must NOT have been called (no successful start)
         get_calls = [c for c in state.calls if c[0] == 'get_assembled_report']
         assert get_calls == [], (
@@ -515,7 +527,11 @@ class TestStartReportErrorHandling:
             f'short-circuit broken, was awaited {cli_mock.await_count} time(s)'
         )
         assert result.items_flagged == []
-        assert result.stats == {}
+        assert result.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }
         assert result.llm_calls == 0
         assert result.tokens_used == 0
 

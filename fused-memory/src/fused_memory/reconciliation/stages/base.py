@@ -217,12 +217,25 @@ class BaseStage:
 
         if start_report_failed:
             completed = datetime.now(UTC)
+            # Stamp the zeroed citation triple even here. This is the ONE path
+            # that returns without reaching the shared assembly below, so it is
+            # the ONE path that would otherwise omit the counters — and a
+            # consumer that took the explicit-zero convention at face value and
+            # indexed report.stats['stageN_citations_verified'] would KeyError
+            # on exactly the degraded run it most wants to account for. Zero is
+            # the honest value: there were no findings, so nothing was verified,
+            # dropped, or errored.
+            _prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
             return StageReport(
                 stage=self.stage_id,
                 started_at=started,
                 completed_at=completed,
                 items_flagged=[],
-                stats={},
+                stats={
+                    f'{_prefix}_phantom_citations_dropped': 0,
+                    f'{_prefix}_citations_verified': 0,
+                    f'{_prefix}_citation_verification_errors': 0,
+                },
                 llm_calls=0,
                 tokens_used=0,
             )
@@ -365,9 +378,9 @@ class BaseStage:
         # precedes every subclass's post-processing (including Stage 1's
         # remediation early-return), full and remediation passes alike are
         # verified and the citation stats are always present on report.stats.
+        _cite_prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
         _cite_stats = await verify_cited_memories(
-            _flagged, self.memory, self.project_id,
-            stat_prefix=STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value),
+            _flagged, self.memory, self.project_id, stat_prefix=_cite_prefix,
         )
         _stats.update(_cite_stats)
 
@@ -380,7 +393,20 @@ class BaseStage:
         # carries; the structured-output JSON fallback has no RRS record to
         # correct, so those findings are skipped (their correction lives in the
         # returned StageReport alone, which is all that exists for them).
-        if _active_rrs is not None:
+        #
+        # Gated on the pass having actually CHANGED something. With zero drops
+        # and zero verification errors — the overwhelmingly common case —
+        # `kept` is the input list and no marker was appended, so every
+        # correction would be a byte-identical rewrite, and
+        # `apply_citation_verification`'s `_persist_run` re-serialises and
+        # upserts EVERY entry of the run. Only findings carrying a
+        # `citation_failures` marker can have moved (a drop and an error each
+        # append one), so those are the only ones worth sending.
+        _cite_changed = (
+            _cite_stats.get(f'{_cite_prefix}_phantom_citations_dropped', 0)
+            or _cite_stats.get(f'{_cite_prefix}_citation_verification_errors', 0)
+        )
+        if _active_rrs is not None and _cite_changed:
             _corrections = [
                 {
                     'finding_id': _item['finding_id'],
@@ -388,7 +414,9 @@ class BaseStage:
                     'citation_failures': _item.get('citation_failures') or [],
                 }
                 for _item in _flagged
-                if isinstance(_item, dict) and _item.get('finding_id')
+                if isinstance(_item, dict)
+                and _item.get('finding_id')
+                and _item.get('citation_failures')
             ]
             if _corrections:
                 try:
