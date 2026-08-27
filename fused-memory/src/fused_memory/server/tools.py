@@ -3032,11 +3032,13 @@ def create_mcp_server(
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
-        Before writing a procedural_knowledge memory, search first for an
-        existing entry covering the same workflow/gotcha and update or skip
-        instead of writing a near-duplicate. procedural_knowledge writes are
-        soft-blocked at write time by two guards: (1) a deterministic
-        topic-cluster guard that fires FIRST when the content matches a
+        Before writing a procedural_knowledge or preferences_and_norms memory,
+        search first for an existing entry covering the same workflow/gotcha/
+        norm and update or skip instead of writing a near-duplicate.
+        procedural_knowledge writes are soft-blocked at write time by two
+        guards, the first of which also covers preferences_and_norms (see
+        below): (1) a deterministic topic-cluster guard that fires FIRST when
+        the content matches a
         known-contradictory topic cluster
         (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do NOT
         add another entry; consolidate/update the existing entries for that
@@ -3313,11 +3315,25 @@ def create_mcp_server(
         # `routed == stored` for a topic match, and a real judge may answer
         # otherwise. That assertion is EXPECTED to change with this arm — it
         # pins the retirement of the soft-block, not the outcome `stored`.
+        # Shared exemptions for both dup-guard blocks below (task 3430 review,
+        # reviewer_comprehensive #1 duplication): hoisted to a single source
+        # of truth so a future new exemption (another agent-id carve-out, a
+        # triage-mode tweak) is a one-place edit instead of two conjunct
+        # chains that can silently drift apart. Deliberately EXCLUDES the
+        # category predicate and the resolve_near_dup_guard_enabled() call:
+        # each block below still spells out its own `category in/== ...`
+        # conjunct ahead of the resolver call, so a write in a category
+        # neither block gates still never calls resolve_near_dup_guard_enabled
+        # — identical short-circuit behaviour to before this hoist, and the
+        # cosine block's behaviour for procedural_knowledge stays provably
+        # unchanged (same truth table, same call count, order of the pure
+        # boolean reads is immaterial since none of them has a side effect).
+        dup_guard_base_exempt = (
+            not triage_enabled and not allow_near_duplicate and not is_recon_stage_agent
+        )
         if (
-            not triage_enabled
+            dup_guard_base_exempt
             and category in _TOPIC_GUARD_GATED_CATEGORIES
-            and not allow_near_duplicate
-            and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
             # Deterministic topic-keyed pre-check (task 2845; widened in task
@@ -3353,14 +3369,13 @@ def create_mcp_server(
         # both procedural-specific, and deciding whether/how to compare a
         # preferences_and_norms write against procedural (or preferences)
         # entries is a separate cost/semantics decision this task does not
-        # make. The full conjunct chain is spelled out again here (rather than
-        # hoisting a shared boolean out of the block above) so this block's
-        # behaviour for procedural_knowledge is provably unchanged by the split.
+        # make. Reuses dup_guard_base_exempt from the block above (the shared
+        # exemptions) and re-spells only its own category predicate, so this
+        # block's behaviour for procedural_knowledge stays provably unchanged
+        # by the split.
         if (
-            not triage_enabled
+            dup_guard_base_exempt
             and category == 'procedural_knowledge'
-            and not allow_near_duplicate
-            and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
