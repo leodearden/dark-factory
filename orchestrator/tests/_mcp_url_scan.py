@@ -145,11 +145,15 @@ def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[in
     # trailing Constant on DIFFERENT lines, so the duplicate has to be
     # prevented structurally.
     #
-    # ONE pass, not a nested ``ast.walk`` per candidate: ``ast.walk`` is
+    # ONE pass, not a nested ``ast.walk`` per owning node: ``ast.walk`` is
     # breadth-first (it popleft()s a deque), so a parent is always visited
-    # before its children and suppression can simply be propagated down one
-    # generation at a time. The sweep guard parses ~500 files, so the
-    # quadratic re-walk this replaces was the dominant cost of the whole test.
+    # before its children and suppression propagates down one generation at a
+    # time. MEASURED over the sweep guard's real 553-file corpus, and checked
+    # to produce an IDENTICAL ``nested`` set on every one of them: 3.4s here
+    # vs 6.2s for the equivalent sub-walk form. (Parsing those files costs
+    # ~7s on top of either, so this is a real but not dominant share; the
+    # guard's actual fix for wall clock is caching the walk — see
+    # ``_sweep_hits``.)
     nested: set[int] = set()
     for node in ast.walk(tree):
         # A suppressed node's descendants are suppressed too; a tail-owning

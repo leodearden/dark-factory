@@ -1352,8 +1352,10 @@ class TestCuratorSubmitTransport:
     discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
     the body, which cannot distinguish a delivered POST from one absorbed by
     the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client through the
-    MockTransport server in ``test_mcp_post_transport`` instead.  The older
-    tests are left intact — they were never wrong, only insufficient.
+    MockTransport server in ``_mcp_transport_harness`` instead — a
+    ``_``-prefixed sibling rather than the ``test_mcp_post_transport`` module
+    that also uses it, so no test module's collection depends on another's.
+    The older tests are left intact — they were never wrong, only insufficient.
     """
 
     def _suggestions(self):
@@ -1377,7 +1379,7 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
         """THE regression: the submit_task tools/call must arrive at /mcp."""
-        from test_mcp_post_transport import (
+        from _mcp_transport_harness import (
             MCP_PATH,
             RecordingClientFactory,
             RecordingMcpServer,
@@ -1401,7 +1403,7 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_client_is_constructed_with_follow_redirects(self):
         """Task's explicit ask (a), first half."""
-        from test_mcp_post_transport import RecordingClientFactory, RecordingMcpServer
+        from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
 
         wf = _make_workflow()
         factory = RecordingClientFactory(RecordingMcpServer())

@@ -10,143 +10,29 @@ redirect.
 So these tests drive a REAL ``httpx.AsyncClient`` through an
 ``httpx.MockTransport`` whose handler reproduces the live fused-memory server,
 and assert the resulting STATE: which path the server actually received a
-``tools/call`` on.  ``MockTransport`` keeps httpx's real redirect semantics, so
-``follow_redirects`` genuinely matters, while needing no socket.
-
-The handler reproduces BOTH live rejections, measured by curl against
-127.0.0.1:8002 while writing this (see escalation esc-4023-2):
-
-  * ``POST /mcp/``            -> 307, Location: /mcp   (trailing slash)
-  * ``POST /mcp`` w/o Accept  -> 406 "Client must accept application/json"
-  * ``POST /mcp`` w/ Accept   -> 200 + a real JSON-RPC result
-
-Both rejections must be reproduced, because fixing only the slash moves the
-failure from a silent 307 no-op to a silent 406 no-op — still a lost write.
+``tools/call`` on.  The handler and the recording client factory live in
+``_mcp_transport_harness`` — a ``_``-prefixed sibling, because
+``test_suggestion_triage.py`` drives the same fake server and test modules must
+not import each other.  See that module's docstring for what the handler
+reproduces and why.
 """
 
 from __future__ import annotations
 
-import json
+import functools
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
+from _mcp_transport_harness import (
+    MCP_PATH,
+    MCP_PATH_WITH_SLASH,
+    RecordingClientFactory,
+    RecordingMcpServer,
+)
 from _mcp_url_scan import find_trailing_slash_mcp_urls
 
 from orchestrator.workflow import TaskWorkflow
-
-#: Captured BEFORE any patching so the factory below can build a real client
-#: without recursing into its own patch.
-_REAL_ASYNC_CLIENT = httpx.AsyncClient
-
-MCP_PATH = '/mcp'
-MCP_PATH_WITH_SLASH = '/mcp/'
-
-
-class RecordingMcpServer:
-    """``httpx.MockTransport`` handler reproducing the live fused-memory server."""
-
-    def __init__(self):
-        #: (path, json_body) for every request the server actually PROCESSED.
-        self.delivered: list[tuple[str, dict]] = []
-        #: Requests refused with a 307 because of the trailing slash.
-        self.redirected: list[str] = []
-        #: Requests refused with a 406 because the Accept header was missing.
-        self.not_acceptable: list[str] = []
-        #: (path, Accept) for EVERY request that arrived, including the ones
-        #: refused above.  Recorded pre-triage so the Accept assertion stays
-        #: non-vacuous even while the slash defect still absorbs the request.
-        self.seen: list[tuple[str, str]] = []
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        self.seen.append((path, request.headers.get('accept', '')))
-
-        if path == MCP_PATH_WITH_SLASH:
-            self.redirected.append(path)
-            return httpx.Response(
-                307,
-                headers={'Location': str(request.url.copy_with(path=MCP_PATH))},
-            )
-
-        if path != MCP_PATH:
-            return httpx.Response(404, text=f'no route for {path}')
-
-        # The live server refuses a POST that does not accept application/json.
-        if 'application/json' not in request.headers.get('accept', ''):
-            self.not_acceptable.append(path)
-            return httpx.Response(
-                406,
-                json={
-                    'jsonrpc': '2.0',
-                    'id': 'server-error',
-                    'error': {
-                        'code': -32600,
-                        'message': 'Not Acceptable: Client must accept application/json',
-                    },
-                },
-            )
-
-        body = json.loads(request.content)
-        self.delivered.append((path, body))
-        return httpx.Response(
-            200,
-            json={'jsonrpc': '2.0', 'id': 1, 'result': {'content': []}},
-        )
-
-    # -- assertions helpers -------------------------------------------------
-
-    def tool_calls(self, tool_name: str) -> list[dict]:
-        """Bodies of every DELIVERED ``tools/call`` for *tool_name*."""
-        return [
-            body for _path, body in self.delivered
-            if body.get('method') == 'tools/call'
-            and body.get('params', {}).get('name') == tool_name
-        ]
-
-    def assert_every_request_accepted_json(self):
-        """Every request that ARRIVED must have declared it accepts JSON.
-
-        Checks ``seen`` rather than ``not_acceptable`` so this stays a real
-        assertion even before the slash fix lands: a request absorbed by the
-        307 never reaches the 406 branch, so an empty ``not_acceptable`` would
-        pass vacuously.
-        """
-        assert self.seen, 'no request reached the server at all'
-        bad = [(p, a) for p, a in self.seen if 'application/json' not in a]
-        assert bad == [], (
-            'every MCP POST must send Accept: application/json (the live server '
-            f'answers 406 without it); these did not: {bad!r}'
-        )
-
-
-class RecordingClientFactory:
-    """Stands in for ``httpx.AsyncClient``: records ctor kwargs, injects transport.
-
-    Uses the same ``patch('httpx.AsyncClient', lambda *a, **k: ...)``
-    constructor seam that ``test_workflow_completion_memory.py`` already relies
-    on — widened to RECORD the kwargs, which is what makes the
-    ``follow_redirects=True`` assertion possible at all.
-    """
-
-    def __init__(self, server: RecordingMcpServer):
-        self._server = server
-        #: One dict per ``httpx.AsyncClient(...)`` construction.
-        self.ctor_kwargs: list[dict] = []
-
-    def __call__(self, *args, **kwargs):
-        self.ctor_kwargs.append(dict(kwargs))
-        kwargs.setdefault('transport', httpx.MockTransport(self._server.handler))
-        return _REAL_ASYNC_CLIENT(*args, **kwargs)
-
-    def assert_follows_redirects(self):
-        assert self.ctor_kwargs, 'no httpx.AsyncClient was constructed at all'
-        for kwargs in self.ctor_kwargs:
-            assert kwargs.get('follow_redirects') is True, (
-                'the MCP client must be constructed with follow_redirects=True '
-                f'(defence in depth against a re-introduced slash); got {kwargs!r}'
-            )
 
 
 @pytest.fixture
@@ -311,11 +197,17 @@ async def test_decisions_write_delivers_every_decision_to_the_mcp_endpoint(
 async def test_decisions_write_uses_the_patched_client_seam(
     tmp_path, server, client_factory,
 ):
-    """The inline ``__import__('httpx')`` site is reached by the same patch seam.
+    """The decisions writer's client construction is reached by the patch seam.
 
-    ``__import__('httpx').AsyncClient`` resolves the attribute at call time, so
-    ``patch('httpx.AsyncClient', ...)`` does intercept it — pinned here so a
-    future rewrite of that import cannot quietly escape this file's coverage.
+    ``_write_decisions_to_memory`` obtains its client through
+    ``shared.mcp_post.open_mcp_client``, which resolves ``AsyncClient`` as a
+    MODULE ATTRIBUTE at call time — so ``patch('httpx.AsyncClient', ...)``
+    intercepts it.  Pinned here because that is a property of HOW the import is
+    written, not of what it imports: this site has already been rewritten once
+    (it used to spell it ``__import__('httpx').AsyncClient``), and a future
+    rewrite that bound ``AsyncClient`` at import time — ``from httpx import
+    AsyncClient`` at module scope — would silently escape every assertion in
+    this file while every test kept passing.
     """
     wf = _workflow_with_decisions(tmp_path)
 
@@ -481,11 +373,20 @@ async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_f
 # Repo-wide sweep guard (step-13 RED / step-14 GREEN)
 # ---------------------------------------------------------------------------
 
-#: Directories holding raw-POST source.  Scoped, not repo-wide, on purpose.
+#: Directories holding raw-POST source.  Scoped, not repo-wide, on purpose:
+#: ``*/tests`` are excluded wholesale because FastMCP's
+#: ``StreamableHttpTransport(f'{base}/mcp/')`` fixtures legitimately use the
+#: slashed mount (see the guard's docstring).  ``escalation/src`` and
+#: ``shared/src`` are in the list even though both are clean today —
+#: ``escalation/src`` hosts an MCP server, and ``shared/src`` now hosts the
+#: primitive the fix routes through, so both are exactly where a sixth site
+#: would appear.  Measured while adding them: 0 hits each.
 SWEEP_DIRS = (
     'orchestrator/src',
     'fused-memory/src',
     'dashboard/src',
+    'escalation/src',
+    'shared/src',
     'scripts',
     'fused-memory/scripts',
 )
@@ -495,25 +396,61 @@ SWEEP_DIRS = (
 #: makes the sweep check THIS worktree, the copy the task's verify run gates on.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Files that legitimately build a slashed URL and are NOT raw POSTs.
-#: Each is a deliberate exclusion, not an oversight — see the reasons.
+#: LINES that legitimately build a slashed URL and are NOT raw POSTs, keyed
+#: ``(relpath, stripped_source_line)``.
+#:
+#: PER-LINE, NOT PER-FILE.  A whole-file exemption for
+#: ``fused_memory/server/main.py`` — a ~1200-line module that IS the MCP
+#: server — would make a genuine raw POST added anywhere in it invisible to
+#: the guard, which is the opposite of what an exclusion list is for.
+#:
+#: Keyed on the source TEXT rather than a line number on purpose: the two
+#: ``main.py`` lines below moved from :1083/:1149 to :1118/:1188 in a single
+#: unrelated rebase during this task, so line-pinned entries would fail the
+#: guard on edits that have nothing to do with MCP URLs.  The text is what
+#: makes the entry specific; the file alone is not.
+#:
+#: (An inline ``# mcp-url-sweep: allow <reason>`` marker on each offending
+#: source line would be better still — the justification would live next to
+#: the code and could not silently widen — but adding those markers means
+#: editing ``fused-memory/src/...``, which task 4023 holds no locks for.
+#: Filed as follow-up rather than reached for here.)
 SWEEP_EXCLUSIONS = {
     # An MCP *config* entry consumed by the Claude CLI's own MCP client, which
     # follows redirects natively.  A different risk class from a raw POST.
-    'fused-memory/src/fused_memory/reconciliation/stages/base.py',
-    # Display/log strings, not URLs that are ever fetched.
-    'fused-memory/src/fused_memory/server/main.py',
+    (
+        'fused-memory/src/fused_memory/reconciliation/stages/base.py',
+        "'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',",
+    ),
+    # Display/log strings in ``main.py::run_server``, not URLs ever fetched.
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        "logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')",
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        "'  Recon Report Endpoint: http://%s:%d/mcp/',",
+    ),
 }
 
 
-def _sweep_hits() -> dict[str, list[tuple[int, str]]]:
+@functools.lru_cache(maxsize=1)
+def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
     """Return ``{relpath: hits}`` for every swept file that builds a slashed URL.
 
     Shared by the guard and the stale-exclusion check below so both read the
     same walk — an exclusion list and the sweep it applies to must never be
     able to disagree about what the tree contains.
+
+    CACHED, and returning tuples so the cached value cannot be mutated by
+    either caller.  The walk parses 553 files (measured); it ran twice for a
+    byte-identical result, and each run is the dominant cost of this whole
+    file — against a 60s per-test timeout (``orchestrator/pyproject.toml``)
+    that only gets tighter under ``-n auto`` contention.  Nothing in the tree
+    changes between the two calls within a session, so the second is pure
+    waste: measured at 0.000004s from cache.
     """
-    found: dict[str, list[tuple[int, str]]] = {}
+    found: dict[str, tuple[tuple[int, str], ...]] = {}
     for rel_dir in SWEEP_DIRS:
         for path in sorted((REPO_ROOT / rel_dir).rglob('*.py')):
             rel = path.relative_to(REPO_ROOT).as_posix()
@@ -521,7 +458,7 @@ def _sweep_hits() -> dict[str, list[tuple[int, str]]]:
                 path.read_text(encoding='utf-8'), filename=rel
             )
             if hits:
-                found[rel] = hits
+                found[rel] = tuple(hits)
     return found
 
 
@@ -542,6 +479,14 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     Rewriting live fixtures to chase a cosmetic match would risk breaking
     readiness gating for zero benefit.
 
+    THE SLASH IS NECESSARY, NOT SUFFICIENT, and this guard only covers the
+    necessary half.  A sixth site could drop the slash and still lose its
+    payload by omitting the ``Accept`` header (the live server answers 406) or
+    ``follow_redirects=True``.  Those three parts are held together by
+    ``shared.mcp_post.post_mcp_tool_call`` / ``open_mcp_client``, which apply
+    them as a unit; this guard is the backstop for a site that bypasses the
+    primitive entirely.
+
     DETECTION IS BY PARSING, NOT SUBSTRING.  This guard originally matched the
     text ``}/mcp/'``, chosen over a bare ``/mcp/`` because that also matches
     the phrase ``scheduler/mcp/usage_gate/cost_store`` in merge_queue.py
@@ -555,21 +500,22 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     MEASURED both directions, against real historical source: run over
     ``git show 2633a244a6:<path>`` the detector fires on exactly the 8 pre-fix
     defect sites (workflow.py 15173/15215/15247/15286, merge_queue.py 16031,
-    and the three operator scripts); run over this tree it flags only the two
-    excluded files below.  A guard that cannot fail on the defect it was
+    and the three operator scripts); run over this tree it flags only the
+    three excluded LINES below.  A guard that cannot fail on the defect it was
     written for is worth nothing.
     """
     offenders = [
         f'{rel}:{lineno}: {text}'
         for rel, hits in sorted(_sweep_hits().items())
-        if rel not in SWEEP_EXCLUSIONS
         for lineno, text in hits
+        if (rel, text) not in SWEEP_EXCLUSIONS
     ]
 
     assert offenders == [], (
         'these build an MCP URL with a trailing slash; the server 307-redirects '
         'it and a bare httpx client discards the payload silently. Use '
-        'shared.mcp_post.mcp_endpoint_url instead:\n  ' + '\n  '.join(offenders)
+        'shared.mcp_post.post_mcp_tool_call (or mcp_endpoint_url) instead:\n  '
+        + '\n  '.join(offenders)
     )
 
 
@@ -577,21 +523,27 @@ def test_every_sweep_exclusion_still_earns_its_place():
     """An exclusion that outlives its offending line must fail, not lurk.
 
     Each entry in ``SWEEP_EXCLUSIONS`` is a hole in the guard above.  If the
-    line that justified one is fixed or deleted, the hole stays open and
-    silently covers whatever a future edit puts in that file.  Requiring every
-    exclusion to still produce a hit turns that into a failing test the moment
-    it goes stale — the entry gets removed instead of masking a regression.
+    line that justified one is fixed or reworded, the hole stays open and
+    silently covers whatever a future edit puts in its place.  Requiring every
+    exclusion to still match a LIVE hit turns that into a failing test the
+    moment it goes stale — the entry gets removed instead of masking a
+    regression.
 
-    Measured today: ``stages/base.py:439`` and ``server/main.py`` :1083 and
-    :1149 all still hit, so this is satisfiable now and is a real check on
-    repo state.
+    Because the entries are ``(relpath, source_text)`` this also fails when an
+    excluded line is merely REWORDED, which a per-file exemption would have
+    absorbed silently.  Measured today: all three still hit.
     """
-    found = _sweep_hits()
+    live = {
+        (rel, text)
+        for rel, hits in _sweep_hits().items()
+        for _lineno, text in hits
+    }
 
-    stale = sorted(rel for rel in SWEEP_EXCLUSIONS if rel not in found)
+    stale = sorted(SWEEP_EXCLUSIONS - live)
 
     assert stale == [], (
-        'these files no longer build a slashed MCP URL, so excluding them from '
-        'the sweep guard now only hides future regressions. Delete the entry '
-        'from SWEEP_EXCLUSIONS:\n  ' + '\n  '.join(stale)
+        'these lines no longer build a slashed MCP URL (moved, reworded or '
+        'deleted), so excluding them from the sweep guard now only hides future '
+        'regressions. Delete the entry from SWEEP_EXCLUSIONS:\n  '
+        + '\n  '.join(f'{rel}: {text}' for rel, text in stale)
     )
