@@ -4352,6 +4352,36 @@ def load_fetch_provenance(path: str | Path) -> dict[str, Any]:
     return provenance
 
 
+def _check_kind_coverage(
+    target: Path, shape: str, kind: str, cached: dict[str, Any],
+    expected: list[str],
+) -> None:
+    """Refuse a cache that is short of the *kind* of ranking being requested.
+
+    Both halves of a cached arm need this, and for the same reason: the
+    consumers index them BARE.  ``measure_arm`` does
+    ``fetched['probes'][cluster_id]``, so an unguarded truncation of the
+    probes half escapes the ``FetchCacheError`` -> exit-3 contract entirely
+    and surfaces instead as an unnamed ``KeyError`` raised from inside the
+    metric code — naming neither the cache nor how to re-dump it.
+
+    Parameterised by *kind* rather than written twice so the two halves
+    cannot drift apart in wording: an operator reading the refusal has to be
+    able to tell a short QUERIES half from a short PROBES half without
+    reading code, which is the whole reason this is a named refusal.
+    """
+    missing = [key for key in expected if key not in cached]
+    if not missing:
+        return
+    raise FetchCacheError(
+        f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
+        f'{len(missing)} of {len(expected)} requested '
+        f'{kind} have no cached ranking, e.g. {missing[:5]}. '
+        f'Measuring the arm anyway would score it over a subset of '
+        f'the {kind} while the report claimed the whole one.'
+    )
+
+
 def _check_corpus_fingerprint(
     target: Path, provenance: dict[str, Any], shape: str, seeded: SeededArm,
 ) -> None:
@@ -4438,6 +4468,7 @@ def load_fetches(
     seeded_by_shape: dict[str, SeededArm],
     *,
     expect_query_ids: list[str] | None = None,
+    expect_probe_ids: list[str] | None = None,
     expect_limit: int | None = None,
     expect_fixtures: list[str | Path] | None = None,
 ) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
@@ -4453,10 +4484,17 @@ def load_fetches(
     shapes is merely wider than this run needs, but a requested shape it does
     not carry would otherwise be measured as an arm with no queries.
 
-    *expect_query_ids*, *expect_limit* and *expect_fixtures* are the
-    truncation, depth and fixture-drift guards.  All three are opt-in so the
-    pure round-trip tests can exercise the join without a full query set, and
-    all three are supplied by the live driver.
+    *expect_query_ids*, *expect_probe_ids*, *expect_limit* and
+    *expect_fixtures* are the two truncation guards, the depth guard and the
+    fixture-drift guard.  All four are opt-in so the pure round-trip tests can
+    exercise the join without a full query or probe set, and all four are
+    supplied by the live driver.
+
+    The two halves are guarded SEPARATELY because they are separately
+    truncatable and separately consumed: ``measure_arm`` indexes
+    ``fetched['probes'][cluster_id]`` bare, so a probes half checked only via
+    the queries guard would fail as an unnamed ``KeyError`` inside the metric
+    code rather than as this module's named refusal.
     """
     target, doc = _read_fetch_cache(path)
     provenance = load_fetch_provenance(path)
@@ -4499,17 +4537,16 @@ def load_fetches(
             )
         _check_corpus_fingerprint(target, provenance, shape, seeded)
 
-        cached_queries = block.get('queries') or {}
         if expect_query_ids is not None:
-            missing = [q for q in expect_query_ids if q not in cached_queries]
-            if missing:
-                raise FetchCacheError(
-                    f'fetch cache at {target} is TRUNCATED for shape {shape!r}: '
-                    f'{len(missing)} of {len(expect_query_ids)} requested '
-                    f'queries have no cached ranking, e.g. {missing[:5]}. '
-                    f'Measuring the arm anyway would score it over a subset of '
-                    f'the query set while the report claimed the whole one.'
-                )
+            _check_kind_coverage(
+                target, shape, 'queries', block.get('queries') or {},
+                expect_query_ids,
+            )
+        if expect_probe_ids is not None:
+            _check_kind_coverage(
+                target, shape, 'probes', block.get('probes') or {},
+                expect_probe_ids,
+            )
         replayed[shape] = {
             kind: {
                 key: _rehydrate_ranking(
