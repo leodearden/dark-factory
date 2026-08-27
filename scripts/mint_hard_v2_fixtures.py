@@ -1339,6 +1339,45 @@ async def _mint_continuity_one(sampler, entry: dict, sampled_at: str, seed: int,
                 f'result. The commands are carried for provenance only.'
             ),
         }
+    # The base is INHERITED, not ladder-resolved, so `base_approximation`'s
+    # rung table cannot answer for it — reading the flag off
+    # CONTINUITY_BASELINE_SOURCE would either assert a truth this path cannot
+    # check or falsely mark a genuinely merge-derived base as approximated.
+    # MEASURE it instead, same discipline as `post_commit_reachable_from_main`
+    # above: does the inherited pre_task_commit equal M^1 of the task's single
+    # landing merge? The step-2 dual-spelling matcher is what makes this
+    # answerable for df_task_18 / reify_task_12, whose landing merges are
+    # colon-spelled. pre/post are NOT touched — the continuity contract
+    # carries them verbatim and test_hard_v2_fixture_pool.py asserts it.
+    merge = find_merge_sha(cand.project_root, task_id)
+    record['provenance']['base_verified_against_merge'] = merge
+    if merge is None:
+        record['provenance']['base_is_approximated'] = True
+        record['provenance']['base_approximation_reason'] = (
+            f'No landing merge for task {task_id} exists in '
+            f'{cand.project_root} under either accepted subject spelling, so '
+            f'the inherited pre_task_commit {cand.pre_commit} cannot be '
+            f'checked against a true branch point (M^1) and is recorded as an '
+            f'APPROXIMATION. A readout that depends on the base being the real '
+            f'branch point should EXCLUDE this fixture.'
+        )
+    else:
+        merge_first_parent = _git(['rev-parse', f'{merge}^1'], cand.project_root)
+        approximated = merge_first_parent != cand.pre_commit
+        record['provenance']['base_is_approximated'] = approximated
+        if approximated:
+            record['provenance']['base_approximation_reason'] = (
+                f'The inherited pre_task_commit {cand.pre_commit} does NOT '
+                f'equal M^1 of task {task_id}\'s landing merge {merge} '
+                f'(M^1 = {merge_first_parent or "unresolvable"}), measured at '
+                f'mint time in {cand.project_root}. The inherited base is '
+                f'therefore an APPROXIMATION of where the work started, not '
+                f'the true branch point, and a readout that depends on the '
+                f'latter should EXCLUDE this fixture. The commit itself is '
+                f'carried verbatim regardless — the continuity contract '
+                f'forbids changing it.'
+            )
+
     record['provenance']['continuity_note'] = (
         f'Re-banded from the standing corpus, not censused. '
         f'pre_task_commit / post_task_commit / task_definition are carried '
