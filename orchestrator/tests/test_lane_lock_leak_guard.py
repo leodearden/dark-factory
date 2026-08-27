@@ -3241,11 +3241,14 @@ class TestCancelledResetNeverOrphansTheLaneLock:
 #
 # Task 3783 absorbed this at the two ACQUIRE-TIMEOUT sites, keyed on an EMPTY
 # result (`_settled_lane_lock_holder_pids`).  It deliberately did not cover the
-# two `holder_pids is None` branches — `_lane_lock_holder_facts` (git_ops.py
-# ~1886) and `_lane_lock_self_owned_leak` (git_ops.py ~2932) — which take their
-# OWN one-shot read.  BE PRECISE ABOUT WHAT THAT RESIDUE IS.  Both production
-# call sites pass `holder_pids` explicitly (git_ops.py ~3331/~3343 and
-# ~10871/~10895, sourced from `_settled_lane_lock_holder_pids`, deliberately so
+# two `holder_pids is None` branches —
+# `orchestrator/src/orchestrator/git_ops.py::_lane_lock_holder_facts` and
+# `orchestrator/src/orchestrator/git_ops.py::GitOps._lane_lock_self_owned_leak`
+# — which take their OWN one-shot read.  BE PRECISE ABOUT WHAT THAT RESIDUE IS.
+# Both production call sites pass `holder_pids` explicitly
+# (`orchestrator/src/orchestrator/git_ops.py::GitOps.merge_verify_lease` and
+# `orchestrator/src/orchestrator/git_ops.py::GitOps.reset_persistent_merge_worktree`,
+# sourced from `_settled_lane_lock_holder_pids`, deliberately so
 # that one snapshot drives both the predicate and the message it is rendered
 # beside — task 3081).  So the `None` branches are reached only from TESTS, and
 # the cases below are a CONTRACT PIN on a public-ish two-argument seam, NOT a

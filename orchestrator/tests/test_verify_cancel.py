@@ -621,7 +621,8 @@ class _ChunkedLocksPath(Path):
     ``locks_path=`` keyword that :data:`PROC_LOCKS_PATH`'s own comment already
     blesses — no new production seam.  Monkeypatching ``PROC_LOCKS_PATH``
     instead would be INERT: both reader variants consume it as a DEF-TIME
-    default (esc-3604-1, recorded at test_lane_lock_leak_guard.py:1241-1246).
+    default (esc-3604-1, recorded at
+    ``orchestrator/tests/test_lane_lock_leak_guard.py::test_an_unreadable_lock_table_is_not_silently_no_holders``).
 
     Snapshots are served in order and STICK on the last one, so a scripted list
     bounds only the LOSSY PREFIX and never the read count — a reader free to
