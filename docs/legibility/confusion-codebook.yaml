@@ -577,6 +577,13 @@ entries:
     manifested_phase: recon
     invariant_violated: 'done_gate_missing_files: task marked done without verifying file deliverables exist'
     note: Guard fires twice (turns 3, 12) in a small automated session on the same gate, indicating tasks were dispatched with unverified premises about deliverable files. Suggests either recon-invented file models or premature done-marking without verification.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 0755ce4d-bc20-4ad7-8f6d-4cc6896e0272
+    origin_phase: architect
+    manifested_phase: implement
+    invariant_violated: Task assumes code structure exists that cannot be located in the active worktree
+    note: Grep search for 'count_foreign_relationships' exits with code 2 and two 'not found' signals at turn 14, suggesting task dispatch into worktree with unvalidated assumptions about code element presence.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -1075,6 +1082,12 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Escalation esc-3807-4 auto-dismissed in race with steward resolution; resolution text never injected into resume path, forcing agent to rediscover and refix abandoned merge state
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 56c45cc7-a3a6-4656-ac0b-7fc317a9096a
+    origin_phase: implement
+    manifested_phase: review
+    note: Stage-1 recon capability clause instructs relay of finding_id and memory ids via flagged_items channel, but base.py:311-317 overwrites stage_result.report with ReconReportState.get_assembled_report(), which rebuilds flagged items as fixed 15-field dicts; add_finding() has no **kwargs passthrough, silently discarding Stage-1 relay fields — Stage-2 is told to persist provenance it cannot receive, a silent-drop failure mode
 - id: fused-memory-api-traps
   title: 'fused-memory tool contracts lie or under-inform: destructive-by-default writes, envelope asymmetry, silent filters, unusable oversized outputs'
   severity: medium
@@ -1425,6 +1438,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Escalation-watcher rotation shows the characteristic loop-mechanics churn: repeated mcp__escalation__get_pending_escalations polling (x6), repeated date-check calls for liveness/time tracking (x3), and a long Bash retry chain around the bounded-wait re-arm script (x10) — the same class of watcher-vs-harness friction as the cited bg-task reaping / improvised liveness checks, though this run''s exit-124 CEILING outcome at turn 501 is correctly tagged designed_outcome rather than tool_error, suggesting the scorer-side misclassification (entry-cand-20260729-2) is already fixed.'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 4d0e01cc-5736-48de-aa6b-b6618b574b62
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Error Neighborhoods shows exit 137 (SIGKILL) from watcher-rearm.sh; tool timeout (3660000ms = 61min) exceeds script timeout (3600s = 1h), suggesting forced termination by Bash harness rather than clean script exit
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -1999,6 +2018,13 @@ entries:
     manifested_phase: architect
     invariant_violated: MCP payload fields must not contain serialized tool-call envelope markup
     note: 'add_design_decision call rejected: ''decision'' field contained `<parameter name=` markup. Same pattern as original incident where XML from tool-call envelope leaked into task description payload. Suggests agent is inadvertently serializing part of its own call envelope into field values during remediation planning.'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 2dc3111c-c8fd-45ca-8fb5-8e00989725df
+    origin_phase: unknown
+    manifested_phase: implement
+    invariant_violated: Tool call payloads must not contain raw MCP markup; boundaries and envelope structure must not leak into user-facing fields
+    note: Markup pattern `</description>` appeared in the summary field of a submit_review_verdict call, similar to the task-description scenario but downstream in the review-verdict submission flow. The task-notification output was truncated in the digest (5989 of 7989 bytes dropped), leaving incomplete context on the markup source.
 - id: oneoff-2026-07-10
   title: install-hooks.sh run inside a task worktree baked ephemeral .worktrees/2288 paths into global ~/.claude/settings.json, and the idempotency check skips rather than repairs dead entr
   severity: low
@@ -3640,6 +3666,13 @@ entries:
     origin_phase: ops
     manifested_phase: unknown
     note: The recalled memories injected at session start (task 1470 wiring /audit into /review, reify task 2531's plan.json finding, architecture-doc corroboration) score 1.0/0.95/0.9 relevance but read as generic project facts with no evident connection to whatever task 3956's worktree actually concerns — matches the generic-high-score-but-irrelevant pattern.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 629dbaba-f8f1-4618-b5fe-abf75b2b4b98
+    origin_phase: architect
+    manifested_phase: architect
+    invariant_violated: digest score misaligned with signal evidence
+    note: Score=30.0 assigned to a session with only 2 non-zero signal counts (self_correct=1, df_guard=1), while 4 items were truncated. No designed_outcome or tool_error, yet high severity score persists.
 - id: entry-cand-20260717-2
   title: Rotation-hour budget invisible during long blocking re-arm waits
   severity: medium
@@ -3894,6 +3927,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Interactive session attempting read-only forensic find command (census report search) blocked by interactive Bash approval, followed by generic ''no such file or directory'' error with no diagnostic context at turn 42. Pattern: approval friction on diagnostic searches + downstream vague failures.'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: e55489a7-e387-4147-b4bc-62b95283cddf
+    origin_phase: ops
+    manifested_phase: verify
+    note: Periodic-census verifier session blocked by per-command interactive Bash approval gates on read-only forensic operations (find, grep, git log, awk); 10 tool_error signals from denied Bash calls; 2 not_found errors when verification diagnostic reads were blocked; verification task unable to complete
 - id: entry-cand-20260719-5
   title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
   severity: medium
@@ -4461,6 +4500,12 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: User correction teaches the distinction between SETTLED (actually resolved/acted on) vs DEFERRED (still open, merely routed to follow-up); the adjudicator was being told that resemblance to a prior round does NOT imply resolution.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 1a213df5-021a-4fba-9c3d-b7b944c314a4
+    origin_phase: review
+    manifested_phase: review
+    note: 'Session shows user providing extensive PRIOR-ROUND SUGGESTIONS block to enable adjudicator to distinguish settled vs deferred concerns. This is exactly the scenario the entry describes: adjudicator must be explicitly told this distinction, which the system does not infer automatically.'
 - id: entry-cand-20260715-4
   title: watcher-rearm.sh requires DARK_FACTORY_ROOT, unset by the rotation's injected supervisor prompt
   severity: medium
@@ -5478,6 +5523,19 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest's 'User Corrections' bucket captured the escalation-watcher rotation's injected supervisor prompt (ROTATION_ESCALATIONS/ROTATION_HOURS limits, project root, DARK_FACTORY_ROOT, verbatim watcher-rearm.sh invocation) as if it were corrective user feedback, even though signal_counts show a clean rotation (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0, designed_outcome=3) — the mislabel is purely a digest-pipeline classification defect, not evidence of session trouble.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 9027f4be-3d27-4171-93ec-4dd9fc8d7e13
+    origin_phase: unknown
+    manifested_phase: ops
+    invariant_violated: Digest extractor must not label trickle-coder's own injected task/system prompts as user-provided corrections
+    note: User Corrections section contains the trickle-coder's own periodic-census task frame ('You are the periodic-census synthesis writer for the dark-factory agent-confusion codebook...'), mislabeled as corrective user feedback
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 4d0e01cc-5736-48de-aa6b-b6618b574b62
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest 'User Corrections' section (turn 3) contains the injected supervisor prompt ('You are running as an autonomous escalation watcher...') mislabeled as user feedback rather than system context
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -6045,6 +6103,19 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest's only content is a Guard Trips line reading '(turn 3) blocked:' with nothing after the colon — the guard signal (df_guard:1) fired but the rendered template dropped whatever substring/reason was actually matched, leaving the trip uninterpretable.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: f0ddec0a-4400-4d15-99b8-fa7d6b8478a9
+    origin_phase: unknown
+    manifested_phase: unknown
+    invariant_violated: digest extraction fidelity
+    note: Guard trips labeled 'blocked:' with no detail. Entry-cand-20260722-33 describes digest generator rendering guard/not-found signals as bare templates, dropping matched substring — exact match to observed bare 'blocked:' entries on turns 32, 42.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: cf648d03-adc7-431d-910b-b8ebd9ff1871
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard signal 'blocked:' rendered as bare template — no matched substring or detail after the colon
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -6538,6 +6609,13 @@ entries:
     origin_phase: implement
     manifested_phase: recon
     note: The 'User Corrections' section contains an auto-generated escalation briefing with structured fields (ID, Category, Severity, Summary, Detail, MEASURED data) — clearly an injected task context block, not user-provided corrections. Content from turn 143 of an orchestrated-task session.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 629dbaba-f8f1-4618-b5fe-abf75b2b4b98
+    origin_phase: architect
+    manifested_phase: architect
+    invariant_violated: digest pipeline categories user-corrigible content
+    note: Session digest labels an orchestrated task's injected briefing ('Read the brief at /home/leo/.claude/spawn-briefs/architect-eval-redesign-20260826.md...') as 'User Corrections' when it is task dispatch context, not corrective feedback.
 - id: entry-cand-20260725-3
   title: Digest 'User Corrections' bucket captures pasted non-corrective report/log content
   severity: medium
@@ -6730,6 +6808,19 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest's 'User Corrections' bucket captures a pasted verification-request report (Claim/Context/Reviewer rationale/Suggested fix for the task-3994 follow-up) as if it were user-authored corrective feedback — matches the established 'non-corrective report/log content captured as User Correction' pattern.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 189f95de-a894-4172-82ff-54f2b3c1557f
+    origin_phase: unknown
+    manifested_phase: review
+    note: Digest 'User Corrections' bucket captured detailed code-review report (flag_dedup.py bug analysis with suggested fix and regression test) and mislabeled it as a correction. Content is non-corrective review feedback, not a user instruction to fix an agent mistake.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 94f9e2a3-6285-4718-be79-ffafba4552b2
+    origin_phase: review
+    manifested_phase: unknown
+    invariant_violated: User Corrections bucket contains tool output, not user feedback
+    note: Review feedback (two test-quality blocker issues from a code-review tool) captured under 'User Corrections' section, misclassifying structured tool output as user feedback correcting the trickle-coder's analysis.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -7369,6 +7460,19 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: score=5.0 assigned while all six signal_counts read 0, and the extracted item is cited as '(turn 3)' despite n_user_turns=1 — label/score decoupled from the session's own signal data, consistent with the prior 'score decoupled from signal_counts' finding.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 94f9e2a3-6285-4718-be79-ffafba4552b2
+    origin_phase: implement
+    manifested_phase: unknown
+    invariant_violated: score ≠ 0 with all signal_counts = 0
+    note: Digest scored 5.0 severity despite tool_error/self_correct/not_found/df_guard/interrupt/designed_outcome all reading zero. Severity assignment decoupled from signal detection.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 02f4788e-d8a4-4913-9638-39696435c045
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest assigned severity score=5.0 despite all signal_counts reading zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0, designed_outcome=0); score decoupled from evidence body
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -7895,6 +7999,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Digest score assigned (0.0) to session with all signal_counts at zero; the score/content decoupling is exact but this session adds a new dimension: zero user turns (n_user_turns=0) suggests the session never ran at all, making the digest entry a candidate for filtering entirely'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 189f95de-a894-4172-82ff-54f2b3c1557f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest assigned score: 5.0 despite all signal_counts (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome) reading exactly 0. High score on empty signals.'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 1a213df5-021a-4fba-9c3d-b7b944c314a4
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest assigned score=5.0 despite all signal_counts reading zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0, designed_outcome=0). Severity scoring is decoupled from signal detection.
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -8450,6 +8566,12 @@ entries:
     origin_phase: review
     manifested_phase: unknown
     note: The digest extracted instructional text ('You are adjudicating whether each CURRENT review suggestion...') framed in imperative mood as part of User Corrections in an orchestrated-task session. This matches the documented pattern of digest systems mislabeling injected task context or trickle-coder prompt content as user-generated corrections, specifically in orchestrated-task workflows.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 1a213df5-021a-4fba-9c3d-b7b944c314a4
+    origin_phase: unknown
+    manifested_phase: review
+    note: Orchestrated-task session with User Corrections section containing pasted instructional context block (PRIOR-ROUND SUGGESTIONS list). The digest mechanism filed this under 'User Corrections' rather than recognizing it as task-context metadata or briefing content.
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -9211,6 +9333,12 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: The 'User Corrections' section contains a task-briefing instruction block ('You are adjudicating whether each CURRENT review suggestion...') that is clearly injected task context/guidance, not user-provided corrective feedback. Digest extraction mislabels it as a correction.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 02f4788e-d8a4-4913-9638-39696435c045
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Digest ''User Corrections'' section captures injected task briefing (''You are adjudicating...'', ''IMPORTANT: the PRIOR-ROUND block...'') mislabeled as user corrections; this was orchestrator-injected context, not interactive feedback'
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -10617,6 +10745,66 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated-task session in task worktree .worktrees/3112 repeatedly hits 'No such file or directory' (sed -n on tests/test_consolidation_gate.py, twice, only the line range varies) with signal_counts showing tool_error:2/not_found:3 and everything else (self_correct, df_guard, interrupt, designed_outcome) at 0 — no other diagnostic signal accompanies the repeated failure, matching this candidate's exact shape almost verbatim.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 18d6b7f6-f395-401b-8e1e-4aa5635223d9
+    origin_phase: implement
+    manifested_phase: implement
+    note: Task 3187 orchestrated worktree fires 7 repeated 'no such file or directory' errors across turns 52, 58, 59, 145+ with identical relative-path misses (orchestrator/, orchestrator/src/orchestrator/merge_queue.py). Agent has git access (commits succeed) but fails on file navigation, suggesting unbrief'd worktree context or no path-adjustment strategy for `.worktrees/<id>` execution location.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: cfdc8d2b-acac-4041-97cb-58f33e3ad787
+    origin_phase: implement
+    manifested_phase: implement
+    note: Agent repeatedly attempts relative-path cds (cd fused-memory) and file reads from main-checkout structure; turns 101, 153, 154, 179 all fire 'no such file or directory' with no diagnostic that the worktree layout differs. No adaptation after first failure.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 0755ce4d-bc20-4ad7-8f6d-4cc6896e0272
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated worktree task (.worktrees/3672) exhibits repeated 'does not exist' and 'no such file or directory' signals (turns 56, 76, 120, 125) with minimal diagnostic context. Agent completes successfully despite the errors, suggesting workaround or non-blocking failures.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 3b90f113-0c0a-4782-8e7d-ab9f05eab392
+    origin_phase: architect
+    manifested_phase: verify
+    note: Orchestrated worktree task (n_user_turns=0) in .worktrees/4764 fires 'no such file or directory' (exit 2) when grepping orchestrator/src/orchestrator/briefing.py. Two guard trips at turns 36 and 48 precede the grep error, suggesting structural concerns were flagged but execution continued.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 89f91fe3-d144-4385-8efa-17230a9bcdec
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Automated dispatch (n_user_turns=0, 519 bytes) fires multiple 'no such file or directory' and 'does not exist' errors across turns 19, 29 with guard-trip blocked on turn 29, matching signature of orchestrated worktree task hitting filesystem errors with no diagnostic detail
+  - date: '2026-08-26'
+    project: dark_factory
+    session: f0ddec0a-4400-4d15-99b8-fa7d6b8478a9
+    origin_phase: architect
+    manifested_phase: architect
+    note: 'Worktree session 3539 exhibits the canonical pattern: 3 ''no such file or directory'' errors (turns 23, 28, 37) with n_user_turns=0 and no other diagnostics beyond a grep failure (turn 7, exit 2). Minimal signal context characteristic of silent worktree setup failures. Strong match to recurring defect.'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 7fed3a7f-0853-4272-86ee-7b5844597fba
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated task in worktree produced minimal output (512 bytes) with 3 'not_found' signals and no other diagnostic signals (tool_error/df_guard/interrupt all zero). Consistent with pattern of orchestrated worktree task failing silently with diagnostic-poor output.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: cc33651a-91ea-443a-adde-277180ed9be4
+    origin_phase: verify
+    manifested_phase: verify
+    note: Orchestrated task in worktree attempted to read .task/metadata.json and .task/plan.json (turns 17, 24) and received exit 1 errors twice. Turn 44 'not_found' signal marks a third unreadable resource. Aligns with repeated file-access failures during task state inspection, preventing full diagnostic capture in block report.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 44d14d9c-1426-45df-85fb-0c071941fe3a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated worktree task (3639) firing ''cd orchestrator: No such file or directory'' during pytest execution; matches candidate pattern of worktree path resolution failure with minimal diagnostic signal (tool_error + not_found only)'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 56c45cc7-a3a6-4656-ac0b-7fc317a9096a
+    origin_phase: unknown
+    manifested_phase: review
+    note: Orchestrated task in worktree .worktrees/4373 attempted to verify review feedback by reading fused-memory/src/fused_memory/reconciliation/server/recon_report.py (referenced in review evidence citations), but file does not exist in worktree; Bash exit 2 with no diagnostic signal
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -10785,6 +10973,19 @@ entries:
     evidence_quote: 'Bash x6: {"command": "date -u +\"%Y-%m-%dT%H:%M:%S%z\""}
 
       - Bash x6: {"command": "cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh --queue-dir /home/leo/src/dark-factory/data/escalations --level 1 --timeout 3600", "timeout": 3660000}'
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 9027f4be-3d27-4171-93ec-4dd9fc8d7e13
+    origin_phase: ops
+    manifested_phase: ops
+    invariant_violated: Digest retry-loop detector must distinguish designed periodic calls (one date check + one bounded re-arm per cycle, hitting ceiling exit=124) from failure-driven retries; tool_error=0 and self_correct=0 are the signal
+    note: Session exhibits 4-hour watcher rotation with repeated identical `date -u` and `watcher-rearm.sh` calls across cycle boundaries; signal_counts confirm zero actual failures (tool_error=0, self_correct=0), yet digest 'Retry Loops' bucket flags this as looping behavior
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 4d0e01cc-5736-48de-aa6b-b6618b574b62
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Retry Loops section flags mcp__escalation__get_pending_escalations (x3) and watcher-rearm.sh (x5) as retry loops when these are designed polling/bounded-wait re-arm behavior inherent to watcher rotation
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -17944,3 +18145,185 @@ candidates:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: 'Bash({"command": "sleep 45; echo done", "dangerouslyDisableSandbox": true}) -> <tool_use_error>Blocked: sleep 45 followed by: echo done. To wait for a condition, use Monitor with an until-loop... Do not chain shorter sleeps to work around this block.</tool_use_error>'
+- id: cand-20260826-1
+  title: Worktree task dispatch doesn't validate premise code existence before execution
+  cause: Task premises about symbols/functions/paths are extrapolated at design time (architect/decompose) without corroborating them against actual worktree state at dispatch boundary
+  area: task-execution / worktree-validation
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 0755ce4d-bc20-4ad7-8f6d-4cc6896e0272
+    origin_phase: architect
+    manifested_phase: implement
+    evidence_quote: Bash exit 2 on 'grep -rn "count_foreign_relationships" --include=*.py .' with two 'not found' signals, 0-turn automated session in .worktrees/3672 context
+- id: cand-20260826-2
+  title: Digest mislabels orchestrator worktree session as 'interactive' with non-existent turn references
+  cause: Session classification confuses orchestrator-spawned worktree sessions with interactive user sessions; digest extraction tries to reference high turn numbers (140, 149, 154) in a session with zero user turns, indicating turn indexing mismatch or session type misclassification
+  area: session classification, digest extraction, turn indexing
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 3b90f113-0c0a-4782-8e7d-ab9f05eab392
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Session 3b90f113-0c0a-4782-8e7d-ab9f05eab392: agent_class=''interactive'' but n_user_turns=0; cwd=''.worktrees/4764'' (orchestrator worktree); not_found signals at turns 140, 149, 154'
+- id: cand-20260826-3
+  title: ListAgents empty-response retry loop in isolated worktree
+  cause: 'Agent in a task worktree repeatedly calls ListAgents and receives empty results ({}), continuing to retry without visible backoff or termination logic. Possible confusion: agent expects to discover other agents/subagents but the isolated worktree environment returns no results, and the agent has no mechanism to recognize this as a permanent state.'
+  area: agent-discovery
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 0755ce4d-bc20-4ad7-8f6d-4cc6896e0272
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'ListAgents x6: {}'
+- id: cand-20260826-4
+  title: Task-notification completion output mislabeled as 'User Corrections'
+  cause: 'Digest pipeline captures a <task-notification> artifact (task completion with results from ''Review test file quality'' agent) and labels it under ''User Corrections'' section. The content is task output (mutation-testing findings), not user-provided feedback or corrections. Possible confusion: digest classifier treats any structured output block as potential user feedback without discriminating between injected task system artifacts and actual user input.'
+  area: digest-capture
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 0755ce4d-bc20-4ad7-8f6d-4cc6896e0272
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: '## User Corrections section contains <task-notification> with <status>completed</status> and substantive task results (mutation test findings) rather than user feedback'
+- id: cand-20260826-5
+  title: Spawn-brief outcome-file protocol with async sub-agent completion
+  cause: Spawn-briefs that mandate autonomous work with asynchronous sub-agents specify an outcome-file requirement ('Before you end this session... write your outcome to [path]'), but the protocol for coordinating async task-notification completion with outcome-file writes is not clearly defined or enforced.
+  area: spawn-brief async orchestration and completion
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: adece00e-8a00-40bd-9c68-388382a52fb2
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Session fires 6 verification sub-agents asynchronously (task-notifications arriving at turns 223, 242, 256, 272, 292, 306). Brief explicitly requires ''Before you end this session... write your outcome to: /home/leo/.claude/fleet/sessions/investigate-df-3635-2719952/result.md'' but digest shows truncated task outputs and no evidence of outcome-file write or explicit await sequence before session exit.'
+- id: cand-20260826-6
+  title: Interactive session fires guards with zero user turns
+  cause: Guards triggered on automated task-setup operations or worktree initialization, not user input. Session classified as interactive but n_user_turns=0 suggests guards fire autonomously (possibly on orchestrated task dispatch, agent setup, or MCP discovery checks in the worktree).
+  area: session classification / guard lifecycle
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: f0ddec0a-4400-4d15-99b8-fa7d6b8478a9
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'agent_class: ''interactive'', n_user_turns: 0, signal_counts: df_guard: 2. Cwd is a worktree (.worktrees/3539), encoding_dir ''subagents'' suggests task-dispatched sub-agent context. No user turns but 2 guards fired — indicates non-user-input trigger.'
+- id: cand-20260826-7
+  title: Digest 'User Corrections' bucket captures background task-completion notifications as user feedback
+  cause: Digest extraction labels all non-error, non-tool-output content in the session as corrections/feedback, including task-notification JSON blocks showing agent completion status. These are orchestration signals, not user-supplied corrections.
+  area: digest-extraction
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 629dbaba-f8f1-4618-b5fe-abf75b2b4b98
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: '''User Corrections'' section contains (turn 138) <task-notification>..., (turn 152) <task-notification>..., (turn 193) <task-notification>..., (turn 207) <task-notification>..., each a completed background agent''s output, not corrective feedback.'
+- id: cand-20260826-8
+  title: Digest score assigned to truncated inventory without accounting for truncation impact on signal reliability
+  cause: Session shows truncated_items=4 and score=30.0 despite only 2 non-zero signal counts. Truncation may have dropped signals that would shift severity categorization, but score is calculated from the incomplete digest.
+  area: digest-scoring
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 629dbaba-f8f1-4618-b5fe-abf75b2b4b98
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: 'signal_counts: {tool_error=0, self_correct=1, df_guard=1, ...}, truncated_items=4, score=30.0 — no mechanism discounts score for truncation or reverifies signals post-truncation.'
+- id: cand-20260826-9
+  title: Bash tool flattens newlines in Python -c command strings
+  cause: The Bash tool is not preserving newline characters in multiline Python code passed via `python3 -c`. Literal `\n` sequences in the command JSON are either stripped or replaced with spaces during execution, collapsing all statements onto one line and triggering IndentationError when Python parses the result.
+  area: Bash tool, command string handling / JSON escaping
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 29071338-fc63-4d33-bb39-54daed39cb35
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'Turns 38, 484, 510: Identical pattern — `python3 -c "\nimport json\nfor line in open(''iterations.jsonl''):\n    d = json.loads(...)` produces execution error with flattened syntax: `import json for line in open(...): d = json.loads(line) print(...)` all on line 1, causing `IndentationError: unexpected indent`. Turn 300 self-corrects but errors recur, suggesting agent works around locally rather than root issue being fixed.'
+- id: cand-20260826-10
+  title: Digest generator probes for fixed turn offsets without checking session length
+  cause: The digest extraction process appears to probe for turns at fixed offsets (151, 200, 205) without verifying the session contains that many turns, generating benign 'not_found' reports for very short sessions.
+  area: digest-extraction
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 7fed3a7f-0853-4272-86ee-7b5844597fba
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Session 512 bytes with signal_counts.not_found: 3 reporting (turn 151) does not exist, (turn 200) does not exist, (turn 205) does not exist'
+- id: cand-20260826-11
+  title: Interactive session with 0 user turns suggests misclassification or early abort
+  cause: Sessions labeled as agent_class='interactive' but with n_user_turns=0 indicate either misclassified session type (e.g., internal/tool session captured as interactive), abort before user interaction, or turn-counting methodology discrepancy
+  area: digest_generation | session_classification | session_lifecycle
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: cf648d03-adc7-431d-910b-b8ebd9ff1871
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'agent_class: ''interactive'', n_user_turns: 0, but signal_counts exist and turn 3 interrupt occurred'
+- id: cand-20260826-12
+  title: Digest generator references hardcoded turns that don't exist in zero-turn sessions
+  cause: Digest signal extraction has template-based or hardcoded turn references (e.g., turns 22, 31) that fire unconditionally even when the session has zero user turns, causing spurious 'not_found' signals
+  area: trickle-coder/digest-generation
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: feb6ff70-eea9-47d2-af08-9b0b96a87234
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: session with n_user_turns=0 reports signal_counts.not_found=2 for '(turn 22) does not exist' and '(turn 31) does not exist'
+- id: cand-20260826-13
+  title: Digest mislabels watcher rotation supervisor prompt as 'User Correction'
+  cause: Digest extraction pipeline misclassifies injected watcher rotation supervisor instructions as user corrections rather than system/supervisory context
+  area: digest
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 63eade40-b9ac-46cf-bced-d9b07a6bf304
+    origin_phase: ops
+    manifested_phase: recon
+    evidence_quote: "## User Corrections\n- (turn 3) You are running as an autonomous escalation watcher.\nRotation limits (injected by supervisor):\n  ROTATION_ESCALATIONS=50\n  ROTATION_HOURS=4.0\n...\nDark-factory tooling root (DARK_FACTORY_ROOT, set in your environment): /home/leo/src/dark-factory\nscripts/watcher-rearm.sh lives in THAT repo -- it is the canonical bounded-wait re-arm wrapper. Re-arm with, verbatim:\n  cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh ..."
+- id: cand-20260826-14
+  title: Orchestrated-task digest misclassifies tool-generated code-review output as user feedback
+  cause: Digest extraction conflates task output (code-review findings) with user corrections; the pipeline captures structured review feedback without distinguishing tool-generated reports from actual human corrections to the trickle-coder's work.
+  area: digest extraction, user-corrections classification
+  first_seen: '2026-08-26'
+  disposition: pending
+  sightings:
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 94f9e2a3-6285-4718-be79-ffafba4552b2
+    origin_phase: implement
+    manifested_phase: unknown
+    evidence_quote: '''User Corrections'' section contains ''(turn 3) The implementation was reviewed and blocking issues were found.'' followed by detailed ''[reviewer_comprehensive]'' sections with test-quality findings — classified as corrections when they are tool-generated review output from the task execution itself.'
