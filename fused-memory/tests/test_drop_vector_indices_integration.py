@@ -212,6 +212,29 @@ class TestDropVectorIndicesLive:
             first = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert len(first) == 2
 
+            # MANDATORY (task 4748) — do NOT delete this as redundant with the
+            # fixture's barrier. DROP re-opens the window the fixture's barrier
+            # closed: dropping a VECTOR field from a label whose merged index
+            # carries other fields makes FalkorDB BUILD A REPLACEMENT index, and
+            # until that build finishes CALL db.indexes() returns BOTH rows in
+            # one result set — the new ['name'] row reading '[Indexing] N/M:
+            # UNDER CONSTRUCTION' and the OLD row still advertising the dropped
+            # name_embedding VECTOR as OPERATIONAL. drop_vector_indices() opens
+            # with its own list_indices(), so without this barrier pass 2's
+            # internal read can land in the window, see the stale
+            # Entity{name_embedding: ['VECTOR']} row, and re-issue
+            # `DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)` — which
+            # FalkorDB then answers with:
+            #   redis.exceptions.ResponseError: Unable to drop index on
+            #   :Entity(name_embedding): no such index.
+            # drop_vector_indices() deliberately does not absorb per-statement
+            # failures, so that ERRORS the test rather than failing an
+            # assertion. Measured against FalkorDB v41800; not a read-path
+            # artifact — RO_QUERY and QUERY agree at every instant. (RELATES_TO
+            # is never the phantom: its index has only the one field, so
+            # dropping it removes the whole index and opens no window.)
+            await await_index_operational(live_vector_graph)
+
             second = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert second == []
         finally:
