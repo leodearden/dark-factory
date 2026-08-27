@@ -754,7 +754,6 @@ async def triage_write(
     judge: Any = None,
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
-    is_recon_stage_agent: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
@@ -775,12 +774,18 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_owns_attach_keys* and
-    *is_recon_stage_agent* are passed IN rather than recomputed:
-    ``add_memory`` already derives all three from the metadata and the
-    agent_id it holds, and a second derivation here is a second place for them
-    to disagree about who is exempt. :func:`declares_attach_keys` is the one
-    spelling of the *caller_owns_attach_keys* predicate.
+    *allow_near_duplicate* and *caller_owns_attach_keys* are passed IN rather
+    than recomputed: ``add_memory`` already derives both from the metadata it
+    holds, and a second derivation here is a second place for them to disagree
+    about who is exempt. :func:`declares_attach_keys` is the one spelling of
+    the *caller_owns_attach_keys* predicate.
+
+    There is deliberately no recon-stage arm. It was retired by task 3134
+    (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
+    whose canonical write goes through ``MemoryService.add_memory`` and never
+    reaches this seam, and which writes that canonical BEFORE any delete —
+    supplying the ordering guarantee whose absence was the arm's whole
+    justification. A recon-stage caller now triages like any other.
     """
     if allow_near_duplicate:
         # D2 reinterprets the retired guard's bypass flag as triage's
@@ -812,21 +817,6 @@ async def triage_write(
         #
         # Returned before retrieval for the same reason as the flag above: no
         # candidate can change the answer, so no round-trip is spent asking.
-        return BandDecision(OUTCOME_STORED, None, None, None, None)
-
-    if is_recon_stage_agent:
-        # The recon-stage exemption SURVIVES this leaf; LEAF IOTA owns its
-        # removal, and its explicit signal is "a recon-agent direct near-dup
-        # add_memory now triages like anyone else".
-        #
-        # Why it must survive until then: Stage-1 consolidation writes a merged
-        # canonical that is EXPECTED to closely resemble the duplicates it
-        # replaces, and there is no ordering guarantee that those duplicates are
-        # deleted first. Attaching the merged entry as a sighting of one of them
-        # would INVERT consolidation — the entry written to supersede a memory
-        # would become its child — and the inversion would be invisible, because
-        # a sighting of a near-identical parent is exactly what a real
-        # restatement looks like.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     try:

@@ -3075,9 +3075,9 @@ def create_mcp_server(
         With triage on, ``metadata={'allow_near_duplicate': True}`` is
         reinterpreted rather than retired: it now means FORCE-STORE — store
         this standalone, do not reroute it — for the same reason it meant
-        "do not reject me" before. recon-stage-* agents are likewise
-        force-stored, as is any write whose own metadata already sets
-        ``parent_id`` or ``kind`` — the two keys an attach would overwrite.
+        "do not reject me" before, as is any write whose own metadata already
+        sets ``parent_id`` or ``kind`` — the two keys an attach would
+        overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
         Content carrying a raw MCP envelope fragment is REJECTED outright
@@ -3233,7 +3233,6 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
-        is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3271,7 +3270,6 @@ def create_mcp_server(
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
-                is_recon_stage_agent=is_recon_stage_agent,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
