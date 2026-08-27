@@ -16,7 +16,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 from orchestrator.workflow_types import WorkflowState
@@ -304,6 +304,18 @@ async def test_run_slot_clears_stale_grace_stamp_at_dispatch(
         await asyncio.wait({wrapper_task}, timeout=5.0)
 
 
+def _narrow(result: TaskReport | None) -> TaskReport:
+    """Narrow ``_run_slot``'s ``TaskReport | None`` to the report it always returns here.
+
+    Every path this driver exercises reaches the ``except asyncio.CancelledError``
+    handler, which returns a synthetic ``TaskReport``.  Stating that precondition
+    once keeps each caller's ``report.block_reason`` / ``.block_phase`` access
+    type-clean without weakening any assertion.
+    """
+    assert result is not None, 'expected a synthetic CANCELLED TaskReport, got None'
+    return result
+
+
 async def _drive_cancelled_slot(
     h: Harness,
     tid: str,
@@ -312,7 +324,7 @@ async def _drive_cancelled_slot(
     state: WorkflowState | None = WorkflowState.EXECUTE,
     cancel_during_setup: bool = False,
     capture_task: list | None = None,
-):
+) -> TaskReport:
     """Run a real _run_slot to its hard-cancel and return the synthetic report.
 
     Reuses the driver shape of test_run_slot_returns_cancelled_report_when_hard
@@ -333,7 +345,7 @@ async def _drive_cancelled_slot(
             wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
             done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
             assert wrapper_task in done
-            return wrapper_task.result()
+            return _narrow(wrapper_task.result())
 
         async def _wedge() -> None:
             await asyncio.sleep(3600)
@@ -359,7 +371,7 @@ async def _drive_cancelled_slot(
 
         done, _ = await asyncio.wait({wrapper_task}, timeout=5.0)
         assert wrapper_task in done, 'wrapper_task did not finish within 5 s'
-        return wrapper_task.result()
+        return _narrow(wrapper_task.result())
 
 
 @pytest.mark.asyncio

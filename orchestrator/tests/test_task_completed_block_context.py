@@ -31,7 +31,7 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.event_store import EventType
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, TaskReport
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ async def _drive_slot(
     *,
     cancel: bool = False,
     state: WorkflowState = WorkflowState.EXECUTE,
-):
+) -> TaskReport:
     """Run ``_run_slot`` with ``build_workflow`` patched to return ``terminal``.
 
     ``cancel=True`` (task 3172) instead makes ``workflow.run()`` raise
@@ -132,7 +132,12 @@ async def _drive_slot(
         # No steward => steward_cost / steward_invocations stay 0.
         mock_wf._steward = None
         MockWorkflow.return_value = mock_wf
-        return await harness._run_slot(assignment, sem)
+        report = await harness._run_slot(assignment, sem)
+    # ``_run_slot`` is typed ``TaskReport | None``; every path this driver
+    # exercises returns a report (terminal or synthetic-CANCELLED), so this
+    # states an existing precondition rather than weakening a check.
+    assert report is not None, 'expected _run_slot to return a TaskReport, got None'
+    return report
 
 
 def _task_completed_payloads(harness: Harness) -> list[dict]:

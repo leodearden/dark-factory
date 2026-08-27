@@ -24,6 +24,24 @@ FRESH_AGE_SECS = 90.0
 THRESHOLD_SECS = 600.0
 
 
+def _queue_of(harness: Harness) -> EscalationQueue:
+    """Narrow ``Harness._escalation_queue`` (typed ``EscalationQueue | None``).
+
+    The ``strand_harness`` fixture always wires a real queue, so this states an
+    existing precondition for the type checker rather than weakening a check.
+    """
+    queue = harness._escalation_queue
+    assert queue is not None, 'strand_harness must be wired with a real EscalationQueue'
+    return queue
+
+
+def _get(queue: EscalationQueue, esc_id: str) -> Escalation:
+    """Narrow ``EscalationQueue.get`` (``Escalation | None``) at a seeded id."""
+    esc = queue.get(esc_id)
+    assert esc is not None, f'escalation {esc_id} missing from the queue'
+    return esc
+
+
 def _seed_escalation(
     queue: EscalationQueue,
     esc_id: str,
@@ -357,29 +375,30 @@ class TestStaleL0StrandIsLoud:
 
     async def test_both_pending_l0s_are_still_dismissed(self, strand_harness: Harness):
         """Loudness must not cost the sweep its actual job."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
 
-        assert queue.get('esc-5189-7').status == 'dismissed'
-        assert queue.get('esc-5685-1').status == 'dismissed'
+        assert _get(queue, 'esc-5189-7').status == 'dismissed'
+        assert _get(queue, 'esc-5685-1').status == 'dismissed'
 
     async def test_strand_and_fresh_record_are_distinguishable_afterwards(
         self, strand_harness: Harness
     ):
         """The exact flattening the origin incident exposed is gone."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
 
-        strand = queue.get('esc-5189-7')
-        fresh = queue.get('esc-5685-1')
+        strand = _get(queue, 'esc-5189-7')
+        fresh = _get(queue, 'esc-5685-1')
         assert strand.resolution_class == 'stale-strand'
         assert fresh.resolution_class == 'benign'
+        assert strand.resolution is not None and fresh.resolution is not None
         assert 'pending_secs=' in strand.resolution
         assert 'pending_secs=' in fresh.resolution
 
@@ -387,7 +406,7 @@ class TestStaleL0StrandIsLoud:
         self, strand_harness: Harness
     ):
         """One event per strand, keyed so it joins against task_completed."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
 
@@ -402,7 +421,7 @@ class TestStaleL0StrandIsLoud:
         self, strand_harness: Harness
     ):
         """The payload states how long it waited and that a workflow was on it."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
@@ -415,7 +434,7 @@ class TestStaleL0StrandIsLoud:
 
     async def test_fresh_l0_produces_no_strand_event(self, strand_harness: Harness):
         """An ordinary restart artifact stays ordinary — no strand telemetry."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
@@ -432,7 +451,7 @@ class TestStaleL0StrandIsLoud:
         genuinely parks.  After a restart _escalation_events is empty, so the
         record's own severity is the only surviving signal.
         """
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(
             queue, 'esc-4242-1', '4242', age_secs=STRAND_AGE_SECS, severity='info'
         )
@@ -446,7 +465,7 @@ class TestStaleL0StrandIsLoud:
 
     async def test_strand_sweep_logs_at_warning(self, strand_harness: Harness, caplog):
         """journald is loud too — a swept strand is not an INFO-level footnote."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
 
         with caplog.at_level(logging.WARNING):
@@ -459,7 +478,7 @@ class TestStaleL0StrandIsLoud:
         self, strand_harness: Harness
     ):
         """An observability failure must not cost the sweep its primary action."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         strand_harness.event_store.emit = MagicMock(  # type: ignore[union-attr]
             side_effect=RuntimeError('event store exploded')
@@ -467,7 +486,7 @@ class TestStaleL0StrandIsLoud:
 
         await strand_harness._dismiss_stale_escalations()
 
-        assert queue.get('esc-5189-7').status == 'dismissed'
+        assert _get(queue, 'esc-5189-7').status == 'dismissed'
 
 
 def _aggregate_escalations(harness: Harness) -> list:
@@ -493,7 +512,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         self, strand_harness: Harness
     ):
         """Two strands plus a fresh L0 file exactly ONE aggregate, not three."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         _seed_escalation(queue, 'esc-5190-1', '5190', age_secs=STRAND_AGE_SECS + 600)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
@@ -504,7 +523,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
 
     async def test_aggregate_is_filed_at_level_1(self, strand_harness: Harness):
         """L0 would be swept by the next restart's own dismissal; L1 survives."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
@@ -517,18 +536,18 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         self, strand_harness: Harness
     ):
         """The whole point: a second restart must not erase the strand record."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         await strand_harness._dismiss_stale_escalations()
         agg_id = _aggregate_escalations(strand_harness)[0].id
 
         await strand_harness._dismiss_stale_escalations()  # the next restart
 
-        assert queue.get(agg_id).status == 'pending'
+        assert _get(queue, agg_id).status == 'pending'
 
     async def test_aggregate_detail_names_every_strand(self, strand_harness: Harness):
         """Per-strand detail is not lost to aggregation."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         _seed_escalation(queue, 'esc-5190-1', '5190', age_secs=STRAND_AGE_SECS + 600)
 
@@ -544,7 +563,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         self, strand_harness: Harness
     ):
         """Anti-storm dedup: one OPEN aggregate at a time, however many strands."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         await strand_harness._dismiss_stale_escalations()
 
@@ -555,7 +574,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
 
     async def test_zero_strands_files_nothing(self, strand_harness: Harness):
         """An ordinary restart that strands nothing stays completely quiet."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
 
         await strand_harness._dismiss_stale_escalations()
@@ -566,7 +585,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         self, strand_harness: Harness, caplog
     ):
         """A failure to file the aggregate is logged, never raised into startup."""
-        queue = strand_harness._escalation_queue
+        queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         with (
             patch.object(queue, 'submit', side_effect=OSError('disk full')),
@@ -574,7 +593,7 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         ):
             await strand_harness._dismiss_stale_escalations()  # must not raise
 
-        assert queue.get('esc-5189-7').status == 'dismissed'
+        assert _get(queue, 'esc-5189-7').status == 'dismissed'
         assert any(
             r.levelno >= logging.WARNING for r in caplog.records
         ), 'the filing failure must be logged'
