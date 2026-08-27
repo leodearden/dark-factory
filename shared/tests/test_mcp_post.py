@@ -8,6 +8,8 @@ while the HTTP exchange itself reported perfect success.
 
 TDD pair 1: ``mcp_endpoint_url`` canonicalization (GREEN on impl step-2).
 TDD pair 2: ``check_mcp_post_response`` loud-and-never-raising (GREEN on step-4).
+Pair 2b + 3: the SSE decode path and the composed ``post_mcp_tool_call`` /
+``open_mcp_client`` primitives (amendment pass, reviewer suggestions 3 and 4).
 """
 from __future__ import annotations
 
@@ -18,7 +20,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from shared.mcp_post import check_mcp_post_response, mcp_endpoint_url
+from shared.mcp_post import (
+    MCP_POST_HEADERS,
+    check_mcp_post_response,
+    mcp_endpoint_url,
+    mcp_tool_call_payload,
+    open_mcp_client,
+    post_mcp_tool_call,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -238,3 +247,331 @@ def test_a_null_jsonrpc_error_member_is_not_treated_as_an_error(caplog):
 
     assert ok is True
     assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# Pair 2b — the SSE decode path (amendment: reviewer suggestion 3)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS BRANCH IS NOT OPTIONAL COVERAGE.  The fix adds
+# ``Accept: application/json, text/event-stream`` to all five POSTs — that
+# header is what INVITES FastMCP to answer in SSE at all.  So the change made
+# ``_decode_body``'s ``text/event-stream`` branch newly reachable in
+# production while nothing exercised it.  If ``_parse_sse`` were wrong, every
+# SUCCESSFUL write would emit a "could not be inspected" WARNING: the exact
+# inverse of this module's loud-only-on-real-failure contract, and
+# indistinguishable in the logs from an actually lost write.
+#
+# ``test_no_input_shape_ever_raises`` above does NOT close this — none of its
+# ten cases carries an SSE content-type.
+
+SSE_HEADERS = {'content-type': 'text/event-stream'}
+
+
+def _sse_body(payload: dict, *, prefix: str = 'data: ') -> str:
+    """An SSE frame the way FastMCP writes one: an ``event:`` line then ``data:``."""
+    return f'event: message\n{prefix}{json.dumps(payload)}\n\n'
+
+
+def test_sse_success_returns_true_and_logs_nothing(caplog):
+    """A successful write answered in SSE must be silent, not warn.
+
+    This is the case that turns a wrong ``_parse_sse`` into log noise on every
+    healthy write rather than into a visible failure.
+    """
+    resp = _response(
+        200,
+        text=_sse_body({'jsonrpc': '2.0', 'id': 1, 'result': {'content': []}}),
+        headers=SSE_HEADERS,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='completion memory write for task 4023')
+
+    assert ok is True, 'an SSE-framed JSON-RPC result is a DELIVERED write'
+    assert _warnings(caplog) == [], (
+        'a successful SSE answer must not warn — that warning would be '
+        'indistinguishable from a genuinely lost write'
+    )
+
+
+def test_sse_frame_without_the_space_after_data_is_still_parsed(caplog):
+    """``data:{...}`` — the no-space spelling — must decode identically.
+
+    ``_parse_sse`` carries a ``'data: '`` / ``'data:'`` prefix pair; only the
+    first was exercised.  The SSE spec makes the single leading space optional,
+    so a server emitting the tight form would otherwise warn on every success.
+    """
+    resp = _response(
+        200,
+        text=_sse_body({'jsonrpc': '2.0', 'id': 1, 'result': {}}, prefix='data:'),
+        headers=SSE_HEADERS,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='completion memory write')
+
+    assert ok is True
+    assert _warnings(caplog) == []
+
+
+def test_sse_jsonrpc_error_member_returns_false_and_warns(caplog):
+    """An application-level failure delivered over SSE is still a failed write.
+
+    Pins that the SSE branch feeds the SAME error inspection as the JSON
+    branch — a decoder that returned the raw text would make every SSE-framed
+    JSON-RPC error read as success.
+    """
+    resp = _response(
+        200,
+        text=_sse_body({
+            'jsonrpc': '2.0',
+            'id': 1,
+            'error': {'code': -32602, 'message': 'bad params over sse'},
+        }),
+        headers=SSE_HEADERS,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='suggestions memory write')
+
+    assert ok is False
+    assert 'bad params over sse' in ' '.join(r.getMessage() for r in _warnings(caplog))
+
+
+def test_sse_last_data_line_wins(caplog):
+    """FastMCP may emit several frames; the JSON-RPC answer is the LAST one."""
+    resp = _response(
+        200,
+        text=(
+            'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"partial":true}}\n\n'
+            'event: message\ndata: {"jsonrpc":"2.0","id":1,'
+            '"error":{"code":-1,"message":"final frame lost"}}\n\n'
+        ),
+        headers=SSE_HEADERS,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='decisions memory write')
+
+    assert ok is False, 'the LAST data frame decides the outcome, not the first'
+    assert 'final frame lost' in ' '.join(r.getMessage() for r in _warnings(caplog))
+
+
+def test_sse_labelled_body_with_no_data_line_warns_instead_of_raising(caplog):
+    """``_parse_sse``'s ValueError must surface as a WARNING, never propagate.
+
+    An SSE content-type with no ``data:`` line at all is malformed; the
+    never-raises contract still holds because every call site is
+    fire-and-forget.
+    """
+    resp = _response(
+        200,
+        text='event: ping\nretry: 3000\n\n',
+        headers=SSE_HEADERS,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='completion memory write')
+
+    assert ok is False
+    warnings = _warnings(caplog)
+    assert warnings, 'a malformed SSE body must warn'
+    assert 'could not be inspected' in ' '.join(r.getMessage() for r in warnings)
+
+
+def test_an_unlabelled_sse_body_is_still_decoded(caplog):
+    """A body that IS SSE but is not labelled falls back to the SSE spelling.
+
+    ``_decode_body`` tries ``resp.json()`` first and only then ``_parse_sse``.
+    Pins that fallback so a server sending SSE under ``application/json`` (or
+    no content-type at all) does not warn on a delivered write.
+    """
+    resp = _response(
+        200,
+        text=_sse_body({'jsonrpc': '2.0', 'id': 1, 'result': {}}),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = check_mcp_post_response(resp, context='completion memory write')
+
+    assert ok is True
+    assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# Pair 3 — the composed primitives (amendment: reviewer suggestion 4)
+# ---------------------------------------------------------------------------
+#
+# The three ingredients alone left the failure this module exists to close
+# still reachable: a sixth call site applying THREE of the four parts (a
+# slash-less URL and follow_redirects, but no Accept header) still discards
+# its payload — to a silent 406 instead of a silent 307.  These pin that the
+# composed form applies all four as a unit, so they cannot be partially
+# applied.
+
+
+class _RecordingClient:
+    """Minimal ``AsyncClient`` stand-in recording exactly what was sent."""
+
+    def __init__(self, response=None, *, follow_redirects=True):
+        self.follow_redirects = follow_redirects
+        self.calls: list[dict] = []
+        self._response = response or _response(
+            200, json_body={'jsonrpc': '2.0', 'id': 1, 'result': {}}
+        )
+
+    async def post(self, url, *, headers=None, json=None, timeout=None):
+        self.calls.append(
+            {'url': url, 'headers': headers, 'json': json, 'timeout': timeout}
+        )
+        return self._response
+
+
+def test_tool_call_payload_is_a_wellformed_jsonrpc_envelope():
+    """The envelope shape all five call sites used to hand-write."""
+    payload = mcp_tool_call_payload('add_memory', {'content': 'hi'})
+
+    assert payload == {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {'name': 'add_memory', 'arguments': {'content': 'hi'}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_mcp_tool_call_applies_all_four_parts_at_once():
+    """THE point of the composed primitive: URL, headers and check together.
+
+    A caller cannot obtain the slash-less URL without also obtaining the
+    ``Accept`` header, which is what makes a partially-applied fix (the 406
+    variant of this task's defect) unreachable through this path.
+    """
+    client = _RecordingClient()
+
+    ok = await post_mcp_tool_call(
+        client, 'http://memory.test:8002', 'submit_task', {'title': 't'},
+        context='curator submit_task for task 4023',
+    )
+
+    assert ok is True
+    assert len(client.calls) == 1
+    sent = client.calls[0]
+    assert sent['url'] == 'http://memory.test:8002/mcp', 'part 1: no trailing slash'
+    assert sent['headers'] == MCP_POST_HEADERS, 'part 2: the Accept header'
+    assert sent['json']['params'] == {'name': 'submit_task', 'arguments': {'title': 't'}}
+    assert sent['timeout'] == 10
+
+
+@pytest.mark.asyncio
+async def test_post_mcp_tool_call_collapses_a_base_that_ends_in_a_slash():
+    """The composed form inherits ``mcp_endpoint_url``'s canonicalization."""
+    client = _RecordingClient()
+
+    await post_mcp_tool_call(
+        client, 'http://memory.test:8002/', 'add_memory', {}, context='fuzz',
+    )
+
+    assert client.calls[0]['url'] == 'http://memory.test:8002/mcp'
+
+
+@pytest.mark.asyncio
+async def test_post_mcp_tool_call_reports_a_failed_write(caplog):
+    """Part 4 is applied too: a 307 answer returns False and warns."""
+    client = _RecordingClient(
+        response=_response(307, headers={'Location': '/mcp'}),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ok = await post_mcp_tool_call(
+            client, 'http://memory.test:8002', 'add_memory', {},
+            context='completion memory write for task 4023',
+        )
+
+    assert ok is False
+    assert 'redirect' in ' '.join(r.getMessage() for r in _warnings(caplog)).lower()
+
+
+@pytest.mark.asyncio
+async def test_post_mcp_tool_call_warns_when_the_client_ignores_redirects(caplog):
+    """Part 3 lives on the client, so a client missing it must be LOUD.
+
+    Client construction is deliberately a separate call — three of the five
+    sites share one connection pool across a batch — so this warning is what
+    keeps splitting it out from reopening the partial-application hole.
+    """
+    client = _RecordingClient(follow_redirects=False)
+
+    with caplog.at_level(logging.WARNING):
+        await post_mcp_tool_call(
+            client, 'http://memory.test:8002', 'add_memory', {}, context='fuzz',
+        )
+
+    message = ' '.join(r.getMessage() for r in _warnings(caplog))
+    assert 'follow_redirects' in message
+    assert 'open_mcp_client' in message, 'the warning must name the fix'
+
+
+@pytest.mark.asyncio
+async def test_post_mcp_tool_call_does_not_warn_for_a_stub_without_the_attribute(caplog):
+    """A duck-typed double with no ``follow_redirects`` must not warn spuriously.
+
+    Several existing test doubles are plain objects; a warning on every one of
+    them would be noise that trains readers to ignore this logger.
+    """
+    class _Bare:
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            return _response(200, json_body={'jsonrpc': '2.0', 'id': 1, 'result': {}})
+
+    with caplog.at_level(logging.WARNING):
+        ok = await post_mcp_tool_call(
+            _Bare(), 'http://memory.test:8002', 'add_memory', {}, context='fuzz',
+        )
+
+    assert ok is True
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_open_mcp_client_follows_redirects_by_default():
+    """Part 3, applied by construction rather than remembered per call site.
+
+    Asserted on a REAL ``httpx.AsyncClient`` (not the monkeypatched factory
+    below) so this stays true of httpx's actual constructor semantics, and
+    closed via ``async with`` so no transport is left open.
+    """
+    async with open_mcp_client() as client:
+        assert isinstance(client, httpx.AsyncClient)
+        assert client.follow_redirects is True
+
+
+def test_open_mcp_client_resolves_asyncclient_at_call_time(monkeypatch):
+    """``patch('httpx.AsyncClient', ...)`` must still intercept construction.
+
+    That constructor seam is what every transport test in this repo drives.  A
+    future rewrite binding ``AsyncClient`` at import time — ``from httpx import
+    AsyncClient`` at module scope — would silently blind all of them while
+    every test kept passing, so the late lookup is pinned here rather than
+    left as a property of how the import happens to be spelled.
+    """
+    built: list[dict] = []
+
+    def _factory(**kwargs):
+        built.append(kwargs)
+        return 'sentinel-client'
+
+    monkeypatch.setattr(httpx, 'AsyncClient', _factory)
+
+    assert open_mcp_client() == 'sentinel-client'
+    assert built == [{'follow_redirects': True}]
+
+
+def test_open_mcp_client_forwards_extra_kwargs(monkeypatch):
+    """``follow_redirects`` is a DEFAULT, and other kwargs pass through."""
+    built: list[dict] = []
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: built.append(kw))
+
+    open_mcp_client(timeout=5, follow_redirects=False)
+
+    assert built == [{'timeout': 5, 'follow_redirects': False}]

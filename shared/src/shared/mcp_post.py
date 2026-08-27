@@ -31,17 +31,63 @@ the failure from a silent 307 no-op to a silent 406 no-op.  With
 :data:`MCP_POST_HEADERS` the same POST returns ``200`` and a real JSON-RPC
 result, with no ``initialize``/session handshake needed.
 
+USE THE COMPOSED FORM.  Exposing only the three ingredients left the failure
+mode this module exists to close still reachable: a sixth call site could get
+three of the four parts right — slash-less URL and ``follow_redirects`` but no
+``Accept`` header — and still discard its payload, this time to a silent 406.
+:func:`post_mcp_tool_call` and :func:`open_mcp_client` apply the four parts as
+a unit, so they cannot be partially applied::
+
+    from shared.mcp_post import open_mcp_client, post_mcp_tool_call
+
+    async with open_mcp_client() as client:            # parts 3
+        await post_mcp_tool_call(                      # parts 1, 2, 4
+            client, self.mcp.url, 'add_memory', arguments,
+            context=f'completion memory write for task {self.task_id}',
+        )
+
+The client is a SEPARATE call rather than folded into ``post_mcp_tool_call``
+because three of the five call sites POST a batch and deliberately share one
+connection pool across it (``_post_submit_tasks``' documented intent); a
+primitive that constructed its own client per call would have silently undone
+that.  ``post_mcp_tool_call`` warns if handed a client that is not following
+redirects, so splitting them does not reopen the partial-application hole.
+
+The ingredients stay public — :data:`MCP_POST_HEADERS`,
+:func:`mcp_endpoint_url`, :func:`check_mcp_post_response` — for a caller that
+genuinely needs a non-``tools/call`` request or a hand-built envelope.
+
+KNOWINGLY PARALLEL TO ``orchestrator.mcp_lifecycle``.  Three primitives here
+have long-lived twins there: :data:`MCP_POST_HEADERS` /
+``mcp_lifecycle.MCP_HEADERS``, :func:`_decode_body` /
+``McpSession._parse_response``, and :func:`_parse_sse` /
+``mcp_lifecycle._parse_sse_response``.  The dependency direction supports
+consolidating (``orchestrator`` already imports ``shared``), and doing so is
+the right end state — but ``orchestrator/src/orchestrator/mcp_lifecycle.py``
+is outside task 4023's module locks, so the copies are left in place
+DELIBERATELY rather than by oversight, and the consolidation is filed as
+follow-up work.  If you are editing either side, change both or finish the
+consolidation; do not let them drift.
+
 Public API::
 
     from shared.mcp_post import (
         MCP_POST_HEADERS,
         check_mcp_post_response,
         mcp_endpoint_url,
+        mcp_tool_call_payload,
+        open_mcp_client,
+        post_mcp_tool_call,
     )
 
 The module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path (see above), consistent with the
 ``mcp_envelope``/``proc_group``/``config_dir`` sub-module convention.
+
+``httpx`` is imported LAZILY, inside :func:`open_mcp_client`, so importing
+this module does not pull httpx into every ``shared`` consumer — and so that
+``patch('httpx.AsyncClient', ...)`` still intercepts client construction,
+which is the seam every transport test in this repo relies on.
 """
 
 from __future__ import annotations
@@ -55,15 +101,19 @@ __all__ = [
     'MCP_POST_HEADERS',
     'check_mcp_post_response',
     'mcp_endpoint_url',
+    'mcp_tool_call_payload',
+    'open_mcp_client',
+    'post_mcp_tool_call',
 ]
 
 logger = logging.getLogger(__name__)
 
 #: Headers every raw MCP POST must send.  Byte-identical to
 #: ``orchestrator.mcp_lifecycle.MCP_HEADERS`` — the already-correct pattern the
-#: five defect sites never adopted.  Without the ``Accept`` member the server
-#: answers ``406 Not Acceptable`` and the payload is discarded (see the module
-#: docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)`` before
+#: five defect sites never adopted, and a knowingly-parallel copy pending the
+#: consolidation described in the module docstring.  Without the ``Accept``
+#: member the server answers ``406 Not Acceptable`` and the payload is
+#: discarded (see the module docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)`` before
 #: mutating: this is a module-level singleton.
 MCP_POST_HEADERS = {
     'Content-Type': 'application/json',
@@ -195,3 +245,96 @@ def check_mcp_post_response(resp: Any, *, context: str) -> bool:
             context, type(exc).__name__, exc,
         )
         return False
+
+
+def mcp_tool_call_payload(
+    tool: str, arguments: dict, *, request_id: Any = 1,
+) -> dict:
+    """Return the JSON-RPC envelope for an MCP ``tools/call``.
+
+    Split out from :func:`post_mcp_tool_call` so a caller that must send the
+    request some other way (a batching transport, a replay fixture) still gets
+    the envelope from one place rather than re-typing four keys.
+    """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'method': 'tools/call',
+        'params': {'name': tool, 'arguments': arguments},
+    }
+
+
+def open_mcp_client(**kwargs: Any) -> Any:
+    """Return an ``httpx.AsyncClient`` configured for raw MCP POSTs.
+
+    Part 3 of the four-part fix: ``follow_redirects=True``, defence in depth
+    against a re-introduced slash.  Returned rather than yielded so the caller
+    keeps the ``async with`` and therefore keeps the connection pool for a
+    whole batch — which three of the five call sites deliberately do.
+
+    ``httpx`` is imported here, not at module scope: it keeps ``shared`` free
+    of an import-time httpx dependency, and it keeps ``AsyncClient`` a MODULE
+    ATTRIBUTE resolved at call time, which is what makes
+    ``patch('httpx.AsyncClient', ...)`` able to intercept every MCP client this
+    repo constructs.  Binding it at import time here would silently blind every
+    transport test.
+
+    Extra *kwargs* are forwarded to ``AsyncClient``; ``follow_redirects`` is a
+    default, so an explicit override is still possible (nothing needs one
+    today).
+    """
+    import httpx
+
+    kwargs.setdefault('follow_redirects', True)
+    return httpx.AsyncClient(**kwargs)
+
+
+async def post_mcp_tool_call(
+    client: Any,
+    base_url: str,
+    tool: str,
+    arguments: dict,
+    *,
+    context: str,
+    request_id: Any = 1,
+    timeout: float = 10,
+) -> bool:
+    """POST one MCP ``tools/call`` over *client* and inspect the answer.
+
+    THE COMPOSED PRIMITIVE.  Applies parts 1, 2 and 4 of the fix together —
+    slash-less URL, ``Accept`` header, loud response check — so a call site
+    cannot get some of them and silently lose its payload to whichever one it
+    missed.  Part 3 belongs to *client*; if that client is not following
+    redirects this warns rather than proceeding quietly, which is the only way
+    splitting client construction out stays safe.
+
+    Never raises for a response-shaped reason (that is
+    :func:`check_mcp_post_response`'s contract).  It DOES propagate a transport
+    exception from ``client.post`` — every call site already wraps this in the
+    ``try/except`` its fire-and-forget behaviour needs, and swallowing a
+    connection error here would hide a server that is simply down.
+
+    :param client: an ``httpx.AsyncClient`` (duck-typed).
+    :param base_url: the server BASE (``http://127.0.0.1:8002``), not an endpoint.
+    :param tool: MCP tool name, e.g. ``'add_memory'`` / ``'submit_task'``.
+    :param arguments: the tool's ``arguments`` mapping.
+    :param context: identifies the call site in any warning.
+    :returns: True only if the call actually landed.
+    """
+    # ``True`` by default so a duck-typed stub with no such attribute (several
+    # existing test doubles) does not produce a spurious warning.
+    if not getattr(client, 'follow_redirects', True):
+        logger.warning(
+            'MCP POST client was built without follow_redirects=True [%s]; use '
+            'shared.mcp_post.open_mcp_client so a re-introduced trailing slash '
+            'cannot silently discard the payload.',
+            context,
+        )
+
+    resp = await client.post(
+        mcp_endpoint_url(base_url),
+        headers=MCP_POST_HEADERS,
+        json=mcp_tool_call_payload(tool, arguments, request_id=request_id),
+        timeout=timeout,
+    )
+    return check_mcp_post_response(resp, context=context)
