@@ -167,3 +167,108 @@ def test_environment_map_falls_back_to_the_whole_line_on_unbalanced_quotes():
 def test_environment_map_returns_empty_for_an_absent_section():
     """No [Service] section at all yields {} rather than raising."""
     assert _env("[Unit]\nDescription=x\n") == {}
+
+
+# ---------------------------------------------------------------------------
+# render_template  (step-3 / step-4)
+# ---------------------------------------------------------------------------
+# The substitution half: exactly what setup-host.sh's two `sed -e` expressions
+# did, now owned by one function so the installer, the byte-for-byte
+# template/committed-unit lockstep guard in
+# tests/scripts/test_dashboard_service_template.py, and this suite all name the
+# SAME spelling of it instead of three replayed copies.
+
+# The literal paths baked into dashboard/dark-factory-dashboard.service, and
+# the values the committed template must expand to in order to produce it.
+HARDCODED_SERVICE_REPO_ROOT = "/home/leo/src/dark-factory"
+HARDCODED_SERVICE_UV_PATH = "/home/leo/.local/bin/uv"
+
+
+def _render_template(template_text, **kwargs):
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.render_template(template_text, **kwargs)
+
+
+def test_render_template_reproduces_the_committed_unit_byte_for_byte():
+    """The canonical lockstep claim, made THROUGH the code the installer runs.
+
+    Rendering the committed template at the hardcoded host's REPO_ROOT/UV_PATH
+    must yield dashboard/dark-factory-dashboard.service exactly. Asserted here
+    as well as in test_dashboard_service_template.py because after this task
+    setup-host.sh no longer carries a `sed` for this unit — this function IS
+    the substitution, so its own suite has to pin the property rather than
+    inheriting it.
+    """
+    rendered = _render_template(
+        TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=HARDCODED_SERVICE_REPO_ROOT,
+        uv_path=HARDCODED_SERVICE_UV_PATH,
+    )
+
+    assert rendered == HARDCODED_PATH.read_text(encoding="utf-8"), (
+        f"Rendered template does not match {HARDCODED_PATH}. The template and "
+        "the committed unit have drifted; re-render with render_template and "
+        "update dashboard/dark-factory-dashboard.service."
+    )
+
+
+def test_render_template_leaves_no_sentinel_behind():
+    """Neither sentinel may survive the render.
+
+    An unsubstituted ``__REPO_ROOT__`` in WorkingDirectory= is not a cosmetic
+    leftover: systemd rejects the unit outright with "WorkingDirectory= path is
+    not absolute".
+    """
+    rendered = _render_template(
+        TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root="/srv/df",
+        uv_path="/opt/uv",
+    )
+
+    assert "__REPO_ROOT__" not in rendered, rendered
+    assert "__UV_PATH__" not in rendered, rendered
+
+
+def test_render_template_substitutes_every_occurrence():
+    """GLOBAL, like `sed s|...|...|g` — not just the first match.
+
+    The committed template carries __REPO_ROOT__ several times (Documentation=,
+    WorkingDirectory=, and two Environment= values at least). A first-match-only
+    substitution would leave the rest as sentinels, which the sentinel guard
+    above catches — this one pins the COUNT, so a render that substituted all
+    but changed how many sites exist is still visible.
+    """
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    occurrences = template.count("__REPO_ROOT__")
+    assert occurrences >= 4, (
+        f"Expected the committed template to carry __REPO_ROOT__ at several "
+        f"sites; found {occurrences}. If the template genuinely shrank, this "
+        "guard needs re-deriving — it exists so a first-match-only "
+        "substitution cannot pass."
+    )
+
+    rendered = _render_template(template, repo_root="/srv/df", uv_path="/opt/uv")
+
+    assert rendered.count("/srv/df") == occurrences
+    assert rendered.count("/opt/uv") == template.count("__UV_PATH__")
+
+
+def test_render_template_substitutes_literally_not_as_a_regex():
+    """A value carrying `|` or a regex metacharacter is inserted VERBATIM.
+
+    The shell spelling this replaces was ``sed -e "s|__REPO_ROOT__|$REPO_ROOT|g"``,
+    whose delimiter is ``|`` — a repo root containing one would have ended the
+    expression and made sed fail (or, worse, silently mean something else).
+    Pinning literal substitution here is what lets the shell form be retired
+    without quietly changing the contract on an exotic path.
+    """
+    template = "[Service]\nWorkingDirectory=__REPO_ROOT__\nExecStart=__UV_PATH__ run\n"
+    weird_root = "/srv/a|b/c.d/e*f/g[h]"
+    weird_uv = "/opt/u|v/uv"
+
+    rendered = _render_template(template, repo_root=weird_root, uv_path=weird_uv)
+
+    assert rendered == (
+        f"[Service]\nWorkingDirectory={weird_root}\nExecStart={weird_uv} run\n"
+    )
