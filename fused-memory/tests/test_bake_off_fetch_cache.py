@@ -1326,6 +1326,80 @@ class TestReplayFetchesFlag:
         )) != 0
         assert not (tmp_path / 'replay.json').exists()
 
+    @staticmethod
+    def _delete_probe_cluster(cache, shape_keys) -> str:
+        """Drop one probe cluster from every named arm, and say which.
+
+        Uniformly across *shape_keys* rather than from one arm, so the
+        refusal cannot be attributed to a per-shape fingerprint mismatch —
+        the corpus is untouched, only the cached probes half is short.
+        """
+        doc = json.loads(cache.read_text(encoding='utf-8'))
+        cluster_id = next(iter(doc['arms'][shape_keys[0]]['probes']))
+        for key in shape_keys:
+            del doc['arms'][key]['probes'][cluster_id]
+        cache.write_text(json.dumps(doc), encoding='utf-8')
+        return cluster_id
+
+    def test_a_replay_against_a_cache_missing_a_probe_cluster_exits_three(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """Exactly 3, and NAMED — not merely "something raised".
+
+        `measure_arm` indexes `fetched['probes'][cluster_id]` bare, so an
+        unguarded truncation of the probes half leaves `main` on a `KeyError`
+        raised from inside the metric code: not the documented
+        `FetchCacheError` -> exit-3 contract, and a message naming neither
+        the cache nor how to re-dump it.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        cluster_id = self._delete_probe_cluster(cache, list(mod.ARM_SHAPES))
+        capsys.readouterr()
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 3
+        message = capsys.readouterr().err
+        assert 'fetch cache error:' in message
+        assert cluster_id in message
+        # And NO artifact was written from the refused run.
+        assert not (tmp_path / 'replay.json').exists()
+
+    def test_a_replay_whose_regrowth_pass_is_missing_a_probe_cluster_exits_three(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """The regrowth pass needs its OWN coverage.
+
+        `measure_regrowth_arms` forwards the same `probes` list into
+        `measure_arm`, so the second `load_fetches` call site has the
+        identical bare-index failure.  Truncating only the regrowth pass keys
+        — leaving every `ARM_SHAPES` block intact — is what makes a fix that
+        wires only the first call site fail here instead of looking complete.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        cluster_id = self._delete_probe_cluster(
+            cache, [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES],
+        )
+        capsys.readouterr()
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 3
+        message = capsys.readouterr().err
+        assert 'fetch cache error:' in message
+        assert cluster_id in message
+        assert not (tmp_path / 'replay.json').exists()
+
 
 # ===========================================================================
 # step-21 — the ONE live end-to-end pass
