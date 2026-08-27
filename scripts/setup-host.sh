@@ -852,11 +852,48 @@ else
   esac
 fi
 
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/dashboard.service.template" \
-  > "$UNIT_DIR/dark-factory-dashboard.service"
+# THE RENDER. No longer `sed ... > "$UNIT_DIR/<unit>"`, and the difference is
+# not stylistic (task 4793).
+#
+# scripts/dashboard.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, which renders to a
+# SINGLE root. Further aggregation roots are host-LOCAL settings, added to the
+# installed unit and deliberately not committed — the committed unit's own
+# comment says so, and nine of them were measured on this host on 2026-08-01. A
+# truncating redirect destroyed eight of those nine on every re-run, and did it
+# INVISIBLY: that variable is on the parity checker's DIVERGENCE_ALLOWLIST
+# (compared by NAME, value blessed), so the post-install check in section 12
+# reported parity afterwards — and the gate above tells the operator to run this
+# script, so following the advice was what caused the loss.
+#
+# THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
+# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# defect one level up: bash truncates the destination before python ever opens
+# it, so the installed value would be gone before it could be read and the tool
+# would preserve nothing while reporting success. --output is read FIRST as the
+# installed copy, then replaced atomically.
+#
+# AND THERE IS DELIBERATELY NO sed FALLBACK. Rendering "the old way" when the
+# renderer is missing would reinstate the exact clobber it replaced, on the one
+# path where nobody is left watching for it — the post-install gate cannot see
+# this variable's value. A missing renderer therefore leaves the unit ALONE and
+# says so, which is the recoverable direction: stale but intact.
+_dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+
+if [ ! -f "$_dash_render_script" ]; then
+  fail "Dashboard unit renderer missing: $_dash_render_script"
+  fail "  NOT rendering it the old way — a plain template render would strip"
+  fail "  this host's local DASHBOARD_KNOWN_PROJECT_ROOTS entries, and the"
+  fail "  post-install parity check cannot see that variable's value."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service is left AS-IS. The watchdog"
+  fail "  units below still install."
+elif python3 "$_dash_render_script" \
+       --template  "$REPO_ROOT/scripts/dashboard.service.template" \
+       --repo-root "$REPO_ROOT" \
+       --uv-path   "$UV_PATH" \
+       --output    "$UNIT_DIR/dark-factory-dashboard.service"; then
+  ok "Dashboard service unit rendered (host-local Environment= values preserved — see the [dashboard_unit_render] lines above)"
+fi
 
 # Watchdog service + timer (no templating needed — no repo-specific paths)
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.service" "$UNIT_DIR/"
