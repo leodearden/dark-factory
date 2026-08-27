@@ -24,6 +24,8 @@ Regenerate with:
 
 ```bash
 python3 scripts/mint_hard_v2_fixtures.py --render   # manifest -> CURATION.md
+python3 scripts/mint_hard_v2_fixtures.py --redrive  # re-derive provenance
+python3 scripts/mint_hard_v2_fixtures.py --base-distance-report
 ```
 
 `--render` reads only the committed manifest and touches no database. Do NOT
@@ -32,6 +34,23 @@ use `--author` for this: it re-derives the whole manifest from the three live
 architect exhaustions, which keep landing) is expected and harmless — so it is
 not a regeneration path and would overwrite a manifest edit rather than render
 it.
+
+`--redrive` is the regeneration path after a provenance-RESOLUTION fix (a
+better landing-merge matcher, a corrected baseline rung). It re-derives only
+`merge_sha` / `baseline_sha` / `baseline_source` / `mint_mode` on the rows the
+committed manifest already carries, so by construction it cannot add or drop a
+fixture or re-adjudicate one — which is exactly why `--author` is wrong for
+this: `--author` re-censuses against `runs.db` files that have moved on since
+the recorded census date, and would change pool membership as a side effect of
+a bug fix. See `scripts/mint_hard_v2_fixtures.py::redrive_provenance`. Follow a
+redrive with `--mint` and `--render`.
+
+`--base-distance-report` prints the per-fixture before/after table of how far
+each `pre_task_commit` sits from the task's true branch point, measured as the
+symmetric difference `git rev-list --count <branch-point>...<base>` (both plain
+and `--first-parent`, which differ by roughly 3x on this history). It REPORTS
+measured distances and asserts nothing against a threshold. See
+`scripts/mint_hard_v2_fixtures.py::base_distance_rows`.
 
 ## Why this directory can never leak into a default eval run
 
@@ -70,15 +89,24 @@ of `timeout_minutes` and its headroom multiples are recorded in `CURATION.md`.
 
 ## Two mint modes
 
-- **`referenced`** — the candidate has exactly one clean
-  `Merge task/<id> into main` commit, so `(pre, post)` = `(M^1, M)` resolves
-  and a real `reference` block is captured.
-- **`planrate_only`** — the candidate landed SPLIT/direct (no single merge
-  commit), so no landed `post` SHA exists. These fixtures carry **no**
-  `reference` key at all and instead stamp `provenance.reference_unavailable`
-  naming the cause, plus `provenance.baseline_source` naming which rung of the
-  baseline ladder produced their `pre_task_commit`. The omission is a positive
-  recorded fact, not a silent empty block.
+A **landing merge** is written under either of two subject spellings, and both
+are accepted — `Merge task/<id> into main` and `Merge task/<id>: <subject>`.
+Both are in live use (censused over reify's `main`: 2741 of the first, 74 of
+the second), and the single derivation both are matched from is
+`scripts/mint_hard_v2_fixtures.py::_merge_subject_patterns`, mirroring
+`orchestrator/src/orchestrator/git_ops.py::_merge_subject`'s
+writer-and-reader-share-one-derivation discipline.
+
+- **`referenced`** — the candidate has exactly one clean landing merge under
+  either spelling, so `(pre, post)` = `(M^1, M)` resolves and a real
+  `reference` block is captured.
+- **`planrate_only`** — the candidate landed SPLIT/direct (no single landing
+  merge under EITHER spelling), so no landed `post` SHA exists. These fixtures
+  carry **no** `reference` key at all and instead stamp
+  `provenance.reference_unavailable` naming the cause, plus
+  `provenance.baseline_source` naming which rung of the baseline ladder
+  produced their `pre_task_commit`. The omission is a positive recorded fact,
+  not a silent empty block.
 
   For the same reason they also carry **no landed `verify_outcome`**. The
   `{source: 'landed', passed: true}` shape asserts "the task merged to `main`
@@ -88,3 +116,31 @@ of `timeout_minutes` and its headroom multiples are recorded in `CURATION.md`.
   `{source: 'unavailable', passed: null, commands: …, reason: …}`, with the
   candidate's adjudicated terminal status mirrored into
   `provenance.task_status` so the JSON is self-describing.
+
+## Is the base a true branch point, or an approximation?
+
+Every fixture carries a bool `provenance.base_is_approximated`, and every
+approximated one carries a `provenance.base_approximation_reason` naming what
+was measured. **Only `baseline_source: merge_first_parent` is the task's true
+branch point** (`M^1` of its landing merge — the exact state of `main` the work
+started from). Every weaker ladder rung is an approximation whose error is
+unbounded, and unknowable without a landing merge to measure against:
+`status_autocommit` anchors on a status auto-commit that can precede or follow
+the real start, and `timestamp_walk` walks back to the FIRST architect
+invocation, which for a re-tried task can be days and thousands of commits
+before the run that produced the work.
+
+A readout that depends on the base being the real branch point should EXCLUDE
+approximated fixtures rather than average them in. Some fixtures can never be
+rescued: `reify_task_3883` has no landing merge under either spelling, so its
+branch point is not derivable from git at all — which is precisely why the flag
+exists rather than a silent second guess.
+
+Continuity fixtures do not go through the rung table at all: their base is
+inherited verbatim from the standing corpus, so
+`scripts/mint_hard_v2_fixtures.py::_mint_continuity_one` MEASURES the flag —
+does the inherited `pre_task_commit` equal `M^1` of the task's landing merge? —
+and records the merge it compared against in
+`provenance.base_verified_against_merge` (`null` when none exists). All three
+were measured to diverge. Their commits are still carried verbatim; the marking
+is observational, never corrective.

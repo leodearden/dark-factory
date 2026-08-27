@@ -114,6 +114,14 @@ SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the tr
 
 A `planrate_only` fixture carries NO `reference` key at all and instead stamps `provenance.reference_unavailable` with the cause plus `provenance.baseline_source` with the ladder rung that produced its `pre_task_commit`. An empty `reference: {}` block would be indistinguishable from a capture that silently failed; omitting the key and recording why makes it a positive, auditable fact.
 
+A landing merge is accepted under EITHER subject spelling — `Merge task/<id> into main` or `Merge task/<id>: <subject>` — so `reference_unavailable` means no single landing merge exists under either. Both spellings are in live use (censused over reify's `main`: 2741 of the first, 74 of the second) and both are derived in one place, `mint_hard_v2_fixtures.py::_merge_subject_patterns`, mirroring `git_ops.py::_merge_subject`.
+
+## Is the base a true branch point, or an approximation?
+
+Every fixture carries a bool `provenance.base_is_approximated`, and every approximated one carries a `base_approximation_reason` naming what was measured. ONLY `baseline_source: merge_first_parent` is the task's true branch point (`M^1` of its landing merge). Every weaker rung is an approximation whose error is unbounded and — absent a landing merge to measure against — unknowable, so a readout that depends on the base being the real branch point should EXCLUDE those fixtures rather than average them in. See `mint_hard_v2_fixtures.py::base_approximation`, and `--base-distance-report` for the measured per-fixture distances.
+
+Continuity fixtures sit outside the rung table — their base is inherited, not ladder-resolved — so `mint_hard_v2_fixtures.py::_mint_continuity_one` MEASURES the flag instead: does the inherited `pre_task_commit` equal `M^1` of the task's landing merge? The merge it compared against is recorded in `provenance.base_verified_against_merge` (`null` when none exists). Their commits are carried verbatim regardless; the marking is observational, never corrective.
+
 ## Continuity back-fill
 
 These three fixtures are back-filled from the standing corpus so the v2 campaign shares part of its population with v1 and the two are comparable rather than merely adjacent. The v1 trial could grade plan_quality against a valid reference on only one fixture; re-banding these under references captured from their own committed pre/post SHAs closes that n=1 confound. Each record is built from the canonical fixture under evals/tasks/ — same pre_task_commit, same post_task_commit, same task_definition, same verify_commands — and the equality is asserted by test, so "reference by copy, do not duplicate content divergently" is machine-checked rather than conventional. Capturing the reference here (rather than copying a post-iota-2 fixture) is the same capture_reference call iota-2 makes for the standing corpus, so beta-1 is self-contained and creates no cross-task coupling.

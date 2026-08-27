@@ -1092,6 +1092,37 @@ def render_curation_md(manifest: dict) -> str:
         'indistinguishable from a capture that silently failed; omitting the '
         'key and recording why makes it a positive, auditable fact.')
     add('')
+    add('A landing merge is accepted under EITHER subject spelling — '
+        '`Merge task/<id> into main` or `Merge task/<id>: <subject>` — so '
+        '`reference_unavailable` means no single landing merge exists under '
+        'either. Both spellings are in live use (censused over reify\'s '
+        '`main`: 2741 of the first, 74 of the second) and both are derived in '
+        'one place, `mint_hard_v2_fixtures.py::_merge_subject_patterns`, '
+        'mirroring `git_ops.py::_merge_subject`.')
+    add('')
+
+    add('## Is the base a true branch point, or an approximation?')
+    add('')
+    add('Every fixture carries a bool `provenance.base_is_approximated`, and '
+        'every approximated one carries a `base_approximation_reason` naming '
+        'what was measured. ONLY `baseline_source: merge_first_parent` is the '
+        'task\'s true branch point (`M^1` of its landing merge). Every weaker '
+        'rung is an approximation whose error is unbounded and — absent a '
+        'landing merge to measure against — unknowable, so a readout that '
+        'depends on the base being the real branch point should EXCLUDE those '
+        'fixtures rather than average them in. See '
+        '`mint_hard_v2_fixtures.py::base_approximation`, and '
+        '`--base-distance-report` for the measured per-fixture distances.')
+    add('')
+    add('Continuity fixtures sit outside the rung table — their base is '
+        'inherited, not ladder-resolved — so '
+        '`mint_hard_v2_fixtures.py::_mint_continuity_one` MEASURES the flag '
+        'instead: does the inherited `pre_task_commit` equal `M^1` of the '
+        'task\'s landing merge? The merge it compared against is recorded in '
+        '`provenance.base_verified_against_merge` (`null` when none exists). '
+        'Their commits are carried verbatim regardless; the marking is '
+        'observational, never corrective.')
+    add('')
 
     continuity = manifest['continuity']
     add('## Continuity back-fill')
