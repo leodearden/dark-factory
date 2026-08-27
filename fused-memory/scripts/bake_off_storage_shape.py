@@ -162,7 +162,10 @@ A thick **pure core** (loaders, arm materialization, read transforms,
 metrics, report rendering) with zero network, fully exercised in the merge
 lane, plus a thin **live driver** (``seed_arm`` / ``run_arm`` /
 ``run_bake_off`` / ``_run``) that is the only part touching Qdrant or an
-embedder.
+embedder ON THE LIVE PATH, i.e. absent ``--replay-fetches``.  A replay
+touches neither: ``run_bake_off`` takes its replay short-circuit and returns
+via ``bake_off_storage_shape.py::_replay_bake_off`` before any of the driver's
+substrate contact happens.
 
 WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
 ------------------------------------------------------------------------
@@ -188,8 +191,9 @@ a standing exemption for whatever it becomes:
     see ``seed_arm``'s own docstring).  So the capability the preflight probes
     for is not one the seeding path needs.
 
-THE RESIDUAL, stated rather than papered over: ``run_bake_off`` builds a real
-``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
+THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
+(i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
+real ``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
 Graphiti startup maintenance — index creation plus the W6-ε dup-uuid-edge
 scan-and-REPAIR — against the production FalkorDB, under no prefix bound at
 all.  That is NOT covered by anything above, and it is not specific to this
@@ -197,6 +201,15 @@ script: no ``run()``-level guard in any of the scripts task 4293 guarded
 dominates ``initialize()`` either, because ``initialize()`` runs before
 ``run()`` is called.  It is a systemic gap tracked by tasks 4318 and 4350, and
 is deliberately not claimed as handled here.
+
+The scoping is a narrowing of the CLAIM, not a weakening of the warning: on a
+live run the residual above applies in full.  It is stated because the
+unqualified form was false in the safe direction — ``run_bake_off`` takes its
+replay short-circuit and returns via
+``bake_off_storage_shape.py::_replay_bake_off`` BEFORE ``MemoryService`` is
+ever constructed, so a replay reaches no ``initialize()`` and inherits none of
+this.  In a file whose whole point is honest disclosure of unprobed
+mutations, overstating one is still drift.
 """
 from __future__ import annotations
 
