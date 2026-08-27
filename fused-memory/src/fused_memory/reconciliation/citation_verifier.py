@@ -42,6 +42,21 @@ thing that can reach the finding, and it rewrites the journal blob. It reuses
 this module's lookup primitive and its three-way found/absent/raised verdict on
 purpose, so the two owners cannot disagree about what a backend timeout means.
 
+**Where this module also stops: PROSE** (task 4818). Everything above acts on
+STRUCTURED citations — a finding's ``cited_memories`` list, or a task's metadata
+pointers. A finding's ``description`` and ``suggested_action`` are free text, and
+a fabricated memory UUID embedded *there* is resolved by nothing: the hoist task
+2979 performed widens the structured guard to Stages 2 and 3, it does not widen
+it to prose. That gap is real and has already cost — a fabricated id escaped
+recon Stage-2 run ``ab330f59`` into gate task 4423's description and needed a
+hand-written hygiene note so a reader would not chase it. Task 2979's charter
+asked for the prose scan as items 4 and 5; they were split out to task 4818
+rather than dropped, and 4818 carries the near-miss specimen pair (the fabricated
+and real ids differ only mid-string) plus the requirement that a warning fire
+only on the FABRICATED branch of ``get_memory_by_id``'s three-way contract — a
+two-way found/not-found test would report every deliberately-tombstoned memory as
+a phantom.
+
 **A tombstone is provenance, never a live pointer.** This is the one rationale
 the rest of the module refers back to rather than restating.
 ``X_CITATION_TOMBSTONE_KEY`` records exist precisely to name a dead id (that is
