@@ -179,6 +179,13 @@ real one — so a truncated prefix fails loudly instead of reporting success. Th
 are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
 
+**The citation gate binds EVERY caller.** A `store='mem0'` `delete_memory` is REFUSED \
+(`error_type='CitationRepointRequired'`) while a live (non-terminal) task still cites the \
+entry in its metadata — dispatch follows those pointers, and the delete is irreversible. \
+This is a property of the RECORD, not of who is deleting, so it applies to every caller. \
+Your agent class earns you no exemption from it — none stands behind a Stage-1 delete. Do \
+not expect one, and do not read a refusal here as a misconfiguration.
+
 **Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
 of a surviving entry, pass `replacement_memory_id=<the surviving entry's full 36-char UUID>` \
 to `delete_memory`. Task metadata that still cites the doomed entry is repointed to that \
@@ -202,6 +209,25 @@ re-deriving at read time resolves back to the superseded cluster members the con
 was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
 Only a concrete UUID forwards. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
+
+**Where there is no survivor at all, there is exactly one sanctioned bypass.** Some \
+deletes are not consolidations — a plain drop rather than a consolidation, where the entry \
+is simply wrong and nothing replaces it, which `replacement_memory_id` cannot express. \
+ONLY there, pass `metadata={{'allow_dangling_citations': True}}` to accept dangling those \
+citations deliberately. Only the literal boolean True counts — a truthy `'yes'`, `1` or \
+`'true'` is IGNORED and the refusal stands (the same rule as `allow_near_duplicate`), so \
+resend it as JSON true if you meant it. The override is recorded at WARNING and the response names \
+every citer it strands. Take it as an individually-reasoned decision per delete, never as \
+a loop default: reaching for it reflexively across a run of refusals is how genuine live \
+pointers get destroyed silently, and a consolidation delete — which has a survivor by \
+definition — must name that survivor instead.
+
+**`consolidate_memories` exposes NO dangling-citation escape at all,** and needs none: \
+its canonical IS the repoint target by construction, so the "you named no survivor" \
+refusal is unreachable there. The reachable citation refusal is `CitationScanFailed`, \
+which fails CLOSED — an unreadable task DB must never be read as "no citations" before \
+an irreversible delete. Retry it once the task backend is reachable; do not look for a \
+flag to bypass it, because there isn't one.
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
