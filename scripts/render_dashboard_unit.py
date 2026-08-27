@@ -235,3 +235,35 @@ def apply_preserved(rendered_text: str, preserved: "dict[str, str]") -> str:
         newline = "\n" if lines[index].endswith("\n") else ""
         lines[index] = f"{prefix}{value}{newline}"
     return "".join(lines)
+
+
+def render_unit(
+    template_text: str,
+    *,
+    repo_root: str,
+    uv_path: str,
+    installed_text: str = "",
+    names: "tuple[str, ...] | list[str]" = HOST_LOCAL_ENVIRONMENT,
+) -> "tuple[str, dict[str, str], dict[str, str]]":
+    """Render *template_text*, then put this host's local values back.
+
+    The composition: ``render_template`` -> ``preserved_values`` ->
+    ``apply_preserved``. Returns ``(text, preserved, skipped)`` — the final unit
+    plus the whole preservation RECORD, so a caller can report what it decided
+    rather than merely doing it.
+
+    *installed_text* is the unit ALREADY on the host (``""`` on a greenfield
+    one). Only names in *names* are read from it; everything else in the output
+    comes from the freshly rendered template. That asymmetry is the design:
+    DASHBOARD_PROJECT_ROOT is on the parity checker's DIVERGENCE_ALLOWLIST too,
+    but it is a RENDERED value that must equal the same copy's
+    WorkingDirectory=, so preserving it would pin the data root at the previous
+    checkout. See HOST_LOCAL_ENVIRONMENT above for the full argument.
+
+    PURE TEXT — no filesystem access at all. ``main`` owns the reading and the
+    atomic write, so the entire preservation contract stays testable without
+    touching a unit dir, which is the rule every sibling suite states.
+    """
+    rendered = render_template(template_text, repo_root=repo_root, uv_path=uv_path)
+    preserved, skipped = preserved_values(installed_text, names)
+    return apply_preserved(rendered, preserved), preserved, skipped
