@@ -54,6 +54,10 @@ _mod = _load_module()
 fact_referents = _mod.fact_referents
 endpoint_referent = _mod.endpoint_referent
 bare_id_present = _mod.bare_id_present
+classify_edge = _mod.classify_edge
+Finding = _mod.Finding
+# vars() does not work on a slots dataclass — the script's own accessor does.
+vars_of = _mod.vars_of
 
 GRAPH = 'reify'
 
@@ -367,3 +371,212 @@ class TestBareIdPresent:
             Referent(kind='task', project_id='reify', number='132'),
             'Ported from task 132 into this tree.',
         )
+
+
+#: The live specimens, as (edge_uuid, subject_name, object_name, fact) tuples.
+#: Named constants rather than inline literals so the OUT-OF-REACH contract
+#: below can pin the SAME rows the in-reach cases use, and so a reader can
+#: cross-check any of them against the graph by uuid.
+SPEC_63FA5C78 = (
+    '63fa5c78',
+    'Task 6165',
+    'ElasticResult.rotation',
+    'Task 6164 described landing the same artefact.',
+)
+SPEC_6AEFAC16 = (
+    '6aefac16',
+    'Task 3421',
+    'commit e6a7e971ed',
+    'Task 3429 made _check_scope_invariant directional as per commit e6a7e971ed.',
+)
+SPEC_8A51E13B = (
+    '8a51e13b',
+    'Task 6080',
+    'Task 6128',
+    'Task 6126 is landing to remove the last admission of dimensionless in '
+    "the transform family, which task 6080's decision addresses.",
+)
+SPEC_1CF19488 = (
+    '1cf19488',
+    'Task 6346',
+    'Task 6347',
+    'The recurring-attention task #6347 depends on task #6346.',
+)
+SPEC_01E3D75E = (
+    '01e3e75e',
+    'Task 5997',
+    'Task 6014',
+    'Task 6014 carries task 5997 as a hard dependency.',
+)
+SPEC_993A9A7B = (
+    '993a9a7b',
+    'Task 6004',
+    'Task 5997',
+    "Task 6004's rulings were ported verbatim into task 5997.",
+)
+
+
+def _classify(spec: tuple[str, str, str, str], graph: str = GRAPH) -> list:
+    """Run the detector over a specimen tuple."""
+    edge_uuid, subject, obj, fact = spec
+    return classify_edge(subject, obj, fact, edge_uuid, graph)
+
+
+class TestClassifyEdge:
+    """The Class-A detector: an endpoint the fact does not name.
+
+    Mirrors the write-time guard's ``set-membership`` check
+    (memory_service.py:3524-3529) deliberately, so the retrospective and live
+    views of one defect cannot drift into two different verdicts.
+    """
+
+    def test_the_canonical_specimen_flags_its_subject(self) -> None:
+        """Node 'Task 6165' carrying a fact about task 6164."""
+        findings = _classify(SPEC_63FA5C78)
+        assert len(findings) == 1
+        (finding,) = findings
+        assert finding.end == 'subject'
+        assert finding.edge_uuid == '63fa5c78'
+        assert finding.graph == GRAPH
+        assert finding.node_name == 'Task 6165'
+        assert finding.node_referent == _task('6165')
+        assert set(finding.fact_referents) == {_task('6164')}
+
+    def test_a_non_task_object_end_is_never_examined(self) -> None:
+        """'ElasticResult.rotation' is not a task label, so it cannot be wrong.
+
+        The detector only ever indicts an endpoint whose NAME claims to be a
+        task; every other node is outside the question this sweep asks.
+        """
+        assert [f.end for f in _classify(SPEC_63FA5C78)] == ['subject']
+
+    def test_the_dark_factory_specimen_flags_its_subject(self) -> None:
+        """6aefac16: node 'Task 3421' carrying a fact about task 3429."""
+        findings = _classify(SPEC_6AEFAC16, graph='dark_factory')
+        assert len(findings) == 1
+        assert findings[0].end == 'subject'
+        assert findings[0].node_referent == _task('3421')
+        assert findings[0].graph == 'dark_factory'
+
+    def test_the_object_end_specimen_a_subject_only_detector_misses(self) -> None:
+        """8a51e13b: (Task 6080)->(Task 6128), fact names 6126 and 6080.
+
+        The SUBJECT is correctly named, so the detector the task description
+        proposes — "fact names an id differing from the id in its SUBJECT
+        node's name" — would report this edge clean. The mis-bound end is the
+        OBJECT. That is why both endpoints are checked.
+        """
+        findings = _classify(SPEC_8A51E13B)
+        assert len(findings) == 1
+        (finding,) = findings
+        assert finding.end == 'object'
+        assert finding.node_name == 'Task 6128'
+        assert finding.node_referent == _task('6128')
+        assert set(finding.fact_referents) == {_task('6126'), _task('6080')}
+
+    def test_a_fact_naming_no_referent_is_unverifiable_not_clean(self) -> None:
+        """Never a finding — and, per build_report, never in the denominator."""
+        assert (
+            classify_edge(
+                'Task 6165',
+                'Task 6164',
+                'The merge worker holds .git/index.lock for the whole hook run.',
+                'edge-1',
+                GRAPH,
+            )
+            == []
+        )
+
+    def test_no_task_shaped_endpoint_yields_nothing(self) -> None:
+        assert (
+            classify_edge(
+                'ElasticResult.rotation',
+                'IMPLEMENTATION COORDINATION',
+                'Task 6164 described landing the same artefact.',
+                'edge-2',
+                GRAPH,
+            )
+            == []
+        )
+
+    def test_a_scanner_blind_spot_does_not_become_a_false_positive(self) -> None:
+        """'#4262' is invisible to scan_content; bare_id_present rescues it."""
+        assert (
+            classify_edge(
+                'Task 4262',
+                'Task 4351',
+                "#4262's cache is separated from the engine-level tables in "
+                'Task 4351.',
+                'edge-3',
+                'dark_factory',
+            )
+            == []
+        )
+
+    def test_a_null_fact_is_never_a_finding(self) -> None:
+        assert classify_edge('Task 6165', 'Task 6164', None, 'edge-4', GRAPH) == []
+
+    def test_episodes_are_carried_onto_the_finding(self) -> None:
+        """``r.episodes`` is the re-derivation path a reader must use.
+
+        Any prior investigation that read "the Task 6165 instance" out of the
+        graph was reading task 6164's ruling; re-deriving the truth means
+        going back to the SOURCE episode, so its uuid has to travel with the
+        finding rather than being looked up again by hand.
+        """
+        findings = classify_edge(
+            'Task 6165',
+            'ElasticResult.rotation',
+            'Task 6164 described landing the same artefact.',
+            '63fa5c78',
+            GRAPH,
+            episodes=['779b7b7d'],
+        )
+        assert findings[0].episodes == ('779b7b7d',)
+
+    def test_findings_are_frozen(self) -> None:
+        """A finding is evidence for a human's adjudication, not an accumulator."""
+        (finding,) = _classify(SPEC_63FA5C78)
+        with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError
+            finding.end = 'object'  # type: ignore[misc]
+
+    def test_vars_of_exposes_every_field(self) -> None:
+        """``vars()`` does not work on a slots dataclass; the accessor does."""
+        (finding,) = _classify(SPEC_63FA5C78)
+        fields = vars_of(finding)
+        assert fields['edge_uuid'] == '63fa5c78'
+        assert set(fields) == set(Finding.__dataclass_fields__)
+
+
+class TestOutOfReachByConstruction:
+    """The two sub-classes this detector provably does NOT cover.
+
+    Asserted rather than merely absent, so the gap is a pinned CONTRACT and
+    the next reader cannot mistake "the sweep found none of these" for "the
+    corpus holds none of these". Both are recorded in the report's
+    ``known_gaps`` key for the same reason.
+    """
+
+    @pytest.mark.parametrize(
+        'spec', [SPEC_1CF19488, SPEC_01E3D75E], ids=['1cf19488', '01e3e75e']
+    )
+    def test_direction_reversal_is_out_of_reach(self, spec: tuple) -> None:
+        """Both endpoints ARE named in the fact; only the direction is wrong.
+
+        The cheap heuristic (leftmost id named == object id != subject id)
+        WAS measured during planning: 85/7131 flagged, overwhelmingly benign
+        grammatical voice ('Task 2660 depends on Task 2659 landing' on edge
+        (2659)->(2660)). Adjudicating direction needs the authoritative task
+        dependency graph, not the fact text, so it is deliberately not
+        shipped.
+        """
+        assert _classify(spec) == []
+
+    def test_fact_contradicts_its_source_episode_is_out_of_reach(self) -> None:
+        """993a9a7b: reachable by no text or topology rule at all.
+
+        Both endpoints are named, so set-membership is satisfied; the defect
+        is that the fact disagrees with the episode it was extracted from,
+        which only a re-read of the episode body could show.
+        """
+        assert _classify(SPEC_993A9A7B) == []
