@@ -262,6 +262,19 @@ def _expected_meta(capability_name: str, check: object) -> dict:
     makes an ABBREVIATED task entry (one omitting the defaulted ``script`` /
     ``args`` / ``timeout_secs`` keys) compare equal to a full one, which is the
     difference between the 8 real drift rows and 22 absent-vs-default artifacts.
+
+    MAY RAISE, and the caller GUARDS it symmetrically with the task-record
+    side. Today it cannot: a validated sidecar grep/script ``DeliveredCheck``
+    shares ``_check_kind_conditional_fields`` with :class:`DeliveredCheckMeta`
+    and ``ManifestCapability.name`` carries ``min_length=1``, so every
+    conversion succeeds. But that is an IMPLICIT coupling between two models
+    that are free to diverge, and an unguarded ``ValidationError`` here would
+    escape :func:`audit_project` into
+    :func:`_task_db_scan.sweep_project_roots`, which catches only
+    ``sqlite3.Error`` — aborting every REMAINING project root over one bad
+    sidecar. That is the exact fail-loud-but-fail-everything mode the
+    ``git_discovery_failed`` handling was written to avoid, so this degrades to
+    a coverage row instead.
     """
     return DeliveredCheckMeta(
         name=capability_name,
@@ -279,11 +292,42 @@ class AuditCoverage(NamedTuple):
     """How much of the corpus the sweep could actually compare.
 
     ALWAYS reported, including on a zero-finding sweep. The finding list is a
-    comparison of MATCHED PAIRS only, and three classes never reach a
+    comparison of MATCHED PAIRS only, and several classes never reach a
     comparison at all: a capability whose producer task carries no same-named
-    entry, a manifest binding a task_id with no tasks.db row, and a sidecar that
-    would not parse. Presenting the finding list as the whole corpus would be a
-    no-silent-fail-soft violation (docs/legibility/design-invariants.md).
+    entry, a manifest binding a task_id with no tasks.db row, a task-record
+    entry that will not validate, a sidecar descriptor that will not convert,
+    and a sidecar that would not parse. Presenting the finding list as the
+    whole corpus would be a no-silent-fail-soft violation
+    (docs/legibility/design-invariants.md).
+
+    SEEN AND COMPARED ARE TWO DIFFERENT NUMBERS, and both are reported because
+    conflating them overstates the one figure that states comparison VOLUME.
+    ``mechanical_capabilities_seen`` counts every mechanical capability the
+    sweep reached — the eligible population. ``mechanical_capabilities_compared``
+    counts only those that actually reached a descriptor comparison, i.e. that
+    paired with a task-record entry AND normalized on both sides. The
+    difference is exactly accounted for by the four skip counters, so::
+
+        seen == compared
+               + capabilities_without_task_entry
+               + malformed_task_entries
+               + unconvertible_sidecar_descriptors
+
+    A reader must never have to derive the true matched-pair count by
+    subtracting other rows, in a report whose whole thesis is that the finding
+    list is not the whole corpus.
+
+    ``task_entries_with_no_sidecar_capability`` is the REVERSE direction, and
+    it exists because the sidecar->task walk alone is blind to two real drift
+    shapes: a hand-repair that RENAMED a capability on the task record (the old
+    name lands in ``capabilities_without_task_entry``, a bucket this report
+    attributes to a different owner, so genuine drift would be misfiled as
+    somebody else's problem), and a sidecar capability changed grep->manual
+    while a stale mechanical entry remains on the record (which a re-decompose
+    would LEAVE in place, since manifest_stamping step 5 does
+    ``if not mechanical: continue`` rather than clearing). A rename shows up as
+    the two rows TOGETHER on the same task — that is its signature, and the
+    details name the manifest so it can be read as one.
 
     ``manifest_parse_failure_details`` and ``uncomparable_details`` carry the
     strings themselves, not just counts: an operator told only that "2 manifests
@@ -302,6 +346,9 @@ class AuditCoverage(NamedTuple):
     manifest_tasks_without_db_row: int
     malformed_task_entries: int
     manifest_parse_failures: int
+    mechanical_capabilities_seen: int = 0
+    unconvertible_sidecar_descriptors: int = 0
+    task_entries_with_no_sidecar_capability: int = 0
     manifest_parse_failure_details: tuple[str, ...] = ()
     uncomparable_details: tuple[str, ...] = ()
     git_discovery_failed: bool = False
@@ -365,6 +412,9 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 manifest_tasks_without_db_row=0,
                 malformed_task_entries=0,
                 manifest_parse_failures=0,
+                mechanical_capabilities_seen=0,
+                unconvertible_sidecar_descriptors=0,
+                task_entries_with_no_sidecar_capability=0,
                 uncomparable_details=(str(exc),),
                 git_discovery_failed=True,
             ),
@@ -372,10 +422,13 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
     findings: list[DescriptorDrift] = []
     manifests_swept = 0
+    seen = 0
     compared = 0
     without_entry = 0
     without_db_row = 0
     malformed = 0
+    unconvertible = 0
+    orphaned_entries = 0
     parse_failure_details: list[str] = []
     uncomparable_details: list[str] = []
 
@@ -404,18 +457,37 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 continue
             entries = task_checks.get(task_id, {})
 
+            mechanical_names: set[str] = set()
             for capability in task.capabilities:
                 check = capability.delivered_check
                 if check is None or check.kind not in MECHANICAL_CHECK_KINDS:
                     continue
-                compared += 1
+                mechanical_names.add(capability.name)
+                # SEEN, not compared: this capability is merely ELIGIBLE for a
+                # comparison. `compared` is incremented below, only once both
+                # sides have actually normalized. See AuditCoverage.
+                seen += 1
 
                 entry = entries.get(capability.name)
                 if entry is None:
                     without_entry += 1
                     continue
 
-                expected = _expected_meta(capability.name, check)
+                try:
+                    expected = _expected_meta(capability.name, check)
+                except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+                    # SYMMETRIC with the task-record guard below, and for the
+                    # same reason: an unconvertible descriptor is a coverage
+                    # row, never a finding and never an abort. See
+                    # _expected_meta for why this cannot fire today and why it
+                    # is guarded anyway.
+                    unconvertible += 1
+                    uncomparable_details.append(
+                        f"{relpath} task {task_id} capability {capability.name!r}: "
+                        f"unconvertible sidecar descriptor: {exc}"
+                    )
+                    continue
+
                 try:
                     actual = DeliveredCheckMeta(**entry).model_dump()
                 except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
@@ -430,6 +502,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                     )
                     continue
 
+                compared += 1
                 if expected == actual:
                     continue
 
@@ -444,6 +517,26 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                     task_check=actual,
                 ))
 
+            # THE OTHER DIRECTION. Everything above walks sidecar -> task, so a
+            # task-record entry with no same-named mechanical capability is
+            # invisible to it — and two real drift shapes live exactly there
+            # (a renamed capability, and a grep->manual sidecar leaving a stale
+            # mechanical entry behind). Reported as its OWN coverage class, not
+            # folded into capabilities_without_task_entry: that bucket is
+            # attributed to a different owner and explicitly never remediated
+            # from this report, so absorbing a rename into it would misfile
+            # genuine drift as somebody else's problem. Coverage rather than a
+            # finding because a finding here means two spellings DISAGREE, and
+            # an orphaned entry is an absence, not a disagreement.
+            for orphan in sorted(set(entries) - mechanical_names):
+                orphaned_entries += 1
+                uncomparable_details.append(
+                    f"task {task_id} capability {orphan!r}: task-record entry "
+                    f"with no same-named mechanical capability in {relpath} "
+                    f"(a renamed capability shows up here AND in the "
+                    f"no-task-entry count, on the same task)"
+                )
+
     findings.sort(key=_drift_sort_key)
     return ProjectAudit(
         project_root=root,
@@ -456,6 +549,9 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             manifest_tasks_without_db_row=without_db_row,
             malformed_task_entries=malformed,
             manifest_parse_failures=len(parse_failure_details),
+            mechanical_capabilities_seen=seen,
+            unconvertible_sidecar_descriptors=unconvertible,
+            task_entries_with_no_sidecar_capability=orphaned_entries,
             manifest_parse_failure_details=tuple(parse_failure_details),
             uncomparable_details=tuple(uncomparable_details),
         ),
@@ -464,11 +560,16 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
 _COVERAGE_CAVEAT = (
     "  COVERAGE (the findings above are a comparison of MATCHED PAIRS only, "
-    "not the whole corpus - a capability with no same-named task-record entry, "
-    "a manifest binding a task_id with no tasks.db row, and an unparseable "
-    "sidecar are all counted here and are NONE of them drift; the "
-    "missing-entry class is owned by audit_combine_gate_marker_loss.py and is "
-    "never remediated from this report):"
+    "not the whole corpus - SEEN is the eligible population and COMPARED the "
+    "matched pairs, and the rows between them account for the difference: a "
+    "capability with no same-named task-record entry, a manifest binding a "
+    "task_id with no tasks.db row, an unvalidatable task entry, an "
+    "unconvertible sidecar descriptor and an unparseable sidecar are all "
+    "counted here and are NONE of them drift; the missing-entry class is owned "
+    "by audit_combine_gate_marker_loss.py and is never remediated from this "
+    "report. A task entry with no capability is the REVERSE direction - a "
+    "RENAMED capability appears as that row AND a no-task-entry row on the "
+    "SAME task, and that pair IS drift even though neither row alone says so):"
 )
 
 # Printed ABOVE a git-discovery-failed project's rows, because a reader must
@@ -516,10 +617,19 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
         _COVERAGE_CAVEAT,
         [
             ("manifests swept:", coverage.manifests_swept),
+            # SEEN is the eligible population; COMPARED is the matched-pair
+            # count. Both are printed, adjacent, so the volume figure cannot be
+            # read as larger than it is and no reader has to derive one by
+            # subtracting the skip rows below. See AuditCoverage.
+            ("mechanical capabilities seen:", coverage.mechanical_capabilities_seen),
             ("mechanical capabilities compared:", coverage.mechanical_capabilities_compared),
             ("capabilities with no task entry:", coverage.capabilities_without_task_entry),
+            ("task entries with no capability:",
+             coverage.task_entries_with_no_sidecar_capability),
             ("manifest tasks with no db row:", coverage.manifest_tasks_without_db_row),
             ("unvalidatable task entries:", coverage.malformed_task_entries),
+            ("unconvertible sidecar descriptors:",
+             coverage.unconvertible_sidecar_descriptors),
             ("manifests that failed to parse:", coverage.manifest_parse_failures),
         ],
         details=(*coverage.manifest_parse_failure_details, *coverage.uncomparable_details),

@@ -44,6 +44,7 @@ from _task_db_scan import (
 )
 from audit_manifest_descriptor_drift import (
     _COVERAGE_CAVEAT,
+    _DISCOVERY_FAILED_NOTICE,
     EXIT_DRIFT,
     EXIT_NO_ROOT,
     EXIT_NOTHING_AUDITED,
@@ -400,8 +401,152 @@ def test_capability_with_no_same_named_task_entry_is_coverage_not_a_finding(
 
     assert audit.findings == []
     assert audit.coverage.capabilities_without_task_entry == 1
-    # Still COMPARED-eligible: it was a mechanical capability we tried to pair.
-    assert audit.coverage.mechanical_capabilities_compared == 1
+    # ELIGIBLE, but NOT compared. It was a mechanical capability the sweep
+    # reached and tried to pair, and the pairing failed — so it counts toward
+    # `seen` and must NOT count toward `compared`, whose whole job is to state
+    # how many descriptor comparisons actually happened.
+    assert audit.coverage.mechanical_capabilities_seen == 1
+    assert audit.coverage.mechanical_capabilities_compared == 0
+    # This fixture is ALSO a rename (sidecar 'gate' vs record 'other-cap'), so
+    # the reverse row fires on the same task — that pairing is the rename
+    # signature. See the dedicated test below.
+    assert audit.coverage.task_entries_with_no_sidecar_capability == 1
+
+
+def test_a_renamed_capability_shows_up_in_BOTH_directions(tmp_path, make_tasks_db):
+    """A rename is drift, and the sidecar->task walk alone cannot see it.
+
+    When a hand-repair RENAMES a capability on the task record, the sidecar's
+    old name lands in capabilities_without_task_entry — a bucket this report
+    attributes to audit_combine_gate_marker_loss.py and says is never
+    remediated from here. Without the reverse walk, a genuine drift would be
+    silently misfiled as somebody else's problem. Both rows firing on the SAME
+    task is the signature, and the detail NAMES the manifest so a reader can
+    act on it.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate-renamed", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.coverage.capabilities_without_task_entry == 1
+    assert audit.coverage.task_entries_with_no_sidecar_capability == 1
+    named = " ".join(audit.coverage.uncomparable_details)
+    assert "gate-renamed" in named
+    assert "plans/a-prd.capability-manifest.yaml" in named
+
+
+def test_stale_mechanical_entry_under_a_now_manual_capability_is_seen(
+        tmp_path, make_tasks_db):
+    """THE SECOND REVERSE SHAPE: grep -> manual on the sidecar.
+
+    A manual capability is skipped by the forward walk (manifest_stamping step
+    5 never copies one), and a re-decompose would LEAVE the stale mechanical
+    entry in place rather than clearing it, because that step does
+    `if not mechanical: continue`. So the stale record entry would otherwise be
+    invisible from both ends.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(100, checks=(("gate", _MANUAL_CHECK),)))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    # Not seen by the forward walk at all — a manual capability is never
+    # mechanical, so it is neither seen nor missing-an-entry.
+    assert audit.coverage.mechanical_capabilities_seen == 0
+    assert audit.coverage.capabilities_without_task_entry == 0
+    # But the stale record entry IS surfaced, by the reverse walk.
+    assert audit.coverage.task_entries_with_no_sidecar_capability == 1
+
+
+def test_seen_equals_compared_plus_every_skip_class(tmp_path, make_tasks_db):
+    """THE ARITHMETIC CLOSES, so no reader has to derive a count by subtraction.
+
+    One corpus exercising all four terms at once: a paired-and-compared
+    capability, one with no task entry, and one whose task entry will not
+    validate. (The fourth term, an unconvertible SIDECAR descriptor, cannot be
+    provoked by data — see its own test.)
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [
+            _entry("paired", {**_GREP_CHECK, "pattern": "drifted"}),
+            {"name": "unvalidatable", "kind": "grep", "pattern": "p"},  # no expect
+        ])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100, checks=(
+            ("paired", _GREP_CHECK),
+            ("unvalidatable", _GREP_CHECK),
+            ("orphan-sidecar", _GREP_CHECK),
+        )))],
+    )
+
+    c = audit_project(str(root)).coverage
+
+    assert c.mechanical_capabilities_seen == 3
+    assert c.mechanical_capabilities_compared == 1
+    assert c.capabilities_without_task_entry == 1
+    assert c.malformed_task_entries == 1
+    assert c.unconvertible_sidecar_descriptors == 0
+    assert c.mechanical_capabilities_seen == (
+        c.mechanical_capabilities_compared
+        + c.capabilities_without_task_entry
+        + c.malformed_task_entries
+        + c.unconvertible_sidecar_descriptors
+    )
+
+
+def test_an_unconvertible_sidecar_descriptor_degrades_to_coverage(
+        tmp_path, make_tasks_db, monkeypatch):
+    """One bad sidecar descriptor must NOT abort the sweep.
+
+    FAULT-INJECTED on purpose: today the conversion cannot fail, because a
+    validated sidecar grep/script DeliveredCheck shares
+    _check_kind_conditional_fields with DeliveredCheckMeta. The guard exists
+    because that coupling is IMPLICIT — if the two models ever diverge, an
+    unguarded raise escapes audit_project into _task_db_scan.sweep_project_roots,
+    which catches only sqlite3.Error, aborting every remaining project root.
+    Injecting the failure is the only way to pin the degradation, and pinning it
+    is the point: the alternative is discovering the coupling broke by losing a
+    whole multi-root sweep to a traceback.
+    """
+    import audit_manifest_descriptor_drift as mod
+
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("boom", _GREP_CHECK),
+                           _entry("fine", {**_GREP_CHECK, "pattern": "drifted"})])],
+        manifests=[("plans/a-prd.capability-manifest.yaml", _manifest_doc(100, checks=(
+            ("boom", _GREP_CHECK), ("fine", _GREP_CHECK),
+        )))],
+    )
+
+    real = mod._expected_meta
+
+    def flaky(capability_name, check):
+        if capability_name == "boom":
+            raise ValueError("models diverged")
+        return real(capability_name, check)
+
+    monkeypatch.setattr(mod, "_expected_meta", flaky)
+
+    audit = mod.audit_project(str(root))
+
+    # The OTHER capability was still compared and still produced its finding.
+    assert _triples(audit) == {("plans/a-prd.capability-manifest.yaml", 100, "fine")}
+    assert audit.coverage.unconvertible_sidecar_descriptors == 1
+    # NAMED with manifest and capability, never merely counted.
+    named = " ".join(audit.coverage.uncomparable_details)
+    assert "boom" in named and "plans/a-prd.capability-manifest.yaml" in named
+    # Not conflated with the TASK-side channel.
+    assert audit.coverage.malformed_task_entries == 0
 
 
 def test_manifest_task_with_no_db_row_is_coverage_not_a_finding(
@@ -423,7 +568,9 @@ def test_manifest_task_with_no_db_row_is_coverage_not_a_finding(
 
     assert audit.findings == []
     assert audit.coverage.manifest_tasks_without_db_row == 1
-    # The whole task block is skipped, so none of its capabilities are compared.
+    # The whole task block is skipped, so none of its capabilities are even
+    # SEEN — the skip happens above the capability loop, not inside it.
+    assert audit.coverage.mechanical_capabilities_seen == 0
     assert audit.coverage.mechanical_capabilities_compared == 0
 
 
@@ -453,6 +600,9 @@ def test_unvalidatable_task_entry_is_coverage_and_is_NAMED(
     assert "100" in named and "gate" in named
     # Not conflated with the sidecar-parse channel.
     assert audit.coverage.manifest_parse_failures == 0
+    # Seen but never compared: the pair existed, the normalization failed.
+    assert audit.coverage.mechanical_capabilities_seen == 1
+    assert audit.coverage.mechanical_capabilities_compared == 0
 
 
 @pytest.mark.parametrize("bad_doc", [
@@ -501,7 +651,12 @@ def test_manifests_swept_and_compared_are_counted(tmp_path, make_tasks_db):
 
     assert coverage.manifests_swept == 2
     # c1 + c2 + the b-prd gate; c3 is manual and never mechanical.
-    assert coverage.mechanical_capabilities_compared == 3
+    assert coverage.mechanical_capabilities_seen == 3
+    # Neither task carries any delivered_checks entry, so nothing PAIRED —
+    # every one of the three is eligible-but-unpaired. `compared` must state
+    # comparison volume, not eligibility.
+    assert coverage.mechanical_capabilities_compared == 0
+    assert coverage.capabilities_without_task_entry == 3
 
 
 # ---------------------------------------------------------------------------
@@ -598,10 +753,17 @@ def test_report_coverage_rows_render_with_their_column_alignment(
     lines = format_report([audit_project(str(root))]).splitlines()
 
     assert "    manifests swept:                    1" in lines
-    assert "    mechanical capabilities compared:   1" in lines
+    # SEEN and COMPARED render as two ADJACENT rows: the eligible population
+    # and the matched-pair count are different numbers, and a report whose
+    # thesis is "the findings are not the whole corpus" must not overstate the
+    # one figure that says how much was actually compared.
+    assert "    mechanical capabilities seen:       1" in lines
+    assert "    mechanical capabilities compared:   0" in lines
     assert "    capabilities with no task entry:    1" in lines
+    assert "    task entries with no capability:    1" in lines
     assert "    manifest tasks with no db row:      0" in lines
     assert "    unvalidatable task entries:         0" in lines
+    assert "    unconvertible sidecar descriptors:  0" in lines
     assert "    manifests that failed to parse:     0" in lines
 
 
@@ -638,8 +800,14 @@ def test_report_says_so_prominently_when_git_discovery_failed(
 
     report = format_report([audit_project(str(root), str(not_a_checkout))])
 
-    assert "NOT a clean result" in report
-    assert "manifest corpus could not be enumerated" in report
+    # On the CONSTANT, matching the _COVERAGE_CAVEAT test's shape. A hardcoded
+    # substring pins WORDING rather than behaviour: it fails a reword that is
+    # just as loud, and survives a rewrite that guts the warning.
+    assert _DISCOVERY_FAILED_NOTICE in report
+    # ABOVE the rows, so a reader sees the zero is UNKNOWN before reading it.
+    lines = report.splitlines()
+    assert lines.index(_DISCOVERY_FAILED_NOTICE) < next(
+        i for i, ln in enumerate(lines) if "drifted descriptors" in ln)
 
 
 def test_format_json_emits_an_object_with_projects_coverage_and_findings(
@@ -851,7 +1019,9 @@ def test_main_manifest_root_that_is_not_a_checkout_is_loudly_non_zero(
     result = _run_cli("--project-root", str(root), "--manifest-root", str(not_a_checkout))
 
     assert result.returncode != 0
-    assert "NOT a clean result" in result.stdout
+    # On the CONSTANT, not a hardcoded substring — see the format_report
+    # counterpart above for why.
+    assert _DISCOVERY_FAILED_NOTICE in result.stdout
 
 
 def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
@@ -1151,6 +1321,21 @@ def test_live_sidecars_carry_the_resynced_descriptors(
 
     Parametrized so a failure NAMES its own manifest/label/capability rather
     than reporting "one of eight".
+
+    MAINTENANCE CONTRACT — READ THIS BEFORE "FIXING" A FAILURE HERE. This is an
+    EXACT pin, not a not-the-stale-spelling pin, and it is deliberately the
+    stricter of the two: because tasks.db is gitignored the sweep itself can
+    never run in CI, so this is the ONLY automated guard that the resync
+    survives. The cost of that strictness is that it also fires on a LEGITIMATE
+    change — a later task that re-repairs one of these eight checks on BOTH
+    sides has zero drift and is entirely correct, and will still turn this red.
+    THAT IS NOT A STALENESS BUG. If you changed one of these checks on purpose,
+    update its row in _MEASURED_DRIFT_ROWS in the SAME commit (the `resynced`
+    element, index 5) and re-run
+    `scripts/audit_manifest_descriptor_drift.py --project-root <primary>
+    --manifest-root <this checkout>` to confirm it still reports zero — which
+    is the assertion this pin is standing in for. Only a sidecar that disagrees
+    with its task record is the defect this test was written to catch.
     """
     root = _repo_root()
     if root is None:
@@ -1186,4 +1371,11 @@ def test_live_sidecars_carry_the_resynced_descriptors(
         "args": [],
         "timeout_secs": None,
         "reason": None,
-    }, f"{relpath} label {label} capability {capability} (task {task_id}) is STALE"
+    }, (
+        f"{relpath} label {label} capability {capability} (task {task_id}) does "
+        f"not carry the descriptor recorded in _MEASURED_DRIFT_ROWS. Either the "
+        f"task-4545 resync was reverted (the sidecar is STALE and a re-decompose "
+        f"would re-stamp the stale spelling over the repair), OR this check was "
+        f"legitimately re-repaired on BOTH sides since — in which case update "
+        f"this row's `resynced` element and see this test's maintenance contract."
+    )
