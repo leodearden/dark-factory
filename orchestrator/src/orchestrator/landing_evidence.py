@@ -2263,12 +2263,35 @@ def file_unattributed_landing_escalation(
             task_id, 'provenance_unattributed', citation_sha,
         )
         if prior is not None:
+            # INV-4 storm counter: record the suppression ON the resolution
+            # that absorbed it, so the storm is a durable structured fact and
+            # not merely the WARNING below (INV-2).  Deliberately
+            # UNTHRESHOLDED — escalating at a count would file the very
+            # escalation this guard exists to suppress, recreating the
+            # close-then-refile storm one level up.
+            #
+            # Its OWN try/except: a bookkeeping-counter failure must never
+            # turn into a re-opened escalation, and must never propagate out
+            # of this best-effort helper.  ``getattr`` for the same
+            # duck-typed-stand-in reason as the lookup itself.
+            absorbed = None
+            noter = getattr(escalation_queue, 'note_suppressed_refile', None)
+            if noter is not None:
+                try:
+                    counted = noter(prior.id)
+                    absorbed = getattr(counted, 'refiles_suppressed', None)
+                except Exception:
+                    logger.warning(
+                        'Failed to count a suppressed provenance_unattributed '
+                        'refile against %s — suppressing anyway',
+                        prior.id, exc_info=True,
+                    )
             logger.warning(
                 'Suppressing provenance_unattributed refile for task %s '
                 '(branch %s, citation %s): already adjudicated by %s '
-                '(%s by %s)',
+                '(%s by %s); refiles absorbed so far: %s',
                 task_id, branch, citation_sha, prior.id, prior.status,
-                prior.resolved_by,
+                prior.resolved_by, absorbed if absorbed is not None else 'uncounted',
             )
             return
         from escalation.models import Escalation  # noqa: PLC0415
