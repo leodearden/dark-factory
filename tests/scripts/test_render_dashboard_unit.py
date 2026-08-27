@@ -467,3 +467,105 @@ def test_apply_preserved_raises_when_the_rendered_text_is_ambiguous():
         _apply_preserved(rendered, {_KNOWN_ROOTS: NINE_ROOTS})
 
     assert _KNOWN_ROOTS in str(excinfo.value), excinfo.value
+
+
+# ---------------------------------------------------------------------------
+# HOST_LOCAL_ENVIRONMENT — the POLICY  (step-7 / step-8)
+# ---------------------------------------------------------------------------
+
+
+def _host_local():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.HOST_LOCAL_ENVIRONMENT
+
+
+def test_host_local_environment_is_not_empty():
+    """An empty preserve set would make this whole module a rename of the clobber."""
+    assert _host_local(), (
+        "HOST_LOCAL_ENVIRONMENT is empty, so the renderer preserves nothing and "
+        "the install is byte-for-byte the `sed >` clobber it replaced — while "
+        "reporting success."
+    )
+
+
+def test_host_local_environment_is_a_subset_of_the_divergence_allowlist():
+    """(a) Preserving a name the checker VALUE-COMPARES would turn the gate red forever.
+
+    check_dashboard_unit_parity compares Environment= values across the
+    committed and installed copies unless the name is on DIVERGENCE_ALLOWLIST.
+    Preserve a name that is NOT on that list and every correctly-configured host
+    reports drift on every run — the always-red-gate outcome that checker's own
+    docstring warns about twice, and which a gate then gets switched off for,
+    taking the accidental drift it exists to catch with it.
+
+    Held by a guard rather than by an import, deliberately: the renderer must
+    not import the checker (see the module docstring and the section comment on
+    the environment_map lift above).
+    """
+    allowlist = set(_load_checker().DIVERGENCE_ALLOWLIST)
+
+    assert set(_host_local()) <= allowlist, (
+        f"HOST_LOCAL_ENVIRONMENT {sorted(_host_local())} is not a subset of "
+        f"DIVERGENCE_ALLOWLIST {sorted(allowlist)}. A preserved name the parity "
+        "checker value-compares makes the gate red on every correctly-"
+        "configured host."
+    )
+
+
+def test_host_local_environment_contains_known_project_roots():
+    """(b) The variable this task exists for."""
+    assert _KNOWN_ROOTS in _host_local()
+
+
+def test_host_local_environment_excludes_project_root():
+    """(c) The two DIVERGENCE_ALLOWLIST entries are NOT interchangeable.
+
+    They are on that allowlist for OPPOSITE reasons, and the naive reading
+    ("preserve everything on the allowlist") destroys the second:
+
+    - DASHBOARD_KNOWN_PROJECT_ROOTS is the declared HOLE — genuinely host-local,
+      "additional project roots are LOCAL settings, added to the installed unit,
+      not committed here". Preserving it is the whole point.
+    - DASHBOARD_PROJECT_ROOT is NOT host-local. Its value is RENDERED from
+      __REPO_ROOT__ per host, and the checker still CHECKS it — intra-copy,
+      against the SAME file's WorkingDirectory= (UnitSpec.env_matches_directive).
+      Preserving a PREVIOUS host's value would pin the dashboard's data root at
+      the OLD repo root while WorkingDirectory= moved to the new one,
+      manufacturing exactly the intra-copy drift _compare_env_matches_directive
+      exists to report — on a host that had just been correctly reinstalled.
+    """
+    assert "DASHBOARD_PROJECT_ROOT" not in _host_local(), (
+        "DASHBOARD_PROJECT_ROOT must NOT be preserved: its value is rendered "
+        "per host and must equal the same copy's WorkingDirectory=. See this "
+        "test's docstring."
+    )
+
+
+def test_host_local_environment_names_are_declared_in_the_committed_template():
+    """(d) STALENESS GUARD: a typo must not rot into a preserve-nothing no-op.
+
+    Mirrors test_divergence_allowlist_names_are_declared_in_a_committed_unit.
+    A misspelled name here would be absent from every installed unit forever,
+    so preserved_values would skip it on every host, the render would take the
+    default every time, and the renderer would report success while doing
+    exactly what the `sed >` it replaced did.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    declared = set(
+        systemd_unit_parity.environment_map(
+            systemd_unit_parity.parse_unit_directives(
+                TEMPLATE_PATH.read_text(encoding="utf-8")
+            ),
+            "Service",
+        )
+    )
+
+    for name in _host_local():
+        assert name in declared, (
+            f"HOST_LOCAL_ENVIRONMENT names {name}, but "
+            f"{TEMPLATE_PATH} declares no such Environment= variable. Declared: "
+            f"{sorted(declared)}. A name nobody sets is preserved on no host, "
+            "forever, while the renderer still reports success."
+        )
