@@ -6888,23 +6888,26 @@ class MemoryService:
         edge_limit to fetch more, or cross-check completeness via a direct
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
-        resolved node uuid(s), uncapped. Both branches exclude invalidated
-        edges (invalid_at set): the exact branch at the Cypher level (WHERE
-        e.invalid_at IS NULL), and the fuzzy branch via an explicit
-        invalid_at filter applied to the search() results, mirroring
-        search()'s own drop (task 312) — so neither branch surfaces
-        superseded facts (task 2726).
+        resolved node uuid(s), uncapped. Both branches exclude edges retired
+        by EITHER marker — `invalid_at` (superseded by fused-memory) or
+        `expired_at` (contradicted by graphiti_core itself): the exact branch
+        at the Cypher level (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE,
+        plus a defence-in-depth Python skip in its dedup loop), and the fuzzy
+        branch via `_edge_is_retired` applied to the search() results,
+        mirroring search()'s own drop (task 312) — so neither branch surfaces
+        superseded facts (task 2726) nor expired ones (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
         false-positive "missing edges" findings. The exact branch's
         get_valid_edges_for_node (graphiti_client.py) runs a plain, uncached
         Cypher MATCH — `MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-()
-        WHERE e.invalid_at IS NULL` — with no LIMIT and no ranking: it
-        returns every RELATES_TO edge that is graph-connected to the
-        resolved node uuid(s), full stop. The fuzzy branch's graphiti.search()
-        instead does a semantic/relevance search over edge fact TEXT, which
-        can surface edges whose fact merely mentions the entity's name (or is
+        WHERE e.invalid_at IS NULL AND e.expired_at IS NULL` — with no
+        LIMIT and no ranking: it returns every RELATES_TO edge that is
+        graph-connected to the resolved node uuid(s), full stop. The fuzzy
+        branch's graphiti.search() instead does a semantic/relevance search
+        over edge fact TEXT, which can surface edges whose fact merely
+        mentions the entity's name (or is
         contextually related) without that edge being RELATES_TO-incident on
         this node at all. So an edge that appears in a search() result for
         this entity's name but is ABSENT from get_entity's exact-branch

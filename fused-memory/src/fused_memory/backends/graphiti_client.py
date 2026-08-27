@@ -600,9 +600,10 @@ kind, so a future fifth structural path is covered by construction.
 #     read makes an embedding-dimension migration look COMPLETE when it is
 #     not — the worst shape of this bug, because the operator's evidence of
 #     success is the very thing being truncated.
-#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
-#     filter, so it includes superseded edges and its row count runs ahead of
-#     the valid-edge census above.
+#   - query_stale_edge_embeddings: ~15242/22392 rows.  No retirement filter
+#     at all, so it includes edges retired by EITHER marker (``invalid_at``
+#     or ``expired_at``) and its row count runs ahead of the valid-edge
+#     census above, whose predicate task 4714 narrowed further.
 #   - query_edges_by_time_range: bounded only by the caller's window width;
 #     any window wide enough to span >10000 edges truncates.
 #   - retrieve_episodes: reaches the same server through graphiti-core's
@@ -1746,7 +1747,10 @@ class GraphitiBackend:
         clear is force-persisted by an explicit direct-Cypher
         ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
         before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
+        counted valid by that refresh's
+        ``WHERE e.invalid_at IS NULL AND e.expired_at IS NULL`` filter — the
+        restored edge must clear BOTH markers to be counted, and clearing
+        ``invalid_at`` alone leaves an ``expired_at``-bearing edge retired).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
@@ -2188,7 +2192,9 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``invalid_at IS NULL``.  This one answers a different question:
+        ``_ACTIVE_EDGE_PREDICATE`` (BOTH retirement markers: ``invalid_at``
+        IS NULL AND ``expired_at`` IS NULL).  This one answers a different
+        question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2292,8 +2298,10 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges where invalid_at IS NULL and excludes the
-        node itself (self-loops excluded via ``m.uuid <> $uuid``).
+        Queries all RELATES_TO edges carrying NEITHER retirement marker
+        (``_ACTIVE_EDGE_PREDICATE``: ``invalid_at`` IS NULL AND ``expired_at``
+        IS NULL) and excludes the node itself (self-loops excluded via
+        ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -2498,9 +2506,10 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid (``invalid_at IS NULL``)
-        incident edges (undirected, so directed and reverse-directed exact
-        duplicates both collapse), delegates grouping + survivor selection
+        Queries the node's currently-valid incident edges — those carrying
+        neither retirement marker, per ``_ACTIVE_EDGE_PREDICATE`` — undirected,
+        so directed and reverse-directed exact duplicates both collapse;
+        delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
 
@@ -3522,7 +3531,9 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        (non-invalidated) RELATES_TO edges, deduplicates their facts
+        RELATES_TO edges — neither superseded (``invalid_at``) nor
+        contradicted by graphiti_core (``expired_at``), per
+        ``_ACTIVE_EDGE_PREDICATE`` — deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
