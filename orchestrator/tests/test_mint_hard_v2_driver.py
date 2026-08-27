@@ -738,6 +738,161 @@ class TestContinuityBaseApproximation:
 
 
 # ---------------------------------------------------------------------------
+# redrive_provenance — re-derive provenance WITHOUT re-censusing
+# ---------------------------------------------------------------------------
+
+def _redrive_manifest() -> dict:
+    """A manifest with the blocks --redrive must leave alone."""
+    return {
+        'census': {'date': '2026-08-08', 'n': 41},
+        'ceilings': {'max_architect_turns': 120, 'timeout_minutes': 180},
+        'continuity': {'fixtures': [{'id': 'reify_task_12'}]},
+        'merge_sha_availability': {'referenced': 1, 'planrate_only': 1},
+        'candidates': [
+            {
+                'task_id': '4026', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Add physical constants', 'status': 'done',
+                'brief_chars': 224, 'decision': 'include',
+                'reason': 'INCLUDE. The brief states an implementable goal.',
+                'merge_sha': None, 'baseline_sha': 'e' * 40,
+                'baseline_source': 'timestamp_walk',
+                'mint_mode': 'planrate_only',
+            },
+            {
+                'task_id': '3883', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Add stdlib dynamics', 'status': 'cancelled',
+                'brief_chars': 300, 'decision': 'include',
+                'reason': 'INCLUDE. The brief states an implementable goal.',
+                'merge_sha': None, 'baseline_sha': '2' * 40,
+                'baseline_source': 'timestamp_walk',
+                'mint_mode': 'planrate_only',
+            },
+            {
+                'task_id': '999', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Too vague', 'status': 'done',
+                'brief_chars': 12, 'decision': 'exclude',
+                'reason': 'EXCLUDE. The brief states no implementable goal.',
+            },
+        ],
+    }
+
+
+def _fake_resolve(table: dict[str, tuple[str | None, str, str]]):
+    """Injected resolver: task_id -> (merge_sha, baseline_sha, baseline_source).
+
+    Same dependency-injection discipline as
+    ``task_sampler.audit_fixture_corpus``'s ``ref_exists`` — no checkout is
+    touched, so the redrive rule itself is testable in isolation.
+    """
+    def resolve(project_root: str, task_id: str):
+        return table[task_id]
+    return resolve
+
+
+class TestRedriveProvenance:
+    def test_a_newly_resolvable_row_is_upgraded(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        row = after['candidates'][0]
+        assert row['merge_sha'] == '3613bea224' + 'f' * 30
+        assert row['baseline_sha'] == '794d321596' + 'a' * 30
+        assert row['baseline_source'] == 'merge_first_parent'
+        assert row['mint_mode'] == 'referenced'
+
+    def test_a_row_that_still_has_no_merge_keeps_planrate_only(self) -> None:
+        after, _changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': (None, 'e' * 40, 'timestamp_walk'),
+                '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+            }))
+        row = after['candidates'][1]
+        assert row['mint_mode'] == 'planrate_only'
+        assert row['merge_sha'] is None
+        assert row['baseline_source'] == 'timestamp_walk'
+        assert row['baseline_sha'] == '2ceaf9ec17' + 'b' * 30
+
+    def test_curation_fields_are_never_re_adjudicated(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        curation_keys = ('task_id', 'project', 'project_root', 'decision',
+                         'reason', 'title', 'status', 'brief_chars')
+        for old_row, new_row in zip(before['candidates'], after['candidates'],
+                                    strict=True):
+            for key in curation_keys:
+                if key in old_row:
+                    assert new_row[key] == old_row[key], key
+
+    def test_the_row_set_and_the_exclude_row_are_untouched(self) -> None:
+        # --redrive re-derives provenance on rows that already exist; by
+        # construction it cannot add or drop a fixture.
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        assert len(after['candidates']) == len(before['candidates'])
+        assert [r['task_id'] for r in after['candidates']] == \
+            [r['task_id'] for r in before['candidates']]
+        assert after['candidates'][2] == before['candidates'][2]
+
+    def test_census_ceilings_and_continuity_blocks_are_untouched(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        for block in ('census', 'ceilings', 'continuity'):
+            assert after[block] == before[block]
+
+    def test_does_not_mutate_the_manifest_it_was_given(self) -> None:
+        before = _redrive_manifest()
+        snapshot = json.dumps(before, sort_keys=True)
+        driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        assert json.dumps(before, sort_keys=True) == snapshot
+
+    def test_the_change_list_names_exactly_what_moved(self) -> None:
+        _after, changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                         'merge_first_parent'),
+                '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+            }))
+        # 3883's rung and mode are unchanged; only its baseline_sha moved (the
+        # --first-parent fix), so BOTH rows moved and both must be listed.
+        assert [c['task_id'] for c in changes] == ['4026', '3883']
+        upgraded = changes[0]
+        assert upgraded['before']['baseline_source'] == 'timestamp_walk'
+        assert upgraded['after']['baseline_source'] == 'merge_first_parent'
+        assert upgraded['before']['mint_mode'] == 'planrate_only'
+        assert upgraded['after']['mint_mode'] == 'referenced'
+
+    def test_an_unchanged_row_is_not_listed(self) -> None:
+        _after, changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': (None, 'e' * 40, 'timestamp_walk'),
+                '3883': (None, '2' * 40, 'timestamp_walk'),
+            }))
+        assert changes == []
+
+
+# ---------------------------------------------------------------------------
 # (d) --render — the documented regeneration path, with no db access
 # ---------------------------------------------------------------------------
 
