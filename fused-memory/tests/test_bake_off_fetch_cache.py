@@ -619,10 +619,17 @@ class TestFetchCacheRefusesAStaleCorpus:
     reading code: the fixtures moved, the cache is truncated, or the cache is
     too shallow for the requested depth."""
 
-    def _dump(self, mod, tmp_path, records, *, queries, search_limit=10):
+    def _dump(self, mod, tmp_path, records, *, queries, probes=None,
+              search_limit=10):
+        """A one-shape cache to truncate.
+
+        *probes* defaults to ``None`` — i.e. an empty probes half — so the
+        refusals that only care about the QUERIES half read exactly as they
+        did before it was a parameter.
+        """
         path = tmp_path / 'cache.json'
         mod.dump_fetches(
-            path, {'c_peers': _fetched(queries, {})},
+            path, {'c_peers': _fetched(queries, probes or {})},
             provenance=_provenance(
                 mod, {'c_peers': records}, search_limit=search_limit,
             ),
