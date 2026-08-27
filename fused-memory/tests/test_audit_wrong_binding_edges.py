@@ -52,6 +52,8 @@ def _load_module() -> types.ModuleType:
 
 _mod = _load_module()
 fact_referents = _mod.fact_referents
+endpoint_referent = _mod.endpoint_referent
+bare_id_present = _mod.bare_id_present
 
 GRAPH = 'reify'
 
@@ -214,3 +216,154 @@ class TestNoSecondVocabulary:
             for alias in node.names
         }
         assert 'scan_content' in imported
+
+    def test_the_anchored_parser_is_imported(self) -> None:
+        """The endpoint side routes through the shared module too.
+
+        Split from the scan_content assertion above because the two enter the
+        script at different steps; keeping them apart makes a regression name
+        which HALF of the vocabulary was re-derived.
+        """
+        imported = {
+            alias.name
+            for node in ast.walk(ast.parse(SCRIPT_PATH.read_text()))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == 'fused_memory.utils.canonical_labels'
+            for alias in node.names
+        }
+        assert 'parse_node_name' in imported
+
+
+class TestEndpointReferent:
+    """The endpoint-side parser: is this entity NAME a task label?
+
+    A thin adapter over the IMPORTED ``canonical_labels.parse_node_name``,
+    which is ANCHORED by design — it answers "is this NAME a task label",
+    not "does this text mention a task" (the fact side answers that with the
+    unanchored scanner). The anchoring is what keeps a name that merely
+    CONTAINS a task reference out of the population entirely.
+    """
+
+    @pytest.mark.parametrize(
+        ('name', 'number'),
+        [
+            ('Task 6165', '6165'),  # the canonical specimen's node
+            ('task 4755', '4755'),
+            ('task #1153', '1153'),  # one of the PRD's 53 measured variants
+            ('Task: 132', '132'),
+        ],
+    )
+    def test_task_shaped_names_parse(self, name: str, number: str) -> None:
+        assert endpoint_referent(name) == Referent(kind='task', number=number)
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            'ElasticResult.rotation',  # live object-end of specimen 63fa5c78
+            'IMPLEMENTATION COORDINATION',
+            '6185 GUI-channel-bridge',  # bare digits: a shared blind spot
+            'commit e6a7e971ed',
+            'Dependencies 1720',
+            'Task 42 orchestrator',  # a MENTION, not a label — anchoring matters
+            '',
+            None,
+        ],
+    )
+    def test_non_labels_are_refused(self, name: str | None) -> None:
+        """These must never enter the population.
+
+        A None/empty ``a.name`` column is included deliberately: the sweep
+        reads every live RELATES_TO row in the graph, and one odd historical
+        node must not raise into a whole-corpus read.
+        """
+        assert endpoint_referent(name) is None
+
+    def test_a_foreign_qualified_name_keeps_its_project(self) -> None:
+        """'reify:132' is a DIFFERENT referent from a local 'Task 132'.
+
+        Flattening the qualifier away is exactly the cross-project collapse
+        ``utils/cross_project_refs.py`` exists to detect, so the detector
+        must compare FULL Referents rather than bare numbers.
+        """
+        assert endpoint_referent('reify:132') == Referent(
+            kind='task', project_id='reify', number='132'
+        )
+
+    def test_a_foreign_referent_never_equals_the_local_one(self) -> None:
+        """The equality the detector's set-membership test relies on.
+
+        Asserted on the Referent type itself rather than only through the
+        detector, because this is the property that makes comparing FULL
+        referents safe: a fact naming local 'Task 132' must NOT satisfy an
+        endpoint named 'reify:132', and vice versa.
+        """
+        local = endpoint_referent('Task 132')
+        foreign = endpoint_referent('reify:132')
+        assert local != foreign
+        assert local not in {foreign}
+        assert foreign not in {local}
+        assert local is not None and foreign is not None
+        assert local.number == foreign.number  # the bare numbers DO collide
+
+
+class TestBareIdPresent:
+    """The containment backstop — the ONLY id check this script does itself.
+
+    It is not a second vocabulary and cannot become one: it compiles no
+    task-label pattern, it can MINT no referent, and it takes an id the
+    shared parser has ALREADY produced. Its only power is to SUPPRESS a
+    flag, which is the conservative direction for a report a human
+    adjudicates by hand.
+
+    It exists because two of the shared scanner's documented blind spots —
+    '#4262' and 'task-1836' — would otherwise make an endpoint that IS named
+    in the fact look unnamed, which is a false positive.
+    """
+
+    def test_the_bare_hash_spelling_is_seen(self) -> None:
+        """'#4262' is invisible to the shared scanner; the digits are not."""
+        assert bare_id_present(
+            _task('4262'),
+            "#4262's cache is separated from the engine-level tables in Task 4351.",
+        )
+
+    def test_the_hyphen_spelling_is_seen(self) -> None:
+        assert bare_id_present(
+            _task('1836'),
+            'Task 1841 found the real SIGHUP bug that '
+            "task-1836's timeout widening had masked.",
+        )
+
+    def test_an_absent_id_is_absent(self) -> None:
+        assert not bare_id_present(
+            _task('6165'), 'Task 6164 described landing the same artefact.'
+        )
+
+    def test_a_digit_run_must_stand_alone(self) -> None:
+        """Word-boundary matched, so a SUBSTRING of a longer id never counts.
+
+        Without this, endpoint 'Task 616' would read as named by a fact about
+        task 6165 and the flag would be suppressed wrongly — silently
+        under-reporting exactly the near-miss population this sweep measures.
+        """
+        assert not bare_id_present(_task('616'), 'Task 6165 landed.')
+        assert not bare_id_present(_task('165'), 'Task 6165 landed.')
+
+    def test_empty_content_is_tolerated(self) -> None:
+        assert not bare_id_present(_task('6165'), '')
+        assert not bare_id_present(_task('6165'), None)
+
+    def test_a_foreign_referent_is_matched_on_its_number(self) -> None:
+        """Deliberate and documented: containment sees DIGITS, not projects.
+
+        A foreign endpoint 'reify:132' whose fact says 'task 132' is
+        suppressed, because the containment check cannot tell the two apart.
+        That is a suppression — a lost flag, never an invented one — and so
+        it lands on the safe side of a report a human adjudicates. The
+        PRECISE comparison still happens in the set-membership test, which
+        compares full Referents; this is only the backstop.
+        """
+        assert bare_id_present(
+            Referent(kind='task', project_id='reify', number='132'),
+            'Ported from task 132 into this tree.',
+        )
