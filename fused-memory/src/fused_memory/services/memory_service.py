@@ -1377,6 +1377,33 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+def _edge_field(edge: Any, name: str) -> Any:
+    """Read *name* off an edge that may be a Mapping or an attribute object.
+
+    Same dual handling ``_edge_to_dict`` does: the exact/topological branch
+    hands back ``EdgeDict`` mappings, the fuzzy/semantic branch hands back
+    graphiti-core ``EntityEdge`` objects.  Absent either way -> None.
+    """
+    if isinstance(edge, Mapping):
+        return edge.get(name)
+    return getattr(edge, name, None)
+
+
+def _edge_is_retired(edge: Any) -> bool:
+    """True when the edge carries EITHER retirement marker.
+
+    ``invalid_at`` is set by fused-memory's own recon Stage 1 / update_edge
+    ("superseded"); ``expired_at`` is set independently by graphiti_core's
+    contradiction resolution (graphiti_core/utils/maintenance/edge_operations.py::
+    resolve_extracted_edge).  Either one means the fact is no longer current, so
+    a read answering "what is currently true?" must drop the edge (task 4714).
+    """
+    return (
+        _edge_field(edge, 'invalid_at') is not None
+        or _edge_field(edge, 'expired_at') is not None
+    )
+
+
 # Defensive: resolve the embedding-provider's RateLimitError class at module
 # load. If the openai SDK is absent or its exception hierarchy is renamed,
 # _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
@@ -6654,8 +6681,9 @@ class MemoryService:
         metadata (task 3658):
 
           - ``store_rank``: 1-based rank, contiguous over the SURVIVING edges
-            (an edge dropped for ``invalid_at`` or planned-only provenance does
-            not consume a rank).
+            (an edge dropped for a retirement marker — ``invalid_at`` or
+            ``expired_at`` — or for planned-only provenance does not consume a
+            rank).
           - ``store_score``: always ``None`` — Graphiti's public ``search()``
             exposes no scores, and synthesizing one would be a lie the
             cross-store merge would then act on.
@@ -6682,10 +6710,12 @@ class MemoryService:
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
 
-            # Skip superseded edges (invalid_at set means the fact has been
-            # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded.
-            if invalid_at is not None:
+            # Skip retired edges: `invalid_at` means we superseded the fact
+            # ourselves, `expired_at` means graphiti_core's own contradiction
+            # resolution did.  Either way it is no longer current.  Check this
+            # before anything else to avoid unnecessary work on edges that will
+            # be discarded, and so a dropped edge consumes no rank.
+            if _edge_is_retired(edge):
                 continue
 
             temporal = _serialize_temporal(valid_at, invalid_at)
