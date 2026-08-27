@@ -112,7 +112,7 @@ Five thrusts, decomposed as chains (§9):
 
 | Seam | Owner | This PRD's edge |
 |---|---|---|
-| XML-leak cure (root-cause, text-match, sweep) | DF 3083 (pending) | ο = containment tripwire only; C3 storm counter names 3083 in its escalation hint |
+| XML-leak cure (root-cause, text-match, sweep) | `plans/toolcall-markup-containment-prd.md` (successor; DF 3083 done, merged 7899eef17b) | ο's in-line tripwire superseded by that PRD's `MarkupGuardMiddleware`; C3 storm counter names 3083 in its escalation hint |
 | In-place update primitive | DF 3055 (in-progress) | none — add-only design throughout |
 | Consolidation-gate filing machinery (`milestone_gate`) | existing orchestrator/recon (deterministic_runner.py:1433, recon_self_model.py:552) | κ changes only the *input* (deterministic report), not the filing mechanism |
 | Writer briefings (roles) | orchestrator repo (same batch, leaf ε) | ε edits `roles.py` only; no reify-side text |
