@@ -1073,6 +1073,53 @@ def _mixed_rotation_records():
     return records
 
 
+_BARE_CEILING = 'command timed out after 60m, exit code 124'
+
+
+def _two_rule_rotation_records():
+    """One 3-call re-arm group whose designed results fire TWO different
+    classification rules -- a self-declared WATCHER_REARM_OUTCOME first,
+    then a bare bounded-wait 124 with no declaration, then the declaration
+    again. Both are designed, both carry exit 124, and they are distinct
+    ``(exit_code, label)`` pairs, so this is the only shape that exercises
+    dedup ACROSS distinct pairs and the renderer's multi-rule join."""
+    contents = [_CEILING_DECLARATION, _BARE_CEILING, _CEILING_DECLARATION]
+    records = []
+    for i, content in enumerate(contents):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-t{i}')))
+        records.append(_tool_result(f'tu-t{i}', content, is_error=True))
+    return records
+
+
+def _codeless_rotation_records():
+    """One 3-call re-arm group whose designed declarations carry NO exit
+    code -- ``FIRED`` with no ``exit=`` and no code anywhere in the blob,
+    which classify_error_content resolves to ``(None, label)``. Pins that
+    the None-code pair is REACHABLE, not a hypothetical of the type."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-n{i}')))
+        records.append(
+            _tool_result(f'tu-n{i}', 'WATCHER_REARM_OUTCOME: FIRED', is_error=True)
+        )
+    return records
+
+
+def _idless_rotation_records():
+    """>= RETRY_MIN attempts whose tool_use blocks carry NO 'id', beside a
+    DESIGNED tool_result whose 'tool_use_id' is likewise absent -- both
+    sides of the join degrade to None. Nothing here may join to anything."""
+    records = []
+    for _ in range(3):
+        block = _tool_use('Bash', _REARM)
+        del block['id']
+        records.append(_assistant(block))
+    orphan = _tool_result('unused', _CEILING_DECLARATION, is_error=True)
+    del orphan['message']['content'][0]['tool_use_id']
+    records.append(orphan)
+    return records
+
+
 def _by_signature(loops):
     return {loop['signature']: loop for loop in loops}
 
@@ -1106,6 +1153,55 @@ class TestRetryLoopDesignedOutcomeJoin:
         assert rearm['designed_outcomes'] == [
             mod.classify_error_content(_CEILING_DECLARATION)
         ]
+
+    def test_two_distinct_rules_are_ordered_by_first_appearance(self):
+        # The non-degenerate case: 3 designed results collapsing to TWO
+        # distinct pairs, not one. Both carry exit 124, so only the LABEL
+        # separates them -- and the declaration is asserted first because
+        # ordering is transcript order (a seen-set, never a sort: exit_code
+        # is int | None, so sorted() would raise the moment a declaration
+        # carries no code).
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [
+            (124, 'watcher-rearm-declared'),
+            (124, 'bounded-wait-ceiling'),
+        ]
+
+    def test_repeat_of_an_earlier_rule_does_not_re_emit_its_pair(self):
+        # Dedup is across DISTINCT pairs, so the third call's repeat of the
+        # first call's declaration adds to the count but not to the list --
+        # the annotation stays one line long however long the rotation ran.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert len(loops[0]['designed_outcomes']) == 2
+
+    def test_declaration_without_an_exit_code_yields_a_none_coded_pair(self):
+        # classify_error_content can return (None, label): the pattern's
+        # `code` group is optional and _declared_exit_code falls through to
+        # a text scan that finds nothing. The join must carry that None
+        # through rather than dropping the pair or coercing a code.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [(None, 'watcher-rearm-declared')]
+
+    def test_idless_blocks_never_join_to_an_idless_neighborhood(self):
+        # Both sides of the join degrade to None independently, so an
+        # unrestricted {id: neighborhood} map would let a malformed id-less
+        # attempt COLLIDE with an orphan designed result and annotate a
+        # group that has no designed outcome at all. The map excludes a
+        # None key precisely to make that collision unrepresentable.
+        loops = mod.find_retry_loops(_idless_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 0
+        assert loops[0]['designed_outcomes'] == []
 
     def test_group_with_no_error_results_annotates_nothing(self):
         # The zero-cost default: the date-check group's results are not
@@ -2972,6 +3068,31 @@ class TestRetryLoopAnnotationRendering:
         assert '[exit 124]' in line
         assert '[watcher-rearm-declared]' in line
 
+    def test_multiple_rules_render_comma_joined_in_first_appearance_order(self):
+        # The multi-rule path asserted as an EXACT substring: separator,
+        # ordering and per-pair spelling in one literal, so a future edit
+        # to any of the three has to say so out loud.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert (
+            '(3 designed-outcome results: '
+            '[exit 124] [watcher-rearm-declared], '
+            '[exit 124] [bounded-wait-ceiling])'
+        ) in line
+
+    def test_pair_without_an_exit_code_renders_the_bare_label(self):
+        # _exit_marker renders '' for a None code, so the rule shows as a
+        # bare [label] with no empty '[exit ]' stub -- the same degradation
+        # the Designed Outcomes section's lines already take.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert '(3 designed-outcome results: [watcher-rearm-declared])' in line
+        assert '[exit' not in line
+
     def test_annotation_survives_the_per_item_byte_cap(self):
         # _cap_item truncates from the RIGHT, so an annotation placed after
         # the signature would be the first thing lost on exactly the
@@ -3023,9 +3144,14 @@ class TestRetryLoopAnnotationEndToEnd:
         # policy says does NOT bump. Bumping would falsely tell a future
         # census that signal semantics moved, corrupting the pre-fix /
         # live-regression discriminator the version exists to provide.
+        # Asserted against the CONSTANT, never a literal: a legitimate
+        # future bump (a real signal-semantics change) must not have to
+        # edit a test named for the 4751 decision, which would point its
+        # implementer at the wrong decision record. The single literal
+        # pin lives in TestRenderFrontmatter, where a bump belongs.
         meta, _ = self._retry_block(_watcher_rotation_records())
 
-        assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION == 2
+        assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
 
     def test_signal_counts_are_unchanged_by_the_annotation(self):
         records = _watcher_rotation_records()
