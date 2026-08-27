@@ -458,8 +458,9 @@ class TestPromotingAnchorNeedsNoContestedKey:
     """Arm (1) is landable today: it reads `topic` and nothing else.
 
     `contested` is a hand-labelled bake-off FIXTURE field — it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601)
-    and has no writer — so an arm that needed it would be unimplementable.
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`) and has no
+    writer — so an arm that needed it would be unimplementable.
     """
 
     @pytest.mark.parametrize('extra_key', ['contested', 'supersedes'])
@@ -756,7 +757,8 @@ class TestTheContestedTermIsStructurallyZeroToday:
     """Arm (2) suppresses, and cannot implement V2's protection.
 
     `contested` is a hand-labelled bake-off FIXTURE field: it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`
     — `{topic, canonical, kind, parent_id, supersedes}`), has no writer and
     no adjudication surface.  So the `+ contested` term above is arithmetic
     that production cannot currently make non-zero, and the report says so
