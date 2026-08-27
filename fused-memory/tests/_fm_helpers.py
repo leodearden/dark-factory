@@ -139,6 +139,12 @@ class MockEdge:
     episodes: list[str] = field(default_factory=list)
     valid_at: Any = None
     invalid_at: Any = None
+    # graphiti_core's EntityEdge declares, persists, and re-parses `expired_at`
+    # (graphiti_core/edges.py), written independently of `invalid_at` by its own
+    # contradiction resolution (graphiti_core/utils/maintenance/edge_operations.py::
+    # resolve_extracted_edge).  The double carries it so tests can express an edge
+    # retired by that marker alone.
+    expired_at: Any = None
 
 
 @dataclass
