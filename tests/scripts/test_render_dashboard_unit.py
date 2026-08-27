@@ -569,3 +569,194 @@ def test_host_local_environment_names_are_declared_in_the_committed_template():
             f"{sorted(declared)}. A name nobody sets is preserved on no host, "
             "forever, while the renderer still reports success."
         )
+
+
+# ---------------------------------------------------------------------------
+# render_unit — the end-to-end composition  (step-9 / step-10)
+# ---------------------------------------------------------------------------
+# This is where ACCEPTANCE 3 is pinned, and it is pinned against the REAL,
+# UNMODIFIED parity checker rather than by restating what parity means.
+
+_OLD_ROOT = "/old/root"
+_NEW_ROOT = "/srv/dark-factory"
+_NEW_UV = "/opt/uv/bin/uv"
+
+
+def _render_unit(**kwargs):
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.render_unit(
+        TEMPLATE_PATH.read_text(encoding="utf-8"), **kwargs
+    )
+
+
+def _reinstall_over_a_configured_host():
+    """Render at a NEW repo root over an installed unit rendered at an OLD one.
+
+    The realistic re-provision: the checkout moved, and the host had nine
+    aggregation roots configured into its installed unit.
+    """
+    return _render_unit(
+        repo_root=_NEW_ROOT,
+        uv_path=_NEW_UV,
+        installed_text=_installed_with_nine_roots(_OLD_ROOT),
+    )
+
+
+def _env_line(text, name):
+    prefix = f"Environment={name}="
+    matches = [
+        line.strip()[len(prefix) :]
+        for line in text.splitlines()
+        if line.strip().startswith(prefix)
+    ]
+    assert len(matches) == 1, f"expected one {prefix!r} line, found {len(matches)}"
+    return matches[0]
+
+
+def _directive(text, key):
+    prefix = f"{key}="
+    matches = [
+        line.strip()[len(prefix) :]
+        for line in text.splitlines()
+        if line.strip().startswith(prefix)
+    ]
+    assert len(matches) == 1, f"expected one {prefix!r} line, found {len(matches)}"
+    return matches[0]
+
+
+def test_render_unit_preserves_the_nine_roots_across_a_moved_checkout():
+    """(a) ACCEPTANCE 1: the host-local value SURVIVES the reinstall, verbatim.
+
+    Nine roots in, nine roots out — asserted by COUNT as well as by equality, so
+    a one-root result cannot pass by some partial match.
+    """
+    text, preserved, skipped = _reinstall_over_a_configured_host()
+
+    assert _env_line(text, _KNOWN_ROOTS) == NINE_ROOTS
+    assert _env_line(text, _KNOWN_ROOTS).count(",") == 8, "not nine roots"
+    assert preserved == {_KNOWN_ROOTS: NINE_ROOTS}
+    assert skipped == {}
+
+
+def test_render_unit_re_derives_project_root_rather_than_preserving_it():
+    """(b) The stale /old/root value must NOT survive — DASHBOARD_PROJECT_ROOT is rendered.
+
+    This is the concrete failure the "preserve everything on the allowlist"
+    reading would produce: the data root pinned at the previous checkout while
+    WorkingDirectory= moved to the new one. The checker relates those two
+    INSIDE one copy (UnitSpec.env_matches_directive), so that shape is drift
+    the gate reports — manufactured by the installer, on a host that had just
+    been correctly reinstalled.
+    """
+    text, _preserved, _skipped = _reinstall_over_a_configured_host()
+
+    assert _OLD_ROOT not in text, (
+        f"The previous repo root survived the re-render:\n{text}"
+    )
+    assert _env_line(text, "DASHBOARD_PROJECT_ROOT") == _NEW_ROOT
+    assert _directive(text, "WorkingDirectory") == _NEW_ROOT
+    assert _env_line(text, "DASHBOARD_PROJECT_ROOT") == _directive(
+        text, "WorkingDirectory"
+    )
+
+
+def test_render_unit_output_is_at_parity_with_the_committed_unit():
+    """(c) ACCEPTANCE 3: the REAL checker, unmodified, calls the result parity.
+
+    compare_unit is the oracle rather than a restatement of what parity means:
+    if preserving host-local values made the installed copy divergent by the
+    gate's own reckoning, this is where it shows up. Note the render is at a
+    DIFFERENT repo root and a DIFFERENT uv path from the committed copy, and
+    carries nine roots where the committed copy carries one — all three are
+    legitimate per-host divergences the spec already models, which is exactly
+    what makes an empty result meaningful rather than trivial.
+    """
+    mod = _load_checker()
+    text, _preserved, _skipped = _reinstall_over_a_configured_host()
+
+    drifts = mod.compare_unit(
+        mod.UNITS["dark-factory-dashboard.service"],
+        HARDCODED_PATH.read_text(encoding="utf-8"),
+        text,
+    )
+
+    assert drifts == [], f"The renderer's output is not at parity: {drifts}"
+
+
+def test_compare_unit_would_have_reported_a_perturbed_value():
+    """(d) ANTI-VACUITY: the empty result above is not an artefact of comparing nothing.
+
+    Same guard-the-guard discipline the checker's own registry-staleness tests
+    use. Perturb one compared, host-invariant literal and the oracle must fire.
+    """
+    mod = _load_checker()
+    text, _preserved, _skipped = _reinstall_over_a_configured_host()
+    perturbed = text.replace("TimeoutStopSec=15", "TimeoutStopSec=30")
+    assert perturbed != text, "fixture perturbation target not found"
+
+    drifts = mod.compare_unit(
+        mod.UNITS["dark-factory-dashboard.service"],
+        HARDCODED_PATH.read_text(encoding="utf-8"),
+        perturbed,
+    )
+
+    assert drifts, "compare_unit reported parity on a changed TimeoutStopSec"
+    assert any("TimeoutStopSec" in d.key for d in drifts), drifts
+
+
+def test_compare_unit_still_reports_a_vanished_known_project_roots():
+    """(d, second shape) Allowlisting a VALUE must never bless the variable VANISHING.
+
+    The name-set branch of _compare_environment is what keeps the hole in the
+    gate from becoming a hole for the whole variable — so a renderer that
+    "preserved" DASHBOARD_KNOWN_PROJECT_ROOTS by deleting the line would still
+    be caught. Pinned here because this suite's parity assertion above leans on
+    that same allowlist.
+    """
+    mod = _load_checker()
+    text, _preserved, _skipped = _reinstall_over_a_configured_host()
+    dropped = "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.strip().startswith(f"Environment={_KNOWN_ROOTS}=")
+    )
+    assert f"Environment={_KNOWN_ROOTS}=" not in dropped
+
+    drifts = mod.compare_unit(
+        mod.UNITS["dark-factory-dashboard.service"],
+        HARDCODED_PATH.read_text(encoding="utf-8"),
+        dropped,
+    )
+
+    assert any(_KNOWN_ROOTS in d.key for d in drifts), (
+        f"A vanished {_KNOWN_ROOTS} was not reported: {drifts}"
+    )
+
+
+def test_render_unit_greenfield_installs_the_single_root_default():
+    """No installed unit → the rendered default, and the fallback is RECORDED."""
+    text, preserved, skipped = _render_unit(
+        repo_root=_NEW_ROOT, uv_path=_NEW_UV, installed_text=""
+    )
+
+    assert _env_line(text, _KNOWN_ROOTS) == _NEW_ROOT
+    assert preserved == {}
+    assert _KNOWN_ROOTS in skipped
+
+
+def test_render_unit_defaults_its_preserve_set_to_the_policy_constant():
+    """The default preserve set is HOST_LOCAL_ENVIRONMENT, not an empty tuple.
+
+    A default of () would make every call site that omits `names` silently
+    preserve nothing — the clobber back, opt-in.
+    """
+    explicit, _p, _s = _render_unit(
+        repo_root=_NEW_ROOT,
+        uv_path=_NEW_UV,
+        installed_text=_installed_with_nine_roots(_OLD_ROOT),
+        names=_host_local(),
+    )
+    defaulted, _p2, _s2 = _reinstall_over_a_configured_host()
+
+    assert explicit == defaulted
