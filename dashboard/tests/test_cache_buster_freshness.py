@@ -490,3 +490,158 @@ class TestResolveReduxBaseStateWhenNoBaseRefResolves:
             f'the resolved ref must be recorded for the failure message, got {state.base_ref!r}'
         )
         assert state.base_version == 45
+
+
+# ---------------------------------------------------------------------------
+# The WIRING proof: that test_index_html.py actually consumes the evaluator,
+# and that the hardcoded floor is gone.
+#
+# Both are proved BEHAVIOURALLY — import the guard and call it with synthetic
+# arguments — never by grepping source text or asserting on docstring prose.
+# A source-grep proof is a documentation meta-test: any refactor breaks it and
+# any copy-pasted call satisfies it, so it cannot distinguish a guard that
+# WORKS from one that merely mentions the right identifier.
+#
+# The imports are function-scoped, not module-scoped, and that is deliberate.
+# The suite's cross-module convention (orchestrator/tests/test_verify_scope_kappa.py:49
+# and siblings) imports HELPERS and FIXTURES at module level — never `test_*`
+# names, because a module-level `from x import test_y` binds `test_y` as an
+# attribute of THIS module and pytest then collects and runs it here a second
+# time, against the real fixtures.
+# ---------------------------------------------------------------------------
+
+# A body carrying every asset test_redux_cache_buster_bumped requires present,
+# at a uniform — and deliberately TINY — version.  v=1 is far below the `>= 45`
+# floor that used to live in that test, which is what makes the floor's
+# retirement observable rather than merely asserted.
+_REQUIRED_ASSETS = (
+    'graph_layout.js',
+    'prd_grouping.js',
+    'task_status_counts.js',
+    'runtime_format.js',
+    'orch_filter.js',
+    'esc_flow_layout.js',
+    'memory_evals_fmt.js',
+    'spark_path.js',
+)
+
+
+def _synthetic_index(version: int) -> str:
+    """An index.html body at a uniform *version* carrying every required asset."""
+    tags = '\n'.join(
+        f'<script src="/static/redux/{name}?v={version}"></script>'
+        for name in _REQUIRED_ASSETS
+    )
+    return f'<!doctype html>\n<html><head>\n{tags}\n</head></html>\n'
+
+
+class TestGuardIsWiredToTheEvaluator:
+    """`test_index_html.py`'s freshness guard consumes `cache_buster_violation`."""
+
+    def test_guard_fails_on_the_task_3490_shape(self) -> None:
+        """Fed a stale state, the real guard RAISES, and names the stale asset.
+
+        This is the end-to-end proof: not that the module imports the helper,
+        but that a state the evaluator rejects actually fails the test that
+        gates the merge.
+        """
+        from test_index_html import test_redux_cache_buster_is_newer_than_merge_base as guard
+
+        base = ReduxBaseState(
+            base_ref='main',
+            base_commit='0123456789abcdef',
+            base_version=45,
+            changed_assets=(_CHARTS_REL,),
+        )
+
+        with pytest.raises(AssertionError) as exc:
+            guard(_synthetic_index(45), base)
+
+        assert _CHARTS_REL in str(exc.value), (
+            'the guard must surface the evaluator\'s message, which names the '
+            f'stale asset — got {exc.value!r}'
+        )
+
+    def test_guard_passes_when_the_bump_landed(self) -> None:
+        """A version strictly newer than the base discharges the demand."""
+        from test_index_html import test_redux_cache_buster_is_newer_than_merge_base as guard
+
+        base = ReduxBaseState(
+            base_ref='main',
+            base_commit='0123456789abcdef',
+            base_version=45,
+            changed_assets=(_CHARTS_REL,),
+        )
+
+        guard(_synthetic_index(46), base)
+
+    def test_guard_passes_when_no_redux_asset_changed(self) -> None:
+        """The exemption survives the wiring: no asset touched, no bump owed."""
+        from test_index_html import test_redux_cache_buster_is_newer_than_merge_base as guard
+
+        base = ReduxBaseState(
+            base_ref='main',
+            base_commit='0123456789abcdef',
+            base_version=45,
+            changed_assets=(),
+        )
+
+        guard(_synthetic_index(45), base)
+
+    def test_guard_skips_when_no_base_state_resolved(self) -> None:
+        """An unresolvable base SKIPS — not a silent pass, and not a red.
+
+        A silent pass would hide that the guard never ran; a red would blame a
+        tree that is not broken.  A skip stays visible in the pytest output,
+        which is the only outcome that tells the truth here.
+        """
+        from test_index_html import test_redux_cache_buster_is_newer_than_merge_base as guard
+
+        with pytest.raises(pytest.skip.Exception):
+            guard(_synthetic_index(45), None)
+
+
+class TestHardcodedFloorIsRetired:
+    """`test_redux_cache_buster_bumped` no longer pins an absolute version."""
+
+    def test_uniform_body_at_a_tiny_version_passes(self) -> None:
+        """A uniform `?v=1` body carrying every required asset must PASS.
+
+        Under the old `assert v >= 45` this fails, so this test is a genuine
+        RED that goes green only once the floor is retired — and it pins the
+        retirement BEHAVIOURALLY, without asserting on any prose.
+
+        The floor was dead weight: index.html shipped v=49 while the floor
+        still read 45, four releases stale.  The base-relative MONOTONIC rule
+        next door is a self-maintaining superset of what it protected against,
+        and eight sibling modules keep their own `min(versions) >= N`
+        anti-revert pins regardless.
+        """
+        from test_index_html import test_redux_cache_buster_bumped as bumped
+
+        bumped(_synthetic_index(1))
+
+    def test_mixed_versions_still_fail(self) -> None:
+        """Retiring the floor must not cost the UNIFORMITY check.
+
+        `test_redux_cache_buster_bumped` remains the sole home of that check —
+        every sibling module asserts only its own floor — so a regression here
+        would go unnoticed everywhere else.
+        """
+        from test_index_html import test_redux_cache_buster_bumped as bumped
+
+        mixed = _synthetic_index(49).replace('graph_layout.js?v=49', 'graph_layout.js?v=48')
+
+        with pytest.raises(AssertionError):
+            bumped(mixed)
+
+    def test_a_missing_required_asset_still_fails(self) -> None:
+        """And it must not cost the presence checks either."""
+        from test_index_html import test_redux_cache_buster_bumped as bumped
+
+        without_spark = _synthetic_index(49).replace(
+            '<script src="/static/redux/spark_path.js?v=49"></script>\n', ''
+        )
+
+        with pytest.raises(AssertionError):
+            bumped(without_spark)
