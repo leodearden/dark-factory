@@ -560,6 +560,54 @@ class TestPlanRateOnlyVerifyOutcome:
 
 
 # ---------------------------------------------------------------------------
+# _mint_one — every fixture declares whether its base is an approximation
+# ---------------------------------------------------------------------------
+
+class TestBaseApproximationMarking:
+    """Only ``merge_first_parent`` yields the task's TRUE branch point (M^1 of
+    its landing merge). Every weaker rung is a guess, and a readout that
+    cannot tell the two apart silently averages them together — which is how
+    reify_task_3883 shipped a base ~1900 first-parent commits from where its
+    work actually started with nothing in the JSON to say so."""
+
+    def test_merge_derived_base_is_not_approximated(self) -> None:
+        rec = _mint(_planrate_row(
+            mint_mode='planrate_only', baseline_source='merge_first_parent',
+        ))
+        assert rec['provenance']['base_is_approximated'] is False
+        assert 'base_approximation_reason' not in rec['provenance']
+
+    def test_status_autocommit_base_is_approximated_and_says_which_rung(
+        self,
+    ) -> None:
+        rec = _mint(_planrate_row(baseline_source='status_autocommit'))
+        assert rec['provenance']['base_is_approximated'] is True
+        reason = rec['provenance']['base_approximation_reason']
+        assert reason.strip()
+        assert 'status_autocommit' in reason
+
+    def test_timestamp_walk_base_is_approximated_and_says_which_rung(
+        self,
+    ) -> None:
+        rec = _mint(_planrate_row(baseline_source='timestamp_walk'))
+        assert rec['provenance']['base_is_approximated'] is True
+        reason = rec['provenance']['base_approximation_reason']
+        assert 'timestamp_walk' in reason
+        # Self-describing: a reader of the JSON alone learns this is an
+        # approximation a readout should exclude, not a derived branch point.
+        assert 'approximation' in reason.lower()
+        assert 'exclude' in reason.lower()
+
+    def test_the_flag_is_a_real_bool(self) -> None:
+        # A readout filters on this. A truthy string would make every fixture
+        # look approximated, including the merge-derived ones.
+        for source in ('merge_first_parent', 'status_autocommit', 'timestamp_walk'):
+            flag = _mint(_planrate_row(baseline_source=source))[
+                'provenance']['base_is_approximated']
+            assert isinstance(flag, bool), f'{source}: {flag!r} is not a bool'
+
+
+# ---------------------------------------------------------------------------
 # (d) --render — the documented regeneration path, with no db access
 # ---------------------------------------------------------------------------
 
