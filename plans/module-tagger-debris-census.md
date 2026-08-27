@@ -1,7 +1,7 @@
 # Tagger-debris census
 
 Every task record still carrying `metadata.files_tagged_at` — the stamp the
-retired module tagger left behind — across all six project corpora, classified
+retired module tagger left behind — across 6 project corpora, classified
 on three axes for the repair pipeline.
 
 Consumers: dark_factory 3113 P4a, dark_factory 3427.
@@ -23,6 +23,14 @@ re-running the command below and diffing is a meaningful reproducibility check.
   treating `lock_reconciled` as repaired.
 - **wipe_signature** — `post_wipe_overwrite` if an authoritative scope event predates
   the stamp (the tagger stamped over it); `no_prior_scope` otherwise.
+  CAVEAT: this reads a record as stamped ONCE, which is the tagger's default
+  path (it skips any task already carrying `files` or `files_tagged_at`). Under a
+  FORCE-RETAG the stamp is overwritten in place, so a lock derived from the first
+  guess predates the second stamp and yields a false `post_wipe_overwrite`. A row
+  whose `preceded_by.fidelity` is lock-level is therefore the WEAKER evidence; the
+  cell counts below carry no such qualifier, so join to the rows to tell them apart.
+- **metadata_files_match_prior_plan** — a per-record qualifier, not an axis. See
+  the `never_reconciled` caveat below.
 - **merge_signature** — the audit's own `merge_finalized` verdict
   (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating
   evidence in the vocabulary both consumers already speak.
@@ -46,15 +54,37 @@ A consumer must **decide for itself** whether to treat `lock_reconciled` records
 as repaired — the class is reported separately precisely so that choice is
 available rather than made here.
 
+### Why `never_reconciled` is not proof that the scope was damaged
+
+`never_reconciled` means **nothing superseded the record's current scope**. Read
+it literally: it is NOT proof that the current scope is the tagger's guess.
+
+The tagger stamped `files_tagged_at` onto **every** task in its batch, but wrote
+the `files` key only when its prediction sanitized to a non-empty file-level
+list; otherwise the stamp went in alone and the task store's default merge
+**preserved any pre-existing real files**. Such a record carries a genuine
+pre-tagger scope that was never damaged — and if it also has a pre-stamp scope
+event it lands in `non_terminal|never_reconciled|post_wipe_overwrite`,
+the strict live-victim cell named below. A repair acting on that cell blind would
+"fix" a record whose scope was fine.
+
+Every record therefore carries **`metadata_files_match_prior_plan`**: `true` when
+a plan event predating the stamp already named every path the record currently
+holds, so its live scope is a preserved pre-tagger scope rather than a guess.
+**Filter on `true` to drop those false victims.** The signal is deliberately
+conservative — `true` is real evidence, `false` proves nothing either way, since
+a scope set by a route this census cannot see, or by a plan event older than the
+retained event log, also reads `false`.
+
 ## Per-project counts
 
 | project | total tasks | stamped | terminal | non-terminal | plan reconciled | lock reconciled | never reconciled | post-wipe overwrite | event log |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| autopilot_video | 651 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | read |
-| dark_factory | 4630 | 309 | 161 | 148 | 110 | 55 | 144 | 5 | read |
+| autopilot_video | 652 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | read |
+| dark_factory | 4738 | 322 | 172 | 150 | 113 | 56 | 153 | 6 | read |
 | know_live | 600 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | read |
 | pump_web_ui | 19 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | read |
-| reify | 6473 | 219 | 87 | 132 | 58 | 14 | 147 | 16 | read |
+| reify | 6788 | 234 | 91 | 143 | 62 | 18 | 154 | 16 | read |
 | solar_challenge_platform | 168 | 1 | 1 | 0 | 1 | 0 | 0 | 0 | read |
 
 ## Three-axis cells
@@ -83,18 +113,18 @@ which is why the two cells are counted apart rather than merged.
 | autopilot_video | `terminal|never_reconciled|post_wipe_overwrite` | 0 |
 | autopilot_video | `terminal|plan_reconciled|no_prior_scope` | 1 |
 | autopilot_video | `terminal|plan_reconciled|post_wipe_overwrite` | 0 |
-| dark_factory | `non_terminal|lock_reconciled|no_prior_scope` | 29 |
+| dark_factory | `non_terminal|lock_reconciled|no_prior_scope` | 27 |
 | dark_factory | `non_terminal|lock_reconciled|post_wipe_overwrite` | 0 |
-| dark_factory | `non_terminal|never_reconciled|no_prior_scope` | 107 |
+| dark_factory | `non_terminal|never_reconciled|no_prior_scope` | 113 |
 | dark_factory | `non_terminal|never_reconciled|post_wipe_overwrite` | 0 |
-| dark_factory | `non_terminal|plan_reconciled|no_prior_scope` | 12 |
+| dark_factory | `non_terminal|plan_reconciled|no_prior_scope` | 10 |
 | dark_factory | `non_terminal|plan_reconciled|post_wipe_overwrite` | 0 |
-| dark_factory | `terminal|lock_reconciled|no_prior_scope` | 25 |
+| dark_factory | `terminal|lock_reconciled|no_prior_scope` | 28 |
 | dark_factory | `terminal|lock_reconciled|post_wipe_overwrite` | 1 |
-| dark_factory | `terminal|never_reconciled|no_prior_scope` | 36 |
+| dark_factory | `terminal|never_reconciled|no_prior_scope` | 39 |
 | dark_factory | `terminal|never_reconciled|post_wipe_overwrite` | 1 |
-| dark_factory | `terminal|plan_reconciled|no_prior_scope` | 95 |
-| dark_factory | `terminal|plan_reconciled|post_wipe_overwrite` | 3 |
+| dark_factory | `terminal|plan_reconciled|no_prior_scope` | 99 |
+| dark_factory | `terminal|plan_reconciled|post_wipe_overwrite` | 4 |
 | know_live | `non_terminal|lock_reconciled|no_prior_scope` | 0 |
 | know_live | `non_terminal|lock_reconciled|post_wipe_overwrite` | 0 |
 | know_live | `non_terminal|never_reconciled|no_prior_scope` | 0 |
@@ -119,17 +149,17 @@ which is why the two cells are counted apart rather than merged.
 | pump_web_ui | `terminal|never_reconciled|post_wipe_overwrite` | 0 |
 | pump_web_ui | `terminal|plan_reconciled|no_prior_scope` | 1 |
 | pump_web_ui | `terminal|plan_reconciled|post_wipe_overwrite` | 0 |
-| reify | `non_terminal|lock_reconciled|no_prior_scope` | 10 |
+| reify | `non_terminal|lock_reconciled|no_prior_scope` | 14 |
 | reify | `non_terminal|lock_reconciled|post_wipe_overwrite` | 0 |
-| reify | `non_terminal|never_reconciled|no_prior_scope` | 107 |
+| reify | `non_terminal|never_reconciled|no_prior_scope` | 112 |
 | reify | `non_terminal|never_reconciled|post_wipe_overwrite` | 3 |
-| reify | `non_terminal|plan_reconciled|no_prior_scope` | 11 |
+| reify | `non_terminal|plan_reconciled|no_prior_scope` | 13 |
 | reify | `non_terminal|plan_reconciled|post_wipe_overwrite` | 1 |
 | reify | `terminal|lock_reconciled|no_prior_scope` | 3 |
 | reify | `terminal|lock_reconciled|post_wipe_overwrite` | 1 |
-| reify | `terminal|never_reconciled|no_prior_scope` | 31 |
+| reify | `terminal|never_reconciled|no_prior_scope` | 33 |
 | reify | `terminal|never_reconciled|post_wipe_overwrite` | 6 |
-| reify | `terminal|plan_reconciled|no_prior_scope` | 41 |
+| reify | `terminal|plan_reconciled|no_prior_scope` | 43 |
 | reify | `terminal|plan_reconciled|post_wipe_overwrite` | 5 |
 | solar_challenge_platform | `non_terminal|lock_reconciled|no_prior_scope` | 0 |
 | solar_challenge_platform | `non_terminal|lock_reconciled|post_wipe_overwrite` | 0 |
@@ -147,11 +177,11 @@ which is why the two cells are counted apart rather than merged.
 ## Coverage
 
 - projects swept: 6
-- tasks examined: 12541
-- stamped records: 532
+- tasks examined: 12965
+- stamped records: 560
 - event log read for every swept project (no coverage shortfall)
 
-## Records (showing 60 of 532)
+## Records (showing 60 of 560)
 
 | project | task | status | status_class | reconciliation | wipe_signature | merge_signature | files_tagged_at |
 | --- | ---: | --- | --- | --- | --- | --- | --- |
@@ -180,7 +210,7 @@ which is why the two cells are counted apart rather than merged.
 | dark_factory | 2860 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-20T17:44:34.919588+00:00 |
 | dark_factory | 2863 | done | terminal | plan_reconciled | no_prior_scope | contradicted_real_merge_sha | 2026-07-20T17:44:34.919588+00:00 |
 | dark_factory | 2895 | done | terminal | plan_reconciled | no_prior_scope | contradicted_real_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
-| dark_factory | 2896 | merge-deferred | non_terminal | plan_reconciled | no_prior_scope | no_successful_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
+| dark_factory | 2896 | in-progress | non_terminal | plan_reconciled | no_prior_scope | no_successful_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
 | dark_factory | 2897 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
 | dark_factory | 2898 | done | terminal | plan_reconciled | no_prior_scope | contradicted_real_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
 | dark_factory | 2899 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-22T11:23:11.727792+00:00 |
@@ -200,10 +230,10 @@ which is why the two cells are counted apart rather than merged.
 | dark_factory | 2927 | done | terminal | plan_reconciled | no_prior_scope | contradicted_real_merge_sha | 2026-07-22T19:26:12.243534+00:00 |
 | dark_factory | 2928 | done | terminal | never_reconciled | no_prior_scope | clean_merge_sha | 2026-07-22T19:26:12.243534+00:00 |
 | dark_factory | 2929 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-22T19:26:12.243534+00:00 |
-| dark_factory | 2930 | in-progress | non_terminal | never_reconciled | no_prior_scope | no_merge_event | 2026-07-22T19:26:12.243534+00:00 |
+| dark_factory | 2930 | pending | non_terminal | never_reconciled | no_prior_scope | no_merge_event | 2026-07-22T19:26:12.243534+00:00 |
 | dark_factory | 2943 | pending | non_terminal | never_reconciled | no_prior_scope | no_merge_event | 2026-07-22T19:26:12.243534+00:00 |
 | dark_factory | 2961 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-22T19:28:31.979856+00:00 |
-| dark_factory | 2979 | pending | non_terminal | lock_reconciled | no_prior_scope | no_merge_event | 2026-07-28T21:30:44.781355+00:00 |
+| dark_factory | 2979 | in-progress | non_terminal | lock_reconciled | no_prior_scope | no_merge_event | 2026-07-28T21:30:44.781355+00:00 |
 | dark_factory | 2985 | pending | non_terminal | never_reconciled | no_prior_scope | no_merge_event | 2026-07-23T14:02:35.849772+00:00 |
 | dark_factory | 2987 | pending | non_terminal | never_reconciled | no_prior_scope | no_merge_event | 2026-07-23T14:02:35.849772+00:00 |
 | dark_factory | 2988 | done | terminal | plan_reconciled | no_prior_scope | clean_merge_sha | 2026-07-23T14:02:35.849772+00:00 |

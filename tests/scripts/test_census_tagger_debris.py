@@ -443,6 +443,118 @@ def test_a_pre_stamp_lock_echoing_the_guess_is_still_a_post_wipe_overwrite():
     assert result.reconciliation == NEVER_RECONCILED
 
 
+# ---------------------------------------------------------------------------
+# metadata_files_match_prior_plan — the FALSE-VICTIM discriminator (schema v3).
+#
+# never_reconciled means "nothing superseded the current scope", NOT "the
+# current scope is a guess". The tagger stamped every task in its batch but
+# wrote the `files` key only when its prediction sanitized to a non-empty
+# file-level list, so a stamped record can be carrying a genuine pre-tagger
+# scope the sentinel-only write preserved — and can land in the strict
+# live-victim cell without ever having been damaged. These tests pin the
+# machine-checkable signal that lets a consumer drop those records.
+# ---------------------------------------------------------------------------
+
+
+def test_a_preserved_pre_tagger_scope_is_flagged_not_left_to_prose():
+    """A pre-stamp PLAN event already named every path the record still holds,
+    so this record's live scope was preserved, not guessed — even though the
+    three axes put it squarely in the strict live-victim cell."""
+    verdict = classify_record(_STAMP, "pending", [_event(_BEFORE, files=_GUESS)], _GUESS)
+
+    assert verdict.reconciliation == NEVER_RECONCILED
+    assert verdict.wipe_signature == POST_WIPE_OVERWRITE
+    assert verdict.metadata_files_match_prior_plan is True
+
+
+def test_a_prior_plan_naming_other_files_does_not_flag_the_record():
+    """The prior plan asserted a DIFFERENT scope, so the current one did not
+    survive from it — which is the genuine overwrite this census hunts."""
+    verdict = classify_record(
+        _STAMP, "pending", [_event(_BEFORE, files=("other/x.py",))], _GUESS
+    )
+
+    assert verdict.metadata_files_match_prior_plan is False
+
+
+def test_a_partially_covered_scope_does_not_flag_the_record():
+    """Containment is TOTAL, not partial: one path the prior plan never named
+    is enough to mean the current scope is not simply that plan preserved."""
+    verdict = classify_record(
+        _STAMP, "pending", [_event(_BEFORE, files=(_GUESS[0],))], _GUESS
+    )
+
+    assert verdict.metadata_files_match_prior_plan is False
+
+
+def test_a_prior_lock_never_flags_the_record_however_well_it_covers():
+    """LOCKS ARE EXCLUDED DELIBERATELY. A lock's modules are scheduler-derived
+    truncations of a file list, so `scripts/` "covers" any guess under
+    scripts/ — the signal would be noise. Only plan sources count."""
+    verdict = classify_record(
+        _STAMP, "pending", [_lock(_BEFORE, ("scripts/", "tests/"))], _GUESS
+    )
+
+    assert verdict.wipe_signature == POST_WIPE_OVERWRITE, "still a prior scope"
+    assert verdict.metadata_files_match_prior_plan is False
+
+
+def test_a_post_stamp_plan_does_not_flag_the_record():
+    """The question is what existed BEFORE the stamp. A plan event that
+    postdates it is reconciliation (axis 2), not preservation."""
+    verdict = classify_record(_STAMP, "pending", [_event(_AFTER, files=_GUESS)], _GUESS)
+
+    assert verdict.reconciliation == RECONCILED
+    assert verdict.metadata_files_match_prior_plan is False
+
+
+def test_a_record_with_no_current_scope_is_never_flagged():
+    """THE reify-5632 SHAPE (metadata.files == []). There is nothing for a
+    prior plan to have preserved, and calling that a match would make the
+    emptiest records look the safest."""
+    verdict = classify_record(_STAMP, "pending", [_event(_BEFORE, files=_GUESS)], ())
+
+    assert verdict.metadata_files_match_prior_plan is False
+
+
+def test_the_flag_reaches_the_emitted_row_and_is_a_real_bool(tmp_path):
+    """A consumer filters on this key in the committed JSON, where it cannot
+    see the NamedTuple — so it must be present and JSON-boolean typed."""
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {
+                "id": 7,
+                "status": "pending",
+                "metadata": {"files_tagged_at": _STAMP, "files": ["scripts/a.py"]},
+            }
+        ],
+        events=[
+            {
+                "event_type": "set_to_plan",
+                "task_id": 7,
+                "timestamp": _BEFORE,
+                "data": {"files": ["scripts/a.py", "scripts/b.py"]},
+            }
+        ],
+    )
+    (record,) = census_project(str(root)).records
+    row = _record_to_dict(record)
+
+    assert row["metadata_files_match_prior_plan"] is True
+    assert json.loads(json.dumps(row))["metadata_files_match_prior_plan"] is True
+
+
+def test_the_params_block_explains_the_qualifier_without_this_source(tmp_path):
+    """The artifact must still describe its own vocabulary to a consumer who
+    only has the JSON — and the qualifier is NOT a fourth axis, so it must not
+    appear inside the closed `classification` block."""
+    params = build_report([_census(tmp_path, tasks=[_stamped(1)])])["params"]
+
+    assert "metadata_files_match_prior_plan" in params["record_qualifiers"]
+    assert "metadata_files_match_prior_plan" not in params["classification"]
+
+
 def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
     """(h) A consumer must be able to tell a file_level assertion from a
     lock_level one WITHOUT re-deriving it — the two are not interchangeable
@@ -1282,18 +1394,19 @@ def _stamped(task_id, status="pending", files=("a.py",)):
     }
 
 
-def test_schema_version_is_the_first_key_and_is_two(tmp_path):
+def test_schema_version_is_the_first_key_and_is_three(tmp_path):
     """(a) First key, so a reader opening the raw JSON sees the version before
     anything it would have to interpret under that version.
 
-    v2, not v1: axis 2 gained a value and every evidence object gained a key,
-    so a consumer written against v1 must be able to DETECT the change. That is
-    exactly what schema_version is for.
+    v2 narrowed axis 2 and gave every evidence object a `fidelity` key; v3 adds
+    the per-record `metadata_files_match_prior_plan` qualifier. Either way a
+    consumer written against the older shape must be able to DETECT the change,
+    which is exactly what schema_version is for.
     """
     report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
 
     assert next(iter(report)) == "schema_version"
-    assert report["schema_version"] == SCHEMA_VERSION == 2
+    assert report["schema_version"] == SCHEMA_VERSION == 3
 
 
 def test_params_says_how_the_artifact_was_produced(tmp_path):
@@ -1506,14 +1619,71 @@ def test_the_markdown_says_which_file_is_authoritative(tmp_path):
     assert "3113" in markdown and "3427" in markdown
 
 
-def test_the_markdown_names_a_coverage_shortfall_rather_than_omitting_it(tmp_path):
-    """(c) An incomplete sweep must be legible in the readable twin too."""
-    report = build_report(
-        [_census(tmp_path, name="reify", tasks=[_stamped(1)], with_runs_db=False)]
+def test_the_markdown_names_an_unreadable_event_log_rather_than_omitting_it(tmp_path):
+    """(c) An incomplete sweep must be legible in the readable twin too.
+
+    ASSERTED ON DISCRIMINATING CONTENT, deliberately. This test previously
+    asserted only `"reify" in markdown` and `"event log" in markdown.lower()`,
+    both of which are UNCONDITIONALLY true — the per-project table always names
+    the project and always ends with the column header `| event log |`. It
+    passed verbatim against a full-coverage report and would have passed with
+    the whole shortfall block deleted, which is why the sibling
+    projects_skipped_unreadable gap below went unnoticed. The clean render is
+    now the control: the shortfall text must appear in one and NOT the other.
+    """
+    shortfall = render_markdown(
+        build_report([_census(tmp_path, name="reify", tasks=[_stamped(1)], with_runs_db=False)])
+    )
+    clean = render_markdown(
+        build_report([_census(tmp_path, name="reify-ok", tasks=[_stamped(1)])])
     )
 
-    assert "reify" in render_markdown(report)
-    assert "event log" in render_markdown(report).lower()
+    assert "UNREADABLE" in shortfall
+    assert "reify" in shortfall
+    assert "no coverage shortfall" not in shortfall
+
+    assert "UNREADABLE" not in clean
+    assert "no coverage shortfall" in clean
+
+
+def test_the_markdown_names_a_root_it_could_not_sweep_at_all(tmp_path):
+    """(c) THE LARGER SHORTFALL, and the one the markdown used to drop.
+
+    A root sweep_project_roots had to SKIP reaches the JSON's
+    projects_skipped_unreadable, but render_markdown read only the event-log
+    list — so the half an operator actually reads printed "no coverage
+    shortfall" and a "projects swept" line that silently excluded the skipped
+    root. Nothing at all is known about such a root, not merely two axes.
+    """
+    markdown = render_markdown(
+        build_report(
+            [_census(tmp_path, name="reify", tasks=[_stamped(1)])],
+            unreadable=["/home/leo/src/know-live"],
+        )
+    )
+
+    assert "know-live" in markdown, "a skipped root must be NAMED, not just counted"
+    assert "SKIPPED" in markdown
+    assert "no coverage shortfall" not in markdown
+
+
+def test_the_markdown_header_counts_the_roots_it_actually_swept(tmp_path):
+    """(c) The header used to say "all six project corpora" whatever was swept,
+    so a one-root or five-root run published a markdown overstating its own
+    coverage. Derived from params.project_roots now."""
+    one = render_markdown(build_report([_census(tmp_path, name="a", tasks=[_stamped(1)])]))
+    two = render_markdown(
+        build_report(
+            [
+                _census(tmp_path, name="b", tasks=[_stamped(1)]),
+                _census(tmp_path, name="c", tasks=[_stamped(2)]),
+            ]
+        )
+    )
+
+    assert "1 project corpus" in one
+    assert "six" not in one
+    assert "2 project corpora" in two
 
 
 def test_write_artifacts_writes_both_files_and_the_json_round_trips(tmp_path):

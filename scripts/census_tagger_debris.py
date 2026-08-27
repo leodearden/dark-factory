@@ -140,8 +140,33 @@ STATUS_NON_TERMINAL = "non_terminal"
 #                      explain, so it was not a re-derivation of the guess.
 #                      Real but WEAKER evidence, given its own label so a
 #                      consumer can filter it rather than having to trust it.
-#   never_reconciled — nothing superseded the guess. It is still this record's
-#                      live scope.
+#   never_reconciled — NOTHING SUPERSEDED THE CURRENT SCOPE. Read that
+#                      literally: it is not proof that the current scope IS a
+#                      guess. See the assumption below.
+#
+# THE ASSUMPTION never_reconciled RESTS ON, STATED PLAINLY.
+# ``_lock_echoes_guess`` — and the whole never_reconciled class — treats a
+# stamped record's ``metadata.files`` as the tagger's guess. For a large
+# sub-population that is FALSE. harness.py:3029-3051 stamps ``files_tagged_at``
+# onto EVERY task in the untagged batch, but writes the ``files`` key only when
+# the prediction sanitizes to a non-empty file-level list; otherwise the
+# sentinel goes in alone and ``update_task``'s default merge mode "preserves
+# any pre-existing real files rather than clobbering them". Such a record
+# carries a GENUINE plan-derived scope, so a post-stamp lock derived from it is
+# correctly an echo — of a real scope, not of a guess — and the census reports
+# never_reconciled for a record that was never damaged. Pair it with a
+# pre-stamp scope event and it lands in
+# non_terminal|never_reconciled|post_wipe_overwrite, the cell the markdown names
+# as the strict live-victim cell.
+#
+# THE MACHINE-CHECKABLE DISCRIMINATOR (schema v3) is the per-record
+# ``metadata_files_match_prior_plan`` boolean, computed by
+# ``_files_match_prior_plan``: True says a PLAN event predating the stamp
+# already asserted every path the record currently carries, so the live scope
+# is a preserved pre-tagger scope rather than the tagger's guess. A consumer
+# can filter those false victims out without re-querying the event log. It is
+# deliberately a conservative signal: True is real evidence, False proves
+# nothing either way (see that function's docstring).
 RECONCILED = "plan_reconciled"
 LOCK_RECONCILED = "lock_reconciled"
 NEVER_RECONCILED = "never_reconciled"
@@ -234,13 +259,20 @@ _NO_EVIDENCE = ScopeEvidence(
 
 
 class Classification(NamedTuple):
-    """The three-axis verdict for one stamped record, plus its evidence."""
+    """The three-axis verdict for one stamped record, plus its evidence.
+
+    ``metadata_files_match_prior_plan`` (schema v3) is NOT a fourth axis. It is
+    a qualifier on axis 2's never_reconciled class, letting a consumer tell a
+    record whose live scope is a preserved PRE-TAGGER scope from one whose live
+    scope is the tagger's guess. See ``_files_match_prior_plan``.
+    """
 
     status_class: str
     reconciliation: str
     wipe_signature: str
     reconciled_by: ScopeEvidence
     preceded_by: ScopeEvidence
+    metadata_files_match_prior_plan: bool
 
 
 class StampedRecord(NamedTuple):
@@ -281,6 +313,7 @@ class CensusRecord(NamedTuple):
     reconciled_by: ScopeEvidence
     preceded_by: ScopeEvidence
     metadata_files: tuple[str, ...]
+    metadata_files_match_prior_plan: bool
     merge_signature: str
 
 
@@ -348,6 +381,49 @@ def _lock_echoes_guess(event: ScopeEvent, metadata_files: tuple[str, ...]) -> bo
         # degenerate into a false echo via a vacuous all().
         return False
     return all(_module_is_explained_by(module, metadata_files) for module in event.files)
+
+
+def _files_match_prior_plan(
+    metadata_files: tuple[str, ...], before: Sequence[ScopeEvent]
+) -> bool:
+    """True when a PRE-stamp PLAN event already asserted every current file.
+
+    THE FALSE-VICTIM DISCRIMINATOR (schema v3). ``never_reconciled`` means
+    "nothing superseded the current scope" — NOT "the current scope is the
+    tagger's guess". The tagger stamped ``files_tagged_at`` on every task in
+    its batch but wrote ``files`` only when its prediction sanitized to a
+    non-empty file-level list (harness.py:3029-3051), and ``update_task``'s
+    default merge preserves pre-existing real files. So a stamped record may be
+    carrying a genuine pre-tagger scope that was never damaged, and a repair
+    acting on the strict live-victim cell could "fix" it.
+
+    True here is evidence that this is such a record: a plan event that PREDATES
+    the stamp already named every path ``metadata.files`` currently holds, so
+    the stamp did not overwrite the scope, it merely accompanied it.
+
+    THE TEST IS DELIBERATELY NARROW, in both directions:
+
+      * Only PLAN sources count (the audit's own ``_EVENT_PLAN_SOURCES``:
+        set_to_plan.files / phase_skipped.plan_files). Those payloads are FILE
+        paths, so the comparison is exact set containment. ``lock_acquired``
+        modules are scheduler-derived TRUNCATIONS of a file list, coarse enough
+        that a same-directory guess would match one — the signal would be noise.
+      * True is real evidence; FALSE PROVES NOTHING. A record whose pre-tagger
+        scope was set by a route this census cannot see, or whose plan event
+        predates the retained event log, is False and may still be undamaged.
+        Consumers may filter ON true; they must not treat false as a victim
+        confirmation.
+    """
+    if not metadata_files:
+        # No current scope at all (the reify-5632 shape). There is nothing for
+        # a prior plan to match, and calling that a match would make the
+        # emptiest records look the safest.
+        return False
+    current = set(metadata_files)
+    return any(
+        event.event_type in _EVENT_PLAN_SOURCES and current <= set(event.files)
+        for event in before
+    )
 
 
 def classify_record(
@@ -425,6 +501,17 @@ def classify_record(
     # the tagger stamped, so it cannot be an echo of a guess that did not yet
     # exist. Applying the axis-2 filter here "for consistency" would erase
     # exactly the wipe signal this census exists to surface.
+    #
+    # THAT REASONING ASSUMES A RECORD IS STAMPED ONCE, and under the tagger's
+    # DEFAULT path it is: harness.py:2920 skips any task already carrying
+    # ``files`` or ``files_tagged_at``. A FORCE-RETAG (harness.py:2929) breaks
+    # the assumption — ``files_tagged_at`` is a single mutable field overwritten
+    # in place, so a lock derived from the FIRST guess predates the SECOND stamp
+    # and is counted here as authoritative prior scope, yielding a false
+    # post_wipe_overwrite. The consequence is contained but NOT free: a row's
+    # ``preceded_by.fidelity`` lets a consumer see that a lock_level event
+    # decided it (the weaker evidence), while the aggregate ``cells`` counts
+    # carry no such qualifier. The markdown's wipe_signature entry says so.
     if before:
         wipe_signature = POST_WIPE_OVERWRITE
         preceded_by = _evidence(max(before, key=lambda event: event.timestamp))
@@ -438,6 +525,7 @@ def classify_record(
         wipe_signature=wipe_signature,
         reconciled_by=reconciled_by,
         preceded_by=preceded_by,
+        metadata_files_match_prior_plan=_files_match_prior_plan(metadata_files, before),
     )
 
 
@@ -730,6 +818,7 @@ def census_project(project_root: str) -> ProjectCensus:
                 reconciled_by=verdict.reconciled_by,
                 preceded_by=verdict.preceded_by,
                 metadata_files=record.metadata_files,
+                metadata_files_match_prior_plan=verdict.metadata_files_match_prior_plan,
                 merge_signature=(
                     classify_wipe_signature(merge_signatures[str(record.task_id)])
                     if str(record.task_id) in merge_signatures
@@ -784,9 +873,28 @@ def census_project(project_root: str) -> ProjectCensus:
 #      plan_reconciled under v1 may be lock_reconciled or never_reconciled
 #      here, and the never_reconciled population is materially larger.
 #      Axis 1, axis 3 and every other key are unchanged.
+#
+# v3 — THE FALSE-VICTIM DISCRIMINATOR. No classification changed; one key was
+#      added. v2's never_reconciled class assumes a stamped record's
+#      ``metadata.files`` IS the tagger's guess, and for a large sub-population
+#      that is false: the tagger stamped every task in its batch but wrote the
+#      ``files`` key only when its prediction sanitized to a non-empty
+#      file-level list (harness.py:3029-3051), so a record can carry a GENUINE
+#      pre-tagger scope the sentinel-only write preserved. Such a record can
+#      land in the strict live-victim cell without ever having been damaged.
+#      What changed:
+#        * every record gained ``metadata_files_match_prior_plan`` (bool): a
+#          PLAN event predating the stamp already named every path the record
+#          currently carries, so its live scope is preserved, not guessed.
+#          Conservative — true is evidence, false proves nothing.
+#        * ``params`` gained a ``record_qualifiers`` block describing it, so
+#          the artifact still explains its own vocabulary without this source.
+#      Axis 1, 2 and 3, every count, every cell and every other key are
+#      UNCHANGED from v2. A v2 consumer keeps working; it simply cannot filter
+#      the false victims out.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The vocabulary, ordered. Iterating THIS rather than the observed data is what
 # makes a zero-valued cell present rather than absent — a missing key must
@@ -823,6 +931,7 @@ def _record_to_dict(record: CensusRecord) -> dict:
         "preceded_by": record.preceded_by._asdict(),
         "merge_signature": record.merge_signature,
         "metadata_files": list(record.metadata_files),
+        "metadata_files_match_prior_plan": record.metadata_files_match_prior_plan,
     }
 
 
@@ -899,6 +1008,17 @@ def build_report(
                 "reconciliation": list(_RECONCILIATIONS),
                 "wipe_signature": list(_WIPE_SIGNATURES),
             },
+            # Not a fourth axis, so deliberately NOT folded into
+            # "classification": a consumer reading that block gets exactly the
+            # three axes and their closed vocabularies, unchanged since v1.
+            "record_qualifiers": {
+                "metadata_files_match_prior_plan": (
+                    "true when a plan event predating files_tagged_at already named every "
+                    "path the record currently carries, so its live metadata.files is a "
+                    "preserved pre-tagger scope rather than the tagger's guess. Conservative: "
+                    "true is evidence, false proves nothing either way."
+                ),
+            },
             "consumers": ["dark_factory 3113 P4a", "dark_factory 3427"],
             "regen_command": " ".join(
                 [_REGEN_COMMAND_HEAD, *(f"--project-root {root}" for root in roots)]
@@ -949,11 +1069,18 @@ def render_markdown(report: dict) -> str:
     coverage = report["coverage"]
     params = report["params"]
 
+    # DERIVED, never the hardcoded "six" this replaced: a one-root or five-root
+    # run would otherwise publish a markdown claiming a coverage it does not
+    # have. The count is of roots actually SWEPT — a root skipped unreadable is
+    # absent from params.project_roots and is named in Coverage below instead.
+    root_count = len(params["project_roots"])
+    corpora = "1 project corpus" if root_count == 1 else f"{root_count} project corpora"
+
     lines: list[str] = [
         "# Tagger-debris census",
         "",
         "Every task record still carrying `metadata.files_tagged_at` — the stamp the",
-        "retired module tagger left behind — across all six project corpora, classified",
+        f"retired module tagger left behind — across {corpora}, classified",
         "on three axes for the repair pipeline.",
         "",
         f"Consumers: {', '.join(params['consumers'])}.",
@@ -975,6 +1102,14 @@ def render_markdown(report: dict) -> str:
         f"  treating `{LOCK_RECONCILED}` as repaired.",
         f"- **wipe_signature** — `{POST_WIPE_OVERWRITE}` if an authoritative scope event predates",
         f"  the stamp (the tagger stamped over it); `{NO_PRIOR_SCOPE}` otherwise.",
+        "  CAVEAT: this reads a record as stamped ONCE, which is the tagger's default",
+        "  path (it skips any task already carrying `files` or `files_tagged_at`). Under a",
+        "  FORCE-RETAG the stamp is overwritten in place, so a lock derived from the first",
+        f"  guess predates the second stamp and yields a false `{POST_WIPE_OVERWRITE}`. A row",
+        "  whose `preceded_by.fidelity` is lock-level is therefore the WEAKER evidence; the",
+        "  cell counts below carry no such qualifier, so join to the rows to tell them apart.",
+        "- **metadata_files_match_prior_plan** — a per-record qualifier, not an axis. See",
+        f"  the `{NEVER_RECONCILED}` caveat below.",
         "- **merge_signature** — the audit's own `merge_finalized` verdict",
         "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
         "  evidence in the vocabulary both consumers already speak.",
@@ -997,6 +1132,28 @@ def render_markdown(report: dict) -> str:
         f"A consumer must **decide for itself** whether to treat `{LOCK_RECONCILED}` records",
         "as repaired — the class is reported separately precisely so that choice is",
         "available rather than made here.",
+        "",
+        f"### Why `{NEVER_RECONCILED}` is not proof that the scope was damaged",
+        "",
+        f"`{NEVER_RECONCILED}` means **nothing superseded the record's current scope**. Read",
+        "it literally: it is NOT proof that the current scope is the tagger's guess.",
+        "",
+        "The tagger stamped `files_tagged_at` onto **every** task in its batch, but wrote",
+        "the `files` key only when its prediction sanitized to a non-empty file-level",
+        "list; otherwise the stamp went in alone and the task store's default merge",
+        "**preserved any pre-existing real files**. Such a record carries a genuine",
+        "pre-tagger scope that was never damaged — and if it also has a pre-stamp scope",
+        f"event it lands in `{STATUS_NON_TERMINAL}|{NEVER_RECONCILED}|{POST_WIPE_OVERWRITE}`,",
+        "the strict live-victim cell named below. A repair acting on that cell blind would",
+        "\"fix\" a record whose scope was fine.",
+        "",
+        "Every record therefore carries **`metadata_files_match_prior_plan`**: `true` when",
+        "a plan event predating the stamp already named every path the record currently",
+        "holds, so its live scope is a preserved pre-tagger scope rather than a guess.",
+        "**Filter on `true` to drop those false victims.** The signal is deliberately",
+        "conservative — `true` is real evidence, `false` proves nothing either way, since",
+        "a scope set by a route this census cannot see, or by a plan event older than the",
+        "retained event log, also reads `false`.",
         "",
         "## Per-project counts",
         "",
@@ -1046,15 +1203,30 @@ def render_markdown(report: dict) -> str:
         f"- tasks examined: {coverage['total_tasks']}",
         f"- stamped records: {coverage['stamped_records']}",
     ]
-    unreadable = coverage["projects_without_event_log"]
-    if unreadable:
+    # BOTH shortfall lists are read here. Reading only the event-log one let a
+    # root that sweep_project_roots had to SKIP ENTIRELY vanish from the half an
+    # operator actually reads: the JSON recorded it, the markdown printed
+    # "no coverage shortfall" and a "projects swept" line that silently excluded
+    # it. A skipped root is the LARGER shortfall of the two — nothing at all is
+    # known about it, not merely two axes — so it is reported first.
+    no_event_log = coverage["projects_without_event_log"]
+    skipped = coverage["projects_skipped_unreadable"]
+
+    if skipped:
         lines += [
-            f"- **event log UNREADABLE for: {', '.join(unreadable)}**. For those projects the",
+            f"- **{len(skipped)} project root(s) SKIPPED, UNREADABLE: {', '.join(skipped)}**.",
+            "  Their task stores could not be read at all, so NOTHING above covers them —",
+            "  not a zero, not a clean verdict. Every count on this page is over the",
+            f"  {coverage['projects_swept']} swept root(s) only.",
+        ]
+    if no_event_log:
+        lines += [
+            f"- **event log UNREADABLE for: {', '.join(no_event_log)}**. For those projects the",
             "  reconciliation and wipe_signature axes are UNKNOWN, not measured clean — every",
             f"  record there is reported as `{NEVER_RECONCILED}`/`{NO_PRIOR_SCOPE}` because no",
             "  scope event could be read, not because none exists.",
         ]
-    else:
+    if not skipped and not no_event_log:
         lines.append("- event log read for every swept project (no coverage shortfall)")
 
     records = report["records"]
