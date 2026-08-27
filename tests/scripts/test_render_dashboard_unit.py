@@ -33,6 +33,8 @@ import importlib.util
 import pathlib
 import types
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
 TEMPLATE_PATH = REPO_ROOT / "scripts" / "dashboard.service.template"
@@ -272,3 +274,196 @@ def test_render_template_substitutes_literally_not_as_a_regex():
     assert rendered == (
         f"[Service]\nWorkingDirectory={weird_root}\nExecStart={weird_uv} run\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# preserved_values / apply_preserved  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+# The preservation MECHANISM, exercised with an EXPLICIT `names` argument — no
+# module constant is consulted here. Which names are host-local is POLICY, and
+# it is pinned separately (see HOST_LOCAL_ENVIRONMENT below), so that a policy
+# change and a mechanism regression cannot be mistaken for one another.
+
+_KNOWN_ROOTS = "DASHBOARD_KNOWN_PROJECT_ROOTS"
+
+# The measured value on this host, recorded in
+# tests/scripts/test_dashboard_installed_unit_parity.py's docstring: NINE
+# project roots where the committed template pins one. This is the exact data
+# the old `sed >` render destroyed on every re-run.
+NINE_ROOTS = ",".join(
+    f"/home/leo/src/{name}"
+    for name in (
+        "dark-factory",
+        "reify",
+        "autopilot-video",
+        "autotrade",
+        "know-live",
+        "solar-challenge",
+        "mission-control",
+        "solar-challenge-platform",
+        "pump-web-ui",
+    )
+)
+
+
+def _preserved_values(installed_text, names):
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.preserved_values(installed_text, names)
+
+
+def _apply_preserved(rendered_text, preserved):
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.apply_preserved(rendered_text, preserved)
+
+
+def _rendered(repo_root="/home/leo/src/dark-factory"):
+    """The committed template rendered at *repo_root* — the single-root default."""
+    return _render_template(
+        TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=repo_root,
+        uv_path=HARDCODED_SERVICE_UV_PATH,
+    )
+
+
+def _installed_with_nine_roots(repo_root="/home/leo/src/dark-factory"):
+    """A realistic INSTALLED unit: the rendered template, nine roots substituted in.
+
+    Built by rendering rather than hand-written, so the fixture cannot drift
+    into a shape the real installer would never produce.
+    """
+    text = _rendered(repo_root)
+    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
+    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
+    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+
+
+def test_preserved_values_reads_the_host_local_value_off_the_installed_unit():
+    """(a) The nine roots are found on a realistically-shaped installed unit."""
+    preserved, skipped = _preserved_values(_installed_with_nine_roots(), (_KNOWN_ROOTS,))
+
+    assert preserved == {_KNOWN_ROOTS: NINE_ROOTS}
+    assert skipped == {}
+
+
+def test_apply_preserved_rewrites_only_the_named_line():
+    """(b) The preserved value goes back, and NOTHING else moves.
+
+    Asserted line-by-line rather than by a single equality, so a failure names
+    the line that changed instead of printing two 119-line units.
+    """
+    rendered = _rendered()
+    result = _apply_preserved(rendered, {_KNOWN_ROOTS: NINE_ROOTS})
+
+    before = rendered.splitlines()
+    after = result.splitlines()
+    assert len(before) == len(after), "apply_preserved changed the line COUNT"
+
+    changed = [i for i, (b, a) in enumerate(zip(before, after, strict=True)) if b != a]
+    assert len(changed) == 1, (
+        f"Expected exactly one changed line; {len(changed)} changed: "
+        f"{[after[i] for i in changed]}"
+    )
+    assert after[changed[0]] == f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}"
+
+
+def test_preserved_values_greenfield_preserves_nothing():
+    """(c) No installed unit at all → the rendered single-root default survives.
+
+    A bare host is the case setup-host.sh exists to serve. Preserving nothing
+    here must be silent-of-error but NOT silent-of-record: the name is reported
+    as skipped, so the install still leaves a trace of what it decided.
+    """
+    preserved, skipped = _preserved_values("", (_KNOWN_ROOTS,))
+
+    assert preserved == {}
+    assert _KNOWN_ROOTS in skipped
+    assert "absent" in skipped[_KNOWN_ROOTS].lower(), skipped
+
+    rendered = _rendered()
+    assert _apply_preserved(rendered, preserved) == rendered
+
+
+def test_preserved_values_ignores_a_unit_that_never_declares_the_name():
+    """(c, second shape) An installed unit that simply lacks the variable."""
+    installed = "[Service]\nType=simple\nEnvironment=SOMETHING_ELSE=1\n"
+
+    preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
+
+    assert preserved == {}
+    assert "absent" in skipped[_KNOWN_ROOTS].lower(), skipped
+
+
+def test_preserved_values_refuses_an_empty_installed_value():
+    """(d) An EMPTY installed value is not preserved, and the fallback is REPORTED.
+
+    An empty DASHBOARD_KNOWN_PROJECT_ROOTS is not a usable aggregation scope —
+    preserving it would be strictly worse than the rendered single-root default,
+    which at least aggregates this repo. But taking the default SILENTLY is the
+    failure this whole change is about, so the skip has to appear in the record.
+    """
+    installed = f"[Service]\nEnvironment={_KNOWN_ROOTS}=\n"
+
+    preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
+
+    assert preserved == {}
+    assert "empty" in skipped[_KNOWN_ROOTS].lower(), skipped
+
+
+def test_preserved_values_refuses_a_whitespace_only_installed_value():
+    """(d, second shape) Whitespace-only is empty for this purpose."""
+    installed = f'[Service]\nEnvironment="{_KNOWN_ROOTS}=   "\n'
+
+    preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
+
+    assert preserved == {}
+    assert "empty" in skipped[_KNOWN_ROOTS].lower(), skipped
+
+
+def test_preserved_values_reads_the_multi_assignment_spelling():
+    """(e) `Environment=FOO=1 KNOWN=/a,/b` is read correctly.
+
+    This is exactly what the step-2 lift buys: the shlex-correct reader the
+    parity checker compares with. A naive split would have yielded the single
+    variable FOO with value `1 DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b`, preserved
+    nothing, and reported success.
+    """
+    installed = f"[Service]\nEnvironment=FOO=1 {_KNOWN_ROOTS}=/a,/b\n"
+
+    preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
+
+    assert preserved == {_KNOWN_ROOTS: "/a,/b"}
+    assert skipped == {}
+
+
+def test_apply_preserved_raises_when_the_rendered_text_has_no_such_line():
+    """(f) A preservation that would silently no-op RAISES, naming the variable.
+
+    Zero matching lines means the template changed shape underneath this code:
+    the value would be read off the installed unit, dropped on the floor, and
+    the install would report success — the exact silent clobber this whole
+    change removes, one layer in. It must be loud.
+    """
+    rendered = "[Service]\nType=simple\n"
+
+    with pytest.raises(ValueError) as excinfo:
+        _apply_preserved(rendered, {_KNOWN_ROOTS: NINE_ROOTS})
+
+    assert _KNOWN_ROOTS in str(excinfo.value), excinfo.value
+
+
+def test_apply_preserved_raises_when_the_rendered_text_is_ambiguous():
+    """(f, second shape) More than one matching line is ambiguous — also loud.
+
+    systemd's last-wins would make the choice invisible, so rewriting one of
+    two and leaving the other is a value nobody chose.
+    """
+    rendered = (
+        f"[Service]\nEnvironment={_KNOWN_ROOTS}=/a\nEnvironment={_KNOWN_ROOTS}=/b\n"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _apply_preserved(rendered, {_KNOWN_ROOTS: NINE_ROOTS})
+
+    assert _KNOWN_ROOTS in str(excinfo.value), excinfo.value
