@@ -11,6 +11,7 @@ ladder runs against temp git repos built per-test. No live data / no network.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
@@ -605,6 +606,135 @@ class TestBaseApproximationMarking:
             flag = _mint(_planrate_row(baseline_source=source))[
                 'provenance']['base_is_approximated']
             assert isinstance(flag, bool), f'{source}: {flag!r} is not a bool'
+
+
+# ---------------------------------------------------------------------------
+# _mint_continuity_one — the inherited base is MEASURED, never assumed
+# ---------------------------------------------------------------------------
+
+def _standing_fixture(repo: Path, task_id: str, pre: str, post: str) -> dict:
+    """A minimal canonical ``evals/tasks/<id>.json`` for the continuity path."""
+    return {
+        'id': f'reify_task_{task_id}',
+        'name': f'Standing fixture {task_id}',
+        'project': 'reify',
+        'project_root': str(repo),
+        'pre_task_commit': pre,
+        'post_task_commit': post,
+        'task_definition': {
+            'title': f'Standing fixture {task_id}',
+            'description': 'Carried verbatim from the standing corpus.',
+        },
+        'verify_commands': {'test': 'true'},
+        'modules': ['kernel'],
+        'complexity': 'complex',
+    }
+
+
+def _mint_continuity(monkeypatch: Any, tmp_path: Path, src_fixture: dict) -> dict:
+    """Mint one continuity record from *src_fixture*, written under a fake
+    REPO_ROOT so nothing is read from or written to the real corpus."""
+    import asyncio
+    rel = Path('orchestrator/src/orchestrator/evals/tasks') / f'{src_fixture["id"]}.json'
+    dest = tmp_path / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(src_fixture, indent=2))
+    monkeypatch.setattr(driver, 'REPO_ROOT', tmp_path)
+    sampler = driver._import_sampler()
+    return asyncio.run(driver._mint_continuity_one(
+        sampler, {'id': src_fixture['id'], 'source_path': str(rel)},
+        sampled_at='2026-08-04T00:00:00+00:00', seed=3631,
+        ceilings={'max_architect_turns': 120, 'timeout_minutes': 180},
+    ))
+
+
+class TestContinuityBaseApproximation:
+    """Continuity fixtures sit OUTSIDE the three-rung ladder: their base is
+    carried verbatim from the standing corpus under
+    ``CONTINUITY_BASELINE_SOURCE``, so the flag cannot be read off a rung
+    label. It is MEASURED against the task's landing merge — the same
+    measure-the-premise discipline as ``post_commit_reachable_from_main``."""
+
+    def test_inherited_base_equal_to_merge_first_parent_is_not_approximated(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        base = _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/12'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 12')
+        _git(['checkout', '-q', 'main'], repo)
+        # The colon spelling on purpose: df_task_18 and reify_task_12 both
+        # have colon-spelled landing merges in the live checkouts, so the
+        # step-2 matcher is what makes them measurable at all.
+        merge = _merge(repo, 'task/12', 'Merge task/12: the landing merge')
+
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '12', base, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is False
+        # The measurement is recorded, not just its verdict: a reader can see
+        # WHICH merge the inherited base was checked against.
+        assert prov['base_verified_against_merge'] == merge
+        assert 'base_approximation_reason' not in prov
+
+    def test_inherited_base_diverging_from_merge_first_parent_is_approximated(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        older = _commit(repo, 'a.txt', 'base\n', 'base')
+        branch_point = _commit(repo, 'a2.txt', 'more\n', 'later main commit')
+        _git(['checkout', '-q', '-b', 'task/13'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 13')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/13', 'Merge task/13 into main')
+
+        # The standing fixture inherited `older`, not the real branch point.
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '13', older, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is True
+        assert prov['base_verified_against_merge'] == \
+            _git(['rev-parse', 'main'], repo)
+        # Both SHAs are reported, so the divergence is legible from the JSON.
+        reason = prov['base_approximation_reason']
+        assert older in reason and branch_point in reason
+
+    def test_no_landing_merge_leaves_the_base_unverifiable(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        base = _commit(repo, 'a.txt', 'base\n', 'base')
+        tip = _commit(repo, 'b.txt', 'work\n', 'landed directly, no merge')
+
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '14', base, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is True
+        assert prov['base_verified_against_merge'] is None
+        assert 'no landing merge' in prov['base_approximation_reason'].lower()
+
+    def test_pre_and_post_are_still_carried_verbatim(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        # The continuity contract forbids divergence; this marking is
+        # OBSERVATIONAL only and must never move a commit.
+        repo = _init_repo(tmp_path, 'reify')
+        older = _commit(repo, 'a.txt', 'base\n', 'base')
+        branch_point = _commit(repo, 'a2.txt', 'more\n', 'later main commit')
+        _git(['checkout', '-q', '-b', 'task/15'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 15')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/15', 'Merge task/15 into main')
+
+        # An approximated base and a verified one must BOTH be carried through
+        # untouched — the marking is observational, never corrective.
+        for pre in (older, branch_point):
+            fixture = _standing_fixture(repo, '15', pre, tip)
+            rec = _mint_continuity(monkeypatch, tmp_path, fixture)
+            assert rec['pre_task_commit'] == fixture['pre_task_commit']
+            assert rec['post_task_commit'] == fixture['post_task_commit']
+            assert rec['provenance']['baseline_source'] == \
+                driver.CONTINUITY_BASELINE_SOURCE
 
 
 # ---------------------------------------------------------------------------
