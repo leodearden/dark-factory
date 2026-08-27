@@ -136,13 +136,76 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   is NOT tombstoned, and it makes the op `partial` — unlike a tombstone shortfall, an
   unprovable closure means the deliverable itself is missing.
 
-Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
-`recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
+Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), `update_memory`'s
 `_apply_memory_metadata_validation` bypass (task 3523 — this op validates the slug at
 entry, bounding but not closing it), and `x_memory_citation_tombstones` on citing tasks
-(task 3893 — a different object in a different store).
+(task 3893 — a different object in a different store). The Stage-1 rewire and the
+`recon-stage-*` guard-exemption retirement, listed here as unclaimed when this op
+landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
+
+**Behaviour change, two sites.** Task 3133 shipped the op; this is the leaf that makes
+the consolidator actually USE it and removes the write-path exemption that existed only
+because it did not.
+
+**The Stage-1 (`memory_consolidator`) prompt now advertises the op and directs folds
+through it.** `mcp__fused-memory__consolidate_memories` is listed in `## Available
+Tools` — the stage always HELD it (`STAGE1_DISALLOWED` never folds
+`DISALLOW_MEMORY_WRITES`), but `--disallowed-tools` omits a denied tool from the agent's
+listing rather than rejecting the call, so a held-but-unadvertised op is
+indistinguishable from inside the stage from one it does not have. A new `## Executing a
+Cluster Fold` section carries what a caller cannot succeed without: the two id arms
+(`supersedes` deletes, `retain` tags in place), the REQUIRED `topic` — a positional
+parameter, so a fold cannot mint an unstamped canonical and the vocabulary stamping stops
+being a step a prompt can forget — the ordering (validate → authorize → `scan_only`
+citation pre-flight → WRITE THE CANONICAL → tag peers → delete each supersede, with the
+byte-identical guarantee stated honestly as covering only the first four steps),
+`survivors` / `survivor_check_failed` as the corroborated closure signal, the no-resume
+rule (`'partial'` is not a retry signal — a second call for the same (project, topic)
+writes a SECOND canonical, which is the ratchet the op exists to end), and `run_id` as
+the DELETING run rather than the victims' own. The TARGET END STATE brief from task
+3112's `## Consolidation Gate` is CROSS-REFERENCED, never restated — a second normative
+copy inside one assembled prompt is resolved arbitrarily by the reader. The shared
+`STALE_KNOWLEDGE_ANNOTATION_NORM` (which renders verbatim into BOTH stage prompts) had
+clause (d) rewritten for the same reason: it prescribed the hand-rolled amend-then-delete
+choreography for a multi-record cluster, and now names the op, while KEEPING that
+sequence for the two cases it is still right for — superseding a SINGLE record (where
+`update_memory` preserves the survivor's id) and hand-finishing a `partial`.
+
+**The `recon-stage-*` exemption is retired at BOTH write sites.** Previously a
+`recon-stage-*` `agent_id` skipped the `add_memory` `procedural_knowledge` guards (cosine
+near-duplicate, known-topic-cluster and sufficient-phrase) AND was force-stored by
+`write_triage` without a retrieval round-trip. Both are gone: a recon-stage caller is now
+soft-blocked exactly like anyone else where the guards are live
+(`ProceduralKnowledgeNearDuplicateWriteRejected` /
+`ProceduralKnowledgeKnownTopicClusterWriteRejected`), and ROUTED by band exactly like
+anyone else where `write_triage.enabled` is on. The exemption's stated premise — a merged
+canonical necessarily resembles the duplicates it replaces, with no ordering guarantee
+that those duplicates are deleted first — is precisely what `consolidate_memories`
+supplies, so it no longer holds. **The sanctioned path is unaffected**: the op writes its
+canonical through `memory_service.add_memory`, the SERVICE method, not the guarded MCP
+`add_memory` tool where the guard block lives, so it never meets that guard at all. The
+retirement redirects Stage 1 onto the op rather than blocking it there too, and that
+property is regression-pinned. The prompt states the consequence for the stage in the
+same change: a soft-block is a SIGNAL that the cluster already exists — fold it, or amend
+the incumbent in place — and NOT an occasion for a reflexive
+`metadata={'allow_near_duplicate': True}`, which is how the cluster grew.
+
+**Stage 1's delete discipline now teaches the post-3624 citation gate.** The gate is a
+property of the RECORD, not of who is deleting, so it binds every caller — the prompt
+said nothing about it, leaving a Stage-1 agent facing a plain drop with no stated way
+forward. `metadata={'allow_dangling_citations': True}` is named as the ONE sanctioned
+bypass, with the rules the server actually enforces: only the literal boolean `True`
+counts (a truthy `'yes'`/`1`/`'true'` is IGNORED and the refusal stands), it is scoped to
+a PLAIN DROP where nothing replaces the entry and `replacement_memory_id` cannot express
+that, it is recorded at WARNING with every stranded citer named, and it is an
+individually-reasoned decision per delete rather than a loop default. It is explicitly
+WRONG for a consolidation, which has a survivor by definition and must name it —
+`consolidate_memories` exposes no such escape at all, because its canonical IS the
+repoint target by construction.
 
 #### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
 
