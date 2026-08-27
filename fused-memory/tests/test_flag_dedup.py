@@ -4264,6 +4264,22 @@ class TestMarkerPayloadKeyInvariant:
     #: docstring: task_id, flag_type, cited_tasks).
     SIGNATURE_INPUT_FIELDS = frozenset({'task_id', 'flag_type', 'cited_tasks'})
 
+    PROJECT = 'know_live'
+    FIX_CITE = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
+    KNOWN = {'dark_factory': '/df'}
+
+    @staticmethod
+    def _taskmaster(*, status='pending', side_effect=None):
+        """Same idiom as TestDedupFlagsCrossProjectFixTaskSuppression._taskmaster."""
+        taskmaster = AsyncMock()
+        if side_effect is not None:
+            taskmaster.get_task = AsyncMock(side_effect=side_effect)
+        else:
+            taskmaster.get_task = AsyncMock(
+                return_value={'id': 3839, 'title': 'Fix', 'status': status}
+            )
+        return taskmaster
+
     @pytest.mark.asyncio
     async def test_no_signature_input_is_persisted_as_durable_payload_state(
         self, ledger_memory_service
@@ -4351,6 +4367,164 @@ class TestMarkerPayloadKeyInvariant:
         assert result[0]['last_seen_run_id'] == 'r1'
         assert 'persisted_from_run' not in result[0], (
             f'a MISS must not annotate persisted_from_run; got {result[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_later_cycle_reads_back_the_row_the_earlier_cycle_wrote(
+        self, ledger_memory_service
+    ):
+        """POSITIVE round-trip: the REACHABILITY half of the key invariant
+        (task 4712). When a flag's signature-bearing inputs are UNCHANGED
+        across cycles, the row a cycle writes IS the row a later cycle reads
+        back — no cross-cycle anchor is needed for the ordinary,
+        stable-signature case; the signature itself is the anchor."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
+        }
+
+        r1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[dict(flag)],
+        )
+        assert 'persisted_from_run' not in r1[0], (
+            f'a first cycle (MISS) must not annotate persisted_from_run; got {r1[0]!r}'
+        )
+
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[dict(flag)],
+        )
+        assert r2[0]['persisted_from_run'] == 'r1', (
+            f'a repeat of the SAME signature must read back the row r1 wrote; got {r2[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_citation_less_cycle_keys_to_a_different_row_and_is_not_suppressed(
+        self, ledger_memory_service
+    ):
+        """The replacement for the two deleted vacuously-seeded tests
+        (test_anchor_survives_the_cycle_it_suppresses and
+        test_persisted_anchor_alone_suppresses) — and the test that would
+        have caught this defect in the first place.
+
+        Retiring the anchor means a citation-less cycle keys to a DIFFERENT
+        row than a citing cycle did, so it is a MISS, not suppressed, and
+        re-asserts the finding. This is the ACCEPTED, DOCUMENTED consequence
+        of retiring the anchor — the two deleted tests asserted the opposite
+        only because they hand-seeded a payload row dedup_flags itself can
+        never write.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        citing_flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
+        }
+        citation_less_flag = {'task_id': 598, 'flag_type': self.FLAG_TYPE}
+
+        r1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[citing_flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+        assert 'persisted_from_run' not in r1[0], (
+            f'the first cycle is a MISS — the gate is HIT-only; got {r1[0]!r}'
+        )
+
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[citation_less_flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+
+        # (a) the r2 flag is RETURNED, not suppressed.
+        assert len(r2) == 1, f'a citation-less cycle must not be suppressed; got {r2!r}'
+        # (b) it carries no persisted_from_run — a MISS, keyed to a different row.
+        assert 'persisted_from_run' not in r2[0], (
+            f'a citation-less cycle keys to a DIFFERENT row than the citing '
+            f'cycle did, so it must be a MISS; got {r2[0]!r}'
+        )
+
+        # (c) both rows exist, at compute_flag_signature of each cycle's own
+        # flag, and those two signatures DIFFER.
+        citing_sig = compute_flag_signature(citing_flag)
+        citation_less_sig = compute_flag_signature(citation_less_flag)
+        assert citing_sig != citation_less_sig, (
+            f'sanity: the two cycles must key differently; got '
+            f'{citing_sig!r} == {citation_less_sig!r}'
+        )
+        citing_row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, *citing_sig
+        )
+        citation_less_row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, *citation_less_sig
+        )
+        assert citing_row is not None, 'the r1 citing row must still exist'
+        assert citation_less_row is not None, 'the r2 citation-less row must exist too'
+
+    @pytest.mark.asyncio
+    async def test_a_stable_citation_set_still_suppresses_across_cycles(
+        self, ledger_memory_service
+    ):
+        """The path that DOES work, pinned so a future change cannot quietly
+        break it: when the LLM re-emits the SAME citation set, the signature
+        is stable, the row is the SAME row across cycles, and suppression
+        fires off the CURRENT cycle's own citation — no anchor required.
+        This is the honest statement of what the gate buys: suppression
+        works exactly when the LLM re-emits the citation."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
+        }
+        taskmaster = self._taskmaster()
+
+        r1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[dict(flag)],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+        assert len(r1) == 1, f'the first cycle is a MISS — the gate is HIT-only; got {r1!r}'
+
+        stats: dict = {}
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[dict(flag)],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert r2 == [], (
+            f'a stable citation set must still suppress across cycles; got {r2!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted; got {stats!r}'
         )
 
 
