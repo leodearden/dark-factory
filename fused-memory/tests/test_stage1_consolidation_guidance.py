@@ -137,3 +137,62 @@ class TestStage1ExecutionContract:
         # quiet direction needs a pin.)
         assert '{{' not in STAGE1_SYSTEM_PROMPT
         assert '}}' not in STAGE1_SYSTEM_PROMPT
+
+
+class TestStage1CitationGateAlignment:
+    """`## UUID Resolution Discipline` must teach the POST-3624 citation gate.
+
+    The pre-delete citation-repoint gate is a property of the RECORD, not of
+    who is deleting.  The section documented `replacement_memory_id` and the
+    two CitationReplacement* refusals but never mentioned the one sanctioned
+    bypass, so a Stage-1 agent facing a plain drop with no survivor had no
+    stated way forward at all.
+
+    Each assertion is pinned on the SAME vocabulary the server-side refusal
+    uses (`server/tools.py::_CITATION_REPOINT_REQUIRED_HINT` and
+    ``::_IGNORED_DANGLING_OVERRIDE_HINT``), so the prompt and the refusal the
+    agent actually receives draw the same boundary by the same names rather
+    than growing a second, drifting explanation of one gate.
+    """
+
+    def test_the_sanctioned_bypass_is_named_as_the_agent_must_type_it(self) -> None:
+        section = _section('## UUID Resolution Discipline')
+        assert "metadata={'allow_dangling_citations': True}" in section
+
+    def test_the_gate_is_stated_to_bind_every_caller(self) -> None:
+        # Same words FUSED_MEMORY_INSTRUCTIONS already uses: "a property of
+        # the RECORD, not of who is deleting, so it applies to every caller".
+        assert 'every caller' in _section('## UUID Resolution Discipline')
+
+    def test_the_bypass_is_scoped_to_a_plain_drop(self) -> None:
+        # `_CITATION_REPOINT_REQUIRED_HINT`'s exact scoping vocabulary.  An
+        # unscoped advertisement would point Stage 1 at the one posture the
+        # field evidence names as destructive — reflexive use across ~88
+        # consecutive refusals is how genuine third-party citers get stranded.
+        assert 'plain drop' in _section('## UUID Resolution Discipline')
+
+    def test_the_literal_true_rule_is_stated(self) -> None:
+        # Per `_IGNORED_DANGLING_OVERRIDE_HINT`: a truthy 'yes'/1/'true' is
+        # IGNORED and the refusal stands.  Without this the strictness reads
+        # as a dead end — the flag appears to have been passed and the same
+        # refusal comes back.
+        assert 'literal' in _section('## UUID Resolution Discipline')
+
+    def test_the_bypass_does_not_displace_the_survivor_naming_rule(self) -> None:
+        # Anti-over-correction.  `replacement_memory_id` remains the correct
+        # answer for a consolidation delete, which has a survivor by
+        # definition; the escape is the exception, not the replacement.
+        assert 'replacement_memory_id' in _section('## UUID Resolution Discipline')
+
+
+class TestStage1DoesNotCiteTheRetiredExemption:
+    """No recon-stage-scoped story may survive in the delete-discipline section.
+
+    The one remaining `recon-stage-*` mention in stage1.py belongs to the
+    `ReconMixedFramingWriteRejected` write gate — a still-live, unrelated
+    mechanism — and sits in a different section, deliberately outside the
+    slice asserted here.
+    """
+
+    def test_the_delete_discipline_section_names_no_recon_stage_exemption(self) -> None:
+        assert 'recon-stage' not in _section('## UUID Resolution Discipline')
