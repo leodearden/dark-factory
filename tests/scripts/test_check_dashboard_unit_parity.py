@@ -2377,7 +2377,8 @@ def _gate_repo(
     """_fake_repo plus the scripts/ files the installer slice reads.
 
     The real checker is copied in (with its sibling systemd_unit_parity import)
-    so the gate drives the real one; only the TREE is fake.
+    so the gate drives the real one; only the TREE is fake. The RENDERER the
+    install half now runs is copied in the same way, for the same reason.
     """
     repo = _fake_repo(tmp_path, mod)
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
@@ -2387,6 +2388,29 @@ def _gate_repo(
         ),
         encoding="utf-8",
     )
+    # The renderer and its shared parsing dependency, copied UNCONDITIONALLY and
+    # BEFORE write_checker. BOTH halves of that are load-bearing:
+    #
+    #   UNCONDITIONALLY, because the install half of this slice runs the
+    #   renderer on EVERY path through the gate — including with_checker=False
+    #   and the usage-error stub, whose whole point is that the units still land
+    #   when the gate did not run. Materializing the renderer only alongside the
+    #   real checker would make those two tests fail on a missing renderer
+    #   rather than on what they assert.
+    #
+    #   BEFORE write_checker, because write_checker(body=...) writes a STUB at
+    #   scripts/<checker>.py and skips its siblings entirely. Copying these
+    #   afterwards would be fine; copying them THROUGH that call would not, and
+    #   ordering them first makes it structural that a stub checker body can
+    #   never shadow the renderer's dependencies.
+    #
+    # This is also why render_dashboard_unit.py must not import the checker: see
+    # its module docstring, which names this harness as the concrete obstacle.
+    for _name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+        (repo / "scripts" / _name).write_text(
+            (REPO_ROOT / "scripts" / _name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     if with_checker:
         write_checker(
             repo,
@@ -2576,6 +2600,153 @@ def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Pa
         f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
     )
     _assert_units_installed(repo, unit_dir)
+
+
+# ---------------------------------------------------------------------------
+# The section-8 INSTALL preserves this host's local Environment= values
+# ---------------------------------------------------------------------------
+#
+# The gate above is only half of section 8. The other half is the RENDER, and
+# until task 4793 it was a plain truncating redirect:
+#
+#     sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" ... > "$UNIT_DIR/<unit>"
+#
+# scripts/dashboard.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, so that render
+# collapsed this host's nine measured aggregation roots to one on every re-run
+# — and INVISIBLY, because that variable is on DIVERGENCE_ALLOWLIST (compared by
+# NAME, value blessed), so the post-install check at section 12 reported parity
+# afterwards. The gate's own remediation line is what sends the operator into it.
+#
+# These two tests are the acceptance criteria for that fix, made at the
+# SANCTIONED INSTALL PATH rather than at the renderer's unit boundary: the real
+# section-8 slice, run over a tmp repo and a tmp unit dir.
+
+# The host-local value these two tests turn on is `_NINE_ROOTS` above — the same
+# measured nine-vs-one divergence the allowlist tests use, deliberately reused
+# rather than re-spelled here, so the value the gate blesses and the value the
+# install must preserve can never drift apart inside this file.
+
+
+def _installed_env(mod: types.ModuleType, unit_dir: pathlib.Path) -> dict[str, str]:
+    """The installed dashboard unit's [Service] Environment= map.
+
+    Read through the checker's own parser rather than a regex, so a value
+    written with any of systemd's accepted Environment= spellings is read here
+    exactly as the gate one section later would read it.
+    """
+    text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
+    return mod._environment_map(mod.parse_unit_directives(text), "Service")
+
+
+def _installed_directive(
+    mod: types.ModuleType, unit_dir: pathlib.Path, key: str
+) -> str:
+    """The single value of *key* in the installed dashboard unit's [Service]."""
+    text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
+    values = mod.parse_unit_directives(text)["Service"][key]
+    assert len(values) == 1, f"expected one {key}= in the installed unit, got {values}"
+    return values[0]
+
+
+def test_section_8_preserves_a_host_local_known_project_roots_value(
+    tmp_path: pathlib.Path,
+):
+    """ACCEPTANCE 1 + 2: re-running the sanctioned install path keeps this host's roots.
+
+    The fixture is the exact real-world starting state: a host whose installed
+    units MATCH the committed ones except for the one allowlisted, host-local
+    value it is supposed to carry. So the gate reports "already at parity"
+    first — which is the whole reason the old clobber was invisible — and then
+    the install runs anyway, because section 8's install is unconditional by
+    design (see test_section_8_installs_even_when_the_gate_did_not_run).
+
+    Three assertions, and the third is what keeps the first two from being
+    satisfiable by simply not rendering:
+
+      1. All nine roots survive the re-render, asserted by COUNT as well as by
+         equality — a one-root result cannot pass by looking like a prefix.
+      2. The install still TOOK: both watchdog units copied, placeholders
+         substituted (_assert_units_installed).
+      3. DASHBOARD_PROJECT_ROOT was RE-DERIVED to this run's repo root and still
+         equals the same copy's WorkingDirectory=. That variable is on the same
+         DIVERGENCE_ALLOWLIST, and preserving it too would have pinned the data
+         root at the PREVIOUS checkout while WorkingDirectory= moved —
+         manufacturing precisely the intra-copy drift
+         UnitSpec.env_matches_directive exists to report. The allowlist is not
+         the preserve set; the host-local SUBSET of it is.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={
+            _DASHBOARD_SERVICE: (
+                "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory",
+                f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS={_NINE_ROOTS}",
+            )
+        },
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "already at parity" in result.stdout, (
+        "The pre-install gate should see a correctly-configured host — the "
+        "host-local value is allowlisted. That green verdict is exactly why "
+        f"the clobber below went unnoticed.\n{result.stdout}"
+    )
+
+    env = _installed_env(mod, unit_dir)
+    assert env["DASHBOARD_KNOWN_PROJECT_ROOTS"] == _NINE_ROOTS, (
+        "The re-render overwrote this host's local aggregation roots. That is "
+        "the defect: the operator followed the parity gate's own remediation "
+        f"advice and lost eight project roots.\n{result.stdout}"
+    )
+    roots = env["DASHBOARD_KNOWN_PROJECT_ROOTS"]
+    assert roots.count(",") == 8, f"expected nine roots, got {roots!r}"
+
+    _assert_units_installed(repo, unit_dir)
+
+    assert env["DASHBOARD_PROJECT_ROOT"] == str(repo), (
+        "DASHBOARD_PROJECT_ROOT must be RE-DERIVED from this run's repo root, "
+        "not preserved from the installed copy — it is allowlisted for the "
+        f"opposite reason.\n{env['DASHBOARD_PROJECT_ROOT']!r} != {str(repo)!r}"
+    )
+    assert env["DASHBOARD_PROJECT_ROOT"] == _installed_directive(
+        mod, unit_dir, "WorkingDirectory"
+    ), "the rendered unit contradicts itself: data root != WorkingDirectory="
+
+
+def test_section_8_greenfield_installs_the_single_root_default(
+    tmp_path: pathlib.Path,
+):
+    """A bare host has nothing to preserve, so it gets the rendered default.
+
+    The failure mode this closes is the mirror of the one above: a preservation
+    step that treats "no installed unit" as an error, or that writes an EMPTY
+    value it read from nowhere, would break provisioning on exactly the hosts
+    the installer exists to serve. Absent is not a failure — it is the
+    greenfield case, and the template's single-root default is the right answer.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "FAIL " not in result.stdout, (
+        f"A greenfield install has nothing to preserve and nothing to warn "
+        f"about.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert _installed_env(mod, unit_dir)["DASHBOARD_KNOWN_PROJECT_ROOTS"] == str(repo), (
+        "With no installed unit to read, the rendered single-root default is "
+        "what must land."
+    )
 
 
 # ---------------------------------------------------------------------------
