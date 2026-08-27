@@ -24,6 +24,12 @@ Modes:
     overlay the v2 ceilings, and write the fixture JSONs plus the generated
     ``CURATION.md``.
 
+``--base-distance-report``
+    Print the per-fixture before/after table of how far each baseline sits
+    from the task's true branch point (``M^1`` of its landing merge).
+    Distances are REPORTED, never asserted against a threshold. See
+    ``base_distance_rows``.
+
 ``--redrive``
     Re-derive ``merge_sha`` / ``baseline_sha`` / ``baseline_source`` /
     ``mint_mode`` on the COMMITTED manifest's existing ``include`` rows and
@@ -1247,6 +1253,175 @@ def run_redrive() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --base-distance-report — how far each base sits from the true branch point
+# ---------------------------------------------------------------------------
+
+def base_distance_rows(before_rows: list[dict], after_rows: list[dict],
+                       distance) -> list[dict]:
+    """Build the per-fixture before/after base-distance table.
+
+    *distance* is injected — ``distance(project_root, a, b) -> int | None`` —
+    so the table's shape is testable with no checkout, mirroring
+    ``redrive_provenance``'s resolver injection.
+
+    The TRUE branch point is ``M^1`` of the task's landing merge, which after
+    a redrive is exactly the ``baseline_sha`` of a ``merge_first_parent`` row.
+    Where no landing merge exists under either spelling the branch point is
+    not derivable from git AT ALL (reify 3883's real case), so both distances
+    are ``None`` and the row carries a note. Such a row is still EMITTED: a
+    silently dropped row would let the table read as full coverage when it is
+    not.
+
+    This REPORTS measured distances. It deliberately asserts nothing against a
+    threshold — no achievability basis exists for a numeric bound here, and
+    the known-worst distances are what they are.
+    """
+    sampler = _import_sampler()
+    rows: list[dict] = []
+    for before, after in zip(before_rows, after_rows, strict=True):
+        if before['task_id'] != after['task_id'] or \
+                before['project'] != after['project']:
+            raise ValueError(
+                f'base_distance_rows: before/after rows do not line up '
+                f'({before["project"]}/{before["task_id"]} vs '
+                f'{after["project"]}/{after["task_id"]}). Reporting them '
+                f'zipped would mis-attribute every distance in the table.'
+            )
+        fixture_id = (f'{sampler.repo_of_project(after["project"])}'
+                      f'_task_{after["task_id"]}')
+        root = after['project_root']
+        knowable = after['baseline_source'] == MERGE_DERIVED_BASELINE_SOURCE
+        branch_point = after['baseline_sha'] if knowable else None
+
+        side = {}
+        for label, row in (('before', before), ('after', after)):
+            approximated, _why = base_approximation(row['baseline_source'])
+            side[label] = {
+                'baseline_sha': row['baseline_sha'],
+                'baseline_source': row['baseline_source'],
+                'base_is_approximated': approximated,
+                'distance_from_branch_point': (
+                    distance(root, branch_point, row['baseline_sha'])
+                    if branch_point else None
+                ),
+            }
+
+        rows.append({
+            'fixture_id': fixture_id,
+            'task_id': after['task_id'],
+            'project': after['project'],
+            'branch_point': branch_point,
+            'note': None if knowable else (
+                f'No landing merge for task {after["task_id"]} under either '
+                f'accepted subject spelling, so the true branch point is not '
+                f'derivable from git and the distance is UNMEASURABLE — not '
+                f'zero. The base stays approximated; a readout that depends '
+                f'on a true branch point should exclude this fixture.'
+            ),
+            **side,
+        })
+    return rows
+
+
+def _commit_distance(project_root: str, a: str, b: str) -> int | None:
+    """``git rev-list --count a...b`` (SYMMETRIC difference), or ``None``.
+
+    Three dots, not two, and that is load-bearing: a one-directional ``a..b``
+    answers 0 whenever ``b`` is an ancestor of ``a``, which is exactly
+    reify_task_4026's shape — its stale base ``e21d047026`` IS an ancestor of
+    the true branch point ``794d321596``, so ``794d321596..e21d047026``
+    measures 0 while the symmetric difference measures the real 245. A
+    distance that silently reads 0 for the worst case in the pool is worse
+    than no distance at all.
+
+    ``None`` means NOT MEASURED (an unresolvable SHA in this checkout). It
+    must never read as ``0``, which is the answer for "already AT the branch
+    point".
+    """
+    out = _git(['rev-list', '--count', f'{a}...{b}'], project_root)
+    return int(out) if out.isdigit() else None
+
+
+def _first_parent_commit_distance(project_root: str, a: str,
+                                  b: str) -> int | None:
+    """``--first-parent`` variant of :func:`_commit_distance`.
+
+    Reported ALONGSIDE the plain count, never instead of it: the two differ by
+    roughly 3x on this history (measured on reify: 245 total vs 78
+    first-parent for task 4026's base), so quoting only one invites a misread.
+    """
+    out = _git(['rev-list', '--count', '--first-parent', f'{a}...{b}'],
+               project_root)
+    return int(out) if out.isdigit() else None
+
+
+def _render_distance_table(rows: list[dict], fp_rows: list[dict]) -> str:
+    """Render the base-distance table. Pure — deterministic in *rows*."""
+    out: list[str] = []
+    out.append('| fixture | before rung | before base | dist (all/1st-parent) '
+               '| after rung | after base | dist (all/1st-parent) |')
+    out.append('|---|---|---|---|---|---|---|')
+
+    def cell(row: dict, fp_row: dict, side: str) -> str:
+        d, fp = (row[side]['distance_from_branch_point'],
+                 fp_row[side]['distance_from_branch_point'])
+        return ('n/a' if row['branch_point'] is None
+                else f'{"?" if d is None else d}/{"?" if fp is None else fp}')
+
+    unmeasurable = 0
+    for row, fp_row in zip(rows, fp_rows, strict=True):
+        if row['branch_point'] is None:
+            unmeasurable += 1
+        out.append(
+            f'| `{row["fixture_id"]}` '
+            f'| {row["before"]["baseline_source"]} '
+            f'| `{row["before"]["baseline_sha"][:10]}` '
+            f'| {cell(row, fp_row, "before")} '
+            f'| {row["after"]["baseline_source"]} '
+            f'| `{row["after"]["baseline_sha"][:10]}` '
+            f'| {cell(row, fp_row, "after")} |'
+        )
+    out.append('')
+    approximated = sum(1 for r in rows if r['after']['base_is_approximated'])
+    out.append(
+        f'{len(rows)} fixture(s); {approximated} still have an APPROXIMATED '
+        f'base after the redrive, of which {unmeasurable} have no landing '
+        f'merge under either spelling and so no measurable distance at all '
+        f'(reported as `n/a`, never as 0). Distances are REPORTED, not '
+        f'asserted against a threshold.'
+    )
+    for row in rows:
+        if row['note']:
+            out.append(f'- `{row["fixture_id"]}`: {row["note"]}')
+    return '\n'.join(out) + '\n'
+
+
+def run_base_distance_report() -> int:
+    """Print the before/after base-distance table for the committed manifest.
+
+    ``before`` is the manifest AS COMMITTED; ``after`` is what a redrive would
+    produce right now. Running this before and after ``--redrive`` therefore
+    gives the two halves of the record, and running it on an
+    already-redriven manifest correctly shows no movement.
+    """
+    if not CURATION_JSON.exists():
+        raise RuntimeError(
+            f'run_base_distance_report: no manifest at {CURATION_JSON}; '
+            f'there is nothing to measure.'
+        )
+    manifest = json.loads(CURATION_JSON.read_text())
+    redriven, _changes = redrive_provenance(
+        manifest, _production_redrive_resolver)
+    before = [r for r in manifest['candidates'] if r['decision'] == 'include']
+    after = [r for r in redriven['candidates'] if r['decision'] == 'include']
+    print(_render_distance_table(
+        base_distance_rows(before, after, _commit_distance),
+        base_distance_rows(before, after, _first_parent_commit_distance),
+    ))
+    return 0
+
+
 def run_author(census_date: str) -> int:
     manifest = author_manifest(census_date)
     CURATION_JSON.parent.mkdir(parents=True, exist_ok=True)
@@ -1705,6 +1880,12 @@ def main(argv: list[str] | None = None) -> int:
                            'manifest edit')
     mode.add_argument('--mint', action='store_true',
                       help='Mint the fixture JSONs from the manifest include rows')
+    mode.add_argument('--base-distance-report', action='store_true',
+                      help='Print the per-fixture before/after table of how '
+                           'far each baseline sits from the task\'s true '
+                           'branch point (M^1 of its landing merge). '
+                           'Distances are REPORTED, never asserted against a '
+                           'threshold')
     mode.add_argument('--redrive', action='store_true',
                       help='Re-derive merge_sha / baseline_sha / '
                            'baseline_source / mint_mode on the COMMITTED '
@@ -1742,6 +1923,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_render()
     if args.redrive:
         return run_redrive()
+    if args.base_distance_report:
+        return run_base_distance_report()
     if args.mint:
         if not args.sampled_at:
             parser.error('--mint requires --sampled-at')

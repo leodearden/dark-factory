@@ -990,6 +990,30 @@ class TestBaseDistanceReport:
         assert rows[0]['before']['distance_from_branch_point'] is None
         assert rows[0]['branch_point'] == '794d321596'
 
+    def test_the_measurement_is_direction_agnostic(self, tmp_path: Path) -> None:
+        # The production measurement must count the SYMMETRIC difference. A
+        # one-directional `git rev-list --count A..B` answers 0 whenever B is
+        # an ancestor of A — which is exactly reify_task_4026's shape, and
+        # would have reported its 245-commit-stale base as a perfect 0.
+        repo = _init_repo(tmp_path)
+        old = _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(repo, 'b.txt', 'one\n', 'one')
+        new = _commit(repo, 'c.txt', 'two\n', 'two')
+
+        assert driver._commit_distance(str(repo), new, old) == 2
+        assert driver._commit_distance(str(repo), old, new) == 2
+        assert driver._commit_distance(str(repo), new, new) == 0
+        assert driver._first_parent_commit_distance(str(repo), new, old) == 2
+
+    def test_an_unresolvable_sha_measures_as_none_not_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = _init_repo(tmp_path)
+        head = _commit(repo, 'a.txt', 'base\n', 'base')
+        assert driver._commit_distance(str(repo), head, 'f' * 40) is None
+        assert driver._first_parent_commit_distance(
+            str(repo), head, 'f' * 40) is None
+
     def test_refuses_rows_that_do_not_line_up(self) -> None:
         # A before/after pair that disagrees on which fixtures it covers would
         # silently mis-attribute every distance in the table.
