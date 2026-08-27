@@ -2216,3 +2216,114 @@ class TestResolvedCitationSuppressesIdenticalRefile:
         assert len(self._pending(queue)) == 1, (
             'a resolved task_failure suppressed a provenance_unattributed filing'
         )
+
+
+class TestSuppressedRefileIsCounted:
+    """The suppression must be a DURABLE structured fact, not log-only (task 4499).
+
+    INV-2 ``structured-facts-at-failure`` and INV-4 ``storm-escape-required``:
+    every suppression path carries a counter, and the fact lands on the record
+    rather than only in a log line.  Without it, "this adjudication has quietly
+    absorbed 900 refiles" is invisible from the queue — the storm is suppressed
+    AND unobservable, which is how a suppression turns into a blindfold.
+    """
+
+    TASK = '42'
+    SHA_A = 'b' * 40
+    SHA_B = 'c' * 40
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    def _file(self, queue, sha: str):
+        file_unattributed_landing_escalation(
+            queue, self.TASK, f'task/{self.TASK}',
+            _verdict('effect_absent', citation=sha, effect_check_sha=sha),
+            agent_role='harness-reconcile',
+        )
+
+    def _file_and_resolve(self, queue, sha: str) -> str:
+        self._file(queue, sha)
+        pending = queue.get_by_task(self.TASK, status='pending')
+        assert len(pending) == 1, f'expected one filing; got {[e.id for e in pending]}'
+        queue.resolve(pending[0].id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        return pending[0].id
+
+    def test_three_suppressed_refiles_are_counted_on_the_prior_record(self, tmp_path) -> None:
+        """(1) The storm is countable from the record the refiles were absorbed by."""
+        queue = self._queue(tmp_path)
+        esc_id = self._file_and_resolve(queue, self.SHA_A)
+
+        for _ in range(3):
+            self._file(queue, self.SHA_A)
+
+        record = queue.get(esc_id)
+        assert record is not None
+        assert record.refiles_suppressed == 3, (
+            'the suppression is LOG-ONLY — the record shows '
+            f'{record.refiles_suppressed!r} absorbed refiles, expected 3'
+        )
+
+    def test_the_prior_record_is_otherwise_untouched(self, tmp_path) -> None:
+        """(2) Only the counter moves; the adjudication itself is immutable."""
+        queue = self._queue(tmp_path)
+        esc_id = self._file_and_resolve(queue, self.SHA_A)
+        before = queue.get(esc_id)
+        assert before is not None
+
+        self._file(queue, self.SHA_A)
+
+        after = queue.get(esc_id)
+        assert after is not None
+        assert after.status == 'resolved', f'status changed: {after.status!r}'
+        assert after.resolved_by == 'escalation-watcher-auto', (
+            f'resolved_by changed: {after.resolved_by!r}'
+        )
+        assert after.resolution == before.resolution
+        assert after.resolved_at == before.resolved_at
+        assert after.citation_sha == self.SHA_A, (
+            f'the identity being matched on drifted: {after.citation_sha!r}'
+        )
+
+    def test_the_record_stays_archived(self, tmp_path) -> None:
+        """(3) Counting must not resurrect the resolution into the queue root.
+
+        A resurrected record would read as a fresh pending escalation to every
+        consumer that scans the root — turning the storm counter into a storm.
+        """
+        queue = self._queue(tmp_path)
+        esc_id = self._file_and_resolve(queue, self.SHA_A)
+
+        self._file(queue, self.SHA_A)
+
+        assert not (queue.queue_dir / f'{esc_id}.json').exists(), (
+            'RESURRECTION: the counted record was written back into the queue root'
+        )
+        assert queue.get_by_task(self.TASK, status='pending') == [], (
+            'counting a suppressed refile produced a pending record'
+        )
+
+    def test_the_counter_is_per_record(self, tmp_path) -> None:
+        """(4) Each adjudicated sha counts its OWN absorbed refiles.
+
+        A shared counter would make two independent findings look like one
+        storm, and would misattribute which evidence is actually recurring.
+        """
+        queue = self._queue(tmp_path)
+        first = self._file_and_resolve(queue, self.SHA_A)
+        second = self._file_and_resolve(queue, self.SHA_B)
+
+        self._file(queue, self.SHA_A)
+        self._file(queue, self.SHA_A)
+
+        first_record, second_record = queue.get(first), queue.get(second)
+        assert first_record is not None and second_record is not None
+        assert first_record.refiles_suppressed == 2, (
+            f'expected 2 on the recurring record; got {first_record.refiles_suppressed!r}'
+        )
+        assert second_record.refiles_suppressed == 0, (
+            'the counter leaked across records; the quiet one reads '
+            f'{second_record.refiles_suppressed!r}'
+        )
