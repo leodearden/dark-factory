@@ -80,6 +80,27 @@ def _commit(repo: Path, filename: str, body: str, message: str,
     return _git(['rev-parse', 'HEAD'], repo)
 
 
+def _merge(repo: Path, branch: str, message: str,
+           date: str | None = None) -> str:
+    """No-ff merge *branch* into the current branch; return the merge SHA.
+
+    *date* pins author and committer date, mirroring :func:`_commit`, so a
+    merge can be placed deterministically relative to the commits it brings in
+    — which is what makes the off-mainline timestamp-walk shape expressible.
+    """
+    args = ['merge', '--no-ff', '-q', branch, '-m', message]
+    if date is None:
+        _git(args, repo)
+    else:
+        subprocess.run(
+            ['git', *args], cwd=str(repo), check=True, capture_output=True,
+            text=True, env={
+                **_base_env(), 'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
+            },
+        )
+    return _git(['rev-parse', 'HEAD'], repo)
+
+
 def _base_env() -> dict[str, str]:
     import os
     return dict(os.environ)
@@ -286,6 +307,57 @@ class TestBaselineLadder:
         sha, rung = driver.resolve_baseline(repo, '782', '2026-02-01T00:00:00+00:00')
         assert sha == early, 'must pick the newest main commit BEFORE the ts'
         assert rung == 'timestamp_walk'
+
+    def test_rung3_never_returns_an_off_mainline_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        # The measured defect. Without --first-parent, `git rev-list -n1
+        # --before=<ts> main` traverses EVERYTHING reachable from main,
+        # including commits that only ever lived on a merged-in side branch.
+        # It then hands back a tree state that was never a state of main.
+        #
+        # Reproduces reify_task_4026's committed base e21d047026 (a side-branch
+        # commit, 245 commits from the true branch point, and absent from
+        # `git rev-list --first-parent main`) and reify_task_4086's.
+        repo = _init_repo(tmp_path)
+        mainline = _commit(repo, 'a.txt', 'base\n', 'base',
+                           date='2026-01-01T00:00:00+00:00')
+        _git(['checkout', '-q', '-b', 'task/999'], repo)
+        side = _commit(repo, 'b.txt', 'work\n', 'work on someone else task',
+                       date='2026-02-01T00:00:00+00:00')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/999', 'Merge task/999 into main',
+               date='2026-03-01T00:00:00+00:00')
+
+        # Task 790 has no landing merge and no status auto-commit, so it falls
+        # to rung 3. Its first invocation sits between the side commit and the
+        # merge that landed it.
+        sha, rung = driver.resolve_baseline(repo, '790', '2026-02-15T00:00:00+00:00')
+        assert rung == 'timestamp_walk'
+        first_parent = _git(['rev-list', '--first-parent', 'main'], repo).split()
+        assert sha in first_parent, (
+            f'rung 3 returned {sha}, which is not on main\'s first-parent line '
+            f'— that tree state never existed on main'
+        )
+        assert sha != side
+        assert sha == mainline
+
+    def test_rung3_still_picks_the_newest_mainline_commit_before_ts(
+        self, tmp_path: Path,
+    ) -> None:
+        # Guard against --first-parent over-pruning: on a linear main it must
+        # still return the NEWEST commit before the cutoff, not the oldest.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'oldest',
+                date='2026-01-01T00:00:00+00:00')
+        middle = _commit(repo, 'b.txt', 'more\n', 'middle',
+                         date='2026-02-01T00:00:00+00:00')
+        _commit(repo, 'c.txt', 'later\n', 'newest',
+                date='2026-03-01T00:00:00+00:00')
+
+        sha, rung = driver.resolve_baseline(repo, '791', '2026-02-15T00:00:00+00:00')
+        assert rung == 'timestamp_walk'
+        assert sha == middle
 
     def test_raises_when_every_rung_fails(self, tmp_path: Path) -> None:
         # Loud-over-silent: an empty pre_task_commit would blow up deep inside
