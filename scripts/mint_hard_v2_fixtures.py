@@ -463,6 +463,45 @@ def resolve_baseline(
     )
 
 
+MERGE_DERIVED_BASELINE_SOURCE = 'merge_first_parent'
+
+
+def base_approximation(baseline_source: str) -> tuple[bool, str | None]:
+    """Return ``(is_approximated, reason)`` for a ladder-resolved *baseline_source*.
+
+    ONE definition of the rule, shared by the mint path (``_mint_one``) and the
+    report path (``base_distance_rows``) so the two cannot drift into
+    disagreeing about which fixtures a readout should exclude.
+
+    Only rung 1 (``merge_first_parent``) yields the task's TRUE branch point —
+    ``M^1`` of its landing merge, i.e. the exact state of main the work started
+    from. Every weaker rung is an approximation whose error is unbounded and
+    unmeasurable without a landing merge to compare against: rung 2 anchors on
+    a status auto-commit that can precede or follow the real start, and rung 3
+    walks back to the FIRST architect invocation, which for a re-tried task can
+    be many days and thousands of commits before the run that actually
+    produced the work (measured: reify 3883's architect events span
+    2026-05-26 to 2026-06-09, 1902 first-parent commits apart).
+
+    Continuity fixtures do NOT go through this function — their base is
+    inherited verbatim from the standing corpus, so ``_mint_continuity_one``
+    MEASURES the flag against the landing merge instead of reading it off a
+    rung label.
+    """
+    if baseline_source == MERGE_DERIVED_BASELINE_SOURCE:
+        return False, None
+    return True, (
+        f'pre_task_commit came from baseline rung {baseline_source!r}, not '
+        f'{MERGE_DERIVED_BASELINE_SOURCE!r}. Only {MERGE_DERIVED_BASELINE_SOURCE!r} '
+        f'yields the task\'s true branch point (M^1 of its landing merge); '
+        f'every weaker rung is an APPROXIMATION of where the work started, '
+        f'with an error that is unbounded and — absent a landing merge to '
+        f'measure against — unknowable. A readout that depends on the base '
+        f'being the real branch point should EXCLUDE this fixture rather than '
+        f'average it in.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candidate assembly
 # ---------------------------------------------------------------------------
@@ -1361,6 +1400,15 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
         cohort='fable-trial-v2-hard', sampled_at=sampled_at, seed=seed,
     )
     record['provenance']['baseline_source'] = row['baseline_source']
+    # Make the base's standing machine-readable, so a readout can exclude
+    # approximated bases instead of silently averaging them in with true
+    # branch points. Same shape as `post_commit_reachable_from_main` in
+    # `_mint_continuity_one`: a boolean plus a prose reason naming what it
+    # rests on, both readable from the fixture JSON alone.
+    approximated, why = base_approximation(row['baseline_source'])
+    record['provenance']['base_is_approximated'] = approximated
+    if why is not None:
+        record['provenance']['base_approximation_reason'] = why
     # The curation's terminal adjudication travels WITH the fixture. Without
     # it a reader of the JSON alone cannot tell a landed task from a cancelled
     # one, and the verify_outcome below would be an unattributable claim.
