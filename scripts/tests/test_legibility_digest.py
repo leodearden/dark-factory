@@ -2907,6 +2907,61 @@ class TestDesignedOutcomesSection:
 
 
 # ---------------------------------------------------------------------------
+# Retry Loops designed-outcome annotation, RENDERED -- census 2026-08-26 R1
+# (task 4751). The annotation must report the designed count against the
+# group's TOTAL (never replacing it), and a group with zero designed results
+# must render byte-identically to the pre-4751 format so a genuine retry
+# storm's rendering is provably untouched.
+# ---------------------------------------------------------------------------
+
+def _retry_item(count, designed_outcome_count=0, designed_outcomes=(), tool='Bash'):
+    """One find_retry_loops group, shaped for _render_retry_loops."""
+    return {
+        'tool': tool,
+        'signature': mod._input_signature(_REARM),
+        'count': count,
+        'indices': list(range(count)),
+        'designed_outcome_count': designed_outcome_count,
+        'designed_outcomes': list(designed_outcomes),
+    }
+
+
+class TestRetryLoopAnnotationRendering:
+    def test_annotation_reports_designed_count_against_the_group_total(self):
+        # The two numbers are DIFFERENT on purpose: 6 calls, 3 of which
+        # ended in a declared ceiling. A reader must be able to see both.
+        item = _retry_item(
+            6, designed_outcome_count=3,
+            designed_outcomes=[(124, 'watcher-rearm-declared')],
+        )
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert 'x6' in line
+        assert '3 designed-outcome results' in line
+
+    def test_zero_designed_group_renders_the_preexisting_format_exactly(self):
+        # REGRESSION GUARD, asserted against the literal pre-4751 f-string:
+        # the annotation is purely additive, so a genuine retry storm's
+        # line is unchanged byte for byte.
+        item = _retry_item(4)
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert line == f"- {item['tool']} x{item['count']}: {item['signature']}"
+
+    def test_mixed_group_still_renders_its_full_call_volume(self):
+        # 2 of 4 designed -- the annotation explains the churn, it never
+        # hides how much churn there was.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert 'x4' in line
+        assert '2 designed-outcome results' in line
+
+
+# ---------------------------------------------------------------------------
 # _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
 # (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
 # invariant step-4's per-item cap makes structurally unreachable at any
