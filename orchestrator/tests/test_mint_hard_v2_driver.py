@@ -346,6 +346,76 @@ class TestFindMergeSha:
         _git(['merge', '--no-ff', 'task/8030', '-m', 'Merge task/8030 into main'], repo)
         assert driver.find_merge_sha(repo, '803') is None
 
+    def test_finds_colon_spelled_merge_subject(self, tmp_path: Path) -> None:
+        # The regressed spelling. Both are in live use on reify's main
+        # (censused: 2741 x "Merge task/N into main", 74 x "Merge task/N: ..."),
+        # and matching only the first is what stamped a false
+        # `reference_unavailable` on fixtures that DO have a landing merge.
+        # This is reify_task_4026's real subject, verbatim.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/4026'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/4026', '-m',
+              'Merge task/4026: Add SPEED_OF_LIGHT + BOLTZMANN_CONSTANT '
+              'physical constants to std.units'], repo)
+        assert driver.find_merge_sha(repo, '4026') == _git(['rev-parse', 'HEAD'], repo)
+
+    def test_colon_spelling_does_not_prefix_match_a_longer_id(
+        self, tmp_path: Path,
+    ) -> None:
+        # Substring-safety must hold for the colon spelling too: 'Merge
+        # task/8030: work' cannot answer a query for task 803. Asserted in BOTH
+        # directions so a pattern that matched nothing at all could not pass.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/8030'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/8030', '-m', 'Merge task/8030: work'], repo)
+        merge = _git(['rev-parse', 'HEAD'], repo)
+        assert driver.find_merge_sha(repo, '803') is None
+        assert driver.find_merge_sha(repo, '8030') == merge
+
+    def test_ambiguous_across_spellings_is_planrate_only(
+        self, tmp_path: Path,
+    ) -> None:
+        # The 'ambiguity is planRate-only, never a coin flip' contract holds
+        # over the UNION of the two spellings, not per-spelling: two landing
+        # merges for one id are ambiguous however each one is worded.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        for branch, fn, subject in (
+            ('task/803-1', 'b.txt', 'Merge task/803 into main'),
+            ('task/803-2', 'c.txt', 'Merge task/803: the colon spelling'),
+        ):
+            _git(['checkout', '-q', '-b', branch], repo)
+            _commit(repo, fn, 'work\n', f'work on {branch}')
+            _git(['checkout', '-q', 'main'], repo)
+            _git(['merge', '--no-ff', branch, '-m', subject], repo)
+        assert driver.find_merge_sha(repo, '803') is None
+
+    def test_colon_spelling_requires_the_space_separator(
+        self, tmp_path: Path,
+    ) -> None:
+        # 'Merge task/803:no-space' is not the landing-merge shape and must not
+        # count as a second match. If it did, the real merge below would be
+        # reported as ambiguous and lost.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/803-decoy'], repo)
+        _commit(repo, 'b.txt', 'decoy\n', 'decoy')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803-decoy', '-m',
+              'Merge task/803:no-space'], repo)
+        _git(['checkout', '-q', '-b', 'task/803'], repo)
+        _commit(repo, 'c.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803', '-m',
+              'Merge task/803: the real landing merge'], repo)
+        assert driver.find_merge_sha(repo, '803') == _git(['rev-parse', 'HEAD'], repo)
+
 
 # ---------------------------------------------------------------------------
 # _mint_one — a planRate-only fixture must not claim a landed verify outcome
