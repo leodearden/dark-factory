@@ -63,7 +63,13 @@ fire-and-forgets ``build_indices_and_constraints()``.
 """
 from __future__ import annotations
 
-from fused_memory.utils.canonical_labels import Referent, scan_content
+import re
+
+from fused_memory.utils.canonical_labels import (
+    Referent,
+    parse_node_name,
+    scan_content,
+)
 
 # --------------------------------------------------------------------------- #
 # The detection vocabulary — IMPORTED, never re-derived
@@ -120,3 +126,72 @@ def fact_referents(fact: str | None, graph: str) -> frozenset[Referent]:
     if not fact:
         return frozenset()
     return frozenset(scan_content(fact, group_id=graph).refs)
+
+
+def endpoint_referent(node_name: str | None) -> Referent | None:
+    """The task referent an edge ENDPOINT's name denotes, or None.
+
+    A one-line delegation to the IMPORTED ``canonical_labels.parse_node_name``
+    — the ANCHORED half of the shared vocabulary, which answers "is this
+    entity NAME a task label?" rather than "does this text mention a task".
+    Anchoring is what keeps a name that merely CONTAINS a reference ('Task 42
+    orchestrator', 'reify task 12') out of the population entirely, so no such
+    node can ever be flagged.
+
+    A FOREIGN-qualified name ('reify:132') yields a referent that keeps its
+    qualifier and is therefore NOT equal to a local ``Task 132``. The detector
+    compares full :class:`Referent` objects, never bare numbers, so the
+    cross-project collapse ``utils/cross_project_refs.py`` exists to detect
+    can never be introduced here by the comparison itself.
+
+    The falsy guard is not decoration: this sweep reads EVERY live
+    ``RELATES_TO`` row in a graph, and a node with a NULL ``name`` arrives
+    here as None. ``parse_node_name`` would raise ``TypeError`` on it, aborting
+    a whole-corpus read over one odd historical row.
+    """
+    if not node_name:
+        return None
+    return parse_node_name(node_name)
+
+
+def bare_id_present(referent: Referent, fact: str | None) -> bool:
+    """Does *referent*'s already-parsed id appear as a standalone digit run?
+
+    THE ONE ID CHECK THIS SCRIPT PERFORMS ITSELF, and deliberately the
+    narrowest one that closes the gap. Read the next paragraph before
+    concluding it violates INV-5.
+
+    IT IS NOT A SECOND VOCABULARY. It compiles no task-label pattern — no
+    'task', no separator alternation, no qualifier rule — and it can MINT no
+    referent: the id it looks for was produced by
+    :func:`endpoint_referent`, i.e. by the shared parser. It is a pure
+    containment question about digits. Its only effect on the detector is to
+    SUPPRESS a flag, never to create one, which is the conservative direction
+    for a report whose every row a human adjudicates by hand.
+    ``tests/test_audit_wrong_binding_edges.py::TestNoSecondVocabulary`` pins
+    the distinction structurally: the pattern below contains no 'task'.
+
+    WHY IT IS NEEDED. ``scan_content`` is documented "precision over recall",
+    and two of its blind spots bite this detector specifically: the bare-hash
+    spelling ('#4262') and the hyphen spelling ('task-1836'). Both are cases
+    where the fact DOES name the endpoint and the shared scanner cannot see
+    it, so without this check the endpoint would be flagged as mis-bound —
+    a false positive in exactly the direction that costs a reader time. The
+    fix is NOT to widen ``canonical_labels`` (that module is on the live
+    memory write path; a survey's convenience must not change what the
+    write-time guard does to production writes) and NOT to add a second
+    mention pattern here (that IS the INV-5 violation).
+
+    Word-boundary matched, so a digit run that is a SUBSTRING of a longer id
+    never counts: an endpoint ``Task 616`` is not "named" by a fact about task
+    6165. Without that, the suppression would silently swallow real findings
+    in exactly the near-miss population this sweep exists to measure.
+
+    A FOREIGN referent is matched on its NUMBER alone, since containment
+    cannot see projects. That makes 'reify:132' look named by a fact saying
+    'task 132' — a suppression, never an invented flag, and the precise
+    comparison still happens in the set-membership test upstream.
+    """
+    if not fact:
+        return False
+    return re.search(rf'\b{re.escape(referent.number)}\b', fact) is not None
