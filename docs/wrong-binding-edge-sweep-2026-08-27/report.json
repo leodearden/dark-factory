@@ -1,0 +1,3680 @@
+{
+  "swept_at": "2026-08-27T04:30:51.546356+00:00",
+  "graphs": [
+    "dark_factory",
+    "reify"
+  ],
+  "scanned": 26667,
+  "population": 6959,
+  "unverifiable": 304,
+  "summary": {
+    "findings": 181,
+    "rate": 0.026009484121281793,
+    "by_graph": {
+      "dark_factory": 76,
+      "reify": 105
+    },
+    "by_end": {
+      "object": 73,
+      "subject": 108
+    },
+    "by_proximity": {
+      "one_digit_diff": 97,
+      "prefix": 8,
+      "similar": 0,
+      "unrelated": 76
+    },
+    "correct_node_present": {
+      "false": 70,
+      "true": 111
+    },
+    "families": [
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 1042",
+        "findings": 4,
+        "edge_uuids": [
+          "4c477609-3040-4190-a8c7-500b8c7e8b11",
+          "62e4e286-f3ad-4195-b124-fb89b57ce6aa",
+          "6ff1c0b9-c6b6-42a5-bc9a-394b8b5c7a8e",
+          "ab801161-ddf9-46cb-a8ad-230417381ae8"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 2365",
+        "findings": 2,
+        "edge_uuids": [
+          "0cbff38a-7bb9-4080-b276-380a735a8a58",
+          "4a81ca10-39f9-4fdc-bc32-dda1703e581b"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3066",
+        "findings": 2,
+        "edge_uuids": [
+          "6464ee7b-405f-4e63-a867-f0ed0b701b37",
+          "998aaab9-a128-4150-9928-756ecb4f9e35"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3163",
+        "findings": 4,
+        "edge_uuids": [
+          "5c6b6b4d-4578-4659-84bc-45e4f48192f9",
+          "93d4d832-285a-4384-be95-e5b90e58318d",
+          "af65bca6-fcce-4c0e-8d4c-0e87f66ce65a",
+          "e40a0f83-4918-4fd5-81c1-69a203c275e4"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3367",
+        "findings": 2,
+        "edge_uuids": [
+          "2642efc3-e633-4855-b118-467f9316c5fe",
+          "2a9382e3-7848-4f4b-adeb-51611214cea1"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3729",
+        "findings": 2,
+        "edge_uuids": [
+          "73b42fd2-6de8-4ee9-aa32-62cb172bd722",
+          "f85d19f9-239b-45fa-a04a-ebc5c617fb56"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3871",
+        "findings": 2,
+        "edge_uuids": [
+          "b8fabad7-42d3-4596-af13-666e697a8f8b",
+          "ef92b342-bcc7-4519-9ed1-298c6d7fe44a"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 430",
+        "findings": 5,
+        "edge_uuids": [
+          "3368a7aa-ea4a-47f2-b57a-ad2c369e26c2",
+          "3d8dc741-0c6c-49c7-a2a2-b57d484565a6",
+          "44c9a2d0-492d-4ce7-aa82-3ab9f1511d1f",
+          "7d954b0e-96d5-4ba8-8e3d-f77865853f72",
+          "e7757b46-a48a-4b56-b947-02e1aaf5deae"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 4377",
+        "findings": 3,
+        "edge_uuids": [
+          "60ba1b60-7caa-4980-b83c-f52816dea50b",
+          "7abf7b11-a9e0-4a2e-8d7c-d80f5185fe30",
+          "f729cf96-4443-4de3-8817-d5cd39d74dc5"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "task 1155",
+        "findings": 3,
+        "edge_uuids": [
+          "28891420-cfec-4da2-9f54-43d6eec2705c",
+          "4895becb-f39c-40ef-9b8a-e3dbb9b58e15",
+          "d5706134-e2d7-4fa9-b4cb-6712bb29f6c7"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 2180",
+        "findings": 2,
+        "edge_uuids": [
+          "70aef703-1c74-4366-b5e4-0f46548765e6",
+          "e4e89204-2f4f-4b65-afd6-672ca0fe6db4"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 2268",
+        "findings": 2,
+        "edge_uuids": [
+          "87448b96-e5c3-40f1-ac8f-1d79da5bb148",
+          "faa8d843-190f-449b-b443-06fabcca0060"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 2590",
+        "findings": 3,
+        "edge_uuids": [
+          "283173b4-1ba7-4d5e-82e5-ec6d505f6a97",
+          "887ee27c-36fc-47d3-a5f9-70a726d07ba2",
+          "f04d4eb1-8550-45eb-b81e-0a07b5429635"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 3019",
+        "findings": 4,
+        "edge_uuids": [
+          "2f7c6873-5070-49d3-bca6-8e8125bf5d97",
+          "442c14ea-a580-443f-b9ae-9d4a4d29bb0c",
+          "4b782505-333f-4667-a931-136c57912dd3",
+          "d0b345d7-6cae-4e6b-9b5e-904fbd963904"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 5623",
+        "findings": 2,
+        "edge_uuids": [
+          "63092fd2-a428-4182-9d7c-1fa79eab17a3",
+          "d597a7de-32fa-4839-85ca-969cf505ccbf"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 5633",
+        "findings": 5,
+        "edge_uuids": [
+          "22beeeed-ef7b-4971-aec2-821fc0df3e25",
+          "3eb80b01-ec5c-4879-93ff-6018006f8444",
+          "5ae2c86c-a22c-4229-938d-31b75e81e1af",
+          "7a913250-ef6a-469d-9dd6-dc46df41e70a",
+          "9a6102bf-6d00-4455-aa52-7b24226f6063"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 6084",
+        "findings": 2,
+        "edge_uuids": [
+          "88178776-38d3-4c38-a615-5fa131bf9fc3",
+          "a85a554a-5153-4bed-8162-20fe42113f72"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 6165",
+        "findings": 6,
+        "edge_uuids": [
+          "317da2e2-39f0-499b-8b45-a02d9aed029a",
+          "54f53beb-d7a0-4cb8-a839-bc97b1becc4b",
+          "63fa5c78-2fe1-4afa-8c43-6ddad646fe40",
+          "6a79d29b-263b-43de-bc5f-3821b761bd31",
+          "9135f049-d87b-40b8-bf22-24a09394fe2a",
+          "9a8e780b-82b2-4823-a612-d5b723bfc9cc"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "Task 6730",
+        "findings": 2,
+        "edge_uuids": [
+          "0aff7cb9-a416-42de-94fc-05a4cae08b04",
+          "dd325db1-c237-4272-886f-72e1257f6f59"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task #10",
+        "findings": 2,
+        "edge_uuids": [
+          "6d6d8985-bc01-41ca-9d31-1e9f992e9296",
+          "8c9e990f-0baf-4a61-bf7b-9f36c75fb073"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 2342",
+        "findings": 4,
+        "edge_uuids": [
+          "0eb5ef53-1736-4d88-9be5-b3ee84f3e9e4",
+          "679942f0-5e01-460a-be0f-558bc9cfddd9",
+          "d80970ea-bd53-469d-8bf8-51878e0c00c8",
+          "e54c4519-e4d7-475c-a3f7-3645481f3312"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 2351",
+        "findings": 2,
+        "edge_uuids": [
+          "d80970ea-bd53-469d-8bf8-51878e0c00c8",
+          "ec3649b7-eb26-4b24-a573-b6100672ac78"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 2354",
+        "findings": 2,
+        "edge_uuids": [
+          "6676d6c7-cad0-4cdb-8297-d427d757b590",
+          "e54c4519-e4d7-475c-a3f7-3645481f3312"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 3316",
+        "findings": 2,
+        "edge_uuids": [
+          "3248c0c3-0051-4f46-8813-50c8772b6a3e",
+          "e4b1e85b-43b9-44a0-b30b-88499433a2db"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 3443",
+        "findings": 2,
+        "edge_uuids": [
+          "6a0a25d3-107d-4fa2-8d6b-14dfde5d2fb9",
+          "b475f624-001f-4d23-9ee1-1f3d2bf0d9b0"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 4105",
+        "findings": 2,
+        "edge_uuids": [
+          "7f438458-5e84-49fa-8fd4-bbe0a17bdcaa",
+          "f8937569-075a-4270-bd44-d615d1bc1980"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 4263",
+        "findings": 2,
+        "edge_uuids": [
+          "2c4815cf-2e52-475c-8bc0-e383483aa44e",
+          "7f3dcc9f-7870-449f-8927-f6af0141d773"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 4490",
+        "findings": 2,
+        "edge_uuids": [
+          "6502a795-6076-485e-a9a3-26676086b304",
+          "c5c4c429-95cf-440e-87cb-d43cb56302c1"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 4615",
+        "findings": 3,
+        "edge_uuids": [
+          "d9580f01-f9d8-4486-a821-ec5ec0a384ca",
+          "ea185157-ab72-4e6a-824d-1cc413856e67",
+          "ea50e06c-e823-4afc-9601-4fda31a94162"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "task 4755",
+        "findings": 4,
+        "edge_uuids": [
+          "10379740-90a8-475e-a821-b66c51dc21e3",
+          "51ce0475-9af9-41fc-b67c-d1cceb314a5d",
+          "92cc574a-a541-46f8-b729-ae45aefb09bb",
+          "a5ef5301-0039-459a-bcce-048d34796b1d"
+        ]
+      },
+      {
+        "graph": "reify",
+        "node_name": "tasks 1999",
+        "findings": 4,
+        "edge_uuids": [
+          "2488db91-9992-4f02-84f8-c6867a1807d6",
+          "94575eda-dd74-4df7-ba9e-c556ad3f858a",
+          "d9595ff2-5814-430a-89e7-659a44a34746",
+          "f0761c0f-ea34-4785-bf67-d43718ed59ac"
+        ]
+      }
+    ]
+  },
+  "truncated_by": null,
+  "caveats": [
+    "CANDIDATES, NOT VERDICTS: every finding is a candidate for HUMAN adjudication. Some are legitimate cross-task relations that merely hang off a task-shaped node \u2014 e.g. \"BOOKMARK task 4043 tracks the ... work surfaced by esc-3437-13\" on node \"task 3443\". Auto-reassigning on a regex verdict is exactly what this task's scope note forbids, and this script has no path to do it.",
+    "DETECTION BOUND, RECALL: endpoints and facts are read with the SHARED vocabulary in fused_memory.utils.canonical_labels, which is documented precision-over-recall. A node named with bare digits, a reference made by task TITLE, an alias/codename, and a hard-wrapped qualified ref are all invisible by design. The rate reported here is therefore a LOWER BOUND on Class A.",
+    "DENOMINATOR: \"rate\" divides by \"population\" \u2014 edges with at least one task-shaped endpoint AND at least one task id named in the fact. Edges whose fact names no task id are UNVERIFIABLE, not clean, and are counted separately; they are never folded into the denominator and never summed with the findings.",
+    "COVERAGE, CLASS: this sweep covers ONE sub-class \u2014 an endpoint the fact does not name. See known_gaps for the two it provably does not cover.",
+    "LIVE CORPUS: both graphs are written to continuously, so every count here is a snapshot at swept_at, not a fixed population."
+  ],
+  "known_gaps": [
+    {
+      "sub_class": "direction_reversal",
+      "description": "The edge points the wrong way: BOTH endpoints are correctly named in the fact, only the subject/object roles are swapped.",
+      "specimen_edge_uuids": [
+        "1cf19488",
+        "01e3e75e"
+      ],
+      "specimens": [
+        "1cf19488 (Task 6346)->(Task 6347): \"The recurring-attention task #6347 depends on task #6346.\"",
+        "01e3e75e (Task 5997)->(Task 6014): \"Task 6014 carries task 5997 as a hard dependency.\""
+      ],
+      "why_out_of_reach": "Set-membership is SATISFIED at both ends, so no text rule can separate a reversal from correct grammatical voice.",
+      "cheap_heuristic_measured_and_rejected": {
+        "rule": "leftmost task id named in the fact == object id != subject id",
+        "flagged": 85,
+        "population": 7131,
+        "verdict": "NOT SHIPPED \u2014 precision far too low",
+        "worked_false_positives": [
+          "\"Task 2660 depends on Task 2659 landing\" on edge (2659)->(2660)",
+          "\"Task 846 is the companion task to Task 839\" on edge (839)->(846)",
+          "\"Themes addressed by follow-up Task 2083 are related to Task 394\" on edge (394)->(2083)"
+        ],
+        "what_would_be_needed": "The AUTHORITATIVE task dependency graph. The two true specimens are indistinguishable from the benign majority by fact text alone, because both of their endpoints are named."
+      }
+    },
+    {
+      "sub_class": "fact_contradicts_source_episode",
+      "description": "The fact is bound to plausible endpoints and names them both, but disagrees with the episode it was extracted from.",
+      "specimen_edge_uuids": [
+        "993a9a7b"
+      ],
+      "specimens": [
+        "993a9a7b (Task 6004)->(Task 5997): \"Task 6004's rulings were ported verbatim into task 5997.\""
+      ],
+      "why_out_of_reach": "Reachable by NO text or topology rule: adjudicating it requires re-reading the source episode body and comparing meaning. That is the fact-CONTENT family esc-4639-1 separates from this one."
+    }
+  ],
+  "findings": [
+    {
+      "edge_uuid": "3368a7aa-ea4a-47f2-b57a-ad2c369e26c2",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 430",
+      "node_task_id": "430",
+      "node_referent": "Task 430",
+      "fact_referents": [
+        "Task 4302"
+      ],
+      "fact": "Task 4302's own partial-sweep prohibition prevents sweeping only the 6 currently-writable targets.",
+      "episodes": [
+        "c5c02d13-fed9-439e-bc2e-77f05a8aa561"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "4302",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "3d8dc741-0c6c-49c7-a2a2-b57d484565a6",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 430",
+      "node_task_id": "430",
+      "node_referent": "Task 430",
+      "fact_referents": [
+        "Task 4302"
+      ],
+      "fact": "Task 4302 was wired to a real dependency to resolve the issue.",
+      "episodes": [
+        "c5c02d13-fed9-439e-bc2e-77f05a8aa561"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "4302",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "44c9a2d0-492d-4ce7-aa82-3ab9f1511d1f",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 430",
+      "node_task_id": "430",
+      "node_referent": "Task 430",
+      "fact_referents": [
+        "Task 4302"
+      ],
+      "fact": "Task 4302 was resolved by wiring a missing dependency for the 29-task corpus x_ metadata sweep.",
+      "episodes": [
+        "c5c02d13-fed9-439e-bc2e-77f05a8aa561"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "4302",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "7d954b0e-96d5-4ba8-8e3d-f77865853f72",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 430",
+      "node_task_id": "430",
+      "node_referent": "Task 430",
+      "fact_referents": [
+        "Task 4302"
+      ],
+      "fact": "Task 4302 uses metadata to declare its blocker.",
+      "episodes": [
+        "c5c02d13-fed9-439e-bc2e-77f05a8aa561"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "4302",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e7757b46-a48a-4b56-b947-02e1aaf5deae",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 430",
+      "node_task_id": "430",
+      "node_referent": "Task 430",
+      "fact_referents": [
+        "Task 4302"
+      ],
+      "fact": "Task 4302 has no dependencies listed, which means it was not gated.",
+      "episodes": [
+        "c5c02d13-fed9-439e-bc2e-77f05a8aa561"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "4302",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "88ec711b-32c1-4470-bb95-ee5ae55ffc3f",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 1030",
+      "node_task_id": "1030",
+      "node_referent": "Task 1030",
+      "fact_referents": [
+        "Task 1031"
+      ],
+      "fact": "Task 1031 transitioned to done in the remediation cycle on 2026-04-29.",
+      "episodes": [
+        "b67d642a-3daa-4152-8113-0bf9a3a9f235"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1031",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "4c477609-3040-4190-a8c7-500b8c7e8b11",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 1042",
+      "node_task_id": "1042",
+      "node_referent": "Task 1042",
+      "fact_referents": [
+        "Task 2042"
+      ],
+      "fact": "Task 2042 is recorded as metadata.substrate_ii_livesmoke_spike=true.",
+      "episodes": [
+        "900e8225-5073-4a69-a8b2-731ce600c9fd"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2042",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "62e4e286-f3ad-4195-b124-fb89b57ce6aa",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 1042",
+      "node_task_id": "1042",
+      "node_referent": "Task 1042",
+      "fact_referents": [
+        "Task 2042"
+      ],
+      "fact": "Task 2042 includes a documented pivot for a capability token.",
+      "episodes": [
+        "900e8225-5073-4a69-a8b2-731ce600c9fd"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2042",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "6ff1c0b9-c6b6-42a5-bc9a-394b8b5c7a8e",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 1042",
+      "node_task_id": "1042",
+      "node_referent": "Task 1042",
+      "fact_referents": [
+        "Task 2042"
+      ],
+      "fact": "Task 2042 includes a documented pivot for a restricted tool surface.",
+      "episodes": [
+        "900e8225-5073-4a69-a8b2-731ce600c9fd"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2042",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ab801161-ddf9-46cb-a8ad-230417381ae8",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 1042",
+      "node_task_id": "1042",
+      "node_referent": "Task 1042",
+      "fact_referents": [
+        "Task 2042"
+      ],
+      "fact": "Task 2042 is fully implemented by the Claude Code CLI agent.",
+      "episodes": [
+        "555b551d-11f7-4f22-99bf-7238ec252b0e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2042",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "11a14e81-460a-4233-8b89-316b84d6d5a0",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "task 1131",
+      "node_task_id": "1131",
+      "node_referent": "Task 1131",
+      "fact_referents": [
+        "Task 1136"
+      ],
+      "fact": "Task 1136 follows the same pattern as self.task_interceptor.",
+      "episodes": [
+        "e72d8db5-0570-4981-9782-fdbb0d9d8348"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1136",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "28891420-cfec-4da2-9f54-43d6eec2705c",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1155",
+      "node_task_id": "1155",
+      "node_referent": "Task 1155",
+      "fact_referents": [
+        "Task 1173"
+      ],
+      "fact": "Task 1173 completed at 2026-05-09T13:53 UTC via commit e6c56c114b2ba04fedd0b71db68258a8535493ea.",
+      "episodes": [
+        "64315ec6-cdb6-4b45-bedd-25104fb24634"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1173",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "4895becb-f39c-40ef-9b8a-e3dbb9b58e15",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1155",
+      "node_task_id": "1155",
+      "node_referent": "Task 1155",
+      "fact_referents": [
+        "Task 1137"
+      ],
+      "fact": "Task 1137 completed at 2026-05-09T17:09 UTC via commit b4b461440d49331f73b716962193ccdb21a04fb2.",
+      "episodes": [
+        "64315ec6-cdb6-4b45-bedd-25104fb24634"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1137",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "d5706134-e2d7-4fa9-b4cb-6712bb29f6c7",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1155",
+      "node_task_id": "1155",
+      "node_referent": "Task 1155",
+      "fact_referents": [
+        "Task 1144"
+      ],
+      "fact": "Task 1144 completed at 2026-05-09T13:47 UTC via commit 75052dc0559f7e733e590c026b2ca214b0aa02ca.",
+      "episodes": [
+        "64315ec6-cdb6-4b45-bedd-25104fb24634"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1144",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "eb4ea3ee-a0aa-4009-94f1-407a0be78040",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1192",
+      "node_task_id": "1192",
+      "node_referent": "Task 1192",
+      "fact_referents": [
+        "Task 1198"
+      ],
+      "fact": "Task 1198 was newly completed since the prior cycle.",
+      "episodes": [
+        "054c894b-e06c-4e42-a278-7418dd79f483"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1198",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "af0c6c69-c990-4117-a82f-885195ca79ca",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "task 1198",
+      "node_task_id": "1198",
+      "node_referent": "Task 1198",
+      "fact_referents": [
+        "Task 1200"
+      ],
+      "fact": "Task 1200 was created as a new task.",
+      "episodes": [
+        "054c894b-e06c-4e42-a278-7418dd79f483"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1200",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2f65981e-9e5c-4294-bf39-a87357b74a2e",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1200",
+      "node_task_id": "1200",
+      "node_referent": "Task 1200",
+      "fact_referents": [
+        "Task 1199"
+      ],
+      "fact": "Task 1199 was newly completed since the prior cycle.",
+      "episodes": [
+        "054c894b-e06c-4e42-a278-7418dd79f483"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1199",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "61b5c4e8-427f-4ce2-81b7-9a2cedd1aea1",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 1405",
+      "node_task_id": "1405",
+      "node_referent": "Task 1405",
+      "fact_referents": [
+        "Task 1406"
+      ],
+      "fact": "Task 1406 was created in the current cycle.",
+      "episodes": [
+        "c8753ec0-fb25-4362-b741-dff9aa5200dc"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1406",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "48671d90-8514-4ca1-a510-58d6c2a5b4df",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "task 1565",
+      "node_task_id": "1565",
+      "node_referent": "Task 1565",
+      "fact_referents": [
+        "Task 1571"
+      ],
+      "fact": "The full dashboard-wide removal of the current_task display was split out to a new task 1571.",
+      "episodes": [
+        "92a6c19c-d55d-4f5e-a647-659ebe0c00ab"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1571",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "5e9cb95a-4482-449f-95ff-acfb21f1aa3a",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 1843",
+      "node_task_id": "1843",
+      "node_referent": "Task 1843",
+      "fact_referents": [
+        "Task 1841"
+      ],
+      "fact": "Task 1841 found the real SIGHUP bug that task-1836's timeout widening had masked.",
+      "episodes": [
+        "22ae51ac-3d9f-4de6-a132-bb6882830b93"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1841",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "f647e76c-a941-47a7-9f83-46506fa3d369",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 2004",
+      "node_task_id": "2004",
+      "node_referent": "Task 2004",
+      "fact_referents": [
+        "Task 1982"
+      ],
+      "fact": "Task 1982 is cancelled as of 2026-07-02.",
+      "episodes": [
+        "539cb5d0-5ac9-4533-a406-370ca7e5c07b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1982",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "08279ebe-d980-4ec5-8406-e28d3676cc6a",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 2210",
+      "node_task_id": "2210",
+      "node_referent": "Task 2210",
+      "fact_referents": [
+        "Task 2115"
+      ],
+      "fact": "W6-\u03b5 will have noisy startup alarms until Task 2115 migration completes.",
+      "episodes": [
+        "55a3859d-a0b1-4dec-85ba-90f13e3d9877"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2115",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "52090eb1-0e35-4f39-b00f-50b516c28a97",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2273",
+      "node_task_id": "2273",
+      "node_referent": "Task 2273",
+      "fact_referents": [
+        "Task 2456"
+      ],
+      "fact": "The live cross-graph migration was executed by sibling deterministic task 2456.",
+      "episodes": [
+        "b7fd131c-3105-4f2b-95db-6b33ec0065b8"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2456",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "0cbff38a-7bb9-4080-b276-380a735a8a58",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2365",
+      "node_task_id": "2365",
+      "node_referent": "Task 2365",
+      "fact_referents": [
+        "Task 2362"
+      ],
+      "fact": "Task 2362 is an ancestor of main.",
+      "episodes": [
+        "e2e1bd92-c70d-4b91-8a6f-c2bdf04f6fab"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2362",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "4a81ca10-39f9-4fdc-bc32-dda1703e581b",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2365",
+      "node_task_id": "2365",
+      "node_referent": "Task 2365",
+      "fact_referents": [
+        "Task 2362"
+      ],
+      "fact": "Task 2362 was merged via commit 0bc5b0b0e3.",
+      "episodes": [
+        "e2e1bd92-c70d-4b91-8a6f-c2bdf04f6fab"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2362",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "02c188c2-9a65-4796-b7e1-0866b44fe97b",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2394",
+      "node_task_id": "2394",
+      "node_referent": "Task 2394",
+      "fact_referents": [
+        "Task 2370"
+      ],
+      "fact": "Commit f03dff179fb9238ebef83b960dc030daf12e9864 is the merge commit for Task 2370.",
+      "episodes": [
+        "97c63ad4-2f80-43fc-b74a-8b700af5e2d1"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2370",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "223452d0-2878-4830-abff-d0650ae275ec",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 2433",
+      "node_task_id": "2433",
+      "node_referent": "Task 2433",
+      "fact_referents": [
+        "Task 2438"
+      ],
+      "fact": "Task 2438 was filed to investigate the false claim generated by the Stage 2 reconciliation finding.",
+      "episodes": [
+        "543aaa7e-7767-44bc-9a4e-1c52c91661d1"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2438",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "198489af-e468-411f-8ead-a3711be17a61",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2561",
+      "node_task_id": "2561",
+      "node_referent": "Task 2561",
+      "fact_referents": [
+        "Task 2564"
+      ],
+      "fact": "Task 2564 fixed the failure-path main-health probe by detaching the cross-check off the critical path.",
+      "episodes": [
+        "840ec5b1-61d1-4ab4-afd4-e5be724d888d"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2564",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "a6bb4c27-0f69-4f32-aa3f-734ce4556071",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 2779",
+      "node_task_id": "2779",
+      "node_referent": "Task 2779",
+      "fact_referents": [
+        "Task 2643"
+      ],
+      "fact": "Task 2643 required no further action after the resolution of its fix-effectiveness contradiction.",
+      "episodes": [
+        "edca59ba-89ed-4f24-b885-2dcbd3c9fa4f"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2643",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "9fe1a8e0-7018-4595-ba50-433ed56b9b90",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 2876",
+      "node_task_id": "2876",
+      "node_referent": "Task 2876",
+      "fact_referents": [
+        "Task 2873"
+      ],
+      "fact": "The dead verify's worktree being written by someone else is already excluded by task 2873's lane lock.",
+      "episodes": [
+        "840ec5b1-61d1-4ab4-afd4-e5be724d888d"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2873",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "6464ee7b-405f-4e63-a867-f0ed0b701b37",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3066",
+      "node_task_id": "3066",
+      "node_referent": "Task 3066",
+      "fact_referents": [
+        "Task 3067"
+      ],
+      "fact": "Task 3067 restored _JUDGE_CLI_MAX_TURNS to 3 in judge.py on 2026-07-30.",
+      "episodes": [
+        "b2c5c6bc-cfed-4c61-a2a5-d7048640fc52"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3067",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "998aaab9-a128-4150-9928-756ecb4f9e35",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3066",
+      "node_task_id": "3066",
+      "node_referent": "Task 3066",
+      "fact_referents": [
+        "Task 3067"
+      ],
+      "fact": "Task 3067 modified reconciliation/judge.py to set _JUDGE_CLI_MAX_TURNS to 3.",
+      "episodes": [
+        "b2c5c6bc-cfed-4c61-a2a5-d7048640fc52"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3067",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "f60f403a-8905-4402-adcc-05efcb5d3dc3",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3074",
+      "node_task_id": "3074",
+      "node_referent": "Task 3074",
+      "fact_referents": [
+        "Task 3075"
+      ],
+      "fact": "Task 3075's design implication is that any subprocess timeout on lane_protect_glob must be sized against the loaded figure, not the plan's figure.",
+      "episodes": [
+        "8562760e-cf33-4f9d-be2e-f5f4b6d653b9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3075",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2b29bd0f-3a10-42e3-b284-f9abd4e06503",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3111",
+      "node_task_id": "3111",
+      "node_referent": "Task 3111",
+      "fact_referents": [
+        "Task 4004"
+      ],
+      "fact": "Task 4004's read-transform bake-off excludes the topic-keyed grouped-read arm based on the rationale that it cannot be built today.",
+      "episodes": [
+        "ea709fa5-31ac-4e62-805c-520adf2f3fbd"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4004",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "5c6b6b4d-4578-4659-84bc-45e4f48192f9",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3163",
+      "node_task_id": "3163",
+      "node_referent": "Task 3163",
+      "fact_referents": [
+        "Task 3162"
+      ],
+      "fact": "task 3162 was amended to include ~/.cargo in its scope.",
+      "episodes": [
+        "a41a9ce9-9491-43ed-ba51-2363c05c7eec"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3162",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "93d4d832-285a-4384-be95-e5b90e58318d",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3163",
+      "node_task_id": "3163",
+      "node_referent": "Task 3163",
+      "fact_referents": [
+        "Task 3162"
+      ],
+      "fact": "task 3162 was amended to include ~/.gradle in its scope.",
+      "episodes": [
+        "a41a9ce9-9491-43ed-ba51-2363c05c7eec"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3162",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "af65bca6-fcce-4c0e-8d4c-0e87f66ce65a",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3163",
+      "node_task_id": "3163",
+      "node_referent": "Task 3163",
+      "fact_referents": [
+        "Task 3162",
+        "Task 3525"
+      ],
+      "fact": "dark_factory task 3525 was cancelled and its substance was re-homed into task 3162.",
+      "episodes": [
+        "a41a9ce9-9491-43ed-ba51-2363c05c7eec"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3162",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "e40a0f83-4918-4fd5-81c1-69a203c275e4",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3163",
+      "node_task_id": "3163",
+      "node_referent": "Task 3163",
+      "fact_referents": [
+        "Task 3162"
+      ],
+      "fact": "task 3162 was amended to include ~/.npm in its scope.",
+      "episodes": [
+        "a41a9ce9-9491-43ed-ba51-2363c05c7eec"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3162",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "23ce2527-6b41-477f-8127-0292d315acb0",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3215",
+      "node_task_id": "3215",
+      "node_referent": "Task 3215",
+      "fact_referents": [
+        "Task 3363"
+      ],
+      "fact": "Task 3363 extended the memory-evals parity vocabulary from 5 states to 13, rejecting the reviewer's suggestion to rename recovered_open.",
+      "episodes": [
+        "22111f4f-544c-4976-a631-56320d60cecc"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3363",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6719b8b2-77b6-461e-bbac-0f08791c13e4",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3220",
+      "node_task_id": "3220",
+      "node_referent": "Task 3220",
+      "fact_referents": [
+        "Task 3072",
+        "Task 3222"
+      ],
+      "fact": "The stale note about .gitignore was carried forward into task 3222 from task 3072.",
+      "episodes": [
+        "754b20cb-fc23-483a-a090-97600d8472f9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3222",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "3470e48c-3525-45e6-a96d-b4e849ac9a04",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3223",
+      "node_task_id": "3223",
+      "node_referent": "Task 3223",
+      "fact_referents": [
+        "Task 4027"
+      ],
+      "fact": "Between landing and task 4027, main is protected against the regression that occurred due to a shared import.",
+      "episodes": [
+        "53ddadb8-3ab1-4b05-9cd2-c48ad76ab630"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4027",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "06dcd52f-2626-4d39-9232-84ae5602a2af",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3363",
+      "node_task_id": "3363",
+      "node_referent": "Task 3363",
+      "fact_referents": [
+        "Task 3216",
+        "Task 3442"
+      ],
+      "fact": "Follow-up task 3442 wires Task 3216's JSX/test to the exported PARITY_STATES.",
+      "episodes": [
+        "22111f4f-544c-4976-a631-56320d60cecc"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3216",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2642efc3-e633-4855-b118-467f9316c5fe",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3367",
+      "node_task_id": "3367",
+      "node_referent": "Task 3367",
+      "fact_referents": [
+        "Task 4363"
+      ],
+      "fact": "The rewrite proposed in task 4363 is prohibited in dark-factory-orchestrator.yaml.",
+      "episodes": [
+        "42c549a5-af9e-40b9-9e53-5dd46003f5dd"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4363",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2a9382e3-7848-4f4b-adeb-51611214cea1",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3367",
+      "node_task_id": "3367",
+      "node_referent": "Task 3367",
+      "fact_referents": [
+        "Task 4363"
+      ],
+      "fact": "The prohibition against the rewrite in task 4363 is machine-enforced by TestRootTypeCheckCommandPyrightInterpreterPinned.",
+      "episodes": [
+        "42c549a5-af9e-40b9-9e53-5dd46003f5dd"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4363",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6aefac16-86a6-4385-b76e-dc6b09c310bd",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3421",
+      "node_task_id": "3421",
+      "node_referent": "Task 3421",
+      "fact_referents": [
+        "Task 3429"
+      ],
+      "fact": "Task 3429 made _check_scope_invariant directional as per commit e6a7e971ed.",
+      "episodes": [
+        "1d1cadea-ce76-45f2-9914-2373b5fc886d"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3429",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "3a502a53-d198-43b1-9b73-adb95421df0d",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3460",
+      "node_task_id": "3460",
+      "node_referent": "Task 3460",
+      "fact_referents": [
+        "Task 3384"
+      ],
+      "fact": "Task 3384 did not implement the routing fix itself but corrected its claim instead.",
+      "episodes": [
+        "574945d6-e17c-4390-87fd-82cac19eb1d6"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3384",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "1f2ceb0e-930b-4601-a7cf-bff27a3b92ca",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3636",
+      "node_task_id": "3636",
+      "node_referent": "Task 3636",
+      "fact_referents": [
+        "Task 3635",
+        "Task 4761"
+      ],
+      "fact": "Blocked task 4761 is based on the premise that re-rule task 3635 should be against the band being decline-shaped, not incapability-shaped.",
+      "episodes": [
+        "95a95a85-6299-4ee3-94ee-92a4eb2dd613"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3635",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "06c5c9cf-12e0-4776-9ca7-5e2cf320dd49",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3673",
+      "node_task_id": "3673",
+      "node_referent": "Task 3673",
+      "fact_referents": [
+        "Task 2520"
+      ],
+      "fact": "The UNARY fact is attached to the Task 2520 node.",
+      "episodes": [
+        "672d203f-955e-492d-8ad6-9dc14bd0850b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2520",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "73b42fd2-6de8-4ee9-aa32-62cb172bd722",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3729",
+      "node_task_id": "3729",
+      "node_referent": "Task 3729",
+      "fact_referents": [
+        "Task 3728"
+      ],
+      "fact": "Task 3728 suppresses the FALSE storm signal but does not make resume work.",
+      "episodes": [
+        "df5a3eaf-08a8-4dc3-9c55-5be5bb9e9b2c"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3728",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f85d19f9-239b-45fa-a04a-ebc5c617fb56",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3729",
+      "node_task_id": "3729",
+      "node_referent": "Task 3729",
+      "fact_referents": [
+        "Task 3619"
+      ],
+      "fact": "The agent_session.json sidecar carries the session_id needed by Task 3619's sweeper.",
+      "episodes": [
+        "bfeaf325-f52c-43be-a51e-6f4454197a4b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3619",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "ebab1964-8ed6-4f63-a561-a7ed9b069b0b",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3730",
+      "node_task_id": "3730",
+      "node_referent": "Task 3730",
+      "fact_referents": [
+        "Task 3728"
+      ],
+      "fact": "Task 3728 suppresses the FALSE storm signal but does not make resume work.",
+      "episodes": [
+        "df5a3eaf-08a8-4dc3-9c55-5be5bb9e9b2c"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3728",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "1fd8c491-711a-4d34-b238-adca629cce28",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3732",
+      "node_task_id": "3732",
+      "node_referent": "Task 3732",
+      "fact_referents": [
+        "Task 3465"
+      ],
+      "fact": "Tasks 3465 edits skills/escalation-watcher-auto/SKILL.md and will rebase over the recent commit.",
+      "episodes": [
+        "d074a0d8-1705-42bc-8491-3041ab391e63"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3465",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "53c32b89-10bb-4409-a42a-046d2e041e69",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3733",
+      "node_task_id": "3733",
+      "node_referent": "Task 3733",
+      "fact_referents": [
+        "Task 3728"
+      ],
+      "fact": "Task 3728 suppresses the FALSE storm signal but does not make resume work.",
+      "episodes": [
+        "df5a3eaf-08a8-4dc3-9c55-5be5bb9e9b2c"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3728",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "deeb2a63-e212-497f-8150-ecffc2c0a115",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3751",
+      "node_task_id": "3751",
+      "node_referent": "Task 3751",
+      "fact_referents": [
+        "Task 2767"
+      ],
+      "fact": "Task 2767 is closed and is not the correct target for escalation.",
+      "episodes": [
+        "424a38b1-832d-434e-96fd-d7c3e4b0a29e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2767",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "473f5938-7799-4722-a9df-f3e79d78adad",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3763",
+      "node_task_id": "3763",
+      "node_referent": "Task 3763",
+      "fact_referents": [
+        "Task 3726"
+      ],
+      "fact": "Tasks 3726 edits skills/escalation-watcher-auto/SKILL.md and will rebase over the recent commit.",
+      "episodes": [
+        "d074a0d8-1705-42bc-8491-3041ab391e63"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3726",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "b8fabad7-42d3-4596-af13-666e697a8f8b",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3871",
+      "node_task_id": "3871",
+      "node_referent": "Task 3871",
+      "fact_referents": [
+        "Task 3857"
+      ],
+      "fact": "Task 3857's offline-banner honesty fix was kept inside task 3857 rather than splitting it into its own task, reversing an earlier suggestion to split.",
+      "episodes": [
+        "cd175b58-8a03-4799-86a4-7556ee059722"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3857",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "ef92b342-bcc7-4519-9ed1-298c6d7fe44a",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3871",
+      "node_task_id": "3871",
+      "node_referent": "Task 3871",
+      "fact_referents": [
+        "Task 3857"
+      ],
+      "fact": "The keepalive_expiry/max_connections defect found in the same session was deliberately not folded into task 3857 and is flagged for its own follow-up.",
+      "episodes": [
+        "cd175b58-8a03-4799-86a4-7556ee059722"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3857",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "d24d58f5-538d-4837-ae48-a122d0814057",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 3986",
+      "node_task_id": "3986",
+      "node_referent": "Task 3986",
+      "fact_referents": [
+        "Task 4000"
+      ],
+      "fact": "Task 4000 handles the guard hazard with a machine-readable marker that bypasses the misconfigured counter.",
+      "episodes": [
+        "98ace763-5758-4b77-b395-c45343e5e603"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4000",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "bd879ad6-96f6-4e98-9fbf-8ba607fa49bd",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4023",
+      "node_task_id": "4023",
+      "node_referent": "Task 4023",
+      "fact_referents": [
+        "Task 2425"
+      ],
+      "fact": "Task 2425 requires human ruling as it confirms the intended cross-stage collapse in recon_report's cited-task fold.",
+      "episodes": [
+        "6abb9108-bd82-4cff-81ad-b855160059ec"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2425",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "7c081bef-5e3e-466a-8206-1ee5788d73bb",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4028",
+      "node_task_id": "4028",
+      "node_referent": "Task 4028",
+      "fact_referents": [
+        "Task 4027"
+      ],
+      "fact": "Defect 2 was filed as task 4027 because fixing it requires a design change.",
+      "episodes": [
+        "53ddadb8-3ab1-4b05-9cd2-c48ad76ab630"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4027",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "7eda4319-6de0-44d1-82a3-e0767a0e73f0",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4039",
+      "node_task_id": "4039",
+      "node_referent": "Task 4039",
+      "fact_referents": [
+        "Task 4031"
+      ],
+      "fact": "The shared helper may be reused if task 4031 has landed, otherwise it will be inlined.",
+      "episodes": [
+        "1a8ed615-5a85-42c2-8218-863b5b59a3ba"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4031",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "144a61d8-dab0-486c-bce6-d2096e2ff0d8",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4198",
+      "node_task_id": "4198",
+      "node_referent": "Task 4198",
+      "fact_referents": [
+        "Task 3746"
+      ],
+      "fact": "Task 3746 discarded its 8 existing commits because they were based on outdated assertions.",
+      "episodes": [
+        "25a26dcd-1456-4f15-888e-18ec957c4242"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3746",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6774c561-020a-4462-821c-cdc01ab4001b",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4208",
+      "node_task_id": "4208",
+      "node_referent": "Task 4208",
+      "fact_referents": [
+        "Task 4202",
+        "Task 4229"
+      ],
+      "fact": "Task 4202 was cancelled as a duplicate of task 4229.",
+      "episodes": [
+        "6bbe4109-d3c3-4908-9ce2-971f4ea1e005"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4202",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "60ba1b60-7caa-4980-b83c-f52816dea50b",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4377",
+      "node_task_id": "4377",
+      "node_referent": "Task 4377",
+      "fact_referents": [
+        "Task 4371"
+      ],
+      "fact": "Task 4371 covers the implementation boundary for the touched-but-undeclared scope check.",
+      "episodes": [
+        "4fa1f656-a8e6-4d8e-b6bb-2e34617a58b7"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4371",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "7abf7b11-a9e0-4a2e-8d7c-d80f5185fe30",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4377",
+      "node_task_id": "4377",
+      "node_referent": "Task 4377",
+      "fact_referents": [
+        "Task 4370",
+        "Task 4371"
+      ],
+      "fact": "task 4371 depends on task 4370.",
+      "episodes": [
+        "8c93d2eb-bffa-47f0-aa18-1e0903623607"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4370",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f729cf96-4443-4de3-8817-d5cd39d74dc5",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4377",
+      "node_task_id": "4377",
+      "node_referent": "Task 4377",
+      "fact_referents": [
+        "Task 4371"
+      ],
+      "fact": "Task 4371 also covers the DEBUGGER in the context of the touched-but-undeclared scope check.",
+      "episodes": [
+        "4fa1f656-a8e6-4d8e-b6bb-2e34617a58b7"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4371",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "c6cb291b-9661-4eb9-9e5f-8b174935839b",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4381",
+      "node_task_id": "4381",
+      "node_referent": "Task 4381",
+      "fact_referents": [
+        "Task 3841"
+      ],
+      "fact": "Escalation esc-3841-1 has discharged gate task 3841 as done.",
+      "episodes": [
+        "7c5484fb-d328-4cc2-a5e9-367ddd7a47f2"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3841",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6ca05a84-d55b-413e-821a-248ff049f827",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4529",
+      "node_task_id": "4529",
+      "node_referent": "Task 4529",
+      "fact_referents": [
+        "Task 452"
+      ],
+      "fact": "The proposed dark_factory task to harden autopilot_video task 452's cadence-check anchor selection was rejected, and the mechanism was retired.",
+      "episodes": [
+        "c4e8c9fd-29c1-4976-816c-c22e246bb0e8"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "452",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "bc8fc55a-5a35-4cdb-a654-d0ad5f0917f3",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4559",
+      "node_task_id": "4559",
+      "node_referent": "Task 4559",
+      "fact_referents": [
+        "Task 4601"
+      ],
+      "fact": "The miss half is caused by the denominator and is owned by follow-up task 4601.",
+      "episodes": [
+        "90fe410b-ba6b-4149-927b-bd64679de239"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4601",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "06e8e9ac-4f1a-47a6-bb06-c751126b1289",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4561",
+      "node_task_id": "4561",
+      "node_referent": "Task 4561",
+      "fact_referents": [
+        "Task 4560"
+      ],
+      "fact": "Task 4560 is related to the dark_factory project as it addresses the defect in the routing mechanism.",
+      "episodes": [
+        "46c7b14e-a5f4-42df-b168-d7b5bdac3d32"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4560",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "705bec48-5c04-49c7-bae2-fc64b722db2e",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4581",
+      "node_task_id": "4581",
+      "node_referent": "Task 4581",
+      "fact_referents": [
+        "Task 4579",
+        "Task 4580"
+      ],
+      "fact": "Task 4580 depends on task 4579.",
+      "episodes": [
+        "7e79c02a-195d-4735-b627-bd1701b6bb61"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4580",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "5798a829-181b-43bd-976a-a468fa672ae1",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4601",
+      "node_task_id": "4601",
+      "node_referent": "Task 4601",
+      "fact_referents": [
+        "Task 4619",
+        "Task 4667"
+      ],
+      "fact": "Task 4667 is scoped explicitly as hygiene and depends on task 4619.",
+      "episodes": [
+        "91d75488-37de-4251-b7ef-3e6b81dad11e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4619",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "ea323a88-08a1-42f2-8d9c-dbbeab4d0fe3",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4619",
+      "node_task_id": "4619",
+      "node_referent": "Task 4619",
+      "fact_referents": [
+        "Task 4222",
+        "Task 4618"
+      ],
+      "fact": "Task 4222's staleness thresholds question was answered by task 4618.",
+      "episodes": [
+        "b874378e-ba6c-42f3-bd63-f324d2c053d9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4618",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ce0772a4-5405-46e9-955a-0be0b2090d4c",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4625",
+      "node_task_id": "4625",
+      "node_referent": "Task 4625",
+      "fact_referents": [
+        "Task 4222",
+        "Task 4623"
+      ],
+      "fact": "Task 4222's location question was also answered by task 4623.",
+      "episodes": [
+        "b874378e-ba6c-42f3-bd63-f324d2c053d9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4623",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "d54c2f63-d64d-4dc2-92aa-1659fd413453",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "Task 4645",
+      "node_task_id": "4645",
+      "node_referent": "Task 4645",
+      "fact_referents": [
+        "Task 3539",
+        "Task 4651"
+      ],
+      "fact": "Task 4651 owns pending/merge-deferred, which never reach the table for task 3539's in-progress rows.",
+      "episodes": [
+        "816b1845-4905-4791-b09b-bd5fbe3242c2"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3539",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "317292d7-2d23-478a-be04-6b7d52d22a8b",
+      "graph": "dark_factory",
+      "end": "object",
+      "node_name": "task 4697",
+      "node_task_id": "4697",
+      "node_referent": "Task 4697",
+      "fact_referents": [
+        "Task 1833"
+      ],
+      "fact": "Task 1833 was held for 2262 ticks due to resolver_degraded.",
+      "episodes": [
+        "ffa31f97-6bd9-426a-8d2e-bcb696d990ed"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "1833",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6d6d8985-bc01-41ca-9d31-1e9f992e9296",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task #10",
+      "node_task_id": "10",
+      "node_referent": "Task 10",
+      "fact_referents": [
+        "Task 3880"
+      ],
+      "fact": "Task 3880 was completed as of 2026-05-27.",
+      "episodes": [
+        "b5b09675-cff1-4a51-a727-c32f95d26c35"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3880",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "8c9e990f-0baf-4a61-bf7b-9f36c75fb073",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task #10",
+      "node_task_id": "10",
+      "node_referent": "Task 10",
+      "fact_referents": [
+        "Task 3800"
+      ],
+      "fact": "Task 3800 was completed as of 2026-05-27.",
+      "episodes": [
+        "b5b09675-cff1-4a51-a727-c32f95d26c35"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3800",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "3baeb93c-842d-47fd-9ea1-9cbf63a280ad",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 266",
+      "node_task_id": "266",
+      "node_referent": "Task 266",
+      "fact_referents": [
+        "Task 3895"
+      ],
+      "fact": "Task 3895 was created as of 2026-05-27.",
+      "episodes": [
+        "7bd166e9-2ae3-445a-b445-34fd3a1ad94d"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3895",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "36e0c23c-5b4e-4f7b-b809-39729c71902f",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 319",
+      "node_task_id": "319",
+      "node_referent": "Task 319",
+      "fact_referents": [
+        "Task 3191"
+      ],
+      "fact": "Task 3191 tracks the movement of the exhaustive tables to a shared Display impl on reify-types to eliminate cross-crate drift.",
+      "episodes": [
+        "d7c70878-6f38-497a-bb97-5f01b8f5fc87"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "3191",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "1620132e-f14e-466b-8d35-80097322acdc",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 923",
+      "node_task_id": "923",
+      "node_referent": "Task 923",
+      "fact_referents": [
+        "Task 955"
+      ],
+      "fact": "Task 955 was bulk-cancelled during Stage 2 reconciliation cycle d5d5c55e.",
+      "episodes": [
+        "f086739b-8add-4946-a859-a257b8301b93"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "955",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "05602754-70aa-4ad2-819b-f00cb124501f",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "dark_factory:1791",
+      "node_task_id": "1791",
+      "node_referent": "dark_factory:1791",
+      "fact_referents": [
+        "dark_factory:1799",
+        "dark_factory:1800"
+      ],
+      "fact": "The task dark_factory:1800 was deliberately not filed as a reify task with an external dependency on dark_factory:1799.",
+      "episodes": [
+        "5d8745c3-d442-4c5b-afb6-6c2afe434a3b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "2488db91-9992-4f02-84f8-c6867a1807d6",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "tasks 1999",
+      "node_task_id": "1999",
+      "node_referent": "Task 1999",
+      "fact_referents": [
+        "Task 1997"
+      ],
+      "fact": "Task 1997's live-status was verified as in-progress by the freshness-gate check.",
+      "episodes": [
+        "71dcbcde-343c-4984-b934-172350d7714e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1997",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "94575eda-dd74-4df7-ba9e-c556ad3f858a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "tasks 1999",
+      "node_task_id": "1999",
+      "node_referent": "Task 1999",
+      "fact_referents": [
+        "Task 1997"
+      ],
+      "fact": "The freshness gate was applied to Task 1997 per FLAG-S2-STALE-STALL-GUARD-PATTERN-2.",
+      "episodes": [
+        "71dcbcde-343c-4984-b934-172350d7714e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1997",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "d9595ff2-5814-430a-89e7-659a44a34746",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "tasks 1999",
+      "node_task_id": "1999",
+      "node_referent": "Task 1999",
+      "fact_referents": [
+        "Task 1997"
+      ],
+      "fact": "Task 1997 is the second occurrence of the stale-stall-guard pattern.",
+      "episodes": [
+        "71dcbcde-343c-4984-b934-172350d7714e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1997",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f0761c0f-ea34-4785-bf67-d43718ed59ac",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "tasks 1999",
+      "node_task_id": "1999",
+      "node_referent": "Task 1999",
+      "fact_referents": [
+        "Task 1997"
+      ],
+      "fact": "Task 1997 was shown as pending due to a stale snapshot.",
+      "episodes": [
+        "71dcbcde-343c-4984-b934-172350d7714e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "1997",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f0815ef7-92c7-4f69-809f-2c234571ec1d",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 2138",
+      "node_task_id": "2138",
+      "node_referent": "Task 2138",
+      "fact_referents": [
+        "Task 2141"
+      ],
+      "fact": "Task 2141 experienced a multi-state bounce within a single reconciliation cycle.",
+      "episodes": [
+        "70f81f94-ab5f-40d4-a85f-4ec5d00c0705"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2141",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "70aef703-1c74-4366-b5e4-0f46548765e6",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 2180",
+      "node_task_id": "2180",
+      "node_referent": "Task 2180",
+      "fact_referents": [
+        "Task 2183"
+      ],
+      "fact": "Task 2183 has the title 'engine_edit Fix 2: drop redundant entirely-removed-sub sweep + tighten Fix 1 comment and HashSet alloc'.",
+      "episodes": [
+        "c3fb7576-bc1f-4492-ba46-f3d46c791bc9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2183",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e4e89204-2f4f-4b65-afd6-672ca0fe6db4",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 2180",
+      "node_task_id": "2180",
+      "node_referent": "Task 2180",
+      "fact_referents": [
+        "Task 2183"
+      ],
+      "fact": "Task 2183 is sourced from esc-2086-28.",
+      "episodes": [
+        "c3fb7576-bc1f-4492-ba46-f3d46c791bc9"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2183",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "87448b96-e5c3-40f1-ac8f-1d79da5bb148",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 2268",
+      "node_task_id": "2268",
+      "node_referent": "Task 2268",
+      "fact_referents": [
+        "Task 2259"
+      ],
+      "fact": "The fast-path divergence bugs from Task 2259 revealed structural divergence between eval() and eval_cached().",
+      "episodes": [
+        "5c40e3d0-280f-439e-aad2-4497454e349b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2259",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "faa8d843-190f-449b-b443-06fabcca0060",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 2268",
+      "node_task_id": "2268",
+      "node_referent": "Task 2268",
+      "fact_referents": [
+        "Task 2266"
+      ],
+      "fact": "The fast-path divergence bugs from Task 2266 revealed structural divergence between eval() and eval_cached().",
+      "episodes": [
+        "5c40e3d0-280f-439e-aad2-4497454e349b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2266",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "0eb5ef53-1736-4d88-9be5-b3ee84f3e9e4",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2342",
+      "node_task_id": "2342",
+      "node_referent": "Task 2342",
+      "fact_referents": [
+        "Task 2347",
+        "Task 2354"
+      ],
+      "fact": "Task 2354 fixed gaps that were previously listed in task 2347.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2347",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "679942f0-5e01-460a-be0f-558bc9cfddd9",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2342",
+      "node_task_id": "2342",
+      "node_referent": "Task 2342",
+      "fact_referents": [
+        "Task 2347"
+      ],
+      "fact": "Task 2347 is the deliverable for the stdlib-trait-breadth audit dated 2026-04-26.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2347",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "d80970ea-bd53-469d-8bf8-51878e0c00c8",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2342",
+      "node_task_id": "2342",
+      "node_referent": "Task 2342",
+      "fact_referents": [
+        "Task 2347",
+        "Task 2352"
+      ],
+      "fact": "Task 2352 fixed gaps that were previously listed in task 2347.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2347",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "e54c4519-e4d7-475c-a3f7-3645481f3312",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2342",
+      "node_task_id": "2342",
+      "node_referent": "Task 2342",
+      "fact_referents": [
+        "Task 2347",
+        "Task 2349"
+      ],
+      "fact": "Task 2349 fixed gaps that were previously listed in task 2347.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2347",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "d80970ea-bd53-469d-8bf8-51878e0c00c8",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2351",
+      "node_task_id": "2351",
+      "node_referent": "Task 2351",
+      "fact_referents": [
+        "Task 2347",
+        "Task 2352"
+      ],
+      "fact": "Task 2352 fixed gaps that were previously listed in task 2347.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2352",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ec3649b7-eb26-4b24-a573-b6100672ac78",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2351",
+      "node_task_id": "2351",
+      "node_referent": "Task 2351",
+      "fact_referents": [
+        "Task 2352"
+      ],
+      "fact": "Task 2352 is one of the deliverables for the stdlib-trait-breadth audit.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2352",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "6676d6c7-cad0-4cdb-8297-d427d757b590",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2354",
+      "node_task_id": "2354",
+      "node_referent": "Task 2354",
+      "fact_referents": [
+        "Task 2349"
+      ],
+      "fact": "Task 2349 is one of the deliverables for the stdlib-trait-breadth audit.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2349",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e54c4519-e4d7-475c-a3f7-3645481f3312",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2354",
+      "node_task_id": "2354",
+      "node_referent": "Task 2354",
+      "fact_referents": [
+        "Task 2347",
+        "Task 2349"
+      ],
+      "fact": "Task 2349 fixed gaps that were previously listed in task 2347.",
+      "episodes": [
+        "f6c10c28-8373-41da-91cd-e836a0f0ef1a"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2347",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "283173b4-1ba7-4d5e-82e5-ec6d505f6a97",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 2590",
+      "node_task_id": "2590",
+      "node_referent": "Task 2590",
+      "fact_referents": [
+        "Task 2593"
+      ],
+      "fact": "Task 2593 was created as a new pending task under the persistent-naming-v2 project.",
+      "episodes": [
+        "6499734e-5730-425f-bd0a-8a1bc7520a45"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2593",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "887ee27c-36fc-47d3-a5f9-70a726d07ba2",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 2590",
+      "node_task_id": "2590",
+      "node_referent": "Task 2590",
+      "fact_referents": [
+        "Task 2592"
+      ],
+      "fact": "Task 2592 was created as a new pending task under the persistent-naming-v2 project.",
+      "episodes": [
+        "6499734e-5730-425f-bd0a-8a1bc7520a45"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2592",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f04d4eb1-8550-45eb-b81e-0a07b5429635",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 2590",
+      "node_task_id": "2590",
+      "node_referent": "Task 2590",
+      "fact_referents": [
+        "Task 2591"
+      ],
+      "fact": "Task 2591 was created as a new pending task under the persistent-naming-v2 project.",
+      "episodes": [
+        "6499734e-5730-425f-bd0a-8a1bc7520a45"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2591",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e8c67496-02bf-4bdb-aa0c-c18d96489b59",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2669",
+      "node_task_id": "2669",
+      "node_referent": "Task 2669",
+      "fact_referents": [
+        "Task 3528"
+      ],
+      "fact": "Task 3528 was cancelled.",
+      "episodes": [
+        "6ee043e1-862d-429a-b7f6-f4b29f94157a"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3528",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f4bbaaca-837e-409f-bf0a-0fa1b25e2c87",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 2699",
+      "node_task_id": "2699",
+      "node_referent": "Task 2699",
+      "fact_referents": [
+        "Task 2324"
+      ],
+      "fact": "Task 2324 is now fully claimable.",
+      "episodes": [
+        "d2ca0a67-0b89-4e05-8b9f-1a06000572a1"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2324",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "873164ed-5501-4a46-9661-92451ed9ce66",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2962",
+      "node_task_id": "2962",
+      "node_referent": "Task 2962",
+      "fact_referents": [
+        "Task 2963"
+      ],
+      "fact": "Task 2963 is completed and is part of the Deformed-shape view end-to-end mechanism.",
+      "episodes": [
+        "0bb6a1ed-ed5c-4962-8cab-78975af49882"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "2963",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "8d66daf3-a078-4d4e-9328-1e76c310b604",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 2979",
+      "node_task_id": "2979",
+      "node_referent": "Task 2979",
+      "fact_referents": [
+        "Task 2981"
+      ],
+      "fact": "Task 2981 was moved from pending to blocked.",
+      "episodes": [
+        "9ee72340-c610-4e72-a9ce-320bc06dab60"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2981",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "cd8a87a2-823f-499f-9ab0-1808c374976c",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 2995",
+      "node_task_id": "2995",
+      "node_referent": "Task 2995",
+      "fact_referents": [
+        "Task 4993"
+      ],
+      "fact": "Task 4993 was resolved via merge_entities, confirming nodes 309c9bd9/d2f52619 are gone as indicated by NodeNotFoundError.",
+      "episodes": [
+        "16e3aae4-944d-4ec8-8a17-6466f34bb831"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4993",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "2f7c6873-5070-49d3-bca6-8e8125bf5d97",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 3019",
+      "node_task_id": "3019",
+      "node_referent": "Task 3019",
+      "fact_referents": [
+        "Task 2918",
+        "Task 2919"
+      ],
+      "fact": "Task 2919 depends on task 2918.",
+      "episodes": [
+        "e2dc2628-171f-4bee-8340-685de34e7a0e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2918",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "442c14ea-a580-443f-b9ae-9d4a4d29bb0c",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 3019",
+      "node_task_id": "3019",
+      "node_referent": "Task 3019",
+      "fact_referents": [
+        "Task 2916",
+        "Task 2919"
+      ],
+      "fact": "Task 2919 depends on task 2916.",
+      "episodes": [
+        "e2dc2628-171f-4bee-8340-685de34e7a0e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2916",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "4b782505-333f-4667-a931-136c57912dd3",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 3019",
+      "node_task_id": "3019",
+      "node_referent": "Task 3019",
+      "fact_referents": [
+        "Task 2919",
+        "Task 3017"
+      ],
+      "fact": "Task 3017 is not task 2919.",
+      "episodes": [
+        "e2dc2628-171f-4bee-8340-685de34e7a0e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3017",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "d0b345d7-6cae-4e6b-9b5e-904fbd963904",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 3019",
+      "node_task_id": "3019",
+      "node_referent": "Task 3019",
+      "fact_referents": [
+        "Task 2919"
+      ],
+      "fact": "Task 2919 is related to the FEA solver, specifically focusing on CG with Jacobi preconditioner via faer-rs.",
+      "episodes": [
+        "e2dc2628-171f-4bee-8340-685de34e7a0e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "2919",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "14525eaf-9078-4332-ac8a-d34ba35a71d4",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 3024",
+      "node_task_id": "3024",
+      "node_referent": "Task 3024",
+      "fact_referents": [
+        "Task 3025"
+      ],
+      "fact": "The stale snapshot indicates that tasks 3025 has been completed since the last snapshot.",
+      "episodes": [
+        "5735728d-e633-4951-b570-6393711df0aa"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3025",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2c5a4cfb-c633-4d40-84f4-0abaf1a2f20c",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "dark_factory:3071",
+      "node_task_id": "3071",
+      "node_referent": "dark_factory:3071",
+      "fact_referents": [
+        "Task 5638"
+      ],
+      "fact": "Task 5638 recorded sound analysis worth preserving regarding the _merge-verify lane-lock failure class.",
+      "episodes": [
+        "4a1615a4-de1b-4cca-a6f5-27815a6297b1"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "5638",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2bdbeab3-035a-43fe-bb0f-fa8077ee4881",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3117",
+      "node_task_id": "3117",
+      "node_referent": "Task 3117",
+      "fact_referents": [
+        "Task 3"
+      ],
+      "fact": "Decomposition task #3 is responsible for the ElasticResult API extension.",
+      "episodes": [
+        "3bcc937e-6dae-4772-9a5a-55a4067e025f"
+      ],
+      "proximity": "prefix",
+      "nearest_id": "3",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2c333dd7-8f26-49f7-911f-6b369776f6ad",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3134",
+      "node_task_id": "3134",
+      "node_referent": "Task 3134",
+      "fact_referents": [
+        "Task 3136"
+      ],
+      "fact": "Task 3136 has commit 2c77bd75df1710cef646644115444e3ec37890eb associated with it.",
+      "episodes": [
+        "a6cc91be-7d86-4db5-8620-cb3840972798"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3136",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "309fd159-ea8b-49c3-9ef5-924a7995f1a9",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 3246",
+      "node_task_id": "3246",
+      "node_referent": "Task 3246",
+      "fact_referents": [
+        "Task 3249"
+      ],
+      "fact": "Task 3249 adds test coverage for exponent-form Real literals.",
+      "episodes": [
+        "4b64388f-964b-4e3c-9c15-5e6407fb1aea"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3249",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "3248c0c3-0051-4f46-8813-50c8772b6a3e",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3316",
+      "node_task_id": "3316",
+      "node_referent": "Task 3316",
+      "fact_referents": [
+        "Task 3317",
+        "Task 3341"
+      ],
+      "fact": "Task 3317 must not run before Task 3341 completes, as it depends on compile_entry_with_imports still existing.",
+      "episodes": [
+        "29b12b47-f991-4c97-a26d-eb12579a0fa7"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3317",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e4b1e85b-43b9-44a0-b30b-88499433a2db",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3316",
+      "node_task_id": "3316",
+      "node_referent": "Task 3316",
+      "fact_referents": [
+        "Task 3318",
+        "Task 3341"
+      ],
+      "fact": "Task 3318 must not run before Task 3341 completes, as it depends on compile_entry_with_imports still existing.",
+      "episodes": [
+        "29b12b47-f991-4c97-a26d-eb12579a0fa7"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3318",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "ed5d66c0-fd80-4bd3-950f-66befc53e1cc",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 3413",
+      "node_task_id": "3413",
+      "node_referent": "Task 3413",
+      "fact_referents": [
+        "Task 3386",
+        "Task 3414"
+      ],
+      "fact": "Task 3386 is a direct prerequisite for Task 3414.",
+      "episodes": [
+        "f4ad41e5-439a-4d3a-97ca-05b4250caaaa"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3414",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6a0a25d3-107d-4fa2-8d6b-14dfde5d2fb9",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3443",
+      "node_task_id": "3443",
+      "node_referent": "Task 3443",
+      "fact_referents": [
+        "Task 4043"
+      ],
+      "fact": "BOOKMARK task 4043 tracks the G3-premise-gap design-first work surfaced by esc-3437-13.",
+      "episodes": [
+        "cf9f1352-dc88-4fe2-b878-9a72bb76b07b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4043",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "b475f624-001f-4d23-9ee1-1f3d2bf0d9b0",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 3443",
+      "node_task_id": "3443",
+      "node_referent": "Task 3443",
+      "fact_referents": [
+        "Task 4043"
+      ],
+      "fact": "esc-3437-13 was resolved on 2026-05-27, allowing progress on BOOKMARK task 4043.",
+      "episodes": [
+        "cf9f1352-dc88-4fe2-b878-9a72bb76b07b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4043",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "e858fb65-9737-412e-98a2-fc204d57520d",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 3526",
+      "node_task_id": "3526",
+      "node_referent": "Task 3526",
+      "fact_referents": [
+        "Task 3525"
+      ],
+      "fact": "Task 3525 belongs in the TDD pipeline due to its dependency on a native C++ dependency.",
+      "episodes": [
+        "b3374bff-9bbf-4ec8-acbe-0d886537d51d"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3525",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2a0a345e-1965-475e-ac4b-a8b8218d2932",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3591",
+      "node_task_id": "3591",
+      "node_referent": "Task 3591",
+      "fact_referents": [
+        "Task 3555"
+      ],
+      "fact": "The same pattern used for the gmsh NodeAttachment/BoundaryAssociation cycle was applied to resolve the crate cycle in Task 3555.",
+      "episodes": [
+        "efea8820-b62c-46e5-b66d-cd8ce163f5de"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3555",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "614bf88e-bc0e-465d-9ff6-219f4f01af80",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3632",
+      "node_task_id": "3632",
+      "node_referent": "Task 3632",
+      "fact_referents": [
+        "Task 3631",
+        "Task 3633"
+      ],
+      "fact": "Task 3631 enables downstream task 3633.",
+      "episodes": [
+        "26e0292c-3fad-4d56-94ca-809a4aa16c5b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3631",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "01785ea0-cadb-4f5c-bfe7-d89ec2485fd0",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 3836",
+      "node_task_id": "3836",
+      "node_referent": "Task 3836",
+      "fact_referents": [
+        "Task 3838"
+      ],
+      "fact": "Task 3838 refactored eval_inverse_dynamics through a shared seam.",
+      "episodes": [
+        "38a50a4d-a37c-49cb-b6d7-8e55b3dd62a4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3838",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "d7c79cee-9488-40f4-8cb0-819709958f0a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 3883",
+      "node_task_id": "3883",
+      "node_referent": "Task 3883",
+      "fact_referents": [
+        "Task 3894"
+      ],
+      "fact": "Task 3894 (RBD-\u03b1.1b) includes a ctor hook at engine_eval.rs:1794.",
+      "episodes": [
+        "e972ba5f-2b07-430e-804b-63c43e21a5d8"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3894",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "446e106b-1ab6-4744-8c58-dd6bf9b3f8b5",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 3908",
+      "node_task_id": "3908",
+      "node_referent": "Task 3908",
+      "fact_referents": [
+        "Task 4148"
+      ],
+      "fact": "The T10 sub-placement integration gate does not need a dependency on task 4148.",
+      "episodes": [
+        "c062400f-71f0-4129-a550-22bdf633d477"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4148",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "75abeea1-4883-48e5-a8d7-e5b9e2e4c24d",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4002",
+      "node_task_id": "4002",
+      "node_referent": "Task 4002",
+      "fact_referents": [
+        "Task 4000"
+      ],
+      "fact": "The issue with the semaphore was surfaced by esc-4000-39, which timed out during the post-merge verify of task 4000.",
+      "episodes": [
+        "15a1b133-e81c-497d-9e99-6a3320ebb51e"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4000",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "a0056eca-5754-4751-8cc7-b85bc9812ff6",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4003",
+      "node_task_id": "4003",
+      "node_referent": "Task 4003",
+      "fact_referents": [
+        "Task 4000"
+      ],
+      "fact": "Task 4000 covers the --purpose flag consumer surface.",
+      "episodes": [
+        "babcf55a-2e16-4e21-85a3-f5d21f486976"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4000",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "bfb026e9-aba7-4a0d-9279-b4aff2e32c82",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4068",
+      "node_task_id": "4068",
+      "node_referent": "Task 4068",
+      "fact_referents": [
+        "Task 3392"
+      ],
+      "fact": "The degenerate-shell element is a strict improvement on the flat transverse-shear of Task 3392.",
+      "episodes": [
+        "a6952530-6823-4148-987e-97e9de1e740e",
+        "fa5d41e1-bbc5-4796-a4e3-559bf230ca96"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3392",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "02c89fb4-9ffe-4ea2-afd0-dd874e64b868",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4071",
+      "node_task_id": "4071",
+      "node_referent": "Task 4071",
+      "fact_referents": [
+        "Task 4820"
+      ],
+      "fact": "Clause (1) was split out to a new keeper task 4820 because it was blocked for different reasons.",
+      "episodes": [
+        "6479d110-2b6e-4275-8cbb-bbd1119295f4"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4820",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "7f438458-5e84-49fa-8fd4-bbe0a17bdcaa",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4105",
+      "node_task_id": "4105",
+      "node_referent": "Task 4105",
+      "fact_referents": [
+        "Task 4082"
+      ],
+      "fact": "The GUI buckling mode-shape preview depends on task 4082 being done.",
+      "episodes": [
+        "fb27aed2-9f1c-4d49-8e10-5b48be4cd976"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4082",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "f8937569-075a-4270-bd44-d615d1bc1980",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4105",
+      "node_task_id": "4105",
+      "node_referent": "Task 4105",
+      "fact_referents": [
+        "Task 4072"
+      ],
+      "fact": "The GUI buckling mode-shape preview depends on task 4072 being done.",
+      "episodes": [
+        "fb27aed2-9f1c-4d49-8e10-5b48be4cd976"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4072",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "f4481d01-028c-45b5-898c-87142a73ff50",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4111",
+      "node_task_id": "4111",
+      "node_referent": "Task 4111",
+      "fact_referents": [
+        "Task 3867"
+      ],
+      "fact": "Cleanups to impulse_shaper.rs cannot be deferred onto task 3867.",
+      "episodes": [
+        "e6dc6ed5-967e-446f-81b0-88a724534006"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "3867",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "2c4815cf-2e52-475c-8bc0-e383483aa44e",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4263",
+      "node_task_id": "4263",
+      "node_referent": "Task 4263",
+      "fact_referents": [
+        "Task 4271"
+      ],
+      "fact": "Task 4271 will use MassProperties as the canonical currency for mechanism-body mass.",
+      "episodes": [
+        "61bbe149-9a6a-4302-b54e-acc5665b75ac"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4271",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "7f3dcc9f-7870-449f-8927-f6af0141d773",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 4263",
+      "node_task_id": "4263",
+      "node_referent": "Task 4263",
+      "fact_referents": [
+        "Task 4271"
+      ],
+      "fact": "Leo's decision to converge mechanism-body mass onto one canonical currency blocks task 4271.",
+      "episodes": [
+        "61bbe149-9a6a-4302-b54e-acc5665b75ac"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4271",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "42a8104d-33f3-436b-a4b7-7ddea55f08f2",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task #4351",
+      "node_task_id": "4351",
+      "node_referent": "Task 4351",
+      "fact_referents": [
+        "Task 4359",
+        "Task 4362"
+      ],
+      "fact": "Task #4362 has Task #4359 as a completed dependency.",
+      "episodes": [
+        "ac650f0a-0c09-4ccd-b28e-59df8fe7ee1f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4359",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "89cf3323-9e24-4e61-865a-9a729abcbe26",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4351",
+      "node_task_id": "4351",
+      "node_referent": "Task 4351",
+      "fact_referents": [
+        "Task 4820",
+        "Task 4829"
+      ],
+      "fact": "Task 4820 was wired to depend on Task 4829.",
+      "episodes": [
+        "6eab0b4c-065a-4847-8cc3-c40fa01d0c9a"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4820",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "b16ed8cb-16d4-4b6a-835a-f656083af3a6",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 4373",
+      "node_task_id": "4373",
+      "node_referent": "Task 4373",
+      "fact_referents": [
+        "Task 4473"
+      ],
+      "fact": "The spawn-brief protocol was used to set task 4473 as deferred at the start of the amendment discussion.",
+      "episodes": [
+        "f64b30c1-1672-462d-b4b6-c69f56895925"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4473",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "00bc56ef-dfdc-4491-a8e6-aefbf0aaee2b",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4375",
+      "node_task_id": "4375",
+      "node_referent": "Task 4375",
+      "fact_referents": [
+        "Task 4379",
+        "Task 4380"
+      ],
+      "fact": "Task 4379 is referred to as sibling B in the context of task 4380.",
+      "episodes": [
+        "31df57b7-a855-4f41-a267-2ed673d4980b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4379",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "e8670300-baf5-447e-96d1-088847b15bb7",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4388",
+      "node_task_id": "4388",
+      "node_referent": "Task 4388",
+      "fact_referents": [
+        "Task 6730"
+      ],
+      "fact": "The GUI DOF badge moves to docs/prds/v0_6/solver-legibility-telemetry.md leaf iota (task #6730).",
+      "episodes": [
+        "a45b1dde-ea46-475a-a4bb-0b80eea50d3d"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6730",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "6502a795-6076-485e-a9a3-26676086b304",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4490",
+      "node_task_id": "4490",
+      "node_referent": "Task 4490",
+      "fact_referents": [
+        "Task 4497"
+      ],
+      "fact": "Task 4497 was reset to pending status after the actions were taken.",
+      "episodes": [
+        "c1459c82-ce13-471b-8ae9-7df266798026"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4497",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "c5c4c429-95cf-440e-87cb-d43cb56302c1",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4490",
+      "node_task_id": "4490",
+      "node_referent": "Task 4490",
+      "fact_referents": [
+        "Task 4497"
+      ],
+      "fact": "The detailed prior plan for Task 4497 was verified as viable and should be reused by the restarted agent.",
+      "episodes": [
+        "c1459c82-ce13-471b-8ae9-7df266798026"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4497",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "d9580f01-f9d8-4486-a821-ec5ec0a384ca",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 4615",
+      "node_task_id": "4615",
+      "node_referent": "Task 4615",
+      "fact_referents": [
+        "Task 4596",
+        "Task 4616"
+      ],
+      "fact": "Leo confirmed that task 4616 should depend on task 4596.",
+      "episodes": [
+        "d21e7ed8-50f7-4388-8e96-bc72b5cc1690"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4616",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ea185157-ab72-4e6a-824d-1cc413856e67",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4615",
+      "node_task_id": "4615",
+      "node_referent": "Task 4615",
+      "fact_referents": [
+        "Task 4616"
+      ],
+      "fact": "Task 4616 is wired to depend on the Gap C honesty-diagnostic leaf.",
+      "episodes": [
+        "d21e7ed8-50f7-4388-8e96-bc72b5cc1690"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4616",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ea50e06c-e823-4afc-9601-4fda31a94162",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 4615",
+      "node_task_id": "4615",
+      "node_referent": "Task 4615",
+      "fact_referents": [
+        "Task 4596",
+        "Task 4616"
+      ],
+      "fact": "The member access for seal.thickness lowers to make_poison_literal until task 4596 is completed, affecting task 4616.",
+      "episodes": [
+        "d21e7ed8-50f7-4388-8e96-bc72b5cc1690"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4616",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "4508fbd0-2231-4176-9701-e84465c8234e",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task #4644",
+      "node_task_id": "4644",
+      "node_referent": "Task 4644",
+      "fact_referents": [
+        "Task 4643"
+      ],
+      "fact": "The fidget per-handle JitShape-cache perf marker is recorded in task #4643.",
+      "episodes": [
+        "fd10fcf0-b9e9-41f6-b2a6-a0a50b0366d3"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4643",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "8047cd8b-d05e-4012-b9e9-9ae95bf48555",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4645",
+      "node_task_id": "4645",
+      "node_referent": "Task 4645",
+      "fact_referents": [
+        "Task 4640",
+        "Task 4646"
+      ],
+      "fact": "Task 4646 supersedes the interim solution of task 4640 by restoring one error.",
+      "episodes": [
+        "c7ce413f-b530-4aa9-89cc-443b02f46851"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4640",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "10379740-90a8-475e-a821-b66c51dc21e3",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4755",
+      "node_task_id": "4755",
+      "node_referent": "Task 4755",
+      "fact_referents": [
+        "Task 4759"
+      ],
+      "fact": "Task 4759 showed deletions in warm_pool.rs.",
+      "episodes": [
+        "ae75ebfb-6267-4a69-8ab9-6f0b56d6f59b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4759",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "51ce0475-9af9-41fc-b67c-d1cceb314a5d",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4755",
+      "node_task_id": "4755",
+      "node_referent": "Task 4755",
+      "fact_referents": [
+        "Task 4759"
+      ],
+      "fact": "Task 4759 confirmed that a plain git rebase applied cleanly after analyzing the diff.",
+      "episodes": [
+        "ae75ebfb-6267-4a69-8ab9-6f0b56d6f59b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4759",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "92cc574a-a541-46f8-b729-ae45aefb09bb",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4755",
+      "node_task_id": "4755",
+      "node_referent": "Task 4755",
+      "fact_referents": [
+        "Task 4759"
+      ],
+      "fact": "Task 4759 showed 4040 deletions in toolpath.rs among other files.",
+      "episodes": [
+        "ae75ebfb-6267-4a69-8ab9-6f0b56d6f59b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4759",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "a5ef5301-0039-459a-bcce-048d34796b1d",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "task 4755",
+      "node_task_id": "4755",
+      "node_referent": "Task 4755",
+      "fact_referents": [
+        "Task 4759"
+      ],
+      "fact": "Task 4759 showed deletions in elastic_static.rs.",
+      "episodes": [
+        "ae75ebfb-6267-4a69-8ab9-6f0b56d6f59b"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4759",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "6b05b9a8-762f-477b-8c26-f3b468545a57",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "task 4859",
+      "node_task_id": "4859",
+      "node_referent": "Task 4859",
+      "fact_referents": [
+        "Task 4837",
+        "Task 4864"
+      ],
+      "fact": "Task 4864's flake fix will be landed first, followed by rebasing task 4837 on top of it.",
+      "episodes": [
+        "767ebb43-6cee-4040-879f-da1219275831"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4837",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "091d397e-8d1b-4c36-96ba-c13e7a900659",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4952",
+      "node_task_id": "4952",
+      "node_referent": "Task 4952",
+      "fact_referents": [
+        "Task 4954"
+      ],
+      "fact": "Task/5026-land6 was chosen over waiting for task 4954 to land first due to task 4954's poor merge verify results.",
+      "episodes": [
+        "2c883d12-3370-462a-afc9-ac3a4c309672"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4954",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "9b104db8-726f-433f-94c2-0609e9efe611",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 4954",
+      "node_task_id": "4954",
+      "node_referent": "Task 4954",
+      "fact_referents": [
+        "Task 6077"
+      ],
+      "fact": "Task #6077's description records that the change also closes the pre-existing #4955 hole.",
+      "episodes": [
+        "042b2e84-0405-4ec1-a68d-b8b19715c679"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6077",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "ab22c3eb-7583-434f-a6ae-0fdbe43f8815",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5011",
+      "node_task_id": "5011",
+      "node_referent": "Task 5011",
+      "fact_referents": [
+        "Task 5017"
+      ],
+      "fact": "Task 5017 has a risk label indicating that human review is required.",
+      "episodes": [
+        "82d5e9b1-c1f5-48a1-8f5a-6ab379de2aeb"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5017",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "99a0c152-de47-4cb5-a802-6a0b1eb6ad6a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5187",
+      "node_task_id": "5187",
+      "node_referent": "Task 5187",
+      "fact_referents": [
+        "Task 5189"
+      ],
+      "fact": "Task 5189 BT-5 resolves reads via direct auto_owner.get, not through derived Let cells like line_cost.",
+      "episodes": [
+        "026fbb46-30b6-4c3b-805f-a3cb2e2a869a"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5189",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "c0db6ca9-23ae-42d9-9973-49c419e4701d",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5189",
+      "node_task_id": "5189",
+      "node_referent": "Task 5189",
+      "fact_referents": [
+        "Task 5334"
+      ],
+      "fact": "The BT-5 acceptance test depends on the cluster-formation gap resolved by Task 5334.",
+      "episodes": [
+        "784fa8a5-49cc-4640-b082-0f23e60aa4b1"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "5334",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "0851f0e4-4445-453e-a5d5-5aab1b1e03d8",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 5363",
+      "node_task_id": "5363",
+      "node_referent": "Task 5363",
+      "fact_referents": [
+        "Task 5569"
+      ],
+      "fact": "task 5569 was filed as a follow-up task on 2026-07-26.",
+      "episodes": [
+        "919a2912-b38d-4704-993a-07d661bf7bac"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "5569",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "75dab54d-d842-4a11-bc30-10857fd698e3",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 5462",
+      "node_task_id": "5462",
+      "node_referent": "Task 5462",
+      "fact_referents": [
+        "Task 6077"
+      ],
+      "fact": "Task #6077 is already dep-gated behind #5467.",
+      "episodes": [
+        "042b2e84-0405-4ec1-a68d-b8b19715c679"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6077",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "c420de2a-a71b-43e4-b68c-0c8383c3c5a9",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 5535",
+      "node_task_id": "5535",
+      "node_referent": "Task 5535",
+      "fact_referents": [
+        "Task 5415"
+      ],
+      "fact": "A set_task_status call was issued against task 5415 during this cycle, returning no_op=true, indicating it was already pending.",
+      "episodes": [
+        "38b259fe-1d2f-447c-bffc-3f5b7eebc27e"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "5415",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "63092fd2-a428-4182-9d7c-1fa79eab17a3",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5623",
+      "node_task_id": "5623",
+      "node_referent": "Task 5623",
+      "fact_referents": [
+        "Task 5627"
+      ],
+      "fact": "Task 5627 owns the PRD-D5-retirement record.",
+      "episodes": [
+        "22b9004c-1a6a-4338-855d-45381af4c5c5"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5627",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "d597a7de-32fa-4839-85ca-969cf505ccbf",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 5623",
+      "node_task_id": "5623",
+      "node_referent": "Task 5623",
+      "fact_referents": [
+        "Task 5627"
+      ],
+      "fact": "The docs-only amendment is related to task 5627.",
+      "episodes": [
+        "22b9004c-1a6a-4338-855d-45381af4c5c5"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5627",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "22beeeed-ef7b-4971-aec2-821fc0df3e25",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5633",
+      "node_task_id": "5633",
+      "node_referent": "Task 5633",
+      "fact_referents": [
+        "Task 5632"
+      ],
+      "fact": "Task 5632 was routed by the implementer.",
+      "episodes": [
+        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5632",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "3eb80b01-ec5c-4879-93ff-6018006f8444",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5633",
+      "node_task_id": "5633",
+      "node_referent": "Task 5633",
+      "fact_referents": [
+        "Task 5632"
+      ],
+      "fact": "Task 5632 was routed by the architect.",
+      "episodes": [
+        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5632",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "5ae2c86c-a22c-4229-938d-31b75e81e1af",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5633",
+      "node_task_id": "5633",
+      "node_referent": "Task 5633",
+      "fact_referents": [
+        "Task 5632"
+      ],
+      "fact": "Task 5632 was authorized by Leo.",
+      "episodes": [
+        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5632",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "7a913250-ef6a-469d-9dd6-dc46df41e70a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5633",
+      "node_task_id": "5633",
+      "node_referent": "Task 5633",
+      "fact_referents": [
+        "Task 5632"
+      ],
+      "fact": "Task 5632 was landed via the merge queue rather than reopening it.",
+      "episodes": [
+        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5632",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "9a6102bf-6d00-4455-aa52-7b24226f6063",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 5633",
+      "node_task_id": "5633",
+      "node_referent": "Task 5633",
+      "fact_referents": [
+        "Task 5632"
+      ],
+      "fact": "Task 5632 has a diff scoped to the 4 expected files.",
+      "episodes": [
+        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "5632",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "b85a4078-5f63-4fd8-b056-47f0eb93552a",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 5976",
+      "node_task_id": "5976",
+      "node_referent": "Task 5976",
+      "fact_referents": [
+        "Task 6058"
+      ],
+      "fact": "TASK 6058's dependency on Curator gate 6060 was explicitly removed so it could proceed.",
+      "episodes": [
+        "4e538397-fcff-4b01-993a-6da046604f07"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6058",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "88178776-38d3-4c38-a615-5fa131bf9fc3",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 6084",
+      "node_task_id": "6084",
+      "node_referent": "Task 6084",
+      "fact_referents": [
+        "Task 6085"
+      ],
+      "fact": "The requirement to actually enforce the bound on the exported mesh has a hard dependency on task 6085.",
+      "episodes": [
+        "7927ff6b-64ac-4714-89fb-47dfe9b8efe0"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6085",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "a85a554a-5153-4bed-8162-20fe42113f72",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6084",
+      "node_task_id": "6084",
+      "node_referent": "Task 6084",
+      "fact_referents": [
+        "Task 6085"
+      ],
+      "fact": "Task 6085 discards the refining of a deflection for the exported mesh.",
+      "episodes": [
+        "7927ff6b-64ac-4714-89fb-47dfe9b8efe0"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6085",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "1f42756f-5444-476d-9c94-d98e920bec6b",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6107",
+      "node_task_id": "6107",
+      "node_referent": "Task 6107",
+      "fact_referents": [
+        "Task 6408"
+      ],
+      "fact": "The ruling regarding the jc_sqlite3() wrapper was recorded on task 6408.",
+      "episodes": [
+        "db4969e8-dc0f-40f1-ba32-50e476661ea8"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6408",
+      "correct_node_present": true
+    },
+    {
+      "edge_uuid": "8a51e13b-dc00-426f-9026-70116b746a7d",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 6128",
+      "node_task_id": "6128",
+      "node_referent": "Task 6128",
+      "fact_referents": [
+        "Task 6080",
+        "Task 6126"
+      ],
+      "fact": "Task 6126 is landing to remove the last admission of dimensionless in the transform family, which task 6080's decision addresses.",
+      "episodes": [
+        "59d2d750-4042-4e58-a893-798f5c4fd2c1"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6126",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "317da2e2-39f0-499b-8b45-a02d9aed029a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6128",
+        "Task 6164"
+      ],
+      "fact": "Task 6164 explicitly forbids reducing the task to 'conformance verification' after the cancellation of task 6128.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "54f53beb-d7a0-4cb8-a839-bc97b1becc4b",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6128",
+        "Task 6164"
+      ],
+      "fact": "Task 6128 was cancelled and consolidated into task 6164 rather than repaired in place.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "63fa5c78-2fe1-4afa-8c43-6ddad646fe40",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6164"
+      ],
+      "fact": "Task 6164 described landing the same artefact \u2014 ElasticResult.rotation.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "6a79d29b-263b-43de-bc5f-3821b761bd31",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6164"
+      ],
+      "fact": "Task 6164 had the 6185 GUI-channel-bridge dependency wired on 2026-08-10.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "9135f049-d87b-40b8-bf22-24a09394fe2a",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6164"
+      ],
+      "fact": "Task 6164's IMPLEMENTATION COORDINATION paragraph was rewritten to record sole ownership.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "9a8e780b-82b2-4823-a612-d5b723bfc9cc",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6165",
+      "node_task_id": "6165",
+      "node_referent": "Task 6165",
+      "fact_referents": [
+        "Task 6164"
+      ],
+      "fact": "Ruling 6164's HALF 2 was described in task 6164.",
+      "episodes": [
+        "779b7b7d-bb31-436b-869b-b4cafd033282"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "6164",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "0aff7cb9-a416-42de-94fc-05a4cae08b04",
+      "graph": "reify",
+      "end": "object",
+      "node_name": "Task 6730",
+      "node_task_id": "6730",
+      "node_referent": "Task 6730",
+      "fact_referents": [
+        "Task 6665"
+      ],
+      "fact": "The deletion of the reify mcp-server is ratified and owned by task #6665.",
+      "episodes": [
+        "4e969fee-e120-4f44-9bb9-9e7a7662a8b7"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6665",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "dd325db1-c237-4272-886f-72e1257f6f59",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 6730",
+      "node_task_id": "6730",
+      "node_referent": "Task 6730",
+      "fact_referents": [
+        "Task 6665"
+      ],
+      "fact": "Task #6665 is recorded in P1 docs/prds/v0_6/solver-driver-parity.md \u00a711.",
+      "episodes": [
+        "4e969fee-e120-4f44-9bb9-9e7a7662a8b7"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6665",
+      "correct_node_present": false
+    }
+  ]
+}
