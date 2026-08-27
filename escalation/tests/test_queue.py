@@ -6103,3 +6103,111 @@ class TestFindTerminalByCitation:
         assert found.id == 'esc-1-1', (
             f'the malformed-stamp record displaced a well-formed one: {found.id!r}'
         )
+
+
+class TestNoteSuppressedRefile:
+    """EscalationQueue.note_suppressed_refile() — the INV-4 storm counter (task 4499).
+
+    Bumping ``refiles_suppressed`` on the RESOLUTION makes "this adjudication
+    has absorbed N identical refiles" a durable structured fact rather than
+    log-only (INV-2).  Shares ``patch_resolution_metadata``'s locate-then-patch-
+    in-place shape, so the same no-resurrection contract applies: the archived
+    copy is rewritten where it lives, never lifted back into the queue root.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_increments_from_zero_and_returns_the_updated_record(self, tmp_path: Path):
+        """(1) The base case — 0 -> 1, and the updated Escalation comes back."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        result = queue.note_suppressed_refile('esc-1-1')
+
+        assert result is not None, 'note_suppressed_refile must return the updated Escalation'
+        assert result.refiles_suppressed == 1, (
+            f'expected 1 absorbed refile; got {result.refiles_suppressed!r}'
+        )
+
+    def test_is_repeatable_and_accumulates_on_disk(self, tmp_path: Path):
+        """(2) Three calls -> 3, re-read from DISK each time (not from the return value).
+
+        A storm counter that only accumulated in memory would read 1 forever to
+        the next process, which is precisely the storm case.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        for expected in (1, 2, 3):
+            queue.note_suppressed_refile('esc-1-1')
+            reread = queue.get('esc-1-1')
+            assert reread is not None
+            assert reread.refiles_suppressed == expected, (
+                f'on-disk counter should read {expected}; got {reread.refiles_suppressed!r}'
+            )
+
+    def test_patches_in_place_without_resurrecting_into_the_queue_root(self, tmp_path: Path):
+        """(3) The archive copy is bumped where it lives; the root stays clean."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: a resolved record lives in the archive, not the root'
+        )
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'RESURRECTION BUG: the archived record was written back into the queue root'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy; got {archived}'
+        assert json.loads(archived[0].read_text())['refiles_suppressed'] == 1
+
+    def test_leaves_the_resolution_untouched(self, tmp_path: Path):
+        """(4) Only the counter moves — the adjudication itself is immutable here."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        before = self._resolved(queue)
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        after = queue.get('esc-1-1')
+        assert after is not None
+        assert after.status == before.status, f'status changed: {after.status!r}'
+        assert after.resolution == before.resolution, f'resolution changed: {after.resolution!r}'
+        assert after.resolved_at == before.resolved_at, f'resolved_at changed: {after.resolved_at!r}'
+        assert after.resolved_by == before.resolved_by, f'resolved_by changed: {after.resolved_by!r}'
+        assert after.citation_sha == before.citation_sha, (
+            f'citation_sha changed: {after.citation_sha!r} — the identity must stay stable'
+        )
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        """(5) A missing record is answered, not raised on."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.note_suppressed_refile('esc-nope-1') is None
+
+    def test_pending_record_is_not_counted_and_not_written(self, tmp_path: Path):
+        """(6) Terminal-only, mirroring patch_resolution_metadata's guard.
+
+        A pending record has absorbed nothing — its own open-L1 veto is what
+        suppresses the refile, and stamping a counter on it would misattribute
+        the storm.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1', level=1)
+        esc.category = 'provenance_unattributed'
+        _submit_escalation(queue, esc)
+        before = (queue.queue_dir / 'esc-1-1.json').read_text()
+
+        assert queue.note_suppressed_refile('esc-1-1') is None
+
+        assert (queue.queue_dir / 'esc-1-1.json').read_text() == before, (
+            'a pending record must be left byte-identical'
+        )
