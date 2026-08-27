@@ -1821,7 +1821,7 @@ class ReconciliationConfig(BaseModel):
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
             'by resolve_topic_guard_clusters in server/near_duplicate_guard.py). '
             'Shares the procedural_knowledge_near_dup_guard_enabled kill-switch and '
-            'the recon-stage / allow_near_duplicate exemptions with the cosine guard.'
+            'the allow_near_duplicate exemption with the cosine guard.'
         ),
     )
 

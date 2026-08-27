@@ -486,8 +486,8 @@ Conventions:
   — do not add another entry; consolidate/update the existing entries or add context to the human gate
   task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
   high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
-  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
-  agents are exempt from both. Both guards apply only while write_triage.enabled is false (the
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct. No agent
+  class is exempt. Both guards apply only while write_triage.enabled is false (the
   shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
   nothing is soft-blocked, the ack carries routed (stored | restated | amended | contested) plus
   canonical_id on an attach, and a restated write becomes a sighting CHILD of the memory it
@@ -3033,12 +3033,13 @@ def create_mcp_server(
         override with metadata={'allow_near_duplicate': True} only when the
         content is genuinely distinct. Both guards only cover writes with an
         explicit category='procedural_knowledge' (a category=None write that
-        auto-classifies to procedural_knowledge is not covered), share the
-        procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
-        recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
-        entry that is expected to closely resemble the duplicates it
-        replaces, with no ordering guarantee that those duplicates are
-        deleted first).
+        auto-classifies to procedural_knowledge is not covered) and share the
+        procedural_knowledge_near_dup_guard_enabled kill-switch. NO agent
+        class is exempt (task 3134): Stage-1 consolidation now folds a
+        cluster with `consolidate_memories`, whose canonical write goes
+        through `memory_service.add_memory` and so never meets these
+        tool-layer guards, and which writes that canonical BEFORE any
+        delete.
 
         BOTH GUARDS ABOVE APPLY ONLY WHILE ``write_triage.enabled`` IS FALSE
         (its shipped default). With write triage ON, an explicit Mem0-primary
@@ -3296,11 +3297,20 @@ def create_mcp_server(
         # `routed == stored` for a topic match, and a real judge may answer
         # otherwise. That assertion is EXPECTED to change with this arm — it
         # pins the retirement of the soft-block, not the outcome `stored`.
+        # (task 3134, PRD leaf iota) NO recon-stage exemption. It rested on
+        # Stage-1 consolidation writing a merged canonical through THIS tool
+        # with no ordering guarantee that the duplicates it resembles were
+        # deleted first. Stage 1 now folds a cluster with
+        # `consolidate_memories`, which writes its canonical through
+        # `memory_service.add_memory` — the SERVICE method, below this tool —
+        # so the sanctioned path never meets this guard at all, and that op
+        # writes the canonical BEFORE any delete, supplying the very ordering
+        # guarantee whose absence the exemption cited. A recon-stage write
+        # arriving HERE is an ordinary duplicate and is treated as one.
         if (
             not triage_enabled
             and category == 'procedural_knowledge'
             and not allow_near_duplicate
-            and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
             # Deterministic topic-keyed pre-check (task 2845): if the content
@@ -3308,9 +3318,9 @@ def create_mcp_server(
             # cosine search. This is strictly cheaper (no embedding round-trip)
             # and catches same-topic paraphrases the cosine guard misses. On no
             # match (or an empty/unconfigured clusters list) fall through to the
-            # existing cosine path unchanged. Shares the allow_near_duplicate /
-            # recon-stage exemptions and the enabled kill-switch above with the
-            # cosine guard.
+            # existing cosine path unchanged. Shares the allow_near_duplicate
+            # exemption and the enabled kill-switch above with the cosine
+            # guard.
             topic_clusters = resolve_topic_guard_clusters(memory_service)
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
