@@ -4297,6 +4297,7 @@ class TestMarkerPayloadKeyInvariant:
             'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}],
         }
         sig = compute_flag_signature(flag)
+        assert sig is not None, 'a well-formed flag must yield a signature'
         assert sig == ('3839,598', self.FLAG_TYPE), (
             f'pre-1 measured signature must still hold; got {sig!r}'
         )
@@ -4467,6 +4468,10 @@ class TestMarkerPayloadKeyInvariant:
         # flag, and those two signatures DIFFER.
         citing_sig = compute_flag_signature(citing_flag)
         citation_less_sig = compute_flag_signature(citation_less_flag)
+        assert citing_sig is not None, 'a well-formed citing flag must yield a signature'
+        assert citation_less_sig is not None, (
+            'a well-formed citation-less flag must yield a signature'
+        )
         assert citing_sig != citation_less_sig, (
             f'sanity: the two cycles must key differently; got '
             f'{citing_sig!r} == {citation_less_sig!r}'
