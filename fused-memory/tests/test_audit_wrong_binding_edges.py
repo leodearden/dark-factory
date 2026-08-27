@@ -416,8 +416,8 @@ SPEC_1CF19488 = (
     'Task 6347',
     'The recurring-attention task #6347 depends on task #6346.',
 )
-SPEC_01E3D75E = (
-    '01e3e75e',
+SPEC_01E3FF5D = (
+    '01e3ff5d',
     'Task 5997',
     'Task 6014',
     'Task 6014 carries task 5997 as a hard dependency.',
@@ -572,7 +572,7 @@ class TestOutOfReachByConstruction:
     """
 
     @pytest.mark.parametrize(
-        'spec', [SPEC_1CF19488, SPEC_01E3D75E], ids=['1cf19488', '01e3e75e']
+        'spec', [SPEC_1CF19488, SPEC_01E3FF5D], ids=['1cf19488', '01e3ff5d']
     )
     def test_direction_reversal_is_out_of_reach(self, spec: tuple) -> None:
         """Both endpoints ARE named in the fact; only the direction is wrong.
@@ -1048,7 +1048,7 @@ class TestBuildReport:
         """Asserted as a CONTRACT so 'found none' cannot read as 'none exist'."""
         gaps = self._build()['known_gaps']
         blob = json.dumps(gaps)
-        assert '1cf19488' in blob and '01e3e75e' in blob  # direction reversal
+        assert '1cf19488' in blob and '01e3ff5d' in blob  # direction reversal
         assert '993a9a7b' in blob  # fact contradicts its source episode
         # The measured refutation of the cheap direction heuristic.
         assert '85' in blob and '7131' in blob

@@ -715,11 +715,11 @@ KNOWN_GAPS: tuple[dict[str, Any], ...] = (
             'The edge points the wrong way: BOTH endpoints are correctly '
             'named in the fact, only the subject/object roles are swapped.'
         ),
-        'specimen_edge_uuids': ['1cf19488', '01e3e75e'],
+        'specimen_edge_uuids': ['1cf19488', '01e3ff5d'],
         'specimens': [
             '1cf19488 (Task 6346)->(Task 6347): "The recurring-attention task '
             '#6347 depends on task #6346."',
-            '01e3e75e (Task 5997)->(Task 6014): "Task 6014 carries task 5997 '
+            '01e3ff5d (Task 5997)->(Task 6014): "Task 6014 carries task 5997 '
             'as a hard dependency."',
         ],
         'why_out_of_reach': (
