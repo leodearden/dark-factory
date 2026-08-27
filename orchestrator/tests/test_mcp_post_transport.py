@@ -434,6 +434,31 @@ SWEEP_EXCLUSIONS = {
 }
 
 
+#: Co-location tag + timeout budget for the two tests that call ``_sweep_hits``.
+#:
+#: MEASURED, and the reason both are needed.  The walk reads and ``ast.parse``s
+#: 553 files: ~13s of pure work, 20.5s wall on a machine already running the
+#: fleet.  The suite's default per-test timeout is 60s
+#: (``orchestrator/pyproject.toml``) with ``timeout_method = "thread"``, which
+#: ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
+#: turns that into a hard suite failure — observed exactly once here as
+#: ``worker 'gw29' crashed``, on the full ``-n auto`` run and never when this
+#: file runs alone.
+#:
+#: ``xdist_group`` is what makes the ``lru_cache`` actually pay: ``--dist
+#: loadgroup`` spreads UNGROUPED tests across workers, so without the tag the
+#: two callers land in different processes and each pays a full walk — a
+#: per-process cache cannot help.  Tagged, they share one worker and the second
+#: call is free (measured 0.000004s).
+#:
+#: The timeout bump is the other half: even one walk can exceed 60s under
+#: 32-way contention.  Deliberately generous rather than tight — this is a
+#: static scan of the tree, so a slow run is contention, not a hang, and the
+#: only thing a tight bound buys is a flaky suite.
+SWEEP_GROUP = 'mcp_url_sweep'
+SWEEP_TIMEOUT_SECONDS = 300
+
+
 @functools.lru_cache(maxsize=1)
 def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
     """Return ``{relpath: hits}`` for every swept file that builds a slashed URL.
@@ -462,6 +487,8 @@ def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
     return found
 
 
+@pytest.mark.xdist_group(SWEEP_GROUP)
+@pytest.mark.timeout(SWEEP_TIMEOUT_SECONDS)
 def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     """No source file may build an MCP URL with a trailing slash.
 
@@ -519,6 +546,8 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     )
 
 
+@pytest.mark.xdist_group(SWEEP_GROUP)
+@pytest.mark.timeout(SWEEP_TIMEOUT_SECONDS)
 def test_every_sweep_exclusion_still_earns_its_place():
     """An exclusion that outlives its offending line must fail, not lurk.
 
