@@ -456,24 +456,39 @@ deliberately does nothing.
 
 ### Recommendation
 
-1. **Primary — wire leaf ETA.** Turn the existing detection into action:
-   `ensure_entity_node` (mint the correct node when absent) → `reassign_edge`
-   (lossless, atomic, stamps `reassigned_from_node_uuid`) →
-   `refresh_entity_summary`, plus the repair-storm streak escalation the PRD
-   specifies. Gate it on `resolvable` — 111/181 (61 %) already have an
-   existing correct node, and mode 1 (§2) supplies the rest via
-   `ensure_entity_node`. **Do not** auto-repair mode 2 (`unrelated` +
-   node-present): that cell contains legitimate cross-task relations and is
-   precisely where an automated verdict would corrupt good data.
-2. **Complementary — prevent it pre-write.** `graphiti_client.py` L1442-1454
-   is the only place fused_memory can pass resolution levers into
-   `add_episode`, and it currently passes none that bite (§3.6). A
-   `custom_extraction_instructions` / `entity_types` constraint requiring an
-   exact referent match for task-shaped names would attack the cause rather
-   than the symptom. Note this cannot be fixed by patching `graphiti_core`
-   in-tree — the submodule is not checked out.
+**The primary fix is already a filed, live task — do not re-file it.**
 
-Both mutate the live write path and belong in **their own tasks**, not here.
+1. **Primary — wire leaf ETA: already tracked as task 3672**, *"Referent
+   repair path: `ensure_entity_node` → `reassign_edge` →
+   `refresh_entity_summary`, + streak escalation"*, **status
+   `in-progress`**, priority high. This sweep does not propose new work here;
+   it supplies 3672 with a measured population (181 edges) and one design
+   constraint it should honour:
+
+   > **Gate the repair on `resolvable`, and exclude mode 2.** 111/181 (61 %)
+   > already have an existing correct node; mode 1 (§2) supplies the rest via
+   > `ensure_entity_node`. **Do not** auto-repair the mode-2 cell
+   > (`unrelated` proximity + node present, ~65 edges): it contains
+   > legitimate cross-task relations, and it is precisely where an automated
+   > verdict would corrupt good data.
+
+2. **Remediation of the existing edges — already tracked as task 3673**
+   (leaf θ, `pending`), which remediates measured live conflations. The 181
+   findings here are candidate input to it, **not** a mandate: each still
+   needs human adjudication (§5, below).
+
+3. **Complementary prevention — NOT currently tracked; filed by this task.**
+   `graphiti_client.py` L1442-1454 is the only place fused_memory can pass
+   resolution levers into `add_episode`, and it passes none that bite (§3.6).
+   A `custom_extraction_instructions` / `excluded_entity_types` constraint
+   requiring an exact referent match for task-shaped names would attack the
+   cause rather than the symptom. Note this **cannot** be fixed by patching
+   `graphiti_core` in-tree — the submodule is not checked out (§3.5).
+
+   Nothing in the backlog covers this: the nearest neighbours are task 2073
+   (duplicate-node minting, done), 385 (noise-edge extraction filters, done),
+   2110 (node-name canonicalisation, done) and 3335 (cross-project collapse,
+   cancelled). None passes resolution levers into `add_episode`.
 
 ### Remediation of the existing ~181 edges stays human-gated
 
