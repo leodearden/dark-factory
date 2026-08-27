@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import types
 from pathlib import Path
 
 import pytest
 
+from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import Referent
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_wrong_binding_edges.py'
@@ -60,6 +62,12 @@ Finding = _mod.Finding
 vars_of = _mod.vars_of
 id_proximity = _mod.id_proximity
 correct_node_present = _mod.correct_node_present
+EdgeReader = _mod.EdgeReader
+RO_COMMAND = _mod.RO_COMMAND
+EDGE_PAGE_CYPHER = _mod.EDGE_PAGE_CYPHER
+EDGE_CENSUS_CYPHER = _mod.EDGE_CENSUS_CYPHER
+NODE_PAGE_CYPHER = _mod.NODE_PAGE_CYPHER
+NODE_CENSUS_CYPHER = _mod.NODE_CENSUS_CYPHER
 
 GRAPH = 'reify'
 
@@ -696,3 +704,209 @@ class TestCorrectNodePresent:
     def test_no_nearest_id_reads_false(self) -> None:
         """An empty nearest id names no node, so nothing can be present."""
         assert correct_node_present('', {'6165'}) is False
+
+
+_SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+_CENSUS_RE = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+
+
+class _FakeResult:
+    """Stands in for a FalkorDB result object (the ``.result_set`` shape)."""
+
+    def __init__(self, result_set: list[list] | None):
+        self.result_set = result_set
+
+
+class _FakeGraph:
+    """A graph double reproducing FalkorDB's SILENT server-side row cap.
+
+    Modelled on ``tests/test_graph_read_pagination.py::FakeCappedGraph`` and
+    sharing its census pattern character for character, so the two doubles in
+    this repo cannot disagree about what a census probe IS.
+
+    The cap is applied with no error and no marker, exactly as the real server
+    does — which is what makes "we now get all the rows" a real before/after
+    rather than a tautology. The writable ``query`` RAISES, so the read-only
+    guarantee is behavioural here and not only structural.
+    """
+
+    def __init__(
+        self,
+        corpus: list[list],
+        *,
+        resultset_cap: int = 10,
+        census_override: int | None = None,
+    ):
+        self.corpus = corpus
+        self.resultset_cap = resultset_cap
+        self.census_override = census_override
+        self.queries: list[str] = []
+
+    @property
+    def page_queries(self) -> list[str]:
+        return [q for q in self.queries if _SKIP_LIMIT_RE.search(q)]
+
+    async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
+        self.queries.append(cypher)
+        if _CENSUS_RE.search(cypher.strip()):
+            count = (
+                self.census_override
+                if self.census_override is not None
+                else len(self.corpus)
+            )
+            # A single-row aggregate can never be truncated by the row cap it
+            # is being used to detect — that is what makes it a proof.
+            return _FakeResult([[count]])
+        match = _SKIP_LIMIT_RE.search(cypher)
+        if match:
+            skip, limit = int(match.group(1)), int(match.group(2))
+            return _FakeResult(self.corpus[skip: skip + limit][: self.resultset_cap])
+        return _FakeResult(self.corpus[: self.resultset_cap])
+
+    async def query(self, cypher: str, params: dict | None = None):
+        raise AssertionError('this sweep is read-only: it may never issue query()')
+
+
+def _edge_rows(n: int) -> list[list]:
+    """``(a.name, b.name, r.uuid, r.fact, r.episodes)`` rows, the live shape."""
+    return [
+        [f'Task {6000 + i}', 'ElasticResult.rotation', f'edge-{i:04d}',
+         f'Task {5000 + i} landed.', [f'ep-{i:04d}']]
+        for i in range(n)
+    ]
+
+
+class TestEdgeReader:
+    """The read seam: paged, census-proven, GRAPH.RO_QUERY only.
+
+    ``audit_unverified_completion_claims.py`` deliberately issues ONE
+    unpaginated ``MATCH (e:Episodic)`` because its population (2976/4547)
+    sits under the 10000-row server cap. THIS sweep's does not — reify holds
+    15256 live RELATES_TO rows — so an unpaginated read would silently return
+    exactly 10000 and every denominator in the report would be wrong.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corpus_larger_than_the_cap_is_returned_in_full(self) -> None:
+        """25 rows through a server capped at 10, read in pages of 5.
+
+        The whole point of the seam: an unpaginated read against this double
+        returns 10 rows, silently, and would look like a complete corpus.
+        """
+        graph = _FakeGraph(_edge_rows(25), resultset_cap=10)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        rows, read = await reader.fetch_edges()
+        assert len(rows) == 25
+        assert read.complete is True
+        assert read.rows_seen == 25
+        assert read.expected_rows == 25
+        assert read.reason is None
+        # More than one page was actually issued — otherwise the pass above
+        # would be an artifact of a cap that never fired.
+        assert len(graph.page_queries) >= 5
+
+    @pytest.mark.asyncio
+    async def test_the_paged_read_reaches_the_caller(self) -> None:
+        """rows AND the PagedRead, so completeness is never inferred."""
+        graph = _FakeGraph(_edge_rows(4), resultset_cap=10)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        rows, read = await reader.fetch_edges()
+        assert isinstance(read, PagedRead)
+        assert [r[2] for r in rows] == [f'edge-{i:04d}' for i in range(4)]
+
+    @pytest.mark.asyncio
+    async def test_a_census_disagreement_surfaces_rather_than_raises(self) -> None:
+        """complete=False with a non-None reason — never an exception.
+
+        A census disagreeing by a few rows is the EXPECTED signature of a
+        live graph being written to mid-read, so raising would take down a
+        sweep for a transient. Surfacing it is what lets build_report record
+        it in truncated_by instead of publishing a wrong denominator.
+        """
+        graph = _FakeGraph(_edge_rows(6), resultset_cap=10, census_override=99)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        rows, read = await reader.fetch_edges()
+        assert len(rows) == 6
+        assert read.complete is False
+        assert read.reason is not None
+        assert read.expected_rows == 99
+
+    @pytest.mark.parametrize(
+        'template', [EDGE_PAGE_CYPHER, NODE_PAGE_CYPHER], ids=['edges', 'nodes']
+    )
+    def test_page_templates_are_orderable_and_pageable(self, template: str) -> None:
+        """Both placeholders AND a total ORDER BY.
+
+        The ORDER BY is load-bearing, not cosmetic: every page is a separate
+        query, and SKIP/LIMIT with no total order gives the store no
+        obligation to return rows in the same order twice — so SKIP n on page
+        2 can skip rows page 1 never returned, dropped silently and
+        permanently.
+        """
+        assert '{skip}' in template
+        assert '{limit}' in template
+        assert 'ORDER BY' in template
+
+    @pytest.mark.parametrize(
+        'query',
+        [EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER, NODE_PAGE_CYPHER, NODE_CENSUS_CYPHER],
+    )
+    def test_no_query_projects_the_fact_embedding(self, query: str) -> None:
+        """~1500 floats per edge, over 15256 edges, for nothing."""
+        assert 'embedding' not in query.lower()
+
+    @pytest.mark.asyncio
+    async def test_only_the_read_only_command_is_ever_issued(self) -> None:
+        """Behavioural, not just structural: the double's query() raises."""
+        graph = _FakeGraph(_edge_rows(3), resultset_cap=10)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        await reader.fetch_edges()
+        await reader.read_task_node_ids()
+        assert graph.queries  # something was actually issued
+        assert RO_COMMAND == 'GRAPH.RO_QUERY'
+        with pytest.raises(RuntimeError, match='read-only'):
+            EdgeReader.assert_read_only_command('GRAPH.QUERY')
+
+
+class TestReadTaskNodeIds:
+    """The Entity-name enumeration feeding ``correct_node_present``.
+
+    Paged the SAME way as the edge read: dark_factory measured 16083 Entity
+    nodes and reify 23616 on 2026-08-17, both far above the 10000 cap, so an
+    unpaginated node read would make correct_node_present answer False for
+    every node past the truncation — manufacturing exactly the "the correct
+    node was missing" conclusion this column exists to test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_ids_are_harvested_past_the_cap(self) -> None:
+        rows = [[f'Task {i}'] for i in range(25)]
+        graph = _FakeGraph(rows, resultset_cap=10)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        ids, read = await reader.read_task_node_ids()
+        assert read.complete is True
+        assert ids == {str(i) for i in range(25)}
+
+    @pytest.mark.asyncio
+    async def test_non_task_names_contribute_nothing(self) -> None:
+        """Harvested through the IMPORTED anchored parser, not a local rule."""
+        rows = [['Task 6165'], ['ElasticResult.rotation'], ['6185 GUI-channel-bridge'],
+                ['task #1153'], [None]]
+        graph = _FakeGraph(rows, resultset_cap=10)
+        reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
+        ids, _ = await reader.read_task_node_ids()
+        assert ids == {'6165', '1153'}
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_node_name_is_not_harvested_as_local(self) -> None:
+        """'reify:132' inside dark_factory is a FOREIGN referent.
+
+        Harvesting its bare number would make correct_node_present claim a
+        local 'Task 132' exists when it does not.
+        """
+        graph = _FakeGraph([['reify:132'], ['Task 133']], resultset_cap=10)
+        reader = EdgeReader(
+            graph=graph, graph_name='dark_factory', page_size=5, resultset_size=10
+        )
+        ids, _ = await reader.read_task_node_ids()
+        assert ids == {'133'}
