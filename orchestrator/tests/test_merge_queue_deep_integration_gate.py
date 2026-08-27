@@ -4756,3 +4756,621 @@ class TestBoundaryRowsComposed:
             worker, await _rev_parse(git_repo, 'main'),
             list(scene.reqs.values()), permits_before=permits_before,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-15 RED: Row 4 — A CHAIN CONFLICT TRUNCATES SILENTLY --
+#
+# The PRD row: "item 2 conflicts with item 1 textually -> chain = [item 1], no
+# conflict outcome for item 2, item 2 handled sequentially later".
+#
+# The SUBSUMPTION table marks this row FULLY SUBSUMED at unit level, and it is:
+# test_merge_queue_deep_landing.py builds a 4-item chain whose FIFTH item (105)
+# conflicts with LINK 102, and pins that the truncator renders no outcome and
+# emits no event.  Two things that scene structurally cannot say, both of which
+# are the composition this class owns:
+#
+#   * TRUNCATION AT POSITION ZERO.  Upstream's truncator sits past three clean
+#     links, so `links` is non-empty and the round is deep either way.  A
+#     conflict with the DISPATCHING item truncates at position 0, which is a
+#     different code path in `_deep_chain_placement` — the `if not result.links`
+#     decline, whose two documented obligations (do NOT release the lane a
+#     second time; consume NO halving round) are invisible to a scene that
+#     never reaches it.
+#   * NO SKIP-AHEAD.  `build_chain` must produce a contiguous PREFIX, so a
+#     conflict at position 0 must NOT be followed by the clean items behind it.
+#     Upstream's fixture has nothing queued past its truncator, so "did it skip
+#     ahead?" is unanswerable there; here 103 and 104 are both clean, both in
+#     the snapshot the build was handed, and both must be left alone.
+#
+# WHY THE SECOND TEST NEEDS A RED FIRST ROUND, since it is the one design
+# choice a reader will question.  The row's last clause — "item 2 handled
+# sequentially later" — can only be staged if item 2 is still MERGEABLE later,
+# and after item 1 lands it is not: main then carries item 1's line and item 2's
+# ordinary merge conflicts for real.  That is not a fixture limitation, it is
+# decision #4's own premise restated — a chain conflict is a conflict with an
+# UNLANDED predecessor, and it says nothing about item 2 precisely BECAUSE the
+# predecessor may never land.  So the second test makes the predecessor's own
+# verify red: item 1 blocks, main never moves, and item 2 then merges cleanly
+# and lands on its own round's verdict.  Staging it any other way would be
+# asserting a scenario the contract does not describe.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ROW4_CONFLICT_LINE = 5
+"""The ``shared.txt`` line the conflicting pair both rewrite.
+
+Line 5 of 20 rather than line 1 or line 20: git's three-line diff context
+window makes edits near a file boundary conflict with edits that are nominally
+several lines away, and a conflict this file did not intend is exactly what
+would turn a "no skip-ahead" claim into an accident.  (The 20-line seed and the
+reason for it are documented on :func:`_setup_repo`.)
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestRow4ConflictTruncatesSilently:
+    """Row 4: a chain conflict is a fact about the CHAIN, not a verdict."""
+
+    async def test_a_conflict_at_position_zero_declines_and_skips_nobody(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The chain is exactly [item 1]; 103 and 104 are offered and refused.
+
+        ``build_chain`` is handed the WHOLE snapshot — 102, 103 and 104 — and
+        102 is the only one that cannot merge.  A build that "helpfully"
+        skipped past it would produce a chain with a HOLE in it, and δ's CAS
+        walk lands ``links`` in order against main: a hole would land 103 onto
+        a main that never received 102, breaking the in-order / frozen-prefix
+        invariant the whole slice rests on.  So the assertion is not merely
+        that the chain is short — it is that the two clean items BEHIND the
+        conflict were available and were left alone.
+
+        The decline's two documented obligations are pinned alongside it:
+        nothing is released twice (the conservation oracle would see a
+        double-release as a permit or lane violation), and the halving
+        bisector is NOT advanced — a round that verified no chain has no tip
+        verdict to halve on, and halving here would drag the ceiling down for
+        rounds that never failed.
+        """
+        from orchestrator.merge_queue import select_chain_depth
+        from orchestrator.merge_types import ItemLifecycleState
+
+        followers = list(_gate_followers(3))
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_HEAD_CAP, n_followers=3, db_name='gate-row4-trunc0.db',
+            script=[True],
+            branch_content=_conflicting_branch_content('101', '102'),
+        )
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        rec = await scene.round_(tag='row4', head_tid='101')
+
+        # ── the chain is exactly [item 1]: a DECLINE, not a short chain ─────
+        assert rec['chain'] is None, (
+            f'a zero-link build must decline outright — `_deep_chain_placement` '
+            f'returns None so the dispatch is byte-identical to the adjacent '
+            f'verify; got {rec["chain"]!r}'
+        )
+        assert len(scene.built) == 1, (
+            f'exactly one build was attempted; got {len(scene.built)}'
+        )
+        built = scene.built[0]
+        result = built['result']
+        assert result.links == [], (
+            f'item 2 conflicts with item 1, so NOTHING chains; got '
+            f'{result.links!r}'
+        )
+        assert result.truncated_at == '102', (
+            f'the truncator must be NAMED, or ε has no fault signal to read; '
+            f'got {result.truncated_at!r}'
+        )
+        assert result.truncated_reason == 'conflict', (
+            f"a textual conflict is the BENIGN bucket — 'merge_error' is the "
+            f'genuine-fault one and would escalate the build log to WARNING; '
+            f'got {result.truncated_reason!r}'
+        )
+        assert result.tip == rec['head_mc'], (
+            f'a zero-link result still names a VERIFIABLE tip, and it is the '
+            f'base it was handed; got {result.tip[:8]!r}'
+        )
+
+        # ── NO SKIP-AHEAD: the clean items were offered and refused ─────────
+        assert [r.task_id for r in built['queue_snapshot']] == followers, (
+            f'the build must be offered the whole snapshot, or "it did not '
+            f'skip ahead" is unfalsifiable; got '
+            f'{[r.task_id for r in built["queue_snapshot"]]!r}'
+        )
+        assert built['cap'] == _HEAD_CAP - 1, (
+            f'the caller converts ITEMS to LINKS-BEYOND-THE-BASE; got '
+            f'{built["cap"]!r}'
+        )
+        assert built['target_depth'] == select_chain_depth(
+            _HEAD_CAP, 1 + len(followers), None,
+        ) - 1, (
+            f'the target depth must be the policy function\'s own answer, '
+            f'converted; got {built["target_depth"]!r}'
+        )
+
+        # ── item 1 lands by the ORDINARY adjacent path ──────────────────────
+        assert rec['advanced'] is True, 'the declined round still lands, ordinarily'
+        assert [
+            (row['branch'], row['landed_via_chain'])
+            for row in _finalized_rows(scene.db_path)
+        ] == [('101', None)], (
+            f'only the dispatching item landed, and NOT via a chain — a stamp '
+            f"here would inflate the canary's ratio for a round that verified "
+            f'no chain at all; got {_finalized_rows(scene.db_path)!r}'
+        )
+
+        # ── the decline consumed NO halving round ───────────────────────────
+        assert worker._chain_halving_state is None, (
+            f'a declined round has no tip verdict to halve on; halving here '
+            f'would drag the ceiling down for rounds that never failed. Got '
+            f'{worker._chain_halving_state!r}'
+        )
+
+        # ── every offered item is UNTOUCHED, in its original lane position ──
+        assert [r.task_id for r in worker._lane_buffers['normal']] == followers, (
+            f'submission order must survive a truncation — it is the next '
+            f'round\'s chain_snapshot; got '
+            f'{[r.task_id for r in worker._lane_buffers["normal"]]!r}'
+        )
+        for tid in followers:
+            req = scene.reqs[tid]
+            assert not req.result.done(), (
+                f'task {tid} was handed a verdict the chain had no standing '
+                f'to render: {req.result!r}'
+            )
+            assert worker._lifecycle.current(req.request_id) is (
+                ItemLifecycleState.LANE_BUFFERED
+            ), f'task {tid} left LANE_BUFFERED'
+            assert _events_for_task(scene.db_path, tid) == ['merge_queued'], (
+                f'task {tid} must emit nothing but its own enqueue — an event '
+                f'here is a public claim about an item nothing verified; got '
+                f'{_events_for_task(scene.db_path, tid)!r}'
+            )
+
+        assert _drain_residue(worker) == set(followers), (
+            'the truncator AND the two clean items behind it stay queued'
+        )
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+    async def test_the_truncated_item_lands_on_its_own_ordinary_round(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Item 2's verdict is its OWN round's, rendered after item 1 blocked.
+
+        The composition half of row 4, and the reason the class banner spends a
+        paragraph on it: the truncation is only meaningful if item 2 is still
+        alive afterwards, so this run carries it to the round where it takes
+        the ordinary sequential path and lands on a verify of its own tree.
+
+        REMOTE, not the cheap seam, and the reason is a fixture fact worth
+        recording: ``_make_gate_scene``'s non-remote ``_oracle`` answers a red
+        with a raw :class:`~orchestrator.verify.VerifyResult`, which the CHAIN
+        arm consumes as "not None -> red" without reading a field, but which
+        the UN-chained arm dereferences (``out.verify_skipped``) — it expects
+        the :class:`MergeOutcome` the real ``_run_post_merge_verify`` renders.
+        A red on a DECLINED round therefore has to be injected below that
+        function, which is exactly what ``remote=True`` does.
+        """
+        from orchestrator.merge_types import ItemLifecycleState
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_HEAD_CAP, n_followers=1, db_name='gate-row4-later.db',
+            remote=True, script=[False, True],
+            branch_content=_conflicting_branch_content('101', '102'),
+        )
+        # Off for the reason Row 1 documents: the remote cross-check of a
+        # remote green is run-to-run nondeterministic in a fixture repo and has
+        # nothing to do with this row's claim.
+        scene.config.verify_cross_check_remote_green = False
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+
+        red = await scene.round_(tag='row4', head_tid='101')
+
+        assert red['chain'] is None and scene.built[0]['result'].links == [], (
+            'the round must really have truncated at position 0'
+        )
+        assert scene.built[0]['result'].truncated_at == '102'
+        assert scene.built[0]['result'].truncated_reason == 'conflict'
+
+        # ── item 1 blocked, so main NEVER MOVED — decision #4's premise ─────
+        assert scene.reqs['101'].result.result().status == 'blocked', (
+            f'item 1 must take the verdict of its OWN tree; got '
+            f'{scene.reqs["101"].result.result()!r}'
+        )
+        assert red['main_after'] == red['main_before'], (
+            'a blocked item moves nothing — and that is precisely why item 2 '
+            'is still mergeable below'
+        )
+
+        # ── item 2 is untouched by the truncation ───────────────────────────
+        two = scene.reqs['102']
+        assert not two.result.done(), 'the truncator was handed a verdict'
+        assert worker._lifecycle.current(two.request_id) is (
+            ItemLifecycleState.LANE_BUFFERED
+        )
+        assert _events_for_task(scene.db_path, '102') == ['merge_queued'], (
+            f'the truncator must emit nothing but its own enqueue up to here; '
+            f'got {_events_for_task(scene.db_path, "102")!r}'
+        )
+
+        # ── ...and then takes the ORDINARY sequential path and lands ────────
+        nxt = worker._pop_next_pickable()
+        assert nxt is two, (
+            f'item 2 must be the next pickable, at its original lane index; '
+            f'got {None if nxt is None else nxt.task_id!r}'
+        )
+        green = await scene.round_(tag='row4', head_tid='102', req=nxt)
+
+        assert green['chain'] is None, (
+            f'nothing is left to chain ONTO item 2, so the policy declines and '
+            f'the dispatch is pre-PRD; got {green["chain"]!r}'
+        )
+        assert len(scene.built) == 1, (
+            f'the decline is made at the POLICY layer — the second round must '
+            f'not even attempt a build; got {len(scene.built)} builds'
+        )
+        assert green['advanced'] is True and green['main_after'] != green['main_before']
+        outcome = two.result.result()
+        assert outcome.status == 'done', (
+            f'item 2 must land on its OWN round\'s verdict; got {outcome!r}'
+        )
+        assert outcome.landed_via_chain is None, (
+            f'item 2 landed by the ordinary advance, not by a walk; got '
+            f'{outcome.landed_via_chain!r}'
+        )
+        assert [
+            (row['branch'], row['landed_via_chain'])
+            for row in _finalized_rows(scene.db_path)
+        ] == [('101', None), ('102', None)], (
+            f'got {_finalized_rows(scene.db_path)!r}'
+        )
+
+        # ── the canary counts NEITHER round as deep ─────────────────────────
+        verify_rows = _verify_rows(scene.db_path)
+        assert [row['chain_items'] for row in verify_rows] == [1, 1], (
+            f'a declined round verifies ONE item; got '
+            f'{[row.get("chain_items") for row in verify_rows]!r}'
+        )
+        assert _canary_predicate_items_per(
+            verify_rows, _finalized_rows(scene.db_path),
+        ) is None, (
+            'a truncation-to-zero contributes nothing to the deep denominator '
+            '— counting it would make the shipped ratio read low forever'
+        )
+
+        assert _drain_residue(worker) == set(), 'the run drained the whole queue'
+        _assert_two_way_quiescent(
+            worker, await _rev_parse(git_repo, 'main'),
+            list(scene.reqs.values()), permits_before=permits_before,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# -- step-15 RED: THE CONSERVATION CAPSTONE — one long mixed run --
+#
+# The CROSS-CUTTING gap the module docstring names, and the gate's single
+# user-observable signal.  Every row above states ONE claim inside a run shaped
+# to make that claim sharp; nothing anywhere — here or upstream — asserts that
+# the conservation surfaces stay green across a MIXED run that actually lands,
+# nor that the telemetry an operator reads agrees with what git actually did.
+#
+# Upstream's two conservation checks are each blind to half of it:
+#   * test_merge_queue_deep_dispatch.py's conservation test never finalizes —
+#     it lands nothing, so no permit is ever consumed by a walk;
+#   * every test_merge_queue_deep_landing.py `_assert_quiescent` call is
+#     single- or two-round, so nothing samples the ledgers ACROSS a sequence.
+#
+# SIX ROUNDS, one worker, one queue, one repo, one permit census, covering
+# every phenomenon the slice can produce:
+#
+#   R1  deep PASS at cap 6            -> six items land through the CAS walk
+#   R2  deep FAIL at 6                -> nothing lands; the bisector halves 6->3
+#   R3  deep FAIL at 3                -> nothing lands; the bisector halves 3->1
+#   R4  the FLOOR round               -> the policy declines (`< 2`); the item
+#                                        lands by the ORDINARY adjacent verify,
+#                                        and the pass RESETS the bisector — the
+#                                        only way the walk ever climbs back out
+#   R5  stale-CAS ABORT               -> main moves externally mid-walk; the
+#                                        landed prefix stays, the rest requeues
+#   R6  hot-reload 6->32 + a CONFLICT -> the very next round chains TWELVE
+#                                        items (twice the old cap, so the
+#                                        reload cannot be a no-op) and
+#                                        truncates on the conflicting tail
+#
+# WHY THE MID-RUN ORACLE IS THE SUBSET, restated once more because this is the
+# one place a reader will expect the full one: surfaces (a), (d) and (f) of
+# `_assert_two_way_quiescent` are WHOLE-REGISTRY claims, and a run that is
+# deliberately mid-flight has queued items with pending futures at every
+# checkpoint.  `_assert_midrun_conserved` is what holds at EVERY instant, so it
+# runs after every round; the full oracle runs once at the end, with the thrash
+# ladder as its CAS/ledger half, after `_drain_residue` has confirmed the run
+# left exactly the residue it promised.
+#
+# THE GROUND TRUTH IS GIT, not the telemetry's own arithmetic.  The canary an
+# operator reads (`scripts/merge-deep-canary-predicate.sh`, transcribed in
+# `_canary_predicate_items_per`) divides a `merge_finalized` sum by a
+# `merge_verify` count; comparing those two to each other proves only that the
+# emitter is self-consistent.  So the run's landings are re-derived from main's
+# first-parent history (`_chain_landed_from_git`) and the telemetry is checked
+# against THAT — the same discipline ε's reader signal will need.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CAPSTONE_CAP = 6
+"""The starting cap: deep enough that R1's chain is a real prefix, and an even
+number, so R2/R3's bisection walks 6 -> 3 -> 1 and reaches the floor in exactly
+two failures rather than three."""
+
+_CAPSTONE_RELOADED_CAP = 32
+"""The PRD's stated maximum, and what η2's promotion ships.  R6 must chain
+DEEPER than ``_CAPSTONE_CAP`` for the reload to have been observable at all."""
+
+_CAPSTONE_FOLLOWERS = 21
+"""``102``..``122``: exactly enough to feed six rounds and leave ONE residue.
+
+Sized from the round schedule, not chosen round: 6 land in R1, 1 in R4, 2 in
+R5 (the abort truncates the walk), 12 in R6, and ``122`` is the conflicting
+tail that must still be queued at the end.  A larger fixture would leave
+untouched items that make the final residue assertion weaker."""
+
+_CAPSTONE_SCRIPT = [True, False, False, True, True, True]
+"""One verdict per round, in order — the mixed sequence R1..R6 above."""
+
+_CAPSTONE_ABORT_AT = 10
+"""The CUMULATIVE ``advance_main`` ordinal R5's external main-bump fires on.
+
+Cumulative across the scene, which is what makes a fixed literal safe here
+(see :func:`_abort_hook_at`): R1 advances six times (calls 1-6), R2 and R3 land
+nothing at all, R4 advances once (call 7), so R5's walk owns calls 8, 9, 10.
+Arming at 10 lets the head and its first link land and aborts on the second,
+which is the shape that leaves a genuinely PARTIAL prefix behind.  Every one of
+those counts is asserted below, so a schedule change surfaces as a legible
+round-by-round failure rather than as a mysteriously mis-armed hook."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+class TestDeepGateCapstone:
+    """One continuous six-round run: conservation, and telemetry vs git."""
+
+    async def test_a_mixed_run_conserves_and_the_canary_agrees_with_git(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Every round conserves, and the shipped canary matches git's own count."""
+        from orchestrator.merge_queue import next_halving_state, select_chain_depth
+
+        scene = await _make_gate_scene(
+            git_repo, tmp_path, monkeypatch,
+            chain_cap=_CAPSTONE_CAP, n_followers=_CAPSTONE_FOLLOWERS,
+            db_name='gate-capstone.db', remote=True, script=_CAPSTONE_SCRIPT,
+            advance_hook=_abort_hook_at(_CAPSTONE_ABORT_AT, bump_repo=git_repo),
+            branch_content=_conflicting_branch_content('121', '122'),
+        )
+        # Off for the reason Row 1 documents (run-to-run nondeterminism in a
+        # fixture repo).  Re-pinned after the reload below, which rebuilds the
+        # comparison config from defaults and therefore turns it back on.
+        scene.config.verify_cross_check_remote_green = False
+        worker = scene.worker
+        permits_before = _permit_census(worker)
+        main_at_start = await _rev_parse(git_repo, 'main')
+
+        def _conserved(rec: dict) -> None:
+            _assert_midrun_conserved(
+                worker, rec['main_after'], permits_before,
+                where=f'after round {rec["round"]} ({rec["tag"]})',
+            )
+
+        # ── R1: a deep PASS lands a six-item prefix ─────────────────────────
+        r1 = await scene.round_(tag='deep-pass', head_tid='101')
+        assert r1['chain'] is not None and 1 + len(r1['chain'].links) == _CAPSTONE_CAP
+        assert len(r1['advance_calls']) == _CAPSTONE_CAP, (
+            f'the walk advances once per chain item; got '
+            f'{len(r1["advance_calls"])}'
+        )
+        assert r1['landed'] == ['101', *[t for t, _mc in r1['chain'].links]]
+        _conserved(r1)
+
+        # ── R2: a deep FAIL halves 6 -> 3 and lands nothing ─────────────────
+        r2 = await scene.round_(tag='deep-fail', head_tid='107')
+        assert r2['chain'] is not None and 1 + len(r2['chain'].links) == _CAPSTONE_CAP
+        assert r2['advanced'] is False and r2['advance_calls'] == [], (
+            f'a red tip must not reach the CAS walk at all; got '
+            f'{r2["advance_calls"]!r}'
+        )
+        assert worker._chain_halving_state == next_halving_state(
+            False, _CAPSTONE_CAP,
+        ) == 3
+        _conserved(r2)
+
+        # ── R3: the SAME request fails again, halving 3 -> 1 (the floor) ────
+        again = worker._queue.get_nowait()
+        assert again is scene.reqs['107'] and not again.result.done(), (
+            'a red tip requeues its head UNRESOLVED — the pipeline re-picks it'
+        )
+        r3 = await scene.round_(tag='deep-fail-2', head_tid='107', req=again)
+        assert r3['chain'] is not None and 1 + len(r3['chain'].links) == 3, (
+            f'the halved ceiling must bind the second attempt; got '
+            f'{None if r3["chain"] is None else 1 + len(r3["chain"].links)}'
+        )
+        assert r3['advanced'] is False and r3['advance_calls'] == []
+        assert worker._chain_halving_state == next_halving_state(False, 3) == 1
+        _conserved(r3)
+
+        # ── R4: the FLOOR declines, the item lands ordinarily, the walk resets
+        floored = worker._queue.get_nowait()
+        assert floored is scene.reqs['107']
+        n_builds_before_floor = len(scene.built)
+        r4 = await scene.round_(tag='floor', head_tid='107', req=floored)
+        assert select_chain_depth(
+            _CAPSTONE_CAP, 1 + len(_gate_followers(_CAPSTONE_FOLLOWERS)), 1,
+        ) is None, "the policy's `< 2` floor is what declines here"
+        assert r4['chain'] is None, (
+            f'at the floor the gate must decline; got {r4["chain"]!r}'
+        )
+        assert len(scene.built) == n_builds_before_floor, (
+            'the floor declines at the POLICY layer — no build may be attempted'
+        )
+        assert r4['advanced'] is True and len(r4['advance_calls']) == 1
+        assert scene.reqs['107'].result.result().landed_via_chain is None, (
+            'the floor round landed by the ordinary adjacent verify'
+        )
+        assert worker._chain_halving_state is None, (
+            'ANY pass resets the bisector — this arm is the only way the walk '
+            'climbs back out once the floor stops producing tip verdicts'
+        )
+        _conserved(r4)
+
+        # ── R5: main moves externally mid-walk; a PARTIAL prefix lands ──────
+        r5 = await scene.round_(tag='stale-cas', head_tid='108')
+        assert r5['chain'] is not None and 1 + len(r5['chain'].links) == _CAPSTONE_CAP
+        assert len(r5['advance_calls']) == 3, (
+            f'the walk must stop at the FIRST non-advanced result and never '
+            f'skip ahead; got {len(r5["advance_calls"])} calls'
+        )
+        assert r5['landed'][-2:] == ['108', '109'], (
+            f'the head and its first link landed before the bump; got '
+            f'{r5["landed"]!r}'
+        )
+        assert [r.task_id for r in worker._lane_buffers['normal']][:4] == [
+            '110', '111', '112', '113',
+        ], (
+            f'every unlanded link returns to its EXACT lane index; got '
+            f'{[r.task_id for r in worker._lane_buffers["normal"]][:4]!r}'
+        )
+        _conserved(r5)
+
+        # ── R6: hot-reload 6 -> 32, then a twelve-item chain that truncates ──
+        reload_result = scene.reload_cap(_CAPSTONE_RELOADED_CAP)
+        assert reload_result['reloaded'] is True, f'apply_reload refused: {reload_result!r}'
+        assert 'merge_deep.chain_cap' in reload_result['applied'], (
+            f'chain_cap must be a GREEN-tier leaf; got {reload_result!r}'
+        )
+        assert reload_result['restart_required'] == {}, (
+            f'no restart may be required for a green-tier leaf; got '
+            f'{reload_result!r}'
+        )
+        # The comparison config `reload_cap` builds carries stock defaults, so
+        # the reload also flips the remote-green cross-check back ON.  Re-pin
+        # it for the same determinism reason it was pinned at the top.
+        scene.config.verify_cross_check_remote_green = False
+
+        nxt = worker._pop_next_pickable()
+        assert nxt is scene.reqs['110']
+        r6 = await scene.round_(tag='reload+truncate', head_tid='110', req=nxt)
+        assert r6['chain'] is not None and 1 + len(r6['chain'].links) == 12, (
+            f'the round AFTER the flip must chain at the NEW cap — twelve '
+            f'items, twice the old ceiling, on the same worker and queue; got '
+            f'{None if r6["chain"] is None else 1 + len(r6["chain"].links)}'
+        )
+        assert 1 + len(r6['chain'].links) > _CAPSTONE_CAP, (
+            'a chain no deeper than the old cap would leave the reload unproven'
+        )
+        assert scene.built[-1]['result'].truncated_at == '122', (
+            f'the conflicting tail must truncate the chain; got '
+            f'{scene.built[-1]["result"].truncated_at!r}'
+        )
+        assert scene.built[-1]['result'].truncated_reason == 'conflict'
+        assert len(r6['advance_calls']) == 12
+        assert scene.worker is worker, (
+            'the same worker across the flip — the "no restart" claim, as an '
+            'object identity rather than an inference from the landing'
+        )
+        _conserved(r6)
+
+        # ── the durable tier, read back through real sqlite ─────────────────
+        finalized = _finalized_rows(scene.db_path)
+        verify_rows = _verify_rows(scene.db_path)
+        assert len(scene.rounds) == 6, f'six rounds; got {len(scene.rounds)}'
+        assert len(verify_rows) == 6, (
+            f'one verify per round, deep or not; got {len(verify_rows)}'
+        )
+        assert [row['chain_items'] for row in verify_rows] == [6, 6, 3, 1, 6, 12], (
+            f'the reader must see each round\'s real breadth; got '
+            f'{[row.get("chain_items") for row in verify_rows]!r}'
+        )
+
+        # ── GROUND TRUTH #1: git's land order IS the telemetry's ────────────
+        main_at_end = await _rev_parse(git_repo, 'main')
+        landed_per_git = await _chain_landed_from_git(
+            git_repo, main_at_start, main_at_end,
+        )
+        assert landed_per_git == [row['branch'] for row in finalized], (
+            f'the merge_finalized stream must be exactly what main\'s '
+            f'first-parent history says landed, in the same order; git says '
+            f'{landed_per_git!r}, telemetry says '
+            f'{[row["branch"] for row in finalized]!r}'
+        )
+        assert len(landed_per_git) == 21, (
+            f'21 of the 22 items land; got {len(landed_per_git)}'
+        )
+
+        # ── GROUND TRUTH #2: sum(landed_via_chain) IS git's chain-round count
+        per_round_landings = [
+            len(await _chain_landed_from_git(
+                git_repo, rec['main_before'], rec['main_after'],
+            ))
+            for rec in scene.rounds
+        ]
+        assert per_round_landings == [6, 0, 0, 1, 2, 12], (
+            f'per-round landings, counted off git; got {per_round_landings!r}'
+        )
+        chain_landed_per_git = sum(
+            n for rec, n in zip(scene.rounds, per_round_landings, strict=True)
+            if rec['chain'] is not None
+        )
+        assert sum(
+            row['landed_via_chain'] or 0 for row in finalized
+        ) == chain_landed_per_git == 20, (
+            f'``landed_via_chain`` ships as ONE PER LANDED ITEM, so its sum is '
+            f'the number of items that landed inside a round that carried a '
+            f'chain — git says {chain_landed_per_git}, telemetry says '
+            f'{sum(row["landed_via_chain"] or 0 for row in finalized)}'
+        )
+        assert all(
+            row['landed_via_chain'] is None
+            for row in finalized if row['branch'] == '107'
+        ), 'the floor round landed ordinarily and must carry no chain stamp'
+
+        # ── GROUND TRUTH #3: the deep DENOMINATOR is the rounds that chained ─
+        n_deep = len([
+            row for row in verify_rows
+            if isinstance(row.get('chain_items'), int) and row['chain_items'] >= 2
+        ])
+        rounds_that_chained = len([r for r in scene.rounds if r['chain'] is not None])
+        assert n_deep == rounds_that_chained == 5, (
+            f'the canary classifies a verify as deep by `chain_items >= 2`, '
+            f'which must be exactly the rounds that really built a chain; '
+            f'predicate says {n_deep}, the scene says {rounds_that_chained}'
+        )
+        assert _canary_predicate_items_per(verify_rows, finalized) == 20 / 5, (
+            f'the SHIPPED predicate, over the run\'s real rows; got '
+            f'{_canary_predicate_items_per(verify_rows, finalized)!r}'
+        )
+
+        # ── the ladder never moved, across two deep fails ───────────────────
+        before = RetryLedger()
+        after = _ladder_after(
+            scene.rounds, ledger=before, requests=list(scene.reqs.values()),
+        )
+
+        # ── and the run left EXACTLY the residue it promised ────────────────
+        residue = _drain_residue(worker)
+        assert residue == {'122'}, (
+            f'only the conflicting tail may still be queued; drained '
+            f'{sorted(residue, key=int)!r}'
+        )
+        _assert_two_way_quiescent(
+            worker, main_at_end, list(scene.reqs.values()),
+            permits_before=permits_before,
+            ladder={'before': before, 'after': after},
+        )
