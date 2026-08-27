@@ -731,8 +731,10 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
 
 # ---------------------------------------------------------------------------
 # task 4077: RED -- drain_gate's busy->idle resume path (both the in-loop
-# site at 378-381 and the post-drain_await_fresh site at 388-390) and its
-# stale-during-defer re-classification (382-404), including the deliberate
+# `verdict == "idle"` arm of its busy poll loop and the post-await
+# `verdict == "idle"` arm nested inside that loop's stale/absent handoff)
+# and its stale-during-defer re-classification (the in-loop stale/absent
+# block that hands off to drain_await_fresh), including the deliberate
 # non-reset of the force-fire anchor on a busy<->stale/absent oscillation.
 # ---------------------------------------------------------------------------
 
@@ -891,9 +893,11 @@ def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
 
 def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     """The ordinary successful outcome of a --drain redeploy: drain_gate's
-    IN-LOOP idle verdict (scripts/restart-all-orchestrators.sh:378-381). A
-    unit that goes busy, then drains WHILE deferred, must resume the restart
-    from inside the poll loop rather than waiting out the full busy grace."""
+    IN-LOOP idle verdict (scripts/restart-all-orchestrators.sh::drain_gate,
+    the `verdict == "idle"` arm reached straight from its busy poll loop,
+    before any stale/absent handoff). A unit that goes busy, then drains
+    WHILE deferred, must resume the restart from inside the poll loop rather
+    than waiting out the full busy grace."""
     # ONE binding feeding both the grace and the timeout -- see
     # test_defer_withholds_restart_while_busy. Here the grace is a
     # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
@@ -939,9 +943,12 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     """A unit that stops heartbeating WHILE deferred (e.g. it crashed
     mid-merge) must drop into the shorter bounded stale/absent grace instead
     of waiting out the rest of the busy grace -- drain_gate's in-loop
-    stale/absent re-classification (scripts/restart-all-orchestrators.sh:
-    382-404) and its else arm (400-402). Parametrized over the two ways a
-    dead unit stops reporting: its heartbeat ages out ("stale") or its file
+    stale/absent re-classification (scripts/restart-all-orchestrators.sh::
+    drain_gate, the `verdict == "stale"/"absent"` block inside its busy poll
+    loop that hands off to drain_await_fresh) and that block's trailing
+    `else` arm, which proceeds once the shorter grace elapses with the
+    heartbeat still unfresh. Parametrized over the two ways a dead unit
+    stops reporting: its heartbeat ages out ("stale") or its file
     disappears entirely ("absent") -- drain_gate treats both identically.
 
     The busy grace (60s, via wait_proof_grace_secs) and the unknown grace (0s)
@@ -967,10 +974,12 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    # THE LOAD-BEARING ASSERTION: the top-level stale/absent path (line 359)
-    # prints a byte-identical "proceeding" line but returns BEFORE any defer
-    # line, so this is what proves the IN-LOOP re-classification block ran,
-    # not the top-level path with the unit simply starting stale/absent.
+    # THE LOAD-BEARING ASSERTION: drain_gate's TOP-LEVEL stale/absent path
+    # -- the early `return 0` it takes on the verdict from its very first
+    # drain_await_fresh, above the defer line -- prints a byte-identical
+    # "proceeding" line but returns BEFORE any defer line, so this is what
+    # proves the IN-LOOP re-classification block ran, not the top-level path
+    # with the unit simply starting stale/absent.
     assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
         f"expected a defer line before the re-classification; got "
         f"stdout={result.stdout!r}"
@@ -999,13 +1008,15 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     """Sibling of test_unit_that_stops_heartbeating_mid_defer_drops_into_the_
     shorter_grace, covering the arm that test's ORCH_DRAIN_UNKNOWN_GRACE_SECS=0
     cannot reach (reviewer_comprehensive #5): with a grace of 0,
-    drain_await_fresh's `while` loop (scripts/restart-all-orchestrators.sh:
-    291-298) breaks on its FIRST elapsed-check, before ever sleeping or
-    re-reading the heartbeat -- so the "poll at least once with a nonzero
-    grace, never see a fresh reading, then proceed" combination, entered from
-    the MID-DEFER handoff at line 385, had no test at all (only the top-level
-    entry point had a same-shaped zero-grace test; neither entry had a
-    nonzero one). A heartbeat that STAYS stale (no further scheduled
+    the stale/absent poll loop in
+    scripts/restart-all-orchestrators.sh::drain_await_fresh breaks on its
+    FIRST elapsed-check, before ever sleeping or re-reading the heartbeat --
+    so the "poll at least once with a nonzero grace, never see a fresh
+    reading, then proceed" combination, entered from the MID-DEFER
+    drain_await_fresh call nested inside drain_gate's busy poll loop (rather
+    than from drain_gate's own opening await), had no test at all (only the
+    top-level entry point had a same-shaped zero-grace test; neither entry
+    had a nonzero one). A heartbeat that STAYS stale (no further scheduled
     transition -- unlike this file's other timelines, this one deliberately
     lets the grace genuinely elapse instead of racing a later flip) with a
     small nonzero grace forces at least one real sleep-and-recheck cycle
@@ -1056,7 +1067,10 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     tmp_path, verdict_label, overrides,
 ):
     """drain_gate's SECOND resume site: the post-drain_await_fresh idle
-    verdict (scripts/restart-all-orchestrators.sh:388-390). A unit that stops
+    verdict (scripts/restart-all-orchestrators.sh::drain_gate, the
+    `verdict == "idle"` arm nested inside its in-loop stale/absent handoff,
+    which reads _DRAIN_VERDICT rather than making a fresh
+    drain_check_verdict call). A unit that stops
     heartbeating mid-defer -- via either way a dead unit stops reporting,
     "stale" or "absent" (parametrized to match its sibling,
     test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace;
@@ -1066,7 +1080,8 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
 
     THE DISCRIMINATOR: this site's resume line
     (f"resuming restart of {UNIT_R}: drained") is byte-identical to the
-    in-loop resume site's (378-381, pinned by
+    in-loop resume site's (drain_gate's `verdict == "idle"` arm reached
+    straight from the busy poll loop, pinned by
     test_busy_unit_that_drains_mid_defer_resumes_and_restarts), so the two
     can't be told apart by text. They're told apart by an ORDERING
     INEQUALITY instead: ORCH_RESTART_FORCE_FIRE_AFTER_SECS=5 is deliberately
@@ -1123,8 +1138,9 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
 
 def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_path):
     """The deliberate NON-reset of `start_secs` in drain_gate's
-    busy-resumption arm (scripts/restart-all-orchestrators.sh:391-399, the
-    arm carrying the "anchored once ... can't defer the forced restart
+    busy-resumption arm (scripts/restart-all-orchestrators.sh::drain_gate,
+    the `elif verdict == "busy"` arm of its in-loop stale/absent handoff --
+    the one carrying the "anchored once ... can't defer the forced restart
     indefinitely" comment): a unit that goes busy -> stale -> busy again
     must NOT get a fresh force-fire deadline on the second busy reading --
     the deadline is anchored to when the unit FIRST went busy.
@@ -1163,8 +1179,10 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     # (rather than pushed higher for even more trap margin) because
     # wait_proof_grace_secs(22)=88 is the largest multiple of this spawn
     # timeout that still stays inside LEAK_SELF_TERMINATION_CEILING_SECS
-    # (90s, df_pytest_isolation.py) -- see design_decisions in this task's
-    # plan.json for why that ceiling is load-bearing.
+    # (90s, df_pytest_isolation.py). That ceiling is load-bearing: a poll
+    # loop that escapes its kill must expire while pytest's tmpdir -- and so
+    # the fake `systemctl` on its PATH -- still exists, or its expiry falls
+    # through to /usr/bin/systemctl and restarts REAL units.
     spawn_timeout = 22
 
     result, state, fired = _busy_unit_drain_run(
