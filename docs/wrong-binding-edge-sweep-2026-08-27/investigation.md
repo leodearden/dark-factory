@@ -1,7 +1,7 @@
 # Wrong-binding in extracted edges — detection, quantification, cause
 
-**Task 4717** · escalation `esc-4639-1` · swept 2026-08-27T04:50:22Z ·
-branch `task/4717` · sweep code at `8bc5f763a2` · `graphiti_core` 0.28.2
+**Task 4717** · escalation `esc-4639-1` · swept 2026-08-27T06:51:37Z ·
+branch `task/4717` · sweep code at `7a64b2a499` · `graphiti_core` 0.28.2
 
 A *wrong-binding* edge is one whose `fact` is a faithful restatement of its
 source episode, but which is **attached to the wrong entity**. Reading it off
@@ -12,14 +12,38 @@ fact-CONTENT family (a fact asserting more than its episode said), which
 
 Every number below is cited from `report.json` in this directory, which is
 byte-for-byte the stdout of
-`fused-memory/scripts/audit_wrong_binding_edges.py` at `8bc5f763a2`. Run
+`fused-memory/scripts/audit_wrong_binding_edges.py` at `7a64b2a499`. Run
 provenance, including the read-population census, is in `provenance.json`.
+
+**This artifact was regenerated once, and a reader comparing against the
+superseded numbers in git history is entitled to know which reads changed.**
+The first published run (`8bc5f763a2`, 04:50Z) read Entity nodes through a
+page template ordered on `n.name`, which is **not a total order** — measured
+the same day, dark_factory holds 17 260 Entity nodes against 17 210 distinct
+names and reify 24 344 against 24 193 — so `SKIP`/`LIMIT` over it could drop
+a row and duplicate another *invisibly*, leaving `rows_seen` unchanged and
+`truncated_by` null. It now orders on `n.uuid`, matching
+`graphiti_client.py::_ENTITY_NODES_PAGE_TEMPLATE`.
+
+**The edge population was unaffected** — the edge page already ordered on
+`r.uuid` — and, measured rather than assumed, so was everything else: the
+re-run returned the *identical* set of 181 `(edge_uuid, end)` findings, and
+identical `by_graph`, `by_end`, `by_proximity` and
+`correct_node_present` breakdowns, with **zero** `correct_node_present`
+flips. Only live-corpus growth over the ~2 h between runs moved: `scanned`
+26 667 → 26 674, `population` 6 959 → 6 961, `unverifiable` 304 → 305.
+That null result was *predicted* before the re-run and is not luck: tie
+permutation can only drop a row whose sort key **equals** one it returned,
+and under `ORDER BY n.name` two tied rows carry the same name and therefore
+the same task id, which the id-set consumer cannot distinguish. The read was
+genuinely lossy; this particular consumer was immune. No number published in
+the superseded artifact was ever wrong because of it.
 
 **On line numbers.** `CLAUDE.md` asks for `path/to/module.py::symbol`
 citations rather than bare line pins, because pins go stale. This document
 cites symbol-first and gives line numbers only as *measurement evidence* —
 here the line is part of the observation. All line numbers were read at
-`8bc5f763a2` (in-tree) and at `graphiti_core` 0.28.2 (the installed wheel);
+`7a64b2a499` (in-tree) and at `graphiti_core` 0.28.2 (the installed wheel);
 if a pin has drifted, the symbol is authoritative.
 
 **Reproduce the whole sweep:**
@@ -103,9 +127,9 @@ Over the **complete live population of both graphs**:
 
 | measure | value |
 |---|---|
-| rows scanned | **26 667** (dark_factory 11 411 + reify 15 256 live `RELATES_TO`) |
-| qualifying population | **6 959** |
-| unverifiable (fact names no task id) | 304 |
+| rows scanned | **26 674** (dark_factory 11 418 + reify 15 256 live `RELATES_TO`) |
+| qualifying population | **6 961** |
+| unverifiable (fact names no task id) | 305 |
 | **findings** | **181** |
 | **rate** | **2.60 %** |
 | by graph | dark_factory 76 · reify 105 |
@@ -124,7 +148,7 @@ first-class report key rather than a footnote.
 
 The task description cited 13/111 = 11.7 %. That figure was a **narrow
 pocket** — edges whose subject is a *ruling task* — not the whole corpus.
-**2.60 % is the whole-corpus rate over 6 959 qualifying edges.** Both stand;
+**2.60 % is the whole-corpus rate over 6 961 qualifying edges.** Both stand;
 they measure different denominators. Neither supersedes the other.
 
 **2.60 % is a LOWER BOUND.** Endpoints and facts are read with the shared
@@ -221,9 +245,13 @@ asyncio.run(m())"
 
 - **105/181 (58 %)** of mis-bound endpoint ids are a *near miss* of an id the
   fact names — 97 one-digit-different at equal length, 8 a strict prefix.
-  Against 1 423 + 2 111 task-shaped nodes, the chance baseline is near zero.
+  Against 1 424 + 2 111 task-shaped nodes — harvested by the corrected
+  uuid-ordered node page — the chance baseline is near zero.
 - **111/181 (61 %)** have `correct_node_present = true`: the node the fact
-  actually names **already exists** in that graph.
+  actually names **already exists** in that graph. This column is the one
+  the node page feeds, so it was re-checked against the regenerated
+  artifact rather than carried over — 111/70 in both, with zero per-finding
+  flips.
 
 Both reproduce the planning-time measurement (62.5 % and 64 %) within the
 movement of a live corpus.
@@ -466,7 +494,9 @@ deliberately does nothing.
    constraint it should honour:
 
    > **Gate the repair on `resolvable`, and exclude mode 2.** 111/181 (61 %)
-   > already have an existing correct node; mode 1 (§2) supplies the rest via
+   > already have an existing correct node (recomputed on the regenerated
+   > artifact, not carried over — the ratio did not move, so neither does
+   > the strength of this recommendation); mode 1 (§2) supplies the rest via
    > `ensure_entity_node`. **Do not** auto-repair the mode-2 cell
    > (`unrelated` proximity + node present, ~65 edges): it contains
    > legitimate cross-task relations, and it is precisely where an automated
@@ -516,7 +546,7 @@ vocabulary cannot see.
 
 **Re-derivation must go through `r.episodes`.** It is populated on **100 % of
 live `RELATES_TO` edges in both graphs** — reify 15 256/15 256, dark_factory
-11 411/11 411, zero null-or-empty — so it is the right handle for recovering
+11 418/11 418, zero null-or-empty — so it is the right handle for recovering
 what an edge was actually extracted from. Never trust the endpoint node name
 alone.
 
