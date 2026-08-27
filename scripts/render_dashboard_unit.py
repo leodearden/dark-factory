@@ -49,6 +49,13 @@ set up — the same rule its ``check_*_unit_parity.py`` neighbours follow, and a
 hard requirement for something setup-host.sh calls before any venv exists.
 """
 
+import argparse
+import os
+import pathlib
+import sys
+import tempfile
+from collections.abc import Sequence
+
 # Prefixed onto every line this script prints, so its report is greppable and
 # so a shell caller can route an operator to it BY TAG in a long bring-up run.
 # Same convention, and the same load-bearing reason, as the
@@ -267,3 +274,137 @@ def render_unit(
     rendered = render_template(template_text, repo_root=repo_root, uv_path=uv_path)
     preserved, skipped = preserved_values(installed_text, names)
     return apply_preserved(rendered, preserved), preserved, skipped
+
+
+def _log(message: str, *, stream=None) -> None:
+    """Print *message* prefixed with the log tag.
+
+    Every line this script emits goes through here, on stdout and stderr alike
+    — pinned by test_main_every_emitted_line_carries_the_log_tag. Same shape
+    and same reason as check_dashboard_unit_parity._log.
+    """
+    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
+
+
+def main(argv: "Sequence[str] | None" = None) -> int:
+    """Render the dashboard unit into --output, preserving host-local values.
+
+    READING AND WRITING THE SAME PATH IS THE INTENDED PRODUCTION CALL:
+    setup-host.sh passes the installed unit as --output, and this reads that
+    file FIRST as the "installed" side before overwriting it. That is precisely
+    why there is an --output flag instead of printing to stdout for a shell
+    redirect — ``python3 render.py ... > "$UNIT_DIR/<unit>"`` has bash TRUNCATE
+    the destination before python ever opens it, so the installed value would be
+    gone before it could be read: the tool would preserve nothing, take the
+    rendered default, and report success. Owning the destination makes the
+    read-then-write ordering structural rather than the caller's responsibility.
+
+    THE WRITE IS ATOMIC — a temp file in --output's OWN parent directory (so the
+    rename cannot cross a filesystem) followed by ``os.replace``. A render that
+    fails part-way therefore leaves the host's existing unit BYTE-UNCHANGED
+    rather than truncated: "stale but working" is recoverable, and setup-host.sh's
+    pre-install parity gate reports it on the next run; "no unit at all" is not.
+
+    Returns 0 on success, non-zero with a tagged error line on any failure,
+    having written nothing.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Render dark-factory-dashboard.service from its template, "
+            "preserving host-local Environment= values already present in "
+            "--output."
+        )
+    )
+    parser.add_argument("--template", required=True, help="Path to the .template file")
+    parser.add_argument("--repo-root", required=True, help="Value for __REPO_ROOT__")
+    parser.add_argument("--uv-path", required=True, help="Value for __UV_PATH__")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help=(
+            "Unit file to write. READ FIRST as the installed copy — see this "
+            "function's docstring for why this is a flag and not a redirect."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    template_path = pathlib.Path(args.template)
+    output_path = pathlib.Path(args.output)
+
+    try:
+        template_text = template_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log(f"FAILED: cannot read template {template_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"  {output_path} was NOT modified — it keeps whatever this host "
+            "already had.",
+            stream=sys.stderr,
+        )
+        return 1
+
+    # The installed side. An absent --output is the greenfield case, not an
+    # error: there is simply nothing to preserve.
+    installed_text = ""
+    if output_path.is_file():
+        try:
+            installed_text = output_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            _log(
+                f"FAILED: cannot read the installed unit {output_path}: {exc}",
+                stream=sys.stderr,
+            )
+            _log(
+                "  Refusing to render over a unit whose host-local values "
+                "could not be read.",
+                stream=sys.stderr,
+            )
+            return 1
+
+    try:
+        text, preserved, skipped = render_unit(
+            template_text,
+            repo_root=args.repo_root,
+            uv_path=args.uv_path,
+            installed_text=installed_text,
+        )
+    except ValueError as exc:
+        _log(f"FAILED: {exc}", stream=sys.stderr)
+        _log(
+            f"  {output_path} was NOT modified — its host-local values are "
+            "intact and the unit may simply be stale.",
+            stream=sys.stderr,
+        )
+        return 1
+
+    # The REPORT. DASHBOARD_KNOWN_PROJECT_ROOTS is on the parity checker's
+    # DIVERGENCE_ALLOWLIST, so setup-host.sh's post-install check is
+    # structurally incapable of saying anything about its value: these lines are
+    # the only record that the variable was handled at all.
+    for name, value in preserved.items():
+        _log(f"preserved host-local Environment={name}={value}")
+    for name, reason in skipped.items():
+        _log(f"default used for Environment={name}: {reason}")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            temp_name = handle.name
+        os.replace(temp_name, output_path)
+    except OSError as exc:
+        _log(f"FAILED: cannot write {output_path}: {exc}", stream=sys.stderr)
+        return 1
+
+    _log(f"rendered {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
