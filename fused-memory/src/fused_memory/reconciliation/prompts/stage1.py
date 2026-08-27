@@ -77,6 +77,57 @@ invalidates task assumptions, completed work not reflected in tasks).
 
 {render_consolidation_gate_section(can_file_tasks=False)}
 
+## Executing a Cluster Fold
+The section above states WHAT a folded cluster must look like when you are done. \
+This one states HOW to get there. Do not hand-roll it.
+
+**Call the op, not the choreography.** To fold a duplicate Mem0 cluster, call \
+`mcp__fused-memory__consolidate_memories(canonical_content=..., topic=<slug>, \
+project_id=..., supersedes=[full 36-char UUIDs to FOLD AND DELETE], \
+retain=[full 36-char UUIDs to TAG IN PLACE], run_id=<the run_id from your \
+## Reconciliation Context>)` instead of a hand-rolled `update_memory` plus N \
+`delete_memory` sequence. List each id ONCE across both arms: a repeat is refused by \
+name, never de-duplicated for you.
+
+**`topic` is REQUIRED.** It is a positional parameter of the op, so a fold cannot mint \
+an unstamped canonical — the shared `metadata.topic` scroll the closure check reads is \
+written by construction rather than by a step a prompt can forget. Retained ids are \
+stamped with that same topic and become PEERS of the canonical: they keep their point \
+ids, are never deleted, and never receive `canonical` or `parent_id`.
+
+**ORDERING IS THE CONTRACT.** The op runs: validate → authorize → citation pre-flight \
+(a non-mutating `scan_only` pass over the whole delete set) → WRITE THE CANONICAL → \
+and only THEN tag the retained peers and delete each supersede. A refusal from any of \
+those first four steps leaves the corpus BYTE-IDENTICAL, which is why a bad argument \
+set costs you nothing. Know the limit of that guarantee: it does NOT extend to a \
+per-id refusal BELOW the canonical write. The mutating repoint pass runs over the whole \
+delete set immediately after the canonical is written, before it is known whether any \
+given id's delete can be earned — so an id refused later has already had its live task \
+citations rewritten onto the canonical while it is still in the corpus. That is the \
+recoverable direction, but it is a mutation: a partial run is not a no-op.
+
+**`survivors` is the load-bearing outcome.** Closure is corroborated by a deterministic \
+re-read, never inferred from "the delete returned ok". `survivors` names ids whose \
+delete reported success but which STILL RESOLVE on that re-read — a non-empty \
+`survivors` means the fold did NOT close. `survivor_check_failed` names ids proven \
+NEITHER gone NOR alive; re-read those with `get_memory_by_id` before acting on them. \
+Read both before reporting a consolidation as complete.
+
+**`'partial'` IS NOT A RETRY SIGNAL.** There is no resume arm. The op takes no existing \
+canonical id, so a second `consolidate_memories` call for the same (project, topic) \
+writes a SECOND canonical — which is precisely the +1-per-pass ratchet this op exists \
+to end, and it is admitted rather than refused wherever canonical uniqueness is still \
+in warn mode. Finish the named ids BY HAND instead: read `failed_deletes`, \
+`reparent_failures` and `retain_failures` for what did not happen and why, fix the \
+cause, then `delete_memory` per still-listed id and `update_memory` to tag any peer \
+that was not retained. The response's `hint` carries that procedure.
+
+**`run_id` names the run PERFORMING the deletion** — yours, stamped as each tombstone's \
+`deleting_run_id`. It is deliberately NOT the victims' own `metadata.run_id`, which \
+names the run that WROTE them. Conflating the two is what makes a deletion audit \
+unreadable, so a delete that cannot be attributed is refused rather than guessed at. \
+It is required whenever `supersedes` is non-empty.
+
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
 - Duplicate knowledge across stores → Keep most recent / highest confidence. Delete duplicate.
