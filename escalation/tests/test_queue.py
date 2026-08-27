@@ -101,6 +101,7 @@ class TestDismissAllPending:
         assert updated is not None
         assert updated.status == 'dismissed'
         # Prefix, not equality: the pending age is always recorded (task 3172).
+        assert updated.resolution is not None
         assert updated.resolution.startswith('Stale from prior run')
 
     def test_multiple_pending_all_dismissed(self, tmp_path: Path):
@@ -172,6 +173,7 @@ class TestDismissAllPending:
 
         esc = queue.get('esc-1-1')
         assert esc is not None
+        assert esc.resolution is not None
         assert esc.resolution.startswith(msg)
         assert _pending_secs(esc.resolution) is not None
 
@@ -281,6 +283,7 @@ class TestDismissAllPendingAgeAware:
         strand = queue.get('esc-5189-7')
         fresh = queue.get('esc-5685-1')
         assert strand is not None and fresh is not None
+        assert strand.resolution is not None and fresh.resolution is not None
         assert strand.resolution.startswith(msg)
         assert fresh.resolution.startswith(msg)
         assert abs(_pending_secs(strand.resolution) - self.STRAND_AGE_SECS) < 5  # type: ignore[operator]
@@ -294,6 +297,7 @@ class TestDismissAllPendingAgeAware:
 
         strand = queue.get('esc-5189-7')
         assert strand is not None
+        assert strand.resolution is not None
         assert 'severity=blocking' in strand.resolution
 
 
@@ -352,6 +356,7 @@ class TestDismissAllPendingAgeAwareDegrades:
 
         swept = queue.get('esc-7-1')
         assert swept is not None
+        assert swept.resolution is not None
         assert swept.resolution.startswith(msg)
         assert _pending_secs(swept.resolution) is None
 
