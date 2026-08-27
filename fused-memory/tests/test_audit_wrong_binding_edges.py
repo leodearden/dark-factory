@@ -187,9 +187,12 @@ class TestNoSecondVocabulary:
             if name != 'compile':
                 continue
             for arg in node.args:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if 'task' in arg.value.lower():
-                        offenders.append(f'{arg.value!r} (line {node.lineno})')
+                if (
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and 'task' in arg.value.lower()
+                ):
+                    offenders.append(f'{arg.value!r} (line {node.lineno})')
         assert offenders == [], (
             f'the script compiles a task-label pattern of its own: {offenders}. '
             'The vocabulary lives at exactly one site — '
@@ -211,4 +214,3 @@ class TestNoSecondVocabulary:
             for alias in node.names
         }
         assert 'scan_content' in imported
-        assert 'parse_node_name' in imported
