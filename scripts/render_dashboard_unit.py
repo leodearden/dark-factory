@@ -57,6 +57,13 @@ hard requirement for something setup-host.sh calls before any venv exists.
 # exit code alone cannot distinguish "ran and reported" from "never ran".
 LOG_TAG = "dashboard_unit_render"
 
+# The bare sibling import resolves in both contexts this script runs in: as a
+# CLI, python puts scripts/ at sys.path[0]; under pytest, tests/scripts/
+# conftest.py inserts scripts/ explicitly (pyproject's --import-mode=importlib
+# deliberately does not). Same mechanics the check_*_unit_parity.py family
+# documents; see systemd_unit_parity.py's "Import mechanics" section.
+import systemd_unit_parity  # noqa: E402
+
 
 def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
     """Substitute the two sentinels in *template_text*.
@@ -80,3 +87,107 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
     return template_text.replace("__REPO_ROOT__", repo_root).replace(
         "__UV_PATH__", uv_path
     )
+
+
+# The section every dashboard Environment= directive lives in. Named rather
+# than searched: check_dashboard_unit_parity's UnitSpec pins the same
+# `environment_section="Service"`, and the two must agree or the installer
+# preserves out of a section the gate does not read.
+_ENVIRONMENT_SECTION = "Service"
+
+# Reasons a name in the preserve set did NOT survive into the render. Both are
+# legitimate, and both are REPORTED rather than taken silently — see the module
+# docstring: DASHBOARD_KNOWN_PROJECT_ROOTS is allowlisted, so setup-host.sh's
+# post-install parity check is structurally incapable of saying anything about
+# its value, and this record is the only trace that the variable was handled.
+_SKIP_ABSENT = "absent from the installed unit — rendered default used"
+_SKIP_EMPTY = (
+    "declared empty in the installed unit — rendered default used (an empty "
+    "value is not a usable setting and would be worse than the default)"
+)
+
+
+def preserved_values(
+    installed_text: str, names: "tuple[str, ...] | list[str]"
+) -> "tuple[dict[str, str], dict[str, str]]":
+    """Read the host-local values of *names* off an ALREADY-INSTALLED unit.
+
+    Returns ``(preserved, skipped)``:
+
+    - ``preserved`` — ``{name: value}`` for every name the installed unit
+      declares with a non-empty stripped value.
+    - ``skipped`` — ``{name: reason}`` for every other name in *names*.
+
+    The skipped map is not diagnostic garnish. Taking the rendered default is
+    the RIGHT answer on a greenfield host and the WRONG one to take silently on
+    a configured one, and nothing downstream can tell the operator which
+    happened: the variable this exists for is on the parity checker's
+    DIVERGENCE_ALLOWLIST, so the post-install gate reports parity either way.
+
+    Parsing goes through ``systemd_unit_parity`` — the SAME reader
+    check_dashboard_unit_parity.py compares these variables with. That is the
+    point of the lift rather than a convenience: a value the gate can see has
+    to be exactly a value this can preserve. In particular the multi-assignment
+    spelling (``Environment=FOO=1 BAR=2``) and quoted values are read the way
+    systemd reads them, where a naive split would preserve nothing and report
+    success.
+
+    An empty installed unit (``""``) yields every name skipped as absent, which
+    is the greenfield case — not an error.
+    """
+    env = systemd_unit_parity.environment_map(
+        systemd_unit_parity.parse_unit_directives(installed_text),
+        _ENVIRONMENT_SECTION,
+    )
+
+    preserved: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    for name in names:
+        if name not in env:
+            skipped[name] = _SKIP_ABSENT
+        elif not env[name].strip():
+            skipped[name] = _SKIP_EMPTY
+        else:
+            preserved[name] = env[name]
+    return preserved, skipped
+
+
+def apply_preserved(rendered_text: str, preserved: "dict[str, str]") -> str:
+    """Put each *preserved* value back into *rendered_text*, one line each.
+
+    LINE-SCOPED rewrite, never a whole-text regex, for the reason
+    ``_exec_start_flag`` documents in check_dashboard_unit_parity.py: the
+    committed template discusses these variables in COMMENT PROSE directly
+    above the directives they describe. A whole-text substitution would edit
+    the explanation as readily as the setting.
+
+    RAISES ValueError, naming the variable, unless EXACTLY ONE line's stripped
+    form starts with ``Environment=<NAME>=``:
+
+    - ZERO means the template changed shape underneath this code. The value
+      would be read off the installed unit and dropped on the floor while the
+      install reported success — precisely the silent clobber this module
+      exists to remove, one layer in.
+    - MORE THAN ONE is ambiguous: systemd applies every occurrence and the last
+      wins, so rewriting one and leaving the other installs a value nobody
+      chose, invisibly.
+
+    Every other byte of *rendered_text* is left alone.
+    """
+    lines = rendered_text.splitlines(keepends=True)
+    for name, value in preserved.items():
+        prefix = f"Environment={name}="
+        matches = [i for i, line in enumerate(lines) if line.strip().startswith(prefix)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{name}: expected exactly one line beginning "
+                f"{prefix!r} in the rendered unit, found {len(matches)}. "
+                "Zero means the template no longer declares the variable, so "
+                "preserving the installed value would silently do nothing; "
+                "more than one is ambiguous, and systemd's last-wins would "
+                "hide which was chosen. Refusing to guess."
+            )
+        index = matches[0]
+        newline = "\n" if lines[index].endswith("\n") else ""
+        lines[index] = f"{prefix}{value}{newline}"
+    return "".join(lines)
