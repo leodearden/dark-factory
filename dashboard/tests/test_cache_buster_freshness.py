@@ -30,6 +30,9 @@ uses to pin `_dashboard_helpers` against synthetic sources.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 from _cache_buster_helpers import (
     INDEX_HTML_REL,
@@ -37,6 +40,7 @@ from _cache_buster_helpers import (
     ReduxBaseState,
     cache_buster_violation,
     redux_cache_buster_versions,
+    resolve_redux_base_state,
     sole_cache_buster_version,
 )
 
@@ -251,3 +255,238 @@ class TestCacheBusterViolationWithNoBaseline:
 
     def test_missing_baseline_with_no_changed_asset_is_clean(self) -> None:
         assert cache_buster_violation(45, _base(None)) is None
+
+
+# ---------------------------------------------------------------------------
+# The git layer, pinned against throwaway repos under tmp_path.
+#
+# `_init_repo` is copied from tests/scripts/test_basetemp_git_isolation.py:55
+# rather than imported, for the reason that module states about its own copy
+# (itself taken from orchestrator/tests/test_git_repo_isolation_guard.py): it
+# is not importable from the dashboard suite.  The suite-wide
+# `_df_git_ceiling_at_basetemp` fixture pins git's upward repo walk inside the
+# pytest basetemp, so a repo built here cannot escape into a live worktree.
+# ---------------------------------------------------------------------------
+
+_CHARTS_REL = f'{REDUX_ASSET_DIR}/charts.jsx'
+
+
+def _init_repo(path: Path) -> Path:
+    """``git init`` a fresh repo at *path* with one commit.  Creates its own
+    target, so it cannot escape into an enclosing repo.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['git', 'init', '-b', 'main'], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'test@test.com'], cwd=path, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Test'], cwd=path, check=True, capture_output=True,
+    )
+    (path / 'README.md').write_text('# sentinel\n')
+    subprocess.run(['git', 'add', '-A'], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'commit', '-m', 'initial'], cwd=path, check=True, capture_output=True,
+    )
+    return path
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run git in *repo*, never inheriting the process cwd."""
+    return subprocess.run(
+        ['git', *args],
+        cwd=repo, capture_output=True, text=True, check=True, timeout=60,
+    ).stdout
+
+
+def _write_index(repo: Path, version: int) -> None:
+    """Write index.html with a handful of `?v=<version>` tags, mirroring the real one."""
+    (repo / INDEX_HTML_REL).write_text(
+        '<!doctype html>\n<html><head>\n'
+        '<link rel="icon" href="/static/favicon.svg">\n'
+        f'<script src="/static/redux/spark_path.js?v={version}"></script>\n'
+        f'<script src="/static/redux/graph_layout.js?v={version}"></script>\n'
+        f'<script type="text/babel" src="/static/redux/charts.jsx?v={version}"></script>\n'
+        '</head></html>\n'
+    )
+
+
+def _released_repo(tmp_path: Path, version: int = 45) -> Path:
+    """A repo whose `main` has released the redux tree at *version*.
+
+    HEAD is left on a fresh branch `work` off main, so `merge-base(main, HEAD)`
+    is main's tip — the shape the guard sees on a real task branch.
+    """
+    repo = _init_repo(tmp_path / 'repo')
+    (repo / REDUX_ASSET_DIR).mkdir(parents=True)
+    _write_index(repo, version)
+    (repo / _CHARTS_REL).write_text('function Chart() { return null; }\n')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', f'release v={version}')
+    _git(repo, 'checkout', '-b', 'work')
+    return repo
+
+
+class TestResolveReduxBaseStateAgainstSyntheticRepos:
+    """`resolve_redux_base_state` against constructed histories.
+
+    Constructed because a real branch cannot exhibit the failure: on a healthy
+    branch the merge base IS main's tip and nothing under the redux directory
+    differs, so every base-relative rule is vacuously satisfied.
+    """
+
+    def test_task_3490_replay_reports_the_stale_asset(self, tmp_path: Path) -> None:
+        """THE HEADLINE: main released v=45; the branch edits charts.jsx and
+        does NOT bump — end to end, that must be reported.
+
+        This is literally what happened on task/3490: the rebase dropped its
+        own `43 -> 44` bump because main had already released 44, so the branch
+        carried main's number while still modifying shipped JSX.  The old
+        `assert v >= 45` floor was green for the entire ride.
+        """
+        repo = _released_repo(tmp_path, version=45)
+        (repo / _CHARTS_REL).write_text('function Chart() { return "fixed"; }\n')
+        _git(repo, 'commit', '-am', 'fix charts, forget the bump')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None, 'a repo with a main ref must resolve a base state'
+        assert state.base_version == 45, (
+            f'the base released 45, got base_version={state.base_version!r}'
+        )
+        assert state.changed_assets == (_CHARTS_REL,), (
+            f'charts.jsx was modified in place versus the base, got {state.changed_assets!r}'
+        )
+        assert cache_buster_violation(45, state) is not None, (
+            'the task/3490 shape must be REPORTED end to end: an asset modified '
+            'in place while the cache-buster still reads the number the base '
+            'already released.'
+        )
+
+    def test_a_bump_alongside_the_asset_change_is_clean(self, tmp_path: Path) -> None:
+        """The correct discharge: touch the asset AND bump past the base."""
+        repo = _released_repo(tmp_path, version=45)
+        (repo / _CHARTS_REL).write_text('function Chart() { return "fixed"; }\n')
+        _write_index(repo, 46)
+        _git(repo, 'commit', '-am', 'fix charts and bump to 46')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None
+        assert state.base_version == 45
+        assert cache_buster_violation(46, state) is None, (
+            'bumping past the base while changing an asset is exactly the '
+            'behaviour the guard asks for and must not be flagged.'
+        )
+
+    def test_a_change_outside_the_redux_dir_is_not_a_trigger(self, tmp_path: Path) -> None:
+        """The EXEMPTION that keeps this guard from taxing every unrelated task."""
+        repo = _released_repo(tmp_path, version=45)
+        (repo / 'README.md').write_text('# sentinel, edited\n')
+        _git(repo, 'commit', '-am', 'unrelated work')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None
+        assert state.changed_assets == (), (
+            f'nothing under {REDUX_ASSET_DIR} changed, got {state.changed_assets!r}'
+        )
+
+    def test_an_uncommitted_edit_already_counts(self, tmp_path: Path) -> None:
+        """The trigger set is the WORKING TREE, not HEAD.
+
+        Diffing base..HEAD would leave the guard exempt for the whole of an
+        implementer's edit/verify loop and only fire after the commit — the
+        slowest possible moment to learn a bump is owed.  This asset is never
+        `git add`ed and must still be seen.
+        """
+        repo = _released_repo(tmp_path, version=45)
+        (repo / _CHARTS_REL).write_text('function Chart() { return "wip"; }\n')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None
+        assert state.changed_assets == (_CHARTS_REL,), (
+            'an uncommitted working-tree edit must already be reported, so the '
+            'implementer sees the demand during the edit/verify loop rather '
+            f'than only after committing; got {state.changed_assets!r}'
+        )
+
+    def test_index_html_is_excluded_from_its_own_trigger_set(self, tmp_path: Path) -> None:
+        """index.html carries the version, so it cannot be its own trigger.
+
+        Including it would make every bump demand a further bump, and a branch
+        editing only inline markup would owe a bump for a change no cached
+        asset URL can serve.
+        """
+        repo = _released_repo(tmp_path, version=45)
+        _write_index(repo, 46)
+        _git(repo, 'commit', '-am', 'bump only')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None
+        assert state.changed_assets == (), (
+            f'index.html must not appear in its own trigger set, got {state.changed_assets!r}'
+        )
+
+    def test_an_added_asset_is_not_a_trigger(self, tmp_path: Path) -> None:
+        """A brand-new file has a brand-new URL that was never in any cache.
+
+        Forcing a bump for it would be a false positive, and the convention
+        already allows it — commit 9e93e849dc registered
+        tasks_offline_banner.js at the then-current v=46.
+        """
+        repo = _released_repo(tmp_path, version=45)
+        (repo / REDUX_ASSET_DIR / 'brand_new.js').write_text('window.DF_NEW = {};\n')
+        _git(repo, 'add', '-A')
+        _git(repo, 'commit', '-m', 'add a new asset')
+
+        state = resolve_redux_base_state(repo)
+
+        assert state is not None
+        assert state.changed_assets == (), (
+            'an ADDED asset gets a URL no browser has cached, so it must not '
+            f'force a bump; got {state.changed_assets!r}'
+        )
+
+
+class TestResolveReduxBaseStateWhenNoBaseRefResolves:
+    """No base ref means NOT MEASURABLE — the caller skips, it does not fail."""
+
+    def test_returns_none_when_no_candidate_ref_exists(self, tmp_path: Path) -> None:
+        """A repo whose only branch is `trunk` resolves nothing, and that is fine.
+
+        An sdist install or a shallow clone has no `main` either.  Failing
+        there would be a false red on a tree that is not broken; returning
+        `None` lets the caller degrade to a visible pytest skip.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+        _git(repo, 'branch', '-m', 'main', 'trunk')
+
+        assert resolve_redux_base_state(repo) is None, (
+            'with no main and no origin/main there is nothing to measure against, '
+            'so the resolver must return None rather than raise.'
+        )
+
+    def test_falls_through_to_the_second_candidate_ref(self, tmp_path: Path) -> None:
+        """`base_refs` is tried in order; a later ref rescues a missing earlier one.
+
+        A checkout that only ever fetched the remote has `origin/main` and no
+        local `main`.
+        """
+        repo = _released_repo(tmp_path, version=45)
+        main_sha = _git(repo, 'rev-parse', 'main').strip()
+        _git(repo, 'update-ref', 'refs/remotes/origin/main', main_sha)
+        _git(repo, 'branch', '-D', 'main')
+
+        state = resolve_redux_base_state(repo, base_refs=('main', 'origin/main'))
+
+        assert state is not None, (
+            'the local main is gone but origin/main resolves, so the second '
+            'candidate ref must be tried.'
+        )
+        assert state.base_ref == 'origin/main', (
+            f'the resolved ref must be recorded for the failure message, got {state.base_ref!r}'
+        )
+        assert state.base_version == 45
