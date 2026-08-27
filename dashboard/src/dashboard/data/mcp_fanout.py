@@ -501,9 +501,14 @@ class TTLCache(Generic[V]):
         :meth:`_refresh_and_store` runs ``refresh()`` and stores the result
         iff ``cache_ok(value)``.
 
-        On a TIMED-OUT acquisition, ``refresh()`` still runs — WITHOUT the
-        lock — rather than raising: a caller that could never previously see
-        a ``TimeoutError`` from this method still cannot. The bypassed result
+        On a TIMED-OUT acquisition, freshness is re-checked FIRST — mirroring
+        the post-lock double-check on the normal path, because the timeout
+        window is exactly when another caller can have filled the entry, and
+        a bypass that skipped this cheap check would spend a duplicate MCP
+        round trip (and clobber a newer value with an older one) for no
+        benefit — and only if still cold does ``refresh()`` run, WITHOUT the
+        lock, rather than raising: a caller that could never previously see a
+        ``TimeoutError`` from this method still cannot. The bypassed result
         is stored under the same ``cache_ok`` rule as the locked path, which
         is what lets a wedged key self-heal for every later caller — during
         the 2026-08-27 incident nothing was ever stored for the wedged key,
@@ -531,6 +536,14 @@ class TTLCache(Generic[V]):
         try:
             await asyncio.wait_for(lock.acquire(), _LOCK_ACQUIRE_TIMEOUT_SECONDS)
         except TimeoutError:
+            # Freshness first, refresh second — never reordered. The timeout
+            # window is exactly when another caller can have filled the
+            # entry, so a bypass that skipped this cheap check would spend a
+            # duplicate MCP round trip (and clobber a newer value with an
+            # older one) for no benefit.
+            fresh = self.get_fresh(key)
+            if fresh is not None:
+                return fresh
             return await self._refresh_and_store(key, refresh, cache_ok)
         else:
             try:
