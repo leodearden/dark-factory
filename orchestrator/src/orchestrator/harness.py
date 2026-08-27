@@ -196,6 +196,22 @@ logger = logging.getLogger(__name__)
 # touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
 
+# Kill switch for the LLM module tagger.  Retirement was ratified 2026-08-20
+# (plans/module-tagger-retirement-prd.md); task 4523 deletes
+# ``_tag_task_modules`` end-to-end once task 3122 lands.  Until then this stops
+# every production call site while leaving the method, its prompt module and
+# its tests intact, so 4523's deletion diff is unchanged.  A module constant
+# rather than a config field for the same reason as _REBLOCK_GUARD_THRESHOLD
+# above, and because PRD decision 7 deletes the ``module_tagger`` config
+# surface -- new config here would only be more for 4523 to remove.
+#
+# Untagged tasks fall back to the synthetic ``task-<id>`` lock until the plan
+# boundary's ``_reconcile_scope_locks`` derives real scope from author-declared
+# files.  The PRD's measured basis for accepting that: the tagger's lock was
+# the sole blocker 0 times ever, against 416/240 blocked pairs from
+# author-declared files.
+_MODULE_TAGGER_ENABLED: bool = False
+
 
 def _bumped_routing_dump(metadata: Any, by: int = 1) -> dict[str, Any]:
     """Return the ``metadata['routing']`` blob with ``routing_tier`` bumped by ``by``.
@@ -2487,8 +2503,10 @@ class Harness:
                 )
 
             # 2b. Tag tasks with code modules for concurrency locking
-            logger.info('Tagging tasks with code modules...')
-            await self._tag_task_modules(force=retag_modules)
+            # (disabled -- see _MODULE_TAGGER_ENABLED)
+            if _MODULE_TAGGER_ENABLED:
+                logger.info('Tagging tasks with code modules...')
+                await self._tag_task_modules(force=retag_modules)
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
@@ -10429,7 +10447,7 @@ class Harness:
                 review_report.findings_count,
                 len(review_report.tasks_created),
             )
-            if review_report.tasks_created:
+            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
                 try:
                     await self._tag_task_modules()
                 except Exception as tag_err:
@@ -10484,7 +10502,7 @@ class Harness:
             # Tag newly created tasks with module metadata (agents may have
             # included modules, but re-run the batch tagger as a fallback
             # for any tasks that lack them).
-            if review_report.tasks_created:
+            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
                 try:
                     await self._tag_task_modules()
                 except Exception as tag_err:
