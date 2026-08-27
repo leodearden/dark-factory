@@ -2025,3 +2025,173 @@ class TestFileUnattributedLandingEscalationStampsCitationSha:
         assert esc.category == 'provenance_unattributed'
         assert esc.suggested_action == 'investigate_unattributed_landing_evidence'
         assert esc.agent_role == 'orchestrator-merge-worker'
+
+
+class TestResolvedCitationSuppressesIdenticalRefile:
+    """THE LOOP PIN — close-then-refile is closed, but new evidence still gets through.
+
+    The defect (task 4499): ``provenance_unattributed``'s reject condition is
+    ABSORBING — main only moves forward, so evidence that stopped surviving
+    stays gone.  The only dedup guard reads PENDING records, so the moment the
+    auto-watcher resolves the L1 the guard goes False and the next tick refiles
+    the identical finding.  Ping-pong, forever, one fresh sequence number per
+    round.
+
+    BOTH HALVES ARE PINNED HERE, deliberately.  A test covering only the
+    suppression half would pass while the guard silently swallowed genuine new
+    evidence — trading an escalation storm for an escalation blackout, which is
+    strictly the worse failure.  Every escape route (a different sha, no sha, a
+    different task, a different category) is asserted alongside.
+
+    Driven end-to-end against a REAL ``EscalationQueue``, exactly as the
+    revalidation reproduction was.
+    """
+
+    TASK = '42'
+    SHA_A = 'b' * 40
+    SHA_B = 'c' * 40
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    def _file(self, queue, sha: str | None, *, task_id: str | None = None, reason: str = 'effect_absent'):
+        task = self.TASK if task_id is None else task_id
+        file_unattributed_landing_escalation(
+            queue, task, f'task/{task}',
+            _verdict(reason, citation=sha, effect_check_sha=sha),
+            agent_role='harness-reconcile',
+        )
+
+    def _pending(self, queue, task_id: str | None = None):
+        return queue.get_by_task(self.TASK if task_id is None else task_id, status='pending')
+
+    def _arrange_resolved(self, tmp_path, sha: str | None = None):
+        """File one L1 on *sha*, resolve it, and prove the PENDING guard is off."""
+        queue = self._queue(tmp_path)
+        self._file(queue, self.SHA_A if sha is None else sha)
+        pending = self._pending(queue)
+        assert [e.id for e in pending] == [f'esc-{self.TASK}-1'], (
+            f'Pre-condition: expected one filed L1; got {[e.id for e in pending]}'
+        )
+        queue.resolve(
+            pending[0].id, 'confirmed benign', resolved_by='escalation-watcher-auto',
+        )
+        # The whole premise: with the L1 closed, the PENDING guard (including
+        # task 3116's category scoping) is genuinely off — so anything observed
+        # below is the NEW terminal-record guard, not the old one.
+        assert queue.has_open_l1(self.TASK, category='provenance_unattributed') is False, (
+            'Pre-condition: the pending guard must be OFF, or this test proves nothing'
+        )
+        return queue, pending[0].id
+
+    def _seq(self, queue) -> str:
+        from escalation.queue import SEQ_COUNTER_SUFFIX  # noqa: PLC0415
+
+        return (queue.queue_dir / f'esc-{self.TASK}{SEQ_COUNTER_SUFFIX}').read_text().strip()
+
+    def test_identical_refile_after_resolution_is_suppressed(self, tmp_path) -> None:
+        """(1) SUPPRESSION HALF — the same evidence never files a second time."""
+        queue, first_id = self._arrange_resolved(tmp_path)
+
+        self._file(queue, self.SHA_A)
+
+        assert self._pending(queue) == [], (
+            f'PING-PONG: an identical refile produced {[e.id for e in self._pending(queue)]}'
+        )
+
+    def test_suppressed_refile_mints_no_id_at_all(self, tmp_path) -> None:
+        """(1b) Suppression happens BEFORE make_id — no record, no sequence burned.
+
+        A suppression that still minted an id would leak the per-task counter
+        one number per tick, which is the same unbounded growth in a quieter
+        costume.
+        """
+        queue, first_id = self._arrange_resolved(tmp_path)
+        assert self._seq(queue) == '1', f'Pre-condition: seq should be 1; got {self._seq(queue)}'
+
+        self._file(queue, self.SHA_A)
+
+        assert {e.id for e in queue.get_by_task(self.TASK)} == {first_id}, (
+            'a suppressed refile must leave the full record set untouched'
+        )
+        assert self._seq(queue) == '1', (
+            f'a suppressed refile burned a sequence number: seq is now {self._seq(queue)}'
+        )
+
+    def test_a_different_citation_sha_still_files(self, tmp_path) -> None:
+        """(2) GENUINE-NEW-EVIDENCE HALF — the guard must not become a blackout."""
+        queue, _ = self._arrange_resolved(tmp_path)
+
+        self._file(queue, self.SHA_B)
+
+        pending = self._pending(queue)
+        assert len(pending) == 1, (
+            f'new evidence was swallowed; pending = {[e.id for e in pending]}'
+        )
+        assert pending[0].citation_sha == self.SHA_B, (
+            f'the new record carries the wrong identity: {pending[0].citation_sha!r}'
+        )
+
+    def test_suppression_accumulates_per_sha_rather_than_being_one_shot(self, tmp_path) -> None:
+        """(3) Each adjudicated sha stays suppressed — suppression is per-evidence."""
+        queue, _ = self._arrange_resolved(tmp_path)
+        self._file(queue, self.SHA_B)
+        second = self._pending(queue)[0]
+        queue.resolve(second.id, 'also benign', resolved_by='escalation-watcher-auto')
+
+        self._file(queue, self.SHA_B)
+        self._file(queue, self.SHA_A)
+
+        assert self._pending(queue) == [], (
+            'suppression is one-shot — a previously adjudicated sha refiled: '
+            f'{[e.id for e in self._pending(queue)]}'
+        )
+
+    def test_no_citation_verdict_always_escapes(self, tmp_path) -> None:
+        """(4) A falsy identity is not an identity — a no_citation reject always files."""
+        queue = self._queue(tmp_path)
+        self._file(queue, None, reason='no_citation')
+        first = self._pending(queue)[0]
+        assert first.citation_sha is None
+        queue.resolve(first.id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+
+        self._file(queue, None, reason='no_citation')
+
+        assert len(self._pending(queue)) == 1, (
+            'a no_citation reject was suppressed against a citation-less resolution'
+        )
+
+    def test_another_tasks_resolution_never_suppresses(self, tmp_path) -> None:
+        """(5a) CROSS-TASK ESCAPE — the same sha on a different task is a different finding."""
+        queue, _ = self._arrange_resolved(tmp_path)
+
+        self._file(queue, self.SHA_A, task_id='99')
+
+        assert len(self._pending(queue, task_id='99')) == 1, (
+            "task 42's resolution suppressed a filing for task 99"
+        )
+
+    def test_another_categorys_resolution_never_suppresses(self, tmp_path) -> None:
+        """(5b) CROSS-CATEGORY ESCAPE — a different root cause must get through.
+
+        Mirrors task 3116's ruling on the pending guard: a new root cause must
+        never hide behind an unrelated adjudication.
+        """
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        queue = self._queue(tmp_path)
+        unrelated = Escalation(
+            id=queue.make_id(self.TASK), task_id=self.TASK, agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='something else failed',
+            level=1, citation_sha=self.SHA_A,
+        )
+        queue.submit(unrelated)
+        queue.resolve(unrelated.id, 'unrelated, handled', resolved_by='steward')
+
+        self._file(queue, self.SHA_A)
+
+        assert len(self._pending(queue)) == 1, (
+            'a resolved task_failure suppressed a provenance_unattributed filing'
+        )
