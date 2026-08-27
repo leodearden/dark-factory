@@ -5939,3 +5939,167 @@ class TestAddMembersToL2VariantConcurrency:
             'concurrent folds lost spellings — missing: '
             f'{sorted(expected - set(record.root_cause_variants))}'
         )
+
+
+class TestFindTerminalByCitation:
+    """EscalationQueue.find_terminal_by_citation() — "was this exact evidence already adjudicated?"
+
+    The complement of ``has_open_l1``, which asks "is a duplicate still OPEN?"
+    and reads PENDING records only.  Once the auto-watcher resolves a
+    ``provenance_unattributed`` L1 the pending guard goes False, and because the
+    reject condition is ABSORBING the very next tick refiles the identical
+    finding — a close-then-refile ping-pong.  This read closes that loop by
+    matching the TERMINAL record carrying the same
+    ``(task_id, category, citation_sha)`` triple (task 4499).
+    """
+
+    CITATION = 'b' * 40
+    CATEGORY = 'provenance_unattributed'
+
+    def _filed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str,
+        *,
+        task_id: str = '1',
+        citation_sha: str | None = None,
+        category: str | None = None,
+    ) -> Escalation:
+        """Submit a provenance-shaped L1 carrying *citation_sha*."""
+        esc = _make_escalation(esc_id, task_id=task_id, level=1)
+        esc.category = category if category is not None else self.CATEGORY
+        esc.citation_sha = self.CITATION if citation_sha is None else citation_sha
+        _submit_escalation(queue, esc)
+        return esc
+
+    def _archived_path(self, queue: EscalationQueue, esc_id: str) -> Path:
+        matches = list((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        assert len(matches) == 1, f'expected exactly one archive copy of {esc_id}; got {matches}'
+        return matches[0]
+
+    def _force_resolved_at(self, queue: EscalationQueue, esc_id: str, stamp: str) -> None:
+        """Rewrite an archived record's resolved_at so ordering is clock-independent."""
+        path = self._archived_path(queue, esc_id)
+        data = json.loads(path.read_text())
+        data['resolved_at'] = stamp
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_resolved_record_matching_the_triple_is_returned(self, tmp_path: Path):
+        """(1) The whole point — a resolved record on this exact evidence is found."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign', resolved_by='escalation-watcher-auto')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a resolved record on this citation must be found'
+        assert found.id == 'esc-1-1', f'wrong record returned: {found.id!r}'
+
+    def test_dismissed_record_is_also_terminal(self, tmp_path: Path):
+        """(2) A dismissal is an equally terminal decision on that exact evidence."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'not a real defect', dismiss=True)
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a DISMISSED record adjudicates the evidence just as a resolved one does'
+        assert found.status == 'dismissed', f'expected dismissed; got {found.status!r}'
+
+    def test_different_citation_sha_does_not_match(self, tmp_path: Path):
+        """(3) Genuine NEW evidence must escape — a different sha is a different finding."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, 'c' * 40) is None
+
+    def test_different_category_does_not_match(self, tmp_path: Path):
+        """(4) A different root cause must escape suppression."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', category='task_failure')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_pending_record_is_not_reported(self, tmp_path: Path):
+        """(5) A pending match is has_open_l1's contract, deliberately not this one's."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            'a still-pending record must NOT be reported as adjudicated'
+        )
+
+    @pytest.mark.parametrize('falsy', [None, ''])
+    def test_falsy_citation_never_matches(self, tmp_path: Path, falsy: str | None):
+        """(6) A no_citation verdict has no evidence identity and can never be suppressed."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', citation_sha=falsy)
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, falsy) is None, (
+            f'falsy citation {falsy!r} must short-circuit to None, never match'
+        )
+
+    def test_no_record_at_all_returns_none(self, tmp_path: Path):
+        """(7) An empty queue answers None rather than raising."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_glob_over_match_on_hyphenated_sibling_task_is_rejected(self, tmp_path: Path):
+        """(8) `esc-{task_id}-*.json` over-matches sibling hyphenated ids.
+
+        The hyphen hazard `_recover_seq_from_disk` documents: the glob for task
+        '1-2' also matches esc-1-2-3-9.json, which belongs to task '1-2-3'.  The
+        record's OWN task_id field is the authoritative filter.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-2-3-9', task_id='1-2-3')
+        queue.resolve('esc-1-2-3-9', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1-2', self.CATEGORY, self.CITATION) is None, (
+            "task '1-2-3' record leaked into task '1-2' via the glob over-match"
+        )
+        assert queue.find_terminal_by_citation('1-2-3', self.CATEGORY, self.CITATION) is not None, (
+            'the owning task must still find its own record'
+        )
+
+    def test_newest_terminal_record_wins(self, tmp_path: Path):
+        """(9) Several terminal matches — the newest by resolved_at is returned."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'first adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'second adjudication')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', '2026-06-01T00:00:00+00:00')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None
+        assert found.id == 'esc-1-2', (
+            f'expected the NEWEST adjudication esc-1-2; got {found.id!r}'
+        )
+
+    def test_malformed_resolved_at_sorts_oldest_and_never_displaces(self, tmp_path: Path):
+        """A malformed stamp is treated as oldest — it never displaces a well-formed newer match.
+
+        Loud-over-silent: the record is still a legitimate adjudication, so it is
+        never dropped; it simply loses the newest-wins comparison.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'well-formed adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'adjudication with a broken stamp')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', 'not-a-timestamp')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a malformed stamp must not drop the record entirely'
+        assert found.id == 'esc-1-1', (
+            f'the malformed-stamp record displaced a well-formed one: {found.id!r}'
+        )
