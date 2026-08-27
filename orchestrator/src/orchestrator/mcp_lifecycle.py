@@ -483,6 +483,22 @@ async def verify_plan_tools_startup(
 # ~/.code-index/config.jsonc. That host file does not currently set
 # git_root_identity, so this env var wins today — but a future host-config
 # edit could silently shadow this fix without any test going red.
+# Adoption precondition: this only stops NEW git-root indexes — jcodemunch's
+# resolve_index_identity (git_root.py) still returns a PRE-EXISTING legacy
+# "<owner>/<repo>" index if one is already on disk (e.g. reify's
+# ~/.code-index/leodearden-reify.db), making this env var INERT there until
+# `jcodemunch-mcp delete-index <owner>/<repo>` is run — see
+# scripts/jcodemunch-watcher.service.template's identical caveat. Dark
+# Factory has no such legacy index today, so the fix is effective here now.
+# Known gap: two sibling launch sites skip this lever and re-spell
+# command/args instead of importing these constants —
+# fused_memory/reconciliation/stages/base.py's recon-stage launch and
+# scripts/setup-host.sh's user-scope `claude mcp add` registration. Either
+# creating a legacy git-root index would silently re-collapse that repo's
+# worktrees per the precondition above, undermining this fix. Out of this
+# task's two-file scope; tracked at tkt_0RSRDYZ75MPVYJP76093P7PYWQ
+# (fused-memory site) and tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ (setup-host.sh site
+# + this compounding risk).
 JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
 JCODEMUNCH_ENV: dict[str, str] = {
     'JCODEMUNCH_NO_VERSION_HINT': '1',
