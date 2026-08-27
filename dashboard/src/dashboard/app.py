@@ -114,7 +114,7 @@ from dashboard.data.reconciliation import (
 )
 from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
@@ -151,6 +151,17 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 # ---------------------------------------------------------------------------
 
 _TASK_CARDS_TTL_SECONDS = 10.0
+
+# Whole-operation bound for ``_load_task_cards``, enforced with
+# ``asyncio.wait_for``. Bound to the shared default rather than restating the
+# literal, so the arithmetic lives in exactly one place; this site may later
+# TIGHTEN its own constant (the structural test enforces it can never widen
+# it). Single-root call whose fan-out happens at the CALLER via
+# ``asyncio.gather`` over root ids, so the handler cost is max-of-N rather
+# than sum-of-N — no whole-loop deadline is needed as it is for
+# ``orchestrator.discover_orchestrators``' sequential walk.
+_TASK_CARDS_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
 _task_cards_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _TASK_CARDS_TTL_SECONDS
 )

@@ -30,7 +30,7 @@ from dashboard.data.db import with_db
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 from dashboard.data.utils import parse_utc, resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
@@ -868,6 +868,17 @@ def enrich_merges_with_titles(
 # lookups.  Cache is in-process; multi-worker deployments will each pay
 # their own MCP roundtrip on first lookup.
 _TASK_TITLES_TTL_SECONDS = 10.0
+
+# Whole-operation bound for ``load_task_titles``, enforced with
+# ``asyncio.wait_for``. Bound to the shared default rather than restating the
+# literal, so the arithmetic lives in exactly one place; this site may later
+# TIGHTEN its own constant (the structural test enforces it can never widen
+# it). No whole-loop deadline is needed here as there is for
+# ``discover_orchestrators``: this is a single-root call whose fan-out happens
+# at the CALLER via ``asyncio.gather``, so the handler cost is max-of-N rather
+# than sum-of-N and one per-call budget already bounds the whole gather.
+_TASK_TITLES_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
 _task_titles_cache: TTLCache[dict[str, str] | None] = TTLCache(
     ttl_seconds=lambda: _TASK_TITLES_TTL_SECONDS
 )

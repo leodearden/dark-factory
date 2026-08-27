@@ -55,9 +55,34 @@ from pathlib import Path
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 
 logger = logging.getLogger(__name__)
+
+# --- Budget constants -------------------------------------------------------
+#
+# ``discover_orchestrators`` walks its project roots SEQUENTIALLY, so it needs
+# the same two-layer bound ``active_tasks.collect_tasks_with_counts`` uses: a
+# per-root budget AND a whole-loop deadline. A per-root bound alone leaves a
+# worst case of ``roots * budget``, which on a machine with several roots
+# overruns the browser's fetch abort and throws away the very degraded payload
+# the bound exists to deliver.
+
+# Whole-operation bound for ONE root's ``fetch_tasks`` call. Bound to the
+# shared default rather than restating the literal, so the arithmetic lives in
+# exactly one place; a site may later TIGHTEN its own constant (the structural
+# test enforces that it can never widen it).
+_ORCHESTRATORS_PER_ROOT_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
+# Whole-loop deadline for the entire per-root walk.
+#
+# Strictly below ``data.js``'s 30 000 ms fetch abort with 10 s of headroom for
+# HTTP and JSON serialisation, so the PARTIAL payload the deadline produces is
+# actually deliverable to the browser that asked for it. The reasoning is
+# ``active_tasks._TASKS_TOTAL_BUDGET``'s, restated here rather than imported
+# because this bounds a DIFFERENT handler: coupling the two would make a
+# future adjustment to one silently move the other.
+_ORCHESTRATORS_TOTAL_BUDGET = 20.0
 
 
 def _resolve_project_root(prd: str, default_root: Path) -> Path:

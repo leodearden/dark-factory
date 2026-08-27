@@ -94,6 +94,57 @@ Strictly tighter than :func:`dashboard.data.memory.mcp_tool_call`'s own 10 s
 default: this seam only ever narrows a budget, never widens one.
 """
 
+COLD_SESSION_POSTS: tuple[str, ...] = (
+    'initialize',
+    'notifications/initialized',
+    'tools/call',
+)
+"""The JSON-RPC posts a COLD MCP session performs against ONE URL.
+
+The fact is :func:`dashboard.data.memory.mcp_tool_call`'s own — its docstring
+states that a cold session performs these three posts, which is why its
+*timeout* bounds each request and not the operation.
+
+A named tuple rather than a literal ``3``, for the same reason
+``active_tasks._PER_PROJECT_MCP_CALLS`` is one: if the session handshake ever
+gains a fourth post, the structural invariant in
+``tests/test_fetch_tasks_whole_operation_budget.py`` fails a test instead of
+silently overrunning in production.
+"""
+
+DEFAULT_WHOLE_OPERATION_BUDGET = 7.0
+"""Whole-operation bound for ONE ``fetch_tasks`` call, enforced by callers.
+
+Nothing in ``fetch_tasks`` applies this itself — it is the value a caller
+hands to ``asyncio.wait_for``, which is the only construct that bounds this
+operation as a whole (``timeout`` is per-HTTP-request; see the "Per-request
+budget" note on :func:`fetch_tasks`).
+
+Derivation: ``DEFAULT_PER_CALL_TIMEOUT`` (2.0) * ``len(COLD_SESSION_POSTS)``
+(3) = 6.0 <= 7.0, leaving 1.0 s of slack so the bound is a real backstop for
+non-MCP overhead (JSON decode, row shaping, event-loop scheduling) rather
+than coinciding exactly with the sum of its parts. It deliberately equals
+``active_tasks._TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
+arithmetic — the two are not coupled in code, so either may be tightened
+independently.
+
+**What that sum does and does NOT claim.** The 6.0 figure is PER URL.
+``fetch_tasks``' ``_refresh`` delegates to
+``first_success(config.fused_memory_urls, ...)``, and
+``mcp_fanout.first_success`` walks its URLs strictly IN ORDER, falling
+through to the next only after the current one fails — so an N-URL
+deployment's cold worst case is ``N * 6.0``, not 6.0. As SHIPPED the fit is
+exact: ``config.DEFAULT_FUSED_MEMORY_URLS`` is
+``('http://localhost:8002',)``, exactly one URL. ``fused_memory_urls`` is
+nevertheless operator-configurable (a comma-separated env var), and for that
+case this budget deliberately CAPS the fan-out rather than accommodating it.
+Capping exactly this residual is why the caller-side ``wait_for`` layer
+exists: the two layers are complementary, not redundant — the same
+disclosure ``active_tasks._TASKS_PER_PROJECT_BUDGET`` carries for its own
+budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
+guarantee it is not.
+"""
+
 _FETCH_TASKS_TTL_SECONDS = 20.0
 _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
@@ -507,8 +558,20 @@ async def fetch_tasks(
     ``tools/call``), so the worst case here is roughly ``3 * timeout`` plus
     the server's think time — and that is before the fan-out tries a second
     URL. A caller needing a hard bound must still wrap this in
-    ``asyncio.wait_for``; ``active_tasks.collect_tasks_with_counts`` does, and
-    the two layers are complementary rather than redundant.
+    ``asyncio.wait_for``; every route caller now does, and the two layers are
+    complementary rather than redundant.
+    ``active_tasks.collect_tasks_with_counts`` was first, with its own
+    per-project budget; ``orchestrator.discover_orchestrators``,
+    ``merge_queue.load_task_titles`` and ``app._load_task_cards`` follow it,
+    each binding a named module constant to
+    :data:`DEFAULT_WHOLE_OPERATION_BUDGET`.
+
+    One caller remains UNBOUNDED and is named here so a reader is not misled
+    into thinking every caller is covered: ``burndown.collect_snapshot``
+    gathers ``fetch_tasks`` with no whole-operation bound. It is a background
+    collector rather than one of the dashboard routes, so a hang there does
+    not wedge an endpoint — which is why it was left out of scope, not
+    because it is bounded.
     """
     project_root_str = str(project_root)
 
