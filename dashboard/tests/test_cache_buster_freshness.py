@@ -34,9 +34,13 @@ import pytest
 from _cache_buster_helpers import (
     INDEX_HTML_REL,
     REDUX_ASSET_DIR,
+    ReduxBaseState,
+    cache_buster_violation,
     redux_cache_buster_versions,
     sole_cache_buster_version,
 )
+
+_CHARTS = 'dashboard/src/dashboard/static/redux/charts.jsx'
 
 # A body shaped like the real index.html: several versioned /static/redux/*
 # tags, one unpkg CDN tag carrying an SRI hash and NO ?v=, and a non-redux
@@ -144,3 +148,106 @@ class TestAssetPathConstants:
     def test_index_html_rel_is_the_versioned_file(self) -> None:
         """`git show <sha>:<path>` needs the repo-root-relative spelling."""
         assert INDEX_HTML_REL == 'dashboard/src/dashboard/static/redux/index.html'
+
+
+def _base(
+    base_version: int | None,
+    changed_assets: tuple[str, ...] = (),
+) -> ReduxBaseState:
+    """A `ReduxBaseState` with the two fields under test varied and the rest fixed."""
+    return ReduxBaseState(
+        base_ref='main',
+        base_commit='0123456789abcdef',
+        base_version=base_version,
+        changed_assets=changed_assets,
+    )
+
+
+class TestCacheBusterViolationWhenAssetsChanged:
+    """FRESH rule: modify an existing redux asset and the number must go UP.
+
+    "Existing" is what makes the demand fair — the URL is already in browser
+    caches, so serving different bytes at the same `?v=` is the exact pairing
+    the guard exists to make impossible.
+    """
+
+    def test_equal_version_with_a_changed_asset_is_a_violation(self) -> None:
+        """THE TASK/3490 SHAPE — the case the old hardcoded floor could not catch.
+
+        3490's rebase dropped its own `43 -> 44` bump because main had already
+        released 44, so the branch carried main's number while still shipping
+        modified JSX.  `>= 45` was satisfied throughout.  Base-relative, it is
+        not: the base already RELEASED this number.
+        """
+        violation = cache_buster_violation(45, _base(45, (_CHARTS,)))
+
+        assert violation is not None, (
+            'a branch that modifies a released redux asset without bumping past the '
+            "base's version must be reported — this is the task/3490 failure."
+        )
+        assert '45' in violation, (
+            f'the message must name the version at issue, got {violation!r}'
+        )
+        assert _CHARTS in violation, (
+            'the message must name the changed asset, so the reader learns WHICH '
+            f'file went stale rather than only that a number is wrong; got {violation!r}'
+        )
+
+    def test_lower_version_with_a_changed_asset_is_a_violation(self) -> None:
+        """A number that went DOWN is worse than one that stood still."""
+        assert cache_buster_violation(44, _base(45, (_CHARTS,))) is not None
+
+    def test_higher_version_with_a_changed_asset_is_clean(self) -> None:
+        """The ordinary correct bump: asset touched, version strictly newer."""
+        assert cache_buster_violation(46, _base(45, (_CHARTS,))) is None
+
+
+class TestCacheBusterViolationWhenNoAssetChanged:
+    """The EXEMPTION: a branch touching no redux asset is never forced to bump.
+
+    Without this, every unrelated task in the repo would owe a cache-buster
+    bump it has no reason to make, and bumps would stop meaning anything.
+    """
+
+    def test_equal_version_with_no_changed_asset_is_clean(self) -> None:
+        """No asset modified, number unchanged — nothing browsers hold went stale."""
+        assert cache_buster_violation(45, _base(45)) is None
+
+    def test_higher_version_with_no_changed_asset_is_clean(self) -> None:
+        """Bumping without touching an asset is wasteful, not wrong; not our rule."""
+        assert cache_buster_violation(46, _base(45)) is None
+
+    def test_lower_version_with_no_changed_asset_is_a_violation(self) -> None:
+        """MONOTONIC rule — and it is NOT redundant with the freshness rule.
+
+        This is the base-relative replacement for the retired `assert v >= 45`
+        floor, and it is the only rule that fires here: `changed_assets` is
+        empty, so freshness is exempt.  A branch that reverts the number
+        re-points every asset URL at bytes browsers already cached from an
+        earlier release, whether or not that branch touched an asset itself.
+        """
+        violation = cache_buster_violation(44, _base(49))
+
+        assert violation is not None, (
+            'a cache-buster that moves BACKWARDS versus the merge base must be '
+            'reported even when the branch modified no redux asset — this is the '
+            'monotonic rule that replaces the retired hardcoded floor.'
+        )
+        assert '44' in violation and '49' in violation, (
+            f'the message must name both versions, got {violation!r}'
+        )
+
+
+class TestCacheBusterViolationWithNoBaseline:
+    """`base_version is None` — the base commit predates the `?v=` scheme.
+
+    There is genuinely nothing to compare against, and a missing baseline must
+    not manufacture a failure: that would turn "we cannot measure" into "you
+    did something wrong", which is a false red on work that is not at fault.
+    """
+
+    def test_missing_baseline_with_a_changed_asset_is_clean(self) -> None:
+        assert cache_buster_violation(45, _base(None, (_CHARTS,))) is None
+
+    def test_missing_baseline_with_no_changed_asset_is_clean(self) -> None:
+        assert cache_buster_violation(45, _base(None)) is None
