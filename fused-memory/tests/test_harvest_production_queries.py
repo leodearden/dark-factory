@@ -70,6 +70,30 @@ def _mod() -> types.ModuleType:
     return _load_module()
 
 
+class TestTheScriptIsLoadedOnceNotReExecuted:
+    """The loader seam must REUSE the script, not re-execute it.
+
+    An unconditional re-exec mints a SECOND module object under the same
+    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
+    hazard the shared helper exists for: ``scripts/read_transform_selection.py``
+    :82-83 returns ``sys.modules[name]`` BY NAME ONLY, with no ``__file__``
+    check, so it serves whichever object a test module last registered under
+    that key.  ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto
+    --dist loadgroup"``, so collection order is not stable.
+
+    The UNCACHED seam is what this calls: ``_mod()`` is ``functools.cache``d
+    and would pass vacuously.
+    """
+
+    def test_the_script_is_loaded_once_not_re_executed(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_module()
+        second = _load_module()
+        assert first is second
+        assert sys.modules['harvest_production_queries'] is first
+
+
 # ---------------------------------------------------------------------------
 # Synthetic journal builder
 # ---------------------------------------------------------------------------

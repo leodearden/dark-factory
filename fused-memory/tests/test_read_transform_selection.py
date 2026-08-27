@@ -76,6 +76,42 @@ def _bake_off() -> types.ModuleType:
     return _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
 
 
+class TestTheScriptsAreLoadedOnceNotReExecuted:
+    """The loader seam must REUSE each script, not re-execute it.
+
+    An unconditional re-exec mints a SECOND module object under the same
+    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
+    hazard: ``scripts/read_transform_selection.py:82-83`` returns
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
+    serves whichever object a test module last registered under
+    ``'bake_off_storage_shape'``.  Three test modules register that key, and
+    ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
+    loadgroup"``, so collection order is not stable.
+
+    The UNCACHED two-argument seam is what these call: ``_mod()`` and
+    ``_bake_off()`` are ``functools.cache``d and would pass vacuously.
+    """
+
+    def test_the_bake_off_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        second = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        assert first is second
+        # The invariant `_assert_reexported_from_bake_off` leans on: it
+        # deliberately bypasses `_bake_off()` and compares against the LIVE
+        # `sys.modules` entry, so this is what keeps its premise honest.
+        assert sys.modules['bake_off_storage_shape'] is first
+
+    def test_the_selection_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        second = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        assert first is second
+        assert sys.modules['read_transform_selection'] is first
+
+
 def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
     """INV-5: `mod.<name>` is the bake-off's definition, not a local restatement.
 
