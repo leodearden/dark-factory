@@ -87,6 +87,15 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # UNBOUNDED wedge (19.8h measured) into a bounded one.
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
+# A bypass must leave its own journal trace — reusing the SAME
+# transition-only policy as _FANOUT_REWARN_EVERY above rather than
+# inventing a second one. The dashboard's UI polls every ~2-3s across ~8
+# TTLCache-backed paths, so one WARNING per bypass would emit tens of
+# thousands of identical lines over a 19.8h wedge and bury the opening
+# (diagnostic) line — the exact flood the fan-out policy above was
+# written to prevent.
+_LOCK_BYPASS_REWARN_EVERY = 100
+
 
 class PreformattedFanoutError(ValueError):
     """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
@@ -361,7 +370,10 @@ class TTLCache(Generic[V]):
     simply runs too long, not only when it fails outright. The alternative, a
     permanent latch, is not acceptable: on 2026-08-27 one refresh that never
     returned held a key's lock for 19.8h with 7 waiters queued behind it,
-    leaving 3 of 14 endpoints dead for the duration.
+    leaving 3 of 14 endpoints dead for the duration. A bypass is never
+    silent — see :meth:`get_or_refresh`'s bypass-logging policy — because a
+    silent bypass would hide the next occurrence, the same invisibility
+    that let the incident run unnoticed for as long as it did.
 
     **Key space is bounded by disuse, not by cardinality.** A key that stops
     being requested is reclaimed: :meth:`_evict_expired` drops store entries
@@ -396,6 +408,12 @@ class TTLCache(Generic[V]):
         )
         self._store: dict[str, tuple[float, V]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
+        # by cache key. Per-instance because the key space is per-cache:
+        # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
+        # share key strings exactly, and three more live instances key on a
+        # bare project_root — a module-level dict would collapse them.
+        self._bypass_streaks: dict[str, int] = {}
 
     def get_fresh(self, key: str) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
@@ -485,6 +503,52 @@ class TTLCache(Generic[V]):
             self._store[key] = (time.monotonic(), value)
         return value
 
+    def _note_lock_bypass(self, key: str, refresh: Callable[[], Awaitable[V]]) -> None:
+        """Record one lock-acquisition bypass for *key*, under the transition-only policy.
+
+        Mirrors :func:`log_fanout_failure`'s policy: WARNING for the first
+        bypass of a streak (and every ``_LOCK_BYPASS_REWARN_EVERY``-th
+        thereafter), DEBUG for the repeats — so a sustained wedge still
+        leaves a trace without flooding the journal.
+        """
+        streak = self._bypass_streaks.get(key, 0) + 1
+        self._bypass_streaks[key] = streak
+        name = getattr(refresh, '__qualname__', repr(refresh))
+        if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+            logger.warning(
+                'lock acquisition for key %r timed out after %.2fs '
+                '(refresh=%s); a prior refresh for this key has been running '
+                'longer than the bound, so single-flight is being skipped '
+                'and this refresh is running WITHOUT the lock '
+                '(%d consecutive)',
+                key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+            )
+        else:
+            logger.debug(
+                'lock acquisition for key %r timed out after %.2fs '
+                '(refresh=%s), running without the lock (%d consecutive)',
+                key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+            )
+
+    def _note_lock_acquired(self, key: str) -> None:
+        """Close an open bypass streak for *key*, logging recovery.
+
+        Emits at WARNING — the same level as the streak's opening line — so
+        the incident has a visible closing bracket at the operator's default
+        level. Bounded by construction: fires only when a streak was
+        actually open, i.e. at most once per opening WARNING. Called on the
+        NORMAL acquisition path only — a key that self-heals via a bypassed
+        store is instead served from the lock-free warm path on its next
+        call, so its recovery line appears on its next COLD miss rather than
+        immediately; the bracket is still bounded and still closes.
+        """
+        streak = self._bypass_streaks.pop(key, 0)
+        if streak:
+            logger.warning(
+                'lock for key %r recovered after %d consecutive bypass(es)',
+                key, streak,
+            )
+
     async def get_or_refresh(
         self,
         key: str,
@@ -516,6 +580,14 @@ class TTLCache(Generic[V]):
         would only release at process exit. See the class docstring's
         "bounded single-flight" paragraph for the accepted trade.
 
+        Every bypass is logged under the module's transition-only policy —
+        WARNING on the first bypass of a streak and every
+        ``_LOCK_BYPASS_REWARN_EVERY``-th thereafter, DEBUG in between,
+        WARNING again on recovery (see :meth:`_note_lock_bypass` /
+        :meth:`_note_lock_acquired`, mirroring :func:`log_fanout_failure` /
+        :func:`note_fanout_success`) — so a wedge is never silent even though
+        no caller ever sees a raised exception for it.
+
         Both the locked cold path and the bypass path sweep expired entries
         (:meth:`_evict_expired`, via :meth:`_refresh_and_store`). That is
         deliberately the ONLY sweep site: a cold miss is exactly when a new
@@ -536,6 +608,11 @@ class TTLCache(Generic[V]):
         try:
             await asyncio.wait_for(lock.acquire(), _LOCK_ACQUIRE_TIMEOUT_SECONDS)
         except TimeoutError:
+            # Report the bypass BEFORE the freshness re-check below: the
+            # wedge outliving the bound is the thing being reported, not
+            # whether this particular caller happens to save a round trip,
+            # so a bypass is logged even when the re-check finds a value.
+            self._note_lock_bypass(key, refresh)
             # Freshness first, refresh second — never reordered. The timeout
             # window is exactly when another caller can have filled the
             # entry, so a bypass that skipped this cheap check would spend a
@@ -546,6 +623,7 @@ class TTLCache(Generic[V]):
                 return fresh
             return await self._refresh_and_store(key, refresh, cache_ok)
         else:
+            self._note_lock_acquired(key)
             try:
                 fresh = self.get_fresh(key)
                 if fresh is not None:
@@ -555,6 +633,7 @@ class TTLCache(Generic[V]):
                 lock.release()
 
     def clear(self) -> None:
-        """Reset the store and all per-key locks (test/admin hook)."""
+        """Reset the store, all per-key locks, and open bypass streaks (test/admin hook)."""
         self._store.clear()
         self._locks.clear()
+        self._bypass_streaks.clear()
