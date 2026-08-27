@@ -463,9 +463,37 @@ class TestIterErrorNeighborhoods:
         assert len(neighborhoods) == 2
         for n in neighborhoods:
             assert set(n) == {
-                'index', 'attempt_tool', 'attempt_input_summary',
+                'index', 'tool_use_id', 'attempt_tool', 'attempt_input_summary',
                 'error_content', 'exit_code', 'designed_outcome',
             }
+
+    def test_neighborhood_carries_the_pairing_tool_use_id(self):
+        # The JOIN KEY (task 4751 / confusion-census-2026-08-26 R1): a
+        # caller holding this scan can relate a classified result back to
+        # the assistant attempt that produced it WITHOUT a second scan.
+        # Record index cannot serve: a retry group's `indices` are tool_use
+        # positions while a neighborhood's `index` is the tool_result one.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert [n['tool_use_id'] for n in neighborhoods] == ['tu-1', 'tu-2']
+
+    def test_tool_use_id_survives_an_unmatched_attempt(self):
+        # Read off the RESULT block, so it is populated even when the
+        # attempt was truncated off the front of the window -- the same
+        # degradation contract the None attempt fields already document.
+        records = [_tool_result('tu-orphan', 'boom', is_error=True)]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['attempt_tool'] is None
+        assert n['tool_use_id'] == 'tu-orphan'
 
     def test_ceiling_result_is_enriched_with_code_and_label(self):
         records = [
