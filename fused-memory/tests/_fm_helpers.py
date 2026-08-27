@@ -29,6 +29,13 @@ import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
 
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    PagedRead,
+)
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
@@ -277,6 +284,87 @@ def extract_params(call_args: Any) -> dict:
     if len(call_args.args) > 1:
         return call_args.args[1]
     return call_args.kwargs.get('params', {})
+
+
+# ---------------------------------------------------------------------------
+# PagedRead test doubles (task 4386)
+# ---------------------------------------------------------------------------
+#
+# The paginated whole-graph reads (`enumerate_all_valid_edges`,
+# `enumerate_entity_nodes`) return `(collection, PagedRead)`, and the
+# consumers wired in task 4386 project that PagedRead's completeness into
+# their own per-cycle stats.  Every stub of one of those methods therefore has
+# to supply a second tuple element, across five test modules in two
+# directories — so the doubles live here rather than being hand-rolled per
+# site, where they would be unreadable and would drift.
+#
+# `rows` is deliberately always empty: these stand in for the SECOND tuple
+# element only.  The collection a consumer actually iterates is the stub's
+# FIRST element, while `rows_seen`/`expected_rows` are what a consumer
+# projects into stats — so the two must be settable independently.
+# ---------------------------------------------------------------------------
+
+_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+}
+
+
+def complete_paged_read(
+    *, rows_seen: int = 0, expected_rows: int | None = None
+) -> PagedRead:
+    """A PagedRead reporting a PROVEN-complete enumeration.
+
+    `expected_rows` defaults to `rows_seen`, which is what a healthy read
+    looks like: the census and the pages agree.  Pass it explicitly only to
+    build a shape the real backend would not produce.
+    """
+    return PagedRead(
+        rows=[],
+        complete=True,
+        rows_seen=rows_seen,
+        expected_rows=rows_seen if expected_rows is None else expected_rows,
+        reason=None,
+        incomplete_kind=None,
+    )
+
+
+def incomplete_paged_read(
+    kind: str,
+    *,
+    rows_seen: int = 0,
+    expected_rows: int | None = None,
+    reason: str | None = None,
+) -> PagedRead:
+    """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
+
+    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    taken on trust: a typo'd kind string matches no policy branch, so it would
+    quietly behave like a complete read and the test would pass for the wrong
+    reason.
+
+    `reason` defaults to a diagnostic string naming the kind and both counts,
+    mirroring the real backend's shape closely enough that an assertion on the
+    reason reaching an operator-facing message is meaningful.
+    """
+    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+        f'unknown incomplete_kind {kind!r}; expected one of '
+        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+    )
+    if reason is None:
+        reason = (
+            f'test double: enumeration reported incomplete '
+            f'(incomplete_kind={kind}) with rows_seen={rows_seen} '
+            f'expected_rows={expected_rows}'
+        )
+    return PagedRead(
+        rows=[],
+        complete=False,
+        rows_seen=rows_seen,
+        expected_rows=expected_rows,
+        reason=reason,
+        incomplete_kind=kind,
+    )
 
 
 # ---------------------------------------------------------------------------
