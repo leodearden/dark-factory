@@ -64,10 +64,19 @@ from shared.task_metadata import parse_metadata
 
 logger = logging.getLogger('audit_found_on_main_provenance')
 
-# Mirrors orchestrator.git_ops.DEFAULT_COMMIT_CITATION_PATTERN (git_ops.py:219)
-# conventions (task 2870 widens that pattern with the same three forms below;
-# this is a deliberately independent, self-contained copy — see the NOT
-# imported note just below — so it does not depend on 2870's landing state).
+# Derived from — and, as of task 4705, deliberately NARROWER than —
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN (task 2870 widened
+# that pattern with the same three additional forms below; this is a
+# deliberately independent, self-contained copy — see the NOT imported note
+# just below — so it does not depend on 2870's landing state). The two are
+# allowed to diverge: orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN
+# and orchestrator/merge_gates.py::ALREADY_LANDED_CITATION_PATTERN both still
+# accept an optional-`#` bare-paren form (`\(#?{tid}\)` / `\(#?{tid}\)!?:`)
+# that task 4705 did not touch — lower-risk there, since both test one
+# ALREADY-KNOWN task id (`{tid}`-interpolated: "does this one candidate cite
+# MY task", never "extract every id") applied to the commit SUBJECT only
+# (git_ops.py) or immediately after the conventional-commit type word
+# (merge_gates.py), never to the whole commit MESSAGE this script scans.
 # NOT imported from there — orchestrator.git_ops pulls in the whole GitOps
 # stack, and a fused-memory -> orchestrator runtime import is architecturally
 # backwards (see task 2645 design decisions). This local pattern is
@@ -101,6 +110,41 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # esc-2683-1 triage. `(#N)` and `(task N)` still cite, so the true-positive
 # case that motivated widening to paren forms in the first place is
 # unaffected.
+#
+# That evidence covers only the SHRINKING direction (fewer/no ids
+# extracted) and was not re-measured live against the production task
+# corpus (review remediation, task 4705 amendment pass) — this task holds
+# no lock on that corpus to run a before/after `verdict_counts` diff, so
+# one is filed as a follow-up instead. Two reverse-direction effects were
+# traced through `_classify_core` below rather than measured live:
+#   (1) self-citation SUPPRESSION narrows too, not just other-task
+#       DETECTION — a message citing the audited task ONLY via bare-paren
+#       while citing a *different* task in one of the three surviving
+#       forms (e.g. subject `impl(77): backfill` + body `Also closes
+#       (50).`, audited for task 50) now flags `misattributed`, where the
+#       bare-paren self-citation used to short-circuit that guard. Covered
+#       by
+#       TestClassifyMisattributed.test_self_citation_only_in_bare_paren_form_now_flags_misattributed
+#       below; accepted as rare for this corpus, since self-citation here
+#       is overwhelmingly written in the conventional-commit subject form.
+#   (2) a found_on_main task with no declared files whose only self-
+#       citation was bare-paren reclassifies `ok` -> `unverifiable`.
+#       Relabeling only, not a new gating false positive: `unverifiable`
+#       is not a member of `_FLAGGED_VERDICTS` below, so it never trips
+#       `_has_flagged_findings` / `--fail-on-findings`.
+#
+# Residual, un-addressed false-positive source (out of this task's scope):
+# the `task/{id}` branch-mention alternative above matches ANYWHERE in the
+# message, not just a merge subject — body prose like "rebased on top of
+# task/3869" or "supersedes task/4012" makes `cited` non-empty with a
+# foreign id, which can flag a correctly-attributed found_on_main task
+# `misattributed` the same way bare parens used to, and this repo's commit
+# bodies cite other tasks in prose considerably more often than they
+# happen to contain an incidental bare-paren integer. Anchoring
+# `task/{id}` to the subject line would close it;
+# plans/found-on-main-provenance-integrity-prd.md label δ already tracks
+# an analogous subject-anchoring fix for git_ops.py's own citation regex,
+# but not for this script's independent copy.
 CITATION_PATTERN = re.compile(
     r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
