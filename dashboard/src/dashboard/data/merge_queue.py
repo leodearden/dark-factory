@@ -903,6 +903,31 @@ async def load_task_titles(
     so the merge-queue tab still renders (titles fall back to empty strings).
     Concurrent cold callers for the same project_root collapse onto one
     in-flight fetch_tasks call (TTLCache single-flight).
+
+    **Bounded as a whole.** The whole operation is bounded by
+    ``_TASK_TITLES_BUDGET`` via ``asyncio.wait_for``. ``fetch_tasks``' own
+    *timeout* is a PER-HTTP-REQUEST budget — it bounds connect/read/write and
+    pool acquisition, never the operation as a whole — so without this layer a
+    hang that opens no socket (a connection-pool lock, say) is unbounded, and
+    that is exactly what wedged /merge-queue for 19.8 h. A timeout returns the
+    SAME ``{}``, so titles degrade to empty strings rather than the tab 500ing
+    or hanging, and nothing is written to the cache (the refresh never
+    completed), so the next poll re-attempts and pays at most the budget
+    again — a timeout can never pin an empty title map for the TTL window.
+
+    The ``wait_for`` deliberately encloses ``get_or_refresh`` rather than the
+    inner ``fetch_tasks``. ``TTLCache.get_or_refresh`` serializes cold callers
+    for one key behind a per-key lock and runs the refresh WHILE HOLDING it,
+    so an inner-only wrap would leave a QUEUED caller waiting unbounded for
+    the holder's full budget before paying its own: the pair costs 2x and N
+    waiters cost N x, and the dashboard's 3 s poll makes waiters routine.
+    Enclosing the outer call bounds the lock wait too, and is safe —
+    ``wait_for`` cancels the inner task, cancellation unwinds
+    ``async with lock``, and ``__aexit__`` releases it rather than leaking it.
+
+    This bounds THIS caller only. It does not fix the general TTLCache
+    queue-amplifier class across all of its call sites; that is the sibling
+    task filed in the same batch.
     """
 
     async def _refresh() -> dict[str, str] | None:
@@ -911,9 +936,21 @@ async def load_task_titles(
             return None
         return {str(t['id']): t['title'] for t in fetched if t.get('title')}
 
-    result = await _task_titles_cache.get_or_refresh(
-        project_root, _refresh, cache_ok=lambda v: v is not None,
-    )
+    try:
+        result = await asyncio.wait_for(
+            _task_titles_cache.get_or_refresh(
+                project_root, _refresh, cache_ok=lambda v: v is not None,
+            ),
+            timeout=_TASK_TITLES_BUDGET,
+        )
+    except TimeoutError:
+        logger.warning(
+            'load_task_titles %s: exceeded the %.1fs whole-operation budget — '
+            'merge rows render with empty titles for this poll (titles are '
+            'UNKNOWN, not absent)',
+            project_root, _TASK_TITLES_BUDGET,
+        )
+        return {}
     return dict(result) if isinstance(result, dict) else {}
 
 
