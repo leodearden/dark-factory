@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import types
 
 import httpx
 import pytest
@@ -787,7 +788,9 @@ class TestTTLCacheEvictsExpiredKeys:
         cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
 
         clock = {'t': 0.0}
-        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+        monkeypatch.setattr(
+            fanout_mod, 'time', types.SimpleNamespace(monotonic=lambda: clock['t'])
+        )
 
         # Each iteration mints a NEW key and never revisits it — exactly the
         # shape of an offset that advances with every completed task.
@@ -818,7 +821,9 @@ class TestTTLCacheEvictsExpiredKeys:
 
         cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
         clock = {'t': 0.0}
-        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+        monkeypatch.setattr(
+            fanout_mod, 'time', types.SimpleNamespace(monotonic=lambda: clock['t'])
+        )
 
         await cache.get_or_refresh('keep-me', _four_hundred_rows)
         clock['t'] += 1.0
@@ -837,7 +842,9 @@ class TestTTLCacheEvictsExpiredKeys:
 
         cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
         clock = {'t': 0.0}
-        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+        monkeypatch.setattr(
+            fanout_mod, 'time', types.SimpleNamespace(monotonic=lambda: clock['t'])
+        )
 
         started = asyncio.Event()
         release = asyncio.Event()
