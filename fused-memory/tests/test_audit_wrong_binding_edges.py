@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import re
 import types
 from pathlib import Path
@@ -68,6 +69,8 @@ EDGE_PAGE_CYPHER = _mod.EDGE_PAGE_CYPHER
 EDGE_CENSUS_CYPHER = _mod.EDGE_CENSUS_CYPHER
 NODE_PAGE_CYPHER = _mod.NODE_PAGE_CYPHER
 NODE_CENSUS_CYPHER = _mod.NODE_CENSUS_CYPHER
+build_report = _mod.build_report
+PROXIMITY_BUCKETS = _mod.PROXIMITY_BUCKETS
 
 GRAPH = 'reify'
 
@@ -910,3 +913,165 @@ class TestReadTaskNodeIds:
         )
         ids, _ = await reader.read_task_node_ids()
         assert ids == {'133'}
+
+
+def _finding(**over) -> object:
+    """A Finding with sensible defaults, so each test names only what it varies."""
+    base = dict(
+        edge_uuid='edge-1',
+        graph=GRAPH,
+        end='subject',
+        node_name='Task 6165',
+        node_referent=_task('6165'),
+        fact_referents=(_task('6164'),),
+        fact='Task 6164 described landing the same artefact.',
+        episodes=('779b7b7d',),
+        proximity='one_digit_diff',
+        nearest_id='6164',
+        correct_node_present=False,
+    )
+    base.update(over)
+    return Finding(**base)
+
+
+class TestBuildReport:
+    """Shape, denominators, and the no-silent-caps contract."""
+
+    def _build(self, findings=(), **over):
+        args = dict(
+            swept_at='2026-08-27T00:00:00+00:00',
+            graphs=['dark_factory', GRAPH],
+            scanned=46000,
+            population=7131,
+            unverifiable=1200,
+            reads=(),
+        )
+        args.update(over)
+        return build_report(list(findings), **args)
+
+    def test_every_top_level_key_is_present(self) -> None:
+        report = self._build()
+        assert set(report) >= {
+            'swept_at', 'graphs', 'scanned', 'population', 'summary',
+            'truncated_by', 'caveats', 'known_gaps', 'findings',
+        }
+
+    def test_the_rate_divides_by_population_not_by_scanned(self) -> None:
+        """A fact naming no task id is UNVERIFIABLE, not clean.
+
+        Folding it into the denominator would divide by a population most of
+        which was never adjudicated, understating the rate by roughly the
+        ratio of the two. Pinned arithmetically so a later editor cannot
+        change the denominator without failing this test.
+        """
+        report = self._build([_finding(edge_uuid=f'e{i}') for i in range(192)])
+        assert report['summary']['findings'] == 192
+        assert report['summary']['rate'] == pytest.approx(192 / 7131)
+        assert report['summary']['rate'] != pytest.approx(192 / 46000)
+
+    def test_an_empty_population_does_not_divide_by_zero(self) -> None:
+        assert self._build([], population=0)['summary']['rate'] == 0.0
+
+    def test_every_proximity_bucket_is_present_even_when_zero(self) -> None:
+        """Absent reads as 'not measured'; 0 reads as 'measured, none'."""
+        summary = self._build([_finding()])['summary']
+        assert set(summary['by_proximity']) == set(PROXIMITY_BUCKETS)
+        assert summary['by_proximity']['one_digit_diff'] == 1
+        assert summary['by_proximity']['unrelated'] == 0
+
+    def test_both_ends_and_both_node_presence_values_are_always_present(self) -> None:
+        summary = self._build([_finding()])['summary']
+        assert summary['by_end'] == {'subject': 1, 'object': 0}
+        assert summary['correct_node_present'] == {'true': 0, 'false': 1}
+
+    def test_by_graph_tallies_every_swept_graph(self) -> None:
+        summary = self._build([_finding(), _finding(edge_uuid='e2')])['summary']
+        assert summary['by_graph'] == {'dark_factory': 0, GRAPH: 2}
+
+    def test_families_are_nodes_carrying_more_than_one_finding(self) -> None:
+        """The Task 6165 shape: five edges, one node, one wrong binding.
+
+        A family is the strongest single signal in the artifact — it is what
+        makes a mis-resolution visible as a systematic event rather than as
+        five unrelated rows — so it is a first-class summary key, not
+        something a reader must recompute from the findings list.
+        """
+        findings = [_finding(edge_uuid=f'6165-{i}') for i in range(5)]
+        findings.append(_finding(edge_uuid='lone', node_name='Task 3421',
+                                 node_referent=_task('3421')))
+        summary = self._build(findings)['summary']
+        assert len(summary['families']) == 1
+        family = summary['families'][0]
+        assert family['node_name'] == 'Task 6165'
+        assert family['graph'] == GRAPH
+        assert family['findings'] == 5
+        assert family['edge_uuids'] == [f'6165-{i}' for i in range(5)]
+
+    def test_an_incomplete_read_is_published_verbatim(self) -> None:
+        """A truncated read must be VISIBLE, never dropped.
+
+        Every denominator in this report depends on the read being complete,
+        so an incomplete one is not a footnote — it invalidates the numbers.
+        The PagedRead's own ``reason`` travels verbatim into both
+        ``truncated_by`` and ``caveats`` rather than being re-worded, so the
+        artifact carries the store's own account of what went wrong.
+        """
+        read = PagedRead(
+            rows=[], complete=False, rows_seen=10000, expected_rows=15256,
+            reason='SHORT: fetched 10000 of 15256', incomplete_kind='short_read',
+        )
+        report = self._build([], reads=[(GRAPH, 'edges', read)])
+        assert report['truncated_by'] is not None
+        entry = report['truncated_by']['incomplete_reads'][0]
+        assert entry['graph'] == GRAPH
+        assert entry['kind'] == 'edges'
+        assert entry['reason'] == 'SHORT: fetched 10000 of 15256'
+        assert entry['rows_seen'] == 10000
+        assert entry['expected_rows'] == 15256
+        assert 'SHORT: fetched 10000 of 15256' in ' '.join(report['caveats'])
+
+    def test_a_complete_read_leaves_truncated_by_null(self) -> None:
+        read = PagedRead(
+            rows=[], complete=True, rows_seen=7, expected_rows=7, reason=None,
+        )
+        assert self._build([], reads=[(GRAPH, 'edges', read)])['truncated_by'] is None
+
+    def test_a_bounded_listing_says_what_it_dropped(self) -> None:
+        findings = [_finding(edge_uuid=f'e{i}') for i in range(10)]
+        report = self._build(findings, limit_listing=3)
+        assert len(report['findings']) == 3
+        assert report['summary']['findings'] == 10  # COUNTED, not listed
+        assert report['truncated_by']['listing']['withheld'] == 7
+
+    def test_known_gaps_names_both_uncovered_subclasses(self) -> None:
+        """Asserted as a CONTRACT so 'found none' cannot read as 'none exist'."""
+        gaps = self._build()['known_gaps']
+        blob = json.dumps(gaps)
+        assert '1cf19488' in blob and '01e3e75e' in blob  # direction reversal
+        assert '993a9a7b' in blob  # fact contradicts its source episode
+        # The measured refutation of the cheap direction heuristic.
+        assert '85' in blob and '7131' in blob
+
+    def test_findings_sort_deterministically(self) -> None:
+        """(graph, node_task_id, edge_uuid), so successive runs diff cleanly."""
+        findings = [
+            _finding(edge_uuid='zzz', graph='reify', node_referent=_task('9')),
+            _finding(edge_uuid='aaa', graph='dark_factory', node_referent=_task('9')),
+            _finding(edge_uuid='mmm', graph='reify', node_referent=_task('1')),
+        ]
+        rows = self._build(findings)['findings']
+        assert [(r['graph'], r['node_task_id'], r['edge_uuid']) for r in rows] == [
+            ('dark_factory', '9', 'aaa'), ('reify', '1', 'mmm'), ('reify', '9', 'zzz'),
+        ]
+
+    def test_the_report_is_byte_stable_across_two_builds(self) -> None:
+        findings = [_finding(edge_uuid=f'e{i}') for i in range(4)]
+        first = json.dumps(self._build(findings), indent=2, default=str)
+        second = json.dumps(self._build(findings), indent=2, default=str)
+        assert first == second
+
+    def test_unverifiable_is_counted_and_never_summed_into_the_rate(self) -> None:
+        """Different facts, never one headline number."""
+        report = self._build([_finding()])
+        assert report['unverifiable'] == 1200
+        assert report['summary']['rate'] == pytest.approx(1 / 7131)
