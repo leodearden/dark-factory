@@ -4220,6 +4220,107 @@ class TestDedupFlagsDedupedAgainstEnrichment:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4712 step-1 ----
+# RED: no INPUT to compute_flag_signature may be persisted in the
+# stage1_flag_marker payload as durable cross-cycle state (task 4712 /
+# esc-3841-1 follow-up). cited_tasks is folded into compute_flag_signature's
+# own task-id component (see that function's docstring), so a value derived
+# from it is stored in a row keyed by itself: a later cycle presenting a
+# DIFFERENT cited_tasks set keys to a DIFFERENT row and can never read the
+# anchor back. Measured on this branch (task 4712 pre-1):
+#   compute_flag_signature({'task_id': 598, 'flag_type': ft,
+#       'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839'}]})
+#     == ('3839,598', ft)
+#   compute_flag_signature({'task_id': 598, 'flag_type': ft})
+#     == ('598', ft)
+# — two different rows for one logical flag. Genuinely RED today: dedup_flags
+# currently writes the sanitized cited_tasks into the payload of the row
+# keyed by the CURRENT cycle's own signature — exactly the row a
+# citation-matching cycle would key to anyway — so the anchor can never be
+# read back by a cycle that would actually need it.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerPayloadKeyInvariant:
+    """No INPUT to ``compute_flag_signature`` may be persisted in the
+    ``stage1_flag_marker`` payload as durable cross-cycle state (task 4712).
+
+    A payload field that is ALSO a signature input is stored in a row keyed
+    by itself, so any cycle presenting a different value for that field keys
+    to a different row and can never read the field back. ``task_id`` and
+    ``flag_type`` are exempt from this rule only because they are exact
+    mirrors of the row's own key columns (the ledger's ``task_id``/
+    ``flag_type`` columns), which any cycle keying to this row at all
+    trivially reproduces. ``cited_tasks`` is not such a mirror — it carries
+    ``project_id``/``title`` the key does not encode — which is exactly what
+    made the now-retired anchor unreachable.
+    """
+
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    #: Payload keys that mirror the row's own (task_id, flag_type) key
+    #: columns — the only signature inputs allowed to appear in the payload.
+    KEY_MIRROR_KEYS = frozenset({'source', 'kind', 'task_id', 'flag_type'})
+    #: Every input compute_flag_signature reads off a flag (see its
+    #: docstring: task_id, flag_type, cited_tasks).
+    SIGNATURE_INPUT_FIELDS = frozenset({'task_id', 'flag_type', 'cited_tasks'})
+
+    @pytest.mark.asyncio
+    async def test_no_signature_input_is_persisted_as_durable_payload_state(
+        self, ledger_memory_service
+    ):
+        """RED: a flag citing a FOREIGN task must not persist ``cited_tasks``
+        — a ``compute_flag_signature`` input — in its marker payload."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}],
+        }
+        sig = compute_flag_signature(flag)
+        assert sig == ('3839,598', self.FLAG_TYPE), (
+            f'pre-1 measured signature must still hold; got {sig!r}'
+        )
+        tid, ftype = sig
+
+        await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='know_live',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'know_live', tid, ftype)
+        assert row is not None, 'marker row must be persisted'
+        payload = json.loads(row.payload_json)
+
+        # (a) The whole defect in one assertion: cited_tasks is a signature
+        # input and must never be persisted as durable payload state.
+        assert 'cited_tasks' not in payload, (
+            f'cited_tasks is a compute_flag_signature INPUT — persisting it '
+            f'stores it in a row keyed by itself, unreachable to any cycle '
+            f'presenting a different citation set; got {payload!r}'
+        )
+
+        # (b) The invariant in general form: no payload key OUTSIDE the
+        # key-mirror set may be a compute_flag_signature input.
+        non_mirror_keys = set(payload) - self.KEY_MIRROR_KEYS
+        assert not (non_mirror_keys & self.SIGNATURE_INPUT_FIELDS), (
+            f'no payload key outside {sorted(self.KEY_MIRROR_KEYS)} may be a '
+            f'compute_flag_signature input; got {payload!r}'
+        )
+
+        # The two signature inputs that DO appear in the payload are exact
+        # mirrors of the row's own key columns, so they are trivially
+        # reproducible by any cycle that keys to this row at all.
+        assert payload['task_id'] == row.task_id
+        assert payload['flag_type'] == row.flag_type
+
+
+# ---------------------------------------------------------------------------
 # ---- task 4381 step-1 ----
 # RED: dedup_flags carries the flag's cited_tasks into the stage1_flag_marker
 # ledger payload (GAP 1 / esc-3841-1), sanitized so the payload json.dumps can
