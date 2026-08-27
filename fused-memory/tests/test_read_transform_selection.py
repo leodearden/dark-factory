@@ -7,9 +7,10 @@ over an already-fetched hit list, so every test here injects hand-built
 ranked lists with exactly-known answers — which is what permits exact
 assertions with no tolerances.
 
-Both scripts are loaded via importlib so they can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily.
+Both scripts are loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so they can be tested without sys.path pollution:
+that helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  Both are invoked lazily.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
 -------------------------------------------
@@ -33,9 +34,10 @@ in-progress and claims that module.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
+
+from _fm_helpers import load_script_module
 
 SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS_DIR / 'read_transform_selection.py'
@@ -49,21 +51,15 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
+    call sys.modules.get(cls.__module__)).  Both keys are SHARED — with
+    ``test_bake_off_storage_shape.py``, with ``test_bake_off_fetch_cache.py``
+    and with the script-side ``read_transform_selection._load_script`` — which
+    is what makes reuse, rather than an unconditional re-exec, correct here.
 
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(path, mod_name=mod_name)
 
 
 @functools.cache

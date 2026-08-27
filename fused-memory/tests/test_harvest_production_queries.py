@@ -10,9 +10,10 @@ Every test here builds a SYNTHETIC SQLite DB in ``tmp_path`` with the real
 it is a ~10 GB file the running fused-memory server is writing to, and a test
 that opened it would be measuring a moving target under xdist.
 
-The script is loaded via importlib so it can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily.
+The script is loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so it can be tested without sys.path pollution: that
+helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  It is invoked lazily.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
 -------------------------------------------
@@ -29,11 +30,11 @@ from the merge lane too — see the same warning at
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -48,21 +49,11 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
 
-    mod_name = 'harvest_production_queries'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(SCRIPT_PATH, mod_name='harvest_production_queries')
 
 
 @functools.cache
