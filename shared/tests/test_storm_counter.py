@@ -310,8 +310,9 @@ class TestPerCallClockOverride:
     fits a consumer that owns its counter for the process lifetime
     (``MarkupStormCounter``, ``MemoryService``). But
     ``reconciliation/harness.py``'s three storm counters inject time PER CALL —
-    ``now: datetime | None = None``, the ``_finding_recently_resolved``
-    convention at harness.py:1592 — and their callers pass an explicit instant
+    ``now: datetime | None = None``, the
+    ``reconciliation/harness.py::_finding_recently_resolved`` convention — and
+    their callers pass an explicit instant
     that the harness itself resolved. Without a per-call override those
     counters could only delegate here via a mutable clock-holder shim mutated
     around every call, which is exactly the hand-rolled state INV-5 is trying
@@ -583,24 +584,48 @@ class TestDistinctKeyOffByDefault:
 
     None of markup_tripwire, memory_service, mcp_markup_middleware,
     escalation/server.py or orchestrator/harness.py passes a key, and all of
-    them threshold on the raw event count. Passing a key to a default counter
-    must therefore change nothing at all.
+    them threshold on the raw event count. A default counter must therefore
+    behave exactly as it did before the mode existed — and must REFUSE a key
+    rather than quietly ignore one.
     """
 
-    def test_default_counter_thresholds_on_raw_events_even_when_keyed(self, counter):
-        assert counter.record(
-            threshold=3, window_seconds=3600.0, label='p', key='same'
-        ) is None
-        assert counter.record(
-            threshold=3, window_seconds=3600.0, label='p', key='same'
-        ) is None
-        summary = counter.record(threshold=3, window_seconds=3600.0, label='p', key='same')
+    def test_mode_is_readable_and_off_by_default(self, counter):
+        assert counter.count_distinct is False
+        assert StormCounter(count_distinct=True).count_distinct is True
 
-        assert summary is not None, (
-            'with count_distinct off, three events sharing one key are still '
-            'three events — this is the pre-existing contract'
+    def test_a_key_on_a_default_mode_counter_is_a_loud_error(self, counter):
+        """A mode mismatch fails loudly instead of degrading in silence.
+
+        Ignoring the key would leave the counter thresholding on RAW events
+        while its call site reads as if it counted distinct ones — the
+        pre-task-2039 regression (esc-recon-50da2482-1) the mode exists to
+        prevent, and invisible in the return value, the summary and the logs
+        alike. It is a wiring bug in the caller, deterministic on the first
+        call, so it raises (INV no-silent-fail-soft).
+        """
+        with pytest.raises(ValueError, match='count_distinct'):
+            counter.record(threshold=3, window_seconds=3600.0, label='p', key='same')
+
+        assert counter.prune(3600.0) == 0, (
+            'the rejected call must not have been recorded'
         )
-        assert summary['count'] == 3, 'count stays the RAW event count by default'
+
+    def test_a_none_key_is_accepted_in_either_mode(self, counter):
+        """``key=None`` is the "no identifier" case, not a mode mismatch.
+
+        A caller forwarding an optional identifier that happens to be missing
+        (``_record_dead_owner_suppression``'s defensive ``instance_id=None``)
+        must not be punished for it, and the shared adapter
+        ``reconciliation/harness.py::_storm_summary`` passes ``key=None`` for
+        both per-event counters on every call.
+        """
+        assert counter.record(
+            threshold=2, window_seconds=3600.0, label='p', key=None
+        ) is None
+        summary = counter.record(threshold=2, window_seconds=3600.0, label='p', key=None)
+
+        assert summary is not None, 'a None key must not disturb the raw count'
+        assert summary['count'] == 2, 'count stays the RAW event count by default'
 
     def test_default_counter_summary_shape_is_unchanged(self, counter):
         counter.record(threshold=2, window_seconds=3600.0, label='p')

@@ -73,7 +73,12 @@ class StormCounter:
     and ``window_seconds`` stay per-call. It is a STRUCTURAL mode fixed by the
     call site, not a config leaf, so capturing it at construction cannot go
     stale — the RELOAD SAFETY rule in the module docstring constrains config
-    VALUES only.
+    VALUES only. It is readable back off :attr:`count_distinct` so a consumer's
+    tests can pin the mode without reaching into private state.
+
+    Because the mode is structural, a ``key`` handed to a counter that is NOT in
+    ``count_distinct`` mode is a WIRING BUG, not a benign extra argument, and
+    :meth:`record` raises rather than ignoring it — see that method.
 
     State is PROCESS-LOCAL and resets on restart, like every other in-process
     storm counter in this codebase: the counter exists to catch a live burst,
@@ -94,6 +99,19 @@ class StormCounter:
         self._count_distinct = count_distinct
         self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
+
+    @property
+    def count_distinct(self) -> bool:
+        """Whether this counter thresholds on distinct ``key`` values.
+
+        Read-only: the mode is structural and fixed at construction (see the
+        class docstring). Exposed so a consumer's tests can pin the mode they
+        depend on — ``reconciliation/harness.py::_record_dead_owner_suppression``
+        is wrong, not merely differently-tuned, if its counter is ever built in
+        the default mode — without asserting on private state this class makes
+        no compatibility promise about.
+        """
+        return self._count_distinct
 
     def _prune(self, now: float, window_seconds: float) -> int:
         """Drop events older than the window as of *now*; return how many remain.
@@ -157,12 +175,23 @@ class StormCounter:
         caller could not resolve one. Unlabelled events still count toward the
         burst — there is simply nothing to name them against.
 
-        *key* is the DISTINCT-COUNT dimension, and is read only when the
-        counter was built with ``count_distinct=True`` (see the class
-        docstring). It is orthogonal to *label*: the burst is thresholded on
-        distinct keys and NAMED by distinct labels. ``key=None`` is excluded
-        from the distinct set entirely — such an event neither counts toward
-        the threshold nor blocks it.
+        *key* is the DISTINCT-COUNT dimension, and requires the counter to have
+        been built with ``count_distinct=True`` (see the class docstring). It is
+        orthogonal to *label*: the burst is thresholded on distinct keys and
+        NAMED by distinct labels. ``key=None`` is excluded from the distinct set
+        entirely — such an event neither counts toward the threshold nor blocks
+        it — and is always accepted, in either mode, so a caller forwarding an
+        optional identifier that happens to be missing is never a mismatch.
+
+        Passing a non-``None`` *key* to a DEFAULT-mode counter raises
+        ``ValueError``. Silently ignoring it would degrade that counter to raw-
+        event thresholding while the call site reads as if it were counting
+        distinct keys — precisely the pre-task-2039 regression
+        (esc-recon-50da2482-1) that ``count_distinct`` exists to prevent, and
+        invisible in the summary, the logs and the return value alike. A mode
+        mismatch is a wiring bug in the CALL SITE, deterministic and caught on
+        its first call, so this fails loudly rather than fails soft (INV
+        no-silent-fail-soft / structured-facts-at-failure).
 
         *now* is an optional PER-CALL clock override, as an epoch float. The
         constructor-injected *time_provider* remains the default and is what
@@ -171,8 +200,8 @@ class StormCounter:
         caller that already carries a per-call injected timestamp of its own:
         ``reconciliation/harness.py``'s three storm counters take
         ``now: datetime | None`` on every recording method (the
-        ``_finding_recently_resolved`` convention at harness.py:1592) and
-        resolve it against ``datetime.now(UTC)`` before calling in. Without
+        ``reconciliation/harness.py::_finding_recently_resolved`` convention)
+        and resolve it against ``datetime.now(UTC)`` before calling in. Without
         this door they could only delegate through a mutable clock-holder
         mutated around each call, which is the hand-rolled state INV-5 exists
         to delete. It threads through the window, the pruning and the
@@ -193,7 +222,18 @@ class StormCounter:
         ``window_seconds`` and ``labels`` — the sorted DISTINCT non-``None``
         labels seen in the window, so the caller can attribute the burst
         instead of blaming whichever event crossed the threshold.
+
+        :raises ValueError: if *key* is not ``None`` on a counter built without
+            ``count_distinct=True``.
         """
+        if key is not None and not self._count_distinct:
+            raise ValueError(
+                f'key={key!r} was passed to a StormCounter built without '
+                'count_distinct=True; that counter thresholds on the RAW event '
+                'count and would silently ignore the key. Construct it with '
+                'StormCounter(count_distinct=True), or drop the key.'
+            )
+
         effective_now = now if now is not None else self._now()
 
         # Append, then prune.
