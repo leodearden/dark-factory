@@ -22,6 +22,19 @@ and inject a ``_MultiTenantFalkorDriver`` directly, NEVER calling
 ``build_indices_and_constraints()``.  Every graph named here is a throwaway from
 ``unique_graph_name``; no real project graph is ever touched.  The absence of
 indices on real graphs is protected evidence for esc-3375-1.
+
+HAZARD (task 4748): the drop side has its own asynchrony, alongside the
+already-documented index BUILD asynchrony (see ``live_vector_graph``'s
+MANDATORY task-3377 barrier below).  ``DROP VECTOR INDEX`` against a label
+whose merged index carries other surviving fields is NOT an in-place catalog
+mutation — FalkorDB builds a REPLACEMENT index for those fields, and any
+catalog read taken before that build finishes can still see the pre-drop row,
+including the just-dropped VECTOR property.  Every post-drop
+``list_indices()`` / ``drop_vector_indices()`` call in this module is
+therefore barriered by ``await_index_operational``, guarding the production
+contract documented on
+``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``;
+those barrier calls are load-bearing, not defensive.
 """
 
 from __future__ import annotations
@@ -135,6 +148,22 @@ class TestDropVectorIndicesLive:
       first bullet, so ``entity_type`` is load-bearing.
     * ``DROP VECTOR INDEX`` on a property carrying ``['RANGE', 'VECTOR']`` leaves
       ``['RANGE']`` behind — it is surgical.
+
+    MEASURED 2026-08-27 (task 4748), extending the above with the post-drop
+    rebuild window that motivates every ``await_index_operational`` call in
+    this class's tests:
+
+    * After ``DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)`` on a
+      graph whose Entity index carries both ``name_embedding`` VECTOR and
+      ``name`` RANGE, one ``CALL db.indexes()`` can return two Entity rows —
+      ``['name'] {'name': ['RANGE']}`` at ``'[Indexing] N/M: UNDER
+      CONSTRUCTION'`` beside ``['name_embedding', 'name']
+      {'name_embedding': ['VECTOR'], 'name': ['RANGE']}`` at ``'OPERATIONAL'``.
+    * The window is ~4 ms on the 1-node fixture graph and 0.21-0.75s at 50,000
+      nodes; it is NOT a read-path artifact (RO_QUERY and QUERY agree at every
+      instant).
+    * A relationship index with a single field opens no window — dropping it
+      removes the whole index.
     """
 
     @pytest.mark.asyncio
