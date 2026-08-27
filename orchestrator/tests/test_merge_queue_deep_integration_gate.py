@@ -134,13 +134,64 @@ queue and one permit census, with the run's landings re-derived from main's
 first-parent history (:func:`_chain_landed_from_git`) so the shipped canary is
 checked against GIT rather than against its own arithmetic.
 
+RESIDUAL GAP — the remote-green cross-check is OFF on every deep round here
+----------------------------------------------------------------------------
+``config.verify_cross_check_remote_green`` (default True) is pinned False on
+every ``remote=True`` scene in this file — rows 1, 4 and 7 and the capstone,
+which between them are every deep round the gate drives (the capstone re-pins
+it after ``reload_cap``, whose comparison config carries stock defaults and
+turns it back on).  The reason is determinism, not scope: the cross-check runs
+a full LOCAL trust-anchor suite over the merge worktree and, MEASURED, emits
+``verdict_parity_ok`` on one run of the same fixture scene and nothing on the
+next, so leaving it on would make every golden and every event-stream
+assertion in the file flaky for a reason unrelated to deep merge-ahead.
+
+The consequence is real and is stated here so it is not discovered by
+following a comment: NO deep round in this gate exercises the cross-check,
+including the post-reload depth-12 round where a CHAINED tip's green is the
+most interesting thing to cross-check.  That combination — a deep tip green
+cross-checked locally — is not covered anywhere in the tree today.  The
+cross-check itself is owned by test_merge_queue_multihost_wiring.py and
+test_multihost_verify_integration.py, both of which drive it with
+``verify_cross_check_remote_green=True`` on the SHALLOW (one-item) path.
+Closing the intersection needs a deterministic trust-anchor stub for a chained
+tip, which is a harness this file does not have and would not be the right
+place to build.
+
 PROVENANCE — every helper below is a PORT, not an original
 -----------------------------------------------------------
-``orchestrator/tests/`` has no ``__init__.py``, so a cross-module helper import
-would be a bare-module-name import of a sibling TEST file, coupling the two
-suites' collection order.  CLONING is the sanctioned convention here, and this
-table is the cost of it: a production change to any of these seams turns this
-file AND its origin red, and the origin is where the unit-level contract lives.
+These helpers are CLONED from their origins, and this table is the cost of
+that: a production change to any of these seams turns this file AND its origin
+red, and the origin is where the unit-level contract lives.
+
+Read the rest of this note before cloning anything else, because the cloning
+here is a SCOPE artifact and not the sanctioned end state.  An earlier draft of
+this table justified it by claiming that ``orchestrator/tests/`` has no
+``__init__.py``, so any cross-module helper import would be a bare-module-name
+import of a sibling TEST file that couples the two suites' collection order.
+That premise is FALSE, and the directory disproves it: ``_merge_queue_harness.py``,
+``_orch_helpers.py``, ``_serial_merge_worker.py``, ``_recording_event_store.py``
+and ``_verify_config_corpus.py`` are flat, NON-test helper modules imported by
+bare module name from dozens of test files (conftest.py puts the tests dir on
+``sys.path``; ``_merge_queue_harness.py``'s own docstring spells the convention
+out).  Importing a ``_``-prefixed helper module is not a test-module import and
+does not couple collection order — test_merge_queue_invariant_integration_gate.py,
+which owns the ORIGINAL ``_assert_quiescent`` this file's oracle is the third
+clone of, already imports from ``_merge_queue_harness`` itself.
+
+The RIGHT end state is one ``orchestrator/tests/_merge_deep_scene.py`` holding
+the shared layer (the repo fixtures, the ``_make_*`` builders, the git helpers,
+the spies, ``_permit_census``, the durable-tier readers and the
+``_assert_quiescent`` core), imported by all three deep-merge modules exactly as
+``_merge_queue_harness`` is imported today.  It is not done here because the
+extraction has to EDIT test_merge_queue_deep_landing.py and
+test_merge_queue_invariant_integration_gate.py to import from it, and task 3187
+holds a concurrency lock on this file only — editing either sibling would widen
+this task's footprint onto modules other PRD leaves are queued behind.  Doing
+half of it (a shared module only this file imports) would leave three copies
+plus a fourth home and be strictly worse.  Until that follow-up lands, treat
+each row below as a KNOWN duplicate to be deleted by the extraction, not as a
+pattern to extend.
 
   helper in this file            | ported from
   -------------------------------+-------------------------------------------
@@ -2168,6 +2219,7 @@ class _GateScene:
         # workaround: nothing in the deep path reads these flags.
         worker._n_failed = False
         worker._remerge_occurred = False
+        n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
         n_releases_before = len(self.lane_releases)
@@ -2200,6 +2252,20 @@ class _GateScene:
         advanced = await worker._finalize_inflight(entry)
         await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
 
+        # `self.calls` is filled ONLY by the `_run_inflight_verify` recorder.
+        # Today every dispatched item reaches it, so `calls[-1]` really is THIS
+        # round's — but the failure mode if that ever stops holding is silent
+        # and total: the PREVIOUS round's dict would be mutated in place and
+        # appended a second time, so `rounds[-1] is rounds[-2]`, every per-round
+        # slice below would be recomputed against the wrong watermarks, and
+        # multi-round assertions would keep passing while reading another
+        # round's facts.  Make it a loud RED instead.
+        assert len(self.calls) == n_calls_before + 1, (
+            f'round {self._round_no} ({tag!r}, head {head_tid}) appended '
+            f'{len(self.calls) - n_calls_before} verify-call records, expected '
+            f'exactly 1 — `calls[-1]` is not this round\'s, so every per-round '
+            f'fact recorded below would belong to a different round'
+        )
         rec = self.calls[-1]
         outcome = popped.result.result() if popped.result.done() else None
         rec.update({
@@ -2351,6 +2417,7 @@ class _GateScene:
         # Slot-1 steady state, for the reason documented at length in `round_`.
         worker._n_failed = False
         worker._remerge_occurred = False
+        n_calls_before = len(self.calls)
         n_built_before = len(self.built)
         n_acquires_before = len(self.lane_acquires)
         n_releases_before = len(self.lane_releases)
@@ -2394,6 +2461,15 @@ class _GateScene:
         advanced = await worker._finalize_inflight(entry)
         await asyncio.sleep(0)  # let every `_on_finalized` done-callback run
 
+        # Exactly one NEW call record, for the reason spelled out in
+        # `round_`.  The head's own record was appended back in `attach_head`
+        # (the recorder appends BEFORE awaiting, so an in-flight verify is
+        # already on the list), so the spec item's is the only addition here.
+        assert len(self.calls) == n_calls_before + 1, (
+            f'adopting round {self._round_no} ({tag!r}, spec {spec_tid}) '
+            f'appended {len(self.calls) - n_calls_before} verify-call records, '
+            f'expected exactly 1 — `calls[-1]` is not this round\'s'
+        )
         rec = self.calls[-1]
         outcome = popped.result.result() if popped.result.done() else None
         rec.update({
@@ -2572,10 +2648,19 @@ async def _make_gate_scene(
     :func:`_conflicting_branch_content` rather than by hand, so the "which line
     of shared.txt is safe" reasoning lives in one place.
 
-    Module-level monkeypatching is confined to the four names
-    test_merge_queue_reachback_patch_guard.py sanctions (``build_chain``,
-    ``_run_post_merge_verify``, ``release_chain_build_lane`` and
-    ``CHAIN_BUILD_TIMEOUT_SECS``); everything else is patched on the INSTANCE.
+    Module-level monkeypatching is confined to (a) the four
+    ``orchestrator.merge_queue`` names test_merge_queue_reachback_patch_guard.py
+    sanctions — ``build_chain``, ``_run_post_merge_verify``,
+    ``release_chain_build_lane`` and ``CHAIN_BUILD_TIMEOUT_SECS`` — and (b) the
+    PUBLIC verify seams conftest's own autouse ``_mock_merge_queue_verification``
+    already occupies: ``orchestrator.merge_queue.run_scoped_verification`` (the
+    ``verdict=`` arm below, installed over that stub so it wins) and
+    ``orchestrator.verify._run_cmd`` plus the same ``run_scoped_verification``
+    name (:func:`_capture_verify_timeouts`, which RESTORES the real function so
+    the resolver is reachable at all).  (b) is not a reach-back: the guard
+    freezes the ``merge_queue.<private>`` surface, and both of these are public
+    names the shipped test harness itself patches.  Everything else — every
+    worker attribute, every ``GitOps`` method — is patched on the INSTANCE.
     """
     from orchestrator.event_store import EventStore
 
@@ -2660,7 +2745,22 @@ async def _make_gate_scene(
         monkeypatch.setattr(
             'orchestrator.merge_queue.run_scoped_verification', _recording_verdict,
         )
-    elif not remote and not real_local:
+    elif real_local:
+        # Hard-guarded for the same reason `verdict=` is: this arm patches
+        # NOTHING on the verify path, so a positional script would be silently
+        # ignored and the caller would get verdicts from a seam it did not
+        # name.  Documented in prose above; asserted here.
+        assert not remote, (
+            'real_local= and remote= are mutually exclusive seams (the '
+            'docstring above names all three): remote= installs a stub '
+            'allocator ABOVE the real local stack real_local= exists to reach'
+        )
+        assert not script, (
+            'real_local= and script= are mutually exclusive: the real stack '
+            'derives its own verdict from what it is handed, so a positional '
+            'script has nowhere to be consumed on this arm'
+        )
+    elif not remote:
         verdicts = list(script or [])
 
         async def _oracle(_git_ops, _req, merge_wt, **kwargs):
@@ -2724,7 +2824,6 @@ class TestDeepScaleBuild:
             f'expected a 15-LINK chain (16 items incl. the head), got '
             f'{len(chain.links)}: {[t for t, _ in chain.links]!r}'
         )
-        assert 1 + len(chain.links) == 16
         assert chain.truncated_at is None, (
             f'a DEPTH stop is not a truncation, but truncated_at is '
             f'{chain.truncated_at!r} (reason {chain.truncated_reason!r})'
@@ -2827,7 +2926,14 @@ class TestRow11TimeoutMargin:
         the general cold knob.  So the negative control matters as much as the
         positive one: 5400.0 — the general cold budget, which is what a
         merge-verify would silently fall back to if the merge knob were ever
-        dropped from the threading — must never appear.
+        dropped from the threading — must never appear.  That negative control
+        is carried by the EXACT-SET assertion below (``set(captured) ==
+        {7200.0}`` excludes every other value, 5400.0 among them), which is why
+        there is no separate ``5400.0 not in captured`` line: it would be
+        entailed by the set form and could never fail independently.  What the
+        set form DOES need is the two knob pins — if the general cold budget
+        were ever retuned to 7200.0 the set assertion would stop discriminating
+        between the two routes, and the pins fail loudly when that happens.
 
         This runs the REAL ``_run_post_merge_verify`` → ``LocalRunner`` →
         ``run_scoped_verification`` → ``run_verification`` stack, with only the
@@ -2855,8 +2961,9 @@ class TestRow11TimeoutMargin:
             f'{config.merge_verify_cold_command_timeout_secs!r}'
         )
         assert config.verify_cold_command_timeout_secs == 5400.0, (
-            'the shipped GENERAL cold budget moved, so the negative control '
-            f'below is no longer the right one: got '
+            'the shipped GENERAL cold budget moved, so the exact-set assertion '
+            'below is no longer a negative control (it discriminates between '
+            'the two routes only while the two budgets DIFFER): got '
             f'{config.verify_cold_command_timeout_secs!r}'
         )
 
@@ -2867,11 +2974,9 @@ class TestRow11TimeoutMargin:
         )
         assert set(captured) == {7200.0}, (
             f'every command in a merge verify is handed the merge-verify cold '
-            f'budget; got {sorted(set(captured))!r} across {len(captured)} '
-            f'commands'
-        )
-        assert 5400.0 not in captured, (
-            f'the GENERAL cold budget leaked into a merge verify: {captured!r}'
+            f'budget, and NOTHING else — 5400.0, the general cold budget a '
+            f'dropped is_merge_verify would fall back to, must not appear; got '
+            f'{sorted(set(captured))!r} across {len(captured)} commands'
         )
 
     async def test_the_same_budget_is_handed_to_a_one_item_verify(
@@ -2950,10 +3055,10 @@ class TestRow11TimeoutMargin:
             f'this row asserts is gone'
         )
 
-    async def test_chain_build_ms_reaches_the_reader_exactly_when_deep(
+    async def test_chain_build_ms_is_stamped_on_the_deep_row(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b) The stall stamp is on the deep row and ABSENT on the shallow one.
+        """(b) A deep verify stamps the stall it paid for, with the chain's own ms.
 
         η1 reads ``chain_build_ms`` out of the durable ``merge_verify`` row
         alongside drain-time, so the presence rule is part of the contract and
@@ -2962,7 +3067,12 @@ class TestRow11TimeoutMargin:
         would be a lie rather than an absence, and would land in the reader's
         histogram as a free build.
 
-        Two scenes, because the two arms cannot coexist in one round.
+        This test owns only the PRESENT half.  The ABSENT half — a one-item
+        verify stamping ``None`` — is
+        :meth:`test_a_one_item_verify_stamps_no_build_cost` below; the two
+        together are the iff, and they are two tests rather than one because
+        the arms cannot coexist in one round (a round either chained or it did
+        not) and because a failure should name WHICH half broke.
         """
         deep = await _make_gate_scene(
             git_repo, tmp_path, monkeypatch,
@@ -2988,7 +3098,11 @@ class TestRow11TimeoutMargin:
     async def test_a_one_item_verify_stamps_no_build_cost(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """(b, control) The always-on arm reports chain_items=1, build_ms None."""
+        """(b, control) The always-on arm reports chain_items=1, build_ms None.
+
+        The ABSENT half of the iff whose PRESENT half is
+        :meth:`test_chain_build_ms_is_stamped_on_the_deep_row` above.
+        """
         shallow = await _make_gate_scene(
             git_repo, tmp_path, monkeypatch,
             chain_cap=32, n_followers=0, db_name='gate-row11-stamps.db',
@@ -3092,14 +3206,27 @@ class TestRow11TimeoutMargin:
         )
 
         # 4 — the bisector halved off the BUILT depth.
-        assert worker._chain_halving_state == next_halving_state(False, 16), (
-            f'a timed-out 16-item tip must halve the ceiling to '
-            f'{next_halving_state(False, 16)}, got '
+        #
+        # The LITERAL is the load-bearing form.  Deriving the expectation from
+        # ``next_halving_state`` — the very function whose policy is under test
+        # — proves only that ``_note_chain_outcome`` CALLED it, never that the
+        # ceiling landed on 8: mutating the fail arm to ``dispatched_depth //
+        # 16`` (a 16-item tree collapsing straight to the floor) keeps a
+        # derived-only assertion green.  The derived form is kept BELOW it as a
+        # secondary cross-check that the worker routes through the shipped
+        # policy rather than computing a ceiling of its own.
+        assert worker._chain_halving_state == 8, (
+            f'a timed-out 16-item tip must halve the ceiling to 8 — not '
+            f'None (a reset, i.e. reading a hung verify as a clean bill of '
+            f'health) and not the floor (1, which would decline to chain and '
+            f'silently switch the feature off for the rest of the walk); got '
             f'{worker._chain_halving_state!r}'
         )
-        assert worker._chain_halving_state is not None, (
-            'a timeout is not a pass — resetting the bisector would read a '
-            'hung verify as a clean bill of health'
+        assert worker._chain_halving_state == next_halving_state(False, 16), (
+            f'the ceiling must come from the SHIPPED policy, not from a '
+            f'private computation: next_halving_state(False, 16) = '
+            f'{next_halving_state(False, 16)!r}, worker holds '
+            f'{worker._chain_halving_state!r}'
         )
 
 
@@ -3257,10 +3384,19 @@ class TestRow3HalvingIsolatesTheBadItem:
             if after_round is not None:
                 after_round(scene, rec)
         else:  # pragma: no cover - a walk that never drains is the bug
-            pytest.fail(
-                f'the queue never drained in {max_rounds} rounds; depths so far '
-                f'were {scene.depths!r}'
-            )
+            # Exhausting `max_rounds` does NOT by itself mean the queue is
+            # still live: the drain check sits at the TOP of the loop, so a
+            # walk whose FINAL iteration emptied the queue lands here having
+            # drained perfectly.  Probe once more before failing — a pop that
+            # returns None consumes nothing, and on the failing branch the
+            # consumed item does not matter.
+            leftover = pending if pending is not None else worker._pop_next_pickable()
+            if leftover is not None:
+                pytest.fail(
+                    f'the queue never drained in {max_rounds} rounds (task '
+                    f'{leftover.task_id} still pickable); depths so far were '
+                    f'{scene.depths!r}'
+                )
         return scene, queue_lens, permits_before
 
     async def test_the_bisection_walks_down_and_terminates_on_the_red_item(
@@ -3446,8 +3582,17 @@ class TestRow3HalvingIsolatesTheBadItem:
             after_round=_snapshot,
         )
 
-        during_bisection = scene.rounds[8]
-        assert during_bisection['round'] == 9, 'round 9 ends the bisection'
+        # The bisection runs 9 rounds; both `scene.rounds` and `streams` are
+        # appended once per round, so index 8 is round 9 on both.  Stated as a
+        # LENGTH bound rather than as `rounds[8]['round'] == 9` — the latter
+        # reads the scene's own monotonic counter, is 9 by construction, and
+        # could only ever fail as an IndexError on the line that fetched it.
+        assert len(scene.rounds) >= 9 and len(streams) >= 9, (
+            f'this test samples the state DURING the bisection (round 9, index '
+            f'8); the walk produced only {len(scene.rounds)} rounds / '
+            f'{len(streams)} snapshots, so the sample below would be a '
+            f'different round than the one the claim is about'
+        )
         chained_at_least_once = {
             tid
             for rec in scene.rounds[:9] if rec['chain'] is not None
