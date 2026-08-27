@@ -3136,19 +3136,23 @@ class TestRetryLoopAnnotationEndToEnd:
         assert 'designed-outcome' not in date_line
         assert date_line.endswith(f': {mod._input_signature(_DATE_CHECK)}')
 
-    def test_instrument_version_is_not_bumped(self):
-        # PRD Sec 7.2.2's own test, applied deliberately (census R1 asks the
-        # implementer to DECIDE rather than default): the annotation adds no
-        # signal_counts key and no detector hit, changes no gold section and
-        # no section partition -- textbook renderer cosmetics, which the
-        # policy says does NOT bump. Bumping would falsely tell a future
-        # census that signal semantics moved, corrupting the pre-fix /
-        # live-regression discriminator the version exists to provide.
-        # Asserted against the CONSTANT, never a literal: a legitimate
-        # future bump (a real signal-semantics change) must not have to
-        # edit a test named for the 4751 decision, which would point its
-        # implementer at the wrong decision record. The single literal
-        # pin lives in TestRenderFrontmatter, where a bump belongs.
+    def test_rendered_instrument_version_is_wired_to_the_live_constant(self):
+        # Named for what it can actually detect. PRD Sec 7.2.2's own test,
+        # applied deliberately (census R1 asks the implementer to DECIDE
+        # rather than default), concluded that the annotation does not bump:
+        # it adds no signal_counts key and no detector hit, and leaves the
+        # gold section and the section partition alone -- textbook renderer
+        # cosmetics, which the policy says does NOT bump. Bumping would
+        # falsely tell a future census that signal semantics moved,
+        # corrupting the pre-fix / live-regression discriminator the version
+        # exists to provide. Those PREMISES are what the two tests below pin
+        # at runtime; the CONCLUSION (the constant still reads 2) is a
+        # diff-level fact, and nothing in this file freezes it -- deliberately,
+        # because a legitimate future bump must not have to edit a test named
+        # for the 4751 decision, which would point its implementer at the
+        # wrong decision record. What this test does pin is that a bump would
+        # PROPAGATE: the rendered frontmatter reports the live constant, not
+        # a literal that could go stale behind it.
         meta, _ = self._retry_block(_watcher_rotation_records())
 
         assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
