@@ -1,15 +1,15 @@
 {
-  "swept_at": "2026-08-27T04:50:22.376271+00:00",
+  "swept_at": "2026-08-27T06:51:37.767043+00:00",
   "graphs": [
     "dark_factory",
     "reify"
   ],
-  "scanned": 26667,
-  "population": 6959,
-  "unverifiable": 304,
+  "scanned": 26674,
+  "population": 6961,
+  "unverifiable": 305,
   "summary": {
     "findings": 181,
-    "rate": 0.026009484121281793,
+    "rate": 0.026002011205286595,
     "by_graph": {
       "dark_factory": 76,
       "reify": 105
