@@ -632,6 +632,20 @@ kind, so a future fifth structural path is covered by construction.
 # --------------------------------------------------------------------------- #
 
 
+# An edge is ACTIVE only when NEITHER retirement marker is set.  The two are
+# independent: `invalid_at` is written by fused-memory (recon Stage 1 /
+# update_edge, "superseded"); `expired_at` is written by graphiti_core's own
+# contradiction resolution (graphiti_core/utils/maintenance/edge_operations.py::
+# resolve_extracted_edge).  Filtering only one leaves the other's retirees
+# surfacing as current facts.  A property never written is NULL in Cypher, so
+# legacy edges predating `expired_at` still pass.  (task 4714)
+#
+# Every read answering "what is currently true?" interpolates this constant.
+# Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
+# retired edges; `count_foreign_relationships` most emphatically so.
+_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL AND e.expired_at IS NULL'
+
+
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
 # are therefore directly comparable.
@@ -2112,8 +2126,10 @@ class GraphitiBackend:
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
-        Matches the node as either source or target (undirected) and filters
-        edges where invalid_at IS NULL (i.e. not yet invalidated).
+        Matches the node as either source or target (undirected) and excludes
+        edges carrying EITHER retirement marker — ``invalid_at`` (superseded by
+        fused-memory) or ``expired_at`` (contradicted by graphiti_core) — per
+        ``_ACTIVE_EDGE_PREDICATE``.
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2132,7 +2148,7 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
+            f'WHERE {_ACTIVE_EDGE_PREDICATE} '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
