@@ -619,7 +619,8 @@ async def test_set_task_claimant_heartbeat_only_tick_on_terminal_row_is_silent(
     """B9 negative control (PRD-named): a heartbeat-only tick on an already-terminal row
 
     must not trip the wire — claimant_run_id is left at the _UNSET default (the wire shape
-    orchestrator/workflow.py:2319 produces), so no claimant is persisted by this call.
+    orchestrator/src/orchestrator/workflow.py::TaskWorkflow._claimant_heartbeat_loop
+    produces), so no claimant is persisted by this call.
     """
     await backend.add_task(project_root=project_root, title='x')
     await backend.set_task_claimant(
