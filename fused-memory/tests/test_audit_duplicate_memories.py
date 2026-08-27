@@ -5430,8 +5430,11 @@ class TestLivenessSubjectFactsIsAdditive:
     A record whose union key is COHERENT, like both of these, is now given no
     clause-scoped key at all -- a second guard on the same invariant, and the
     one that keeps grouping from turning on where the author put a full stop.
-    The partial key survives only where it earns its keep, on a DIVERGENT
-    record, and the test below pins that the seed still sits beside it there.
+    A clause key earns a bucket of its own only by naming the record's FULL
+    field vocabulary; a PARTIAL one is dropped everywhere, DIVERGENT record
+    included, and the divergent-record test below pins what survives that
+    drop -- the seed is never swapped out, so its subject keeps the
+    whole-record bucket it would have had anyway.
     """
 
     def _pair(self) -> list[dict]:
