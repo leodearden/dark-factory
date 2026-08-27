@@ -7011,12 +7011,13 @@ class MemoryService:
         edges = cast(list, results[1])
 
         node_data = [_node_to_dict(n) for n in nodes]
-        # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
-        # presents the same valid-edge semantics as the exact/topological branch
-        # (get_valid_edges_for_node's Cypher WHERE invalid_at IS NULL) and as
-        # search() (task 312, ~line 2588) — otherwise an agent resolving via the
-        # fuzzy fallback could silently act on a stale fact (task 2726).
-        edge_data = [_edge_to_dict(e) for e in edges if getattr(e, 'invalid_at', None) is None]
+        # Drop retired edges — superseded by us (invalid_at) or contradicted by
+        # graphiti_core itself (expired_at, task 4714) — so the fuzzy/semantic
+        # branch presents the same valid-edge semantics as the exact/topological
+        # branch (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and
+        # as search() (task 312) — otherwise an agent resolving via the fuzzy
+        # fallback could silently act on a stale fact (task 2726).
+        edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]
 
         return {'nodes': node_data, 'edges': edge_data}
 
