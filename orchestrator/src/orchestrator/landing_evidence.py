@@ -2237,6 +2237,23 @@ def file_unattributed_landing_escalation(
     the only outcome that LOSES an escalation, so it is the narrowest of the
     two guards by construction.
 
+    For the same reason the suppression lookup **fails open**: it is wrapped in
+    its own ``try/except`` (and its attribute ``getattr``-guarded, so an older
+    or duck-typed queue stand-in files as before) rather than being allowed to
+    reach the outer blanket ``except`` below, which would drop the filing
+    entirely. Its failure direction has to be "file, possibly a duplicate", not
+    "lose this escalation now" — the policy ``find_dedupe_parent``'s falsy-key
+    short-circuit and ``gate_backlog_fingerprint_key``'s documented
+    fail-toward-duplicates rule already encode. The counter bump is wrapped
+    separately for the mirror-image reason: it is observability, not the
+    decision, so its failure must not re-open the storm.
+
+    Note the resulting, deliberate CONTRAST with ``has_open_l1``: a raising
+    ``has_open_l1`` still DOES drop the filing (it reaches the outer blanket
+    except, as ``test_raising_queue_is_contained`` pins), because ITS failure
+    direction is "file a duplicate on the next tick" — recoverable. A raising
+    ``find_terminal_by_citation`` is not, so it is handled differently.
+
     Args:
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
         task_id: The task (or coalesce member) id the escalation is filed for.
@@ -2259,9 +2276,30 @@ def file_unattributed_landing_escalation(
         # "is a duplicate still OPEN?" (pending-only), this one asks "was this
         # exact evidence already ADJUDICATED?" (terminal-only).  It must run
         # BEFORE make_id below, so a suppressed refile burns no sequence number.
-        prior = escalation_queue.find_terminal_by_citation(
-            task_id, 'provenance_unattributed', citation_sha,
-        )
+        #
+        # It FAILS OPEN, in its own try/except rather than the function's outer
+        # blanket one below.  Suppression is the ONLY outcome here that LOSES an
+        # escalation, so the two failure directions are not symmetric: a guard
+        # that errs toward FILING costs a duplicate record someone closes, while
+        # one that errs toward SUPPRESSING costs a provenance defect nobody ever
+        # sees.  Letting this call reach the outer except would take the second
+        # direction — it would drop the filing on the floor.  Same policy as
+        # ``find_dedupe_parent``'s falsy-key short-circuit and
+        # ``gate_backlog_fingerprint_key``'s fail-toward-duplicates rule.
+        #
+        # ``getattr`` for the attribute itself so a duck-typed or older queue
+        # stand-in that lacks the method files as before rather than raising.
+        prior = None
+        finder = getattr(escalation_queue, 'find_terminal_by_citation', None)
+        if finder is not None:
+            try:
+                prior = finder(task_id, 'provenance_unattributed', citation_sha)
+            except Exception:
+                logger.warning(
+                    'Suppression lookup failed for task %s (citation %s) — '
+                    'filing anyway rather than risk losing the escalation',
+                    task_id, citation_sha, exc_info=True,
+                )
         if prior is not None:
             # INV-4 storm counter: record the suppression ON the resolution
             # that absorbed it, so the storm is a durable structured fact and
