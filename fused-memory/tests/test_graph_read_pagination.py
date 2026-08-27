@@ -30,10 +30,18 @@ import pytest_asyncio
 from _fm_helpers import (
     FALKOR_HOST,
     FALKOR_PORT,
+    complete_paged_read,
     falkor_skipif,
+    incomplete_paged_read,
     unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
+
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+)
 
 _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 
@@ -1498,6 +1506,236 @@ class TestCompleteEnumerationIsUnaffected:
         assert grouped == {}
         assert nodes == []
         assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# task 4386: the policy helper as a PUBLIC, consumer-facing contract
+# ---------------------------------------------------------------------------
+#
+# `apply_incompleteness_policy` used to be private and was reachable only
+# THROUGH the two shims, so it carried no direct coverage of its own. Task
+# 4386 promotes it because the three consumers it wires apply the same policy
+# at their own `enumerate_*` call sites — one implementation for five callers,
+# which is the whole point: copies of the raise/warn split would drift, and
+# the drift would be silent in exactly the direction that matters.
+#
+# These tests pin the helper DIRECTLY. The shim regression below then pins
+# that the promotion changed nothing an existing caller can observe.
+# ---------------------------------------------------------------------------
+
+
+def _warning_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestApplyIncompletenessPolicy:
+    """The SPLIT policy, exercised on the helper rather than through a shim."""
+
+    @staticmethod
+    def _call(paged, **overrides):
+        from fused_memory.backends.graphiti_client import apply_incompleteness_policy
+
+        kwargs = {
+            'method': 'enumerate_all_valid_edges',
+            'group_id': 'test-group',
+            'returned_count': 7,
+            'noun': 'entities',
+            'consequence': 'must not drive a staleness verdict',
+        }
+        kwargs.update(overrides)
+        return apply_incompleteness_policy(paged, **kwargs)
+
+    # -- (a) STRUCTURAL -> raise -----------------------------------------
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    def test_structural_kinds_raise_with_an_actionable_message(self, kind, caplog):
+        """Every member of the frozenset raises — iterated, not enumerated.
+
+        Parametrising over ``INCOMPLETE_STRUCTURAL_KINDS`` rather than naming
+        the two constants is the backend's own documented guidance for
+        branching on this set, and it means a future third structural path is
+        covered here by construction instead of silently skipped.
+        """
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        paged = incomplete_paged_read(kind, rows_seen=20, expected_rows=25040)
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(IncompleteEnumerationError) as exc,
+        ):
+            self._call(paged)
+
+        message = str(exc.value)
+        # An operator reading only the traceback must learn what was read,
+        # from where, why it is not an answer, and what it must not be used for.
+        assert 'enumerate_all_valid_edges' in message      # the method
+        assert 'test-group' in message                     # the group_id
+        assert kind in message                             # the typed kind
+        assert '7' in message                              # returned_count
+        assert 'entities' in message                       # the noun
+        assert 'must not drive a staleness verdict' in message   # consequence
+        assert paged.reason is not None
+        assert paged.reason in message                     # the diagnostic prose
+
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    def test_structural_kinds_raise_rather_than_warn(self, kind, caplog):
+        """The structural branch must not ALSO emit the empirical warning.
+
+        A warn-and-raise would train an operator to read the warning as the
+        whole story on the paths where a caller catches the raise.
+        """
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        with caplog.at_level(logging.WARNING), pytest.raises(IncompleteEnumerationError):
+            self._call(incomplete_paged_read(kind))
+        assert _warning_records(caplog) == []
+
+    # -- (b) EMPIRICAL -> warn and return --------------------------------
+    @pytest.mark.parametrize(
+        'kind',
+        [
+            pytest.param(INCOMPLETE_CENSUS_UNAVAILABLE, id='census-unavailable'),
+            pytest.param(INCOMPLETE_SHORT_READ, id='short-read'),
+        ],
+    )
+    def test_empirical_kinds_warn_once_and_return_none(self, kind, caplog):
+        """POLICY PRESERVATION: an empirical incompleteness never raises.
+
+        These graphs are written to continuously, so a census disagreement is
+        the expected signature of a benign concurrent write. Raising would
+        flap and take the live path down for something that self-heals next
+        cycle — the trade-off task 4340 deliberately rejected, and which this
+        promotion must not quietly reverse.
+        """
+        paged = incomplete_paged_read(kind, rows_seen=16038, expected_rows=16262)
+        with caplog.at_level(logging.WARNING):
+            assert self._call(paged) is None
+
+        records = _warning_records(caplog)
+        assert len(records) == 1, 'exactly one WARNING, not zero and not two'
+        message = records[0].getMessage()
+        assert 'rows_seen=16038' in message
+        assert 'expected_rows=16262' in message
+        assert 'enumerate_all_valid_edges' in message
+
+    def test_census_unavailable_reports_an_absent_expected_rows(self, caplog):
+        """The proof was missing, not small: `expected_rows` is None, not 0.
+
+        Rendering it as 0 would read as "the census said the graph is empty",
+        inverting the meaning of the one kind that says nothing about size.
+        """
+        paged = incomplete_paged_read(
+            INCOMPLETE_CENSUS_UNAVAILABLE, rows_seen=16038, expected_rows=None
+        )
+        with caplog.at_level(logging.WARNING):
+            assert self._call(paged) is None
+        message = _warning_records(caplog)[0].getMessage()
+        assert 'expected_rows=None' in message
+
+    # -- (c) COMPLETE -> silent ------------------------------------------
+    def test_a_complete_read_returns_none_and_says_nothing(self, caplog):
+        """Guard against an over-broad warning: a healthy read stays silent."""
+        with caplog.at_level(logging.WARNING):
+            assert self._call(complete_paged_read(rows_seen=25040)) is None
+        assert _warning_records(caplog) == []
+
+    # -- (d) the injected logger -----------------------------------------
+    def test_warning_goes_to_the_injected_logger_when_one_is_passed(self, caplog):
+        """The `log=` kwarg is what lets a sweep own its own diagnostics.
+
+        Both reconciliation sweeps already thread `log: logging.Logger`
+        through every other message they emit; without this kwarg the one
+        message about a truncated corpus would surface under the backend
+        module logger instead, detached from the cycle that suffered it.
+        """
+        injected = logging.getLogger('test.4386.injected')
+        with caplog.at_level(logging.WARNING):
+            self._call(
+                incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1),
+                log=injected,
+            )
+        names = [r.name for r in _warning_records(caplog)]
+        assert names == ['test.4386.injected']
+
+    def test_warning_defaults_to_the_backend_module_logger(self, caplog):
+        """Omitting `log=` must leave both shims' behaviour byte-identical."""
+        with caplog.at_level(logging.WARNING):
+            self._call(incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1))
+        names = [r.name for r in _warning_records(caplog)]
+        assert names == [_LOGGER_NAME]
+
+    def test_log_is_keyword_only(self):
+        """`log` must not be positionally reachable.
+
+        The five existing keyword-only parameters are already position-proof;
+        a positional sixth would let a caller pass a logger where a future
+        parameter lands, so pin the shape rather than trusting call sites.
+        """
+        import inspect
+
+        from fused_memory.backends.graphiti_client import apply_incompleteness_policy
+
+        param = inspect.signature(apply_incompleteness_policy).parameters['log']
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+class TestShimPolicyIsUnchangedByThePromotion:
+    """REGRESSION: promoting the helper changed nothing a shim caller sees.
+
+    The shims are the pre-4386 consumer contract and stay in place (the
+    rebuild write-path still depends on their fail-closed raise), so the
+    promotion has to be provably behaviour-preserving for them. Driven
+    through the REAL backend against `FakeCappedGraph` rather than against a
+    stubbed policy, so it exercises the actual wiring.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'force', [pytest.param(_refusal, id='refusal'), pytest.param(_page_cap, id='page-cap')]
+    )
+    async def test_shims_still_raise_on_structural_incompleteness(
+        self, force, mock_config, make_backend, monkeypatch
+    ):
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        backend = make_backend(mock_config)
+        force(monkeypatch)
+
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        with pytest.raises(IncompleteEnumerationError):
+            await backend.get_all_valid_edges(group_id='test')
+
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        with pytest.raises(IncompleteEnumerationError):
+            await backend.list_entity_nodes(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_shims_still_warn_and_return_on_empirical_incompleteness(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+
+        _wire(
+            backend,
+            FakeCappedGraph(
+                make_live_shaped_edge_corpus(), census_override=_LIVE_EDGE_ROWS + 5000
+            ),
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            grouped = await backend.get_all_valid_edges(group_id='test')
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+        assert any('get_all_valid_edges' in m for m in _warnings(caplog))
+
+        caplog.clear()
+        _wire(
+            backend,
+            FakeCappedGraph(
+                make_entity_node_corpus(), census_override=_LIVE_ENTITY_NODES + 4000
+            ),
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == _LIVE_ENTITY_NODES
+        assert any('list_entity_nodes' in m for m in _warnings(caplog))
 
 
 # ---------------------------------------------------------------------------
