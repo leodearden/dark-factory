@@ -1,17 +1,25 @@
 {
   "task_id": "4717",
   "escalation": "esc-4639-1",
-  "git_sha": "496b84cf4b91b22102696778944ce0dc70e58823",
+  "git_sha": "8bc5f763a2e1946a298eb08f46031d0af2d382da",
   "branch": "task/4717",
-  "swept_at": "2026-08-27T04:30:51.546356+00:00",
-  "started_at": "2026-08-27T04:30:44Z",
-  "finished_at": "2026-08-27T04:30:52Z",
+  "swept_at": "2026-08-27T04:50:22.376271+00:00",
+  "started_at": "2026-08-27T04:50:10Z",
+  "finished_at": "2026-08-27T04:50:26Z",
   "exit_code": 0,
   "cwd": "/home/leo/src/dark-factory/.worktrees/4717/fused-memory",
   "argv": [
-    "uv", "run", "python", "scripts/audit_wrong_binding_edges.py",
-    "--graph", "dark_factory", "--graph", "reify",
-    "--json", "--out-dir", "../docs/wrong-binding-edge-sweep-2026-08-27"
+    "uv",
+    "run",
+    "python",
+    "scripts/audit_wrong_binding_edges.py",
+    "--graph",
+    "dark_factory",
+    "--graph",
+    "reify",
+    "--json",
+    "--out-dir",
+    "../docs/wrong-binding-edge-sweep-2026-08-27"
   ],
   "read_population": {
     "dark_factory": {
@@ -29,12 +37,14 @@
   },
   "notes": [
     "report.json is byte-for-byte the script's stdout (cmp-verified against the captured stream, modulo the single trailing newline the --out-dir writer appends). It was neither pretty-printed nor hand-edited. All logging went to stderr.",
-    "PAGINATION IS LOAD-BEARING HERE AND THE RUN PROVES IT: reify returned 15256 live RELATES_TO rows through _paged_ro_query. The server's RESULTSET_SIZE is 10000, so an unpaginated MATCH — the shape audit_unverified_completion_claims.py uses, correctly, for its smaller population — would have returned exactly 10000 of them silently, and every denominator in this report would be wrong. This is why EdgeReader routes both reads through the shared paged primitive and why truncated_by is a first-class report key rather than a footnote.",
-    "AGREEMENT WITH THE PLANNING MEASUREMENT (2026-08-27, a few hours earlier, same branch): 181 findings over a 6959 population (2.60%) against the planning figures of 192/7131 (2.69%). Both graphs are written to continuously, so the denominator is a moving target and this is agreement, not drift. The two predicted families are both present: reify 'Task 6165' (6 findings here, 5 at planning time — the corpus grew) and dark_factory 'Task 430' (5). No extractor regression is indicated.",
+    "REGENERATED 2026-08-27T04:50Z at 8bc5f763a2, after the sweep at 496b84cf4b/dff8c0ec58. The earlier run's known_gaps cited `01e3e75e` as the second direction-reversal specimen; that uuid does not exist in reify in ANY state. The real edge is `01e3ff5d-ef73-4f52-9914-95533fca5cf9` \u2014 re-verified live over GRAPH.RO_QUERY here, and independently corroborated by docs/unverified-completion-claim-sweep-2026-08-11/report.json, which names the same full uuid. The endpoints and fact text were already right, so the documented gap was sound but uncitable. It was fixed in the script's KNOWN_GAPS literal (the artifact was NOT hand-patched) and the sweep re-run, which is what preserves the byte-for-byte property asserted in the note below.",
+    "DETERMINISM, MEASURED: the re-run 20 minutes later reproduced EVERY measured value bit for bit \u2014 scanned 26667, population 6959, unverifiable 304, findings 181, and the identical set of 181 edge uuids, plus identical by_graph/by_end/by_proximity/correct_node_present breakdowns. Only swept_at and the three corrected known_gaps lines differ. known_gaps is a static literal, not a measurement, so the correction moved no number. Note this is a stability observation over two nearby snapshots, NOT a guarantee: both graphs are written to continuously (see the LIVE CORPUS caveat in report.json), and the earlier planning-time measurement a few hours before did differ (192/7131).",
+    "PAGINATION IS LOAD-BEARING HERE AND THE RUN PROVES IT: reify returned 15256 live RELATES_TO rows through _paged_ro_query. The server's RESULTSET_SIZE is 10000, so an unpaginated MATCH \u2014 the shape audit_unverified_completion_claims.py uses, correctly, for its smaller population \u2014 would have returned exactly 10000 of them silently, and every denominator in this report would be wrong. This is why EdgeReader routes both reads through the shared paged primitive and why truncated_by is a first-class report key rather than a footnote.",
+    "AGREEMENT WITH THE PLANNING MEASUREMENT (2026-08-27, a few hours earlier, same branch): 181 findings over a 6959 population (2.60%) against the planning figures of 192/7131 (2.69%). Both graphs are written to continuously, so the denominator is a moving target and this is agreement, not drift. The two predicted families are both present: reify 'Task 6165' (6 findings here, 5 at planning time \u2014 the corpus grew) and dark_factory 'Task 430' (5). No extractor regression is indicated.",
     "CAUSE EVIDENCE, RE-MEASURED ON THIS RUN: 105/181 (58%) of mis-bound endpoint ids fall in the near-miss proximity buckets (one_digit_diff 97, prefix 8, similar 0) against a chance baseline near zero over 1423 + 2111 task-shaped nodes; and correct_node_present is true for 111/181 (61%), meaning the node the fact actually names ALREADY EXISTS in that graph in the majority of cases. Both figures reproduce the planning measurement (62.5% and 64%) within the movement of a live corpus. The second is the load-bearing one: this is predominantly ACTIVE mis-resolution, not a missing-node coverage gap.",
     "THE CANONICAL SPECIMEN IS NOT REPRESENTATIVE, and the report carries both counts so that is visible: reify node 'Task 6164' does NOT exist, which puts the Task 6165 family in the 39% minority where the correct node is absent. A reader generalizing from that family alone would reach the wrong diagnosis.",
-    "BOTH ENDS ARE REPRESENTED: 108 subject-end and 73 object-end findings. The object-end population is what a subject-only detector — the one the task description proposes — would have missed entirely, and specimen 8a51e13b is in it.",
-    "SCOPE, STATED IN THE ARTIFACT ITSELF: report.json's known_gaps names the two sub-classes this Class-A detector provably does not cover (direction-reversal, specimens 1cf19488 / 01e3e75e; and fact-contradicts-source-episode, specimen 993a9a7b) together with the measured refutation of the cheap leftmost-id direction heuristic. So 'this run found no reversals' cannot be read as 'the corpus holds no reversals'.",
+    "BOTH ENDS ARE REPRESENTED: 108 subject-end and 73 object-end findings. The object-end population is what a subject-only detector \u2014 the one the task description proposes \u2014 would have missed entirely, and specimen 8a51e13b is in it.",
+    "SCOPE, STATED IN THE ARTIFACT ITSELF: report.json's known_gaps names the two sub-classes this Class-A detector provably does not cover (direction-reversal, specimens 1cf19488 / 01e3ff5d; and fact-contradicts-source-episode, specimen 993a9a7b) together with the measured refutation of the cheap leftmost-id direction heuristic. So 'this run found no reversals' cannot be read as 'the corpus holds no reversals'.",
     "INVARIANT HELD: this sweep invalidated nothing, reassigned nothing and deleted nothing. Every edge the report names is left exactly as it is, for human adjudication. The script has no --apply/--invalidate/--delete/--repair/--reassign path, an absence pinned by TestReadOnlyByConstruction (whose forbidden-call set deliberately includes reassign_edge and merge_entities, the lossless remediation primitives for THIS defect class), and it reads the graph exclusively over GRAPH.RO_QUERY, where read-only is server-enforced."
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "swept_at": "2026-08-27T04:30:51.546356+00:00",
+  "swept_at": "2026-08-27T04:50:22.376271+00:00",
   "graphs": [
     "dark_factory",
     "reify"
@@ -350,11 +350,11 @@
       "description": "The edge points the wrong way: BOTH endpoints are correctly named in the fact, only the subject/object roles are swapped.",
       "specimen_edge_uuids": [
         "1cf19488",
-        "01e3e75e"
+        "01e3ff5d"
       ],
       "specimens": [
         "1cf19488 (Task 6346)->(Task 6347): \"The recurring-attention task #6347 depends on task #6346.\"",
-        "01e3e75e (Task 5997)->(Task 6014): \"Task 6014 carries task 5997 as a hard dependency.\""
+        "01e3ff5d (Task 5997)->(Task 6014): \"Task 6014 carries task 5997 as a hard dependency.\""
       ],
       "why_out_of_reach": "Set-membership is SATISFIED at both ends, so no text rule can separate a reversal from correct grammatical voice.",
       "cheap_heuristic_measured_and_rejected": {
