@@ -723,13 +723,51 @@ def _input_signature(tool_input: Any) -> str:
         return str(tool_input)
 
 
-def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group tool_use calls by (name, canonical input signature) and flag
-    groups recurring >= RETRY_MIN times as near-identical retry loops.
+def find_retry_loops(
+    records: list[dict[str, Any]],
+    *,
+    neighborhoods: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Group tool_use calls by (name, canonical input signature), flag
+    groups recurring >= RETRY_MIN times as near-identical retry loops, and
+    ANNOTATE each with how many of its calls ended in a DESIGNED outcome.
 
-    Deterministic and dependency-free (sibling to the decoy-FAIL decision,
-    PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
-    canonical-JSON input, again".
+    Grouping stays deterministic and dependency-free (sibling to the
+    decoy-FAIL decision, PRD Sec 13.2): no fuzzy string similarity, no
+    time or adjacency heuristic, just "same tool, same canonical-JSON
+    input, again". The annotation adds no second classifier and no second
+    pattern table -- it JOINS, on ``tool_use_id``, against the
+    already-enriched :func:`iter_error_neighborhoods` scan that task 3610
+    made the single source of truth for "was this result designed?".
+
+    Why (confusion-census-2026-08-26 §1.1 / R1, task 4751): a healthy
+    escalation-watcher rotation makes one date-check and one re-arm call
+    per ~3600s cycle, so ANY rotation of >= RETRY_MIN cycles necessarily
+    crossed this threshold and rendered under "## Retry Loops" -- while the
+    same digest's ``signal_counts`` correctly reported ``tool_error: 0``
+    and tallied the ceilings under ``designed_outcome``. Two layers of one
+    instrument told contradictory stories about one session. Reading ONE
+    classification is what stops that.
+
+    Annotation, never suppression. A group is always returned at its true
+    ``count``, so a genuine retry storm interleaved with bounded-wait
+    ceilings stays fully visible and ambiguity still costs a reader one
+    annotated line rather than a hidden failure (PRD Sec 7.2.1's
+    fail-toward-genuine principle). A group with no designed results
+    reports ``designed_outcome_count`` 0 and an empty ``designed_outcomes``,
+    and renders byte-identically to the pre-4751 format.
+
+    ``designed_outcomes`` holds the DISTINCT ``(exit_code, label)`` pairs
+    in first-appearance order -- deterministic by construction over the
+    group's already-ordered members, and needing no comparison key:
+    ``exit_code`` is ``int | None``, so a naive ``sorted()`` would raise
+    TypeError the moment a declaration carries no code.
+
+    Pass ``neighborhoods=`` to annotate from a scan the caller already
+    holds -- the same efficiency contract and the same resolver
+    (:func:`_neighborhoods_to_partition`) as :func:`iter_genuine_errors`
+    and :func:`iter_designed_outcomes`, which is what keeps a digest at two
+    neighborhood scans rather than three (see :data:`_NEIGHBORHOOD_ANNOTATORS`).
     """
     # `str | None` in the key, not `str`: _iter_tool_use_blocks selects on
     # `type == 'tool_use'` only, so a malformed block with no 'name' yields a
@@ -737,20 +775,64 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # than the value coerced, which would change what a nameless block renders
     # as in the report for no benefit.
     groups: dict[tuple[str | None, str], list[int]] = {}
+    # Member tool_use ids, accumulated in lockstep with the record indices:
+    # the indices are tool_use RECORD positions, so they cannot address a
+    # neighborhood (whose own `index` is the tool_result position).
+    group_ids: dict[tuple[str | None, str], list[Any]] = {}
     for index, block in _iter_tool_use_blocks(records):
         key = (block.get('name'), _input_signature(block.get('input')))
         groups.setdefault(key, []).append(index)
+        group_ids.setdefault(key, []).append(block.get('id'))
+
+    # Only the DESIGNED half is indexed: a genuine failure needs no
+    # annotation here (it has its own section), and restricting the map is
+    # what makes a hit unambiguous. A None id is excluded so a malformed
+    # id-less block cannot collide with an orphan neighborhood's None.
+    designed_by_id = {
+        n['tool_use_id']: n
+        for n in _neighborhoods_to_partition(records, neighborhoods)
+        if n['designed_outcome'] is not None and n['tool_use_id'] is not None
+    }
 
     loops = []
     for (name, signature), indices in groups.items():
-        if len(indices) >= RETRY_MIN:
-            loops.append({
-                'tool': name,
-                'signature': signature,
-                'count': len(indices),
-                'indices': indices,
-            })
+        if len(indices) < RETRY_MIN:
+            continue
+        designed_count = 0
+        pairs: list[tuple[int | None, str]] = []
+        seen: set[tuple[int | None, str]] = set()
+        for tool_use_id in group_ids[(name, signature)]:
+            hit = designed_by_id.get(tool_use_id)
+            if hit is None:
+                continue
+            designed_count += 1
+            pair = (hit['exit_code'], hit['designed_outcome'])
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+        loops.append({
+            'tool': name,
+            'signature': signature,
+            'count': len(indices),
+            'indices': indices,
+            'designed_outcome_count': designed_count,
+            'designed_outcomes': pairs,
+        })
     return loops
+
+
+_NEIGHBORHOOD_ANNOTATORS = (find_retry_loops,)
+"""The detectors in _SECTION_RENDERERS that scan *records* themselves but
+ALSO annotate from an existing neighborhood scan -- invoked as
+``detector(records, neighborhoods=...)``, the third dispatch shape in
+:func:`_build_sections`.
+
+Sibling to :data:`_NEIGHBORHOOD_PARTITIONS` (which is invoked as
+``detector(neighborhoods=...)`` alone) and declared here rather than
+literally beside it only because :func:`find_retry_loops` is defined
+further down the module. Both exist so _SECTION_RENDERERS remains the
+single declaration of WHICH detector feeds which section, with only HOW it
+is invoked varying."""
 
 
 def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -1596,9 +1678,13 @@ def _build_sections(
     render_digest skips emitting a heading for it.
 
     The two neighborhood partitions (_NEIGHBORHOOD_PARTITIONS) are fed one
-    shared scan instead of scanning *records* once each: which detector
-    serves which section still comes from _SECTION_RENDERERS alone, only
-    HOW it is invoked differs.
+    shared scan instead of scanning *records* once each, and the
+    annotators (_NEIGHBORHOOD_ANNOTATORS) are fed that SAME scan alongside
+    *records*: which detector serves which section still comes from
+    _SECTION_RENDERERS alone, only HOW it is invoked differs. Feeding the
+    shared scan is required, not an optimisation --
+    :func:`find_retry_loops` would otherwise self-scan here and make a
+    single digest pay three full neighborhood passes.
 
     Returns ``(sections, truncated)``, where *truncated* is the set of
     ``(section_key, item_index)`` positions :func:`_cap_item` actually
@@ -1617,11 +1703,12 @@ def _build_sections(
     sections: dict[str, list[str]] = {}
     truncated: set[tuple[str, int]] = set()
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        items = (
-            detector(neighborhoods=neighborhoods)
-            if detector in _NEIGHBORHOOD_PARTITIONS
-            else detector(records)
-        )
+        if detector in _NEIGHBORHOOD_PARTITIONS:
+            items = detector(neighborhoods=neighborhoods)
+        elif detector in _NEIGHBORHOOD_ANNOTATORS:
+            items = detector(records, neighborhoods=neighborhoods)
+        else:
+            items = detector(records)
         lines = []
         for index, line in enumerate(renderer(items)):
             capped = _cap_item(line, item_max_bytes)
