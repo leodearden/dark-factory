@@ -2327,3 +2327,131 @@ class TestSuppressedRefileIsCounted:
             'the counter leaked across records; the quiet one reads '
             f'{second_record.refiles_suppressed!r}'
         )
+
+
+class TestSuppressionFailsOpen:
+    """The new guard must FAIL OPEN — never swallow an escalation (task 4499).
+
+    Suppression is the ONLY outcome of this filer that LOSES an escalation, so
+    the failure directions are not symmetric.  A guard that errs toward FILING
+    costs a duplicate record someone closes; a guard that errs toward
+    SUPPRESSING costs a provenance defect nobody ever sees.  Every uncertain
+    path must therefore resolve toward filing — the same policy
+    ``find_dedupe_parent``'s falsy-key short-circuit and
+    ``gate_backlog_fingerprint_key``'s fail-toward-duplicates rule encode.
+
+    Note the deliberate CONTRAST with ``has_open_l1``, pinned by
+    ``test_raising_queue_is_contained`` above: a raising ``has_open_l1`` DOES
+    drop the filing (it reaches the outer blanket except), because its failure
+    direction is "file a duplicate on the next tick".  A raising
+    ``find_terminal_by_citation`` must not, because its failure direction would
+    be "lose this escalation now".
+    """
+
+    TASK = '42'
+    SHA = 'b' * 40
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    def _file(self, queue, *, reason: str = 'effect_absent'):
+        file_unattributed_landing_escalation(
+            queue, self.TASK, f'task/{self.TASK}',
+            _verdict(reason, citation=self.SHA, effect_check_sha=self.SHA),
+            agent_role='harness-reconcile',
+        )
+
+    def test_raising_lookup_still_files_and_warns(self, tmp_path, caplog) -> None:
+        """(1) A lookup that explodes must not reach the outer blanket except.
+
+        Patched on a REAL queue so everything downstream of the lookup stays
+        honest — the record really has to be minted, written and re-readable.
+        """
+        queue = self._queue(tmp_path)
+
+        with patch.object(
+            queue, 'find_terminal_by_citation', side_effect=RuntimeError('index corrupt'),
+        ), caplog.at_level('WARNING'):
+            self._file(queue)
+
+        assert len(queue.get_by_task(self.TASK, status='pending')) == 1, (
+            'a failing suppression lookup DROPPED the escalation — the one '
+            'failure direction that loses a provenance defect'
+        )
+        assert any('index corrupt' in r.message or r.exc_info for r in caplog.records), (
+            'the lookup failure must be loud, not silently swallowed'
+        )
+
+    def test_queue_without_the_method_still_files(self, tmp_path) -> None:
+        """(2) A duck-typed / older stand-in lacking the method files as before."""
+        legacy = MagicMock(spec=['has_open_l1', 'make_id', 'submit'])
+        legacy.has_open_l1.return_value = False
+        legacy.make_id.return_value = f'esc-{self.TASK}-1'
+        assert not hasattr(legacy, 'find_terminal_by_citation'), (
+            'Pre-condition: the stand-in must genuinely lack the attribute'
+        )
+
+        self._file(legacy)
+
+        legacy.submit.assert_called_once()
+
+    def test_a_dismissed_prior_suppresses_end_to_end(self, tmp_path) -> None:
+        """(3) A dismissal adjudicates the evidence just as a resolution does.
+
+        Pinned at the queue level in the find_terminal_by_citation tests; this
+        pins the WIRING — that the filer actually honours a dismissal.
+        """
+        queue = self._queue(tmp_path)
+        self._file(queue)
+        first = queue.get_by_task(self.TASK, status='pending')[0]
+        queue.resolve(first.id, 'not a real defect', dismiss=True, resolved_by='steward')
+
+        self._file(queue)
+
+        assert queue.get_by_task(self.TASK, status='pending') == [], (
+            'a DISMISSED adjudication failed to suppress an identical refile'
+        )
+
+    def test_a_raising_counter_still_suppresses(self, tmp_path, caplog) -> None:
+        """(4) A bookkeeping failure must not re-open the storm.
+
+        The counter is observability, not the decision.  Letting its failure
+        propagate would file the escalation the guard just decided to suppress
+        — turning a metrics fault into the storm it exists to stop.
+        """
+        queue = self._queue(tmp_path)
+        self._file(queue)
+        first = queue.get_by_task(self.TASK, status='pending')[0]
+        queue.resolve(first.id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+
+        with patch.object(
+            queue, 'note_suppressed_refile', side_effect=RuntimeError('write failed'),
+        ), caplog.at_level('WARNING'):
+            self._file(queue)
+
+        assert queue.get_by_task(self.TASK, status='pending') == [], (
+            'a failing counter re-opened the refile storm'
+        )
+        assert any(r.exc_info for r in caplog.records), (
+            'the counter failure must be loud, not silently swallowed'
+        )
+
+    def test_none_queue_is_still_a_silent_noop(self, tmp_path) -> None:
+        """(5a) Pre-existing contract: a bare-harness caller passes None."""
+        self._file(None)
+
+    def test_raising_has_open_l1_is_still_contained_without_filing(self, tmp_path) -> None:
+        """(5b) Pre-existing contract, unchanged: has_open_l1 keeps the OLD direction.
+
+        Its failure means "file a duplicate on the next tick", which is
+        recoverable — so it stays contained by the outer blanket except and
+        this step must not change it.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = RuntimeError('queue exploded')
+
+        self._file(queue)
+
+        queue.submit.assert_not_called()
