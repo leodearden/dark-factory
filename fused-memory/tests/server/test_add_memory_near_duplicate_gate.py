@@ -850,6 +850,60 @@ class TestAddMemoryTopicClusterGate:
         mock_service.add_memory.assert_called_once()
 
 
+class TestAddMemoryTopicClusterGatePreferencesCategory:
+    """Write-gate: the deterministic topic-cluster pre-check also covers
+    category='preferences_and_norms', not just procedural_knowledge (task 3430).
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocks_matching_topic_before_cosine_search(self):
+        """A preferences_and_norms write matching a cluster's phrases is blocked;
+        search is NOT called.
+
+        Mirrors TestAddMemoryTopicClusterGate.test_blocks_matching_topic_before_cosine_search,
+        changing only category (and asserting the new category echo). Fails today: a
+        preferences_and_norms write is entirely ungated, so add_memory is called and
+        no block dict is returned.
+        """
+        mock_service = AsyncMock()
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+        )
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _TOPIC_MATCH_CONTENT,
+                'category': 'preferences_and_norms',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Expected topic-cluster block, got: {result!r}'
+        )
+        assert result.get('error') == 'procedural_knowledge_known_topic_cluster_write_blocked', (
+            f'Expected topic-cluster error key, got: {result!r}'
+        )
+        assert result.get('topic_id') == 'test-topic', f'Expected topic_id echoed, got: {result!r}'
+        assert result.get('matched_phrases'), f'Expected matched_phrases, got: {result!r}'
+        assert result.get('agent_id') == 'claude-interactive'
+        assert result.get('content_excerpt') == _TOPIC_MATCH_CONTENT[:200]
+        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        assert result.get('category') == 'preferences_and_norms', (
+            f'Expected the category echo on the block dict, got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_not_called()
+
+
 class TestAddMemorySufficientPhraseGate:
     """End-to-end: a sufficient-phrase block reaches a real add_memory call (task 3054).
 
