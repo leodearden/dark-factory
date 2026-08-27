@@ -578,12 +578,47 @@ the row cap it is being used to detect."""
 
 _NODE_MATCH = 'MATCH (n:Entity) '
 
-NODE_PAGE_CYPHER = _NODE_MATCH + 'RETURN n.name ORDER BY n.name SKIP {skip} LIMIT {limit}'
+NODE_PAGE_CYPHER = (
+    _NODE_MATCH + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
+)
 """One page of Entity names, filtered to task labels in Python.
 
 The filter cannot run in Cypher: "is this name a task label" is the imported
 anchored parser's question, and re-expressing it as a Cypher predicate would
 be exactly the second vocabulary INV-5 forbids.
+
+``ORDER BY n.uuid`` — not ``n.name``, which this template used to page on.
+``n.name`` is NOT a total order and paging on it violates the documented
+precondition of ``_paged_ro_query``. Duplicate names are not hypothetical:
+measured 2026-08-27, dark_factory holds 17260 Entity nodes against 17210
+distinct names (50 duplicate-name groups) and reify 24344 against 24193 (151
+excess rows). At the default page_size of 5000 that is 3 page boundaries in
+dark_factory and 4 in reify, and a tie straddling one drops a row while
+duplicating another — leaving ``rows_seen`` unchanged, so guard 4
+(``rows_seen < expected_rows``) never fires and the loss is invisible in
+``truncated_by``.
+
+This was a MISSED REUSE, not a novel design question. The in-tree precedent
+``graphiti_client.py::_ENTITY_NODES_PAGE_TEMPLATE`` solves the identical
+problem identically — ``RETURN n.uuid, n.name, n.summary ORDER BY n.uuid``,
+carrying the comment "Here ``n.uuid`` alone IS a total order — one row per
+node, and node uuids are unique". The two templates now agree by
+construction rather than by coincidence.
+
+The sort key is PROJECTED rather than ordered on as a bare non-returned
+property, again mirroring the precedent: a driver may refuse to order on
+what it does not return, and an identifying column that never reaches the
+result set cannot be audited by a reader or a test double.
+
+No dedup pass is layered on top, unlike the precedent's ``n.uuid`` dedup.
+The difference is the consumer, not the hazard: this reader accumulates into
+a ``set`` of ids, so a re-returned row is harmless. What the non-total order
+actually cost was measured (see the RED commit and
+``test_a_tie_straddling_a_page_boundary_drops_a_node``): the DROPPED row was
+always a name-tie of a row that WAS returned, so it carried the same task id
+and ``correct_node_present`` was never corrupted by it. The read was lossy;
+this particular consumer happened to be immune. Ordering on a unique key
+removes the loss rather than continuing to rely on that immunity.
 """
 
 NODE_CENSUS_CYPHER = _NODE_MATCH + 'RETURN count(*)'
@@ -698,7 +733,9 @@ class EdgeReader:
         read = await self._read(NODE_PAGE_CYPHER, NODE_CENSUS_CYPHER)
         ids: set[str] = set()
         for row in read.rows:
-            referent = endpoint_referent(row[0] if row else None)
+            # row is (n.uuid, n.name) — see NODE_PAGE_CYPHER for why the uuid
+            # is projected even though only the name is read here.
+            referent = endpoint_referent(row[1] if len(row) > 1 else None)
             if referent is not None and not referent.project_id:
                 ids.add(referent.number)
         return ids, read

@@ -1022,6 +1022,9 @@ class TestEdgeReader:
 class TestReadTaskNodeIds:
     """The Entity-name enumeration feeding ``correct_node_present``.
 
+    Rows are ``(n.uuid, n.name)`` because NODE_PAGE_CYPHER projects its sort
+    key — see that template for why it pages on ``n.uuid`` and not ``n.name``.
+
     Paged the SAME way as the edge read: dark_factory measured 16083 Entity
     nodes and reify 23616 on 2026-08-17, both far above the 10000 cap, so an
     unpaginated node read would make correct_node_present answer False for
@@ -1031,7 +1034,7 @@ class TestReadTaskNodeIds:
 
     @pytest.mark.asyncio
     async def test_task_ids_are_harvested_past_the_cap(self) -> None:
-        rows = [[f'Task {i}'] for i in range(25)]
+        rows = [[f'node-{i:02d}', f'Task {i}'] for i in range(25)]
         graph = _FakeGraph(rows, resultset_cap=10)
         reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
         ids, read = await reader.read_task_node_ids()
@@ -1041,8 +1044,8 @@ class TestReadTaskNodeIds:
     @pytest.mark.asyncio
     async def test_non_task_names_contribute_nothing(self) -> None:
         """Harvested through the IMPORTED anchored parser, not a local rule."""
-        rows = [['Task 6165'], ['ElasticResult.rotation'], ['6185 GUI-channel-bridge'],
-                ['task #1153'], [None]]
+        rows = [['u0', 'Task 6165'], ['u1', 'ElasticResult.rotation'],
+                ['u2', '6185 GUI-channel-bridge'], ['u3', 'task #1153'], ['u4', None]]
         graph = _FakeGraph(rows, resultset_cap=10)
         reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
         ids, _ = await reader.read_task_node_ids()
@@ -1055,7 +1058,9 @@ class TestReadTaskNodeIds:
         Harvesting its bare number would make correct_node_present claim a
         local 'Task 132' exists when it does not.
         """
-        graph = _FakeGraph([['reify:132'], ['Task 133']], resultset_cap=10)
+        graph = _FakeGraph(
+            [['u0', 'reify:132'], ['u1', 'Task 133']], resultset_cap=10
+        )
         reader = EdgeReader(
             graph=graph, graph_name='dark_factory', page_size=5, resultset_size=10
         )
