@@ -2,7 +2,7 @@
 
 **Project:** dark-factory (fused-memory + orchestrator). **Status:** active, 2026-07-28. **Approach:** B+H (contracts + two-way boundary tests).
 **Origin:** reify curator session 2026-07-27 (19 `milestone_gate` L2 escalations; 90 Mem0 deletions, 21 canonicals) + the forensic RCA at `/home/leo/.claude/fleet/sessions/review-reify-1693879/result.md`. This PRD implements that RCA's 10 recommendations, with recs 1–2 amended per the 2026-07-28 design review (server-side dedup, cosine-as-candidate-generator + LLM judge, non-destructive attach).
-**Siblings:** DF **3083** (XML-leak root-cause + Qdrant payload text-match tool + corpus sweep — pending, owns that territory; leaf ο here is containment only). DF **3055** (in-place Mem0 update decision — in-progress; this PRD is deliberately add-only-compatible and takes no dependency on its outcome).
+**Siblings:** DF **3083** (XML-leak root-cause + Qdrant payload text-match tool + corpus sweep — done, merged 7899eef17b; territory now owned by `plans/toolcall-markup-containment-prd.md` as successor; leaf ο's in-line containment here is superseded, not live). DF **3055** (in-place Mem0 update decision — in-progress; this PRD is deliberately add-only-compatible and takes no dependency on its outcome).
 
 ## 1. Goal (G1 consumer + user-observable surface)
 
