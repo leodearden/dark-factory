@@ -3920,6 +3920,59 @@ class TestGetEntity:
             'retired by invalid_at (task 4714)'
         )
 
+    @pytest.mark.asyncio
+    async def test_exact_branch_drops_retired_edge_dicts(self, service):
+        """EXACT branch must not pass a retired edge dict through (task 4714).
+
+        Mirrors the reconciliation repro: edge ``ff24780c`` was invalidated via
+        ``update_edge`` with ``verified:true``, yet get_entity kept serving it
+        alongside its still-valid sibling ``71416f6c``.  The exact branch's
+        dedup loop applies no predicate of its own — it only dedups by uuid —
+        so any retired dict the backend hands back reaches the caller verbatim.
+
+        This is defence in depth over the Cypher filter: it makes the contract
+        assertable against a MagicMock backend, with no live FalkorDB.
+        """
+        retired = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'n-99', 'name': 'Task 99', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[
+            # The sibling that correctly stayed visible.
+            {'uuid': '71416f6c', 'fact': 'Task 99 depends on Task 98', 'name': 'DEPENDS_ON'},
+            # The one update_edge retired with verified:true.
+            {
+                'uuid': 'ff24780c',
+                'fact': 'Task 99 depends on Task 97',
+                'name': 'DEPENDS_ON',
+                'invalid_at': retired,
+            },
+            # Retired by graphiti_core's own contradiction resolution instead.
+            {
+                'uuid': 'c0ffee01',
+                'fact': 'Task 99 is blocked',
+                'name': 'IS_BLOCKED',
+                'expired_at': retired,
+            },
+        ])
+
+        result = await service.get_entity('Task 99', project_id='test')
+
+        edge_uuids = [e['uuid'] for e in result['edges']]
+        assert edge_uuids == ['71416f6c'], (
+            'an edge invalidated via update_edge must not resurface in '
+            'get_entity while its sibling still does (repro: ff24780c)'
+        )
+        assert 'ff24780c' not in edge_uuids, (
+            'repro: ff24780c was invalidated via update_edge with verified:true '
+            'and must not be served as a current fact'
+        )
+        assert 'c0ffee01' not in edge_uuids, (
+            'an edge retired by graphiti_core via expired_at must not be served '
+            'as a current fact either (task 4714)'
+        )
+
     # ------------------------------------------------------------------
     # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
     # ------------------------------------------------------------------
