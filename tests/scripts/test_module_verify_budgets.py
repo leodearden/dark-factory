@@ -461,9 +461,18 @@ MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
         'is the dominant fleet segment (measured 1366.23s and 1157.62s on one '
         'day, ~18% apart, in task 3062 attempt-2 / esc-3062-3), and task 3353 '
         "has since been rewritten to \"split or shard the orchestrator test "
-        'suite\" — so a budget declared now against an unsharded 1366s figure '
+        'suite\" — so a budget declared now against an unsharded figure '
         "would be invalidated by 3353's own change rather than merely refined "
-        'by it. DELETION CONDITION: once orchestrator/orchestrator.yaml declares '
+        'by it. TASK 4902 RE-MEASURED that segment on 2026-08-28 at a median of '
+        '1765.95s (n=28 green full-suite runs, 2026-08-22..2026-08-28), with an '
+        'observed green maximum of 3310.50s and one run already consuming the '
+        'full 3600s ceiling as a false infra_timeout. That makes the deferral '
+        'MORE justified, not less: a budget sized against the unsharded suite '
+        'is chasing a moving target — the figure rose ~29% in 28 days, and the '
+        'run-to-run spread is now 3.8x rather than the ~18% recorded above. '
+        'DELETION CONDITION (unchanged, and NOT satisfied by 4902, which '
+        're-measured only and declared no budget): once '
+        'orchestrator/orchestrator.yaml declares '
         'its own verify_command_timeout_secs, delete this entry — the coverage '
         'guard then covers it automatically with no further edit.'
     ),

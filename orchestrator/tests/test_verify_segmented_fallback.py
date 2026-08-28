@@ -290,10 +290,13 @@ class TestRunSegmentedSharedDeadline:
     by the segment count and could wedge the merge queue.
 
     This path is load-bearing, not theoretical. The committed config's own
-    measured table records five of seven segments already costing 1838.60s
-    (orchestrator alone 1366.23s), a hard lower bound because that run timed
-    out before dashboard started — so a real chain can exhaust even the raised
-    3600s ceiling mid-run.
+    measured table records five of eight segments already costing 2238.32s
+    (orchestrator alone 1765.95s — the task-4902 re-measurement of 2026-08-28,
+    the median of 28 green full-suite runs), a lower bound because dashboard,
+    sampler and cockpit carry no measurement at all. So a real chain can
+    exhaust even the raised 3600s ceiling mid-run: 4902 recorded green
+    orchestrator runs up to 3310.50s, and one attempt has already consumed the
+    full 3600s and been logged as a false infra_timeout.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the
     UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
@@ -1510,8 +1513,8 @@ class TestRunVerificationSegmentedAcceptance:
         removing the `&&` short-circuit — the whole point of task 3338 — makes
         budget exhaustion strictly MORE likely, because all 8 segments now
         always run where the shell previously stopped at the first red. The
-        committed config's own measured table already records five of seven
-        segments costing 1838.60s.
+        committed config's own measured table already records five of eight
+        segments costing 2238.32s.
 
         Synthesising `timed_out` on exhaustion would relabel this genuine red as
         an `infra_timeout` (``classify_failure`` guard 2 wins over every output
