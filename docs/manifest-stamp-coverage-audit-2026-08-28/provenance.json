@@ -1,0 +1,37 @@
+{
+  "sweep": "manifest-stamp-coverage-audit",
+  "task_id": "4590",
+  "measured_at": "2026-08-28T22:40:37Z",
+  "branch": "task/4590",
+  "branch_base_sha": "b2035cf8c691eaffa92c5f64addb5f5e7ff25711",
+  "branch_commits_beyond_main_at_measurement": 0,
+  "task_store": {
+    "path": "/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db",
+    "opened": "file:...?mode=ro with uri=True (READ-ONLY; the sweep made no writes)",
+    "why_this_store": ".taskmaster/tasks/tasks.json is stale; data/tasks.db and data/orchestrator/tasks.db have no `tasks` table",
+    "tag": "master",
+    "metadata_encoding": "plain JSON text in the `metadata` TEXT column"
+  },
+  "sidecar": {
+    "path": "plans/toolcall-markup-containment-prd.capability-manifest.yaml",
+    "last_touching_commit": "965f3206eb2fc0f6291c08ae79e3f0d64914a409",
+    "last_touching_date": "2026-08-19T18:39:55+01:00",
+    "unchanged_since": "that commit — i.e. the sidecar is byte-identical to its state during the invalid window",
+    "parses_clean_today": true
+  },
+  "derivation_rule_mirrored": {
+    "source": "fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl",
+    "step_1_admission_gate": "task metadata must carry BOTH non-empty prd_path AND prd_task_label",
+    "step_1_sidecar_derivation": "re.sub(r'\\.md$', '', prd_path) + '.capability-manifest.yaml'",
+    "why_not_metadata_capability_manifest": "MEASURED: tasks 4457 and 4458 both set metadata.capability_manifest to the '.capability-manifest.md' twin, not the '.yaml' the stamper actually reads — binding by that key would answer the wrong question",
+    "step_4_match": "label_to_task_id keyed on prd_task_label, matched against entry.get('label')",
+    "step_5_filter": "only delivered_check.kind in ('grep','script'); 'manual' is never copied",
+    "step_5_round_trip": "DeliveredCheckMeta(...).model_dump(), which materializes defaults",
+    "comparison_normalization": "None normalized against [] for the optional list fields (paths, args) before declaring drift, because of the step-5 round trip above"
+  },
+  "corpus_enumeration": {
+    "command": "git ls-files '*.capability-manifest.yaml'",
+    "tracked_sidecar_count": 53
+  },
+  "authoring_hazard_honored": "No raw toolcall/MCP envelope sentinel literal appears anywhere in this artifact set. The one pattern divergence is recorded by measured properties (length, bracket/slash presence, sha256 prefix) rather than by value."
+}
