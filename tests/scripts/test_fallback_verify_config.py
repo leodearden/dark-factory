@@ -659,6 +659,101 @@ def _verify_budgets() -> dict:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding='utf-8'))
 
 
+# Task 4902: the per-segment measurement above is republished, verbatim, as an
+# operator-facing comment block in dark-factory-orchestrator.yaml. These two
+# regexes walk that block. They are deliberately anchored on its SHAPE (a
+# comment, four-plus spaces of indent, name then float then `(`) rather than on
+# any prose, so they parse structure and assert numbers only.
+_YAML_SEGMENT_ENTRY_RE = re.compile(
+    r'^#\s{4,}([A-Za-z][\w/-]*)\s+([0-9]+\.[0-9]+)\s+\(', re.MULTILINE
+)
+_YAML_SEGMENT_TOTAL_RE = re.compile(
+    r'^#\s{4,}([0-9]+\.[0-9]+)s\s+<-', re.MULTILINE
+)
+
+
+def test_published_yaml_segment_table_matches_the_python_measurement_table() -> None:
+    """The yaml's republished segment table must agree with the Python table.
+
+    Task 4902. The fleet-segment measurement exists TWICE: as
+    ``MEASURED_FLEET_SEGMENT_SECS`` here, and as an operator-facing comment
+    block in ``dark-factory-orchestrator.yaml`` that republishes the same
+    per-segment figures and their total. Nothing tied the two together.
+
+    That is the exact hazard this repo already names in its own words — the
+    per-module budget figures are deliberately NOT copied into the root yaml
+    because "a second copy of a measurement is a second thing to raise in
+    lockstep" — yet this table was copied anyway. Task 4902 had to edit both,
+    which is precisely the moment the drift becomes reachable, so the copies are
+    tied together here.
+
+    This asserts NUMERIC AGREEMENT ONLY. It says nothing about the block's
+    prose, its ordering, or its parentheticals; it is a consistency invariant
+    between two copies of one measurement, not a documentation meta-test.
+
+    A short or empty parse FAILS LOUDLY rather than passing vacuously — the
+    property ``TestFleetTypeCheckCoversEveryWorkspaceMember`` and friends in
+    this file already insist on. Otherwise someone reflowing the comment block
+    would silently disable the check while leaving it green.
+    """
+    published = DF_CONFIG_PATH.read_text(encoding='utf-8')
+    entries = _YAML_SEGMENT_ENTRY_RE.findall(published)
+    totals = _YAML_SEGMENT_TOTAL_RE.findall(published)
+
+    # (a) The parse must be complete before any comparison is meaningful.
+    assert len(entries) == len(MEASURED_FLEET_SEGMENT_SECS) and len(totals) == 1, (
+        f'could not parse the republished segment table in {DF_CONFIG_PATH}: '
+        f'found {len(entries)} entr(y/ies) and {len(totals)} total line(s), '
+        f'expected {len(MEASURED_FLEET_SEGMENT_SECS)} and 1. This guard ties '
+        'that comment block to MEASURED_FLEET_SEGMENT_SECS in '
+        f'{pathlib.Path(__file__).name}; a short or empty parse means the block '
+        'was reflowed or removed, which would silently disable the check rather '
+        'than fail it. Restore the block shape — each entry a comment line of '
+        "four-plus spaces then `<name>  <float>  (...)`, and the total line "
+        'keeping its `<-` marker — or update these regexes deliberately.'
+    )
+
+    parsed = {name: float(value) for name, value in entries}
+    published_total = float(totals[0])
+    expected_total = sum(MEASURED_FLEET_SEGMENT_SECS.values())
+
+    # (b) Entry-for-entry agreement.
+    disagreements = sorted(
+        set(parsed) ^ set(MEASURED_FLEET_SEGMENT_SECS)
+    ) + sorted(
+        k for k in set(parsed) & set(MEASURED_FLEET_SEGMENT_SECS)
+        if abs(parsed[k] - MEASURED_FLEET_SEGMENT_SECS[k]) >= 0.005
+    )
+    assert not disagreements, (
+        'the two copies of the fleet-segment measurement disagree:\n'
+        + '\n'.join(
+            f'  {k}: {DF_CONFIG_PATH.name} says '
+            f'{parsed.get(k, "<absent>")}, MEASURED_FLEET_SEGMENT_SECS says '
+            f'{MEASURED_FLEET_SEGMENT_SECS.get(k, "<absent>")}'
+            for k in disagreements
+        )
+        + f'\n\nThe Python table lives in {pathlib.Path(__file__).name} and the '
+        f'republished copy in {DF_CONFIG_PATH}. The yaml block is the '
+        'OPERATOR-FACING copy — it is what someone reads when deciding whether '
+        'a verify budget is sized right — so it must be raised in the SAME '
+        'commit as the Python table, never later.'
+    )
+
+    # (c) The published total must equal the sum of the published parts. Both
+    # sides are 2-decimal literals, so compare with an absolute tolerance well
+    # under a cent rather than with float ==.
+    assert abs(published_total - expected_total) < 0.005, (
+        f'{DF_CONFIG_PATH} publishes a segment total of {published_total}s, but '
+        f'MEASURED_FLEET_SEGMENT_SECS sums to {expected_total:.2f}s '
+        f'(off by {abs(published_total - expected_total):.2f}s). That total is '
+        'the number operators read as the fleet-chain floor, and '
+        'test_fallback_verify_budget_clears_the_measured_fleet_chain_floor '
+        'derives its floor from the Python sum — so a stale total in the yaml '
+        'is a headroom claim that no longer follows from its own table. Raise '
+        'both copies together.'
+    )
+
+
 def test_measured_fleet_segment_table_reflects_the_post_cap_orchestrator_regime() -> None:
     """The ``orchestrator`` table entry must not predate the -n 8 fanout cap.
 
