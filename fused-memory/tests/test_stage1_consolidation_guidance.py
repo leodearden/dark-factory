@@ -103,16 +103,24 @@ class TestStage1ExecutionContract:
 
     def test_the_load_bearing_call_and_outcome_names_are_present(self) -> None:
         section = _section('## Executing a Cluster Fold')
-        for token in ('supersedes', 'retain', 'run_id', 'survivors'):
+        # `canonical_content` and `topic` are REQUIRED parameters of the
+        # shipped op — a caller cannot succeed without naming them — and the
+        # rest are the id arms, the run attribution and the outcome field that
+        # decides whether the fold actually closed.
+        for token in ('canonical_content', 'topic', 'supersedes', 'retain', 'run_id', 'survivors'):
             assert token in section, token
-
-    def test_the_canonical_is_written_before_any_delete(self) -> None:
-        # The ordering directive is the whole reason this rewrite exists: an
-        # unordered canonical-write-plus-deletes with no verification is the
-        # +1-per-pass ratchet `consolidate_memories` was built to end.
-        section = _section('## Executing a Cluster Fold')
-        assert 'before' in section
-        assert 'delete' in section
+        # Positional pin: the ADVERTISED CALL names the canonical arm first.
+        # This pins the advertised signature's argument ORDER and explicitly
+        # NOT the runtime write-before-delete property — that one is not a
+        # prompt-side property at all.  It is owned by
+        # `server/tools.py::consolidate_memories` step (4) and executably
+        # covered by tests/test_consolidate_memories_tool.py
+        # (::test_a_repeated_supersede_is_refused_before_any_write,
+        # ::test_delete_arm_without_run_id_is_refused_before_the_canonical,
+        # ::test_unauthorized_agent_is_denied_before_the_canonical_write,
+        # ::test_citations_are_repointed_before_any_delete_lands and
+        # ::test_each_victim_is_read_before_its_delete).
+        assert 'consolidate_memories(canonical_content=' in section
 
     def test_partial_is_stated_as_a_no_resume_outcome(self) -> None:
         # `server/consolidation.py::_PARTIAL_RECOVERY_HINT` says it on the
