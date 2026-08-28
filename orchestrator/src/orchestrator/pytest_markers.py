@@ -337,6 +337,34 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
 
     module_markers = _module_level_marker_names_from_tree(tree)
 
+    body_ids = {id(statement) for statement in tree.body}
+    class_body_ids = {
+        id(statement)
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        for statement in node.body
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            if node.name.startswith('test') and id(node) not in class_body_ids:
+                return module_markers
+            if node.name.startswith('pytest_') and id(node) in body_ids:
+                return module_markers
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == '*' for alias in node.names):
+                return module_markers
+            if _bound_names_start_with_test_ci(node):
+                return module_markers
+        elif (
+            (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
+            or (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and id(node) in body_ids
+                and _assign_binds_test_prefixed_name(node)
+            )
+        ):
+            return module_markers
+
     collectable = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     if not collectable:
         return module_markers
