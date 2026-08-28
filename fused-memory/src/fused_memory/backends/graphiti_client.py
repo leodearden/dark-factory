@@ -956,7 +956,7 @@ async def _paged_ro_query(
     )
 
 
-def _apply_incompleteness_policy(
+def apply_incompleteness_policy(
     paged: PagedRead,
     *,
     method: str,
@@ -964,17 +964,27 @@ def _apply_incompleteness_policy(
     returned_count: int,
     noun: str,
     consequence: str,
+    log: logging.Logger = logger,
 ) -> None:
-    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+    """Apply the SPLIT incompleteness policy to an enumeration's PagedRead.
 
     ONE implementation, shared by every back-compat shim over
-    ``_paged_ro_query``, because the policy is a single decision and not a
+    ``_paged_ro_query`` AND by every consumer that calls an ``enumerate_*``
+    method directly, because the policy is a single decision and not a
     per-method opinion: copies drift, and the drift would be silent in exactly
-    the direction that matters — a shim that forgot to raise returns a
-    fabricated empty and the write-back path blanks summaries with it.  It is
-    also the single seam the follow-up ticket
+    the direction that matters — a caller that forgot to raise takes a
+    fabricated empty for an answer and the write-back path blanks summaries
+    with it.  It is also the single seam the follow-up ticket
     (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
     consumers) has to move when the policy migrates to the consumer.
+
+    PUBLIC because ``enumerate_*`` never raises: a consumer that switches to
+    one for the completeness signal must re-apply this policy itself, or it
+    silently drops the fail-closed structural guard the shims provide and
+    hands a fabricated-empty corpus onward as a clean read.  Calling this from
+    each consumer keeps the raise/warn split a single implementation instead
+    of one hand-written copy per consumer — which is the drift the paragraph
+    above warns about, at consumer scale.
 
       STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
       ``IncompleteEnumerationError``.  Deterministic, non-transient, and
@@ -993,6 +1003,11 @@ def _apply_incompleteness_policy(
         noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
         consequence: Method-specific clause naming what must NOT be done with
             a structurally incomplete result, appended to the raise message.
+        log: Logger for the EMPIRICAL warning.  Defaults to this module's
+            logger, so the shims are unaffected; a reconciliation sweep passes
+            its own injected logger so the one message about a truncated
+            corpus surfaces alongside the rest of that cycle's diagnostics
+            rather than detached under the backend module.
 
     Raises:
         IncompleteEnumerationError: ``paged`` is structurally incomplete.
@@ -1006,7 +1021,7 @@ def _apply_incompleteness_policy(
             f'answer and {consequence}. {paged.reason}'
         )
     if not paged.complete:
-        logger.warning(
+        log.warning(
             '%s(group_id=%r): enumeration INCOMPLETE — returning %d rows as '
             '%d %s, but %s. rows_seen=%s expected_rows=%s',
             method, group_id, paged.rows_seen, returned_count, noun,
@@ -2390,7 +2405,7 @@ class GraphitiBackend:
         one-block edit); the ORDER BY and completeness rules that make paging
         safe are in _paged_ro_query.
 
-        Incompleteness is handled by the shared _apply_incompleteness_policy:
+        Incompleteness is handled by the shared apply_incompleteness_policy:
         STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
         and return what was fetched.  See that helper for the policy and
         IncompleteEnumerationError for why a structural non-read must not be
@@ -2418,7 +2433,7 @@ class GraphitiBackend:
             Halving buys margin, not correctness.
         """
         grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
-        _apply_incompleteness_policy(
+        apply_incompleteness_policy(
             paged,
             method='get_all_valid_edges',
             group_id=group_id,
@@ -3759,7 +3774,7 @@ class GraphitiBackend:
         than deferred.
 
         Incompleteness is handled by the same shared
-        _apply_incompleteness_policy get_all_valid_edges uses; see that helper.
+        apply_incompleteness_policy get_all_valid_edges uses; see that helper.
         enumerate_entity_nodes returns the signal as a value and never raises.
 
         Args:
@@ -3774,7 +3789,7 @@ class GraphitiBackend:
                 structurally incomplete.
         """
         nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
-        _apply_incompleteness_policy(
+        apply_incompleteness_policy(
             paged,
             method='list_entity_nodes',
             group_id=group_id,
