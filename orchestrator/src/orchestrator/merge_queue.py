@@ -2908,6 +2908,25 @@ async def _run_post_merge_verify(
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
+        # Task ε: attempts whose VERDICT is superseded by a retry below, but whose
+        # OBSERVATION is not.  §5.5 records the observation, not the remedy — and the
+        # compound case is real: `apply_merge_flake_suppression` runs on the SCOPED
+        # leg, so an attempt can suppress a scoped red (a genuine `passes_in_isolation`
+        # observation) and STILL come back failing because the unscoped gate then broke
+        # or the run hit ENOSPC.  That result is retried, `verify` is rebound, and
+        # recording only the settled verdict would silently drop the observation —
+        # exactly the load-correlated shape this PRD exists to measure, and one that
+        # WAS emitted inline (at the moment of observation) before ε moved recording to
+        # the dispatcher.  §8.3's `(test_id, observed_at, call_site)` dedup keeps a
+        # replay idempotent, and each attempt stamps its own `observed_at`, so every
+        # attempt contributes exactly one row per test.
+        superseded_observations: list[VerifyResult] = []
+
+        def _remember_superseded(v: VerifyResult) -> None:
+            """Stash *v* iff it carries an observation, just BEFORE `verify` is rebound."""
+            if getattr(v, 'flake_suppression', None) is not None:
+                superseded_observations.append(v)
+
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2930,6 +2949,7 @@ async def _run_post_merge_verify(
                     'stale merge worktree(s), retrying verify once',
                     req.task_id, len(pruned),
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -3039,19 +3059,31 @@ async def _run_post_merge_verify(
                     '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
                     req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
                     chain_build_ms=chain_build_ms,
                 )
 
-    # Task ε: record the SETTLED dispatched verdict's flake observation.
+    # Task ε: record EVERY attempt's flake observation, oldest first.
     #
     # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
-    # rebinding `verify`, so a superseded attempt never writes rows of its own.
-    # Nothing is lost by waiting: a suppression PASSES, so a suppressed result is
-    # never itself retried — only a still-red or infra-transient result re-enters
-    # a loop, and its own observation is superseded along with its verdict.
+    # rebinding `verify`, so the recording order matches the observation order and
+    # a single pass covers both loops.  A superseded attempt's VERDICT is dead, but
+    # its OBSERVATION is not (§5.5 — record the observation, not the remedy): an
+    # attempt whose SCOPED red was suppressed can still come back failing on the
+    # unscoped gate or on ENOSPC and be retried, and that suppression is a real
+    # masked red that the inline pre-ε emit would have reported at the moment it
+    # happened.  `superseded_observations` is empty on every path where no retry
+    # carried an observation, which is the overwhelmingly common case.
+    for superseded in superseded_observations:
+        _record_flake_observation(
+            superseded, req,
+            merge_sha=merge_sha,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
     _record_flake_observation(
         verify, req,
         merge_sha=merge_sha,

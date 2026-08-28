@@ -358,18 +358,56 @@ class TestDispatcherRecordsTheFlakeObservation:
         assert len(_suppression_events(store)) == 1, store.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
 
-    # -- (f) recorded ONCE per settled verdict --------------------------------
+    async def test_a_remote_suppression_and_a_cross_check_suppression_both_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """The compound case: the dispatched (remote) verdict suppressed AND the
+        cross-check's own gate suppressed — TWO observations for ONE merge SHA.
+
+        Both are recorded, deliberately.  The unit of the ledger and of the INV-4
+        window is a SUPPRESSION (one red masked), never a merge: two independent
+        gate runs on two different hosts really did mask two separate reds, and the
+        differing ``runner`` column is precisely what lets θ's class-3 check tell a
+        bad HOST from a bad SUITE (the same tests suppressed on both ⇒ the suite).
+
+        Pinned rather than deduped because the alternative reading — "one merge, one
+        unit" — would silently discard the local trust anchor's independent evidence.
+        Before ε the remote leg contributed nothing at all here, so this is the count
+        becoming COMPLETE, not double-counting; ``_bump_suppression_streak_and_maybe_
+        escalate``'s docstring says so where an operator reading the counter will
+        find it.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive(
+            tmp_path, task_id='xcheck2',
+            runner=_remote_runner(_wired(_suppressed_pass(_suppression()))),
+            event_store=store, escalation_queue=queue,
+            cross_check=True,
+        )
+
+        assert outcome is None, f'both legs passed; expected a land, got {outcome!r}'
+        rows = _rows(tmp_path)
+        assert len(rows) == 2, f'one row per OBSERVATION, not per merge; got {rows}'
+        assert {r.verdict for r in rows} == {'passes_in_isolation'}
+        # The remote's row is re-stamped by dispatch; the cross-check ran locally.
+        assert sorted(r.runner or '' for r in rows) == ['local', _REMOTE], rows
+        assert len(_suppression_events(store)) == 2, store.emits
+        assert flake_recorder._merge_flake_suppression_streak == 2
+
+    # -- (f) every ATTEMPT's observation, not only the settled verdict's ------
 
     async def test_infra_transient_retry_records_only_the_settled_verdict(
         self, tmp_path: Path,
     ) -> None:
-        """Recording sits AFTER the infra-transient retry loop, so a superseded
-        attempt never writes rows of its own.
+        """An attempt that carried NO observation contributes nothing when it is
+        superseded — the retry's verdict is the only thing recorded.
 
-        Attempt 0 returns an infra-transient red (no observation — the gate does
+        Attempt 0 returns an infra-transient red with no observation (the gate does
         not suppress an infra category); the retry returns the suppressed pass.
         Exactly one logical observation is recorded, and the streak advances by
-        exactly one — a per-attempt recorder would double-count both.
+        exactly one.  The companion test below covers the case where the superseded
+        attempt DID carry one.
         """
         store, queue = _FakeEventStore(), _FakeEscalationQueue()
         transient = VerifyResult(
@@ -387,5 +425,52 @@ class TestDispatcherRecordsTheFlakeObservation:
 
         assert outcome is None
         assert len(_rows(tmp_path)) == 1, _rows(tmp_path)
+        assert len(_suppression_events(store)) == 1, store.emits
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+    async def test_a_superseded_attempts_observation_is_still_recorded(
+        self, tmp_path: Path,
+    ) -> None:
+        """A SUPERSEDED verdict is dead; its OBSERVATION is not (§5.5 — record the
+        observation, not the remedy).
+
+        The compound shape this covers is real and load-correlated, which is exactly
+        the regime the PRD exists to measure: ``apply_merge_flake_suppression`` runs
+        on the SCOPED leg, so an attempt can suppress a scoped red — a genuine
+        ``passes_in_isolation`` observation, a real masked red — and STILL come back
+        failing because the unscoped gate then broke or the host ran out of disk.
+        That result is infra-transient, so it is retried and ``verify`` is rebound.
+        Recording only the settled verdict would drop the observation entirely,
+        where the pre-ε inline emit reported it at the moment it happened.
+
+        Attempt 0: infra-transient red CARRYING a suppression.  Retry: a clean green
+        with none.  Both attempts' observations reach the recorder — here that is
+        one, from the attempt whose verdict was thrown away.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        from dataclasses import replace as _replace
+
+        suppressed_then_broke = _replace(
+            _suppressed_pass(_suppression()),
+            passed=False,
+            summary='disk full during the unscoped typecheck gate',
+            category='disk_full',
+        )
+
+        outcome = await _drive(
+            tmp_path, task_id='superseded',
+            runner=_remote_runner(
+                _wired(suppressed_then_broke), _wired(_passing_result()),
+            ),
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert outcome is None, f'the retry was green; expected a land, got {outcome!r}'
+        rows = _rows(tmp_path)
+        assert len(rows) == 1, (
+            f'the superseded attempt observed a real masked red; got {rows}'
+        )
+        assert rows[0].verdict == 'passes_in_isolation'
+        assert rows[0].test_id == _BETA_FAILING_ID
         assert len(_suppression_events(store)) == 1, store.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
