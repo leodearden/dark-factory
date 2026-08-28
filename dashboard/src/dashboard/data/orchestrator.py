@@ -414,6 +414,28 @@ async def discover_orchestrators(
     with zero tasks, which is exactly the invisible-failure class this bound
     exists to close.
 
+    **This site deliberately DIVERGES from the sibling invariant.**
+    ``active_tasks.collect_tasks_with_counts`` states that "*degraded* and
+    *offline* are DISTINCT FACTS and must never be merged by a consumer:
+    *offline* means the fetch demonstrably failed (the project is proven
+    unreachable), *degraded* means the budget expired first and this project's
+    state is simply UNKNOWN"
+    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``),
+    and that is right — collapsing them can send an operator to restart a
+    healthy service. Honouring it HERE, though, means adding a third state to
+    this entry contract, to ``redux_api.shape_orchestrators`` and to the React
+    orchestrators tab, which is outside a change whose remit is "wrap each call
+    site in ``asyncio.wait_for``". So the divergence is a scope boundary, not a
+    disagreement, and it is bounded rather than silent: the distinction
+    survives verbatim in ``error`` and in the WARNING, and a follow-up is filed
+    to widen the entry contract with a ``degraded`` key so the two facts can be
+    carried separately on the wire.
+
+    Until that lands, a CONSUMER of this function must not read ``offline``
+    alone as "fused-memory is proven down" — both budget paths set it with an
+    ``error`` that names the budget verbatim, and neither means the fetch was
+    attempted and failed.
+
     The two-layer bound is complementary, not redundant: ``fetch_tasks``'
     ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
     connect/read/write and pool acquisition, and never bounds the operation as
@@ -470,17 +492,31 @@ async def discover_orchestrators(
                 logger.warning('project %s: %s', project_root, message)
                 project_cache[project_root] = ([], True, message)
             else:
+                # The EFFECTIVE share, hoisted so the operator message can
+                # report the bound this root actually got. Late in the walk
+                # the whole-loop deadline, not the per-root constant, is the
+                # binding constraint — reporting the constant there would tell
+                # an operator a root blew a 7.0s share when it was in fact
+                # given 1.2s, which is the same illegibility this change set
+                # exists to close.
+                share = min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)
                 try:
                     fetched = await asyncio.wait_for(
                         fetch_tasks(client, config, project_root),
-                        timeout=min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET),
+                        timeout=share,
                     )
                 except TimeoutError:
+                    # On 3.11+ ``asyncio.TimeoutError`` IS the builtin, and so
+                    # is ``socket.timeout``, so a ``TimeoutError`` raised
+                    # INSIDE the fetch is deliberately folded into this same
+                    # budget path rather than propagating. The message is
+                    # therefore authoritative about the OUTCOME — this root's
+                    # task tree is unknown — and not about the cause.
                     message = (
-                        f'exceeded its {_ORCHESTRATORS_PER_ROOT_BUDGET:.1f}s '
-                        f'share of the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
-                        f'orchestrators budget ({remaining:.1f}s remained); '
-                        'its task tree is UNKNOWN for this render (not zero)'
+                        f'exceeded its {share:.1f}s share of the '
+                        f'{_ORCHESTRATORS_TOTAL_BUDGET:.1f}s orchestrators '
+                        'budget; its task tree is UNKNOWN for this render '
+                        '(not zero)'
                     )
                     logger.warning('project %s: %s', project_root, message)
                     project_cache[project_root] = ([], True, message)
