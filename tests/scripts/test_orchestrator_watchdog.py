@@ -51,6 +51,60 @@ def _load_watchdog() -> types.ModuleType:
     return mod
 
 
+def _neutralize_fleet_clock_gates(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub BOTH of staleness_pass's fleet deploy-clock gates to "not blocking".
+
+    For the many staleness_pass tests that are about something else entirely
+    (enumeration, per-unit probes, delegation, exception isolation) and just
+    need the clock gates out of the way.
+
+    WHY A HELPER RATHER THAN TWO setattr LINES PER TEST: this is the read-side
+    isolation boundary, and it is easy to under-apply. REPO_DIR is a hardcoded
+    "/home/leo/src/dark-factory" literal in the watchdog, NOT derived from
+    __file__, so FLEET_DEPLOY_CLOCK_PATH resolves to the LIVE deploy clock even
+    when the suite runs from a worktree — a test that forgets one of these
+    stubs silently reads real machine state, and (because the resulting failure
+    is a hollow pass or a machine-state-dependent flake rather than a hard
+    error) nothing flags it. Each gate added to the pass has so far meant
+    another sweep across every such test — task 2396 added the min-interval
+    stub, task 4754 the head-start stub — so the list lives in ONE place and
+    the next gate is a one-line edit here.
+
+    Deliberately NOT used by the acceptance tests that must exercise the real
+    file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
+    expiry_real_clock_file, test_staleness_pass_head_start_fails_open_on_
+    unreadable_fleet_clock, test_staleness_head_start_gates_read_separate_
+    clocks, and the boundary-scenario clock-file tests — which point
+    FLEET_DEPLOY_CLOCK_PATH at a tmp file instead and monkeypatch neither
+    gate. Nor by tests that hold a gate OPEN (lambda: True) on purpose.
+    """
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+
+
+def _neutralize_fm_clock_gates(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub BOTH of fused_memory_staleness_pass's fm deploy-clock gates.
+
+    fm sibling of _neutralize_fleet_clock_gates — same rationale, against fm's
+    OWN clock (FM_DEPLOY_CLOCK_PATH, likewise resolved off the hardcoded
+    REPO_DIR and therefore live). Kept as a SEPARATE helper rather than one
+    parameterized by tier so no test can neutralize the wrong tier's gates,
+    mirroring the two separate zero-arg gates in the watchdog itself.
+
+    Deliberately NOT used by the fm acceptance tests that must exercise the
+    real file reads (test_fm_staleness_head_start_anchored_on_fm_min_interval_
+    expiry_real_clock_file, test_fm_staleness_pass_head_start_fails_open_on_
+    unreadable_fm_clock, test_staleness_head_start_gates_read_separate_clocks),
+    nor by tests that hold a gate open on purpose.
+    """
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # probe_port tests
 # ---------------------------------------------------------------------------
@@ -2010,8 +2064,7 @@ def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
         unknown_unit: None,  # undeterminable -> must not count as stale
     }
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(
         wdog, "_enumerate_running_units", lambda: [stale_unit, fresh_unit, unknown_unit]
     )
@@ -2067,8 +2120,7 @@ def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPa
             raise RuntimeError("systemctl exploded")
         return commit_epoch - 100  # stale
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [boom_unit, stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2096,14 +2148,11 @@ def test_staleness_pass_noop_when_commit_epoch_none(monkeypatch: pytest.MonkeyPa
         enumerated.append("called")
         return ["orchestrator-x.service"]
 
-    # Neutralize BOTH fleet clock gates (task 2396 step-11; head start added
-    # by task 4754): both are checked BEFORE commit_epoch, and
-    # _read_last_fleet_deploy_epoch reads a real on-disk file at the default
-    # path — this test must exercise the commit_epoch-None path specifically,
-    # not an incidental gate skip. It pins no fake time.time(), so the LIVE
-    # clock's real age would otherwise decide.
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    # Both clock gates are checked BEFORE commit_epoch, and this test must
+    # exercise the commit_epoch-None path specifically, not an incidental gate
+    # skip. It pins no fake time.time(), so — see _neutralize_fleet_clock_gates
+    # — the LIVE clock's real age would otherwise decide the outcome.
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
@@ -2130,8 +2179,7 @@ def test_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     disabled_unit = "orchestrator-disabled.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [disabled_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2162,8 +2210,7 @@ def test_staleness_pass_skips_startup_grace(monkeypatch: pytest.MonkeyPatch) -> 
 
     grace_unit = "orchestrator-grace.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [grace_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
@@ -2197,8 +2244,7 @@ def test_staleness_pass_none_elapsed_does_not_block_restart(
 
     unit = "orchestrator-unknown-elapsed.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
@@ -2234,11 +2280,7 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
     stale_unit = "orchestrator-young-commit.service"
 
-    # Neutralize BOTH fleet clock gates (task 2396 step-11; head start added
-    # by task 4754) — see the comment in
-    # test_staleness_pass_noop_when_commit_epoch_none above.
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2269,8 +2311,7 @@ def test_staleness_pass_delegates_exactly_once_for_multiple_stale_units(
 
     stale_units = ["orchestrator-stale-a.service", "orchestrator-stale-b.service"]
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(stale_units))
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2305,8 +2346,7 @@ def test_staleness_pass_delegates_zero_times_when_all_fresh(
 
     fresh_units = ["orchestrator-fresh-a.service", "orchestrator-fresh-b.service"]
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(fresh_units))
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2749,8 +2789,7 @@ def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
         enumerated.append("called")
         return []
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
@@ -3066,8 +3105,7 @@ def test_staleness_pass_e2e_restarts_stale_unit_then_converges(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -3126,8 +3164,7 @@ def test_staleness_pass_e2e_commit_grace_suppresses_all_restarts(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -3163,8 +3200,7 @@ def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyP
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -3203,8 +3239,7 @@ def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.Monk
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -6696,8 +6731,7 @@ def test_fused_memory_staleness_pass_core_stale_delegates_once(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6725,8 +6759,7 @@ def test_fused_memory_staleness_pass_fresh_does_not_delegate(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6896,8 +6929,7 @@ def test_fused_memory_staleness_pass_commit_grace_suppresses(
     now = 2_000_000_000.0
     commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(
@@ -6920,13 +6952,11 @@ def test_fused_memory_staleness_pass_noop_when_commit_epoch_none(
     enabled/active probe, no delegate)."""
     wdog = _load_watchdog()
 
-    # Neutralize BOTH fm clock gates (head start added by task 4754): both are
-    # checked BEFORE commit_epoch, and _read_last_fm_deploy_epoch reads a real
-    # on-disk file at the default path — this test must exercise the
-    # commit_epoch-None path specifically, not an incidental gate skip. It pins
-    # no fake time.time(), so the LIVE clock's real age would otherwise decide.
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    # Both fm clock gates are checked BEFORE commit_epoch, and this test must
+    # exercise the commit_epoch-None path specifically, not an incidental gate
+    # skip. It pins no fake time.time(), so — see _neutralize_fm_clock_gates —
+    # the LIVE clock's real age would otherwise decide the outcome.
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: None)
     monkeypatch.setattr(
         wdog,
@@ -6952,8 +6982,7 @@ def test_fused_memory_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPa
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
@@ -6981,8 +7010,7 @@ def test_fused_memory_staleness_pass_skips_startup_grace(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -7011,8 +7039,7 @@ def test_fused_memory_staleness_pass_active_none_does_not_delegate(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -7039,8 +7066,7 @@ def test_fused_memory_staleness_pass_isolates_probe_exception(
     def _boom(_u: str) -> bool:
         raise RuntimeError("systemctl exploded")
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", _boom)
@@ -7061,8 +7087,7 @@ def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPat
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
     active = {"epoch": commit_epoch - 100}  # starts stale
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
-    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
