@@ -1659,14 +1659,18 @@ def test_wait_for_path_require_nonempty_waits_for_content_to_land(
 
     WRITE_DELAY = 0.2
 
-    def _write_late() -> None:
-        time.sleep(WRITE_DELAY)
-        pidfile.write_text("12345\n")
-
-    writer = threading.Timer(0.0, _write_late)
+    writer = threading.Timer(WRITE_DELAY, lambda: pidfile.write_text("12345\n"))
+    # Sampled BEFORE writer.start(), not after: Timer.start() blocks until
+    # the child thread has begun bootstrapping, so sampling afterward lets
+    # the timer's delay clock start ticking before ours does -- shrinking
+    # the observed elapsed below WRITE_DELAY under scheduler contention and
+    # self-inflicting exactly the kind of flake this file exists to
+    # eliminate. Starting our clock first only ever makes elapsed LARGER,
+    # which keeps the `elapsed >= WRITE_DELAY` assertion below sound instead
+    # of racy.
+    start = time.monotonic()
     writer.start()
     try:
-        start = time.monotonic()
         _wait_for_path(pidfile, timeout=5.0, require_nonempty=True)
         elapsed = time.monotonic() - start
     finally:
