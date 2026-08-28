@@ -694,3 +694,78 @@ class TestPreconditionOrdering:
         actions = self._actions(report)
         assert actions[STALE_ID] == 'skip:already_amended'
         assert actions[WARNING_ID] == 'amend'
+
+
+class TestIdempotency:
+    """Re-running after a successful (or partial) apply must be safe.
+
+    This is what lets an operator re-run without first working out how far the
+    previous attempt got.
+    """
+
+    @staticmethod
+    def _amended_corpus() -> dict[str, str]:
+        return {t.memory_id: t.new_content for t in _mod.AMEND_TARGETS}
+
+    @pytest.mark.asyncio
+    async def test_second_apply_writes_nothing(self):
+        service = _memory_service(self._amended_corpus())
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_second_apply_reports_both_skipped_and_unapplied(self):
+        report = await _mod.run(
+            _memory_service(self._amended_corpus()),
+            project_id='dark_factory', apply=True,
+        )
+        assert [c['action'] for c in report['changes']] == [
+            'skip:already_amended', 'skip:already_amended',
+        ]
+        assert all(c['applied'] is False for c in report['changes'])
+        assert report['totals']['skipped'] == 2
+        assert report['totals']['amended'] == 0
+
+    @pytest.mark.asyncio
+    async def test_all_skip_run_does_not_probe_write_capability(self, monkeypatch):
+        # Nothing is going to be written, so no capability is needed. This is
+        # what lets an operator confirm from a sandbox that a previous apply
+        # completed, without the probe refusing the run.
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw),
+        )
+        await _mod.run(
+            _memory_service(self._amended_corpus()),
+            project_id='dark_factory', apply=True,
+        )
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_partially_amended_corpus_writes_only_what_is_still_stale(self):
+        # The resume-after-partial-failure case: the first write landed, the
+        # second did not.
+        service = _memory_service({
+            STALE_ID: _mod.AMEND_TARGETS[0].new_content,
+            WARNING_ID: _mod.AMEND_TARGETS[1].expected_preimage,
+        })
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [c.kwargs['memory_id'] for c in service.update_memory.await_args_list]
+        assert written == [WARNING_ID]
+        assert report['totals']['amended'] == 1
+        assert report['totals']['skipped'] == 1
+
+    @pytest.mark.asyncio
+    async def test_third_run_after_completion_is_a_stable_no_op(self):
+        # Idempotency must be stable, not merely true once: two consecutive
+        # re-runs over an amended corpus give the same answer.
+        corpus = self._amended_corpus()
+        first = await _mod.run(
+            _memory_service(corpus), project_id='dark_factory', apply=True,
+        )
+        second = await _mod.run(
+            _memory_service(corpus), project_id='dark_factory', apply=True,
+        )
+        assert first['changes'] == second['changes']
+        assert first['totals'] == second['totals']
