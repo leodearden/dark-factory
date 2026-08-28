@@ -469,6 +469,33 @@ human, mirroring the cross-project external-dep gate's L1 filer but one
 level up — a persistently false capability claim is a "someone must look
 at this now" condition, not a routine triage item.
 
+**Choosing a descriptor**
+
+A `grep` for a SYMBOL NAME asserts that a string appears in a file, not that
+a behaviour exists. It is satisfiable by prose — a comment, a docstring, or a
+variable named after the thing — so it must never stand in for a behavioural
+capability. Prefer a pattern that can only match a real implementation.
+
+When the capability IS behavioural, prefer `kind: "script"` pointing at a
+COMMITTED predicate. If the same invariant is already gated elsewhere (a
+`metadata.before_done` predicate, a CI check), point the delivered check at
+THAT SAME script with the same `args`/`timeout_secs`: one encoding referenced
+from two enforcement points cannot drift, whereas two independent encodings of
+one demand can, and have.
+
+A descriptor that no longer matches what the producing task actually lands is
+worse than no descriptor — the dependent is then gated on a claim the dep never
+makes. Drop the check rather than keep a false one.
+
+The `script` kind carries a failure mode the table above records but whose
+consequence it does not spell out: a missing, non-executable, or malformed
+`script` yields ERRORED, and ERRORED is a fail-safe wait with no streak bump
+and no escalation. That is a SILENT, indefinite hold on the dependent. Pin the
+script's existence and executability with a test.
+
+See `plans/write-triage-attach-target-contradiction.md` for the worked example
+(tasks 4762 / 4810 / 3169).
+
 **Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable):
 
 | Knob | Default | Meaning |
