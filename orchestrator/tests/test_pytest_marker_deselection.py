@@ -672,6 +672,16 @@ class TestOnly:
 """
 
 
+def _classes_marked_plus(extra: str) -> str:
+    """``_ALL_CLASSES_MARKED_SOURCE`` with *extra* appended at module scope."""
+    return f'{_ALL_CLASSES_MARKED_SOURCE}\n\n{extra}\n'
+
+
+def _classes_marked_importing(import_line: str) -> str:
+    """``_ALL_CLASSES_MARKED_SOURCE`` with *import_line* prepended at module scope."""
+    return f'{import_line}\n{_ALL_CLASSES_MARKED_SOURCE}'
+
+
 class TestGuaranteedMarkerNames:
     """``guaranteed_marker_names(source) -> frozenset[str]``.
 
@@ -738,6 +748,112 @@ class TestGuaranteedMarkerNames:
 
     def test_unmarked_module_is_empty(self):
         assert guaranteed_marker_names(_UNMARKED_SOURCE) == frozenset()
+
+    # -- refusals: shapes with a collectable item outside the marked classes --
+    #
+    # Every fixture below is `_ALL_CLASSES_MARKED_SOURCE` (which on its own
+    # yields `frozenset({'slow'})`, pinned above) plus exactly ONE offending
+    # construct, so a refusal can never pass vacuously: if the guard under
+    # test stopped firing, the assertion would fail with `frozenset({'slow'})`.
+    # The assertion form is `== module_level_marker_names(source)` rather than
+    # `== frozenset()` because that pins the exact DEGRADATION CONTRACT — a
+    # guard failure falls back to the primary tier's answer, never below it.
+
+    def test_refuses_on_a_module_level_test_function_beside_the_marked_classes(self):
+        """The mixed module the task names explicitly.
+
+        ``test_a`` is an undecorated, still-SELECTED item that no class
+        marker covers, so no class-level marker is a module-wide bound.
+        """
+        source = _classes_marked_plus('def test_a():\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_when_a_test_function_is_nested_below_tree_body(self):
+        """THE UNSOUNDNESS THIS GUARD CLOSES.
+
+        An undecorated, still-SELECTED sibling hiding inside a top-level
+        ``if`` would otherwise be invisible to a class-body-only walk, and
+        the module would falsely widen.
+        """
+        source = _classes_marked_plus(
+            "if sys.platform == 'linux':\n    def test_b():\n        pass\n",
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_module_level_async_test_function(self):
+        """``async def`` counts as an item exactly as ``def`` does."""
+        source = _classes_marked_plus('async def test_c():\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'hook_source',
+        [
+            'def pytest_collection_modifyitems(config, items):\n    pass\n',
+            'def pytest_generate_tests(metafunc):\n    pass\n',
+        ],
+    )
+    def test_refuses_on_a_top_level_pytest_hook(self, hook_source):
+        """A hook can add items outside the classes this walk sees."""
+        source = _classes_marked_plus(hook_source)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_star_import(self):
+        """Bound names from ``from x import *`` are statically unknowable."""
+        source = _classes_marked_importing('from helpers import *')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'import_line',
+        [
+            'from helpers import TestBase',
+            'import helpers as TestAlias',
+            'from helpers import Base as TestBase',
+            'from helpers import test_shared_case',
+            'import helpers as test_alias',
+            'from helpers import shared_case as test_alias',
+        ],
+    )
+    def test_refuses_when_an_import_binds_a_name_starting_with_test(self, import_line):
+        """THE "test classes imported from another module" CASE, and its function twin.
+
+        Pytest collects an imported ``Test*`` CLASS in THIS module under the
+        default ``python_classes``, and an imported lowercase ``test_*``
+        FUNCTION under ``python_functions``; ``asname`` wins either way.
+        Neither is inside one of this module's marked classes.
+        """
+        source = _classes_marked_importing(import_line)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_asname_that_does_not_start_with_test_does_not_refuse_on_that_ground_alone(self):
+        """THE REVERSE CONTROL: aliasing a ``Test*`` name AWAY is not a hole."""
+        source = _classes_marked_importing('from helpers import TestBase as _base')
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    @pytest.mark.parametrize(
+        'assignment_line',
+        [
+            'test_generated = _make_case()',
+            'test_generated: object = _make_case()',
+        ],
+    )
+    def test_refuses_on_a_top_level_assignment_that_binds_a_test_prefixed_name(
+        self, assignment_line,
+    ):
+        """THE "dynamically generated items" CASE.
+
+        The default ``python_functions = test*`` collects a module attribute
+        so named however it was bound, and this walk cannot tell statically
+        whether ``_make_case()`` returns a callable.
+        """
+        source = _classes_marked_plus(assignment_line)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_an_ordinary_helper_import_does_not_refuse(self):
+        """THE CONTROL: the ``test``-prefix guard must not be over-broad."""
+        source = _classes_marked_importing(
+            'from systemd_unit_invariants import require_installed_unit',
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
 
 
 # ---------------------------------------------------------------------------
