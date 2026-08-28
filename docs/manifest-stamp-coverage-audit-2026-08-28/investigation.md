@@ -112,8 +112,9 @@ This matters because of how the stamper matches. Step 4 builds
 `label_to_task_id` keyed on each batch task's `prd_task_label`, and matches those keys against
 `entry.get('label')` read from the sidecar. A transliterated label matches **no** sidecar entry,
 so a future `commit_planning` over these three would stamp nothing, copy nothing, and deposit all
-three in step 4b's `missing_labels` — the same failure class this task was filed to audit, still
-live today, and reached by a different route.
+three in step 4b's `missing_labels` — the same failure class this task was filed to audit, live at
+measurement time, and reached by a different route. (It is fixed below; `report.json` preserves the
+pre-remediation rows as the finding.)
 
 The Greek form is the convention, not an arbitrary pick:
 
@@ -178,9 +179,15 @@ metadata writers clobbering sibling keys (tasks 3260, 3933, 4507).
   still `[]`, and the δ/3691 descriptor divergence still present and still deferred.
 
 All three tasks are `done`, and the change is still safe: `prd_task_label` is provenance-only — a
-blessed key in `shared/src/shared/task_metadata.py` whose sole functional consumer is
-`manifest_stamping` (verified by grep across every `*.py`). Nothing re-reads it to make a decision
-about a completed task.
+blessed key in `shared/src/shared/task_metadata.py` with exactly one *behavioural* consumer,
+`fused-memory/src/fused_memory/server/manifest_stamping.py`, which keys `label_to_task_id` on it.
+A grep across every tracked `*.py` returns one other reader, and only one:
+`scripts/audit_combine_gate_marker_loss.py`, which lists `prd_task_label` in `_PROVENANCE_KEYS` and
+builds its manifest-sourced `expected` dict as `{"prd_task_label": expectation.label}` — that is, a
+read-only provenance audit comparing the **task-side** label against the **sidecar's**, making no
+dispatch decision. Realigning the task side *to* the sidecar can only increase its agreement, so
+that consumer is strengthened by this change rather than perturbed by it. Nothing re-reads the key
+to make a decision about a completed task.
 
 See `report.json` → `remediation` for the full before/after record.
 
@@ -235,10 +242,15 @@ contend with.
   4172 `kappa-followup` — and note `kappa-followup` is *not* a transliteration of `κ`, since that
   sidecar declares `κ` separately and binds it to task 3544). They need per-class adjudication by
   someone holding the relevant PRD context, not a blanket rename, and this task holds no lock on
-  those sidecars. **Filed as `tkt_0RT0D6M68VMRA0X45GXQXNW9YH`** with all 21 rows recorded verbatim
-  and the reproduction recipe, so the measurement survives independently of this document. One
-  detail worth carrying: **4172 is the only non-terminal row in the set**, and therefore the only
-  one where the defect is still live for a future `commit_planning`.
+  those sidecars. **Filed as task 4907** (from ticket
+  `tkt_0RT0D6M68VMRA0X45GXQXNW9YH`) with all 21 rows recorded verbatim and the reproduction recipe,
+  so the measurement survives independently of this document. Cite the **task** id: 4907 is the
+  durable handle this document uses for every other cross-reference (4545, 4628, 4782, 4896),
+  whereas a ticket row is a transient curator artifact and `list_tickets` defaults to a 7-day
+  window. Task 4907 is `pending`, priority `low`, and declares the `eval-framework-revival` and
+  `found-on-main-provenance-integrity` sidecars in `metadata.files`. One detail worth carrying:
+  **4172 is the only non-terminal row in the set**, and therefore the only one where the defect is
+  still live for a future `commit_planning`.
 - **No pointer was added to the PRD's own docs trail, deliberately.** The natural target,
   `plans/toolcall-markup-containment-prd.md`, is declared by four in-flight tasks (4502
   in-progress, 4558 deferred, 4787 pending, 4896 pending). Editing it here would contend on their

@@ -24,6 +24,7 @@
     ],
     "independent_corroboration": "task 4457's dry_run_proposals record the pydantic failure verbatim at merge-verify on 2026-08-20, naming the same 5 OPEN rows and the same Literal['PASS','FAIL'] schema"
   },
+  "note_on_measurement_epoch": "MEASUREMENT EPOCH. `labels` and `findings` below are the PRE-remediation measurement (2026-08-28T22:40:37Z) — that is what the audit found, and it is preserved verbatim so the finding stays verifiable. They are NOT the current state of the task store. The three `findings.prd_task_label_mismatches` rows were repaired by this same task at 2026-08-28T22:54:52Z; each is stamped `remediated_by_this_task: true`, and `labels` still shows their pre-remediation `prd_task_label` / `label_matches_prd_task_label: false`. For what is live now, read `remediation` — every other finding here is unchanged by it.",
   "labels": [
     {
       "label": "α",
@@ -205,27 +206,34 @@
   "findings": {
     "unstamped_labels": [],
     "missing_delivered_checks": [],
+    "note_on_findings": "PRE-remediation. `prd_task_label_mismatches` below was true at measurement time and has since been repaired by this task — see `remediation`. `unstamped_labels` and `missing_delivered_checks` are empty findings and are unaffected; `field_level_divergences` is still live and deferred to task 4545.",
     "prd_task_label_mismatches": [
       {
         "task_id": "3690",
         "sidecar_label": "γ1",
         "task_prd_task_label": "gamma-1",
         "task_status": "done",
-        "consequence": "manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label']; these three match NO sidecar entry, so a future commit_planning over them stamps nothing, copies nothing, and buries them in report['missing_labels']"
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ1",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
       },
       {
         "task_id": "4457",
         "sidecar_label": "γ2",
         "task_prd_task_label": "gamma-2",
         "task_status": "done",
-        "consequence": "manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label']; these three match NO sidecar entry, so a future commit_planning over them stamps nothing, copies nothing, and buries them in report['missing_labels']"
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ2",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
       },
       {
         "task_id": "4458",
         "sidecar_label": "γ3",
         "task_prd_task_label": "gamma-3",
         "task_status": "done",
-        "consequence": "manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label']; these three match NO sidecar entry, so a future commit_planning over them stamps nothing, copies nothing, and buries them in report['missing_labels']"
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ3",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
       }
     ],
     "field_level_divergences": [
@@ -261,6 +269,9 @@
     "unmatched_label_count": 24,
     "in_scope_here": 3,
     "out_of_scope_deferred_to_followup": 21,
+    "followup_task_id": "4907",
+    "followup_ticket_id": "tkt_0RT0D6M68VMRA0X45GXQXNW9YH",
+    "followup_note": "The 21 out-of-scope rows were filed as ticket tkt_0RT0D6M68VMRA0X45GXQXNW9YH, which the curator materialized as TASK 4907 (pending, priority low, metadata.spawned_from='4590', escalation_id='agent-followup-4590'). Task 4907 is the durable handle — cite it, not the ticket id: a ticket row is a transient curator artifact and `list_tickets` defaults to a 7-day window.",
     "rows": [
       {
         "task_id": "2464",
@@ -675,7 +686,7 @@
       "this_sidecar_label_mismatches_after": 0,
       "unrelated_findings_unchanged": "unstamped_labels still []; missing_delivered_checks still []; the single delta/3691 pattern divergence is unchanged and still deferred to task 4545"
     },
-    "safety_basis": "prd_task_label is provenance-only: a blessed key in shared/src/shared/task_metadata.py whose sole functional consumer is manifest_stamping (verified by grep across all *.py). That is why realigning it is safe even though all three tasks are already done.",
-    "note_on_corpus_rows": "corpus_unmatched_labels above records the PRE-remediation measurement (24 rows), which is the audit's finding. Post-remediation the same sweep returns 21; the 3 rows for this sidecar are cleared. The remaining 21 are out of scope and filed as a follow-up."
+    "safety_basis": "prd_task_label is provenance-only, and has exactly ONE behavioural consumer: fused-memory/src/fused_memory/server/manifest_stamping.py, which keys label_to_task_id on it. MEASURED by grep across every tracked *.py, the only OTHER reader is scripts/audit_combine_gate_marker_loss.py, which lists it in _PROVENANCE_KEYS and builds its manifest-sourced `expected` dict as {'prd_task_label': expectation.label} — i.e. it is a read-only provenance audit that compares the TASK-side label against the SIDECAR's, and makes no dispatch decision. Realigning the task side to the sidecar can therefore only increase its agreement. Nothing else re-reads the key to make a decision about a completed task, which is why realigning it is safe even though all three tasks are already done.",
+    "note_on_corpus_rows": "corpus_unmatched_labels above records the PRE-remediation measurement (24 rows), which is the audit's finding. Post-remediation the same sweep returns 21; the 3 rows for this sidecar are cleared. The remaining 21 are out of scope and filed as task 4907 (ticket tkt_0RT0D6M68VMRA0X45GXQXNW9YH)."
   }
 }

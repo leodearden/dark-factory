@@ -7,7 +7,7 @@
   "branch_commits_beyond_main_at_measurement": 0,
   "task_store": {
     "path": "/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db",
-    "opened": "file:...?mode=ro with uri=True (READ-ONLY; the sweep made no writes)",
+    "opened": "file:...?mode=ro with uri=True — READ-ONLY. Scoped to the MEASUREMENT pass: this sqlite handle made no writes, and could not have. It is NOT a claim that the run as a whole touched nothing — see the `remediation` stanza below, which went through the MCP write path.",
     "why_this_store": ".taskmaster/tasks/tasks.json is stale; data/tasks.db and data/orchestrator/tasks.db have no `tasks` table",
     "tag": "master",
     "metadata_encoding": "plain JSON text in the `metadata` TEXT column"
@@ -18,6 +18,20 @@
     "last_touching_date": "2026-08-19T18:39:55+01:00",
     "unchanged_since": "that commit — i.e. the sidecar is byte-identical to its state during the invalid window",
     "parses_clean_today": true
+  },
+  "remediation": {
+    "applied_at": "2026-08-28T22:54:52Z",
+    "relative_to_measurement": "~14 minutes AFTER measured_at above",
+    "path": "mcp__fused-memory__update_task — the MCP write path, NOT the read-only sqlite handle in `task_store`",
+    "tasks": [
+      "3690",
+      "4457",
+      "4458"
+    ],
+    "what": "metadata.prd_task_label realigned to the sidecar's own label spelling (gamma-1/2/3 -> the Greek forms)",
+    "payload_scope": "only {'prd_task_label': '<greek>'} per call, inheriting the default shallow merge; the whole metadata blob was deliberately not sent back",
+    "files_touched": "none — a task-store write leaves no repo diff; report.json -> remediation and investigation.md -> 'What was changed' are its only durable trace",
+    "full_record": "report.json -> remediation"
   },
   "derivation_rule_mirrored": {
     "source": "fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl",
@@ -33,5 +47,7 @@
     "command": "git ls-files '*.capability-manifest.yaml'",
     "tracked_sidecar_count": 53
   },
-  "authoring_hazard_honored": "No raw toolcall/MCP envelope sentinel literal appears anywhere in this artifact set. The one pattern divergence is recorded by measured properties (length, bracket/slash presence, sha256 prefix) rather than by value."
+  "authoring_hazard_honored": "No raw toolcall/MCP envelope sentinel literal appears anywhere in this artifact set. The one pattern divergence is recorded by measured properties (length, bracket/slash presence, sha256 prefix) rather than by value.",
+  "note_on_branch_commit_count": "That count is as of the measurement pass, and is necessarily false in the commit that introduces this artifact set — the branch carries the audit's own commits.",
+  "what_this_run_touched": "Repo: only the three files in this directory. Task store: exactly the three metadata.prd_task_label values in the `remediation` stanza above, written via update_task. Nothing else — no sidecar, no script, no file owned by another in-flight task."
 }
