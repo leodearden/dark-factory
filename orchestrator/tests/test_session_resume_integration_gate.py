@@ -1518,8 +1518,8 @@ async def test_b6_kill_switch_fresh_dispatch_no_event(harness: Harness):
 
     ω asserts the LANDED inject-time-only semantics (ω design_decision #3):
     ``_adopt_recovered_session`` has no ``enabled`` gate, so recovery populates
-    ``_recovered_sessions`` regardless; only ``_session_resume_eligible``
-    returns ``(False, 'disabled')`` and ``_run_slot`` degrades without an
+    ``_recovered_sessions`` regardless; only ``_session_resume_reasons``
+    returns ``frozenset({'disabled'})`` and ``_run_slot`` degrades without an
     event or a storm-streak bump. This deliberately does NOT assert the PRD §8
     prose "no adoption at boot" — that would be a RED-doomed false premise
     against merged γ.

@@ -726,6 +726,16 @@ _MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
 })
 
 
+# TRANSITIONAL (task 3728, deleted in the same task's step-4): projects the
+# composite reason set returned by `Harness._session_resume_reasons` back onto
+# the single first-match `reason` string the session_resume_fallback payload
+# used to carry, so the rename lands as one green commit ahead of the payload
+# rewrite. Order reproduces the predecessor's branch order exactly.
+_SESSION_RESUME_REASON_PRECEDENCE: tuple[str, ...] = (
+    'disabled', 'stale', 'capped', 'no_transcript', 'reseeded',
+)
+
+
 def _is_terminal_merged(task: dict | None) -> bool:
     """Return True iff *task* is a done task whose content is confirmed merged.
 
@@ -3461,25 +3471,43 @@ class Harness:
             )
         return archived
 
-    def _session_resume_eligible(
+    def _session_resume_reasons(
         self, session: dict, config_dir: str | None
-    ) -> tuple[bool, str]:
-        """Return ``(eligible, reason)`` for a recovered session (task γ).
+    ) -> frozenset[str]:
+        """Return EVERY reason a recovered session is ineligible (task β/3728).
 
         The PRD §7 eligibility predicate, evaluated in _run_slot BEFORE the
-        β resume injection. Totally fail-safe (I3): every ambiguous or broken
-        input degrades to an ineligible ``(False, <reason>)`` so the caller
-        falls back to a fresh dispatch — this method NEVER raises.
+        β resume injection. The EMPTY set means ELIGIBLE — ``not reasons`` IS
+        the eligibility predicate, so there is no separate bool that can drift
+        out of step with the reasons it is supposed to summarise.
 
-        Reasons, in branch order:
-          - 'disabled'      — the session_resume kill switch is off (B6).
+        Every predicate below is evaluated and ACCUMULATED; the set is not
+        ordered and carries no precedence. Its predecessor
+        ``_session_resume_eligible`` returned on the first matching branch, so
+        an aged sidecar whose transcript had ALSO vanished reported only
+        ``stale`` — sending an operator to check NTP for a session that was
+        additionally uncorroborated (task 3728 / D5).
+
+        Totally fail-safe (I3): every ambiguous or broken input degrades to a
+        non-empty (ineligible) set so the caller falls back to a fresh
+        dispatch — this method NEVER raises.
+
+        The reason VOCABULARY, each leg independent of the others:
+          - 'disabled'      — the session_resume kill switch is off (B6). The
+                              ONE predicate that still short-circuits: it is a
+                              property of the FEATURE, not of the session, so
+                              it is returned ALONE. A set mixing it with
+                              session-derived reasons would invite a
+                              co-occurrence census to count sessions that were
+                              never evaluated for resume at all — and the
+                              corroboration leg's filesystem glob is pure waste
+                              on the dispatch path while the feature is off.
           - 'stale'         — (now - started_at) >= freshness_window_secs, OR
                               started_at is missing/unparseable (fail-safe).
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-        Then transcript corroboration, which resolves three ways. Note
-        'no_transcript' is listed first because it is reached BOTH before the
-        transcript glob (nothing to corroborate with) and after it (the store
-        survived but this session's file is missing):
+        Then transcript corroboration, which contributes AT MOST ONE of the
+        following two — they are the two arms of a single check, mutually
+        exclusive by construction:
           - 'no_transcript' — no stashed config_dir, no session_id, the config
                               dir survives but this session's transcript is
                               absent, or the dir is present-but-unreadable
@@ -3491,13 +3519,17 @@ class Harness:
                               (docs/prds/warm-lane-pool-cow-seeding.md §9.3/
                               §9.5), which wipes <lane>/.task/ and the whole
                               transcript store with it. An EXPECTED fallback,
-                              not a corroboration failure (task 3256) — it
-                              does not feed the fallback-storm streak.
-          - 'eligible'      — all corroboration passed; inject the session.
+                              not a corroboration failure (task 3256).
+
+        How the caller ROUTES a reason (silent / capped event / fallback
+        event) and which reasons feed the fallback-storm streak are the
+        caller's business, not this method's: see the _run_slot guard block
+        and :data:`_BY_DESIGN_SESSION_RESUME_REASONS`.
         """
         cfg = self.config.session_resume
         if not cfg.enabled:
-            return (False, 'disabled')
+            return frozenset({'disabled'})  # the feature, not the session
+        reasons: set[str] = set()
         # Freshness — any parse failure or absent started_at is 'stale'.
         try:
             started_at = datetime.fromisoformat(session['started_at'])
@@ -3505,16 +3537,16 @@ class Harness:
                 started_at = started_at.replace(tzinfo=UTC)
             age_secs = (datetime.now(UTC) - started_at).total_seconds()
             if age_secs >= cfg.freshness_window_secs:
-                return (False, 'stale')
+                reasons.add('stale')
         except (KeyError, ValueError, TypeError):
-            return (False, 'stale')
+            reasons.add('stale')
         # Per-task resume cap (throttling of a healthy long-running task).
         try:
             resume_count = int(session.get('resume_count', 0))
         except (ValueError, TypeError):
             resume_count = 0
         if resume_count >= cfg.max_resumes_per_task:
-            return (False, 'capped')
+            reasons.add('capped')
         # Transcript corroboration — RE-glob at dispatch (INV-3), so a
         # reseed/wipe of .task between boot and re-dispatch is detected.
         # transcript_exists is itself total (any glob error → False), so no
@@ -3534,8 +3566,8 @@ class Harness:
         # pathological and must stay loud.
         session_id = session.get('session_id')
         if not config_dir or not session_id:
-            return (False, 'no_transcript')
-        if not transcript_exists(Path(config_dir), session_id):
+            reasons.add('no_transcript')
+        elif not transcript_exists(Path(config_dir), session_id):
             # Discriminate "PROVABLY gone" from "there but unreadable", and do
             # it with an explicit stat rather than Path.exists(), which is
             # wrong for this seam in both directions: it swallows exactly
@@ -3549,14 +3581,15 @@ class Harness:
             # ENOTDIR earns 'reseeded'; everything else falls through to the
             # LOUD arm, caught here so the method stays total (ValueError
             # covers the NUL-bearing path that os.stat rejects outright).
+            wiped = False
             try:
                 Path(config_dir).stat()
             except (FileNotFoundError, NotADirectoryError):
-                return (False, 'reseeded')
+                wiped = True
             except (OSError, ValueError):
                 pass  # unreadable/faulted != wiped — stay loud
-            return (False, 'no_transcript')
-        return (True, 'eligible')
+            reasons.add('reseeded' if wiped else 'no_transcript')
+        return frozenset(reasons)
 
     def _archive_available(self, task_id: str, session_id: str | None) -> bool:
         """Was *session_id* recoverable from the durable transcript archive?
@@ -8988,15 +9021,23 @@ class Harness:
             # may later gate on the signal; task 3578 is what consumes
             # durable_archive_path to perform an actual restore.
             if recovered_session is not None:
-                eligible, reason = self._session_resume_eligible(
+                reasons = self._session_resume_reasons(
                     recovered_session, recovered_config_dir
+                )
+                # TRANSITIONAL (task 3728, removed in step-4): project the set
+                # back onto the legacy first-match string so this commit is
+                # the rename ONLY and every existing payload assertion stays
+                # byte-identically green.
+                reason = next(
+                    (r for r in _SESSION_RESUME_REASON_PRECEDENCE if r in reasons),
+                    'eligible',
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
                     'session_id': recovered_session.get('session_id'),
                     'role': recovered_session.get('role'),
                 }
-                if eligible:
+                if not reasons:
                     self._session_resume_fallback_streak = 0  # break any storm run
                     # Drop the chain's comparison point too, so the next
                     # fallback starts a fresh run instead of chaining off a
