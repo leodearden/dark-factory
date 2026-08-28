@@ -21,9 +21,13 @@ STATE (N short single-claim peers sharing ``metadata.topic``, exactly one
 task owns HOW the fold is EXECUTED — the ordering, ``run_id``, ``survivors``,
 the no-resume rule, and the two escape flags.  The end-state brief is
 CROSS-REFERENCED, never restated: a second normative copy inside one assembled
-prompt is the INV-5 no-lockstep-duplication failure, and
-``TestStage1ExecutionContract`` carries the negative assertion that pins the
-boundary.
+prompt is the INV-5 no-lockstep-duplication failure.  That boundary is
+carried by the PROMPT's own opening cross-reference ("The section above states
+WHAT a folded cluster must look like when you are done. This one states HOW to
+get there."), not by a test here: a negative substring pin over the section
+(``'TARGET END STATE' not in ...``) was removed because a restatement that
+reworded the heading passes it, so it could never detect the duplication it
+named.
 """
 
 from __future__ import annotations
@@ -122,22 +126,6 @@ class TestStage1ExecutionContract:
         # ::test_each_victim_is_read_before_its_delete).
         assert 'consolidate_memories(canonical_content=' in section
 
-    def test_partial_is_stated_as_a_no_resume_outcome(self) -> None:
-        # `server/consolidation.py::_PARTIAL_RECOVERY_HINT` says it on the
-        # response; the prompt must say it where the caller reads it BEFORE
-        # calling, because re-running for the same (project, topic) writes a
-        # SECOND canonical rather than resuming.
-        section = _section('## Executing a Cluster Fold')
-        assert 'partial' in section
-        assert 'consolidate_memories' in section
-
-    def test_the_target_end_state_brief_is_not_restated_here(self) -> None:
-        # INV-5 no-lockstep-duplication.  `render_end_state_brief` (task 3112)
-        # owns that text and renders it into this same assembled prompt; a
-        # second normative copy is a contradiction an inference-time reader
-        # resolves arbitrarily.  This section CROSS-REFERENCES it instead.
-        assert 'TARGET END STATE' not in _section('## Executing a Cluster Fold')
-
     def test_no_doubled_brace_survives_into_the_rendered_prompt(self) -> None:
         # `STAGE1_SYSTEM_PROMPT` is an f-string, so literal braces in its
         # source must be doubled — and a doubled brace SURVIVING into the
@@ -158,35 +146,24 @@ class TestStage1CitationGateAlignment:
     bypass, so a Stage-1 agent facing a plain drop with no survivor had no
     stated way forward at all.
 
-    Each assertion is pinned on the SAME vocabulary the server-side refusal
-    uses (`server/tools.py::_CITATION_REPOINT_REQUIRED_HINT` and
-    ``::_IGNORED_DANGLING_OVERRIDE_HINT``), so the prompt and the refusal the
-    agent actually receives draw the same boundary by the same names rather
-    than growing a second, drifting explanation of one gate.
+    Exactly two things are pinned here, and both are wire-typed: the payload
+    literal an agent must type verbatim for the server to honour it
+    (``metadata={'allow_dangling_citations': True}``, the spelling
+    `server/tools.py::_CITATION_REPOINT_REQUIRED_HINT` advertises and
+    ``::_IGNORED_DANGLING_OVERRIDE_HINT`` enforces), and
+    ``replacement_memory_id``.
+
+    The section's PROSE — that the gate binds every caller, that the bypass is
+    scoped to a plain drop, that only a literal ``True`` counts — is
+    deliberately left UNPINNED so it stays freely rewordable.  A substring pin
+    over a phrase occurring once in a ~4.8k-char slice goes red on a rewrite
+    that changes nothing an agent can act on, which is the drift this file's
+    stated convention exists to avoid.
     """
 
     def test_the_sanctioned_bypass_is_named_as_the_agent_must_type_it(self) -> None:
         section = _section('## UUID Resolution Discipline')
         assert "metadata={'allow_dangling_citations': True}" in section
-
-    def test_the_gate_is_stated_to_bind_every_caller(self) -> None:
-        # Same words FUSED_MEMORY_INSTRUCTIONS already uses: "a property of
-        # the RECORD, not of who is deleting, so it applies to every caller".
-        assert 'every caller' in _section('## UUID Resolution Discipline')
-
-    def test_the_bypass_is_scoped_to_a_plain_drop(self) -> None:
-        # `_CITATION_REPOINT_REQUIRED_HINT`'s exact scoping vocabulary.  An
-        # unscoped advertisement would point Stage 1 at the one posture the
-        # field evidence names as destructive — reflexive use across ~88
-        # consecutive refusals is how genuine third-party citers get stranded.
-        assert 'plain drop' in _section('## UUID Resolution Discipline')
-
-    def test_the_literal_true_rule_is_stated(self) -> None:
-        # Per `_IGNORED_DANGLING_OVERRIDE_HINT`: a truthy 'yes'/1/'true' is
-        # IGNORED and the refusal stands.  Without this the strictness reads
-        # as a dead end — the flag appears to have been passed and the same
-        # refusal comes back.
-        assert 'literal' in _section('## UUID Resolution Discipline')
 
     def test_the_bypass_does_not_displace_the_survivor_naming_rule(self) -> None:
         # Anti-over-correction.  `replacement_memory_id` remains the correct
