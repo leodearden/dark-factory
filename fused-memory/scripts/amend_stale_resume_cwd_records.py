@@ -108,7 +108,11 @@ to ``DONE — APPLIED <date> by <session>`` once it has been.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -154,6 +158,20 @@ WRITE_REASON = (
 #: it keeps idempotency independent of whether the optional metadata arm
 #: survives vocabulary validation.
 AMENDED_SENTINEL = 'amended in place by task 4610'
+
+#: Outcomes meaning the corpus did not get what the plan intended. Named once,
+#: here, so :func:`resolve_exit_code` and the report agree on what "clean"
+#: means instead of each keeping its own list -- the drift that would let a new
+#: refusal exit 0 and read to an automated caller as success.
+ERROR_OUTCOMES: frozenset[str] = frozenset({
+    'refuse:read_error',
+    'refuse:not_found',
+    'refuse:preimage_mismatch',
+    'refuse:store_unavailable',
+    'refuse:write_error',
+    'refuse:write_failed',
+    'refuse:precondition_failed',
+})
 
 
 # ---------------------------------------------------------------------------
@@ -653,3 +671,95 @@ async def _apply_amendments(
         updated.append(decision)
 
     return updated
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser.
+
+    Extracted from :func:`main` so tests can assert flag defaults without
+    invoking the live entry point (mirrors
+    ``tag_cgl_eta_rehome_scope.build_parser``).
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help='Commit both amendments (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', default='dark_factory',
+        help='Project whose Mem0 collection holds the two records '
+             '(default: dark_factory -- both target ids are dark_factory records)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def resolve_exit_code(report: dict[str, Any]) -> int:
+    """0 on a clean run, 1 when anything did not land as planned.
+
+    Graded off :data:`ERROR_OUTCOMES` -- the SAME set the report counts as
+    ``refused`` -- so the exit code and the artifact can never disagree about
+    whether a run was clean.
+
+    A dry run, a fully-applied run and an all-skipped run are all clean: none
+    of them leaves the corpus in a state the plan did not intend. Only a
+    refusal is non-zero, which is what an operator gates on.
+    """
+    return 1 if any(
+        change['action'] in ERROR_OUTCOMES
+        for change in report.get('changes', ())
+    ) else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: parse args, build a live MemoryService, run, report."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    args = build_parser().parse_args(argv)
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> int:
+        # Deferred so importing this module for tests never touches config or
+        # a backend (mirrors tag_cgl_eta_rehome_scope.main).
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        memory = MemoryService(FusedMemoryConfig())
+        await memory.initialize()
+        try:
+            report = await run(
+                memory, project_id=args.project_id, apply=args.apply,
+            )
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+        print(json.dumps(report, indent=2))
+        print(
+            f"amend_stale_resume_cwd_records "
+            f"({'DRY RUN' if report['dry_run'] else 'APPLIED'}) at "
+            f"{report['generated_at']}: targets={report['targets']} "
+            f"amended={report['totals']['amended']} "
+            f"skipped={report['totals']['skipped']} "
+            f"refused={report['totals']['refused']}",
+            file=sys.stderr,
+        )
+        return resolve_exit_code(report)
+
+    return asyncio.run(_run_live())
+
+
+if __name__ == '__main__':
+    sys.exit(main())
