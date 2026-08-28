@@ -327,6 +327,80 @@ def parse_judge_verdict(raw, candidate_ids=None):
         raise ValueError('not a judge verdict word')
     return (verdict, payload.get('candidate_id'))
 ''',
+    # An ECHO wearing option (a)'s clothes: the outcome grew a diagnostics /
+    # logging field that hands the whole submitted payload back. It discards
+    # the candidate entirely — nothing here READS candidate_id — yet the id
+    # the probe supplied is recoverable from the result, and two payloads
+    # naming different candidates parse to different values. Reviewer-reported
+    # false pass: the pre-fix probe printed "option (a): satisfied" and exited
+    # 0, authorising the production flip.
+    'echoes_payload': r"""
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return {'outcome': _parse_bare_str(raw), 'raw_payload': json.loads(raw)}
+""",
+    # The same echo one level cruder: the RAW REQUEST TEXT carried alongside
+    # the outcome. The id is a substring of that text, never a value the
+    # parser extracted, so containment-style recovery (the old ``repr``
+    # fallback) blessed it. Also a false pass before the fix.
+    'echoes_raw_string': r"""
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return (_parse_bare_str(raw), raw)
+""",
+    # A REAL option (b) that identifies the target by OBJECT IDENTITY rather
+    # than by id. Handed the candidate object it renders correctly; handed an
+    # id string it matches nothing and renders every candidate the same way.
+    # Reviewer-reported false FAIL: the old 'pick the first spelling that does
+    # not raise' picked the id spelling (which never raises here), so the
+    # object spelling was dead for exactly the implementations needing it.
+    'object_identity_target': r"""
+
+def build_judge_prompt(content, candidates, attach_target=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate is attach_target else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
+    # A REAL option (b) whose target parameter is NOT the third one. The old
+    # probe fed the id into ``verdict_words`` unconditionally, so the target
+    # stayed None, both renderings came out identical, and a correct fix was
+    # failed with the factually wrong diagnostic that the rendering "does not
+    # depend on the argument at all".
+    'target_in_fourth_position': r"""
+
+def build_judge_prompt(content, candidates, *, verdict_words=None, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
     # A STRICTER option (a): the parser refuses a verdict that carries no
     # candidate id at all, and refuses one naming a candidate outside the
     # slate. It therefore RAISES on a bare {"verdict": ...} payload — which
@@ -543,6 +617,59 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode != 0, f'unrelated variance passed:\n{proc.stdout}'
         assert _INDETERMINATE in proc.stdout, proc.stdout
+
+    def test_echoed_payload_does_not_satisfy_option_a(self, tmp_path):
+        """Recoverability from an ECHO of the probe's own input is not a binding.
+
+        Reviewer-reported false pass: a parser that carries the submitted
+        payload alongside its outcome — a plainly plausible diagnostics
+        refactor that discards the candidate entirely — round-tripped the id
+        the probe handed in, so the probe reported option (a) satisfied and
+        exited 0. Exit 0 here authorises the production write_triage.enabled
+        flip, so this is the same class as the ``{'outcome': ...}`` false pass
+        the id-less guard already covers; the fix was incomplete."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='echoes_payload')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'an echoing parser passed option (a):\n{proc.stdout}'
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
+        assert _INDETERMINATE in proc.stdout, proc.stdout
+
+    def test_echoed_raw_request_text_does_not_satisfy_option_a(self, tmp_path):
+        """The id being a SUBSTRING of a returned blob is not the id being read."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='echoes_raw_string')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'a raw-text echo passed option (a):\n{proc.stdout}'
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
+        assert _INDETERMINATE in proc.stdout, proc.stdout
+
+    def test_object_identity_target_is_a_valid_option_b(self, tmp_path):
+        """Naming the target by OBJECT rather than by id is a correct fix.
+
+        Reviewer-reported false FAIL: the probe chose a spelling on 'did not
+        raise', and the id spelling never raises for an identity-style
+        implementation, so the object spelling was unreachable for exactly the
+        implementations that need it. Failing this would re-block task 3169
+        against a valid fix — the very defect task 4810 removes."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='object_identity_target')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe rejected an object-identity option (b):\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+
+    def test_target_parameter_need_not_be_the_third(self, tmp_path):
+        """Parameter POSITION is a mechanism; the invariant does not depend on it.
+
+        Reviewer-reported false FAIL: the probe fed the id into whatever sat
+        third, so ``(content, candidates, *, verdict_words=None,
+        attach_target_id=None)`` never had its target set and was failed with
+        a diagnostic that was factually wrong about why."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='target_in_fourth_position')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe pinned the target parameter to position 3:\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
 
     def test_todays_main_shape_still_fails(self, tmp_path):
         """Regression guard: the option-(a) branch must not accidentally pass

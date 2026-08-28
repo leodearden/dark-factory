@@ -38,6 +38,7 @@ EXIT-CODE CONTRACT
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import importlib
 import inspect
@@ -175,75 +176,117 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
     return slate, slate[index], index
 
 
-def _target_parameter(fn: Any) -> Any:
-    """The third accepted parameter of *fn*, or ``None``.
+def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
+    """Every ``(index, parameter)`` of *fn* beyond the first two.
 
-    Positional-or-keyword and keyword-only both count: the point is whether
-    the renderer can be TOLD which candidate the attach will touch, not how
-    the argument is spelled.
+    The first two are the new entry and the slate; anything after them is a
+    candidate for "which candidate is the attach target". ALL of them are
+    returned, not just the third, because the position of that parameter is a
+    MECHANISM and the invariant does not depend on it: a correct fix spelled
+    ``build_judge_prompt(content, candidates, *, verdict_words=None,
+    attach_target_id=None)`` would otherwise have the id fed into
+    ``verdict_words`` and be failed with the factually wrong diagnostic that
+    the rendering "does not depend on the argument at all".
+
+    Positional-only, positional-or-keyword and keyword-only all count: the
+    point is whether the renderer can be TOLD which candidate the attach will
+    touch, not how the argument is spelled.
     """
     try:
         params = list(inspect.signature(fn).parameters.values())
     except (TypeError, ValueError):
-        return None
+        return []
     kinds = (
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
     )
     usable = [p for p in params if p.kind in kinds]
-    if len(usable) < 3:
-        return None
-    return usable[2]
+    return list(enumerate(usable))[2:]
 
 
 def _value_for(candidate: Any, spelling: str) -> Any:
     return candidate.id if spelling == 'id' else candidate
 
 
-def _call_render(fn: Any, param: Any, slate: list[Any], value: Any) -> str:
-    if param.kind is inspect.Parameter.KEYWORD_ONLY:
-        return fn(_NEW_ENTRY, slate, **{param.name: value})
-    return fn(_NEW_ENTRY, slate, value)
+def _render(
+    fn: Any,
+    index: int,
+    param: Any,
+    slate: list[Any],
+    target: Any,
+    spelling: str,
+) -> tuple[str | None, str | None]:
+    """``(rendering, error)`` — render *slate* naming *target* via *param*.
 
-
-def _pick_spelling(fn: Any, param: Any, slate: list[Any], target: Any) -> tuple[str, str]:
-    """Render once, returning ``(spelling, rendering)``.
-
-    Tries the id spelling first, then the object spelling. A renderer that
-    raises under BOTH is unverifiable — it is not evidence the invariant holds.
+    Passed BY KEYWORD wherever the parameter allows it, so a target parameter
+    that is not the third one still reaches the slot it was named for.
     """
-    errors: list[str] = []
-    for spelling in _SPELLINGS:
-        try:
-            rendered = _call_render(fn, param, slate, _value_for(target, spelling))
-        except Exception as exc:  # noqa: BLE001 - any render failure is unverifiable
-            errors.append(f'{spelling}={exc!r}')
-            continue
-        if not isinstance(rendered, str):
-            errors.append(f'{spelling}=returned {type(rendered).__name__}, not str')
-            continue
-        return spelling, rendered
-    raise _Unverifiable(
-        'build_judge_prompt could not be rendered with an attach target '
-        f'({"; ".join(errors)})',
-    )
-
-
-def _render(fn: Any, param: Any, slate: list[Any], target: Any, spelling: str) -> str:
-    """Render *slate* naming *target*, using an already-chosen *spelling*."""
-    try:
-        rendered = _call_render(fn, param, slate, _value_for(target, spelling))
-    except Exception as exc:  # noqa: BLE001 - any render failure is unverifiable
-        raise _Unverifiable(
-            f'build_judge_prompt raised rendering attach target {target.id!r}: {exc!r}',
-        ) from exc
-    if not isinstance(rendered, str):
-        raise _Unverifiable(
-            f'build_judge_prompt returned {type(rendered).__name__}, not str, '
-            f'for attach target {target.id!r}',
+    if param.kind is inspect.Parameter.POSITIONAL_ONLY and index != 2:
+        return None, (
+            'positional-only and not the third parameter, so it cannot be '
+            'reached without inventing values for the parameters before it'
         )
-    return rendered
+    value = _value_for(target, spelling)
+    try:
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            rendered = fn(_NEW_ENTRY, slate, value)
+        else:
+            rendered = fn(_NEW_ENTRY, slate, **{param.name: value})
+    except Exception as exc:  # noqa: BLE001 - any render failure is inconclusive
+        return None, f'raised: {exc!r}'
+    if not isinstance(rendered, str):
+        return None, f'returned {type(rendered).__name__}, not str'
+    return rendered, None
+
+
+def _search_option_b(
+    build: Any,
+    slate: list[Any],
+    target: Any,
+    other: Any,
+) -> tuple[tuple[int, Any, str] | None, list[str], bool]:
+    """Search the (parameter x spelling) space for a combination that holds.
+
+    Returns ``(winner, attempts, rendered_any)``.
+
+    WHY A SEARCH RATHER THAN A CHOICE. The previous shape picked the third
+    parameter, then picked the first spelling that did not RAISE. Both choices
+    silently asserted a mechanism:
+
+    * "did not raise" is not "was understood". An implementation that marks
+      ``if c is attach_target`` accepts the id spelling perfectly happily — it
+      simply matches nothing — so the object spelling was dead for exactly the
+      implementations that needed it, and a correct object-identity fix
+      rendered identically for both targets and FAILED.
+    * the third parameter is not the only place a target argument can sit.
+
+    So every combination is tried and the FIRST one whose swap test holds
+    wins. A combination the implementation ignores renders identically and is
+    simply not the winner, which costs nothing; only a judge where NO
+    combination holds fails. On failure the whole search is reported, so the
+    operator sees what was tried rather than one arbitrary verdict.
+    """
+    attempts: list[str] = []
+    rendered_any = False
+    for index, param in _target_parameters(build):
+        for spelling in _SPELLINGS:
+            label = f'{param.name!r} (parameter {index}, candidate {spelling})'
+            rendered_target, error = _render(build, index, param, slate, target, spelling)
+            if error is not None:
+                attempts.append(f'{label} — {error}')
+                continue
+            rendered_other, error = _render(build, index, param, slate, other, spelling)
+            if error is not None:
+                attempts.append(f'{label} — {error}')
+                continue
+            rendered_any = True
+            assert rendered_target is not None and rendered_other is not None
+            reason = _swap_verdict(slate, target, other, rendered_target, rendered_other)
+            if reason is None:
+                return (index, param, spelling), attempts, rendered_any
+            attempts.append(f'{label} — {reason}')
+    return None, attempts, rendered_any
 
 
 # --- option (a): the verdict names its own candidate --------------------------
@@ -265,20 +308,30 @@ _ID_FIELDS = ('candidate_id', 'id')
 #: ``isinstance`` covers the subclass either way.
 _NOT_A_CANDIDATE_BINDING = (str, bytes, bool, int, float)
 
+#: A field name no candidate contract can plausibly read as "the candidate this
+#: verdict is about". ``_echoes_payload`` hides the id there to tell a parser
+#: that READS the contract from one that merely echoes its input back.
+_DECOY_FIELD = 'x_probe_field_that_no_contract_reads'
+
+#: How deep ``_recoverable`` descends. Deep enough for any plausible verdict
+#: shape (a pair holding a dataclass holding a dict), bounded so a pathological
+#: or deeply self-referential structure cannot stall the probe.
+_SCAN_DEPTH = 6
+
 
 def _binds_candidate(result: Any) -> bool:
     """True when *result* is a shape that COULD carry a candidate id.
 
-    Necessary, never sufficient: ``_carries_id`` is what actually decides the
-    branch. ``None`` and the scalars are excluded so a parser that quietly
+    Necessary, never sufficient: ``_recoverable`` (plus the ``_echoes_payload``
+    control) is what actually decides the branch. ``None`` and the scalars are excluded so a parser that quietly
     returns ``None`` on an unrecognised payload — rather than raising — is not
     mistaken for one that returns an ``(outcome, candidate_id)`` pair.
     """
     return result is not None and not isinstance(result, _NOT_A_CANDIDATE_BINDING)
 
 
-def _carries_id(result: Any, ident: str) -> bool:
-    """True when the supplied *ident* is RECOVERABLE from *result*.
+def _recoverable(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[int] | None = None) -> bool:
+    """True when *ident* appears as a DISCRETE string value inside *result*.
 
     This is the evidence half of the option-(a) branch. A non-scalar return is
     only a SHAPE that could carry a candidate; unless the id actually handed in
@@ -286,29 +339,102 @@ def _carries_id(result: Any, ident: str) -> bool:
     dataclass or a ``{'outcome': ...}`` dict for the outcome alone would
     otherwise read as satisfied and authorise a production flag flip.
 
-    Structural sources are checked first (mapping values, sequence items,
-    ``__dict__``/``__slots__`` attributes) and ``repr`` is the last resort, so
-    an object whose ``repr`` hides its fields is not failed for that alone.
+    TWO DELIBERATE NARROWINGS, both from measured false passes:
+
+    * ONLY EXACT STRING EQUALITY COUNTS. A string that merely CONTAINS the id
+      is not evidence — the probe hands the parser a JSON payload naming the
+      id, so any parser that returns that raw text alongside its outcome
+      (``return (verdict, raw)``) would otherwise "recover" the id it was
+      never asked to extract. Measured: that shape reported option (a)
+      satisfied and exited 0, authorising the flip.
+    * THERE IS NO ``repr`` FALLBACK. ``ident in repr(result)`` is the same
+      containment mistake one level up, and it reaches THROUGH any nested echo
+      of the input. Measured: ``return {'outcome': v, 'raw_payload':
+      json.loads(raw)}`` — a plainly plausible diagnostics refactor that
+      discards the candidate entirely — passed on the ``repr`` last resort
+      alone. The recursive structural scan below covers every shape the
+      fallback was there for (dicts, sequences, ``__dict__``/``__slots__``
+      objects, and those nested inside each other), so dropping it costs no
+      legitimate implementation.
+
+    Recovering the id from a nested ECHO of the probe's own payload is still
+    possible here by construction — a value equal to the payload cannot be
+    told from a binding by inspection alone. ``_echoes_payload`` is the
+    control that separates them.
     """
-    seen: list[Any] = []
-    if isinstance(result, dict):
-        seen.extend(result.values())
-        seen.extend(result.keys())
-    elif isinstance(result, (list, tuple, set, frozenset)):
-        seen.extend(result)
-    seen.extend(getattr(result, '__dict__', {}).values())
-    for name in getattr(type(result), '__slots__', ()) or ():
-        seen.append(getattr(result, name, None))
-    for value in seen:
-        try:
-            if isinstance(value, str) and value == ident:
-                return True
-        except Exception:  # noqa: BLE001 - a hostile __eq__ is not evidence
-            continue
-    try:
-        return ident in repr(result)
-    except Exception:  # noqa: BLE001 - a raising __repr__ is not evidence
+    if depth < 0:
         return False
+    if isinstance(result, str):
+        return result == ident
+    if seen is None:
+        seen = set()
+    marker = id(result)
+    if marker in seen:
+        return False
+    seen.add(marker)
+
+    children: list[Any] = []
+    if isinstance(result, dict):
+        children.extend(result.keys())
+        children.extend(result.values())
+    elif isinstance(result, (list, tuple, set, frozenset)):
+        children.extend(result)
+    with contextlib.suppress(Exception):  # a hostile __dict__ is not evidence
+        children.extend(getattr(result, '__dict__', {}).values())
+    slots = getattr(type(result), '__slots__', ()) or ()
+    for name in (slots,) if isinstance(slots, str) else slots:
+        try:
+            children.append(getattr(result, name, None))
+        except Exception:  # noqa: BLE001 - a hostile __getattr__ is not evidence
+            continue
+
+    for child in children:
+        try:
+            if _recoverable(child, ident, depth - 1, seen):
+                return True
+        except Exception:  # noqa: BLE001 - a hostile container is not evidence
+            continue
+    return False
+
+
+def _echoes_payload(parse: Any, key: str, word: str, ident: str) -> str | None:
+    """The CONTROL for the option-(a) evidence test: is the parser just echoing?
+
+    Recoverability of an id from a result is only a BINDING if the parser got
+    it by reading the candidate field of the contract. A parser that hands the
+    whole submitted payload back — ``{'outcome': v, 'raw_payload':
+    json.loads(raw)}``, ``{**payload}`` — reproduces whatever it was given, so
+    the id comes back out no matter what the field meant. That is an echo, not
+    a verdict bound to a candidate, and it passed the pre-fix probe.
+
+    So submit a payload that names the id ONLY under a field the contract
+    cannot plausibly read, and NOWHERE a candidate field would be. A parser
+    that reads the contract reports no id (or refuses the payload outright); a
+    parser that echoes reports *ident* anyway, which is the signature.
+
+    Returns the reason string when the echo is detected, else ``None``.
+
+    FAILS TOWARDS THE PASS, deliberately: a parser that RAISES on the control
+    is a validating one (the stricter option (a) — see the
+    ``option_a_rejects_dangling`` fixture — refuses a verdict carrying no
+    candidate id at all), and a raise is not evidence of echoing. Only a
+    successful parse that surfaces the decoy id counts.
+    """
+    control = {key: word, _DECOY_FIELD: ident}
+    try:
+        result = parse(json.dumps(control))
+    except Exception:  # noqa: BLE001 - a refusal is a validating parser, not an echo
+        return None
+    if not _recoverable(result, ident):
+        return None
+    return (
+        f'the id is ECHOED, not bound — a control payload naming {ident!r} only '
+        f'under {_DECOY_FIELD!r} (a field no candidate contract reads, with no '
+        f'candidate field present at all) still parsed to {result!r}, which '
+        f'carries {ident!r}. The parser reproduces its input rather than '
+        'reporting which candidate the verdict is about, so recovering the id '
+        'proves nothing about the binding'
+    )
 
 
 def _same_result(left: Any, right: Any) -> bool:
@@ -390,7 +516,7 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
             missing = [
                 ident
                 for ident, result in parsed
-                if not _carries_id(result, ident)
+                if not _recoverable(result, ident)
             ]
             if missing:
                 inert.append(
@@ -398,6 +524,13 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
                     f'{missing!r} are not recoverable from them, so the difference '
                     'is not the candidate binding',
                 )
+                continue
+            # The CONTROL. Recoverability alone cannot tell a parser that READS
+            # the candidate field from one that hands the whole payload back;
+            # both round-trip the id and both make the two results differ.
+            echo = _echoes_payload(parse, key, word, id_b)
+            if echo is not None:
+                inert.append(f'{field!r} — {echo}')
                 continue
             return True, (
                 f'satisfied — parse_judge_verdict round-trips the candidate id: '
@@ -597,17 +730,6 @@ def _probe(src_root: Path, out: list[str]) -> int:
         return EXIT_OK
 
     build = _require(module, 'build_judge_prompt')
-    param = _target_parameter(build)
-    if param is None:
-        out.append(
-            'option (b): build_judge_prompt'
-            f'{inspect.signature(build)} takes no attach-target parameter',
-        )
-        out.extend(_FAIL_NEITHER)
-        out.extend(_rescue_note(slate_ids, index))
-        return EXIT_FAIL
-
-    spelling, rendered_target = _pick_spelling(build, param, slate, target)
     other = slate[0]
     if other is target:
         # The fixture puts the rescued winner LAST, so this cannot happen —
@@ -618,18 +740,37 @@ def _probe(src_root: Path, out: list[str]) -> int:
             'the rescued attach target is also slate[0]; there is no second target '
             'to swap against, so the invariant is unverifiable on this slate',
         )
-    rendered_other = _render(build, param, slate, other, spelling)
-    reason = _swap_verdict(slate, target, other, rendered_target, rendered_other)
-    if reason is not None:
-        out.append(f'option (b): {reason}')
+
+    if not _target_parameters(build):
+        out.append(
+            'option (b): build_judge_prompt'
+            f'{inspect.signature(build)} takes no attach-target parameter',
+        )
         out.extend(_FAIL_NEITHER)
         out.extend(_rescue_note(slate_ids, index))
         return EXIT_FAIL
 
+    winner, attempts, rendered_any = _search_option_b(build, slate, target, other)
+    if winner is None:
+        if not rendered_any:
+            # Not one combination produced a pair of renderings to compare, so
+            # nothing was ever asserted about the invariant. Unverifiable, not
+            # failed.
+            raise _Unverifiable(
+                'build_judge_prompt could not be rendered with an attach target '
+                f'({_first_few(attempts)})',
+            )
+        out.append(f'option (b): {_first_few(attempts, limit=len(attempts))}')
+        out.extend(_FAIL_NEITHER)
+        out.extend(_rescue_note(slate_ids, index))
+        return EXIT_FAIL
+
+    param_index, param, spelling = winner
     out.append(
         f'option (b): satisfied — build_judge_prompt accepts an attach target via '
-        f'{param.name!r} (spelled as the candidate {spelling}) and its rendering '
-        f'depends on which candidate is the attach target',
+        f'{param.name!r} (parameter {param_index}, spelled as the candidate '
+        f'{spelling}) and its rendering depends on which candidate is the attach '
+        'target',
     )
     out.append(
         'PASS  the judge path binds a verdict to a determinate candidate '
