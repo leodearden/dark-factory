@@ -100,7 +100,17 @@ fi
 fail=0
 report=''
 
+#: The NUMBERS of the items that failed, space-separated, in check order. Read
+#: only by the compact summary line at the very end of the report — see the
+#: comment there for why the report's tail is the only part that reliably
+#: reaches an operator.
+failed_items=''
+
 note() { report="${report}$1"$'\n'; }
+
+# Set the exit status AND record which item earned it. Always called from this
+# shell, never from inside a `$(...)` — see the note above read_ref_file.
+record_fail() { fail=1; failed_items="${failed_items}${1} "; }
 
 # item 1 extracts the ref's package tree to a temp dir. `git archive` is
 # read-only and touches no .git state, unlike `git worktree add` -- which
@@ -137,24 +147,24 @@ note ""
 
 # --- item 1: the judge path must bind a verdict to a determinate candidate ----
 #
-# EVERY unverifiable outcome here sets fail=1: a missing probe, a temp dir that
+# EVERY unverifiable outcome here calls record_fail: a missing probe, a temp dir that
 # cannot be made, a failed archive, an interpreter that will not run, a probe
 # crash or a timeout. An unverifiable invariant is not a satisfied one, and
-# note that each fail=1 below is assigned in THIS shell and never inside a
+# note that each record_fail below runs in THIS shell and never inside a
 # `$(...)`, for the reason recorded above read_ref_file.
 if [ ! -f "$PROBE" ]; then
   note "FAIL  item 1  UNVERIFIABLE: probe missing at $PROBE. Failing closed."
-  fail=1
+  record_fail 1
 else
   PROBE_TMP="$(mktemp -d 2>/dev/null)"
   if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
     note "FAIL  item 1  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
-    fail=1
+    record_fail 1
   elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
        | tar -x -C "$PROBE_TMP" 2>/dev/null; then
     note "FAIL  item 1  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
     note "              Failing closed."
-    fail=1
+    record_fail 1
   else
     # shellcheck disable=SC2086  # PROBE_TIMEOUT and PROBE_PY are command word lists.
     probe_out="$($PROBE_TIMEOUT $PROBE_PY "$PROBE" \
@@ -180,11 +190,11 @@ else
       note "              that slate the attach target is LAST. The probe's own report"
       note "              below carries the measured slate."
       note "              Subject: $JUDGE at ref '$REF'."
-      fail=1
+      record_fail 1
     else
       note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
       note "              Interpreter: $PROBE_PY. Failing closed."
-      fail=1
+      record_fail 1
     fi
     # The probe's own report, indented under the verdict. It carries the
     # measured slate and, on an unverifiable outcome, its own UNVERIFIABLE line.
@@ -208,7 +218,7 @@ if read_ref_file "$EVAL"; then
     note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
     note "              Precedent for pinning it (task 4012): assert"
     note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
-    fail=1
+    record_fail 2
   else
     note "PASS  item 2  $EVAL no longer iterates the frozenset directly"
   fi
@@ -225,13 +235,13 @@ if read_ref_file "$EVAL"; then
     note "              NOTE the guard_committed_report guard added post-cycle-2 does"
     note "              NOT cover this — it addresses dry-run/--limit publishing and"
     note "              returns early for any non-committed path."
-    fail=1
+    record_fail 4
   else
     note "PASS  item 4  $EVAL no longer uses with_suffix('.md') for the sibling"
   fi
 else
   note "FAIL  items 2+4  UNVERIFIABLE: cannot read $EVAL at ref '$REF'. Failing closed."
-  fail=1
+  record_fail '2 4'
 fi
 
 # --- premature-flip detection -------------------------------------------------
@@ -264,6 +274,20 @@ else
   note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
   note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
   note "        satisfies it. See its report above for what was measured."
+fi
+
+# LAST, deliberately. DeterministicRunner._default_run_script returns only the
+# TRAILING 2000 characters of this script's stdout, and _run_predicate feeds
+# exactly that into the milestone_check_failed escalation's detail. The all-FAIL
+# report is several times that and item 1 is emitted FIRST, so item 1's guidance
+# -- the corrected spec an implementer is meant to read -- is precisely what
+# gets truncated away. Anything that must reach the operator has to sit at the
+# tail. The detailed guidance stays where it is: read in full, the report is
+# still ordered for a human.
+if [ -n "$failed_items" ]; then
+  note "FAILING ITEMS: ${failed_items% }"
+else
+  note "FAILING ITEMS: none"
 fi
 
 printf '%s' "$report"
