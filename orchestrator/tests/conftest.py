@@ -73,6 +73,7 @@ from df_pytest_isolation import (  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 
 from orchestrator import merge_queue  # noqa: E402
+from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
     FusedMemoryConfig,
@@ -242,6 +243,27 @@ def repo_root() -> Path | None:
         if (parent / '.git').exists():
             return parent
     return None
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
+
+    Shared by ``test_roles_wait_pattern.py`` and
+    ``test_roles_background_warning.py`` (task 3747 — the two files were
+    forked from a common ancestor and carried byte-identical copies of this
+    fixture until they were consolidated here).
+    """
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
 
 
 @pytest.fixture(autouse=True)
