@@ -672,6 +672,95 @@ _YAML_SEGMENT_TOTAL_RE = re.compile(
 )
 
 
+def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
+    """Each segment figure must say how old it is and what sample it rests on.
+
+    Task 4902. The table's core defect is that it cannot say its own age. It now
+    mixes a 2026-07-31 epoch with a 2026-08-28 one, and without this mapping a
+    reader cannot tell which entry is which without archaeology — four of the
+    five figures are 28 days older than the fifth and rest on a single logged
+    run each, which is exactly why one regime change (commit 685f558728) could
+    invalidate the table wholesale and go unnoticed for eight days.
+
+    WHAT THIS GUARD IS: it makes the table's AGE machine-readable, so the next
+    reader can see at a glance which epoch each figure came from, and so
+    reverting a re-measurement without also reverting its provenance is caught.
+
+    WHAT IT IS NOT: the durations-based growth detector. That would have to read
+    a recent run's own recorded per-segment times, which means reading the
+    `.task/verify/*.summary.json` corpus at test time — pruned with its
+    worktrees, therefore non-deterministic and eventually vacuous. It is
+    deliberately not built here, and this guard must not be mistaken for it: it
+    proves the table is DATED, never that it is CURRENT.
+    """
+    # (a) Keys correspond exactly — no segment without provenance, and no
+    #     provenance for a segment that no longer exists.
+    assert set(MEASURED_FLEET_SEGMENT_PROVENANCE) == set(MEASURED_FLEET_SEGMENT_SECS), (
+        'MEASURED_FLEET_SEGMENT_PROVENANCE keys '
+        f'{sorted(MEASURED_FLEET_SEGMENT_PROVENANCE)} do not match '
+        f'MEASURED_FLEET_SEGMENT_SECS keys {sorted(MEASURED_FLEET_SEGMENT_SECS)} '
+        f'(missing provenance: {sorted(set(MEASURED_FLEET_SEGMENT_SECS) - set(MEASURED_FLEET_SEGMENT_PROVENANCE))}; '
+        f'orphaned provenance: {sorted(set(MEASURED_FLEET_SEGMENT_PROVENANCE) - set(MEASURED_FLEET_SEGMENT_SECS))}). '
+        'Every segment figure must carry its date and sample, or the table goes '
+        'back to being un-ageable — the defect task 4902 was filed to fix.'
+    )
+
+    # (b) Each record must be a real date backed by at least one measurement.
+    for segment, record in sorted(MEASURED_FLEET_SEGMENT_PROVENANCE.items()):
+        try:
+            datetime.date.fromisoformat(record.measured_at)
+        except ValueError as exc:
+            raise AssertionError(
+                f"MEASURED_FLEET_SEGMENT_PROVENANCE['{segment}'].measured_at="
+                f'{record.measured_at!r} is not an ISO YYYY-MM-DD date ({exc}). '
+                'The whole point of this field is that the table\'s age can be '
+                'compared, which needs a parseable date, not prose.'
+            ) from exc
+        assert record.sample_size >= 1, (
+            f"MEASURED_FLEET_SEGMENT_PROVENANCE['{segment}'].sample_size="
+            f'{record.sample_size} — a figure with a zero sample behind it is a '
+            'claim, not a measurement. Record the number of runs actually '
+            'observed, even when it is 1.'
+        )
+
+    # (c) The re-measurement must be visible as data: orchestrator's entry is
+    #     strictly newer than every figure it was NOT measured alongside.
+    orchestrator = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
+    others = {
+        segment: record
+        for segment, record in MEASURED_FLEET_SEGMENT_PROVENANCE.items()
+        if segment != 'orchestrator'
+    }
+    newest_other = max(
+        others.items(), key=lambda kv: datetime.date.fromisoformat(kv[1].measured_at)
+    )
+    assert (
+        datetime.date.fromisoformat(orchestrator.measured_at)
+        > datetime.date.fromisoformat(newest_other[1].measured_at)
+    ), (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at="
+        f'{orchestrator.measured_at} is not strictly later than the newest other '
+        f"segment ('{newest_other[0]}', {newest_other[1].measured_at}). Task 4902 "
+        're-measured ONLY the orchestrator segment, so it must be the newest '
+        'entry in the table. If this fails, either the orchestrator figure was '
+        'reverted to a pre-4902 value without reverting its provenance — which '
+        'is exactly what this assertion exists to catch — or the other four were '
+        're-measured too, in which case update their records rather than '
+        'relaxing this.'
+    )
+
+    # (d) The recorded sample and the recorded percentiles must describe the
+    #     same measurement.
+    assert orchestrator.sample_size == POST_CAP_ORCHESTRATOR_GREEN_N, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].sample_size="
+        f'{orchestrator.sample_size} disagrees with '
+        f'POST_CAP_ORCHESTRATOR_GREEN_N={POST_CAP_ORCHESTRATOR_GREEN_N}, the n '
+        'behind POST_CAP_ORCHESTRATOR_GREEN_SECS. These describe one mine of one '
+        'corpus; if a re-mine produced a different n, both must move together, '
+        'or the recorded percentiles no longer belong to the recorded sample.'
+    )
+
+
 def test_published_yaml_segment_table_matches_the_python_measurement_table() -> None:
     """The yaml's republished segment table must agree with the Python table.
 
