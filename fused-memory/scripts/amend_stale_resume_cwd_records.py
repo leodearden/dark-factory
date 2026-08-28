@@ -108,8 +108,23 @@ to ``DONE — APPLIED <date> by <session>`` once it has been.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
+
+# Module-level (NOT deferred) so the test suite can monkeypatch the module
+# attribute, and so an import-time failure of the guard is loud rather than
+# discovered halfway through a write. The rest of the live stack --
+# FusedMemoryConfig / MemoryService -- is imported lazily inside main(),
+# mirroring tag_cgl_eta_rehome_scope, so importing this module for tests never
+# touches config or a backend.
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,  # noqa: F401 -- used by the --apply path below
+    assert_store_mutation_allowed,  # noqa: F401 -- ditto; see run()
+)
+
+logger = logging.getLogger('amend_stale_resume_cwd_records')
 
 # ---------------------------------------------------------------------------
 # Write attribution
@@ -420,3 +435,72 @@ def build_amend_report(
         },
         'changes': changes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Live shell: run
+# ---------------------------------------------------------------------------
+
+def _normalise_fetched(record: dict[str, Any] | None) -> dict[str, Any]:
+    """Map ``MemoryService.get_memory_by_id``'s return to the tool-layer shape.
+
+    The service returns ``dict | None`` and PROPAGATES a backend read failure
+    as an exception; the MCP tool above it converts those into
+    ``{'found': True/False, ...}`` and ``{'error', 'error_type'}`` respectively.
+    :func:`classify_amend_target` is written against the tool-layer shape --
+    the documented one, and the one that keeps "absent" and "unreadable"
+    distinguishable -- so the raising/None seam is normalised here, at the I/O
+    boundary, rather than teaching the pure classifier about two shapes.
+    """
+    if record is None:
+        return {'found': False}
+    return {'found': True, 'content': record.get('content') or ''}
+
+
+async def run(
+    memory_service: Any,
+    *,
+    project_id: str,
+    apply: bool,
+) -> dict[str, Any]:
+    """Corroborate both targets and, with *apply*, amend the stale ones.
+
+    Reads each target in :data:`AMEND_TARGETS` order, classifies it via
+    :func:`classify_amend_target`, and assembles the report. See the module
+    docstring for the two-phase (dry-run default / ``--apply``) model.
+
+    A read that RAISES is caught and classified ``'refuse:read_error'`` rather
+    than aborting the run: with two targets, one unreadable record must still
+    leave the operator with a report about the other.
+
+    Returns the report dict (see :func:`build_amend_report`).
+    """
+    generated_at = datetime.now(UTC).isoformat()
+
+    decisions: list[dict[str, Any]] = []
+    for target in AMEND_TARGETS:
+        try:
+            record = await memory_service.get_memory_by_id(
+                project_id=project_id, memory_id=target.memory_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- unknown is not absent
+            logger.warning(
+                'amend_stale_resume_cwd_records: read FAILED for %s: %r',
+                target.memory_id, exc,
+            )
+            decisions.append({
+                'id': target.memory_id,
+                'action': 'refuse:read_error',
+                'error': f'{type(exc).__name__}: {exc}',
+            })
+            continue
+        decisions.append(classify_amend_target(target, _normalise_fetched(record)))
+
+    applied_ids: set[str] = set()
+
+    return build_amend_report(
+        decisions=decisions,
+        applied_ids=applied_ids,
+        dry_run=not apply,
+        generated_at=generated_at,
+    )
