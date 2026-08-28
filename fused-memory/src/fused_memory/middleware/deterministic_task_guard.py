@@ -196,9 +196,13 @@ def _validate_recurrence(
     guard at all. So an update that flips ``before_done.kind`` to
     ``'deploy'``, deletes ``metadata.milestone``, or attaches ``recurrence``
     to an existing normal task lands exactly the state C-1 forbids, and no
-    error is raised. Closing the gap means hoisting these three clauses into
-    a helper the update path also calls; that is beyond task 4676, which
-    rules the submit boundary. Until it is closed, r2's mint MUST re-verify
+    error is raised. This is a THIRD symptom of the root cause task **3093**
+    already tracks ("update_task never runs deterministic_task_error"),
+    whose two recorded symptoms are the milestone spec and a task_kind
+    change — so closing it belongs there, as one hoist of these clauses into
+    a helper both boundaries call, not as a recurrence-shaped patch here.
+    Task 4676 rules the submit boundary only. Until 3093 lands, r2's mint
+    MUST re-verify
     the carrier of the link it is about to renew instead of trusting that
     submit-time validation still holds — ``docs/task-authoring.md`` §6.1
     carries the same warning for authors.

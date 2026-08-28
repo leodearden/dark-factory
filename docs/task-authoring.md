@@ -845,7 +845,9 @@ that guard, and the check the submodel registration buys at the write
 boundary covers the `recurrence` *shape* alone. So a later `update_task`
 that flips `before_done.kind` to `deploy`, deletes `metadata.milestone`, or
 attaches `recurrence` to an existing normal task lands exactly the state
-this contract forbids, with no error raised. Don't do it — and any consumer
+this contract forbids, with no error raised. That is not specific to
+`recurrence`: it is the root cause task **3093** tracks, which `milestone`
+(§6) and `task_kind` are already symptoms of. Don't do it — and any consumer
 acting on a chain link (the mint above all) should re-verify the carrier
 rather than assume submit-time validation still holds.
 
