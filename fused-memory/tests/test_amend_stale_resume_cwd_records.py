@@ -11,6 +11,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -346,3 +347,110 @@ class TestBuildAmendReport:
         )
         assert report['generated_at'] == '2026-08-28T12:34:56+00:00'
         assert report['targets'] == 2
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    writes. That probe touches the real filesystem, so without this fixture
+    every ``--apply`` test would pass or fail according to whether the machine
+    running pytest happens to be able to write mem0's history directory -- and
+    it genuinely cannot inside an agent sandbox, which is the whole reason the
+    guard exists. This suite is deliberately MOCK-unit (an AsyncMock memory
+    service, no live Qdrant), so the environment must not be an input to it.
+
+    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
+    record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+
+
+def _memory_service(contents: dict[str, str] | None = None) -> AsyncMock:
+    """AsyncMock MemoryService whose get_memory_by_id serves *contents*.
+
+    Defaults to serving each target's exact pre-image, i.e. the corpus as it
+    actually stands today: both records stale and amendable.
+    """
+    if contents is None:
+        contents = {t.memory_id: t.expected_preimage for t in _mod.AMEND_TARGETS}
+
+    service = AsyncMock()
+
+    async def _get(*, project_id, memory_id):  # noqa: ARG001
+        if memory_id not in contents:
+            return None
+        return {'id': memory_id, 'content': contents[memory_id], 'metadata': {}}
+
+    service.get_memory_by_id.side_effect = _get
+    service.update_memory.return_value = {'status': 'updated', 'store': 'mem0'}
+    return service
+
+
+class TestRunDryRun:
+    """Dry run is the DEFAULT, and it must be inert."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reads_each_target_once(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=False)
+        assert service.get_memory_by_id.await_count == len(_mod.AMEND_TARGETS)
+
+    @pytest.mark.asyncio
+    async def test_dry_run_writes_nothing(self):
+        # The safety property that makes the default mode runnable from
+        # anywhere, including a sandboxed task worktree.
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=False)
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_never_deletes(self):
+        # There is no delete arm in this script at all: the April incident is
+        # preserved, not retracted. Pinned here and again on the apply path.
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=False)
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_probe_write_capability(self, monkeypatch):
+        # Nothing is going to be written, so no capability is needed. Probing
+        # anyway would make the read-only report unobtainable from exactly the
+        # sandboxed environments that most need to run it first.
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed',
+            lambda **kw: calls.append(kw),
+        )
+        await _mod.run(_memory_service(), project_id='dark_factory', apply=False)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reports_both_targets_as_amendable_but_unapplied(self):
+        report = await _mod.run(
+            _memory_service(), project_id='dark_factory', apply=False,
+        )
+        assert report['dry_run'] is True
+        assert [c['action'] for c in report['changes']] == ['amend', 'amend']
+        assert all(c['applied'] is False for c in report['changes'])
+
+    @pytest.mark.asyncio
+    async def test_dry_run_passes_the_project_id_through_to_each_read(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=False)
+        for call in service.get_memory_by_id.await_args_list:
+            assert call.kwargs['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reads_the_two_target_ids(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=False)
+        read_ids = [
+            c.kwargs['memory_id'] for c in service.get_memory_by_id.await_args_list
+        ]
+        assert read_ids == [STALE_ID, WARNING_ID]
