@@ -744,3 +744,86 @@ class TestSeamFlagsABlockLessGate:
             r for r in caplog.records
             if r.levelno == logging.WARNING and 'DORMANT' in r.getMessage()
         ] == []
+
+
+class TestKnownGoodCorpusShape:
+    """ACCEPTANCE 4, as a permanent guard rather than a one-time manual check.
+
+    The SHAPE measured on 2026-08-28 across all four consolidated topics —
+    `worktree-stale-base-premise-verification`,
+    `gitops-quarantine-rename-worktree-bare-branch-name`,
+    `watchdog-clock-gate-test-isolation` and `mem0-tombstone-coverage`, the
+    hand-verified regression corpus named in the task's acceptance criteria:
+
+    * every `provenance.observed_members` id IS present in the live topic
+      scroll (the curator hand-stamped them on 2026-08-27);
+    * the scroll is COMPLETE;
+    * exactly one canonical;
+    * `canonical.supersedes` is EMPTY — all four were RETAIN-arm
+      consolidations.
+
+    The parametrised counts are the real measured numbers: observed 6/3/3/2
+    against scroll totals 9/4/4/3. Member CONTENT is deliberately NOT
+    invented — only the counts and the stamped-ness relation are
+    load-bearing, and it is the SHAPE that is being pinned. This runs without
+    a store, so acceptance 4 keeps a guard after the live re-run in step-16
+    has passed into history.
+    """
+
+    @pytest.mark.parametrize(
+        'topic,observed_count,scroll_total',
+        [
+            ('worktree-stale-base-premise-verification', 6, 9),
+            ('gitops-quarantine-rename-worktree-bare-branch-name', 3, 4),
+            ('watchdog-clock-gate-test-isolation', 3, 4),
+            ('mem0-tombstone-coverage', 2, 3),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_closes_with_zero_probes(
+        self, interceptor, taskmaster, topic, observed_count, scroll_total
+    ):
+        members = [
+            {
+                'id': _uuid(i),
+                'created_at': '2026-08-27T00:00:00+00:00',
+                'metadata': (
+                    {'topic': topic, 'canonical': True}
+                    if i == 1
+                    else {'topic': topic}
+                ),
+            }
+            for i in range(1, scroll_total + 1)
+        ]
+        observed = [_uuid(i) for i in range(1, observed_count + 1)]
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _gate_metadata(
+                **{
+                    GATE_METADATA_KEY: {
+                        'topic': topic,
+                        'provenance': {
+                            'report_run': 'recon-2026-08-27',
+                            'observed_members': observed,
+                            'detector': 'topic-cluster-scan',
+                            'authoritative': False,
+                        },
+                    }
+                }
+            ),
+        }
+        # Armed to report every id LIVE, so a probe that IS issued would be
+        # visible in `probes` rather than accidentally harmless.
+        scroll = _scroll(members, live_ids=[m['id'] for m in members] + observed)
+        interceptor.set_consolidation_scroll(scroll)
+        result = await _set_done(interceptor)
+
+        assert result.get('error') is None
+        assert result.get('reasons') is None or result['reasons'] == []
+        assert taskmaster.set_task_status.await_count == 1
+        # STRONGER than merely asserting closure: a future refactor that
+        # probed every observed member unconditionally would still close, but
+        # would issue 14 pointless point reads per gate close across the
+        # corpus. Zero is the property that makes this change free.
+        assert scroll.probes == []
