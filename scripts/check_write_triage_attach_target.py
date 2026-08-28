@@ -228,14 +228,94 @@ def _pick_spelling(fn: Any, param: Any, slate: list[Any], target: Any) -> tuple[
     )
 
 
+def _render(fn: Any, param: Any, slate: list[Any], target: Any, spelling: str) -> str:
+    """Render *slate* naming *target*, using an already-chosen *spelling*."""
+    try:
+        rendered = _call_render(fn, param, slate, _value_for(target, spelling))
+    except Exception as exc:  # noqa: BLE001 - any render failure is unverifiable
+        raise _Unverifiable(
+            f'build_judge_prompt raised rendering attach target {target.id!r}: {exc!r}',
+        ) from exc
+    if not isinstance(rendered, str):
+        raise _Unverifiable(
+            f'build_judge_prompt returned {type(rendered).__name__}, not str, '
+            f'for attach target {target.id!r}',
+        )
+    return rendered
+
+
+# --- the swap test ----------------------------------------------------------
+#
+# Render the SAME slate twice against two DIFFERENT attach targets. Everything
+# below is stated in terms of opaque ids and rendering inequality; no heading
+# text is ever matched, so any rewording survives.
+
+
+def _id_lines(rendering: str, ident: str) -> tuple[int, ...]:
+    """The line indices where *ident* appears — its rendered footprint."""
+    return tuple(i for i, line in enumerate(rendering.splitlines()) if ident in line)
+
+
+def _distinguished_by_repetition(rendering: str, slate: list[Any]) -> str | None:
+    """The one id mentioned strictly more often than every other, or ``None``.
+
+    An implementation that hard-codes ``candidates[0]`` as the attach target
+    renders that id twice — once in whatever marks it, once in the list — while
+    every other candidate is mentioned once. That is an ID-LEVEL signal, so it
+    separates the positional bug from an argument that is simply ignored
+    without reading a word of the prompt.
+    """
+    counts = {str(c.id): rendering.count(str(c.id)) for c in slate}
+    if len(counts) < 2:
+        return None
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    return ranked[0][0] if ranked[0][1] > ranked[1][1] else None
+
+
+def _swap_verdict(
+    slate: list[Any],
+    target: Any,
+    other: Any,
+    rendered_target: str,
+    rendered_other: str,
+) -> str | None:
+    """``None`` when the swap test holds, else the reason it does not."""
+    if rendered_target == rendered_other:
+        marked = _distinguished_by_repetition(rendered_target, slate)
+        if marked is not None and marked == str(other.id):
+            return (
+                f'build_judge_prompt distinguishes slate[0] ({marked!r}) regardless '
+                f'of the requested attach target — asking for {target.id!r} and for '
+                f'{other.id!r} rendered identically'
+            )
+        return (
+            'build_judge_prompt produced byte-identical prompts for two different '
+            'attach targets, so its output does not depend on the argument at all '
+            '(a prose-only change renders identically whichever candidate is named)'
+        )
+    for named, unnamed, ident in (
+        (rendered_target, rendered_other, str(target.id)),
+        (rendered_other, rendered_target, str(other.id)),
+    ):
+        if _id_lines(named, ident) == _id_lines(unnamed, ident):
+            return (
+                'the two renderings differ, but the id ' + repr(ident) + ' occupies '
+                'the SAME lines whether or not it is the named attach target, so the '
+                'difference is not attributable to the candidate being named'
+            )
+    return None
+
+
 # --- report -----------------------------------------------------------------
 
 _FAIL_NEITHER = [
     'FAIL  the attach target is INDETERMINATE on the judge path.',
-    '      build_judge_prompt cannot be told which candidate the attach will',
-    '      touch, so a verdict reasoned about one candidate is filed against',
-    '      another. Give build_judge_prompt an attach-target parameter and make',
-    '      its rendering DEPEND on which candidate that names.',
+    '      The judge is shown several candidates but the attach touches exactly',
+    '      one of them, so a verdict reasoned about one candidate is filed',
+    '      against another and x_contested lands on a canonical the entry never',
+    '      contradicted.',
+    '      Remedy (b): give build_judge_prompt a parameter naming the attach',
+    '      target, and make its rendering DEPEND on which candidate that names.',
 ]
 
 
@@ -274,10 +354,29 @@ def _probe(src_root: Path, out: list[str]) -> int:
         out.extend(_rescue_note(slate_ids, index))
         return EXIT_FAIL
 
-    spelling, _rendered = _pick_spelling(build, param, slate, target)
+    spelling, rendered_target = _pick_spelling(build, param, slate, target)
+    other = slate[0]
+    if other is target:
+        # The fixture puts the rescued winner LAST, so this cannot happen —
+        # but a swap test that compared a rendering with itself would pass
+        # vacuously, which is exactly the failure mode this gate exists to
+        # prevent. Refuse rather than "pass".
+        raise _Unverifiable(
+            'the rescued attach target is also slate[0]; there is no second target '
+            'to swap against, so the invariant is unverifiable on this slate',
+        )
+    rendered_other = _render(build, param, slate, other, spelling)
+    reason = _swap_verdict(slate, target, other, rendered_target, rendered_other)
+    if reason is not None:
+        out.append(f'option (b): {reason}')
+        out.extend(_FAIL_NEITHER)
+        out.extend(_rescue_note(slate_ids, index))
+        return EXIT_FAIL
+
     out.append(
-        f'option (b): build_judge_prompt accepts an attach target via {param.name!r} '
-        f'(spelled as the candidate {spelling})',
+        f'option (b): satisfied — build_judge_prompt accepts an attach target via '
+        f'{param.name!r} (spelled as the candidate {spelling}) and its rendering '
+        f'depends on which candidate is the attach target',
     )
     out.append('PASS  the judge path binds a verdict to a determinate candidate.')
     return EXIT_OK
