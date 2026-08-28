@@ -6178,6 +6178,14 @@ class TestResolveLocalDfCheckout:
 # ---------------------------------------------------------------------------
 
 
+# Task 4539: the post-sync entry-point liveness probe the runner must issue.
+# Held as a literal (rather than imported at module scope) so this file's RED
+# state is a behavioural failure rather than a collection error that would mask
+# every other test here; pinned against the source constant by
+# TestRemoteRunnerSyncWorkspaceSafety::test_liveness_probe_command_is_exported.
+_EXPECTED_LIVENESS_CMD = 'orchestrator verify-merge --help'
+
+
 class _RecordingEventStore:
     """Minimal EventStore stand-in capturing emit() calls in-memory.
 
@@ -6214,6 +6222,7 @@ def _make_sync_runner(
     upstream_head: str | None = None,
     pull_rc: int = 0,
     uv_rc: int = 0,
+    liveness_rc: int = 0,
     post_sync_head: str | None = None,
     raise_on: str | None = None,
 ):
@@ -6227,7 +6236,10 @@ def _make_sync_runner(
                                                         post_sync_head once a
                                                         pull has fired
       * ssh ``git -C <df> pull --ff-only``           -> pull_rc
-      * ssh ``cd <df> && uv sync``                   -> uv_rc
+      * ssh ``cd <df> && uv sync --all-packages``    -> uv_rc
+      * ssh ``orchestrator verify-merge --help``     -> liveness_rc (task 4539:
+                                                        the post-sync entry-point
+                                                        liveness probe)
     ``upstream_head`` models the dispatcher's last-fetched origin ref used by the
     false-stale suppression (remote-at-origin while local leads origin); None
     (the default) makes ``@{upstream}`` unresolvable so the raw HEAD-mismatch
@@ -6259,6 +6271,12 @@ def _make_sync_runner(
                 return (pull_rc, '', '' if pull_rc == 0 else 'pull rejected')
             if 'uv sync' in remote_cmd:
                 return (uv_rc, '', '' if uv_rc == 0 else 'uv sync failed')
+            if remote_cmd == _EXPECTED_LIVENESS_CMD:
+                return (
+                    liveness_rc, '',
+                    '' if liveness_rc == 0
+                    else 'bash: line 1: orchestrator: command not found',
+                )
         return (0, '', '')
 
     runner = RemoteRunner(
@@ -6442,6 +6460,125 @@ class TestRemoteRunnerSyncIfStale:
         out = await runner.sync_if_stale(event_store=None, task_id=None)
         assert out.synced is True
         assert out.ok is True
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSyncWorkspaceSafety:
+    """Task 4539 — the auto-sync must leave a WORKING remote checkout behind.
+
+    dark-factory's root ``pyproject.toml`` declares a uv WORKSPACE
+    (``[tool.uv.workspace].members``).  In a workspace a bare ``uv sync`` syncs
+    only the ROOT project's environment and PRUNES what the root does not
+    declare — including the workspace MEMBERS' console-script entry points.
+    Measured on the real second host: before, ``.venv/bin/orchestrator`` existed
+    and ``orchestrator verify-merge --help`` returned rc=0; after a bare
+    ``uv sync`` the entry point was GONE and the ssh dispatch failed rc=127;
+    ``uv sync --all-packages`` restored it.  So the INV-2 sync that exists to
+    make a remote CURRENT was instead DELETING the very CLI it then invokes.
+
+    Two halves, and the second matters as much as the first: the sync command
+    itself must be workspace-correct, AND success must NOT be keyed on the
+    subprocess return codes alone — the destructive bare ``uv sync`` returns 0.
+    """
+
+    async def test_uv_sync_passes_all_packages_so_member_entry_points_survive(self):
+        """The remote sync command carries ``--all-packages``.
+
+        A bare ``uv sync`` against the workspace-layout DF checkout prunes the
+        ``orchestrator`` console script that ``run_merge_verify`` then invokes
+        over ssh.
+        """
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', post_sync_head='NEW',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.synced is True
+
+        uv_cmds = [c for c in _ssh_cmds(calls) if 'uv sync' in c]
+        assert len(uv_cmds) == 1, f'expected exactly one uv sync, got {uv_cmds!r}'
+        assert '--all-packages' in uv_cmds[0], (
+            'a bare `uv sync` prunes the workspace members\' console scripts — '
+            f'the remote sync must pass --all-packages; got {uv_cmds[0]!r}'
+        )
+
+    async def test_liveness_probe_runs_after_uv_sync_via_dispatch_path_resolution(self):
+        """A post-sync liveness probe fires AFTER the sync, over ssh with NO ``cd``.
+
+        The probe must resolve ``orchestrator`` through exactly the PATH lookup
+        ``run_merge_verify``'s dispatch argv uses — a probe that cd'd into the
+        checkout (or invoked ``.venv/bin/orchestrator`` by absolute path) could
+        pass while the real dispatch still hit rc=127.
+        """
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', post_sync_head='NEW',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.ok is True
+        assert out.synced is True
+
+        ssh = _ssh_cmds(calls)
+        probes = [i for i, c in enumerate(ssh) if c == _EXPECTED_LIVENESS_CMD]
+        assert len(probes) == 1, (
+            f'expected exactly one {_EXPECTED_LIVENESS_CMD!r} liveness probe, got {ssh!r}'
+        )
+        uv_idxs = [i for i, c in enumerate(ssh) if 'uv sync' in c]
+        assert uv_idxs and uv_idxs[0] < probes[0], (
+            f'liveness probe must follow the sync it validates; got {ssh!r}'
+        )
+        # No `cd` / no absolute venv path — same resolution as the dispatch.
+        assert 'cd ' not in _EXPECTED_LIVENESS_CMD
+        assert not _EXPECTED_LIVENESS_CMD.startswith('/')
+
+    async def test_liveness_probe_failure_is_fail_closed_and_loud(self):
+        """A sync whose subprocesses BOTH returned 0 but which left the remote
+        without a working ``orchestrator`` CLI benches the runner fail-closed.
+
+        This is the case the two return codes cannot see: the destructive bare
+        ``uv sync`` exits 0.  Without the probe the breakage is only rediscovered
+        one dispatch later as an rc=127 ``RunnerUnavailable`` — indistinguishable
+        from ssh flakiness.
+        """
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', pull_rc=0, uv_rc=0, liveness_rc=127,
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+
+        assert out.ok is False, 'a broken post-sync entry point must bench the runner'
+        assert out.synced is False
+        assert out.stale is True
+        # Staleness was announced; the sync is NOT recorded as a success.
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert store.events_of(EventType.runner_synced) == []
+        # Loud: the detail names the probe and its rc so the bench reads as
+        # "the sync broke the host", not as transport flakiness.
+        detail = out.detail or ''
+        assert 'orchestrator' in detail and '127' in detail, detail
+
+    async def test_liveness_probe_not_issued_when_checkout_already_current(self):
+        """The probe is scoped to the post-sync path: a current checkout issues
+        ZERO extra ssh round-trips (the common per-dispatch case stays cheap)."""
+        runner, calls, store = _make_sync_runner(local_head='SAME', remote_head='SAME')
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.stale is False
+        ssh = _ssh_cmds(calls)
+        assert _EXPECTED_LIVENESS_CMD not in ssh, (
+            f'no sync ran, so no liveness probe should fire; got {ssh!r}'
+        )
+
+    async def test_liveness_probe_not_issued_when_sync_skipped_inflight(self):
+        """Nothing was mutated under a live verify, so nothing needs validating."""
+        runner, calls, store = _make_sync_runner(local_head='NEW', remote_head='OLD')
+        runner._inflight_request_id = 'live-verify'
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.synced is False
+        assert _EXPECTED_LIVENESS_CMD not in _ssh_cmds(calls)
+
+    async def test_liveness_probe_command_is_exported(self):
+        """The probe command is a module constant, so the runner and this suite
+        cannot drift apart on the exact string being asserted."""
+        from orchestrator.verify_runner import REMOTE_LIVENESS_CMD
+
+        assert REMOTE_LIVENESS_CMD == _EXPECTED_LIVENESS_CMD
 
 
 # ---------------------------------------------------------------------------
