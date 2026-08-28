@@ -55,6 +55,23 @@ import shlex
 
 from orchestrator import verify_cmd
 
+# The checker keyword each guard parses, single-sourced HERE rather than
+# restated per caller. The keyword is not policy: it is what SELECTS the anchor
+# (:func:`anchor_split` takes ``keyword.split()[-1]``), so it is part of this
+# module's contract. ``ruff check`` anchors on its ``check`` SUBCOMMAND;
+# ``pyright`` and ``pytest`` are invoked as ``<program> <targets>`` with no
+# subcommand at all, so each anchors on the program name itself.
+#
+# Before task 3745's amendment pass the literal ``"ruff check"`` was spelled in
+# four files under three names. That is the same N-copy shape the rest of this
+# module exists to close: were ruff ever to spell its subcommand differently,
+# one edit here beats four coordinated ones, and a caller left behind would not
+# fail loudly — it would fail to MATCH a segment and take the exactly-one
+# assertion, or match and anchor in the wrong place.
+RUFF = "ruff check"
+PYRIGHT = "pyright"
+PYTEST = "pytest"
+
 
 def _where(label: str | None, fallback: str) -> str:
     """How a diagnostic names the thing being parsed.
@@ -168,9 +185,29 @@ def anchor_split(
     Takes an already-extracted SEGMENT rather than a whole command, so the
     segment-selection policy stays the caller's choice — :func:`required_segment`
     for the ruff and pyright legs, :func:`optional_token_segment` for pytest.
+
+    A segment ``shlex`` cannot tokenise raises an ``AssertionError`` naming the
+    label and the segment, never a bare ``ValueError: No closing quotation``.
+    This is the tokenisation choke point for every caller that reaches it
+    through :func:`required_segment`, and one of them parses HUMAN-EDITED PROSE:
+    ``test_contributing_lint_command_drift.py`` extracts its command from a
+    CONTRIBUTING.md bullet, so a stray apostrophe there is ordinary input, not a
+    programming error. An unbalanced quote in that bullet must say WHICH command
+    would not tokenise — a raw ``ValueError`` traceback names neither the label
+    nor the bullet, which is precisely the diagnostic failure this module
+    exists to prevent. Note the contrast with
+    :func:`optional_token_segment`, which SKIPS such a segment: there, an
+    unparseable clause is one among several and the helper has no opinion about
+    it; here, the caller has already committed to this segment being the one.
     """
     anchor = keyword.split()[-1]
-    tokens = shlex.split(segment)
+    try:
+        tokens = shlex.split(segment)
+    except ValueError as exc:
+        raise AssertionError(
+            f"cannot tokenise the `{keyword}` segment of {_where(label, segment)}: "
+            f"{exc}; segment: {segment!r}"
+        ) from exc
     assert anchor in tokens, (
         f"no `{anchor}` token in the `{keyword}` segment of "
         f"{_where(label, segment)}, so the checker's own arguments cannot be "
@@ -211,11 +248,26 @@ def positional_targets(
 
     WHAT THIS GUARANTEES, stated no more strongly than it holds: every returned
     token was a positional argument after the anchor. It is NOT a proof that no
-    unlisted value-taking flag exists — an unknown one still donates its value —
-    which is why the caller that cares asserts its targets EXIST rather than
-    filtering unresolvable ones away. A phantom target can only ever make a
-    coverage check pass spuriously, so silently discarding it would preserve the
-    false-pass hazard the parsing exists to close.
+    unlisted value-taking flag exists — an unknown one still donates its value as
+    a PHANTOM target, and nothing here can tell that phantom from a real path.
+
+    A PHANTOM IS NOT UNIFORMLY HARMLESS, and which callers can tolerate one does
+    NOT partition by which ones supply a set. Against a COVERAGE check a phantom
+    is inert: :func:`covers` over an extra target can only ever pass spuriously,
+    never fail. But a caller that ALSO asserts each target exists on disk reads
+    the list for exactly what a phantom adds, and goes red naming a flag value as
+    a missing path — a misleading diagnosis on a change that broke nothing.
+    Measured across the four callers: THREE assert existence
+    (``test_root_lint_covers_nonmember_py.py``,
+    ``test_contributing_lint_command_drift.py``,
+    ``test_skills_module_config_decision.py``) while only two of those three
+    supply a set; ``test_scripts_module_config.py`` supplies none and asserts no
+    existence. The remaining exposure is root_lint's, and it is recorded on that
+    guard's own ``_ruff_targets`` rather than papered over here.
+
+    Discarding unrecognised tokens instead is not an option: that would silently
+    shrink the target list and re-open the false-pass hazard the parsing exists
+    to close. Widening the set is the caller's call, not this module's.
     """
     post = anchor_split(segment, keyword, label=label)[1]
     targets: list[str] = []

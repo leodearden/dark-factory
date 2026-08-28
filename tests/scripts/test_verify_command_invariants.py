@@ -54,7 +54,14 @@ import shlex
 import pytest
 import verify_command_invariants as vci
 
+# Spelled as LITERALS on purpose, even though ``vci`` now exports the same three
+# strings. This file is the module's oracle, so it must be able to disagree with
+# it; ``test_exported_keywords_are_the_strings_the_guards_parse`` below is the
+# one place the two are compared, and it is what makes the guards' aliasing of
+# ``vci.RUFF`` / ``vci.PYRIGHT`` / ``vci.PYTEST`` a checked contract rather than
+# a convention.
 _RUFF = "ruff check"
+_PYRIGHT = "pyright"
 _PYTEST = "pytest"
 
 # A real-shaped chain: the live repo-root lint_command is a ruff leg followed by
@@ -65,6 +72,41 @@ _CHAINED_LINT = (
     "uv run ruff check alpha beta && "
     "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
 )
+
+
+# ---------------------------------------------------------------------------
+# exported keywords
+# ---------------------------------------------------------------------------
+
+
+def test_exported_keywords_are_the_strings_the_guards_parse() -> None:
+    """The four guards alias these rather than restating the literal.
+
+    The keyword is not per-caller policy — it is what SELECTS the anchor
+    (``keyword.split()[-1]``), so it belongs to the shared contract. Before the
+    task-3745 amendment pass ``"ruff check"`` was spelled in four files under
+    three names (``_RUFF_KEYWORD`` twice, ``_RUFF`` once), which is the same
+    N-copy shape this module exists to close.
+
+    Compared against this file's own literals, which are deliberately NOT
+    aliases: an edit to the exported constant that the guards silently inherit
+    surfaces here as a disagreement with the oracle every other test uses.
+    """
+    assert (vci.RUFF, vci.PYRIGHT, vci.PYTEST) == (_RUFF, _PYRIGHT, _PYTEST)
+
+
+def test_exported_keywords_select_the_anchor_each_guard_needs() -> None:
+    """Why the keyword is shared: ruff anchors on a SUBCOMMAND, the others do not.
+
+    ``ruff check <targets>`` puts the anchor one token past the program name,
+    while ``pyright <targets>`` and ``pytest <targets>`` anchor on the program
+    name itself. One rule over these three constants reproduces all three.
+    """
+    assert [k.split()[-1] for k in (vci.RUFF, vci.PYRIGHT, vci.PYTEST)] == [
+        "check",
+        "pyright",
+        "pytest",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +261,31 @@ def test_anchor_split_asserts_when_the_anchor_is_absent() -> None:
     assert "uv run ruff format alpha" in message
 
 
+def test_anchor_split_reports_an_untokenisable_segment_with_its_label() -> None:
+    """An unbalanced quote is an AssertionError naming the label, not a ValueError.
+
+    Unlike ``optional_token_segment``, which SKIPS a clause it cannot tokenise,
+    this helper's caller has already committed to this segment being the one — so
+    the failure must say WHICH command would not parse. That matters because one
+    caller parses human-edited prose: ``test_contributing_lint_command_drift.py``
+    extracts its command from a CONTRIBUTING.md bullet, where a stray apostrophe
+    is ordinary input rather than a programming error, and a bare
+    ``ValueError: No closing quotation`` names neither the label nor the bullet.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        vci.anchor_split("uv run ruff check alpha'", _RUFF, label="the documented command")
+    message = str(excinfo.value)
+    assert "the documented command" in message
+    assert "uv run ruff check alpha'" in message
+
+
+def test_positional_targets_propagates_the_tokenisation_failure() -> None:
+    """The guard is at the choke point, so every caller reaching it inherits it."""
+    with pytest.raises(AssertionError) as excinfo:
+        vci.positional_targets("ruff check 'alpha", _RUFF, label="the live lint_command")
+    assert "the live lint_command" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # positional_targets
 # ---------------------------------------------------------------------------
@@ -242,9 +309,16 @@ def test_positional_targets_with_no_value_flags_is_the_naive_dash_prefix_filter(
     ``100`` as though they were paths. With an empty ``value_flags`` set the
     consume-next flag can never become True, so the loop reduces to exactly that
     filter — and asserting the PHANTOM-ADMITTING result here is what proves the
-    migration changed nothing for those two files. (A phantom target can only
-    ever make a coverage check pass spuriously, never fail, which is why those
-    two callers can tolerate it and the two stricter ones do not.)
+    migration changed nothing for those two files.
+
+    What a phantom then COSTS its caller does not partition by which callers
+    supply a set. Against a coverage check it is inert (an extra target can only
+    make ``covers`` pass spuriously, never fail), but against a target-EXISTS
+    assertion it is a misleading red naming a flag value as a missing path — and
+    ``test_root_lint_covers_nonmember_py.py`` both omits the set AND asserts
+    existence. Preserving its behaviour bit-for-bit was this task's requirement;
+    the residual exposure is recorded on that guard's own ``_ruff_targets``, not
+    resolved here.
     """
     segment = "ruff check --select E,F --line-length 100 --fix alpha beta.py"
     assert vci.positional_targets(segment, _RUFF) == ["E,F", "100", "alpha", "beta.py"]
