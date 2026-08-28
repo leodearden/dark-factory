@@ -159,4 +159,109 @@ edges `4762 -> 4810` and `4762 -> 4822`, added before any other mutation.
 
 ## APPLIED
 
-Filled in by task 4822 step-5, after the task-record surgery.
+Task 4822, 2026-08-28, at main `753ea8bd1b`. Observed return values, not
+intended ones. **5d is BLOCKED — read §APPLIED-5d before acting on this task.**
+
+### Premises re-verified before any mutation (pre-1)
+
+| check | expected | observed |
+| --- | --- | --- |
+| `git show main:...write_triage_judge.py \| grep -c candidate_id` | 0 | **0** |
+| `git rev-list --count main..task/4762` | 0 | **0** |
+| `bash scripts/check_write_triage_flip_preconditions.sh` | rc=1, items 1/2/4 FAIL | **rc=1, items 1, 2 and 4 FAIL** |
+| `select_judge_candidates(results, 3, canonical_id='parent-1')` | §2 | **`['m0','m1','child-1']`, len 3, first False, last True, `'parent-1'` absent** |
+| control, `canonical_id='m0'` | target first | **`['m0','m1','m2']`, first True** |
+
+Baseline `tests/server/test_write_triage_judge.py`: **163 passed**, green before
+anything was added. A byte-exact capture of task 4762 was saved to
+`.worktrees/.task-meta/4822/capture/task-4762.pre1.json` first (description
+sha256 `e2e3813f9553bf48af46dc0ac0797fda67bc8230dea0a75fb0cd91f556dd091b`,
+details sha256 `756bee1988c081e179b188cba904d2fa34b43b1d45860d101a923ca49425dd8d`).
+
+### pre-2 — the freeze
+
+Two `add_dependency` calls, bare-integer form:
+
+```
+add_dependency(id="4762", depends_on="4810") -> {"id":"4762","dependency_id":"4810","message":"Added dependency: 4762 now depends on 4810"}
+add_dependency(id="4762", depends_on="4822") -> {"id":"4762","dependency_id":"4822","message":"Added dependency: 4762 now depends on 4822"}
+```
+
+Observed afterwards: `dependencies: [4810, 4822]`. No cycle, no rejection.
+
+### 5a — 4762 still idle
+
+`.worktrees/.task-meta/4762/` held `metadata.json`, `plan.json`, `reviews/`,
+`verdicts/` — no `plan.lock`, no `agent_session.json`. Task row read
+`('pending', None, None)` for `(status, claimant_run_id, heartbeat_at)`.
+
+### 5b — metadata (APPLIED)
+
+`update_task` returned `{"id":"4762","message":"Task 4762 updated","updated":true}`.
+Read back, `delivered_checks` is the three-entry list of §4 AFTER: the
+`kind='script'` descriptor first, then `eval_outcome_order_is_deterministic`
+and `report_path_does_not_overwrite_its_own_json` byte-identical to the
+pre-1 capture. `x_4762_option_contradiction` is present with
+`measured_slate ['m0','m1','child-1']`, `target_index 2`, `slate_len 3`,
+`canonical_id_in_slate false`.
+
+### 5c — description round-trip (APPLIED)
+
+`update_task` returned `updated: true`. Verified against the pre-1 capture,
+not merely by sentinel search:
+
+| assertion | result |
+| --- | --- |
+| new description `.endswith(original)` — byte-exact | **True** |
+| original found at offset | **2599** (chars prepended; none altered) |
+| length | **4898 -> 7497** |
+| `details` sha256 vs capture | **identical — details never passed** |
+| sentinels `ORDERING CONSTRAINT`, `reviews-cycle-2/` | **both present** |
+| sentinels `RECOVERY PROVENANCE`, payload sha256 | **both present in details** |
+| `title` / `status` / `priority` / `test_strategy` | **all unchanged** |
+
+### APPLIED-5d — NOT APPLIED. The plan archive is BLOCKED.
+
+`cp`/`rm` against `.worktrees/.task-meta/4762/` both failed with
+`Permission denied`. This is OS sandbox **worktree containment**, not a
+filesystem permission: the process runs as `leo` (uid 1000), the directory is
+`leo:leo 775` and `plan.json` is `leo:leo 664`, and a `touch` probe into this
+task's own `.worktrees/.task-meta/4822/` succeeds while the same probe into
+`4762/` is denied. 5b and 5c landed because they go through the fused-memory
+MCP server, not through the filesystem.
+
+**CONSEQUENCE, stated plainly.** 4762's corrected description (5c) says the
+previous plan "has been SUPERSEDED and archived to
+`.worktrees/.task-meta/4762/plan.superseded-by-4822.json`". That sentence is
+currently FALSE: `plan.json` is still in place, unarchived, and
+`.worktrees/4762/.task/plan.json` still resolves to it. So does
+`metadata.x_4762_option_contradiction.plan_superseded`. Until the archive is
+performed, 4762's record makes a claim about itself that is not true — the
+same class of defect this whole file exists to correct.
+
+**Why this is contained rather than urgent.** pre-2 landed first and by
+design: 4762 now depends on 4810 and 4822, so it cannot be dispatched, and
+therefore cannot be re-planned or implemented against the stale
+`plan.json`, until both land. The freeze is doing exactly the job it was
+ordered first to do.
+
+**What remains, verbatim.** From a context that can write
+`.worktrees/.task-meta/4762/`:
+
+```
+cp .worktrees/.task-meta/4762/plan.json .worktrees/.task-meta/4762/plan.superseded-by-4822.json
+cmp .worktrees/.task-meta/4762/plan.json .worktrees/.task-meta/4762/plan.superseded-by-4822.json
+rm .worktrees/.task-meta/4762/plan.json
+```
+
+Do NOT hand-edit `plan.json`, and do not touch `metadata.json`, `reviews/` or
+`verdicts/`. Leave the `.worktrees/4762/.task/plan.json` symlink dangling —
+`TaskArtifacts.write_plan` / `single_source_plan` recreates it. With
+`plan.json` absent, `read_plan()` returns `{}` and `workflow._plan()` takes
+the fresh-planning path, which is what re-plans 4762 from its corrected
+record. The archived plan is 45846 bytes, 24 steps, `_finalized_at`
+`2026-08-27T14:52:57.460150+00:00`; its step-2 begins "[PRE-FLIP CRITICAL —
+cycle-2 item 1, part 2 of 2] In write_triage_judge.py: (1) restructure
+build_judge_prompt (:314-362".
+
+Filed as a `scope_violation` blocker by task 4822.
