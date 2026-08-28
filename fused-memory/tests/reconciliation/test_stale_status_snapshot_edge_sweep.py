@@ -37,8 +37,13 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import complete_paged_read, incomplete_paged_read
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_PAGE_CAP,
+    IncompleteEnumerationError,
+)
 from fused_memory.reconciliation import task_filter
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
@@ -66,7 +71,9 @@ def _make_memory_service() -> MagicMock:
     """
     memory_service = MagicMock()
     memory_service.graphiti = MagicMock()
-    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
     memory_service.update_edge = AsyncMock()
     memory_service.add_memory = AsyncMock()
     return memory_service
@@ -2515,7 +2522,7 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
 
 class TestSweepStaleStatusSnapshotEdgesCore:
     """sweep_stale_status_snapshot_edges enumerates valid edges via
-    memory_service.graphiti.get_all_valid_edges, cross-references each
+    memory_service.graphiti.enumerate_all_valid_edges, cross-references each
     candidate id's CURRENT status via taskmaster.get_statuses (never
     semantic search), and invalidates only the edges
     select_stale_status_snapshot_edges identifies as stale.
@@ -2537,8 +2544,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         healthy_edge = {
             'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge, healthy_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '999': 'pending'})
 
@@ -2613,8 +2623,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         control_edge = {
             'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+                complete_paged_read(rows_seen=3),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2885': 'done', '3001': 'blocked'})
         now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
@@ -2711,8 +2724,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
         control_edge = {
             'uuid': 'edge-3100-control', 'fact': 'Task 3100 is pending.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [genitive_edge, plural_edge, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [genitive_edge, plural_edge, control_edge]},
+                complete_paged_read(rows_seen=3),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={
@@ -2799,8 +2815,11 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'fact': 'Dependencies for tasks 1020 and task 1030 are pending in blocked status',
             'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [true_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [true_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         # Both ids POSITIVELY KNOWN and != 'blocked', so the blocked rule
         # fires the moment the extractor hands it either of them: the census
@@ -2875,8 +2894,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         control_edge = {
             'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [blocked_edge, control_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [blocked_edge, control_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending', '3001': 'blocked'})
         now = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
@@ -2926,8 +2948,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value=census)
 
@@ -2974,8 +2999,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
         failing = {
             'uuid': 'edge-failing', 'fact': 'Task 144 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [terminal_stale, blocked_stale, healthy, failing]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [terminal_stale, blocked_stale, healthy, failing]},
+                complete_paged_read(rows_seen=4),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={
@@ -3046,8 +3074,11 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
             {'uuid': f'edge-{i}', 'fact': fact, 'name': ''}
             for i, fact in enumerate(facts)
         ]
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': edges},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': edges},
+                complete_paged_read(rows_seen=len(edges)),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '142': 'done', '1020': 'blocked',
@@ -3090,10 +3121,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """One add_memory per contradicted task, with the full write envelope."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
 
@@ -3133,11 +3167,14 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
-                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                    {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
 
@@ -3171,11 +3208,14 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
-                {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-a', 'fact': self.BLOCKED_FACT, 'name': ''},
+                    {'uuid': 'edge-b', 'fact': 'Task 2848 is currently blocked', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(
@@ -3223,15 +3263,18 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         task_ids = list(range(9000, 9000 + total))
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {
-                    'uuid': f'edge-{task_id}',
-                    'fact': f'Task {task_id} remains blocked as of 2026-07-22',
-                    'name': '',
-                }
-                for task_id in task_ids
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {
+                        'uuid': f'edge-{task_id}',
+                        'fact': f'Task {task_id} remains blocked as of 2026-07-22',
+                        'name': '',
+                    }
+                    for task_id in task_ids
+                ]},
+                complete_paged_read(rows_seen=total),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={str(task_id): 'pending' for task_id in task_ids},
@@ -3272,10 +3315,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """The common case logs nothing — the warning marks real truncation."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         log = MagicMock()
@@ -3300,10 +3346,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.update_edge = AsyncMock(side_effect=RuntimeError('lock contention'))
@@ -3330,10 +3379,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
 
@@ -3358,10 +3410,13 @@ class TestSweepStaleStatusSnapshotEdgesSupersedeWrite:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'done'})
 
@@ -3409,7 +3464,7 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
 
     @pytest.mark.asyncio
     async def test_taskmaster_none_yields_all_zero_stats_with_no_calls(self):
-        """taskmaster=None -> all-zero stats; get_all_valid_edges never awaited."""
+        """taskmaster=None -> all-zero stats; enumerate_all_valid_edges never awaited."""
         memory_service = _make_memory_service()
 
         stats = await sweep_stale_status_snapshot_edges(
@@ -3422,7 +3477,7 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
         }
-        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_candidate_ids_skips_get_statuses(self):
@@ -3433,8 +3488,11 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
         count_only_edge = {
             'uuid': 'edge-count', 'fact': 'There are 8 tasks in progress', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [count_only_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [count_only_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
 
         stats = await sweep_stale_status_snapshot_edges(
@@ -3471,8 +3529,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         stale_edge_2 = {
             'uuid': 'edge-stale-2', 'fact': 'Task 144 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge_1, stale_edge_2]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge_1, stale_edge_2]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done', '144': 'cancelled'})
         memory_service.update_edge = AsyncMock(
@@ -3496,12 +3557,14 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         )
 
     @pytest.mark.asyncio
-    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
-        """get_all_valid_edges raises -> sweep returns all-zero stats (errors
+    async def test_enumerate_all_valid_edges_failure_yields_all_zero_stats_without_raising(
+        self,
+    ):
+        """enumerate_all_valid_edges raises -> sweep returns all-zero stats (errors
         tallied) without raising and without calling get_statuses/update_edge."""
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
             side_effect=RuntimeError('transient read timeout'),
         )
 
@@ -3521,6 +3584,56 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         memory_service.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_structurally_incomplete_enumeration_is_a_best_effort_error(self):
+        """A STRUCTURAL incompleteness aborts the cycle as a best-effort error.
+
+        ``enumerate_all_valid_edges`` never raises — it reports incompleteness
+        as a value — so the fail-closed guard the ``get_all_valid_edges`` shim
+        used to provide has to be re-applied by the sweep itself.  Without it a
+        page-capped read would be taken for the whole corpus and every edge the
+        missing pages carry would be scanned as absent, which is exactly the
+        direction that silently retires nothing and reports a clean cycle.
+
+        The pin is that the truncated rows are NOT scanned (``scanned == 0``,
+        no ``update_edge``) and that the abort is tallied (``errors == 1``)
+        rather than propagated: the sweep is best-effort, and one truncated
+        read must not take the surrounding reconciliation cycle down.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': 'Task 142 is an active pending task',
+                     'name': ''},
+                ]},
+                incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1, expected_rows=9999),
+            ),
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+
+        try:
+            stats = await sweep_stale_status_snapshot_edges(
+                memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+            )
+        except IncompleteEnumerationError as exc:
+            pytest.fail(
+                'A structurally incomplete enumeration must be tallied as a best-effort '
+                f'error, not propagated out of the sweep, got: {exc!r}'
+            )
+
+        assert stats == {
+            'scanned': 0, 'candidate_edges': 0,
+            'invalidated': 0, 'errors': 1,
+            'superseded': 0, 'supersede_errors': 0,
+            'supersede_skipped': 0,
+        }, (
+            f'Expected the structural incompleteness to abort the cycle with nothing '
+            f'scanned and one error tallied, got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_get_statuses_failure_is_best_effort_no_op(self):
         """get_statuses raises -> best-effort no-op: errors tallied, no
         update_edge attempted, no raise."""
@@ -3529,8 +3642,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         candidate_edge = {
             'uuid': 'edge-candidate', 'fact': 'Task 142 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [candidate_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [candidate_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('transient read timeout'))
 
@@ -3557,8 +3673,11 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         stale_edge = {
             'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
         memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
@@ -3593,11 +3712,14 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-                {'uuid': 'edge-2849', 'fact': self.BLOCKED_FACT_2849, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                    {'uuid': 'edge-2849', 'fact': self.BLOCKED_FACT_2849, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '2849': 'in-progress'},
@@ -3641,10 +3763,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(side_effect=RuntimeError('write rejected'))
@@ -3674,11 +3799,14 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-                {'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                    {'uuid': 'edge-healthy', 'fact': 'Task 3001 is blocked.', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(
             return_value={'2848': 'pending', '3001': 'blocked'},
@@ -3717,10 +3845,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-2848', 'fact': self.BLOCKED_FACT_2848, 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'2848': 'pending'})
         memory_service.add_memory = AsyncMock(side_effect=exc_type())
@@ -3745,10 +3876,13 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
         """
         memory_service = _make_memory_service()
         taskmaster = _make_taskmaster()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [
-                {'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': ''},
-            ]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': ''},
+                ]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
         memory_service.update_edge = AsyncMock(side_effect=exc_type())
