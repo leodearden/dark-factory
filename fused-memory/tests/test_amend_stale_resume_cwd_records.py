@@ -454,3 +454,136 @@ class TestRunDryRun:
             c.kwargs['memory_id'] for c in service.get_memory_by_id.await_args_list
         ]
         assert read_ids == [STALE_ID, WARNING_ID]
+
+
+class TestRunApply:
+    """The --apply write path: exactly two content amends, no deletes."""
+
+    @pytest.mark.asyncio
+    async def test_apply_writes_once_per_target(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        assert service.update_memory.await_count == len(_mod.AMEND_TARGETS)
+
+    @pytest.mark.asyncio
+    async def test_apply_sends_each_targets_own_replacement_text(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        sent = {
+            c.kwargs['memory_id']: c.kwargs['content']
+            for c in service.update_memory.await_args_list
+        }
+        for target in _mod.AMEND_TARGETS:
+            assert sent[target.memory_id] == target.new_content
+
+    @pytest.mark.asyncio
+    async def test_apply_attributes_every_write_to_this_sweep(self):
+        # The amendment storm alarm reads _source. A bulk rewrite under the
+        # default 'mcp_tool' source would look exactly like the runaway
+        # rewrite that alarm exists to catch.
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        for call in service.update_memory.await_args_list:
+            assert call.kwargs['_source'] == _mod.WRITE_SOURCE
+            assert call.kwargs['reason'] == _mod.WRITE_REASON
+            assert call.kwargs['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_apply_never_deletes_anything(self):
+        # The whole point of this task: the April incident is PRESERVED. A
+        # delete would retire a measured historical observation.
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_passes_no_metadata_delete_keys(self):
+        # Content amend plus an additive metadata patch only -- nothing on
+        # this path removes an existing key.
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        for call in service.update_memory.await_args_list:
+            assert call.kwargs.get('metadata_delete_keys') is None
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_both_amended(self):
+        report = await _mod.run(
+            _memory_service(), project_id='dark_factory', apply=True,
+        )
+        assert report['dry_run'] is False
+        assert [c['action'] for c in report['changes']] == ['amend', 'amend']
+        assert all(c['applied'] is True for c in report['changes'])
+        assert report['totals']['amended'] == 2
+
+
+class TestApplyStoreMutationPreflight:
+    """The guard's own behaviour, re-rigged per test rather than assumed away.
+
+    The autouse fixture neutralises the probe for every other test; this class
+    puts it back so the fail-closed property is pinned explicitly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_preflight_runs_before_any_write(self, monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed',
+            lambda **_kw: order.append('preflight'),
+        )
+        service = _memory_service()
+
+        async def _update(**kwargs):  # noqa: ARG001
+            order.append('write')
+            return {'status': 'updated'}
+
+        service.update_memory.side_effect = _update
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        assert order[0] == 'preflight'
+        assert 'write' in order
+
+    @pytest.mark.asyncio
+    async def test_preflight_is_probed_once_per_run_not_per_write(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw),
+        )
+        await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_preflight_names_the_operation_it_gates(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw),
+        )
+        await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_refused_preflight_performs_zero_writes(self, monkeypatch):
+        def _refuse(**_kw):
+            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refused_preflight_surfaces_a_refusal_not_a_traceback(
+        self, monkeypatch,
+    ):
+        # A sandboxed operator must get the report back and see WHY, rather
+        # than a stack trace they have to interpret.
+        def _refuse(**_kw):
+            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        report = await _mod.run(
+            _memory_service(), project_id='dark_factory', apply=True,
+        )
+        assert [c['action'] for c in report['changes']] == [
+            'refuse:store_unavailable', 'refuse:store_unavailable',
+        ]
+        assert all(c['applied'] is False for c in report['changes'])
+        assert report['totals']['refused'] == 2
