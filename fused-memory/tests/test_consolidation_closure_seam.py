@@ -584,3 +584,91 @@ class TestSeamUnstampedEdgePolicies:
         result = await _set_done(interceptor)
         assert result.get('error') is None
         assert taskmaster.set_task_status.await_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Task 4808 — the PRODUCTION binding. Without this the whole change ships
+# dormant in the live server, which is the exact "both halves exist and
+# neither is wired to the other" failure this task exists to fix.
+# --------------------------------------------------------------------------- #
+
+
+class _StubMemoryService:
+    """Just ``get_memory_by_id`` — no store, no config, no MemoryService."""
+
+    def __init__(self, *, result=None, raises=None):
+        self.result = result
+        self.raises = raises
+        self.calls = []
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.calls.append((project_id, memory_id))
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+class TestProductionProbeWiring:
+    @pytest.mark.asyncio
+    async def test_a_payload_dict_reads_as_live(self):
+        from fused_memory.server.main import _closure_exists_for
+
+        stub = _StubMemoryService(
+            result={'id': _uuid(42), 'content': 'x', 'metadata': {}}
+        )
+        probe = _closure_exists_for(stub)
+        assert await probe(_uuid(42), project_id='dark_factory') is True
+
+    @pytest.mark.asyncio
+    async def test_none_reads_as_absent(self):
+        """The two outcomes that distinguish live-but-unstamped from absorbed."""
+        from fused_memory.server.main import _closure_exists_for
+
+        probe = _closure_exists_for(_StubMemoryService(result=None))
+        assert await probe(_uuid(42), project_id='dark_factory') is False
+
+    @pytest.mark.asyncio
+    async def test_project_id_is_the_first_positional_argument(self):
+        """``MemoryService.get_memory_by_id(self, project_id, memory_id)``.
+        An argument-order slip here would probe the wrong scope and silently
+        report every candidate as absent."""
+        from fused_memory.server.main import _closure_exists_for
+
+        stub = _StubMemoryService(result=None)
+        probe = _closure_exists_for(stub)
+        await probe(_uuid(42), project_id='dark_factory')
+        assert stub.calls == [('dark_factory', _uuid(42))]
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_propagates_rather_than_collapsing_to_false(self):
+        """``get_memory_by_id``\'s docstring makes this contract explicit: the
+        timeout is PROPAGATED, not collapsed into None, precisely so a caller
+        can tell "genuinely absent" from "backend timed out". Collapsing it
+        here would let an unreadable store read as "no strays"."""
+        from fused_memory.server.main import _closure_exists_for
+
+        probe = _closure_exists_for(
+            _StubMemoryService(raises=TimeoutError('qdrant point read'))
+        )
+        with pytest.raises(TimeoutError):
+            await probe(_uuid(42), project_id='dark_factory')
+
+    def test_both_production_call_sites_pass_exists(self):
+        """A probe wired at only ONE ``set_consolidation_scroll`` site would
+        leave the closure gate half-armed depending on config — the same class
+        of silent half-wiring this task fixes. The comment above each site
+        already records why both exist (defining the collaborators inside the
+        enabled arm left the disabled arm raising NameError at startup)."""
+        import inspect  # noqa: PLC0415
+
+        from fused_memory.server import main as server_main
+
+        src = inspect.getsource(server_main)
+        sites = [
+            block
+            for block in src.split('task_interceptor.set_consolidation_scroll(')[1:]
+        ]
+        assert len(sites) == 2
+        for site in sites:
+            call = site.split(')')[0]
+            assert 'exists=' in call, call
