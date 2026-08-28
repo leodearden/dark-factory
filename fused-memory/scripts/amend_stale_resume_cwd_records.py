@@ -282,3 +282,66 @@ AMEND_TARGETS: tuple[AmendTarget, ...] = (
         metadata_patch={'x_corrected_by_task': '4610'},
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Pure core: classify_amend_target
+# ---------------------------------------------------------------------------
+
+def classify_amend_target(
+    target: AmendTarget,
+    fetched: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Decide what a live read of *target* means. Pure function -- no I/O.
+
+    *fetched* is a ``get_memory_by_id``-shaped envelope: ``{'found': True,
+    'content': ...}`` on a hit, ``{'found': False, ...}`` on a genuine miss, or
+    ``{'error', 'error_type'}`` with ``found`` ABSENT on a backend failure.
+
+    Returns ``{'id', 'action'}`` -- mirroring
+    ``tag_cgl_eta_rehome_scope.classify_rehome_record``'s decision shape --
+    where ``action`` is one of:
+
+    - ``'refuse:read_error'`` -- the read itself failed. NOT the same claim as
+      not-found: ``get_memory_by_id``'s no-silent-fail contract keeps "memory
+      genuinely absent" and "backend timed out" distinguishable, and unknown is
+      not absent. Collapsing them would let a transient Qdrant fault be
+      reported as a vanished record.
+    - ``'refuse:not_found'`` -- the record is genuinely gone (consolidated
+      away, reaped). Nothing to amend, and inventing it back is not this
+      script's job.
+    - ``'skip:already_amended'`` -- content carries :data:`AMENDED_SENTINEL`.
+    - ``'amend'`` -- content still equals the pinned pre-image exactly.
+    - ``'refuse:preimage_mismatch'`` -- content exists but is neither. Somebody
+      else changed this record; REFUSE rather than clobber.
+
+    The check ORDER is load-bearing. The sentinel test precedes the pre-image
+    comparison because after a successful apply the live content no longer
+    equals the pre-image -- it equals the replacement. Pre-image-first would
+    therefore report every re-run as ``refuse:preimage_mismatch``, turning the
+    idempotency property into a false tamper alarm and leaving an operator
+    unable to tell a safe re-run from a genuine race.
+
+    And the mismatch branch REFUSES rather than overwrites because an in-place
+    amend is invisible to every downstream reader: silently rewriting a record
+    that moved underneath us (a curator sitting, a recon Stage-1/2
+    consolidation) would destroy someone else's correction with no trace. A
+    loud refusal converts that race into an operator decision.
+    """
+    result = {'id': target.memory_id}
+
+    if not isinstance(fetched, dict) or 'found' not in fetched:
+        return {**result, 'action': 'refuse:read_error'}
+
+    if not fetched.get('found'):
+        return {**result, 'action': 'refuse:not_found'}
+
+    content = fetched.get('content') or ''
+
+    if AMENDED_SENTINEL in content:
+        return {**result, 'action': 'skip:already_amended'}
+
+    if content == target.expected_preimage:
+        return {**result, 'action': 'amend'}
+
+    return {**result, 'action': 'refuse:preimage_mismatch'}
