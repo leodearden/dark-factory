@@ -33,6 +33,21 @@ Taking the executed config is also what makes the over-fire task 3494's
 docstring feared structurally impossible: by then any subproject rescoping has
 already happened, so the command's own shape decides.
 
+CLASS-LEVEL MARKERS (task 4561 — Gap 2 of task 3513, re-specced by esc-3513-2,
+tracing to the same esc-3292-1 above).  The detector grew a THIRD proof tier,
+``guaranteed_marker_names``: a module-wide lower bound that reads a class's
+decorators and its class-body ``pytestmark`` and folds them across every
+collectable class as an INTERSECTION — but only under an
+all-items-accounted-for guard proving no collected item lives outside those
+classes.  It closes the shape both earlier tiers refuse: a file whose every
+item is class-marked, which collects zero under the module's own ``-m`` and so
+returns the very rc=5 false RED this module exists to eliminate.
+
+It was added as a SIBLING of ``module_level_marker_names`` rather than an edit
+to it because that function's set is the strict module-only bound the other two
+tiers are each defined as a SUPERSET of; widening it in place would move the
+baseline every one of them is stated against.
+
 This module unit-tests the pure static detector (``orchestrator.pytest_markers``)
 against synthetic strings, then pins the wired ``derive_verify_plan`` behaviour —
 including the real-config incident golden — then the shared probe, the fallback
