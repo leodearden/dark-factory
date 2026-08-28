@@ -70,18 +70,20 @@ block and is unaffected here.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import pathlib
 import re
 import shlex
+import socket
 import subprocess
 import tomllib
 
 import pytest
 import yaml
-
-from orchestrator import verify_cmd
+from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
+from orchestrator.verify_cmd import split_top_level_and
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -164,7 +166,7 @@ def _fleet_pyright_clauses() -> list[str]:
     ``str.split('&&')`` would read a quoted ``&&`` as a clause boundary.
     """
     cmd = _fleet_config()["type_check_command"]
-    clauses = [c.strip() for c in verify_cmd.split_top_level_and(cmd)]
+    clauses = [c.strip() for c in split_top_level_and(cmd)]
     pyright_clauses = [c for c in clauses if "pyright" in c]
     assert pyright_clauses, (
         f"no pyright clause in dark-factory-orchestrator.yaml type_check_command "
@@ -321,7 +323,7 @@ def test_the_cold_worktree_install_step_runs_before_the_type_leg() -> None:
     silently take the venv sync down with it and reintroduce esc-2913-3.
     """
     cmd = _fleet_config()["verify_cold_preprovision_command"]
-    clauses = [c.strip() for c in verify_cmd.split_top_level_and(cmd)]
+    clauses = [c.strip() for c in split_top_level_and(cmd)]
 
     npm_ci = [i for i, c in enumerate(clauses) if shlex.split(c)[:2] == ["npm", "ci"]]
     assert len(npm_ci) == 1, (
@@ -391,75 +393,204 @@ def test_both_type_check_lanes_resolve_the_same_pyright_version() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _npx_pyright_version(subdir: pathlib.Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    """Run ``npx --offline pyright --version`` from *subdir*, capturing rc+output.
 
-    ``--offline`` is what makes this a PROOF rather than an observation: with an
-    empty ``npm_config_cache`` the ONLY way this can succeed is a local
-    ``node_modules/.bin/pyright`` found by walking up from *subdir*. Any
-    registry or npx-cache path fails with ENOTCACHED instead of quietly
-    returning some other version — so a green result cannot come from a warm
-    cache the way the real hosts' shared ``~/.npm/_npx`` allows.
 
-    *subdir* mirrors the fleet chain's first clause, ``cd fused-memory``: the
-    walk-up from a SUBDIRECTORY is the part that could plausibly not work, and
-    a check run at the root would not exercise it.
+def _fleet_pyright_clause_cwds() -> list[tuple[str, str]]:
+    """``(cwd, clause)`` for every pyright clause of the fleet TYPE chain.
+
+    Walks the ``&&``-chain tracking cwd through its ``cd`` clauses with the
+    PRODUCTION helpers ``verify._AND_CLAUSE_SPLIT_RE`` /
+    ``verify._cd_clause_target`` — the same pair
+    ``verify._scope_fallback_tool_to_subproject`` uses to read this exact
+    command, and the same pair ``test_fallback_verify_config._pyright_clause_cwds``
+    walks it with. Deriving the directories here rather than hardcoding
+    ``fused-memory`` is what lets the resolution check below claim it measures
+    what the CONFIGURED ``type_check_command`` resolves, at every one of its
+    clauses, instead of a plausible-looking stand-in.
     """
-    return subprocess.run(
-        ["npx", "--yes", "--offline", "pyright", "--version"],
-        cwd=subdir, env=env, capture_output=True, text=True, timeout=180,
+    cmd = _fleet_config()["type_check_command"]
+    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+    cwd = "."
+    found: list[tuple[str, str]] = []
+    for i in range(0, len(parts), 2):
+        clause = parts[i].strip()
+        target = _cd_clause_target(clause)
+        if target is not None:
+            cwd = os.path.normpath(os.path.join(cwd, target))
+            continue
+        if "pyright" in clause:
+            found.append((cwd, clause))
+    assert found, (
+        f"the &&-walk of type_check_command resolved no pyright clause at all "
+        f"(task 4538) — the resolution check below would measure nothing; "
+        f"command: {cmd!r}"
     )
+    return found
+
+
+def _configured_npm_install_argv() -> list[str]:
+    """The ``npm ci`` clause of ``verify_cold_preprovision_command``, as argv.
+
+    Taken from the CONFIG, never retyped. The whole claim under test is about
+    what the deployed pre-provision does to a cold worktree, so a hand-written
+    ``npm ci`` here would leave the config free to drift (drop ``ci`` for
+    ``install``, add an ``--omit`` that skips devDependencies) while this file
+    stayed green on a command nothing runs.
+
+    The sibling ``uv sync`` clause is deliberately NOT run: it provisions the
+    Python workspace, which this throwaway tree neither has nor needs, and it
+    would add minutes to a check about npm resolution.
+    """
+    cmd = _fleet_config()["verify_cold_preprovision_command"]
+    clauses = [shlex.split(c) for c in split_top_level_and(cmd)]
+    npm = [argv for argv in clauses if argv[:2] == ["npm", "ci"]]
+    assert len(npm) == 1, (
+        f"expected exactly one `npm ci` clause in "
+        f"verify_cold_preprovision_command to drive this check, found {npm!r} "
+        f"(task 4538); command: {cmd!r}"
+    )
+    return npm[0]
+
+
+def _registry_is_reachable() -> bool:
+    """True when ``registry.npmjs.org:443`` accepts a TCP connection in 5s.
+
+    Used ONLY to tell an infrastructure skip apart from a real failure. An
+    ``npm ci`` that fails with the registry reachable is a genuine defect in
+    the committed lockfile (out of sync with package.json, a yanked version, a
+    bad integrity hash) and must go RED; one that fails with the registry down
+    is not evidence about the pin either way, and says so.
+    """
+    try:
+        with socket.create_connection(("registry.npmjs.org", 443), timeout=5):
+            return True
+    except OSError:
+        return False
+
+
+def _offline_probe_argv(clause: str) -> list[str]:
+    """Turn a configured pyright clause into an offline version probe.
+
+    ``npx pyright`` -> ``npx --yes --offline pyright --version``. Both added
+    flags are deliberately one-directional, which is what keeps this a probe of
+    the configured command rather than a different command:
+
+      ``--offline`` can only turn a resolution that WOULD have reached the
+      registry into a failure. It cannot cause a different local binary to be
+      found, so a version it reports is a version the bare clause would also
+      have run.
+      ``--yes`` only suppresses the install-confirmation prompt, which never
+      appears non-interactively anyway; it is there so a TTY run behaves the
+      same as a captured one.
+      ``--version`` is pyright's own flag and is the only thing being asked.
+    """
+    tokens = shlex.split(clause)
+    assert tokens[:2] == ["npx", "pyright"], (
+        f"cannot build an offline probe from clause {clause!r} (task 4538): the "
+        f"transformation documented here is defined for a bare `npx pyright` "
+        f"clause only, and test_the_fleet_chain_stays_bare_npx_pyright asserts "
+        f"the chain keeps that shape"
+    )
+    return ["npx", "--yes", "--offline", "pyright", *tokens[2:], "--version"]
 
 
 @pytest.fixture(scope="module")
 def clean_worktree_resolution(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
-    """Reproduce a clean worktree + cold npx cache, and record BOTH resolutions.
+    """Reproduce a clean worktree + COLD npx cache, and record both resolutions.
 
-    Copies only the two committed pin files into a throwaway tree, points npm at
-    an EMPTY cache dir and an empty HOME (so no ``~/.npmrc`` and, decisively, no
-    warm ``_npx`` entry), and measures the same invocation twice:
+    Copies only the two committed pin files into a throwaway tree and recreates
+    the member directories the fleet chain ``cd``s into.
 
-      ``before`` — no ``node_modules/``, i.e. exactly what a fresh merge-verify
-                   worktree looks like. This is the negative control, and it
-                   needs no network.
-      ``after``  — following the same ``npm ci`` the cold-verify pre-provision
-                   runs. This is the claim.
+    THE TWO STEPS GET DIFFERENT CACHES, deliberately, and the asymmetry sharpens
+    the isolation rather than relaxing it:
 
-    Both are taken in ONE fixture so the two tests below cannot be reordered
-    into disagreement, and so the (network-dependent) install happens once.
+      the INSTALL runs with the ambient environment, i.e. the host's real
+      ``~/.npm``. It is reproducing the deployed pre-provision, which runs that
+      way, and the lockfile — not the cache — decides what gets installed, so a
+      warm ``_cacache`` changes only how fast the tarball arrives. Measured
+      2026-08-28: ~16s against an empty cache, ~2s against a warm one, and the
+      difference is pure download.
+
+      the PROBES run against an EMPTY ``npm_config_cache`` and an empty HOME.
+      That is the load-bearing isolation. Real hosts share ``~/.npm/_npx``, and
+      a check that is green only because two hosts happen to hold the same
+      cached version is vacuously green — the failure mode task 4538 names
+      explicitly. Here the probe's cache holds nothing at all, not even what the
+      install just downloaded, so the ONLY thing that can satisfy an
+      ``--offline`` invocation is the local ``node_modules`` install.
+
+    Measures the same configured invocation twice:
+
+      ``before`` — no ``node_modules/``: exactly what a fresh merge-verify
+                   worktree looks like. The negative control; needs no network.
+      ``after``  — after running the CONFIGURED pre-provision npm clause. The
+                   claim, taken at every pyright clause's cwd, not just the
+                   first.
+
+    Both in ONE module-scoped fixture, so the two tests cannot be reordered into
+    disagreement and the install happens once.
+
+    COST, stated rather than left for someone to discover: this fixture is the
+    expensive part of the file — measured 25.6s on 2026-08-28 with a warm host
+    npm cache, under live fleet load, against a tests/scripts suite whose own
+    recorded runs are 146-233s. Most of it is unpacking pyright's 37MB package
+    and eight node startups; the seven probes are already concurrent. It buys
+    the one assertion here that is not a paper contract between committed files.
     """
     root = tmp_path_factory.mktemp("pyright-pin")
     # Read through the asserting accessors, never `if src.is_file()`. A fixture
     # that shrugs at a missing pin file would build a tree with nothing to
     # install, `npm ci` would fail, and the positive test below would SKIP —
     # reporting "not verified" for what is actually the pin being absent. The
-    # negative control's whole claim also depends on package.json being PRESENT
-    # and still not sufficient.
+    # negative control's claim also depends on package.json being PRESENT and
+    # still not sufficient.
     _package_json()
     _package_lock()
     for name in ("package.json", "package-lock.json"):
         (root / name).write_bytes((REPO_ROOT / name).read_bytes())
-    # Mirrors the fleet chain's first `cd` target; deliberately holds no
-    # package.json or node_modules of its own, so npx must walk up to `root`.
-    subdir = root / "fused-memory"
-    subdir.mkdir()
-    cache = root / "npm-cache"
+
+    clause_cwds = _fleet_pyright_clause_cwds()
+    for rel, _clause in clause_cwds:
+        # Deliberately empty: no package.json and no node_modules of their own,
+        # so npx must walk UP to `root` to find anything — the step that would
+        # break if a member ever grew its own package.json.
+        (root / rel).mkdir(parents=True, exist_ok=True)
+
     home = root / "home"
     home.mkdir()
-    env = {
+    probe_env = {
         **{k: v for k, v in os.environ.items() if not k.startswith("npm_config_")},
         "HOME": str(home),
-        "npm_config_cache": str(cache),
+        # Never created, never written to by anything but npx itself: cold by
+        # construction, per run, for _cacache and _npx alike.
+        "npm_config_cache": str(root / "npm-cache"),
         "npm_config_update_notifier": "false",
     }
 
-    before = _npx_pyright_version(subdir, env)
+    def probe(rel: str, clause: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            _offline_probe_argv(clause),
+            cwd=root / rel, env=probe_env, capture_output=True, text=True, timeout=180,
+        )
+
+    first_rel, first_clause = clause_cwds[0]
+    before = probe(first_rel, first_clause)
 
     install = subprocess.run(
-        ["npm", "ci", "--no-audit", "--no-fund"],
-        cwd=root, env=env, capture_output=True, text=True, timeout=900,
+        _configured_npm_install_argv(),
+        cwd=root, capture_output=True, text=True, timeout=900,
     )
-    after = _npx_pyright_version(subdir, env) if install.returncode == 0 else None
+    # Every clause, not just the first — the last one sits seven `cd`s deep and
+    # its walk-up is a different path than the first one's. Probed CONCURRENTLY
+    # because each spawns node and costs ~2.9s serially (measured 2026-08-28);
+    # seven of those would put ~20s on every tests/scripts verify for a set of
+    # independent, side-effect-free reads of one already-installed tree.
+    if install.returncode == 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(clause_cwds)) as pool:
+            futures = {rel: pool.submit(probe, rel, clause) for rel, clause in clause_cwds}
+            after = {rel: f.result() for rel, f in futures.items()}
+    else:
+        after = {}
 
     return {"root": root, "before": before, "install": install, "after": after}
 
@@ -467,70 +598,97 @@ def clean_worktree_resolution(tmp_path_factory: pytest.TempPathFactory) -> dict[
 def test_npx_in_a_fresh_worktree_does_not_resolve_the_pin_on_its_own(
     clean_worktree_resolution: dict[str, object],
 ) -> None:
-    """NEGATIVE CONTROL: package.json alone pins nothing.
+    """NEGATIVE CONTROL: the committed package.json alone pins nothing.
 
-    Without this, the positive test below could pass for the wrong reason —
-    "both hosts happened to share a cached version" is the vacuous green the
-    whole task warns about. Here the committed package.json IS present and the
-    pinned devDependency IS declared, and the invocation still cannot resolve:
-    npx reads an INSTALLED binary, never the dependency spec. That is the
-    measured reason a lockfile alone is not the fix, and the reason
-    ``verify_cold_preprovision_command`` carries an install step.
+    Without this the positive test could pass for the wrong reason, and the
+    wrong reason is the exact hazard named in task 4538: a check that is green
+    only because a warm cache happened to hold the right version. Here the
+    committed package.json IS present, its pinned devDependency IS declared, and
+    the configured invocation still cannot resolve — because npx reads an
+    INSTALLED binary and never the dependency spec.
 
-    Needs no network — an offline npx with an empty cache fails locally.
+    That is the measurement behind the design: the pin needs an install step,
+    which is why ``verify_cold_preprovision_command`` carries one. It also
+    doubles as the isolation check for the fixture — if this ever goes green,
+    the cache isolation has stopped working and the positive test is vacuous.
+
+    Needs no network: an offline npx against an empty cache fails locally.
     """
     before = clean_worktree_resolution["before"]
     assert isinstance(before, subprocess.CompletedProcess)
     assert before.returncode != 0, (
-        f"`npx --offline pyright --version` SUCCEEDED in a tree with no "
-        f"node_modules/ (task 4538), printing {before.stdout.strip()!r}. Either "
-        f"the cache isolation in this fixture stopped working — in which case "
-        f"the positive test below is now vacuous, because it could be reading "
-        f"the same warm cache — or npx changed to honour the package.json spec "
-        f"directly, which would make the install step unnecessary. Investigate "
-        f"before touching either test."
+        f"the configured pyright clause SUCCEEDED, printing "
+        f"{before.stdout.strip()!r}, in a tree with a committed package.json but "
+        f"no node_modules/ (task 4538). Either this fixture's cache isolation "
+        f"stopped working — in which case the positive test below is now vacuous, "
+        f"since it could be reading the same warm cache — or npx changed to "
+        f"honour the dependency spec directly, which would make the install step "
+        f"unnecessary. Investigate before touching either test."
     )
 
 
 def test_npx_in_a_clean_worktree_resolves_the_pinned_version(
     clean_worktree_resolution: dict[str, object],
 ) -> None:
-    """THE SIGNAL: after the pre-provision's ``npm ci``, npx resolves the pin.
+    """THE SIGNAL: after the configured pre-provision, every clause resolves the pin.
 
-    Run from a subdirectory, offline, against an empty npm cache — the three
-    conditions that together rule out every non-pinned resolution path. What is
-    left is the one the fleet chain relies on: ``npm ci`` materialises the
-    lockfile's pyright into ``<worktree>/node_modules/.bin``, and npx's walk up
-    from the ``cd``-ed member directory finds it.
+    Three conditions together rule out every unpinned resolution path: run from
+    the ``cd``-ed member SUBDIRECTORY (so the walk-up is exercised), ``--offline``
+    (so the registry cannot answer), and an EMPTY npm cache (so no warm ``_npx``
+    entry can). What is left is the path the fleet chain depends on — ``npm ci``
+    materialises the lockfile's pyright into ``<worktree>/node_modules/.bin`` and
+    npx finds it there.
 
-    The ``npm ci`` step is the only part that reaches the network. A failure
-    there SKIPS rather than fails, and says so — an unreachable registry is not
-    evidence about the pin. The assertion itself never skips.
+    The install is the only step that touches the network. It skips ONLY when
+    ``registry.npmjs.org`` is unreachable, and says what was not proven; an
+    install that fails with the registry UP is a real lockfile defect and goes
+    red. The version assertion itself never skips.
     """
     install = clean_worktree_resolution["install"]
     assert isinstance(install, subprocess.CompletedProcess)
-    if install.returncode != 0:
+    if install.returncode != 0 and not _registry_is_reachable():
         pytest.skip(
-            "could not `npm ci` the committed lockfile into a throwaway tree "
-            f"(rc={install.returncode}), so the clean-worktree resolution of "
-            "`npx pyright` was NOT verified on this host. This is an "
-            "infrastructure skip, not evidence: the npm registry is the only "
-            f"network dependency here. stderr tail: {install.stderr[-500:]!r}"
+            "registry.npmjs.org is unreachable, so the configured pre-provision "
+            f"install failed (rc={install.returncode}) and the clean-worktree "
+            "resolution of the fleet type_check_command was NOT verified on this "
+            "host. An infrastructure skip, not evidence about the pin. stderr "
+            f"tail: {install.stderr[-500:]!r}"
         )
+    assert install.returncode == 0, (
+        f"the configured verify_cold_preprovision_command npm clause "
+        f"{_configured_npm_install_argv()!r} failed (rc={install.returncode}) "
+        f"against the committed lockfile, with the registry reachable (task "
+        f"4538) — so a cold merge-verify worktree gets NO local pyright and every "
+        f"`npx pyright` clause silently reverts to fetching pyright@latest. The "
+        f"usual cause is package.json and package-lock.json out of sync; re-run "
+        f"`npm install --package-lock-only` and commit. stderr tail: "
+        f"{install.stderr[-800:]!r}"
+    )
 
     after = clean_worktree_resolution["after"]
-    assert isinstance(after, subprocess.CompletedProcess)
+    assert isinstance(after, dict)
     pin = _declared_npm_pyright_pin()
-    assert after.returncode == 0, (
-        f"`npx --offline pyright --version` failed (rc={after.returncode}) from a "
-        f"subdirectory of a tree where `npm ci` had just installed the pinned "
-        f"pyright (task 4538) — so the fleet type_check_command's `cd "
-        f"fused-memory && npx pyright` would NOT pick up the local install "
-        f"either. stdout: {after.stdout!r} stderr: {after.stderr[-500:]!r}"
+    expected = f"pyright {pin}"
+
+    # Non-vacuity: an empty result set would satisfy every loop assertion below.
+    assert after, (
+        "no pyright clause of the fleet type_check_command was probed (task "
+        "4538) — this check would pass having measured nothing"
     )
-    assert after.stdout.strip() == f"pyright {pin}", (
-        f"`npx pyright --version` resolved {after.stdout.strip()!r} in a clean "
-        f"worktree, but package.json pins {pin} (task 4538). The fleet TYPE gate "
-        f"is running a version nobody declared, which is exactly the "
-        f"host-to-host and publish-to-publish drift this pin exists to remove."
-    )
+
+    for rel, result in sorted(after.items()):
+        assert result.returncode == 0, (
+            f"the configured pyright clause failed (rc={result.returncode}) in "
+            f"{rel}/ after the pre-provision had installed the pinned pyright "
+            f"(task 4538) — so `cd {rel} && npx pyright` would not pick up the "
+            f"local install either, and that clause of the fleet TYPE gate is "
+            f"still unpinned. stdout: {result.stdout!r} stderr: "
+            f"{result.stderr[-500:]!r}"
+        )
+        assert result.stdout.strip() == expected, (
+            f"the fleet type_check_command's pyright clause in {rel}/ resolved "
+            f"{result.stdout.strip()!r} in a clean worktree with a cold cache, "
+            f"but package.json pins {pin} (task 4538). The TYPE gate is running a "
+            f"version nobody declared — the host-to-host and publish-to-publish "
+            f"drift this pin exists to remove."
+        )

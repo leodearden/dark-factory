@@ -235,9 +235,13 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   ```bash
   cd fused-memory && uv run pyright   # also: orchestrator, dashboard
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same
-  three packages via `npx pyright` (needs Node 22+) — either invocation
-  works.
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs all seven
+  workspace members via `npx pyright` (needs Node 22+) — either invocation
+  works, and both resolve the SAME pyright version: `uv run pyright` resolves
+  the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
+  `package.json` pin that `npm ci` installs into `node_modules/`. Run `npm ci`
+  once locally, or a bare `npx pyright` fetches whatever is current instead.
+  `tests/scripts/test_pyright_version_pin.py` holds the two lanes together.
 
 Treat `dark-factory-orchestrator.yaml`'s `test_command` / `lint_command` /
 `type_check_command` as the source of truth if these drift.
