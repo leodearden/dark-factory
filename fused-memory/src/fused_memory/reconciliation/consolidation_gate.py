@@ -71,6 +71,7 @@ __all__ = [
     'evaluate_closure',
     'render_consolidation_gate_section',
     'render_end_state_brief',
+    'resolve_unstamped_live_ids',
     'unstamped_candidates',
 ]
 
@@ -311,6 +312,58 @@ def unstamped_candidates(
         seen.add(folded)
         candidates.append(str(raw))
     return tuple(candidates)
+
+
+async def resolve_unstamped_live_ids(
+    gate_block: Any,
+    *,
+    members: Sequence[Any],
+    exists: Any,
+    project_id: str,
+) -> tuple[str, ...]:
+    """The observed cluster members that are still LIVE but never got stamped.
+
+    Performs no I/O ITSELF — it awaits what it is GIVEN.  *exists* is an
+    injected, project-scoped collaborator
+    ``async (memory_id: str, *, project_id: str) -> bool``; the seam binds
+    ``MemoryService.get_memory_by_id`` and the CLI binds the same method, so
+    this module stays the stdlib-only import leaf its module docstring
+    requires.
+
+    DORMANT WHEN UNWIRED.  ``exists=None`` returns ``()`` immediately, before
+    any candidate is derived.  Without a probe we cannot distinguish an
+    absorbed-and-deleted id from a live-but-unstamped one, and guessing
+    "unstamped" would make every delete-arm consolidation permanently
+    uncloseable — the exact regression the derivation exists to avoid.
+
+    Candidate derivation is delegated to :func:`unstamped_candidates`, never
+    re-implemented (INV-5): the CLI and the seam must not be able to disagree
+    about which ids are ambiguous.
+
+    Sequential rather than ``asyncio.gather``: the candidate list is empty for
+    every well-formed gate (measured 2026-08-28: zero candidates across all
+    four live consolidated topics) and small otherwise, so concurrency would
+    buy nothing and would obscure which probe raised.
+
+    Any exception PROPAGATES.  Both production callers already convert a
+    failed store read into their own fail-closed outcome — the seam refuses
+    the transition, the CLI exits "could not check" — so swallowing here would
+    let an unreadable store read as "no strays".
+
+    TRUNCATION IS DELIBERATELY NOT RE-GUARDED HERE.
+    ``consolidation_gate.py::evaluate_closure`` already suppresses
+    ``unstamped_cluster_member`` on a truncated scroll (the reason is
+    absence-based, and past the cap "not stamped" and "not seen" are the same
+    fact), so neither caller needs a second copy of that guard and this
+    function takes no ``scroll_truncated`` argument.
+    """
+    if exists is None:
+        return ()
+    live: list[str] = []
+    for candidate in unstamped_candidates(gate_block, members=members):
+        if await exists(candidate, project_id=project_id):
+            live.append(candidate)
+    return tuple(live)
 
 
 def evaluate_closure(
