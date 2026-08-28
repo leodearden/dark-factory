@@ -2695,6 +2695,90 @@ class TestSessionResumeStorm:
         assert harness._session_resume_fallback_streak == 1
         assert harness._escalation_queue.submit.call_count == 0
 
+    async def test_window_retires_the_run_on_a_by_design_dispatch(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The counter must be correct when READ, not merely when incremented
+        (task 3256's addendum defect, in scope for 3728).
+
+        The decay is only meaningful if the passage of the window RETIRES a run
+        — but it is computed inside the increment branch, so with no genuine
+        feeder arriving the counter holds its last value indefinitely and any
+        other reader sees a run that ended long ago. ε's re-armed feeder makes
+        that reader real; today it is already a lie about state.
+
+        Drive threshold-1 genuine failures, let the window pass, then dispatch
+        ONE ordinary by-design (stale) session: the run must be gone — streak 0
+        AND the chain's comparison stamp cleared — even though that dispatch
+        contributed nothing itself.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):  # threshold - 1
+            await _drive_session_slot(harness, f'rq{i}', self._fresh_session(f'uuid-rq{i}'))
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._last_session_resume_fallback_at is not None
+
+        # The clock passes the window with no further genuine failure.
+        harness._last_session_resume_fallback_at -= 120
+
+        # A perfectly ordinary by-design dispatch (real predicate, corroborated
+        # dir, aged sidecar → {'stale'}) is enough to observe the expiry.
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-rq-stale')
+        await _drive_session_slot(
+            harness, 'rq-stale', self._stale_session('uuid-rq-stale'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_by_design_dispatch_inside_the_window_decays_nothing(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """...and evaluating the decay per dispatch must not become a RESET per
+        dispatch.
+
+        The same interleaving WITHOUT the clock passing leaves both the counter
+        and the stamp exactly as they were: a by-design outcome still neither
+        FEEDS the streak nor RESETS it (task 3256's anti-masking rule — a drip
+        of expected fallbacks must not launder a genuine systematic failure
+        interleaved between them), and it still does not refresh the chain
+        stamp, which would keep a run alive across an arbitrarily long gap.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=3, storm_window_secs=60,
+        )
+        harness._escalation_queue = self._queue()
+
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):
+            await _drive_session_slot(harness, f'nw{i}', self._fresh_session(f'uuid-nw{i}'))
+        stamp = harness._last_session_resume_fallback_at
+        assert harness._session_resume_fallback_streak == 2
+        assert stamp is not None
+
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-nw-stale')
+        await _drive_session_slot(
+            harness, 'nw-stale', self._stale_session('uuid-nw-stale'), config_dir=cfg,
+        )
+
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._last_session_resume_fallback_at == stamp
+
+        # And the run is still live: one more genuine failure reaches the
+        # threshold, so the per-dispatch decay did not quietly neuter INV-4.
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'nw2', self._fresh_session('uuid-nw2'))
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+
     async def test_by_design_fallbacks_do_not_refresh_the_chain_stamp(
         self, harness: Harness, tmp_path: Path
     ):
