@@ -1881,6 +1881,43 @@ class TestWarmLaneBashRealConfigRegression:
 _SLOW_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.slow\n\n\ndef test_x():\n    pass\n'
 _UNMARKED_PLAIN_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
 
+#: The CLASS-LEVEL twin of `_SLOW_MARKED_SOURCE`: every top-level class carries
+#: `slow`, there is no module-level `pytestmark`, and there is no module-level
+#: test function — so ONLY `guaranteed_marker_names` can prove it deselected.
+_CLASS_MARKED_SLOW_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestAlpha:
+
+    def test_a(self):
+        pass
+
+
+class TestBeta:
+
+    pytestmark = [pytest.mark.slow]
+
+    def test_b(self):
+        pass
+"""
+
+#: A class-marked override for every `.py` path the both-arms tests use, served
+#: through `_permissive_reader`'s existing `overrides` channel so no new I/O
+#: seam appears.  Non-vacuity is preserved: every `*pyproject.toml` still serves
+#: `_DESELECTING_PYPROJECT`, so a guard that stopped firing would WIDEN and the
+#: refusal assertions would fail rather than pass silently.
+_CLASS_MARKED_OVERRIDES: dict[str, str | None] = dict.fromkeys(
+    (
+        'mod/tests/test_a.py',
+        'sub/tests/test_a.py',
+        'tests/test_a.py',
+        'tests/test_b.py',
+    ),
+    _CLASS_MARKED_SLOW_SOURCE,
+)
+
 
 def _permissive_reader(
     reads: list[str],
@@ -1892,6 +1929,11 @@ def _permissive_reader(
     ``_SLOW_MARKED_SOURCE`` at every ``*.py`` path, recording each read into
     *reads*.  *overrides* wins where present (a ``None`` value models a file the
     reader cannot read — a directory, or a missing path).
+
+    *overrides* is also how a CLASS-marked source is served
+    (``_CLASS_MARKED_OVERRIDES``): the ``*pyproject.toml`` arm is untouched, so
+    every refusal test keeps its non-vacuity — a guard that stopped firing
+    would widen, not merely read a different file.
 
     Same injected seam as ``verify_plan``'s ``worktree_reader``
     (``Callable[[str], str | None]``); no new I/O is introduced.
@@ -2022,6 +2064,48 @@ class TestDeselectingExpressionForCommand:
             _permissive_reader(reads),
         ) is None
 
+    # -- ARM 1 inherits the class-level tier through this one probe -----------
+
+    def test_a_class_marked_target_returns_the_expression(self):
+        """The module arm's probe gained the class tier with no edit of its own.
+
+        ``_derive_module_runs`` arm 4 reaches
+        ``pytest_markers.deselecting_expression_for_targets`` only through this
+        function, so widening that one probe's primary tier is what gives this
+        arm the capability — no second call site exists to drift from.
+        """
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        ) == 'not slow'
+
+    def test_a_cd_command_with_a_class_marked_target_still_reads_its_own_rootdir(self):
+        """WHERE is decided before WHETHER: the new tier does not move the ini lookup."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, _CLASS_MARKED_OVERRIDES)
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
+        ) == 'not slow'
+        assert 'sub/pyproject.toml' in reads
+        assert 'pyproject.toml' not in reads, "root config is not this command's rootdir"
+
+    @pytest.mark.parametrize(
+        'test_command',
+        ['npm test', './scripts/test.sh', 'cd sub && uv run pytest x && cd .. && pytest y'],
+    )
+    def test_a_class_marked_target_behind_a_command_guard_is_refused_before_any_read(
+        self, test_command,
+    ):
+        """The command-shape guards run FIRST, and the new tier does not soften them."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            test_command, ['mod/tests/test_a.py'],
+            _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
 
 def _fallback_mc(test_command: str | None) -> ModuleConfig:
     """The shape ``verify._build_fallback_config`` emits, with *test_command* substituted.
@@ -2115,6 +2199,27 @@ class TestWidenFallbackRefuses:
             'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
         )
 
+    # -- ARM 2's guards are unmoved by the class-level tier --------------------
+
+    @pytest.mark.parametrize(
+        'test_command',
+        [
+            None,
+            'npm test',
+            'cd sub && uv run pytest tests/test_a.py && cd .. && pytest tests/test_b.py',
+            'pytest',
+        ],
+    )
+    def test_a_class_marked_target_behind_each_guard_still_refuses(self, test_command):
+        """One case per guard: no command, non-PYTEST, raw-retained chain, no targets.
+
+        Each returns the input ModuleConfig by IDENTITY.  Serving CLASS-marked
+        sources here is what makes these non-vacuous under the widened probe:
+        the pyproject arm still deselects, so a guard that stopped firing would
+        now WIDEN — which it could not have done before task 4561.
+        """
+        self._refuses(test_command, _CLASS_MARKED_OVERRIDES)
+
 
 class TestWidenFallbackWidensOnFullDeselection:
     """``widen_fallback_for_marker_deselection`` — the POSITIVE half.
@@ -2177,6 +2282,29 @@ class TestWidenFallbackWidensOnFullDeselection:
         assert 'tests/test_a.py' in reason
         assert 'tests/test_b.py' in reason
 
+    def test_a_class_marked_target_widens_the_fallback(self):
+        """ARM 2 inherits the class tier through the SAME probe — no second call site.
+
+        ``widen_fallback_for_marker_deselection`` reaches
+        ``pytest_markers.deselecting_expression_for_targets`` only through
+        ``deselecting_expression_for_command``, exactly as the module arm does,
+        so widening that one probe gave both arms the capability in ONE place.
+        """
+        reads: list[str] = []
+        fallback = _fallback_mc('pytest tests/test_a.py')
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        )
+        assert widened.test_command == 'pytest', 'targets dropped, command otherwise intact'
+        assert reason is not None
+        assert 'tests/test_a.py' in reason, 'the reason names the still-unrun file'
+        assert 'not slow' in reason
+        assert 'NOT executed' in reason
+        # Marker deselection is a pytest-only concern: nothing else may move.
+        assert widened.prefix == fallback.prefix
+        assert widened.lint_command == fallback.lint_command
+        assert widened.type_check_command == fallback.type_check_command
+
     def test_the_subproject_shape_widens_against_its_own_rootdir(self):
         """``cd sub && uv run pytest <file>`` — task 2344's rescoping, unscoped in place.
 
@@ -2215,6 +2343,67 @@ class TestWidenFallbackWidensOnFullDeselection:
         widened, reason = widen_fallback_for_marker_deselection(fallback, read)
         assert widened is fallback
         assert reason is None
+
+
+class TestBothArmsAgreeOnClassLevelMarkers:
+    """THE AGREEMENT PIN — one shared probe, so the two arms cannot disagree.
+
+    The task's wiring requirement is that both consumers route through
+    ``guaranteed_marker_names``.  They do, but not by two call sites: BOTH
+    reach ``pytest_markers.deselecting_expression_for_targets`` through
+    ``verify_plan.deselecting_expression_for_command``, so tier 1 was widened
+    in exactly ONE place.  A second call site would CREATE the divergence risk
+    this pin exists to exclude, so the inheritance is asserted rather than a
+    second edit manufactured.
+    """
+
+    def test_both_arms_answer_alike_for_the_same_class_marked_command(self):
+        """Same command, same target, same reader: same verdict AND same reads."""
+        command = 'pytest mod/tests/test_a.py'
+
+        module_arm_reads: list[str] = []
+        module_arm = deselecting_expression_for_command(
+            command,
+            ['mod/tests/test_a.py'],
+            _permissive_reader(module_arm_reads, _CLASS_MARKED_OVERRIDES),
+        )
+
+        fallback_arm_reads: list[str] = []
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc(command),
+            _permissive_reader(fallback_arm_reads, _CLASS_MARKED_OVERRIDES),
+        )
+
+        assert module_arm == 'not slow'
+        assert widened.test_command == 'pytest'
+        assert reason is not None and module_arm in reason
+        assert module_arm_reads == fallback_arm_reads, (
+            'the two arms must read the same files in the same order'
+        )
+
+    def test_both_arms_refuse_alike_for_a_partially_marked_target(self):
+        """The refusal direction agrees too, not only the widening direction."""
+        override = dict(_CLASS_MARKED_OVERRIDES)
+        override['mod/tests/test_a.py'] = _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE.replace(
+            'warm_lane_bash', 'slow',
+        )
+        command = 'pytest mod/tests/test_a.py'
+
+        module_arm_reads: list[str] = []
+        module_arm = deselecting_expression_for_command(
+            command, ['mod/tests/test_a.py'], _permissive_reader(module_arm_reads, override),
+        )
+
+        fallback_arm_reads: list[str] = []
+        fallback = _fallback_mc(command)
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(fallback_arm_reads, override),
+        )
+
+        assert module_arm is None
+        assert widened is fallback, 'a refusal returns the input config untouched'
+        assert reason is None
+        assert module_arm_reads == fallback_arm_reads
 
 
 @pytest.mark.usefixtures('code_default_config')
