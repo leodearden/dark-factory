@@ -429,3 +429,158 @@ class TestSeamUnstampedClusterMember:
         result = await _set_done(interceptor)
         assert result['error'] == 'consolidation_not_closed'
         assert probes == [(stray, resolve_project_id(_PROJECT_ROOT))]
+
+
+class TestSeamUnstampedEdgePolicies:
+    """The policies the minimal wiring is not FORCED to get right.
+
+    Each is asserted through the real ``set_task_status`` chokepoint, because
+    the property that matters is what the seam does, not what the predicate
+    would do if called correctly.
+    """
+
+    @staticmethod
+    def _canonical_claiming(absorbed):
+        """``_WELL_FORMED``, with the canonical claiming *absorbed* deleted."""
+        canonical = {
+            'id': _uuid(1),
+            'created_at': '2026-08-24T00:00:00+00:00',
+            'metadata': {
+                'topic': _TOPIC,
+                'canonical': True,
+                'supersedes': [absorbed],
+            },
+        }
+        return [canonical, _member(_uuid(2))]
+
+    @pytest.mark.asyncio
+    async def test_the_delete_arm_still_closes(self, interceptor, taskmaster):
+        """ACCEPTANCE 3. An observed id absent from the scroll AND claimed in
+        the canonical\'s ``supersedes`` is a correctly absorbed member, not a
+        stray. Without this, every correctly executed delete-arm consolidation
+        would become permanently uncloseable."""
+        absorbed = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([_uuid(1), absorbed]),
+        }
+        # The probe would report it LIVE if asked — proving the SUPPRESSION is
+        # what closes the gate, not a lucky probe result.
+        scroll = _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
+        interceptor.set_consolidation_scroll(scroll)
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert taskmaster.set_task_status.await_count == 1
+        assert scroll.probes == []
+
+    @pytest.mark.asyncio
+    async def test_hard_deleted_but_unclaimed_still_closes(
+        self, interceptor, taskmaster
+    ):
+        """The PROBE, not the claim, is the final discriminator: an id deleted
+        by hand without being recorded in ``supersedes`` is still absorbed."""
+        gone = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([gone]),
+        }
+        scroll = _scroll(_WELL_FORMED, live_ids=[])
+        interceptor.set_consolidation_scroll(scroll)
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert taskmaster.set_task_status.await_count == 1
+        assert scroll.probes == [(gone, resolve_project_id(_PROJECT_ROOT))]
+
+    @pytest.mark.asyncio
+    async def test_dormant_without_a_probe(self, interceptor, taskmaster):
+        """An unwired probe must not manufacture a refusal it cannot
+        substantiate — the inertness property
+        ``test_consolidation_gate.py::test_provenance_never_grants_a_pass``
+        states, in the direction that matters here."""
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        interceptor.set_consolidation_scroll(_scroll(_WELL_FORMED))
+        with_prov = await _set_done(interceptor)
+
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _gate_metadata(),
+        }
+        taskmaster.set_task_status.reset_mock()
+        interceptor.set_consolidation_scroll(_scroll(_WELL_FORMED))
+        without_prov = await _set_done(interceptor)
+
+        assert with_prov == without_prov
+        assert with_prov.get('error') is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_fails_closed(self, interceptor, taskmaster):
+        """Same direction as ``TestSeamFailsClosed``\'s scroll cases: the probe
+        inherits the fail-closed policy by sitting inside the same try."""
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([_uuid(42)]),
+        }
+        interceptor.set_consolidation_scroll(
+            _scroll(_WELL_FORMED, probe_raises=TimeoutError('qdrant point read'))
+        )
+        result = await _set_done(interceptor)
+        assert result['success'] is False
+        assert result['error'] == 'consolidation_not_closed'
+        taskmaster.set_task_status.assert_not_called()
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_truncation_suppresses_it_at_the_seam(
+        self, interceptor, taskmaster
+    ):
+        """The caller INHERITS ``evaluate_closure``\'s absence-based guard
+        rather than re-implementing it: past the cap, \'not stamped\' and
+        \'not seen\' are the same fact."""
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        interceptor.set_consolidation_scroll(
+            _scroll(_WELL_FORMED, total=500, live_ids=[stray])
+        )
+        result = await _set_done(interceptor)
+        codes = [r['code'] for r in result['reasons']]
+        assert 'scroll_incomplete' in codes
+        assert 'unstamped_cluster_member' not in codes
+
+    @pytest.mark.asyncio
+    async def test_a_waiver_reaches_the_derived_id(self, interceptor, taskmaster):
+        """The only sanctioned exit for a stray a curator deliberately kept —
+        which also proves the derived ids really do land in
+        ``evaluate_closure``\'s ``live_universe``."""
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate(
+                [stray],
+                considered_and_kept=[
+                    {
+                        'id': stray,
+                        'note': 'kept deliberately: a separate claim, not residue',
+                        'recorded_at': '2026-08-27T12:00:00+00:00',
+                        'recorded_by': 'recon-stage-2',
+                    }
+                ],
+            ),
+        }
+        interceptor.set_consolidation_scroll(_scroll(_WELL_FORMED, live_ids=[stray]))
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert taskmaster.set_task_status.await_count == 1
