@@ -2283,18 +2283,30 @@ class TestSessionResumeGuard:
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:
-    """γ fallback-storm escape (INV-4, task 2774, narrowed by task 3256): a RUN
-    of UNEXPLAINED session_resume_fallback degradations reaching
+    """γ fallback-storm escape (INV-4, task 2774; narrowed by 3256, carved out
+    by 3728): a RUN of GENUINE session-resume failures reaching
     fallback_storm_threshold files ONE deduped L1 escalation.
 
     The streak is a rolling CHAIN, not a per-boot running total: consecutive
     means chained within storm_window_secs, so a gap at least that long decays
     it to 0 (an eligible resume also resets it outright, and clears the chain's
-    comparison stamp). Three degradations are excluded from it — 'disabled'
-    (silent kill switch), 'capped' (by-design throttling) and 'reseeded'
-    (by-design lane wipe) — leaving only the genuine corroboration failures
-    {stale, no_transcript}. Filing is best-effort — a None queue never raises
-    (I3).
+    comparison stamp).
+
+    WHAT FEEDS IT is the part task 3728 changed. EVERY by-design outcome is now
+    excluded by construction — 'disabled' (silent kill switch), 'capped'
+    (throttling), 'reseeded' (lane wipe) and, newly, 'stale' and
+    'no_transcript'. The last two were classified genuine while
+    ``_session_resume_reasons``' own docstring described them as the
+    anticipated reseed/wipe/clock cases, so the L1 they filed sent operators to
+    check NTP for a population the system expects to see. After the carve-out
+    NOTHING the predicate can currently produce feeds the streak — the
+    deliberate, G7-waived window that PRD leaf ε (task 3733) closes by
+    installing the archive-restore-failure feeder.
+
+    So the mechanism is RETAINED and exercised here through a SYNTHETIC feeder
+    (:meth:`_arm_synthetic_feeder`) standing in for ε's, which doubles as the
+    executable statement of the extension contract ε consumes. Filing is
+    best-effort — a None queue never raises (I3).
     """
 
     @staticmethod
@@ -2326,6 +2338,130 @@ class TestSessionResumeStorm:
         q.make_id = MagicMock(return_value='sr-storm')
         return q
 
+    @staticmethod
+    def _arm_synthetic_feeder(
+        harness: Harness, reasons: frozenset[str] = frozenset({'restore_failed'}),
+    ) -> None:
+        """Make every dispatch report *reasons*, standing in for ε's feeder.
+
+        After the 3728 carve-out no reason the real predicate can produce feeds
+        the streak, so the increment / threshold / filing path has no reachable
+        production input until PRD leaf ε (task 3733) adds one. Patching the
+        predicate is the narrowest injection point that still exercises the
+        REAL caller, the REAL streak, the REAL dedup and the REAL filer — and
+        it states ε's extension contract executably: a reason absent from
+        ``_BY_DESIGN_SESSION_RESUME_REASONS`` feeds the storm with no second
+        edit anywhere.
+
+        ``restore_failed`` is deliberately the name ε is expected to use.
+        """
+        def _reasons(session: dict, config_dir: str | None) -> frozenset[str]:
+            return reasons
+
+        harness._session_resume_reasons = _reasons  # type: ignore[method-assign]
+
+    # ── NEGATIVE half: no by-design outcome can trip the escape ──────────────
+
+    @pytest.mark.parametrize(
+        'reason', ['stale', 'no_transcript', 'reseeded', 'capped'],
+    )
+    async def test_by_design_reasons_never_file_l1(
+        self, harness: Harness, tmp_path: Path, reason: str,
+    ):
+        """EVERY by-design outcome is excluded from the streak by construction
+        (task 3728 D4), however many of them arrive.
+
+        threshold=1 makes the very first GENUINE fallback fire, so a zero
+        submit count across four dispatches proves the reason does not feed the
+        streak at all. ``stale`` and ``no_transcript`` are the two this task
+        RECLASSIFIED — they used to file the L1 that told operators to check
+        NTP; ``reseeded`` and ``capped`` were already excluded (task 3256 /
+        2774) and are re-asserted here under the new set-based feeder.
+
+        The telemetry channel must SURVIVE the carve-out: this is noise
+        suppression of the ESCALATION, never of the event. One event per
+        dispatch, carrying the reason, exactly as before.
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=1, max_resumes_per_task=3,
+        )
+        harness._escalation_queue = self._queue()
+
+        expect_capped = reason == 'capped'
+        for i in range(4):
+            sid = f'uuid-bd-{reason}-{i}'
+            if reason == 'stale':
+                # Corroborated dir, so staleness is the SOLE reason.
+                session, cfg = self._stale_session(sid), _make_transcript(tmp_path, sid)
+            elif reason == 'no_transcript':
+                # The dir SURVIVES but holds no transcript for this session.
+                session = self._fresh_session(sid)
+                cfg = tmp_path / f'empty-{i}'
+                (cfg / 'projects').mkdir(parents=True)
+            elif reason == 'reseeded':
+                session = self._fresh_session(sid)
+                cfg = tmp_path / f'gone{i}' / 'claude-config-x'
+            else:  # capped
+                session = self._fresh_session(sid) | {'resume_count': 3}
+                cfg = _make_transcript(tmp_path, sid)
+
+            await _drive_session_slot(harness, f'bd{i}', session, config_dir=cfg)
+            # Asserted INSIDE the loop: the counter must never transiently
+            # rise, not merely end at 0.
+            assert harness._session_resume_fallback_streak == 0
+            assert harness._escalation_queue.submit.call_count == 0
+
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 4
+        for et, kwargs in emits:
+            if expect_capped:
+                assert et == EventType.session_resume_capped
+            else:
+                assert et == EventType.session_resume_fallback
+                assert kwargs['data']['reasons'] == [reason]
+
+    async def test_by_design_constant_classifies_every_producible_reason(self):
+        """``_BY_DESIGN_SESSION_RESUME_REASONS`` covers EXACTLY the vocabulary
+        ``_session_resume_reasons`` can currently produce.
+
+        The classification defaults to GENUINE — a reason absent from the
+        constant feeds the storm — which is the fail-LOUD direction, but it
+        makes "forgot to think about it" and "deliberately genuine"
+        indistinguishable at the constant. This row closes that: the producible
+        vocabulary is read structurally out of the predicate's own source, so
+        adding a reason without classifying it fails HERE.
+
+        ε (task 3733) is EXPECTED to trip this when it adds ``restore_failed``.
+        The correct resolution is almost certainly to extend this assertion,
+        NOT the constant: a restore failure is a genuine feeder, which is the
+        whole point of ε.
+        """
+        import ast  # noqa: PLC0415 — structural read of one method's source
+        import inspect  # noqa: PLC0415
+        import textwrap  # noqa: PLC0415
+
+        from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
+
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(Harness._session_resume_reasons))
+        )
+        producible: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            adds = isinstance(fn, ast.Attribute) and fn.attr == 'add'
+            builds = isinstance(fn, ast.Name) and fn.id == 'frozenset'
+            if adds or builds:
+                producible |= {
+                    c.value for c in ast.walk(node)
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                }
+
+        assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
+                              'reseeded'}, 'the source read itself drifted'
+        assert producible == _BY_DESIGN_SESSION_RESUME_REASONS
+
     async def test_reseeded_fallbacks_never_file_l1(
         self, harness: Harness, tmp_path: Path
     ):
@@ -2354,87 +2490,6 @@ class TestSessionResumeStorm:
             assert et == EventType.session_resume_fallback
             assert kwargs['data']['reasons'] == ['reseeded']
 
-    async def test_genuine_failures_still_file_l1_across_reseeded(
-        self, harness: Harness, tmp_path: Path
-    ):
-        """A reseeded fallback neither counts toward NOR resets the genuine
-        streak — the same semantics as ``capped`` (task 3256).
-
-        Interleaving reseeds between ``threshold`` stale fallbacks must still
-        file exactly one L1: a drip of by-design reseeds cannot mask a genuine
-        systematic failure hiding between them.
-        """
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        for i in range(3):
-            await _drive_session_slot(harness, f'g{i}', self._stale_session(f'uuid-g{i}'))
-            await _drive_session_slot(
-                harness, f'ir{i}', self._fresh_session(f'uuid-ir{i}'),
-                config_dir=tmp_path / f'gone{i}' / 'claude-config-x',
-            )
-
-        assert harness._escalation_queue.submit.call_count == 1
-        esc = harness._escalation_queue.submit.call_args.args[0]
-        assert esc.level == 1
-        assert 'resume' in esc.summary.lower()
-
-    async def test_streak_files_one_l1_at_threshold(self, harness: Harness):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        for i in range(3):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
-
-        assert harness._escalation_queue.submit.call_count == 1
-        esc = harness._escalation_queue.submit.call_args.args[0]
-        assert esc.level == 1
-        assert 'resume' in esc.summary.lower()
-
-    async def test_dedup_no_second_submit_when_l1_open(self, harness: Harness):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        for i in range(3):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
-        assert harness._escalation_queue.submit.call_count == 1
-
-        # L1 now open → further fallbacks must NOT re-submit (has_open_l1 dedup).
-        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        for i in range(3, 6):
-            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
-        assert harness._escalation_queue.submit.call_count == 1
-
-    async def test_streak_is_consecutive_reset_by_eligible(
-        self, harness: Harness, tmp_path: Path
-    ):
-        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
-        harness._escalation_queue = self._queue()
-
-        # 2 stale fallbacks (streak=2)...
-        for i in range(2):
-            await _drive_session_slot(harness, f'a{i}', self._stale_session(f'uuid-a{i}'))
-        # ...then an ELIGIBLE resume resets the streak to 0.
-        cfg = _make_transcript(tmp_path, 'uuid-ok')
-        await _drive_session_slot(
-            harness, 'ok1',
-            {
-                'session_id': 'uuid-ok', 'role': 'implementer',
-                'started_at': datetime.now(UTC).isoformat(),
-                'resume_count': 0,
-            },
-            config_dir=cfg,
-        )
-        # 2 more stale after the reset → streak=2 (<3) → still no L1.
-        for i in range(2):
-            await _drive_session_slot(harness, f'b{i}', self._stale_session(f'uuid-b{i}'))
-        assert harness._escalation_queue.submit.call_count == 0
-
-        # A 3rd consecutive stale AFTER the reset reaches threshold → fires once,
-        # proving the streak resumed from 0 (consecutive, not cumulative).
-        await _drive_session_slot(harness, 'b2', self._stale_session('uuid-b2'))
-        assert harness._escalation_queue.submit.call_count == 1
-
     async def test_capped_does_not_feed_streak(self, harness: Harness, tmp_path: Path):
         """resume_count-capped degradations are by-design throttling and must
         NOT count toward the storm streak (design decision, task 2774).
@@ -2458,6 +2513,157 @@ class TestSessionResumeStorm:
             )
         assert harness._escalation_queue.submit.call_count == 0
 
+    # ── POSITIVE half: the RETAINED mechanism, driven by ε's stand-in ────────
+
+    async def test_genuine_feeder_files_one_l1_at_threshold(self, harness: Harness):
+        """A reason OUTSIDE the by-design vocabulary reaches the threshold and
+        files exactly one L1 — the mechanism is retained, not deleted (F3).
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+
+        assert harness._session_resume_fallback_streak == 3
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
+        # The telemetry rides the same emit, carrying the unclassified reason.
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 3
+        for et, kwargs in emits:
+            assert et == EventType.session_resume_fallback
+            assert kwargs['data']['reasons'] == ['restore_failed']
+
+    async def test_dedup_no_second_submit_when_l1_open(self, harness: Harness):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # L1 now open → further fallbacks must NOT re-submit (has_open_l1 dedup).
+        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        for i in range(3, 6):
+            await _drive_session_slot(harness, f'st{i}', self._fresh_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_a_by_design_reason_cannot_launder_a_genuine_one(
+        self, harness: Harness
+    ):
+        """D4 ∧ D5 — a MIXED set still feeds the streak.
+
+        This is the conjunction that makes the carve-out safe. Under first-match
+        reporting a session that was BOTH stale and (say) restore-failed
+        reported only ``stale``; carving ``stale`` out of the feeder on top of
+        that would have SILENCED the genuine failure entirely — a by-design
+        reason laundering a real one, which is strictly worse than the
+        misdirection this task set out to fix. Because the caller subtracts the
+        by-design SET from the full reason set, what is left is non-empty and
+        the streak feeds exactly as it would on the genuine reason alone.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=2)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness, frozenset({'stale', 'restore_failed'}))
+
+        for i in range(2):
+            await _drive_session_slot(harness, f'mx{i}', self._fresh_session(f'uuid-mx{i}'))
+
+        assert harness._session_resume_fallback_streak == 2
+        assert harness._escalation_queue.submit.call_count == 1
+        # ...and BOTH reasons are on the wire, so the operator sees the
+        # by-design co-occurrence rather than inferring it.
+        et, kwargs = _session_resume_emits(harness)[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['restore_failed', 'stale']
+
+    async def test_storm_l1_no_longer_blames_clock_skew(self, harness: Harness):
+        """The filed L1's prose must match its new feeder.
+
+        Its detail used to name ``stale`` and ``no_transcript`` as the only
+        surviving causes and send the operator to check NTP FIRST. After D4
+        those are excluded by construction, so that text would be a confident
+        instruction to investigate a population that provably did not
+        contribute — the exact misdirection this task exists to remove, now
+        printed on the escalation itself.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        await _drive_session_slot(harness, 'p1', self._fresh_session('uuid-p1'))
+
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
+        assert 'NTP' not in text
+        assert 'clock skew' not in text.lower()
+        assert 'stale' not in text
+        assert 'no_transcript' not in text
+        # It must instead point at the reasons actually on the wire.
+        assert "$.reasons" in esc.detail
+
+    async def test_genuine_failures_still_file_l1_across_by_design(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A by-design fallback neither counts toward NOR resets the genuine
+        streak (task 3256's anti-masking rule, generalised by 3728).
+
+        Interleaving reseeds between ``threshold`` genuine fallbacks must still
+        file exactly one L1: a drip of by-design outcomes cannot mask a genuine
+        systematic failure hiding between them. The genuine half now comes from
+        the synthetic feeder, since stale no longer qualifies — so the
+        interleaving is driven by swapping the predicate rather than by two
+        different fixtures.
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            self._arm_synthetic_feeder(harness)
+            await _drive_session_slot(harness, f'g{i}', self._fresh_session(f'uuid-g{i}'))
+            # A by-design reseed between each genuine failure.
+            self._arm_synthetic_feeder(harness, frozenset({'reseeded'}))
+            await _drive_session_slot(harness, f'ir{i}', self._fresh_session(f'uuid-ir{i}'))
+
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
+
+    async def test_streak_is_consecutive_reset_by_eligible(
+        self, harness: Harness, tmp_path: Path
+    ):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
+
+        # 2 genuine fallbacks (streak=2)...
+        for i in range(2):
+            await _drive_session_slot(harness, f'a{i}', self._fresh_session(f'uuid-a{i}'))
+        # ...then an ELIGIBLE resume resets the streak to 0. The real predicate
+        # has to be back in place for a resume to BE eligible.
+        del harness._session_resume_reasons
+        cfg = _make_transcript(tmp_path, 'uuid-ok')
+        await _drive_session_slot(
+            harness, 'ok1', self._fresh_session('uuid-ok'), config_dir=cfg,
+        )
+        # 2 more genuine after the reset → streak=2 (<3) → still no L1.
+        self._arm_synthetic_feeder(harness)
+        for i in range(2):
+            await _drive_session_slot(harness, f'b{i}', self._fresh_session(f'uuid-b{i}'))
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # A 3rd consecutive genuine fallback AFTER the reset reaches threshold →
+        # fires once, proving the streak resumed from 0 (consecutive, not
+        # cumulative).
+        await _drive_session_slot(harness, 'b2', self._fresh_session('uuid-b2'))
+        assert harness._escalation_queue.submit.call_count == 1
+
     async def test_streak_decays_after_storm_window(self, harness: Harness):
         """A gap of >= storm_window_secs between two genuine fallbacks decays
         the streak to 0, so an isolated drip can never accumulate into a false
@@ -2471,10 +2677,11 @@ class TestSessionResumeStorm:
             fallback_storm_threshold=3, storm_window_secs=60,
         )
         harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
 
         # Two genuine fallbacks inside the window → streak=2.
         for i in range(2):
-            await _drive_session_slot(harness, f'd{i}', self._stale_session(f'uuid-d{i}'))
+            await _drive_session_slot(harness, f'd{i}', self._fresh_session(f'uuid-d{i}'))
         assert harness._session_resume_fallback_streak == 2
 
         # ...then the clock jumps past the window before the 3rd arrives.
@@ -2482,25 +2689,22 @@ class TestSessionResumeStorm:
         assert harness._last_session_resume_fallback_at is not None
         harness._last_session_resume_fallback_at -= 120
 
-        await _drive_session_slot(harness, 'd2', self._stale_session('uuid-d2'))
+        await _drive_session_slot(harness, 'd2', self._fresh_session('uuid-d2'))
 
         # Decayed to 0, then re-incremented — NOT 3, so no L1.
         assert harness._session_resume_fallback_streak == 1
         assert harness._escalation_queue.submit.call_count == 0
 
-    async def test_reseeded_fallbacks_do_not_refresh_the_chain_stamp(
+    async def test_by_design_fallbacks_do_not_refresh_the_chain_stamp(
         self, harness: Harness, tmp_path: Path
     ):
-        """A reseeded fallback must leave ``_last_session_resume_fallback_at``
+        """A by-design fallback must leave ``_last_session_resume_fallback_at``
         untouched, not just the streak counter (task 3256 amendment).
 
         The stamp is the chain's comparison point, so refreshing it on a
-        by-design reseed would keep the chain alive across an arbitrarily long
+        by-design outcome would keep the chain alive across an arbitrarily long
         drip: two genuine failures hours apart could then still chain into a
-        false storm, re-opening the exact hole the decay window closes. That
-        is one refactor away — hoisting ``now = time.monotonic()`` above the
-        reason dispatch — and every other test in this class stays green
-        under it, so the stamp identity is pinned directly here.
+        false storm, re-opening the exact hole the decay window closes.
         """
         harness.config.session_resume = SessionResumeConfig(
             fallback_storm_threshold=2, storm_window_secs=60,
@@ -2508,12 +2712,15 @@ class TestSessionResumeStorm:
         harness._escalation_queue = self._queue()
 
         # One genuine fallback opens the chain: streak=1, stamp set.
-        await _drive_session_slot(harness, 'cs0', self._stale_session('uuid-cs0'))
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'cs0', self._fresh_session('uuid-cs0'))
         assert harness._session_resume_fallback_streak == 1
         stamp = harness._last_session_resume_fallback_at
         assert stamp is not None
 
-        # A drip of reseeds moves NEITHER the counter nor the stamp.
+        # A drip of REAL by-design reseeds moves NEITHER the counter nor the
+        # stamp (real predicate, so this is not an artifact of the stand-in).
+        del harness._session_resume_reasons
         for i in range(3):
             await _drive_session_slot(
                 harness, f'csr{i}', self._fresh_session(f'uuid-csr{i}'),
@@ -2526,7 +2733,8 @@ class TestSessionResumeStorm:
         # measured against the first one and decays — reaching 1, not the
         # threshold of 2.
         harness._last_session_resume_fallback_at = stamp - 120
-        await _drive_session_slot(harness, 'cs1', self._stale_session('uuid-cs1'))
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'cs1', self._fresh_session('uuid-cs1'))
 
         assert harness._session_resume_fallback_streak == 1
         assert harness._escalation_queue.submit.call_count == 0
@@ -2539,10 +2747,11 @@ class TestSessionResumeStorm:
             fallback_storm_threshold=3, storm_window_secs=60,
         )
         harness._escalation_queue = self._queue()
+        self._arm_synthetic_feeder(harness)
 
         # Three back-to-back fallbacks — no rewind, so all chain inside the window.
         for i in range(3):
-            await _drive_session_slot(harness, f'w{i}', self._stale_session(f'uuid-w{i}'))
+            await _drive_session_slot(harness, f'w{i}', self._fresh_session(f'uuid-w{i}'))
 
         assert harness._session_resume_fallback_streak == 3
         assert harness._escalation_queue.submit.call_count == 1
@@ -2559,10 +2768,12 @@ class TestSessionResumeStorm:
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
         harness._escalation_queue = self._queue()
 
-        await _drive_session_slot(harness, 'ts0', self._stale_session('uuid-ts0'))
+        self._arm_synthetic_feeder(harness)
+        await _drive_session_slot(harness, 'ts0', self._fresh_session('uuid-ts0'))
         assert harness._session_resume_fallback_streak == 1
         assert harness._last_session_resume_fallback_at is not None
 
+        del harness._session_resume_reasons  # a resume must be genuinely eligible
         cfg = _make_transcript(tmp_path, 'uuid-ts-ok')
         await _drive_session_slot(
             harness, 'ts-ok', self._fresh_session('uuid-ts-ok'), config_dir=cfg,
@@ -2577,10 +2788,11 @@ class TestSessionResumeStorm:
         """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = None
+        self._arm_synthetic_feeder(harness)
 
-        # threshold=1 → the very first fallback trips the filer, which must
-        # early-return on the absent queue rather than raising.
-        await _drive_session_slot(harness, 'x1', self._stale_session('uuid-x1'))
+        # threshold=1 → the very first genuine fallback trips the filer, which
+        # must early-return on the absent queue rather than raising.
+        await _drive_session_slot(harness, 'x1', self._fresh_session('uuid-x1'))
 
 
 @pytest.mark.asyncio
