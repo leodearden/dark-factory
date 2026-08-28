@@ -41,7 +41,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import complete_paged_read, incomplete_paged_read
 
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_PAGE_CAP,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+)
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     extract_priority_override_task_id,
     is_ttl_override_fact,
@@ -52,12 +59,14 @@ from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
 
 
 def _make_memory_service() -> MagicMock:
-    """MagicMock memory_service with an AsyncMock .graphiti.get_all_valid_edges
-    and .update_edge (mirrors test_stale_status_snapshot_edge_sweep.py's
-    _make_memory_service)."""
+    """MagicMock memory_service with an AsyncMock
+    .graphiti.enumerate_all_valid_edges and .update_edge (mirrors
+    test_stale_status_snapshot_edge_sweep.py's _make_memory_service)."""
     memory_service = MagicMock()
     memory_service.graphiti = MagicMock()
-    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
     memory_service.update_edge = AsyncMock()
     return memory_service
 
@@ -502,7 +511,8 @@ class TestReadLiveOverrideState:
 
 class TestSweepStalePriorityOverrideEdgesCore:
     """sweep_stale_priority_override_edges enumerates valid edges via
-    memory_service.graphiti.get_all_valid_edges, reads live override state via
+    memory_service.graphiti.enumerate_all_valid_edges, reads live override state
+    via
     the injected read_live, and invalidates only the edges
     select_stale_priority_override_edges identifies as stale.
     """
@@ -526,8 +536,11 @@ class TestSweepStalePriorityOverrideEdgesCore:
             'fact': "Set priority override for task 999: {'boost_tier': 'high'}",
             'name': '',
         }
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge, healthy_edge]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         read_live = AsyncMock(return_value={'999': {'ttl_until': None}})
 
@@ -562,6 +575,8 @@ class TestSweepStalePriorityOverrideEdgesCore:
             'stale_selected': 1,
             'invalidated': 1,
             'errors': 0,
+            'enumeration_complete': True,
+            'enumeration_incomplete_kind': None,
         }, (
             'Expected both priority-override edges counted as candidates, exactly '
             f'the one stale edge selected+invalidated, got stats={stats!r}'
@@ -588,7 +603,7 @@ class TestSweepStalePriorityOverrideEdgesGuards:
 
     @pytest.mark.asyncio
     async def test_empty_project_root_yields_all_zero_stats_with_no_calls(self):
-        """project_root='' -> all-zero stats; get_all_valid_edges and
+        """project_root='' -> all-zero stats; enumerate_all_valid_edges and
         read_live never awaited."""
         memory_service = _make_memory_service()
         read_live = AsyncMock()
@@ -603,16 +618,20 @@ class TestSweepStalePriorityOverrideEdgesGuards:
             'stale_selected': 0,
             'invalidated': 0,
             'errors': 0,
+            'enumeration_complete': None,
+            'enumeration_incomplete_kind': None,
         }
-        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
         read_live.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
-        """get_all_valid_edges raises -> all-zero stats except errors=1, no
+    async def test_enumerate_all_valid_edges_failure_yields_all_zero_stats_without_raising(
+        self,
+    ):
+        """enumerate_all_valid_edges raises -> all-zero stats except errors=1, no
         raise, read_live/update_edge not awaited."""
         memory_service = _make_memory_service()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
             side_effect=RuntimeError('transient read timeout'),
         )
         read_live = AsyncMock()
@@ -627,6 +646,8 @@ class TestSweepStalePriorityOverrideEdgesGuards:
             'stale_selected': 0,
             'invalidated': 0,
             'errors': 1,
+            'enumeration_complete': None,
+            'enumeration_incomplete_kind': None,
         }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
@@ -639,8 +660,11 @@ class TestSweepStalePriorityOverrideEdgesGuards:
         read_live never awaited and invalidated == 0."""
         memory_service = _make_memory_service()
         non_candidate = {'uuid': 'edge-x', 'fact': 'Task 5 is done', 'name': ''}
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [non_candidate]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [non_candidate]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         read_live = AsyncMock()
 
@@ -667,8 +691,11 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
         """read_live raises -> best-effort no-op: errors tallied, no
         update_edge attempted, no raise."""
         memory_service = _make_memory_service()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [_boost_fact_edge('edge-c', 5166)]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [_boost_fact_edge('edge-c', 5166)]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         read_live = AsyncMock(side_effect=RuntimeError('db locked'))
 
@@ -682,6 +709,8 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
             'stale_selected': 0,
             'invalidated': 0,
             'errors': 1,
+            'enumeration_complete': True,
+            'enumeration_incomplete_kind': None,
         }, (
             'Expected the candidate counted but the read_live failure tallied as '
             'an error before any selection/invalidation (stale_selected stays 0), '
@@ -695,13 +724,16 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
         still attempted. Only the successful one counts as invalidated, the
         failure counts as an error."""
         memory_service = _make_memory_service()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={
-                'entity-a': [
-                    _boost_fact_edge('edge-stale-1', 5166),
-                    _boost_fact_edge('edge-stale-2', 4079),
-                ],
-            },
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {
+                    'entity-a': [
+                        _boost_fact_edge('edge-stale-1', 5166),
+                        _boost_fact_edge('edge-stale-2', 4079),
+                    ],
+                },
+                complete_paged_read(rows_seen=2),
+            ),
         )
         # Empty live map -> both absent -> both stale.
         read_live = AsyncMock(return_value={})
@@ -720,6 +752,8 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
             'stale_selected': 2,
             'invalidated': 1,
             'errors': 1,
+            'enumeration_complete': True,
+            'enumeration_incomplete_kind': None,
         }, (
             f'Expected the failed update tallied without blocking the second, got {stats!r}'
         )
@@ -729,8 +763,11 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
         """asyncio.CancelledError raised from update_edge must propagate — it
         is never swallowed as a best-effort error."""
         memory_service = _make_memory_service()
-        memory_service.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [_boost_fact_edge('edge-stale', 5166)]},
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [_boost_fact_edge('edge-stale', 5166)]},
+                complete_paged_read(rows_seen=1),
+            ),
         )
         read_live = AsyncMock(return_value={})
         memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
@@ -739,3 +776,219 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
             await sweep_stale_priority_override_edges(
                 memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
             )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_priority_override_edges — enumeration completeness signal
+# (task 4386)
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStalePriorityOverrideEdgesEnumerationCompleteness:
+    """This sweep reports whether the corpus it swept was the WHOLE corpus.
+
+    Same tri-state contract as the status-snapshot sweep — ``True`` proven
+    complete, ``False`` observed-and-incomplete, ``None`` no-corpus-observed,
+    and ``is True`` the only admissible gate — deliberately identical so a
+    consumer reading both sweeps' stats applies ONE rule, not two.
+
+    What is NOT shared is the funnel these keys sit beside. This sweep counts
+    ``scanned`` -> ``candidate_edges`` (the PRE-selection pool) ->
+    ``stale_selected`` (post-selection) -> ``invalidated``, which is the
+    opposite sense from the status sweep's ``candidate_edges``, and it has no
+    supersede counters at all. The two new keys describe the READ that
+    produced ``scanned``, not a stage of that funnel, so they narrow nothing.
+
+    This sweep also short-circuits on a falsy ``project_root`` rather than on
+    a falsy ``taskmaster``, so the no-corpus path is reached differently even
+    though it reports the same ``None``.
+    """
+
+    @staticmethod
+    def _memory_reading(paged) -> MagicMock:
+        """A memory service whose enumeration returns one stale edge + *paged*."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=({'entity-a': [_boost_fact_edge('edge-stale', 5166)]}, paged),
+        )
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_complete_read_reports_complete_true_and_no_kind(self):
+        """A proven-complete read: the sweep behaves exactly as it always did."""
+        memory_service = self._memory_reading(complete_paged_read(rows_seen=1))
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1',
+            read_live=AsyncMock(return_value={}),
+        )
+
+        assert stats['enumeration_complete'] is True, (
+            f'Expected a proven-complete read reported as True, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind, got {stats!r}'
+        )
+        assert stats['scanned'] == 1
+        assert stats['stale_selected'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind', [INCOMPLETE_CENSUS_UNAVAILABLE, INCOMPLETE_SHORT_READ],
+        ids=['census_unavailable', 'short_read'],
+    )
+    async def test_empirical_incompleteness_still_sweeps_but_says_so(self, kind):
+        """EMPIRICAL incompleteness -> sweep what was fetched, and report it.
+
+        The empirical kinds are transient-capable on a graph under continuous
+        write, so the sweep proceeds through ``read_live`` and invalidation
+        normally and ``errors`` stays 0. What changes is that the cycle now
+        SAYS the corpus was partial, so a consumer can decline to treat this
+        cycle's absences as evidence that an override is gone.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=40),
+        )
+        read_live = AsyncMock(return_value={})
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1',
+            read_live=read_live,
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the partial corpus reported as False, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the stable {kind!r} discriminator surfaced, got {stats!r}'
+        )
+        read_live.assert_awaited_once_with('/tmp/reify')
+        assert stats['scanned'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0, (
+            f'An empirical incompleteness is NOT an error — raising on a census '
+            f'disagreement would flap on a live graph, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_structural_incompleteness_reports_the_kind_beside_the_error(
+        self, kind,
+    ):
+        """A STRUCTURAL abort is a STRUCTURED fact, not just a log line.
+
+        Parametrised over the frozenset rather than the two named constants,
+        so a future third structural path is covered by construction.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=9999),
+        )
+        read_live = AsyncMock(return_value={})
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1',
+            read_live=read_live,
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the aborted cycle to still report the corpus as partial, '
+            f'got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the abort reason carried as a structured fact, got {stats!r}'
+        )
+        assert stats['errors'] == 1, f'Expected the abort tallied, got {stats!r}'
+        assert stats['scanned'] == 0, (
+            f'A structurally truncated read must NOT be scanned as if whole, '
+            f'got {stats!r}'
+        )
+        assert stats['candidate_edges'] == 0, (
+            f'The abort precedes candidate selection entirely, got {stats!r}'
+        )
+        read_live.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_observes_no_corpus(self):
+        """Falsy project_root -> no read happened, so completeness is UNKNOWN.
+
+        ``None``, not ``True``: nothing was proven about the corpus because
+        nothing was read.
+        """
+        memory_service = _make_memory_service()
+        read_live = AsyncMock()
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '', run_id='run-1', read_live=read_live,
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN on the short-circuit path, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 0, (
+            f'The short-circuit is not an error — that is what distinguishes it '
+            f'from a failed read, got {stats!r}'
+        )
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_observes_no_corpus(self):
+        """The read itself raised -> also UNKNOWN, distinguished by ``errors``."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1',
+            read_live=AsyncMock(),
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN when the read never returned, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 1, (
+            f'Expected the failed read tallied, which is what distinguishes it '
+            f'from the short-circuit, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_is_true_gates_a_swept_corpus(self):
+        """``is True`` is the ONLY admissible gate predicate.
+
+        An ``is not False`` test would wrongly admit the UNKNOWN path, letting
+        a cycle that never looked pass as one that looked and found
+        everything.
+        """
+        async def _sweep(memory_service, project_root='/tmp/reify'):
+            return await sweep_stale_priority_override_edges(
+                memory_service, 'test_project', project_root, run_id='run-1',
+                read_live=AsyncMock(return_value={}),
+            )
+
+        complete = await _sweep(self._memory_reading(complete_paged_read(rows_seen=1)))
+        empirical = await _sweep(self._memory_reading(
+            incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40),
+        ))
+        structural = await _sweep(self._memory_reading(
+            incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1, expected_rows=9999),
+        ))
+        unread = await _sweep(_make_memory_service(), project_root='')
+
+        gated = [
+            name for name, stats in (
+                ('complete', complete), ('empirical', empirical),
+                ('structural', structural), ('unread', unread),
+            )
+            if stats['enumeration_complete'] is True
+        ]
+        assert gated == ['complete'], (
+            f'Only a PROVEN-complete read may pass the gate, got {gated!r}'
+        )
+        assert empirical['enumeration_complete'] is False
+        assert structural['enumeration_complete'] is False
+        assert unread['enumeration_complete'] is None
