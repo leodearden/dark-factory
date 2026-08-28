@@ -232,7 +232,17 @@ contend with.
   `plans/eval-framework-revival-prd.capability-manifest.yaml` and 4 on
   `plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml` (early-Greek tasks
   against sidecars declaring only a later wave), plus 2 non-Greek labels (3289 `restore-gate`,
-  4172 `kappa-followup`). They need per-class adjudication by someone holding the relevant PRD
-  context, not a blanket rename, and this task holds no lock on those sidecars.
+  4172 `kappa-followup` — and note `kappa-followup` is *not* a transliteration of `κ`, since that
+  sidecar declares `κ` separately and binds it to task 3544). They need per-class adjudication by
+  someone holding the relevant PRD context, not a blanket rename, and this task holds no lock on
+  those sidecars. **Filed as `tkt_0RT0D6M68VMRA0X45GXQXNW9YH`** with all 21 rows recorded verbatim
+  and the reproduction recipe, so the measurement survives independently of this document. One
+  detail worth carrying: **4172 is the only non-terminal row in the set**, and therefore the only
+  one where the defect is still live for a future `commit_planning`.
+- **No pointer was added to the PRD's own docs trail, deliberately.** The natural target,
+  `plans/toolcall-markup-containment-prd.md`, is declared by four in-flight tasks (4502
+  in-progress, 4558 deferred, 4787 pending, 4896 pending). Editing it here would contend on their
+  file locks for a one-line cross-reference. This directory is discoverable on its own, and task
+  4896 is free to link it if that turns out to matter.
 - **The δ descriptor divergence is measured but not fixed** — see
   [The deferred row](#the-deferred-row).
