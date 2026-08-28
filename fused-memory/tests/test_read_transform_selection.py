@@ -77,7 +77,7 @@ class TestTheScriptsAreLoadedOnceNotReExecuted:
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py:82-83`` returns
+    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
     ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
     serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and

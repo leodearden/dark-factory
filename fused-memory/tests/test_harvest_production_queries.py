@@ -62,15 +62,26 @@ def _mod() -> types.ModuleType:
 
 
 class TestTheScriptIsLoadedOnceNotReExecuted:
-    """The loader seam must REUSE the script, not re-execute it.
+    """The local loader seam must DELEGATE to the shared helper rather than
+    re-execute the script.
 
-    An unconditional re-exec mints a SECOND module object under the same
-    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard the shared helper exists for: ``scripts/read_transform_selection.py``
-    :82-83 returns ``sys.modules[name]`` BY NAME ONLY, with no ``__file__``
-    check, so it serves whichever object a test module last registered under
-    that key.  ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto
-    --dist loadgroup"``, so collection order is not stable.
+    Narrower than the bake-off module's version of this test, and
+    deliberately so: the hazard THAT one names —
+    ``scripts/read_transform_selection.py::_load_script`` serving
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check — cannot
+    reach this key at all, because that bootstrap is only ever called via
+    ``bake_off()`` with the name ``'bake_off_storage_shape'``.
+
+    What is real here is smaller: TWO test modules register
+    ``'harvest_production_queries'`` for the same file — this module's
+    ``_load_module()`` and ``test_read_transform_selection.py``'s
+    ``_load_script(HARVEST_PATH, ...)``.  An unconditional re-exec in either
+    mints a SECOND module object under that shared key and whichever loader
+    ran last wins; ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto
+    --dist loadgroup"``, so which one that is is not stable.  Both now route
+    through ``load_script_module``, which serves the already-loaded module
+    for the same path — so the two registrations cooperate instead of
+    racing.  This test is what holds that delegation in place.
 
     The UNCACHED seam is what this calls: ``_mod()`` is ``functools.cache``d
     and would pass vacuously.

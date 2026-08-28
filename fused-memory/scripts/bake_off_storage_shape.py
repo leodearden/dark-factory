@@ -4398,10 +4398,15 @@ def read_fetch_cache(path: str | Path | FetchCache) -> FetchCache:
 def load_fetch_provenance(path: str | Path | FetchCache) -> dict[str, Any]:
     """The dump's provenance block — the live-only half of a replayed report.
 
-    Separate from :func:`load_fetches` because the driver needs it BEFORE it
-    has materialized anything (``guard_threshold`` and ``embedder_model`` go
-    into the protocol block), and because reading it must not require the
-    caller to have already built every arm.
+    A convenience accessor for a caller that wants ONLY the provenance and
+    holds nothing else from the cache; it is exactly
+    ``read_fetch_cache(path).provenance``.  It no longer has a production
+    caller: ``_replay_bake_off`` used to reach for it before it had
+    materialized any arm, but it now decodes the document once up front and
+    reads ``.provenance`` off the threaded :class:`FetchCache` instead —
+    which is the point of threading one.  Kept because it names that read for
+    the tests that only want the block, and because it costs one line over
+    the accessor they would otherwise spell out.
     """
     return read_fetch_cache(path).provenance
 
