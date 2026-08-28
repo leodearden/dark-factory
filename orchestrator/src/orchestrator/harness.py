@@ -9053,7 +9053,7 @@ class Harness:
             # storm-escape at fallback_storm_threshold) is a separate question
             # from which event is emitted: see the streak branch below.
             #
-            # Both session_resume_fallback emits also carry archive_available
+            # Every session_resume_fallback emit also carries archive_available
             # (task 3727) — was this session still recoverable from the durable
             # transcript archive? That is INSTRUMENTATION ONLY (D8 / INV-3
             # instrument-before-acting): it reports the recoverable population
@@ -9062,6 +9062,41 @@ class Harness:
             # may later gate on the signal; task 3578 is what consumes
             # durable_archive_path to perform an actual restore.
             if recovered_session is not None:
+                # Rolling-window decay, evaluated ONCE PER DISPATCH that
+                # carried a recovered session — BEFORE the reasons, because it
+                # is about the passage of time, not about this session.
+                #
+                # "Consecutive" means CHAINED within storm_window_secs, not
+                # merely cumulative-per-boot, which is what makes the streak a
+                # storm DETECTOR rather than a running total. A gap at least as
+                # long as the window means the previous run ENDED. Monotonic,
+                # not wall-clock: clock skew is one of the things this seam
+                # exists to survive.
+                #
+                # Hoisted here (task 3728) from the increment branch, where it
+                # made the counter correct only at the moment it CHANGED: with
+                # no genuine failure arriving, an ended run kept reading its
+                # last value indefinitely and was retired only if and when the
+                # next one happened to show up. Any other reader — ε's re-armed
+                # feeder (task 3733) among them — saw a run that was over.
+                #
+                # Scoped to dispatches carrying a recovered session rather than
+                # literally every dispatch: that is the population the counter
+                # is ABOUT, and this guard block is the only site with the
+                # state in scope. Widening it would put resume bookkeeping on
+                # the path of tasks that have no recovered session, for no
+                # signal. A by-design outcome still neither feeds NOR resets
+                # the streak — expiry is not a reset, it is the run ending.
+                now = time.monotonic()
+                window = self.config.session_resume.storm_window_secs
+                if (
+                    self._last_session_resume_fallback_at is not None
+                    and (now - self._last_session_resume_fallback_at) >= window
+                ):
+                    self._session_resume_fallback_streak = 0
+                    # Drop the comparison point too, so the next fallback opens
+                    # a fresh run instead of chaining off an expired stamp.
+                    self._last_session_resume_fallback_at = None
                 reasons = self._session_resume_reasons(
                     recovered_session, recovered_config_dir
                 )
@@ -9172,21 +9207,12 @@ class Harness:
                         # putting a by-design reason back on the feeder.
                         genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
                         if genuine:
-                            #
-                            # Rolling-window decay (task 3256): "consecutive" means
-                            # CHAINED within storm_window_secs, not merely
-                            # cumulative-per-boot — which is what makes this a
-                            # storm DETECTOR rather than a running total. A gap at
-                            # least as long as the window means the previous run
-                            # ended, so start counting over. Monotonic, not
-                            # wall-clock: 'stale' is itself produced by clock skew.
-                            now = time.monotonic()
-                            window = self.config.session_resume.storm_window_secs
-                            if (
-                                self._last_session_resume_fallback_at is not None
-                                and (now - self._last_session_resume_fallback_at) >= window
-                            ):
-                                self._session_resume_fallback_streak = 0
+                            # The window was already applied above, so this
+                            # branch only EXTENDS the chain: refresh the
+                            # comparison stamp and count. The stamp is
+                            # refreshed ONLY here, by a genuine feeder — a drip
+                            # of by-design fallbacks must not keep a chain
+                            # alive across an arbitrarily long gap (task 3256).
                             self._last_session_resume_fallback_at = now
                             self._session_resume_fallback_streak += 1
                             if (
