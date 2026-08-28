@@ -3009,7 +3009,14 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path_scaled(capture_file, 5)
+    # require_nonempty=True (task 4776): the fake claude above publishes
+    # capture_file via `{ ... } > capture_file` -- bash opens (creates) the
+    # redirect target before the block's echoes run, so an exists-only poll
+    # can observe an empty file and hand _parse_captured_env nothing,
+    # failing later on an unrelated-looking captured.get(...) assertion
+    # instead of the intended readiness-timeout. Same race, same fix, as
+    # the two pidfile gates this task rewired.
+    _wait_for_path_scaled(capture_file, 5, require_nonempty=True)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
