@@ -367,35 +367,83 @@ def build_audit_report(
     }
 
 
+def _corpus_marker(project_summary: dict[str, Any]) -> str:
+    """Render one project's two read verdicts as a single operator-legible cell.
+
+    ``ok`` only when BOTH reads were PROVEN whole.  ``PARTIAL`` when either was
+    observed and found incomplete.  ``?`` when either is UNKNOWN — deliberately
+    NOT ``ok``, because a run that never looked must never read as a run that
+    looked and found everything, which is the single failure this whole signal
+    exists to prevent.  (task 4386)
+    """
+    verdicts = (
+        project_summary.get('entities_complete'),
+        project_summary.get('edges_complete'),
+    )
+    if any(v is False for v in verdicts):
+        return 'PARTIAL'
+    if all(v is True for v in verdicts):
+        return 'ok'
+    return '?'
+
+
 def format_summary_table(report: dict[str, Any]) -> str:
     """Render a human-readable per-project summary table from an audit report.
 
-    Produces one row per project plus a TOTALS row.
+    Produces one row per project plus a TOTALS row, and — when any project was
+    scanned over a partial corpus — a trailing warning naming those projects
+    (task 4386).  This table goes to STDERR while the machine-readable JSON
+    goes to stdout, so the warning reaches the person reading the terminal
+    without polluting the parseable output.
+
+    The ``Corpus`` column exists because the operator's next move after reading
+    this table is to re-run with ``--apply`` and invalidate the matched edges,
+    and that is precisely the move that is unsafe over a partial read: the
+    counts describe whatever was fetched, so on a truncated corpus a small
+    ``Matched`` is not evidence that little is wrong.
     """
     projects = report.get('projects', {})
     totals = report.get('totals', {})
 
-    header = f"{'Project':<30} {'Entities':>9} {'Matched':>9} {'Invalidated':>12} {'RefFail':>8}"
+    header = (
+        f"{'Project':<30} {'Entities':>9} {'Matched':>9} {'Invalidated':>12} "
+        f"{'RefFail':>8} {'Corpus':>8}"
+    )
     sep = '-' * len(header)
     rows = [header, sep]
 
+    partial_projects: list[str] = []
     for pid in sorted(projects.keys()):
         p = projects[pid]
+        marker = _corpus_marker(p)
+        if marker != 'ok':
+            partial_projects.append(pid)
         rows.append(
             f"{pid:<30} {p.get('entities_scanned', 0):>9} "
             f"{p.get('edges_matched', 0):>9} {p.get('edges_invalidated', 0):>12} "
-            f"{p.get('refresh_failures', 0):>8}"
+            f"{p.get('refresh_failures', 0):>8} {marker:>8}"
         )
 
     rows.append(sep)
     rows.append(
         f"{'TOTAL':<30} {totals.get('entities_scanned', 0):>9} "
         f"{totals.get('edges_matched', 0):>9} {totals.get('edges_invalidated', 0):>12} "
-        f"{totals.get('refresh_failures', 0):>8}"
+        f"{totals.get('refresh_failures', 0):>8} "
+        f"{totals.get('incomplete_enumerations', 0):>8}"
     )
 
     dry_tag = ' [DRY RUN]' if report.get('dry_run') else ''
     rows.insert(0, f"Count-snapshot cleanup report — {report.get('generated_at', '')}{dry_tag}")
+
+    if partial_projects:
+        rows.append('')
+        rows.append(
+            'WARNING: these projects were scanned over a PARTIAL or UNVERIFIED '
+            f'corpus: {", ".join(partial_projects)}. Their counts above describe '
+            'only what could be fetched, so for them an absence of matches is '
+            'NOT proof of cleanliness — re-run before concluding a project is '
+            'clean, and do not treat this report as a licence to --apply there.'
+        )
     return '\n'.join(rows)
 
 
@@ -724,12 +772,27 @@ async def run(
         args.yes_i_am_sure,
     )
     if abort:
+        # The node-read completeness travels WITH the abort, because the cap
+        # itself was decided on a count from that read: check_limit_cap sees
+        # per_project_counts derived from len(entities), so a TRUNCATED node
+        # read UNDER-counts and an oversized project slips UNDER the cap --
+        # the cap silently stops protecting exactly the projects it exists
+        # for. This return is before build_audit_report, so the report path
+        # cannot carry it and the payload must. (task 4386)
         cap_payload: dict[str, Any] = {
             'aborted': True,
             'dry_run': not args.apply,
             'exceeding_projects': exceeding,
             'limit_per_project': args.limit_per_project,
             'generated_at': generated_at,
+            'entities_complete': {
+                pid: rec['entities_complete']
+                for pid, rec in enumeration_by_project.items()
+            },
+            'entities_incomplete_kind': {
+                pid: rec['entities_incomplete_kind']
+                for pid, rec in enumeration_by_project.items()
+            },
         }
         print(json.dumps(cap_payload, indent=2, default=str))
         print(
