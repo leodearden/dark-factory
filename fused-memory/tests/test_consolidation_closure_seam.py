@@ -672,3 +672,75 @@ class TestProductionProbeWiring:
         for site in sites:
             call = site.split(')')[0]
             assert 'exists=' in call, call
+
+
+class TestSeamFlagsABlockLessGate:
+    """The seam FLAGS a block-less gate carrying a hand-rolled member
+    enumeration; it does NOT refuse.
+
+    `operational_mode == 'gate'` is a generic human-gate marker
+    (`curator_gate_resolution_sweep.py::extract_open_gate_task_ids` selects on
+    exactly that value across all 127 gates), so refusing would brick the 123
+    that legitimately carry no block. One WARNING converts a silent dormancy
+    into a visible one at zero brick risk.
+    """
+
+    @staticmethod
+    def _blockless(**extra):
+        meta = {'execution_class': 'operational', 'operational_mode': 'gate'}
+        meta.update(extra)
+        return {'id': '9001', 'status': 'pending', 'metadata': meta}
+
+    @pytest.mark.asyncio
+    async def test_it_still_closes(self, interceptor, taskmaster, caplog):
+        taskmaster.get_task.return_value = self._blockless(
+            related_memory_ids=[_uuid(1), _uuid(2)]
+        )
+        interceptor.set_consolidation_scroll(_scroll(_MALFORMED))
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert taskmaster.set_task_status.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_it_emits_exactly_one_warning_naming_the_facts(
+        self, interceptor, taskmaster, caplog
+    ):
+        import logging  # noqa: PLC0415
+
+        caplog.set_level(logging.WARNING)
+        taskmaster.get_task.return_value = self._blockless(
+            related_memory_ids=[_uuid(1)]
+        )
+        interceptor.set_consolidation_scroll(_scroll(_MALFORMED))
+        await _set_done(interceptor)
+
+        hits = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'related_memory_ids' in r.getMessage()
+        ]
+        assert len(hits) == 1
+        msg = hits[0].getMessage()
+        assert '9001' in msg
+        assert GATE_METADATA_KEY in msg
+        assert _uuid(1) in msg
+        # Grep-stable: an operator must be able to find every dormant gate.
+        assert 'consolidation gate is DORMANT' in msg
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_block_less_gate_stays_silent(
+        self, interceptor, taskmaster, caplog
+    ):
+        """`TestSeamDormancy::test_dormant_without_the_gate_key`\'s shape — the
+        118-task majority. The existing dormancy tests must not be made
+        noisy."""
+        import logging  # noqa: PLC0415
+
+        caplog.set_level(logging.WARNING)
+        taskmaster.get_task.return_value = self._blockless()
+        interceptor.set_consolidation_scroll(_scroll(_MALFORMED))
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'DORMANT' in r.getMessage()
+        ] == []

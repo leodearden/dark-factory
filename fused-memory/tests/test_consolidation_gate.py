@@ -1035,6 +1035,90 @@ class TestResolveUnstampedLiveIds:
     def test_it_is_exported(self):
         assert 'resolve_unstamped_live_ids' in consolidation_gate.__all__
 
+class TestHandrolledMemberEnumeration:
+    """The SECOND gap: a gate filed with no `x_recon_consolidation_gate` block
+    at all, for which the seam is fully dormant and `set_task_status(done)`
+    closes it untouched (task 4747 was filed exactly that way).
+
+    A refusal is NOT available here — `operational_mode == 'gate'` is a
+    GENERIC human-gate marker — so the detector exists to FLAG, and its
+    precision only has to be good enough for a log line.
+    """
+
+    @staticmethod
+    def _meta(**extra):
+        meta = {'execution_class': 'operational', 'operational_mode': 'gate'}
+        meta.update(extra)
+        return meta
+
+    def test_fires_for_the_memory_ids_spelling(self):
+        """Gate 3036 — the very gate this module\'s docstring already indicts
+        for inventing `metadata.memory_ids`."""
+        ids = [_uuid(1), _uuid(2)]
+        assert consolidation_gate.handrolled_member_enumeration(
+            self._meta(memory_ids=ids)
+        ) == ('memory_ids', ids)
+
+    def test_fires_for_the_related_memory_ids_spelling(self):
+        """Gate 4747, before it was retro-fitted with a real block."""
+        ids = [_uuid(1)]
+        assert consolidation_gate.handrolled_member_enumeration(
+            self._meta(related_memory_ids=ids)
+        ) == ('related_memory_ids', ids)
+
+    def test_silent_for_an_ordinary_gate_with_neither_key(self):
+        """The 118-task majority. A false positive here would spam the log for
+        every gate close in the fleet."""
+        assert consolidation_gate.handrolled_member_enumeration(self._meta()) is None
+
+    def test_silent_when_a_proper_block_is_present(self):
+        """4747\'s post-retrofit shape: a real block WINS, even alongside a
+        leftover hand-rolled key."""
+        assert (
+            consolidation_gate.handrolled_member_enumeration(
+                self._meta(
+                    memory_ids=[_uuid(1)],
+                    **{GATE_METADATA_KEY: {'topic': _TOPIC}},
+                )
+            )
+            is None
+        )
+
+    def test_silent_for_a_non_gate_carrying_the_key(self):
+        assert (
+            consolidation_gate.handrolled_member_enumeration(
+                {'execution_class': 'operational',
+                 'operational_mode': 'llm',
+                 'memory_ids': [_uuid(1)]}
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize('metadata', [None, 'not-a-mapping', 42, [], {}])
+    def test_silent_for_non_dict_or_absent_metadata(self, metadata):
+        assert consolidation_gate.handrolled_member_enumeration(metadata) is None
+
+    def test_key_selection_is_deterministic_when_both_are_present(self):
+        """Sorted-first, so the warning text is stable across runs."""
+        key, _ = consolidation_gate.handrolled_member_enumeration(
+            self._meta(memory_ids=[_uuid(1)], related_memory_ids=[_uuid(2)])
+        )
+        assert key == sorted(consolidation_gate.HANDROLLED_MEMBER_KEYS)[0]
+
+    def test_an_empty_enumeration_is_not_a_hit(self):
+        """An empty list enumerates nothing, so there is nothing to flag."""
+        assert (
+            consolidation_gate.handrolled_member_enumeration(self._meta(memory_ids=[]))
+            is None
+        )
+
+    def test_the_measured_key_set_is_exported(self):
+        assert consolidation_gate.HANDROLLED_MEMBER_KEYS == frozenset(
+            {'memory_ids', 'related_memory_ids'}
+        )
+        assert 'HANDROLLED_MEMBER_KEYS' in consolidation_gate.__all__
+        assert 'handrolled_member_enumeration' in consolidation_gate.__all__
+
 # --------------------------------------------------------------------------- #
 # Guard: the seam's import weight, and INV-5's single homes (step-15a)
 # --------------------------------------------------------------------------- #
