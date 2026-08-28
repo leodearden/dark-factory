@@ -28,6 +28,17 @@ values sit legibly in the tail of ``detail`` — but it CANNOT be a fixture
 here: ``data/`` is gitignored so it does not exist in this worktree, and it is
 doubly corrupted (PRD boundary row B5) so it could never demonstrate a
 successful recovery. The corpus supplies both shapes instead.
+
+TASK **4502** SPLIT THAT CLASS IN TWO, and the claim above survives only for
+one half. B5's guard used to refuse on the mere PRESENCE of a closing tag in a
+recovered value, which also caught reports merely QUOTING one; the ``esc-3514``
+pair (``escalation/tests/fixtures/markup_specimens/``) is exactly that shape
+and NOW RECOVERS both swallowed siblings. What still refuses — including
+:data:`UNREPAIRABLE` below, re-measured at 4502 — is the genuinely ambiguous
+half: an inner closer that mis-closes the item itself, spans a tool-call
+boundary, or yields an equally valid alternative parse. So "doubly corrupted"
+is no longer a synonym for "unrecoverable", and a reader must not take the
+paragraph above as saying the whole class is beyond the repairer.
 """
 
 from __future__ import annotations
@@ -92,7 +103,10 @@ GAMMA_1 = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
 #: DOUBLY corrupted — the residue's own value carries a closing content tag, so
 #: :func:`repair` cannot locate the boundary and refuses (PRD boundary row B5).
 #: The same class as the on-disk ``esc-3184-2``, which is why that record could
-#: never have demonstrated a recovery.
+#: never have demonstrated a recovery. RE-MEASURED at task 4502, which narrowed
+#: B5: this record still refuses, because the ambiguity here is genuine rather
+#: than a quotation — see the module docstring for the half of the class that
+#: 4502 moved.
 UNREPAIRABLE = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
 
 #: The category the middleware stamps on a residue record
