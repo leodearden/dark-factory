@@ -443,3 +443,175 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode != 0, f'option (a) branch passed main:\n{proc.stdout}'
         assert _INDETERMINATE in proc.stdout, proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# The gate script, end to end against hermetic fixture repos
+# ---------------------------------------------------------------------------
+
+# Committed identity so a fixture commit does not depend on a global git
+# identity being configured in the test environment (the idiom from
+# fused-memory/tests/test_predicate_contradiction.py).
+_GIT_ENV_ARGS = [
+    '-c',
+    'user.email=write-triage-gate-test@example.com',
+    '-c',
+    'user.name=write-triage-gate-test',
+    '-c',
+    'commit.gpgsign=false',
+]
+
+#: The fixture repo's branch, pinned so the test does not depend on whatever
+#: `init.defaultBranch` the host git is configured with.
+_FIXTURE_REF = 'fixture-main'
+
+# Item 2 greps for the frozenset being iterated directly; item 4 for the
+# self-overwriting markdown sibling. These two fixtures straddle both.
+_EVAL_FAILING = '''\
+"""Fixture stand-in for fused-memory/scripts/eval_write_triage_judge.py."""
+CONFUSION_COLUMNS = list(TRIAGE_OUTCOMES)
+
+
+def publish(report_path):
+    return report_path.with_suffix('.md')
+'''
+
+_EVAL_FIXED = '''\
+"""Fixture stand-in with both cycle-2 findings fixed."""
+EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))
+CONFUSION_COLUMNS = EVAL_OUTCOMES
+
+
+def publish(report_path):
+    sibling = report_path.parent / (report_path.stem + '.md')
+    assert sibling != report_path
+    return sibling
+'''
+
+_CONFIG_YAML = 'write_triage:\n  enabled: false\n  judge_enabled: true\n'
+
+
+def _make_gate_repo(tmp_path: Path, *, judge: str = 'flat', eval_src: str = 'failing') -> Path:
+    """A throwaway git repo the gate script can be run from.
+
+    The script derives ``REPO`` from ``BASH_SOURCE/..`` with no env override,
+    so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
+    the fixture repo, rather than the real checkout, the thing item 1's
+    ``git archive`` reads.
+    """
+    repo = tmp_path / 'gate-repo'
+    (repo / 'scripts').mkdir(parents=True)
+    for script in (_GATE_SCRIPT, _PROBE):
+        dest = repo / 'scripts' / script.name
+        dest.write_bytes(script.read_bytes())
+        dest.chmod(0o755)
+
+    _write_fake_judge(repo / 'fused-memory' / 'src', variant=judge)
+    (repo / 'fused-memory' / 'scripts').mkdir(parents=True)
+    (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_judge.py').write_text(
+        _EVAL_FIXED if eval_src == 'fixed' else _EVAL_FAILING,
+    )
+    (repo / 'fused-memory' / 'config').mkdir(parents=True)
+    (repo / 'fused-memory' / 'config' / 'config.yaml').write_text(_CONFIG_YAML)
+
+    subprocess.run(
+        ['git', 'init', '-q', '-b', _FIXTURE_REF],
+        cwd=repo, check=True, capture_output=True,
+    )
+    subprocess.run(['git', 'add', '-A', '-f'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', 'fixture'],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return repo
+
+
+def _run_gate(script: Path, *, ref: str, probe_py: str | None = None):
+    """Execute the gate script DIRECTLY, as DeterministicRunner does."""
+    full_env = dict(os.environ)
+    full_env['WRITE_TRIAGE_GATE_REF'] = ref
+    full_env['CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY'] = probe_py or sys.executable
+    return subprocess.run(
+        [str(script)],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        env=full_env,
+    )
+
+
+def _assert_no_bare_grep_verdict(stdout: str) -> None:
+    """Item 1 must no longer report a source-text grep as its verdict.
+
+    A grep asserts which MECHANISM landed, not whether the invariant holds: it
+    fails a correct option-(b) fix and passes prose that changes no behaviour.
+    """
+    assert 'candidate_id ABSENT' not in stdout, stdout
+    assert 'candidate_id present' not in stdout, stdout
+
+
+class TestFlipPreconditionsScript:
+    """The gate script end to end. Item 1 delegates to the probe; items 2 and
+    4 keep their existing eval-source patterns, unchanged."""
+
+    def test_flat_judge_fails_item_1(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='flat')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1' in proc.stdout, proc.stdout
+        _assert_no_bare_grep_verdict(proc.stdout)
+
+    def test_by_id_judge_with_fixed_eval_passes_everything(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        _assert_no_bare_grep_verdict(proc.stdout)
+
+    def test_marking_candidates_zero_does_not_satisfy_the_gate(self, tmp_path):
+        """The gate must not bless candidates[0]-as-attach-target."""
+        repo = _make_gate_repo(tmp_path, judge='positional_target', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1' in proc.stdout, proc.stdout
+        assert _RESCUE_PATH in proc.stdout, proc.stdout
+
+    def test_unreadable_ref_fails_closed(self):
+        """NEGATIVE CONTROL, mandated by the script's own comment.
+
+        A `$(...)` command substitution runs in a SUBSHELL, so a `fail=1`
+        assigned inside one is discarded — the bug caught 2026-08-27, where an
+        unreadable ref skipped its whole check block and the gate exited 0 on
+        unverifiable input. Run against the REAL checkout, read-only.
+        """
+        proc = _run_gate(_GATE_SCRIPT, ref='no-such-ref')
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_unresolvable_probe_interpreter_fails_closed(self, tmp_path):
+        """A judge that WOULD pass, but no interpreter to prove it with.
+
+        An unverifiable invariant is not a satisfied one — this must never be
+        the difference between exit 1 and exit 0.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name,
+            ref=_FIXTURE_REF,
+            probe_py=str(tmp_path / 'no-such-python3'),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_items_2_and_4_still_fail_on_their_patterns(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 2' in proc.stdout, proc.stdout
+        assert 'FAIL  item 4' in proc.stdout, proc.stdout
+
+    def test_items_2_and_4_still_pass_on_the_fixed_patterns(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
