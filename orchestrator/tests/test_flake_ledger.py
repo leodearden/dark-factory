@@ -516,12 +516,21 @@ class TestFlakeSuppressionFromWire:
         assert rt.test_ids == ()
         assert rt.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
 
-    def test_none_returns_none_without_warning(self) -> None:
+    def test_none_returns_none_without_warning(self, caplog) -> None:
         """(b) ``None`` is the ordinary "no observation" case — the B13 old-remote
-        shape — not a fault, so it must not log."""
+        shape — not a fault, so it must not log.
+
+        The SILENCE is the assertion, not an afterthought: on a mixed-version fleet
+        this is by far the most frequent input, so a regression that made it warn
+        would put one WARNING on every single merge.  Asserting only the ``None``
+        return would leave that regression green.
+        """
         from orchestrator.flake_ledger import flake_suppression_from_wire
 
-        assert flake_suppression_from_wire(None) is None
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(None) is None
+
+        assert self._warnings(caplog) == [], 'the no-observation case must be silent'
 
     @pytest.mark.parametrize(
         'bogus',
@@ -597,8 +606,9 @@ class TestFlakeSuppressionFromWire:
 
     def test_a_bare_str_test_ids_becomes_a_one_tuple(self) -> None:
         """``tuple('a::t')`` explodes a node-id into one entry PER CHARACTER — the same
-        hazard ``record_flake_occurrence`` guards (flake_ledger.py:404-412), wrapped the
-        same way rather than with a second, divergent rule."""
+        hazard ``record_flake_occurrence`` guards, and now literally the same code:
+        both route through ``flake_ledger.py::_coerce_test_ids`` so the wrap-not-drop
+        rule cannot drift between the wire path and the write path."""
         from orchestrator.flake_ledger import flake_suppression_from_wire
 
         d = self._wire(_suppression())

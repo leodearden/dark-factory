@@ -171,6 +171,40 @@ class FlakeSuppression:
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
 
 
+def _coerce_test_ids(value: object, *, context: str) -> tuple[str, ...]:
+    """Normalize a ``test_ids`` payload to a tuple, stating the wrap-not-drop rule ONCE.
+
+    A bare ``str`` where a tuple belongs is an easy mistake to make (one node-id passed
+    unwrapped), it is TRUTHY, and ``tuple('a::t')`` explodes it into one entry PER
+    CHARACTER — a dozen garbage test_ids silently written into the evidence trail this
+    PRD exists to make trustworthy.  WRAP rather than drop: a single node-id string has
+    exactly one honest reading, so the observation is preserved and the warning still
+    surfaces the upstream bug.
+
+    Both the WRITE path (:func:`record_flake_occurrence`) and the WIRE path
+    (:func:`flake_suppression_from_wire`) route through here.  They had two separate
+    copies of this rule with two separately-worded warnings, which could drift
+    independently — e.g. a ``bytes`` or generator case added to one and not the other,
+    which would then behave differently depending only on whether the observation
+    crossed the wire.  *context* names the caller for the log line (a ``call_site``
+    value at write time, ``'the wire'`` on the deserialization path) so one rule can
+    still produce a locatable message.
+
+    Raises ``TypeError`` on a non-iterable, deliberately: both callers wrap this in a
+    catch-all (B12 at write time, the never-raise guard on the wire), and each already
+    knows how to degrade loudly.
+    """
+    if isinstance(value, str):
+        logger.warning(
+            'flake_ledger: test_ids arrived as a bare str (%r) from %s; treating it as '
+            'ONE node-id — the producer should pass a list/tuple',
+            value,
+            context,
+        )
+        return (value,)
+    return tuple(value)  # type: ignore[call-overload]
+
+
 def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
     """Rebuild a :class:`FlakeSuppression` from its JSON-decoded wire form (§8, §8.4).
 
@@ -227,19 +261,12 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
                 with contextlib.suppress(ValueError):
                     kwargs[name] = enum_cls(kwargs[name])
 
-        # Same bare-str hazard `record_flake_occurrence` guards (see its `test_ids`
-        # comment): `tuple('a::t')` explodes one node-id into one entry per CHARACTER.
-        # Wrapped identically rather than with a second, divergent rule.
-        supplied = kwargs.get('test_ids')
-        if isinstance(supplied, str):
-            logger.warning(
-                'flake_ledger: wire test_ids arrived as a bare str (%r); treating it as '
-                'ONE node-id — the producer should send a list',
-                supplied,
-            )
-            kwargs['test_ids'] = (supplied,)
-        elif supplied is not None:
-            kwargs['test_ids'] = tuple(supplied)
+        # Same bare-str hazard `record_flake_occurrence` guards, and literally the same
+        # code: `_coerce_test_ids` states the wrap-not-drop rule once so the two paths
+        # cannot drift.  A MISSING key is left missing so the `FlakeSuppression(**kwargs)`
+        # below still raises for a truncated payload (caught, warned, dropped).
+        if kwargs.get('test_ids') is not None:
+            kwargs['test_ids'] = _coerce_test_ids(kwargs['test_ids'], context='the wire')
 
         # A missing REQUIRED key raises TypeError here and is caught below — a truncated
         # payload is a producer bug worth a loud line, not a half-built observation.
@@ -480,21 +507,13 @@ def record_flake_occurrence(
         call_site = FlakeCallSite(s.call_site)
         observed_at = _normalize_observed_at(s.observed_at)
 
-        # A bare `str` where a tuple belongs is an easy mistake at ε's call site (one
-        # node-id passed unwrapped), it is TRUTHY, and `tuple('a::t')` explodes it into
-        # one row PER CHARACTER — a dozen garbage test_ids silently written into the
-        # evidence trail this PRD exists to make trustworthy.  Wrap rather than drop: a
-        # single node-id string has exactly one honest reading, so the observation is
-        # preserved, and the warning still surfaces the upstream bug.
-        supplied_test_ids: tuple[str, ...] | str = s.test_ids
-        if isinstance(supplied_test_ids, str):
-            logger.warning(
-                'flake_ledger: test_ids arrived as a bare str (%r) at call_site=%s; '
-                'treating it as ONE node-id — the producer should pass a tuple',
-                supplied_test_ids,
-                call_site.value,
-            )
-            supplied_test_ids = (supplied_test_ids,)
+        # The bare-`str` hazard (one node-id passed unwrapped, TRUTHY, and
+        # `tuple('a::t')` explodes it into one row PER CHARACTER) is handled by the
+        # shared `_coerce_test_ids` — same rule, same warning, as the wire path, stated
+        # in exactly one place.
+        supplied_test_ids: tuple[str, ...] = _coerce_test_ids(
+            s.test_ids, context=f'call_site={call_site.value}',
+        )
 
         # §8: EMPTY test_ids is legal only for `unconfirmable`.  An unconfirmable
         # observation that resolved no node-ids is still COUNTED, under the sentinel —
