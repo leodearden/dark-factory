@@ -137,8 +137,23 @@ class SoftScopeSignal:
         module's fail-safe contract and its 22 existing tests stay untouched,
         and the trigger adapts to the confirmation step rather than the
         reverse.  The tags double as operator-facing provenance in the
-        escalation detail and in the ``possible_scope_mismatch`` marker task
-        3121 consumes.
+        ``soft_scope_lint.flagged`` census line, in the ``scope_violation``
+        escalation raised under ``FUSED_SOFT_SCOPE_ENFORCE``, and in the
+        ``possible_scope_mismatch`` marker stamped beside it — which are this
+        module's consumers today.
+
+        Task 3121 is NOT one of them, despite what an earlier draft of this
+        docstring claimed.  It landed (``a66e6ae174``) with exactly two
+        blocking legs — ``metadata.cross_repo`` truthy, and every declared
+        file absolute and outside ``project_root`` — and a docstring stating
+        there is deliberately NO leg for ``possible_scope_mismatch``.  A
+        FILELESS soft-signal task carries neither, so
+        ``orchestrator/src/orchestrator/cross_repo_gate.py::
+        carries_cross_repo_signal`` does not even admit it to that gate.  The
+        stamp's only surviving role there is naming an owner
+        (``cross_repo_gate.py::_resolve_owner``), reached solely after a real
+        leg has already fired.  Re-opening 3121 to add a leg is follow-up
+        work; do not describe one as existing.
         """
         return f'{_EVIDENCE_TAGS[self.kind]}:{self.evidence}'
 

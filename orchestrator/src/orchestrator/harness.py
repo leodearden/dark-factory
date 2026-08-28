@@ -3098,8 +3098,19 @@ class Harness:
         # per batch). files_tagged_empty preserves it. It is NOT a gate on
         # its own — it also fires for genuinely-new-file and vague tasks —
         # but in conjunction with the submit-time soft scope signals it is
-        # strong evidence for the FILELESS misfile class. Task 3121 is its
-        # consumer.
+        # strong evidence for the FILELESS misfile class.
+        #
+        # NOTHING READS IT, and task 3121 is NOT its consumer (an earlier
+        # draft of this comment said otherwise). 3121 landed (a66e6ae174)
+        # with exactly two blocking legs -- metadata.cross_repo truthy, and
+        # every declared file absolute and outside project_root -- and a
+        # docstring stating there is deliberately NO leg for
+        # possible_scope_mismatch. A fileless task carries neither, so
+        # cross_repo_gate.py::carries_cross_repo_signal never admits it to
+        # that gate at all. The submit-time soft signals' consumers today are
+        # fused-memory's soft_scope_lint.flagged census line and, under
+        # FUSED_SOFT_SCOPE_ENFORCE, the operator scope_violation escalation;
+        # re-opening 3121 to add a leg is follow-up work.
         tagged_at = datetime.now(UTC).isoformat()
 
         tagged_count = 0
@@ -3123,8 +3134,9 @@ class Harness:
             # above: scheduler.update_task's default merge is shallow
             # last-write-wins, so a set-only-when-empty write would leave a
             # stale True from an earlier cycle sitting beside the real files
-            # a force re-tag just predicted — handing task 3121 a signal that
-            # contradicts the list next to it.
+            # a force re-tag just predicted — a self-contradicting record
+            # in which an "empty verdict" flag sits beside a non-empty file
+            # list, for whatever eventually reads the pair.
             metadata_payload['files_tagged_empty'] = not sanitized
             if sanitized:
                 metadata_payload['files'] = sanitized

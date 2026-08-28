@@ -1173,8 +1173,10 @@ async def test_force_retag_overwrites_a_stale_true(harness):
 
     Scheduler.update_task defaults to shallow last-write-wins `merge`, so a
     conditional write would leave a previously-recorded True sitting beside
-    the real `files` this run predicts. Task 3121 would then read a signal
-    that contradicts the file list next to it.
+    the real `files` this run predicts — a self-contradicting record for
+    whatever eventually reads the pair. (Nothing does yet; task 3121 landed
+    with no leg for these signals — see
+    `orchestrator/src/orchestrator/cross_repo_gate.py::classify_cross_repo`.)
     """
     metadata = await _run_tagger(
         harness,
