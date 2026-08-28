@@ -747,6 +747,7 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         meta['before_done']['kind'] = 'deploy'
         result = deterministic_task_error('deterministic', meta, str(tmp_path))
         _assert_recurrence_rejection(result)
+        assert result is not None
         assert 'deploy' in result['error']
         hint = result['hint'].lower()
         assert 'unruled' in hint
@@ -775,6 +776,7 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         }
         result = deterministic_task_error('normal', meta, '/proj')
         _assert_recurrence_rejection(result)
+        assert result is not None
         assert 'task_kind' in result['error']
 
     def test_recurrence_on_pure_gate_rejects(self):
@@ -797,6 +799,7 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         del meta['milestone']
         result = deterministic_task_error('deterministic', meta, str(tmp_path))
         _assert_recurrence_rejection(result)
+        assert result is not None
         assert 'milestone' in result['error']
 
     def test_recurrence_with_delayed_milestone_rejects(self, tmp_path):
@@ -809,6 +812,7 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         meta['milestone'] = {'mode': 'delayed', 'after_secs': 86400}
         result = deterministic_task_error('deterministic', meta, str(tmp_path))
         _assert_recurrence_rejection(result)
+        assert result is not None
         assert 'dated' in result['error']
 
     # -- acceptance ------------------------------------------------------
