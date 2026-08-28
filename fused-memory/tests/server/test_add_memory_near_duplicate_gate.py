@@ -7,8 +7,11 @@ server._tool_manager.call_tool('add_memory', {...}).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1033,19 +1036,54 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
     """Anti-over-correction for the recon-stage exemption's retirement (task 3134).
 
     Retiring the exemption is only SAFE because the sanctioned path does not
-    pass through this guard at all: ``consolidate_memories`` writes its
-    canonical with ``await memory_service.add_memory(...)`` -- the SERVICE
-    method -- whereas the near-duplicate, topic-cluster and sufficient-phrase
-    guards all live in the MCP ``add_memory`` TOOL above them.
+    meet this guard: a merged canonical is BY DESIGN near-identical to the
+    entries it replaces, so a ``consolidate_memories`` that routed through the
+    guarded MCP ``add_memory`` TOOL body would soft-block every Stage-1
+    consolidation -- the exact opposite of the intent.
 
-    Getting that wrong would have broken the very op this task adopts. A
-    merged canonical is BY DESIGN near-identical to the entries it replaces,
-    so if the guard did sit on the service method, retiring the exemption
-    would have turned every Stage-1 consolidation into a soft-block -- the
-    exact opposite of the intent. This test makes the property a pin rather
-    than a fact the next reader has to rediscover, and it is deliberately
-    sited in the same file that pinned the exemption's existence.
+    Read what each half below actually pins, because they are NOT the same
+    claim and neither one alone is the safety property:
+
+    * ``test_a_recon_stage_canonical_write_still_lands`` pins that the op
+      reaches ``memory_service.add_memory`` WITHOUT passing through the MCP
+      ``add_memory`` tool body -- which it could, since that closure is
+      defined in the same ``create_mcp_server`` scope -- and that it does so
+      with the guards' config ARMED rather than switched off. It cannot say
+      anything about where the guard code lives: ``mock_service`` is an
+      ``AsyncMock``, so ``memory_service.add_memory`` is a bare mock that
+      contains no guard no matter what the real one does.
+    * ``test_the_guard_entrypoints_are_absent_from_the_service_layer`` is the
+      structural half, and it is the one that would catch the guard being
+      MOVED down onto ``MemoryService.add_memory``. Behavioural coverage of
+      that move is unavailable here for the mock reason above.
     """
+
+    def test_the_guard_entrypoints_are_absent_from_the_service_layer(self) -> None:
+        """The guards belong to the tool layer, structurally, not by convention.
+
+        Read by AST rather than by substring so a prose mention in a comment
+        or docstring does not count -- ``memory_service.py`` legitimately
+        NAMES ``near_duplicate_guard`` in comments today, and a test that
+        tripped on that would be deleted rather than heeded.
+
+        Catches the realistic drift (a move that carries the guard
+        entrypoints with it), not a hand-reimplementation under new names.
+        """
+        from fused_memory.services import memory_service as _service_module
+
+        source_path = inspect.getsourcefile(_service_module)
+        assert source_path is not None
+        tree = ast.parse(Path(source_path).read_text(encoding='utf-8'))
+        referenced = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        } | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+        for symbol in ('resolve_near_dup_guard_enabled', 'find_matching_topic_cluster'):
+            assert symbol not in referenced, (
+                f'{symbol} is referenced from the service layer; the near-duplicate '
+                f'guards must stay in the MCP add_memory tool body, or every '
+                f'consolidate_memories canonical write starts soft-blocking'
+            )
 
     @pytest.mark.asyncio
     async def test_a_recon_stage_canonical_write_still_lands(self):
