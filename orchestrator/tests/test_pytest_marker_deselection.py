@@ -682,6 +682,29 @@ def _classes_marked_importing(import_line: str) -> str:
     return f'{import_line}\n{_ALL_CLASSES_MARKED_SOURCE}'
 
 
+#: A module pytest collects NOTHING from: no ``Test*``-named class, no ``test*``
+#: function, only marked helper classes.  Both helpers carry ``slow``, so an
+#: intersection over "every top-level class" would read ``{'slow'}`` and prove
+#: any expression mentioning it -- THE VACUOUS-INTERSECTION HAZARD.
+_ONLY_HELPER_CLASSES_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class _Helper:
+
+    def build(self):
+        pass
+
+
+@pytest.mark.slow
+class _Other:
+
+    def render(self):
+        pass
+"""
+
+
 class TestGuaranteedMarkerNames:
     """``guaranteed_marker_names(source) -> frozenset[str]``.
 
@@ -854,6 +877,142 @@ class TestGuaranteedMarkerNames:
             'from systemd_unit_invariants import require_installed_unit',
         )
         assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    # -- class shape and the INTERSECTION fold --------------------------------
+    #
+    # Same non-vacuity discipline as the sub-section above: every refusal
+    # fixture carries at least one fully-marked class, and the assertion form
+    # stays `== module_level_marker_names(source)` so the degradation contract
+    # is pinned rather than an emptiness that happens to coincide.
+
+    def test_an_unmarked_collectable_class_beside_a_marked_one_refuses(self):
+        """ALL, not ANY: EVERY collectable class must carry the marker.
+
+        ``TestOther``'s items are unmarked and still SELECTED, so no class
+        marker is a module-wide bound.  A union fold would answer
+        ``{'slow'}`` here and widen away a run that genuinely collects.
+        """
+        source = _classes_marked_plus(
+            'class TestOther:\n    def test_x(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_heterogeneously_marked_classes_intersect_to_nothing(self):
+        """THE KEY SOUNDNESS PIN: the fold is an INTERSECTION, never a union.
+
+        ``TestA`` guarantees ``slow`` only for its OWN items and ``TestB``
+        guarantees ``integration`` only for its own.  A union would claim
+        ``slow`` for ``TestB``'s items, and
+        ``expression_definitely_deselects('not slow', ...)`` would then read
+        True and widen away a run that genuinely collects ``TestB`` -- the
+        over-fire that reopens esc-3292-1 / task 1852.
+        """
+        source = (
+            'import pytest\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.integration\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset()
+
+    def test_a_marker_carried_by_every_class_survives_the_intersection(self):
+        """The other half of the fold: a SHARED marker is a genuine bound."""
+        source = (
+            'import pytest\n\n\n'
+            '@pytest.mark.slow\n'
+            '@pytest.mark.timeout\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_refuses_on_a_class_nested_inside_another_class(self):
+        """Pins that the class scan uses ``ast.walk``, not just ``tree.body``.
+
+        ``TestInner`` defines no method of its own here, so nothing else in
+        the guard fires: only the non-top-level-class rule can catch it.
+        """
+        source = _classes_marked_plus(
+            '@pytest.mark.slow\n'
+            'class TestOuter:\n\n'
+            '    class TestInner:\n'
+            '        pass\n\n'
+            '    def test_a(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_class_nested_inside_a_top_level_if(self):
+        """A conditionally-defined test class is still collected when the branch runs."""
+        source = _classes_marked_plus(
+            'if True:\n    class TestNested:\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_zero_collectable_classes_refuses_rather_than_proving_everything(self):
+        """THE VACUOUS-INTERSECTION PIN.
+
+        ``frozenset.intersection()`` over an EMPTY family is conventionally
+        "every marker", so a module with no collectable class at all would
+        prove any expression false and widen everything.  Both helper classes
+        here carry ``slow``, so an unguarded fold over "every top-level class"
+        answers ``{'slow'}`` -- yet pytest collects nothing from this module.
+        """
+        assert guaranteed_marker_names(_ONLY_HELPER_CLASSES_SOURCE) == module_level_marker_names(
+            _ONLY_HELPER_CLASSES_SOURCE,
+        )
+        assert guaranteed_marker_names(_ONLY_HELPER_CLASSES_SOURCE) == frozenset()
+
+    def test_refuses_on_an_unmarked_non_test_named_class_that_defines_a_test_method(self):
+        """COLLECTABILITY IS NAME-PREFIX **OR** HAS-A-TEST-METHOD.
+
+        ``per_item_marker_names``' docstring already records that the default
+        ``python_classes = Test*`` is an UNCHECKED premise.  A repo that
+        overrides it to collect ``FooSuite`` would slip past a pure prefix
+        rule, so a non-``Test*``-named class that defines a ``test*`` method
+        must be marked or else refuse -- which makes the premise
+        self-checking in the safe direction.
+        """
+        source = _classes_marked_plus(
+            'class _Base:\n    def test_shared(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_a_plain_helper_class_does_not_force_a_refusal(self):
+        """THE BOUNDED-OVER-REFUSAL CONTROL.
+
+        ``_Config`` is neither ``Test*``-named nor defines a ``test*``
+        method, so pytest collects nothing from it and it is simply ignored.
+        Refusing on every unmarked helper class would kill this tier on most
+        real modules.
+        """
+        source = _classes_marked_plus(
+            'class _Config:\n    value = 1\n',
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_pytestmark_inside_a_class_if_block_is_not_that_classs_marker(self):
+        """Mirrors ``module_level_marker_names``' ``tree.body``-only rule one level down."""
+        source = _classes_marked_plus(
+            'class TestConditional:\n\n'
+            '    if True:\n'
+            '        pytestmark = pytest.mark.slow\n\n'
+            '    def test_x(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    # -- never raises ----------------------------------------------------------
+
+    def test_none_source_is_empty(self):
+        assert guaranteed_marker_names(None) == frozenset()
+
+    def test_syntax_error_is_empty_not_a_raise(self):
+        assert guaranteed_marker_names('def broken(:\n') == frozenset()
 
 
 # ---------------------------------------------------------------------------
