@@ -18,11 +18,24 @@
 # issue numbers -- payload 1/2/4 map to artifact issues #3/#6/#8, so a reader who
 # follows these numbers into reviews-cycle-2/ reads an entirely different set.
 #
-#   item 1  the judge's verdict carries no candidate id, while the attach always
-#           targets the band's top-1 -- so a verdict earned by candidate #3 is
-#           filed against candidate #1, and x_contested is stamped on a canonical
-#           the entry never contradicted. Harmless while the flag is off; it
+#   item 1  the judge path does not bind a verdict to a determinate candidate:
+#           the judge is shown several candidates while the attach always targets
+#           the band's top-1 -- so a verdict earned by candidate #3 is filed
+#           against candidate #1, and x_contested is stamped on a canonical the
+#           entry never contradicted. Harmless while the flag is off; it
 #           ACTIVATES on the flip.
+#
+#           Checked by EXECUTING the ref's judge module, via
+#           scripts/check_write_triage_attach_target.py. It used to be a grep of
+#           that module's source for `candidate_id`, which asserted which
+#           MECHANISM landed rather than whether the invariant holds: it failed a
+#           correct fix that established the invariant another way, and it passed
+#           prose that changed no behaviour at all. Task 4810 replaced it. EITHER
+#           remedy now closes item 1 -- a verdict that names its own candidate
+#           (option a, task 4798 item 7), or a prompt told which candidate the
+#           attach will touch whose rendering actually depends on it (option b,
+#           task 4762). Marking candidates[0] is NOT one of them; see the probe's
+#           own report for the measured reason.
 #   item 2  the confusion-column order is derived by iterating a frozenset, so the
 #           committed accuracy artifact is PYTHONHASHSEED-dependent. Measured
 #           2026-08-27: the committed .md and .json disagree on column order, so
@@ -62,10 +75,43 @@ JUDGE='fused-memory/src/fused_memory/server/write_triage_judge.py'
 EVAL='fused-memory/scripts/eval_write_triage_judge.py'
 CONF='fused-memory/config/config.yaml'
 
+# The item-1 probe, and the interpreter that runs it. The env seam mirrors
+# scripts/check_sandbox_soak.sh's CHECK_SANDBOX_SOAK_PY: it is what lets the
+# hermetic tests point the probe at their own interpreter instead of resolving
+# the fused-memory virtualenv.
+PROBE="$REPO/scripts/check_write_triage_attach_target.py"
+if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
+  PROBE_PY="$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
+elif [ -x "$REPO/.venv/bin/python3" ]; then
+  PROBE_PY="$REPO/.venv/bin/python3"
+else
+  PROBE_PY="uv run --frozen --project $REPO/fused-memory python"
+fi
+
+# Bounded well inside the before_done predicate's own 120s budget. A host
+# without coreutils' `timeout` runs the probe unbounded rather than failing
+# every run on a missing binary.
+if command -v timeout >/dev/null 2>&1; then
+  PROBE_TIMEOUT='timeout 90'
+else
+  PROBE_TIMEOUT=''
+fi
+
 fail=0
 report=''
 
 note() { report="${report}$1"$'\n'; }
+
+# item 1 extracts the ref's package tree to a temp dir. `git archive` is
+# read-only and touches no .git state, unlike `git worktree add` -- which
+# matters in this repo, where refs are shared across every worktree.
+PROBE_TMP=''
+cleanup() {
+  if [ -n "${PROBE_TMP:-}" ]; then
+    rm -rf "$PROBE_TMP"
+  fi
+}
+trap cleanup EXIT
 
 # Fail closed if the ref or a file is unreadable — an unverifiable invariant is
 # not a satisfied one.
@@ -89,29 +135,61 @@ read_ref_file() {
 note "write_triage flip preconditions — checked against ref '$REF' in $REPO"
 note ""
 
-# --- item 1: the judge verdict must be able to name its candidate -------------
-if read_ref_file "$JUDGE"; then
-  judge_src="$REF_CONTENT"
-  if printf '%s' "$judge_src" | grep -q 'candidate_id'; then
-    note "PASS  item 1  candidate_id present in $JUDGE"
-  else
-    note "FAIL  item 1  candidate_id ABSENT from $JUDGE"
-    note "              The judge is shown up to judge_candidate_count candidates but"
-    note "              returns a bare verdict string, while the attach targets the"
-    note "              band's top-1. Once the flag is on, a verdict reasoned about"
-    note "              candidate #3 lands on candidate #1 and stamps x_contested on a"
-    note "              canonical the entry never contradicted."
-    note "              Fix (a) is the one that matches declared intent:"
-    note "              build_judge_prompt's own docstring says ids are rendered"
-    note "              'because the model must be able to say which candidate it"
-    note "              means'. Add candidate_id to the judge's JSON contract,"
-    note "              validate it against the slate in parse_judge_verdict, and"
-    note "              thread it through BandDecision."
-    fail=1
-  fi
-else
-  note "FAIL  item 1  UNVERIFIABLE: cannot read $JUDGE at ref '$REF'. Failing closed."
+# --- item 1: the judge path must bind a verdict to a determinate candidate ----
+#
+# EVERY unverifiable outcome here sets fail=1: a missing probe, a temp dir that
+# cannot be made, a failed archive, an interpreter that will not run, a probe
+# crash or a timeout. An unverifiable invariant is not a satisfied one, and
+# note that each fail=1 below is assigned in THIS shell and never inside a
+# `$(...)`, for the reason recorded above read_ref_file.
+if [ ! -f "$PROBE" ]; then
+  note "FAIL  item 1  UNVERIFIABLE: probe missing at $PROBE. Failing closed."
   fail=1
+else
+  PROBE_TMP="$(mktemp -d 2>/dev/null)"
+  if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
+    note "FAIL  item 1  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
+    fail=1
+  elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
+       | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+    note "FAIL  item 1  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
+    note "              Failing closed."
+    fail=1
+  else
+    # shellcheck disable=SC2086  # PROBE_TIMEOUT and PROBE_PY are command word lists.
+    probe_out="$($PROBE_TIMEOUT $PROBE_PY "$PROBE" \
+      --src-root "$PROBE_TMP/fused-memory/src" 2>&1)"
+    probe_rc=$?
+    if [ "$probe_rc" -eq 0 ]; then
+      note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
+    elif [ "$probe_rc" -eq 1 ]; then
+      note "FAIL  item 1  the judge path does NOT bind a verdict to a determinate candidate"
+      note "              The judge is shown up to judge_candidate_count candidates but"
+      note "              the attach touches exactly one of them, so once the flag is on"
+      note "              a verdict reasoned about candidate #3 lands on candidate #1 and"
+      note "              stamps x_contested on a canonical the entry never contradicted."
+      note "              EITHER remedy closes this -- what is asserted is the INVARIANT,"
+      note "              not which mechanism landed:"
+      note "                (a) make parse_judge_verdict return the judged candidate"
+      note "                    alongside the outcome, so the verdict names its own"
+      note "                    candidate and slate position stops mattering; or"
+      note "                (b) give build_judge_prompt a parameter naming the attach"
+      note "                    target and make its rendering DEPEND on it."
+      note "              Marking candidates[0] is NOT sufficient: select_judge_candidates"
+      note "              rescues a hoisted parent's evidence child by APPENDING it, so on"
+      note "              that slate the attach target is LAST. The probe's own report"
+      note "              below carries the measured slate."
+      note "              Subject: $JUDGE at ref '$REF'."
+      fail=1
+    else
+      note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
+      note "              Interpreter: $PROBE_PY. Failing closed."
+      fail=1
+    fi
+    # The probe's own report, indented under the verdict. It carries the
+    # measured slate and, on an unverifiable outcome, its own UNVERIFIABLE line.
+    note "$(printf '%s\n' "$probe_out" | sed 's/^/              /')"
+  fi
 fi
 
 # --- item 2: the committed accuracy artifact must be reproducible -------------
@@ -181,8 +259,11 @@ note ""
 if [ "$fail" -eq 0 ]; then
   note "RESULT: all preconditions satisfied — the flip may proceed."
 else
-  note "RESULT: preconditions NOT satisfied. Task 4762 (priority high) owns these"
-  note "        fixes; see its description and details for the verbatim findings."
+  note "RESULT: preconditions NOT satisfied. Items 2 and 4 are task 4762's (priority"
+  note "        high); see its description and details for the verbatim findings."
+  note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
+  note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
+  note "        satisfies it. See its report above for what was measured."
 fi
 
 printf '%s' "$report"
