@@ -1424,12 +1424,19 @@ class TestNoSilentPartialRepairOfSelfNameMisclose:
 
     THIS CANNOT REGRESS THE COMMITTED CORPUS, and that is measured rather than
     hoped. Replaying every record of
-    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` at this HEAD: **504
-    records, 443 accepted by repair(), and ZERO of those 443 produce a
+    ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` at TASK 4696's HEAD:
+    **504 records, 443 accepted by repair(), and ZERO of those 443 produce a
     clean_value carrying a qualifying closer** — under the self-name-only
     widening AND under the full ``param + schema_params`` widening alike. So no
-    per-specimen expectation flips and the corpus fixture is NOT edited by task
+    per-specimen expectation flips and the corpus fixture was NOT edited by task
     4696.
+
+    The accepted count is **444** as of task **4502**, which narrowed boundary
+    row B5 and moved one record repaired-ward; 4696's 443 is left as it was
+    measured rather than retyped, so the two figures stay attributable. The
+    ZERO clause is the substantive half and was RE-VERIFIED at 4502, not merely
+    restated: the newly-accepted record's ``clean_value`` carries no qualifying
+    closer either, so all 444 still satisfy it.
     """
 
     #: The tool the specimen was captured against: ``add_design_decision``.

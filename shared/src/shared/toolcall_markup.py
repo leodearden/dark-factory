@@ -55,6 +55,29 @@ the sweep's bare list items, prose scans), and an optional keyword would make
 each site's blindness ungreppable. The predicates split by NAME so a reader can
 see at a glance which gates are parameter-aware.
 
+## What ``repair`` guarantees about its OWN output — and what it does not
+
+Two outputs, two different contracts. Confusing them is how this module's one
+narrowing (task **4502**) reads as a weakening when it is not.
+
+* ``Repair.clean_value`` is the value the repairer REWROTE, and it is
+  ENVELOPE-FREE: ``detect_for(clean_value, param, schema_params) is None``.
+  That is contract C1's post-condition, it is what the C2 middleware forwards
+  as the repaired argument, and it is UNCHANGED — non-negotiable, because a
+  residual envelope there would re-trip the write-time tripwire downstream
+  while permanently dropping whatever hid in the residue.
+* ``Repair.recovered`` values are VERBATIM CALLER TEXT, guaranteed by invariant
+  D5 to be substrings of the input. A recovered value MAY legitimately contain
+  an envelope literal, because a faithful REPORT of a markup leak necessarily
+  quotes the pattern that tripped the tripwire. Refusing to deliver it drops
+  the caller's own characters on the floor — the exact information loss this
+  module exists to end. Boundary row B5 is therefore an alternative-boundary
+  test (:func:`_inner_closer_blocks`), not a bare substring refusal.
+
+The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
+the recovered parameter names whose delivered value still trips
+:func:`detect` on the ``markup_detected`` fact and on both policy payloads.
+
 ## Staged API — the consumer of :func:`repair` and :func:`detect`
 
 This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
@@ -463,28 +486,87 @@ def _as_name_set(names: object) -> frozenset[str]:
     return frozenset(name for name in names if isinstance(name, str))
 
 
-def _parse_tail(tail: str) -> dict[str, str] | None:
-    """Parse *tail* as a sequence of pseudo-parameters, else ``None``.
+def _inner_closer_blocks(
+    body: str,
+    value_start: int,
+    item_value: str,
+    name: str,
+    closer_name: str,
+) -> bool:
+    """Is a closing tag inside a recovered item's value a SECOND mis-close?
 
-    The grammar is PRD section 4 C1's, verbatim: a name-echoing pair, a
-    canonical ``parameter`` pair, or a final UNTERMINATED opener whose value
-    runs to end-of-string (the parser consumed that closer as its terminator),
-    with one trailing invoke closer stripped and whitespace allowed between
-    items. ``None`` means the tail did not parse with ZERO leftover, which
-    rejects the candidate and advances the scan — this function never yields a
-    partial parse of one tail.
+    Boundary row B5's real question, asked properly (task **4502**). B5 refuses
+    a recovered item whose "value is itself doubly corrupted, so its boundary
+    is a guess" — but it was implemented as a bare substring test for a closing
+    tag ANYWHERE in the value, which is strictly wider than that. The shape it
+    over-refused is a faithful REPORT of a markup leak: such a report quotes
+    the pattern that tripped the tripwire, so the quote lands inside a
+    swallowed argument and the guard fired on the caller's own prose. Those
+    characters were then dropped on the floor — the exact information loss this
+    module exists to end, inflicted by its own refusal.
 
-    That is a per-tail guarantee only, and on its own it is NOT enough to rule
-    out a partial REPAIR: advancing the scan leaves the rejected closer inside
-    the next candidate's prefix. The prefix-clean accept-time condition in
-    :func:`repair` is what closes that gap.
+    An inner closer naming ``N`` blocks recovery iff EITHER:
 
-    Every returned value is a SLICE of *tail*; nothing is rebuilt or decoded.
+    (i) ``N`` names the item ITSELF, the item's opener-dialect closer (the
+        canonical ``parameter``), or ``invoke`` — a cross-dialect or repeated
+        mis-close of this very item, or a tail spanning a tool-call boundary.
+        An item's own closing tag appearing inside its own value is a mis-close
+        BY DEFINITION, never prose about itself, so this may be stated
+        categorically; or
+    (ii) reading that closer as this item's terminator ALSO yields a valid
+        parse of the remainder — the genuine AMBIGUITY B5's own wording
+        describes, where the item's boundary really is a guess.
+
+    Otherwise the occurrence is QUOTED PROSE and recovery proceeds.
+
+    CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
+    way a reimplementation goes wrong. The ambiguity probe alone — or
+    qualifying inner closers only on schema membership — also accepts
+    committed-corpus record 25 (``mcp__plan-tools__add_design_decision`` /
+    ``decision``), whose value opens canonically for ``rationale``, closes with
+    the name-echoing ``rationale`` closer, and is followed by an invoke closer
+    plus the head of a whole NEXT invoke block. The probe does not catch it
+    because that residue does not itself parse as pseudo-parameters, so the
+    naive rule would silently swallow the next tool call's fragment into the
+    recovered ``rationale`` — a no-silent-partial-repair failure, and strictly
+    worse than the ``None`` returned today.
+
+    *value_start* is *item_value*'s offset within *body*, so the probe can read
+    the remainder from the shared string rather than re-slicing the caller's.
+
+    Bounded like everything else here: at most :data:`_MAX_CANDIDATES` inner
+    closers are considered, and the probe runs at depth 1 with the blanket
+    substring behaviour restored, so it cannot recurse. Beyond the budget the
+    answer is BLOCK, the conservative direction.
     """
-    body = tail.rstrip()
-    if body.endswith(INVOKE_CLOSER):
-        body = body[: -len(INVOKE_CLOSER)].rstrip()
+    considered = 0
+    for inner in _CLOSER_RE.finditer(item_value):
+        considered += 1
+        if considered > _MAX_CANDIDATES:
+            return True
+        inner_name = inner.group(1)
+        if inner_name in (name, closer_name) or closer_for(inner_name) == INVOKE_CLOSER:
+            return True  # (i) a mis-close of THIS item, or a call boundary
+        if _parse_body(body[value_start + inner.end():], probe=True) is not None:
+            return True  # (ii) the alternative boundary parses too — a guess
+    # The prefilter fired but no WELL-FORMED closer is present, so there is
+    # nothing to reason about: keep B5's original answer rather than widening
+    # the carve-out onto a shape this rule was never measured against.
+    return considered == 0
 
+
+def _parse_body(body: str, *, probe: bool) -> dict[str, str] | None:
+    """The item loop of :func:`_parse_tail`, after the invoke closer is stripped.
+
+    Factored out (task **4502**) so :func:`_inner_closer_blocks` can ask whether
+    a remainder ALSO parses without standing up a second parser that could
+    drift from this one. *probe* is that reentrant call: it restores the blanket
+    bare-substring refusal, which bounds the recursion at depth 1 by
+    construction — deliberately a flag rather than a depth counter, because
+    there is exactly one legal depth and a counter would invite a second.
+
+    ``None`` means the body did not parse with ZERO leftover.
+    """
     recovered: dict[str, str] = {}
     pos = 0
     for _ in range(_MAX_TAIL_ITEMS):
@@ -512,15 +594,55 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
             item_value = body[match.end(): closer.start()]
             pos = closer.end()
 
+        # THE CHEAP PREFILTER, retained verbatim so the clean path pays exactly
+        # what it paid before: one substring scan, and nothing else.
         if '\x3c/' in item_value:
-            # A second mis-close INSIDE the recovered tail: the value is itself
-            # doubly corrupted, so its boundary is a guess. Refuse (PRD B5).
-            return None
+            if probe:
+                # Depth 1. The probe only has to answer "does this remainder
+                # parse at all"; re-entering the narrowing here would recurse.
+                return None
+            if _inner_closer_blocks(body, match.end(), item_value, name, closer_name):
+                return None  # a SECOND mis-close: the boundary is a guess (B5)
         if name in recovered:
             return None  # the same parameter twice is not a well-formed tail
         recovered[name] = item_value
 
     return None  # more items than any real call has — refuse rather than guess
+
+
+def _parse_tail(tail: str) -> dict[str, str] | None:
+    """Parse *tail* as a sequence of pseudo-parameters, else ``None``.
+
+    The grammar is PRD section 4 C1's, verbatim: a name-echoing pair, a
+    canonical ``parameter`` pair, or a final UNTERMINATED opener whose value
+    runs to end-of-string (the parser consumed that closer as its terminator),
+    with one trailing invoke closer stripped and whitespace allowed between
+    items. ``None`` means the tail did not parse with ZERO leftover, which
+    rejects the candidate and advances the scan — this function never yields a
+    partial parse of one tail.
+
+    That is a per-tail guarantee only, and on its own it is NOT enough to rule
+    out a partial REPAIR: advancing the scan leaves the rejected closer inside
+    the next candidate's prefix. The prefix-clean accept-time condition in
+    :func:`repair` is what closes that gap.
+
+    BOUNDARY ROW B5 lives in :func:`_inner_closer_blocks`, which this delegates
+    to via :func:`_parse_body`. As of task **4502** it is an ALTERNATIVE-BOUNDARY
+    test rather than a bare substring refusal: a closing tag inside a recovered
+    item's value blocks recovery when it mis-closes THAT item or spans a
+    tool-call boundary, or when reading it as the terminator also parses — but
+    NOT when it is merely quoted prose. A recovered value is verbatim caller
+    text under invariant D5, and a faithful report of a markup leak necessarily
+    quotes the leak; ``clean_value``'s envelope-free post-condition is
+    untouched, because that is the value the repairer REWROTE.
+
+    Every returned value is a SLICE of *tail*; nothing is rebuilt or decoded.
+    """
+    body = tail.rstrip()
+    if body.endswith(INVOKE_CLOSER):
+        body = body[: -len(INVOKE_CLOSER)].rstrip()
+
+    return _parse_body(body, probe=False)
 
 
 def repair(
@@ -565,6 +687,15 @@ def repair(
     exists to end, reintroduced by its own repairer. When the only candidates
     that parse would leave a poisoned prefix, the honest answer is ``None``.
 
+    THE POST-CONDITION IS ON ``clean_value`` ONLY, and deliberately so (task
+    **4502**). A RECOVERED value may still trip :func:`detect`: it is verbatim
+    caller text under invariant D5, and a faithful report of a markup leak
+    quotes the leak. Boundary row B5 is an alternative-boundary test rather
+    than a bare substring refusal precisely so those characters are recovered
+    instead of dropped — see :func:`_inner_closer_blocks` for the rule and for
+    why its own-name condition is not redundant. The C2 middleware surfaces
+    which recovered names carry a literal rather than letting it pass silently.
+
     The guard is stated against :func:`detect_for` rather than :func:`detect`
     as of task **4696**, because the gates that consume ``clean_value`` are
     parameter-aware: a prefix carrying a canonical closer for *param* or for a
@@ -573,6 +704,12 @@ def repair(
     task's HEAD — 504 records, 443 accepted, ZERO carrying a qualifying closer
     in the accepted prefix — so the tightening changed no per-specimen
     expectation; it closed the DOUBLE SELF-NAME MISCLOSE hole and nothing else.
+    The committed corpus now reads 504 records / **444 accepted** after task
+    **4502** moved one record repaired-ward; the 443 above is 4696's datum and
+    stays as it was measured, so a reader who checks it against today's fixture
+    and finds 444 knows which task moved it rather than suspecting rot. The
+    ZERO clause is unchanged and was re-verified at 4502: the newly-accepted
+    record's ``clean_value`` carries no qualifying closer either.
 
     The canonical closer is always a candidate even though C1's literal wording
     does not list it. PRD section 2.1's fourth specimen mis-closes ``content``
