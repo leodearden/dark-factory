@@ -175,9 +175,13 @@ except (KeyError, ValueError):
 # orchestrator package, so this is a hardcoded env-mirror of the config
 # default (drift-tested in tests/scripts/test_orchestrator_watchdog.py
 # against a live OrchestratorConfig, task 2396 Open-Q1) rather than a live
-# read of it. 0 disables the cap entirely. Mirrors STALENESS_GRACE_SECS's
-# env-with-default try/except pattern immediately above — a typo'd env var
-# must not crash the oneshot watchdog.
+# read of it. 0 disables the cap entirely — but since task 4754 that no longer
+# removes EVERY deploy-clock gate from the staleness backstop: the head start
+# (_within_fleet_staleness_head_start) is measured from the same clock with a
+# summed cap, so a 0 here still leaves a STALENESS_GRACE_SECS hold after each
+# verified deploy. Mirrors STALENESS_GRACE_SECS's env-with-default try/except
+# pattern immediately above — a typo'd env var must not crash the oneshot
+# watchdog.
 try:
     ORCH_RESTART_MIN_INTERVAL_SECS = int(os.environ["ORCH_RESTART_MIN_INTERVAL_SECS"])
 except (KeyError, ValueError):
@@ -267,7 +271,9 @@ FM_DEPLOY_CLOCK_PATH = os.environ.get(
 # Minimum wall-clock seconds between successive fm redeploys — fm's own
 # independent cap, mirroring ORCH_RESTART_MIN_INTERVAL_SECS's 8h default and its
 # env-with-try/except-fallback pattern (a typo'd env var must not crash the
-# oneshot watchdog). 0 disables the cap entirely.
+# oneshot watchdog). 0 disables the cap entirely — and, as for the fleet cap,
+# since task 4754 that leaves fm's head start (_within_fm_staleness_head_start)
+# still holding for STALENESS_GRACE_SECS after each verified fm deploy.
 try:
     FM_RESTART_MIN_INTERVAL_SECS = int(os.environ["FM_RESTART_MIN_INTERVAL_SECS"])
 except (KeyError, ValueError):

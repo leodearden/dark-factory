@@ -1890,6 +1890,38 @@ def test_within_fleet_staleness_head_start_false_when_both_caps_disabled(
     assert wdog._within_fleet_staleness_head_start() is False
 
 
+@pytest.mark.parametrize(
+    ("clock_age", "expected"),
+    [(300.0, True), (1900.0, False)],
+)
+def test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, clock_age: float, expected: bool
+) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS=0 still leaves a STALENESS_GRACE_SECS head start.
+
+    The REALISTIC disabled-cap configuration an operator produces, as distinct
+    from test_within_fleet_staleness_head_start_false_when_both_caps_disabled
+    above (which zeroes BOTH knobs and so only exercises _within_min_interval's
+    <=0 short-circuit).
+
+    With the cap at 0 the summed cap is STALENESS_GRACE_SECS (1800 > 0), so
+    the clock IS read and the head start degenerates to "1800s since the last
+    verified fleet deploy" — measured from the same instant, against a
+    zero-length min-interval window. That is a genuine behaviour CHANGE from
+    before task 4754: ORCH_RESTART_MIN_INTERVAL_SECS=0 used to remove every
+    deploy-clock gate from the staleness backstop, and now removes only the
+    min-interval one. Both the constant's comment and
+    _within_fleet_staleness_head_start's docstring say so; this pins it.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + clock_age)
+
+    assert wdog._within_fleet_staleness_head_start() is expected
+
+
 def test_staleness_head_start_gates_read_separate_clocks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
@@ -6436,6 +6468,31 @@ def test_within_fm_staleness_head_start_false_when_both_caps_disabled(
     )
 
     assert wdog._within_fm_staleness_head_start() is False
+
+
+@pytest.mark.parametrize(
+    ("clock_age", "expected"),
+    [(300.0, True), (1900.0, False)],
+)
+def test_within_fm_staleness_head_start_holds_grace_when_only_the_cap_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, clock_age: float, expected: bool
+) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS=0 still leaves a STALENESS_GRACE_SECS head start.
+
+    fm mirror of
+    test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disabled
+    — the realistic disabled-cap configuration (only the cap zeroed), as
+    distinct from the both-caps-zeroed short-circuit above. Same behaviour
+    change from before task 4754, against fm's OWN clock: a 0 cap now removes
+    the min-interval gate but not the head-start gate.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + clock_age)
+
+    assert wdog._within_fm_staleness_head_start() is expected
 
 
 def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
