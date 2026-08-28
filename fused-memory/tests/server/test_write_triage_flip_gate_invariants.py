@@ -25,6 +25,12 @@ No test in this file needs an API key, a network, or Qdrant.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+import pytest
+from shared.capability_manifest import DeliveredCheckMeta
+
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY
@@ -126,3 +132,78 @@ class TestAttachTargetIsNotAlwaysFirst:
             r for r in selected if (r.metadata or {}).get(PARENT_ID_KEY) == 'parent-1'
         ]
         assert [r.id for r in by_parent] == ['child-1']
+
+
+#: This file sits at ``<root>/fused-memory/tests/server/``.
+_REPO_ROOT = Path(__file__).parents[3]
+
+#: The ``metadata.delivered_checks`` entry task 4822 installed on task 4762,
+#: replacing a ``{kind: 'grep', pattern: 'candidate_id', expect: 'present'}``
+#: descriptor that asserted a symbol NAME rather than a behaviour -- and that
+#: named the option the corrected plan does not take.
+#:
+#: This is byte-for-byte the same ``script``/``args``/``timeout_secs`` as task
+#: 3169's ``metadata.before_done`` predicate. That is the point: the invariant
+#: then has ONE encoding referenced from TWO enforcement points -- the
+#: dispatch-time delivered-checks gate and the before_done gate -- instead of
+#: two independent encodings that can drift apart, which is exactly how the
+#: contradiction this file records came about.
+#:
+#: ``metadata.delivered_checks`` is invisible to git, so without this constant
+#: the swap would have no auditable home in the repo.
+FLIP_GATE_DELIVERED_CHECK = {
+    'name': 'write_triage_pre_flip_preconditions_on_main',
+    'kind': 'script',
+    'script': 'scripts/check_write_triage_flip_preconditions.sh',
+    'args': [],
+    'timeout_secs': 120,
+}
+
+
+class TestFlipGateDeliveredCheckDescriptor:
+    """The installed descriptor, pinned against the real tree.
+
+    ``run_delivered_check`` degrades a malformed or unreachable ``script``
+    descriptor to ``DeliveredCheckResult.ERRORED``, and per
+    ``docs/task-authoring.md`` section 3.3 an ERRORED check is a fail-safe
+    wait with NO streak bump and NO escalation. It therefore holds the
+    dependent SILENTLY and indefinitely -- the one new failure mode the swap
+    to ``kind='script'`` introduces, and the reason these three tests exist.
+    """
+
+    def test_the_repo_root_resolves(self) -> None:
+        """Fail loudly if this file moves, rather than checking the wrong tree."""
+        assert (_REPO_ROOT / 'dark-factory-orchestrator.yaml').exists()
+
+    def test_the_descriptor_validates_as_a_DeliveredCheckMeta(self) -> None:
+        """A descriptor that does not validate is a silent, unescalated hold."""
+        meta = DeliveredCheckMeta(**FLIP_GATE_DELIVERED_CHECK)
+
+        assert meta.kind == 'script'
+        assert meta.script == 'scripts/check_write_triage_flip_preconditions.sh'
+        assert meta.args == []
+        assert meta.timeout_secs == 120
+
+    def test_a_zero_timeout_descriptor_is_rejected(self) -> None:
+        """The cross-field validator is what makes the assertion above load-bearing."""
+        with pytest.raises(ValueError, match='timeout_secs is required and must be > 0'):
+            DeliveredCheckMeta(**{**FLIP_GATE_DELIVERED_CHECK, 'timeout_secs': 0})
+
+    def test_the_named_script_exists_and_is_executable(self) -> None:
+        """``_run_script_check`` execs ``project_root / meta.script`` directly.
+
+        A rename, a deletion, or a lost exec bit is the same silent hold as a
+        malformed descriptor. This does NOT duplicate task 4810's
+        ``scripts/tests/`` suite: that pins the script's exit-code BEHAVIOUR,
+        this pins that the descriptor's path still resolves to it.
+        """
+        script = _REPO_ROOT / FLIP_GATE_DELIVERED_CHECK['script']
+
+        assert script.exists(), f'delivered-check script is missing: {script}'
+        assert os.access(script, os.X_OK), f'delivered-check script is not executable: {script}'
+
+    def test_the_descriptor_is_not_a_bare_symbol_grep(self) -> None:
+        """Fails the moment someone reintroduces the symbol-grep shape 4822 removed."""
+        assert FLIP_GATE_DELIVERED_CHECK['kind'] == 'script'
+        assert 'pattern' not in FLIP_GATE_DELIVERED_CHECK
+        assert 'expect' not in FLIP_GATE_DELIVERED_CHECK
