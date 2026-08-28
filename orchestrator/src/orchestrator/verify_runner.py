@@ -2296,11 +2296,21 @@ class VerifyRunnerPool:
         # A pure `dataclasses.replace` and nothing else: `dispatch` is a TRANSPORT
         # concern, and the ledger write / event / streak bump belong to
         # `flake_recorder` on the merge path (recording here too would double-count).
-        # Guarded on the dataclass type rather than on `is not None`, so a payload that
-        # somehow arrived as a bare dict degrades to an un-stamped observation instead
-        # of raising `TypeError` out of `replace` and into the merge path.
+        #
+        # BOTH objects `replace` touches are guarded, not just the inner one: the
+        # observation must be a real `FlakeSuppression` (a payload that somehow arrived
+        # as a bare dict degrades to an un-stamped observation) AND `result` must be a
+        # dataclass INSTANCE, since a runner returning a Protocol-conformant fake or a
+        # test double would otherwise raise `TypeError` out of the OUTER `replace` and
+        # into the merge path — which has no VerifyInfraError handler.  Mirrors
+        # `verify._is_attachable`: an observation is evidence ABOUT a verdict and must
+        # never be able to destroy the verdict it describes.
         carried = getattr(result, 'flake_suppression', None)
-        if isinstance(carried, flake_ledger.FlakeSuppression):
+        if (
+            isinstance(carried, flake_ledger.FlakeSuppression)
+            and dataclasses.is_dataclass(result)
+            and not isinstance(result, type)
+        ):
             result = dataclasses.replace(
                 result,
                 flake_suppression=dataclasses.replace(

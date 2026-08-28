@@ -8973,47 +8973,49 @@ async def apply_merge_flake_suppression(
     Shaping the suppressed pass stays here rather than moving to the recorder:
     that is the GATE's judgement about the merge, not a record of anything.
 
-    Never raises: the pure gate is itself fail-closed and non-raising, and
-    ``replace`` cannot fail — an uncaught raise here would stall the merge queue
-    (merge_queue.py has no VerifyInfraError handler). *_confirm* is injectable
-    for testing.
+    Never raises: the pure gate is itself fail-closed and non-raising, and the
+    ``_is_attachable`` guard below covers BOTH branches' ``replace`` calls — an
+    uncaught raise here would stall the merge queue (merge_queue.py has no
+    VerifyInfraError handler). *_confirm* is injectable for testing.
     """
     suppression = await _confirm(
         config, failing_result, worktree=worktree, module_configs=module_configs,
     )
+    # ONE guard, checked before either branch, because BOTH of them reach
+    # `dataclasses.replace` — the suppressed branch via `_merge_flake_suppressed_pass`
+    # and the non-suppressed branch directly.  Guarding only the second (as this
+    # originally did) left the never-raise claim above half-true: the exact
+    # non-dataclass input it defended against still raised `TypeError` one branch over.
+    if not _is_attachable(failing_result):
+        logger.warning(
+            'apply_merge_flake_suppression: cannot attach a %s observation to a '
+            '%s (not a VerifyResult dataclass); returning the verdict unchanged',
+            getattr(suppression.verdict, 'value', suppression.verdict),
+            type(failing_result).__name__,
+        )
+        return failing_result
     if suppression.verdict is FlakeVerdict.passes_in_isolation:
         return replace(
             _merge_flake_suppressed_pass(failing_result, list(suppression.test_ids)),
             flake_suppression=suppression,
         )
-    return _attach_observation(failing_result, suppression)
+    return replace(failing_result, flake_suppression=suppression)
 
 
-def _attach_observation(
-    result: VerifyResult, suppression: FlakeSuppression,
-) -> VerifyResult:
-    """Attach *suppression* to *result*, or return *result* untouched if it is not
-    a ``VerifyResult`` dataclass instance.
+def _is_attachable(result: object) -> bool:
+    """True iff *result* is a dataclass INSTANCE, so ``dataclasses.replace`` is safe.
 
-    ``dataclasses.replace`` raises ``TypeError`` on anything that is not a dataclass
-    instance, and this is the NON-suppressed branch: the merge is already staying
-    red on its own merits, and the only thing being added is a record of WHY.
-    Raising here would convert a legible 'Verification failed' outcome into an
-    opaque 'Merge worker error: replace() should be called on dataclass instances'
-    — trading the caller's real verdict for a bookkeeping crash, and violating
-    ``apply_merge_flake_suppression``'s own never-raise contract (merge_queue.py
-    has no VerifyInfraError handler).
+    ``replace`` raises ``TypeError`` on anything else (including a dataclass CLASS,
+    hence the ``isinstance(..., type)`` arm).  Degrading instead of raising is the
+    point: the caller is holding a real verdict, and the only thing being added is a
+    record of WHY.  Raising would convert a legible 'Verification failed' outcome into
+    an opaque 'Merge worker error: replace() should be called on dataclass instances'
+    — trading the caller's verdict for a bookkeeping crash, and violating
+    ``apply_merge_flake_suppression``'s never-raise contract (merge_queue.py has no
+    VerifyInfraError handler).
 
-    Same discipline as ``VerifyRunnerPool.dispatch``'s guard on the runner
-    re-stamp: an observation is evidence ABOUT a verdict and must never be able to
-    destroy the verdict it describes.
+    Same discipline as ``VerifyRunnerPool.dispatch``'s guard on the runner re-stamp:
+    an observation is evidence ABOUT a verdict and must never be able to destroy the
+    verdict it describes.
     """
-    if not is_dataclass(result) or isinstance(result, type):
-        logger.warning(
-            'apply_merge_flake_suppression: cannot attach a %s observation to a '
-            '%s (not a VerifyResult dataclass); returning the verdict unchanged',
-            getattr(suppression.verdict, 'value', suppression.verdict),
-            type(result).__name__,
-        )
-        return result
-    return replace(result, flake_suppression=suppression)
+    return is_dataclass(result) and not isinstance(result, type)

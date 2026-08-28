@@ -1745,6 +1745,43 @@ class TestDispatchStampsFlakeSuppressionRunner:
         assert result.flake_suppression is None
         assert result.passed is True
 
+    async def test_a_non_dataclass_result_is_not_destroyed_by_the_stamp(self):
+        """(d2) BOTH objects ``replace`` touches are guarded, not just the inner one.
+
+        The inner ``isinstance(carried, FlakeSuppression)`` check protects the
+        observation, but the OUTER ``dataclasses.replace(result, ...)`` needs
+        ``result`` to be a dataclass instance too.  A runner returning a
+        Protocol-conformant fake or a test double that happens to carry a real
+        ``FlakeSuppression`` would otherwise raise ``TypeError`` out of ``dispatch``
+        and into the merge path — which has no ``VerifyInfraError`` handler, so a
+        bookkeeping correction would take down a real verdict.
+
+        Same discipline as ``verify._is_attachable``: an observation is evidence
+        ABOUT a verdict and must never be able to destroy the verdict it describes.
+        The stamp degrades to a no-op and the caller keeps its result.
+        """
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        class _NotADataclass:
+            passed = True
+            category = 'merge_flake_suppressed'
+            trivial = False
+
+            def __init__(self, suppression):
+                self.flake_suppression = suppression
+
+        carried = _make_suppression(runner='local')
+        fake = _NotADataclass(carried)
+        remote = self._runner('remote-lab-1', is_local=False, result=fake)
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result is fake, 'the caller keeps its own verdict'
+        # Un-stamped rather than crashed: the observation is still the one the
+        # discriminator produced, just without the runner correction.
+        assert result.flake_suppression is carried
+
     async def test_stamping_is_pure(self):
         """(e) ``dispatch`` stays a TRANSPORT concern: it corrects one field and
         records nothing.  Recording belongs to the dispatcher's merge path, which

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -938,7 +939,49 @@ class TestApplyMergeFlakeSuppression:
                 )
             )
 
-    # -- (f) the injected gate's call shape is unchanged ---------------------
+    # -- (f) the never-raise guard covers BOTH branches ----------------------
+
+    @pytest.mark.parametrize(
+        'verdict_name',
+        ['passes_in_isolation', 'fails_in_isolation', 'unconfirmable'],
+        ids=['suppressed_branch', 'failing_branch', 'unconfirmable_branch'],
+    )
+    def test_a_non_dataclass_result_degrades_loudly_on_every_branch(
+        self, tmp_path: Path, caplog, verdict_name,
+    ) -> None:
+        """The never-raise contract, actually exercised — and on EVERY branch.
+
+        ``dataclasses.replace`` raises ``TypeError`` on a non-dataclass, and BOTH
+        branches reach it: the suppressed one through
+        ``_merge_flake_suppressed_pass``, the other directly.  The guard originally
+        sat only on the second, so the exact input it defended against still raised
+        one branch over — a bookkeeping crash swallowing a real verdict, on a merge
+        path with no ``VerifyInfraError`` handler.  Parametrised over all three
+        verdicts so a future re-split of the branches cannot re-open the hole.
+
+        The verdict is returned UNCHANGED (never a suppressed pass — fail-closed on
+        a shape we do not understand) and the loss is LOUD.
+        """
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        class _NotADataclass:
+            """A Protocol-conformant stand-in: enough surface to be used as a
+            result, but nothing ``replace`` can copy."""
+
+            passed = False
+            category = 'test_failure'
+            flake_suppression = None
+
+        not_a_result = _NotADataclass()
+        _s, confirm = self._confirming(FlakeVerdict[verdict_name])
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = self._apply(not_a_result, tmp_path, confirm=confirm)
+
+        assert result is not_a_result, 'the caller keeps its own verdict'
+        assert 'not a VerifyResult dataclass' in caplog.text, caplog.text
+
+    # -- (g) the injected gate's call shape is unchanged ---------------------
 
     def test_confirm_called_with_config_and_failing_and_worktree(self, tmp_path: Path) -> None:
         """The injected _confirm still receives (config, failing_result)
