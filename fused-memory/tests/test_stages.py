@@ -9,7 +9,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
+from _fm_helpers import assert_id_title_pairing, complete_paged_read, make_8df8_scenario
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
@@ -1962,6 +1962,30 @@ class BaseStageValidationTest:
 class TestProjectIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates project_id and watermark.project_id."""
 
+    @pytest.fixture
+    def mock_deps(self):
+        """The base fixture's deps, with the whole-graph edge read stubbed EXPLICITLY.
+
+        Overridden only for this class, whose success-path tests assert a WHOLE
+        ``result.stats`` dict and so are the only ones here that observe what the
+        two stale-edge sweeps contribute.
+
+        ``_mock_stage_deps`` hands back a bare ``AsyncMock`` memory_service, so
+        ``graphiti.enumerate_all_valid_edges`` would otherwise be an AUTO-CREATED
+        child whose return value unpacks as ``grouped, paged = <AsyncMock>`` and
+        raises ValueError.  Both sweeps catch that INSIDE their own try and
+        return normally with ``errors=1``, so the stage would report a *failed*
+        corpus read as if this test had asked for one.  Stubbing an empty,
+        proven-complete read instead makes the outcome deterministic rather than
+        leaving it to auto-mock semantics — the same closure applied to
+        ``test_stage1.py``'s bare-AsyncMock factories.  (task 4386)
+        """
+        deps = _mock_stage_deps()
+        deps['memory_service'].graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=({}, complete_paged_read()),
+        )
+        return deps
+
     @pytest.mark.asyncio
     async def test_run_raises_on_empty_project_id(self, mock_deps):
 
@@ -2061,6 +2085,32 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # ELEVEN keys from the two stale-edge sweeps, not the four this
+            # task added (task 4386).  The count is what needs explaining: the
+            # consolidator's per-sweep `else:` branch copies out the WHOLE key
+            # set — 7 for the status-snapshot sweep, 4 for the priority-override
+            # sweep — and before this task these tests never reached that branch
+            # at all, so none of the 7 pre-existing keys appeared here either.
+            # They did not reach it because this class's memory_service is a bare
+            # AsyncMock: under the old `get_all_valid_edges` shim the auto-mocked
+            # read blew up OUTSIDE the sweep's try, escaped the sweep, and was
+            # swallowed by the consolidator's `except:` — which sets no stat at
+            # all.  The mock_deps override above now stubs an empty,
+            # proven-complete read, so both sweeps complete honestly over an
+            # empty corpus and report it.  Hence every count 0, and
+            # `enumeration_complete` True (a corpus WAS observed, and it was
+            # whole) with no incompleteness kind.
+            'stale_status_snapshot_edges_invalidated': 0,
+            'stale_status_snapshot_edges_scanned': 0,
+            'stale_blocked_edges_superseded': 0,
+            'stale_blocked_edges_supersede_errors': 0,
+            'stale_blocked_edges_supersede_skipped': 0,
+            'stale_status_snapshot_edges_enumeration_complete': True,
+            'stale_status_snapshot_edges_enumeration_incomplete_kind': None,
+            'stale_priority_override_edges_invalidated': 0,
+            'stale_priority_override_edges_scanned': 0,
+            'stale_priority_override_edges_enumeration_complete': True,
+            'stale_priority_override_edges_enumeration_incomplete_kind': None,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2186,6 +2236,32 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # ELEVEN keys from the two stale-edge sweeps, not the four this
+            # task added (task 4386).  The count is what needs explaining: the
+            # consolidator's per-sweep `else:` branch copies out the WHOLE key
+            # set — 7 for the status-snapshot sweep, 4 for the priority-override
+            # sweep — and before this task these tests never reached that branch
+            # at all, so none of the 7 pre-existing keys appeared here either.
+            # They did not reach it because this class's memory_service is a bare
+            # AsyncMock: under the old `get_all_valid_edges` shim the auto-mocked
+            # read blew up OUTSIDE the sweep's try, escaped the sweep, and was
+            # swallowed by the consolidator's `except:` — which sets no stat at
+            # all.  The mock_deps override above now stubs an empty,
+            # proven-complete read, so both sweeps complete honestly over an
+            # empty corpus and report it.  Hence every count 0, and
+            # `enumeration_complete` True (a corpus WAS observed, and it was
+            # whole) with no incompleteness kind.
+            'stale_status_snapshot_edges_invalidated': 0,
+            'stale_status_snapshot_edges_scanned': 0,
+            'stale_blocked_edges_superseded': 0,
+            'stale_blocked_edges_supersede_errors': 0,
+            'stale_blocked_edges_supersede_skipped': 0,
+            'stale_status_snapshot_edges_enumeration_complete': True,
+            'stale_status_snapshot_edges_enumeration_incomplete_kind': None,
+            'stale_priority_override_edges_invalidated': 0,
+            'stale_priority_override_edges_scanned': 0,
+            'stale_priority_override_edges_enumeration_complete': True,
+            'stale_priority_override_edges_enumeration_incomplete_kind': None,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
