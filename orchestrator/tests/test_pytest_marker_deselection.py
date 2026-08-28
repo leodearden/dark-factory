@@ -705,6 +705,26 @@ class _Other:
 """
 
 
+#: Every marker-source fixture in this module, by NAME.  The family invariant
+#: below parametrizes over names rather than values because this class is
+#: created at import time, BEFORE the fixtures defined further down the module
+#: exist; ``globals()`` resolves them at call time instead.
+_MARKER_SOURCE_FIXTURE_NAMES = (
+    '_REAL_PYTESTMARK_SOURCE',
+    '_ALL_DECORATED_SOURCE',
+    '_MIXED_DECORATED_SOURCE',
+    '_ALL_CLASSES_MARKED_SOURCE',
+    '_ONE_CLASS_MARKED_SOURCE',
+    '_ONLY_HELPER_CLASSES_SOURCE',
+    '_MARKED_SOURCE',
+    '_UNMARKED_SOURCE',
+    '_ALL_DECORATED_SOURCE_WITH_CLASS',
+    '_SLOW_MARKED_SOURCE',
+    '_UNMARKED_PLAIN_SOURCE',
+    '_SMOKE_MARKED_SOURCE',
+)
+
+
 class TestGuaranteedMarkerNames:
     """``guaranteed_marker_names(source) -> frozenset[str]``.
 
@@ -1013,6 +1033,112 @@ class TestGuaranteedMarkerNames:
 
     def test_syntax_error_is_empty_not_a_raise(self):
         assert guaranteed_marker_names('def broken(:\n') == frozenset()
+
+    # -- the named refusal cases, their in-class acceptance twin, and the ----
+    # -- family invariant ----------------------------------------------------
+
+    @pytest.mark.parametrize(
+        'decorator_line',
+        [
+            "@pytest.mark.parametrize('x', [1, 2])",
+            "@pytest.mark.parametrize('x', [1, pytest.param(2, marks=pytest.mark.xfail)])",
+        ],
+    )
+    def test_refuses_on_a_module_level_parametrized_test_function(self, decorator_line):
+        """``parametrize`` / ``pytest.param(marks=...)`` where they ARE a genuine hole.
+
+        ``module_level_marker_names``' docstring names both as reasons a
+        per-item DECORATOR SWEEP is unsound.  At MODULE level they still are:
+        ``test_a``'s items live outside every marked class, so no class
+        marker bounds them — the accounted-for guard's module-level-test-
+        function rule is what refuses, and it would refuse here even without
+        the parametrize.
+        """
+        source = _classes_marked_plus(f'{decorator_line}\ndef test_a(x):\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_parametrize_inside_a_fully_marked_class_does_not_block_widening(self):
+        """THE PAIRED ACCEPTANCE PIN, and why refusing here would buy no soundness.
+
+        Marks compose ADDITIVELY up the Module -> Class -> Function node
+        chain and nothing can REMOVE an ancestor mark, so ``parametrize``
+        multiplies items without breaking a bound that already holds for all
+        of them.  Refusing would still be SOUND, but ``parametrize`` is
+        near-ubiquitous inside test classes, so the guard would make this
+        tier fire on essentially nothing.
+
+        MEASURED, not assumed (scratch repo, re-verified in this task's
+        implementation session).  Under ``-m 'not slow'``, a class-level
+        ``pytestmark = [pytest.mark.slow]`` deselected ``test_plain``,
+        ``test_p[1]`` AND ``test_p[2]`` — the
+        ``pytest.param(2, marks=pytest.mark.xfail)`` one — for a total of
+        ``4 deselected, 0 selected`` and rc=5: precisely the false-RED shape
+        this widening exists to convert into a real run.
+        """
+        source = (
+            'import pytest\n\n\n'
+            'class TestBody:\n\n'
+            '    pytestmark = [pytest.mark.slow]\n\n'
+            '    def test_plain(self):\n        pass\n\n'
+            "    @pytest.mark.parametrize('x', [1, pytest.param(2, marks=pytest.mark.xfail)])\n"
+            '    def test_p(self, x):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_a_marked_subclass_of_an_imported_base_is_not_a_hole(self):
+        """Inherited test methods are collected under the marked SUBCLASS's node.
+
+        Same measured basis as above: ``@pytest.mark.slow class TestSub(Base)``
+        with ``Base`` defined in ANOTHER module and no methods of its own
+        still yielded ``TestSub::test_inherited`` as a collected, DESELECTED
+        item.  ``from base_helper import Base`` binds no ``test``-prefixed
+        name, so the import guard correctly stays quiet; the separate
+        ``from helpers import TestBase`` shape remains refused (pinned above).
+        """
+        source = (
+            'import pytest\n\n'
+            'from base_helper import Base\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestSub(Base):\n'
+            '    pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    @pytest.mark.parametrize('fixture_name', _MARKER_SOURCE_FIXTURE_NAMES)
+    def test_is_a_superset_of_the_module_level_tier_on_every_fixture(self, fixture_name):
+        """THE FAMILY INVARIANT, swept over every marker-source fixture in this module.
+
+        ``guaranteed_marker_names`` is a provable SUPERSET of
+        ``module_level_marker_names`` on every input, which is what makes
+        routing the composed entry point's primary tier through it STRICTLY
+        ADDITIVE: it can never refuse a target the current code accepts.
+        """
+        source = globals()[fixture_name]
+        assert module_level_marker_names(source) <= guaranteed_marker_names(source)
+
+    # -- cost bound: exactly one parse per call --------------------------------
+
+    def test_does_not_re_parse_source_to_derive_the_module_level_union(self, monkeypatch):
+        """One ``ast.parse`` per call, not two.
+
+        This function replaces a ``module_level_marker_names(source)`` call at
+        the composed entry point's tier-1 call site, so it must not cost more
+        than the call it replaces.  Reusing
+        ``_module_level_marker_names_from_tree`` off its OWN tree — rather
+        than calling ``module_level_marker_names(source)``, which would
+        re-parse — is what keeps the per-target parse count unchanged and the
+        existing cost pins green.
+        """
+        calls: list[None] = []
+        original_parse = ast.parse
+
+        def counting_parse(*args, **kwargs):
+            calls.append(None)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(ast, 'parse', counting_parse)
+        assert guaranteed_marker_names(_ALL_CLASSES_MARKED_SOURCE) == frozenset({'slow'})
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
