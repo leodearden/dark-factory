@@ -41,7 +41,10 @@ from _fm_helpers import complete_paged_read, incomplete_paged_read
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_PAGE_CAP,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
     IncompleteEnumerationError,
 )
 from fused_memory.reconciliation import task_filter
@@ -2586,6 +2589,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 1, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
         )
@@ -2642,6 +2646,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected both blocked-worded task-2885 edges invalidated and the '
             f'still-blocked control edge left alone, got stats={stats!r}'
@@ -2747,6 +2752,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 2, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected both repro-shape edges invalidated and the still-pending '
             f'control edge left alone, got stats={stats!r}'
@@ -2839,6 +2845,7 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'invalidated': 0, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the prepositional-complement enumeration scanned but never '
             f'selected — it asserts nothing about task 1020 or 1030 — got stats={stats!r}'
@@ -3476,6 +3483,7 @@ class TestSweepStaleStatusSnapshotEdgesGuards:
             'invalidated': 0, 'errors': 0,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': None, 'enumeration_incomplete_kind': None,
         }
         memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
@@ -3552,6 +3560,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 1, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the failed update tallied as an error without blocking the second, got {stats!r}'
         )
@@ -3577,6 +3586,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': None, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
@@ -3627,6 +3637,8 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': False,
+            'enumeration_incomplete_kind': INCOMPLETE_PAGE_CAP,
         }, (
             f'Expected the structural incompleteness to abort the cycle with nothing '
             f'scanned and one error tallied, got {stats!r}'
@@ -3659,6 +3671,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 0, 'errors': 1,
             'superseded': 0, 'supersede_errors': 0,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             f'Expected the get_statuses failure tallied as an error with no invalidation, got {stats!r}'
         )
@@ -3746,6 +3759,7 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             'invalidated': 2, 'errors': 0,
             'superseded': 1, 'supersede_errors': 1,
             'supersede_skipped': 0,
+            'enumeration_complete': True, 'enumeration_incomplete_kind': None,
         }, (
             'Expected the failed supersede tallied into supersede_errors only, '
             f'leaving both invalidations intact and errors at 0, got {stats!r}'
@@ -3891,3 +3905,277 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
             await sweep_stale_status_snapshot_edges(
                 memory_service, taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
             )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges — enumeration completeness signal
+# (task 4386)
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStaleStatusSnapshotEdgesEnumerationCompleteness:
+    """The sweep reports whether the corpus it swept was the WHOLE corpus.
+
+    Before this, a cycle that swept a truncated read was indistinguishable in
+    its stats from one that swept everything: both reported the same counters,
+    and the only trace of the truncation was a log line nobody correlates with
+    the cycle. That is the ambiguity the two new keys close, and it is the same
+    move the supersede counters already make against the same failure — a bare
+    ``superseded=0`` cannot distinguish "nothing needed superseding" from
+    "every superseding write failed".
+
+    ``enumeration_complete`` is deliberately TRI-STATE, because three outcomes
+    are genuinely distinct and collapsing any pair loses information a reader
+    needs:
+
+      ``True``  — the read was PROVEN complete. The only value a caller may
+                  gate on; see ``test_only_is_true_gates_a_swept_corpus``.
+      ``False`` — a corpus was observed and it was INCOMPLETE, with
+                  ``enumeration_incomplete_kind`` naming which way.
+      ``None``  — NO corpus was observed at all: either the sweep
+                  short-circuited before reading, or the read itself failed.
+                  Distinguished from each other by ``errors``.
+
+    ``enumeration_incomplete_kind`` carries the backend's stable
+    ``INCOMPLETE_*`` discriminator, never ``PagedRead.reason`` — that field is
+    diagnostic prose the backend documents as an unstable interface, so
+    asserting on it here would pin wording rather than behaviour.
+    """
+
+    STALE_FACT = 'Task 142 is an active pending task'
+
+    def _memory_reading(self, paged) -> MagicMock:
+        """A memory service whose enumeration returns one stale edge + *paged*."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [
+                    {'uuid': 'edge-142', 'fact': self.STALE_FACT, 'name': ''},
+                ]},
+                paged,
+            ),
+        )
+        return memory_service
+
+    @staticmethod
+    def _taskmaster_saying_done() -> MagicMock:
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_complete_read_reports_complete_true_and_no_kind(self):
+        """A proven-complete read: the sweep behaves exactly as it always did."""
+        memory_service = self._memory_reading(complete_paged_read(rows_seen=1))
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is True, (
+            f'Expected a proven-complete read reported as True, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind, got {stats!r}'
+        )
+        # Unchanged behaviour on the path that was already correct.
+        assert stats['scanned'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind', [INCOMPLETE_CENSUS_UNAVAILABLE, INCOMPLETE_SHORT_READ],
+        ids=['census_unavailable', 'short_read'],
+    )
+    async def test_empirical_incompleteness_still_sweeps_but_says_so(self, kind):
+        """EMPIRICAL incompleteness -> sweep what was fetched, and report it.
+
+        This is the whole point of the task. The empirical kinds are
+        transient-capable on a graph under continuous write, so aborting would
+        take the live rebuild down for something that self-heals next cycle —
+        the sweep therefore proceeds normally and ``errors`` stays 0. What
+        changes is that the cycle now SAYS the corpus was partial instead of
+        reporting a clean sweep, so a consumer can decline to treat this
+        cycle's absences as evidence.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=40),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the partial corpus reported as False, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the stable {kind!r} discriminator surfaced, got {stats!r}'
+        )
+        # The sweep still did its job on what it did fetch.
+        assert stats['scanned'] == 1
+        assert stats['invalidated'] == 1
+        assert stats['errors'] == 0, (
+            f'An empirical incompleteness is NOT an error — raising on a census '
+            f'disagreement would flap on a live graph, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empirical_incompleteness_warns_through_the_injected_log(self):
+        """The one warning about a truncated corpus rides the sweep's logger.
+
+        ``apply_incompleteness_policy`` defaults to the BACKEND module logger,
+        which would surface this message detached from the cycle that produced
+        it. The sweep passes its own injected ``log`` so the truncation shows
+        up beside the rest of that cycle's diagnostics.
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40),
+        )
+        log = MagicMock()
+
+        await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1', log=log,
+        )
+
+        assert log.warning.call_count == 1, (
+            f'Expected exactly one truncation warning on the sweep\'s own logger, '
+            f'got {log.warning.call_args_list!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_structural_incompleteness_reports_the_kind_beside_the_error(
+        self, kind,
+    ):
+        """A STRUCTURAL abort is a STRUCTURED fact, not just a log line.
+
+        The keys are assigned BEFORE the policy is applied, which is what lets
+        an aborted cycle still say WHY it aborted. Without that ordering the
+        operator gets ``errors=1`` and has to reconstruct the cause from logs —
+        exactly the reconstruction this task exists to remove.
+
+        Parametrised over the frozenset rather than the two named constants, so
+        a future third structural path is covered by construction (the backend
+        asks callers to branch on membership, not on a specific kind).
+        """
+        memory_service = self._memory_reading(
+            incomplete_paged_read(kind, rows_seen=1, expected_rows=9999),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, self._taskmaster_saying_done(), 'test_project',
+            '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is False, (
+            f'Expected the aborted cycle to still report the corpus as partial, '
+            f'got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] == kind, (
+            f'Expected the abort reason carried as a structured fact, got {stats!r}'
+        )
+        assert stats['errors'] == 1, f'Expected the abort tallied, got {stats!r}'
+        assert stats['scanned'] == 0, (
+            f'A structurally truncated read must NOT be scanned as if whole, '
+            f'got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_observes_no_corpus(self):
+        """No taskmaster -> no read happened, so completeness is UNKNOWN.
+
+        ``None``, not ``True``: nothing was proven about the corpus because
+        nothing was read. Reporting ``True`` here would let a caller treat a
+        cycle that never looked as a cycle that looked and found everything.
+        """
+        memory_service = _make_memory_service()
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN on the short-circuit path, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 0, (
+            f'The short-circuit is not an error — that is what distinguishes it '
+            f'from a failed read, got {stats!r}'
+        )
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_observes_no_corpus(self):
+        """The read itself raised -> also UNKNOWN, distinguished by ``errors``.
+
+        Both no-corpus paths report ``None``; ``errors`` is what tells them
+        apart, which is why the tri-state does not need a fourth value.
+        """
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, _make_taskmaster(), 'test_project', '/tmp/reify',
+            run_id='run-1',
+        )
+
+        assert stats['enumeration_complete'] is None, (
+            f'Expected UNKNOWN when the read never returned, got {stats!r}'
+        )
+        assert stats['enumeration_incomplete_kind'] is None
+        assert stats['errors'] == 1, (
+            f'Expected the failed read tallied, which is what distinguishes it '
+            f'from the short-circuit, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_is_true_gates_a_swept_corpus(self):
+        """``is True`` is the ONLY admissible gate predicate.
+
+        A truthiness test (``if stats['enumeration_complete']``) happens to
+        agree here, but an ``is not False`` or ``!= False`` test would wrongly
+        admit the two UNKNOWN paths — so this pins identity, not truthiness,
+        and pins that the three states are mutually exclusive.
+        """
+        taskmaster = self._taskmaster_saying_done()
+        complete = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(complete_paged_read(rows_seen=1)), taskmaster,
+            'test_project', '/tmp/reify', run_id='run-1',
+        )
+        empirical = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(
+                incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40),
+            ),
+            taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+        structural = await sweep_stale_status_snapshot_edges(
+            self._memory_reading(
+                incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1, expected_rows=9999),
+            ),
+            taskmaster, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+        unread = await sweep_stale_status_snapshot_edges(
+            _make_memory_service(), None, 'test_project', '/tmp/reify', run_id='run-1',
+        )
+
+        gated = [
+            name for name, stats in (
+                ('complete', complete), ('empirical', empirical),
+                ('structural', structural), ('unread', unread),
+            )
+            if stats['enumeration_complete'] is True
+        ]
+        assert gated == ['complete'], (
+            f'Only a PROVEN-complete read may pass the gate, got {gated!r}'
+        )
+        assert empirical['enumeration_complete'] is False
+        assert structural['enumeration_complete'] is False
+        assert unread['enumeration_complete'] is None
