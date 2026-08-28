@@ -733,7 +733,15 @@ verify_cold_command_timeout_secs: 5400
 # and npm's cache is keyed by integrity, so a cache hit is always the right
 # bytes — it just avoids a registry round-trip on every cold worktree.
 # MEASURED 2026-08-28 with an empty, isolated npm cache (the worst case, and the
-# one a fresh host actually sees): 15.9s.
+# one a fresh host actually sees): 15.9s. Warm cache: ~2s.
+#
+# DISK, stated because it is a real per-worktree cost and nobody should have to
+# rediscover it: this leaves a 37MB `node_modules/` in every cold-verified
+# worktree (gitignored, and pyright/ruff/pytest are all given explicit targets
+# so nothing walks it). Context, measured the same day on this host: the `.venv`
+# each worktree already carries is 156-803MB, so this adds roughly 5-24% to a
+# worktree's footprint, on 2.0T free. If that ever stops being a rounding error
+# the answer is worktree GC, not dropping the pin.
 verify_cold_preprovision_command: "uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline"
 
 # TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
