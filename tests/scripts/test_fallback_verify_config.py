@@ -605,19 +605,51 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
-# PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
-# test.log}; run started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`;
-# surfaced as escalation esc-3062-3. These are LOGGED durations, not estimates.
+# PROVENANCE — this table now spans TWO measurement epochs. Do not read it as
+# one run.
 #
-# `tests/scripts` uses the LOWEST of four independent measurements (105-127s),
-# and `dashboard`, `sampler` and `cockpit` are OMITTED ENTIRELY — the run timed
-# out at 1800.66s before dashboard even started, so no figure exists for them.
-# The sum is therefore a hard measured LOWER BOUND on the chain's cost: the real
-# green-path chain is strictly more expensive than this, never less.
+#   shared / escalation / fused-memory / tests/scripts — task 3062,
+#     .task/verify/attempt-2.__fallback__.{summary.json,test.log}; run started
+#     2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`; surfaced as
+#     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
+#     uses the LOWEST of four independent measurements (105-127s).
+#
+#   orchestrator — RE-MEASURED by task 4902 on 2026-08-28 from the per-module
+#     verify corpus (`.worktrees/*/.task/verify/*.orchestrator.summary.json`),
+#     selecting FULL-SUITE GREEN runs only: n=28, window 2026-08-22..2026-08-28,
+#     p50 1765.95 / p90 2552.09 / max 3310.50. The old figure (1366.23, one run)
+#     predates commit 685f558728's `verify_admission_pytest_n: "8"` fanout cap
+#     and understated this segment by ~400s. Full selection rules, both regime
+#     arms and the percentile conventions are on
+#     POST_CAP_ORCHESTRATOR_GREEN_SECS above.
+#
+# WHAT THE SUM IS, PRECISELY. `dashboard`, `sampler` and `cockpit` are OMITTED
+# ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
+# started, so no figure exists for them. So sum() is a lower bound on the MEDIAN
+# green chain cost: five of eight segments, each a representative green run.
+#
+# It is NOT a bound on an individual run, and the earlier wording here ("the
+# real green-path chain is strictly more expensive than this, never less") was
+# wrong to imply otherwise — task 3062 itself logged 1366.23s and 1157.62s for
+# the same segment on the same day, and the 4902 corpus shows green full-suite
+# orchestrator runs spanning 864.83s to 3310.50s. Individual runs land on both
+# sides of this sum; the median chain does not.
+#
+# FINDING (data for the pinned operator decision, task 3353's L1 — deliberately
+# NOT acted on here). At the observed green MAXIMUM the five-segment floor is
+# 472.37 + 3310.50 = 3782.87s, already above the 3600s
+# `verify_command_timeout_secs`; adding the yaml's own ~407s of estimates for
+# the three unmeasured segments puts that path at ~4190s. One run has already
+# consumed the full ceiling and been recorded as a false infra_timeout
+# (.worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json, 3600.649s,
+# 2026-08-28T17:25:05Z). This task changes NO budget, NOT the -n cap, and NOT
+# orchestrator/orchestrator.yaml — it only records the measurement those
+# decisions need.
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    'orchestrator': 1366.23,
+    # Task 4902: 1366.23 -> 1765.95, the post-cap median. See PROVENANCE above.
+    'orchestrator': 1765.95,
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
 }
@@ -681,18 +713,34 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
 
     SCOPE — what this guard does NOT do. It is a floor-REGRESSION guard: it
     fails if someone lowers ``verify_command_timeout_secs`` back below the
-    measured 1838.60s lower bound. It is NOT a suite-growth detector, and
+    measured floor (now 2238.32s). It is NOT a suite-growth detector, and
     nothing here re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a
-    frozen literal asserted against a config value; if the orchestrator segment
-    doubles to 2700s tomorrow, the table still reads 1366.23, the floor still
-    reads 1838.60, and this test passes green while the budget is once again
-    provably below the honest green path. Genuine growth detection would have to
-    come from RE-MEASUREMENT — an operator runbook step, or a check against
-    durations recorded by a recent verify run — not from a hardcoded table
-    asserting against itself. Stating that plainly is the point: task 3350
-    exists because a justification nobody re-checked was left standing until it
-    was off by an order of magnitude, and a guard that overstates its own reach
-    is the same defect wearing a test's clothes.
+    frozen literal asserted against a config value.
+
+    That limitation is no longer hypothetical. This paragraph used to warn: "if
+    the orchestrator segment doubles to 2700s tomorrow, the table still reads
+    1366.23, the floor still reads 1838.60, and this test passes green while the
+    budget is once again provably below the honest green path." That is what
+    happened. Commit 685f558728 (2026-08-20) capped the orchestrator fanout at
+    ``pytest -n 8``; its median green full-suite cost went from 691.40s to
+    1765.95s; the table stayed at 1366.23 and this test stayed green throughout,
+    for eight days, until task 4902 re-measured the segment BY HAND on
+    2026-08-28. The prediction was correct in kind and roughly correct in
+    magnitude, and the guard did not fire.
+
+    So the disclaimer stands, with one thing added and nothing softened.
+    Genuine growth detection still has to come from RE-MEASUREMENT — an operator
+    runbook step, or a check against durations recorded by a recent verify run —
+    not from a hardcoded table asserting against itself, and 4902 built no such
+    detector. What 4902 did add is age: every entry now carries dated provenance
+    (``MEASURED_FLEET_SEGMENT_PROVENANCE``), so the next reader can see which
+    epoch a figure came from without archaeology, and
+    ``test_published_yaml_segment_table_matches_the_python_measurement_table``
+    ties this table to its republished copy in the config so the two cannot
+    drift apart. Neither makes the table measure itself. Stating that plainly is
+    the point: task 3350 exists because a justification nobody re-checked was
+    left standing until it was off by an order of magnitude, and a guard that
+    overstates its own reach is the same defect wearing a test's clothes.
     """
     budgets = _verify_budgets()
     warm = budgets['verify_command_timeout_secs']
