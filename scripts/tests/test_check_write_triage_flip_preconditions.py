@@ -615,3 +615,34 @@ class TestFlipPreconditionsScript:
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
         assert 'PASS  item 2' in proc.stdout, proc.stdout
         assert 'PASS  item 4' in proc.stdout, proc.stdout
+
+
+#: DeterministicRunner._default_run_script folds stderr into stdout and returns
+#: ``decode()[-2000:]``, and _run_predicate feeds exactly that into the
+#: milestone_check_failed escalation's detail. The all-FAIL report is several
+#: times that, and item 1 is emitted FIRST — so item 1's rewritten guidance,
+#: the corrected spec an implementer is meant to read, is precisely what gets
+#: truncated away from what an operator actually sees.
+_ESCALATION_DETAIL_CHARS = 2000
+
+
+class TestReportSurvivesTruncation:
+    """What reaches the operator is the report's TAIL, not its head."""
+
+    def test_all_fail_tail_still_names_every_failing_item(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Vacuous otherwise: a report that fits inside the window proves nothing.
+        assert len(proc.stdout) > _ESCALATION_DETAIL_CHARS, len(proc.stdout)
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        # Item NUMBERS, not guidance prose — the summary is deliberately a
+        # summary, so this does not become a wording pin.
+        assert 'FAILING ITEMS: 1 2 4' in tail, tail
+
+    def test_all_pass_tail_reports_no_failing_items(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: none' in tail, tail
