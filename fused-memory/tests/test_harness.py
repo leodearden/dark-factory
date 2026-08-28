@@ -12653,10 +12653,45 @@ def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
         return await original_replay(pid)
 
     async def spy_complete(pid, *args, **kwargs):
+        # Record AFTER the await, for the same reason as _make_completion_spy:
+        # a predicate keyed on this list must observe the effect, not the entry.
+        # Ordering semantics are unchanged — under the release-before-replay bug
+        # mark_run_complete both starts and returns before _replay_deferred_writes
+        # is entered, so call_order is still ['complete', 'replay'].
+        result = await original_complete(pid, *args, **kwargs)
         call_order.append('complete')
-        return await original_complete(pid, *args, **kwargs)
+        return result
 
     return spy_replay, spy_complete, call_order, lock_held_during_replay
+
+
+def _make_completion_spy(original):
+    """Wrap ``original``, recording completion AFTER it returns.
+
+    Returns ``(spy, signal)``.  ``signal`` gains a single ``True`` once — and
+    only once — ``original`` has actually returned, so a caller polling
+    ``bool(signal)`` observes "the effect happened", never "the call started".
+
+    That distinction is load-bearing for ``_drive_project_loop_until``, which
+    cancels the driven ``_project_loop`` on the first poll tick where its
+    predicate holds.  A signal raised on ENTRY lets that cancel land at an await
+    point inside the real ``mark_run_complete``, whose ``DELETE`` is then rolled
+    back by ``EventBuffer._txn`` (it catches ``BaseException`` so cancellation
+    cannot leave the sqlite writer lock open).  The caller's "lock was released"
+    assertion would then fail with the ordering-bug message it guards — blaming
+    correct production code for a slow test host.
+
+    Deliberately NOT ``try/finally``: a ``mark_run_complete`` that raised did not
+    release the lock, so it must not be reported as complete.
+    """
+    signal: list[bool] = []
+
+    async def spy(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        signal.append(True)
+        return result
+
+    return spy, signal
 
 
 async def _drive_project_loop_until(
@@ -12683,6 +12718,13 @@ async def _drive_project_loop_until(
     the signal genuinely never arrives (the real regression these tests pin), the
     predicate stays false and the caller's own assertion fires with its diagnostic
     message instead of hanging.
+
+    The other half of that contract is on the caller: ``predicate`` must observe
+    an EFFECT, not a call's entry.  This driver cancels the driven task on the
+    first tick where the predicate holds, so a predicate signalled on entry gives
+    it permission to cancel the very work it is waiting for — mid-transaction, in
+    the ``mark_run_complete`` case, where ``EventBuffer._txn`` then rolls the
+    write back.  Build such predicates with ``_make_completion_spy``.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -12757,12 +12799,7 @@ async def test_project_loop_releases_lock_when_replay_raises(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     await _seed_recon_state(event_buffer)
 
-    complete_called: list[bool] = []
-    original_complete = harness.buffer.mark_run_complete
-
-    async def spy_complete(pid, *args, **kwargs):
-        complete_called.append(True)
-        return await original_complete(pid, *args, **kwargs)
+    spy_complete, complete_called = _make_completion_spy(harness.buffer.mark_run_complete)
 
     with (
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
