@@ -1986,11 +1986,18 @@ class TestB9RecoveredNameCollidesWithASuppliedArgument:
 # ---------------------------------------------------------------------------
 
 
-#: The eight keys PRD section 6 contracts for ``markup_detected``, plus the key
-#: naming the fact itself. Asserted as an EXACT set, which catches drift in both
-#: directions: a missing key sends a consumer back to log-scraping, and an extra
-#: value-bearing key would turn the fact stream into a second copy of the
-#: caller's payload.
+#: The eight keys PRD section 6 contracts for ``markup_detected``, the key
+#: naming the fact itself, and — as of task **4502** — ``quoted_markup_params``.
+#: Asserted as an EXACT set, which catches drift in both directions: a missing
+#: key sends a consumer back to log-scraping, and an extra value-bearing key
+#: would turn the fact stream into a second copy of the caller's payload.
+#:
+#: The 4502 addition is NAMES ONLY, so it does not breach that second guard: it
+#: is the subset of ``recovered_params`` whose delivered value still trips
+#: ``detect``, which exists because narrowing boundary row B5 made such a value
+#: possible and INV-2 requires it be countable rather than silent. Extending
+#: this set is deliberate — the exactness is the point, so a key may only
+#: appear here alongside the reason it is not payload.
 FACT_KEYS = {
     'fact',
     'tool',
@@ -1999,6 +2006,7 @@ FACT_KEYS = {
     'misclose',
     'outcome',
     'recovered_params',
+    'quoted_markup_params',
     'agent_id',
     'project',
 }

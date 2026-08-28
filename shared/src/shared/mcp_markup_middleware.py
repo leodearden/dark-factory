@@ -124,10 +124,16 @@ from pydantic import Field
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
     MARKUP_OVERRIDE_KEY,
-    # ``detect`` is deliberately NOT imported here any more (task 4696). This
-    # boundary has exactly one scan and it is parameter-aware; importing the
-    # blanket predicate too would leave a loaded gun for a future edit to
-    # re-blind the gate with, and ruff would not complain.
+    # ``detect`` is BACK (task 4502) after task 4696 removed it — but NOT for
+    # gating, and the 4696 rationale it was removed under still binds: this
+    # boundary has exactly ONE gate scan, it is :func:`detect_for`, and a
+    # future edit must not re-blind it by reaching for the blanket predicate
+    # here. The single legal use is the CENSUS in
+    # :func:`_quoted_markup_params` — asking, of a value already recovered,
+    # whether what it carries would trip a downstream blanket consumer. That
+    # question has no parameter to be aware of, because the recovered value is
+    # the caller's own text rather than something this guard rewrote.
+    detect,
     detect_for,
     markup_override_requested,
     repair,
@@ -281,6 +287,63 @@ def _json_type_name(value: Any) -> str | None:
         elif isinstance(value, python_type):
             return name
     return None
+
+
+def _quoted_markup_params(recovered: Any) -> list[str]:
+    """The recovered names whose value STILL trips :func:`detect`, sorted.
+
+    WHY THIS EXISTS, not just what it does. A faithful REPORT of a markup leak
+    necessarily quotes the leak: an escalation saying "the tripwire matched X"
+    contains X. Task **4502** narrowed ``shared.toolcall_markup`` boundary row
+    B5 so those reports are REPAIRED rather than refused, which means a
+    recovered value may legitimately carry an envelope literal. That is not
+    residue — invariant D5 guarantees a recovered value is a verbatim substring
+    of what the caller actually sent, so it is the caller's own text. Refusing
+    to deliver it would drop precisely the characters this PRD exists to stop
+    dropping; delivering it is the correct outcome.
+
+    But correct is not the same as invisible. Per INV-2 and this repo's
+    loud-over-silent-degradation norm the quoting is PUBLISHED, on the
+    ``markup_detected`` fact and on both policy payloads, so the population is
+    countable rather than rediscovered later as a bug — and so a caller
+    mechanically resubmitting an offered ``repaired_call`` can see WHY that
+    call still carries a literal and reach for the ``allow_mcp_markup``
+    override, instead of looping against its own rejection.
+
+    MEASURED POPULATION at 4502's HEAD: committed-corpus record
+    ``toolu_01XbCz5NFCA6pCvmseyqFgvy`` plus the two ``esc-3514`` specimens,
+    which are the same underlying leaked call. One call and its two filings.
+
+    THE ABSORBING PARAMETER IS NOT IN SCOPE HERE and never becomes so.
+    ``fix.clean_value`` is the value this guard REWROTE, and its envelope-free
+    post-condition (contract C1, stated against :func:`detect_for`) is
+    unchanged and non-negotiable. This census covers ``fix.recovered`` only.
+
+    NAMES ONLY, like ``recovered_params``: a fact must not become a second copy
+    of the caller's payload. Non-``str`` values are skipped because
+    :func:`_coerce_recovered` may have typed them into a list or dict, and a
+    blanket textual scan of a decoded structure would be answering a different
+    question than the one a downstream string consumer asks.
+
+    Total for the unrepairable path's ``()``, which has no recovery at all: the
+    answer there is the EMPTY list, present-and-empty for the same reason
+    ``misclose`` is present-and-null — a consumer must never have to tell "none
+    quoted" apart from "that emitter forgot the key".
+
+    Related, and deliberately NOT reopened here: this module passes no
+    ``schema_params`` at its :func:`detect_for` call site, leaving a cross-field
+    misclose ungated. That is a DECLARED residual, argued in place at that call
+    site and pinned by a negative-control test
+    (``TestSelfNameCloserIsSeenAtTheBoundary``); task 4502 ruled it an explicit
+    non-goal rather than re-litigating a landed decision.
+    """
+    if not isinstance(recovered, Mapping):
+        return []
+    return sorted(
+        name
+        for name, value in recovered.items()
+        if isinstance(value, str) and detect(value) is not None
+    )
 
 
 def _coerce_recovered(
@@ -1124,15 +1187,20 @@ class MarkupGuardMiddleware(Middleware):
             'misclose': misclose,
             'outcome': outcome,
             'recovered_params': sorted(recovered),
+            # Task 4502. A SUBSET of recovered_params, never the absorbing
+            # parameter — see :func:`_quoted_markup_params` for why delivering
+            # these is correct and why it must nonetheless be countable.
+            'quoted_markup_params': _quoted_markup_params(recovered),
             'agent_id': agent_id,
             'project': project,
         }
 
         logger.warning(
             'markup guard: %s tool=%s param=%s pattern=%r misclose=%r '
-            'recovered_params=%r agent_id=%r project=%r',
+            'recovered_params=%r quoted_markup_params=%r agent_id=%r project=%r',
             outcome, tool, param, pattern, misclose,
-            fact['recovered_params'], agent_id, project,
+            fact['recovered_params'], fact['quoted_markup_params'],
+            agent_id, project,
         )
 
         if self._fact_sink is None:
@@ -1549,6 +1617,11 @@ class MarkupGuardMiddleware(Middleware):
             'matched_pattern': fix.pattern,
             'misclose': fix.misclose,
             'recovered_params': sorted(fix.recovered),
+            # The load-bearing one. ``repaired_call`` is offered for verbatim
+            # resubmission, and a recovered value that quotes a literal makes
+            # that retry bounce again — naming it is what turns an infinite
+            # mechanical retry into an adjudicable report (task 4502).
+            'quoted_markup_params': _quoted_markup_params(fix.recovered),
             'repaired_call': repaired_call,
             'hint': _REJECT_HINT,
         }, storm)))
@@ -1603,6 +1676,11 @@ class MarkupGuardMiddleware(Middleware):
             # of its arguments the guard altered, and the warning must not
             # become a second copy of its payload.
             'recovered_params': sorted(fix.recovered),
+            # Present-and-empty rather than omitted, unlike `unrecovered_params`
+            # below: this one answers "did anything I was handed still carry a
+            # literal", and an absent key would read as "no" while actually
+            # meaning "this emitter is older than task 4502".
+            'quoted_markup_params': _quoted_markup_params(fix.recovered),
             'hint': _FORWARD_HINT,
         }, storm)
         # Omitted when empty, the same convention `storm` follows: a key that is
