@@ -1418,7 +1418,7 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'no_transcript'
+    assert kwargs['data']['reasons'] == ['no_transcript']
 
 
 # ── B4': the lane was reseeded → EXPECTED fallback, no escalation ────────────
@@ -1466,7 +1466,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'reseeded'
+    assert kwargs['data']['reasons'] == ['reseeded']
     assert harness._escalation_queue.submit.call_count == 0
 
 
@@ -1505,7 +1505,7 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'stale'
+    assert kwargs['data']['reasons'] == ['stale']
 
 
 # ── B6: kill switch (session_resume.enabled = false) ─────────────────────────

@@ -2020,7 +2020,7 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'stale'
+        assert kwargs['data']['reasons'] == ['stale']
 
     async def test_unparseable_or_missing_started_at_falls_back_stale(
         self, harness: Harness, tmp_path: Path
@@ -2047,7 +2047,7 @@ class TestSessionResumeGuard:
         assert len(emits) == 2
         for et, kwargs in emits:
             assert et == EventType.session_resume_fallback
-            assert kwargs['data']['reason'] == 'stale'
+            assert kwargs['data']['reasons'] == ['stale']
 
     async def test_transcript_absent_falls_back_no_transcript(
         self, harness: Harness, tmp_path: Path
@@ -2073,7 +2073,58 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
+
+    async def test_aged_and_uncorroborated_reports_both_reasons(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The user-observable signal of task 3728, end to end through the
+        guard: a sidecar that is BOTH too old AND missing its transcript emits
+        ONE fallback carrying BOTH reasons.
+
+        Before the composite rewrite this event said ``reason='stale'`` and
+        nothing else, because freshness was checked first — so an operator
+        triaging it went to check host clock skew for a session that had also
+        lost its transcript, and the second cause was not merely unranked but
+        absent from the wire entirely.
+
+        The list is SORTED (alphabetical, hence no_transcript before stale) so
+        ``json_extract(data,'$.reasons')`` is a stable composite group key, and
+        it is a real ``list`` — a set/frozenset would not survive the JSON
+        round-trip into runs.db.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+        session = {
+            'session_id': 'uuid-both-wire',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-both-wire'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        resume_id = await _drive_session_slot(
+            harness, 'both1', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        data = kwargs['data']
+        assert data['reasons'] == ['no_transcript', 'stale']
+        assert isinstance(data['reasons'], list)
+        # The first-match scalar is GONE, not kept as an alias: retaining it
+        # would mean retaining the projection this task exists to kill, and
+        # operators would keep reading the field that misdirects them.
+        assert 'reason' not in data
+        # α's instrument still rides the same emit (no archive was written).
+        assert data['archive_available'] is False
 
     async def test_wiped_config_dir_falls_back_reseeded(
         self, harness: Harness, tmp_path: Path
@@ -2109,7 +2160,7 @@ class TestSessionResumeGuard:
         # The event type is UNCHANGED — the downgrade suppresses the
         # escalation, not the telemetry channel (PRD open question 3).
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'reseeded'
+        assert kwargs['data']['reasons'] == ['reseeded']
 
     async def test_surviving_config_dir_missing_transcript_stays_no_transcript(
         self, harness: Harness, tmp_path: Path
@@ -2140,7 +2191,7 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
 
     async def test_unreadable_config_dir_stays_no_transcript(
         self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2188,7 +2239,7 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
 
     async def test_no_config_dir_falls_back_no_transcript(self, harness: Harness):
         """No stashed config_dir at all → cannot corroborate → 'no_transcript'."""
@@ -2206,7 +2257,7 @@ class TestSessionResumeGuard:
         emits = _session_resume_emits(harness)
         assert len(emits) == 1
         assert emits[0][0] == EventType.session_resume_fallback
-        assert emits[0][1]['data']['reason'] == 'no_transcript'
+        assert emits[0][1]['data']['reasons'] == ['no_transcript']
 
     async def test_capped_emits_capped(self, harness: Harness, tmp_path: Path):
         """resume_count at the cap → fresh dispatch + session_resume_capped (B7).
@@ -2301,7 +2352,7 @@ class TestSessionResumeStorm:
         assert len(emits) == 3
         for et, kwargs in emits:
             assert et == EventType.session_resume_fallback
-            assert kwargs['data']['reason'] == 'reseeded'
+            assert kwargs['data']['reasons'] == ['reseeded']
 
     async def test_genuine_failures_still_file_l1_across_reseeded(
         self, harness: Harness, tmp_path: Path
@@ -2843,7 +2894,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
         # `is True`, not truthy: the field must be a real JSON bool for
         # json_extract(data, '$.archive_available') to be queryable in runs.db.
         assert kwargs['data']['archive_available'] is True
@@ -2874,7 +2925,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
         assert harness._session_resume_fallback_streak == 1
 
@@ -2902,7 +2953,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'stale'
+        assert kwargs['data']['reasons'] == ['stale']
         assert kwargs['data']['archive_available'] is True
         assert harness._session_resume_fallback_streak == 1
 
@@ -2935,7 +2986,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'reseeded'
+        assert kwargs['data']['reasons'] == ['reseeded']
         assert kwargs['data']['archive_available'] is True
         # D8: 'reseeded' still does NOT feed the storm streak.
         assert harness._session_resume_fallback_streak == 0
@@ -2961,7 +3012,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'reseeded'
+        assert kwargs['data']['reasons'] == ['reseeded']
         assert kwargs['data']['archive_available'] is False
 
     async def test_unconfigured_transcript_archive_degrades_to_false(
@@ -3006,7 +3057,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
 
     async def test_archive_available_is_total_against_broken_config(
@@ -3110,7 +3161,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is True
 
     async def test_null_session_id_reports_false_without_raising(
@@ -3134,7 +3185,7 @@ class TestSessionResumeArchiveAvailable:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
-        assert kwargs['data']['reason'] == 'no_transcript'
+        assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
 
     async def test_eligible_and_capped_events_do_not_carry_the_field(
