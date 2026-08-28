@@ -1,180 +1,212 @@
-# Machine-readable twin of merge-status-durable-non-landed-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc);
-# field reference at plans/capability-delivered-checks-prd.md section Contract.
-# task_id values stay null until commit_planning stamps them.
 prd: plans/merge-status-durable-non-landed-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Home the merge-state vocabularies in shared/ with a SKILL.md drift guard"
-    capabilities:
-      - name: "shared-vocabulary-module-convention"
-        binding: "capability→producer (wired) — shared/src/shared/task_statuses.py::TaskStatus; precedent plans/task-status-authority-prd.md"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "class MergeState"
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "doc-consistency-guard-precedent"
-        binding: "capability→producer (wired) — scripts/tests/test_design_invariants_consistency.py::PINNED_SITES already pins a skills/ markdown file"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "MergeSubmitStatus"
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "skill-vocabulary-lists-pinned"
-        binding: "capability→producer (wired) — the three SKILL.md consumers exist and enumerate terminal sets"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "merge_state|MergeState"
-          paths: ["scripts/tests/"]
-          expect: present
-      - name: "drift-guard-fires-on-seeded-violation"
-        binding: "rejection-mechanism (G6 branch 4) — built and bound by α's own seeded-violation fixture"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "rejection quality is judged by the seeded fixture failing the guard, not by a grep"
-
-  - label: "γ"
-    task_id: null
-    title: "Cross-run merge_finalized reads plus durable alias resolution"
-    capabilities:
-      - name: "latest-merge-finalized-exists"
-        binding: "capability→producer (wired) — orchestrator/src/orchestrator/event_store.py::EventStore.latest_merge_finalized"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "cross_run"
-          paths: ["orchestrator/src/orchestrator/event_store.py"]
-          expect: present
-      - name: "finalize-payload-carries-superseded-by"
-        binding: "capability→producer (wired) — the merge_finalized emit in merge_queue.py already writes superseded_by; the train reverse-index needs no new write"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "absorbed_request_ids"
-          paths: ["orchestrator/src/orchestrator/merge_queue.py"]
-          expect: present
-      - name: "event-type-index-covers-the-predicate"
-        binding: "capability→producer (wired) — idx_events_type ON events(event_type); merge_finalized is 0.7% of rows"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "index coverage is a property of the live store, verified by measurement at authoring"
-      - name: "cross-run-query-is-affordable"
-        binding: "numeric floor — floor: 50 ms > ~0.05 ms measured 2026-08-28 on 364,134 rows / 161 MB"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "latency is pinned by boundary row B10 in leaf ζ, not by a grep"
-
-  - label: "β"
-    task_id: null
-    title: "Rebuild merge_status's read path: epistemic states, reason codes, journal tier"
-    capabilities:
-      - name: "git-authority-tier-importable"
-        binding: "capability→producer, DAG-direction — producer:task-4649 UPSTREAM (out-of-batch hard prereq, wired as a real edge)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the import target is created by out-of-batch 4649; ζ's B5 pins the consumption"
-      - name: "merge-queue-store-readable-from-escalation"
-        binding: "capability→producer (wired) — merge_queue_store.py::MergeQueueStore; escalation/server.py already lazily imports orchestrator.* at 9 sites"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "MergeQueueStore"
-          paths: ["escalation/src/escalation/server.py"]
-          expect: present
-      - name: "merge-state-vocabulary"
-        binding: "capability→producer, DAG-direction — producer:task-α UPSTREAM"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "stale_record"
-          paths: ["escalation/src/escalation/server.py"]
-          expect: present
-      - name: "cross-run-read-mode"
-        binding: "capability→producer, DAG-direction — producer:task-γ UPSTREAM; β cannot emit stale_record without it"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "last_outcome"
-          paths: ["escalation/src/escalation/server.py"]
-          expect: present
-
-  - label: "δ"
-    task_id: null
-    title: "Collapse the three skills' unknown decision trees onto the reason code"
-    capabilities:
-      - name: "reason-field-emitted-by-the-server"
-        binding: "capability→producer, DAG-direction — producer:task-β UPSTREAM; the signal reads a field β populates"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "prior_run_terminal"
-          paths: ["skills/"]
-          expect: present
-      - name: "retention-ring-explanation-removed"
-        binding: "rejection-mechanism / expect absent — the skills currently explain unknown via a ring no production path constructs; that prose must be gone"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "retention ring"
-          paths: ["skills/merge-queue/SKILL.md", "skills/unblock/SKILL.md", "skills/unblock-low-risk/SKILL.md"]
-          expect: absent
-      - name: "vocabulary-lists-already-normalized"
-        binding: "capability→producer, DAG-direction — producer:task-α UPSTREAM; α edits the lists, δ edits the reasoning, so they never contend on the same lines"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "line-level non-contention is enforced by the dependency edge, not by a pattern"
-
-  - label: "ε"
-    task_id: null
-    title: "Delete TerminalOutcomeRetention and the dead Tier-2 read path"
-    capabilities:
-      - name: "ring-is-genuinely-unwired"
-        binding: "rejection-mechanism / expect absent — re-derived at decompose, NOT taken from task 3149: zero production assignments to _terminal_retention, zero production TerminalOutcomeRetention( constructions"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "TerminalOutcomeRetention"
-          paths: ["orchestrator/src/orchestrator/", "escalation/src/escalation/"]
-          expect: absent
-      - name: "tier2-read-already-removed"
-        binding: "capability→producer, DAG-direction — producer:task-β UPSTREAM; β removes the read path before ε removes the type"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "_get_terminal_retention"
-          paths: ["escalation/src/escalation/server.py"]
-          expect: absent
-
-  - label: "ζ"
-    task_id: null
-    title: "Integration gate: the merge_status boundary suite B1-B10 green as one suite"
-    capabilities:
-      - name: "all-boundary-rows-have-upstream-producers"
-        binding: "DAG-direction — every row's producer (α, γ, β, δ, ε, out-of-batch 4649) is UPSTREAM of ζ; no row depends on a task that depends on ζ"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "DAG direction is enforced by the wired dependency edges, not by a pattern"
-      - name: "B5-asserts-a-non-call"
-        binding: "capability→producer (wired) — is_ancestor / find_merge_marker exist in git_ops.py today; B5 asserts this module does NOT call them (invariant I5), checkable by spy"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a non-call is asserted with a spy in the suite; no static pattern expresses it"
-      - name: "B10-latency-bound-is-above-the-floor"
-        binding: "numeric floor — floor: p99 < 50 ms > ~0.05 ms measured; ~3 orders of margin"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the bound is asserted by boundary row B10 itself against a seeded production-sized store"
+- label: α
+  task_id: 4829
+  title: Home the merge-state vocabularies in shared/ with a SKILL.md drift guard
+  capabilities:
+  - name: shared-vocabulary-module-convention
+    binding: capability→producer (wired) — shared/src/shared/task_statuses.py::TaskStatus;
+      precedent plans/task-status-authority-prd.md
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class MergeState
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: doc-consistency-guard-precedent
+    binding: capability→producer (wired) — scripts/tests/test_design_invariants_consistency.py::PINNED_SITES
+      already pins a skills/ markdown file
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MergeSubmitStatus
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: skill-vocabulary-lists-pinned
+    binding: capability→producer (wired) — the three SKILL.md consumers exist and
+      enumerate terminal sets
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: merge_state|MergeState
+      paths:
+      - scripts/tests/
+      expect: present
+  - name: drift-guard-fires-on-seeded-violation
+    binding: rejection-mechanism (G6 branch 4) — built and bound by α's own seeded-violation
+      fixture
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by the seeded fixture failing the guard,
+        not by a grep
+- label: γ
+  task_id: 4830
+  title: Cross-run merge_finalized reads plus durable alias resolution
+  capabilities:
+  - name: latest-merge-finalized-exists
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/event_store.py::EventStore.latest_merge_finalized
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cross_run
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: finalize-payload-carries-superseded-by
+    binding: capability→producer (wired) — the merge_finalized emit in merge_queue.py
+      already writes superseded_by; the train reverse-index needs no new write
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: absorbed_request_ids
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: event-type-index-covers-the-predicate
+    binding: capability→producer (wired) — idx_events_type ON events(event_type);
+      merge_finalized is 0.7% of rows
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: index coverage is a property of the live store, verified by measurement
+        at authoring
+  - name: cross-run-query-is-affordable
+    binding: 'numeric floor — floor: 50 ms > ~0.05 ms measured 2026-08-28 on 364,134
+      rows / 161 MB'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: latency is pinned by boundary row B10 in leaf ζ, not by a grep
+- label: β
+  task_id: 4831
+  title: 'Rebuild merge_status''s read path: epistemic states, reason codes, journal
+    tier'
+  capabilities:
+  - name: git-authority-tier-importable
+    binding: capability→producer, DAG-direction — producer:task-4649 UPSTREAM (out-of-batch
+      hard prereq, wired as a real edge)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the import target is created by out-of-batch 4649; ζ's B5 pins the consumption
+  - name: merge-queue-store-readable-from-escalation
+    binding: capability→producer (wired) — merge_queue_store.py::MergeQueueStore;
+      escalation/server.py already lazily imports orchestrator.* at 9 sites
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MergeQueueStore
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: merge-state-vocabulary
+    binding: capability→producer, DAG-direction — producer:task-α UPSTREAM
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: stale_record
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: cross-run-read-mode
+    binding: capability→producer, DAG-direction — producer:task-γ UPSTREAM; β cannot
+      emit stale_record without it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: last_outcome
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+- label: δ
+  task_id: 4832
+  title: Collapse the three skills' unknown decision trees onto the reason code
+  capabilities:
+  - name: reason-field-emitted-by-the-server
+    binding: capability→producer, DAG-direction — producer:task-β UPSTREAM; the signal
+      reads a field β populates
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: prior_run_terminal
+      paths:
+      - skills/
+      expect: present
+  - name: retention-ring-explanation-removed
+    binding: rejection-mechanism / expect absent — the skills currently explain unknown
+      via a ring no production path constructs; that prose must be gone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retention ring
+      paths:
+      - skills/merge-queue/SKILL.md
+      - skills/unblock/SKILL.md
+      - skills/unblock-low-risk/SKILL.md
+      expect: absent
+  - name: vocabulary-lists-already-normalized
+    binding: capability→producer, DAG-direction — producer:task-α UPSTREAM; α edits
+      the lists, δ edits the reasoning, so they never contend on the same lines
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: line-level non-contention is enforced by the dependency edge, not by
+        a pattern
+- label: ε
+  task_id: 4833
+  title: Delete TerminalOutcomeRetention and the dead Tier-2 read path
+  capabilities:
+  - name: ring-is-genuinely-unwired
+    binding: 'rejection-mechanism / expect absent — re-derived at decompose, NOT taken
+      from task 3149: zero production assignments to _terminal_retention, zero production
+      TerminalOutcomeRetention( constructions'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TerminalOutcomeRetention
+      paths:
+      - orchestrator/src/orchestrator/
+      - escalation/src/escalation/
+      expect: absent
+  - name: tier2-read-already-removed
+    binding: capability→producer, DAG-direction — producer:task-β UPSTREAM; β removes
+      the read path before ε removes the type
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _get_terminal_retention
+      paths:
+      - escalation/src/escalation/server.py
+      expect: absent
+- label: ζ
+  task_id: 4834
+  title: 'Integration gate: the merge_status boundary suite B1-B10 green as one suite'
+  capabilities:
+  - name: all-boundary-rows-have-upstream-producers
+    binding: DAG-direction — every row's producer (α, γ, β, δ, ε, out-of-batch 4649)
+      is UPSTREAM of ζ; no row depends on a task that depends on ζ
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: DAG direction is enforced by the wired dependency edges, not by a pattern
+  - name: B5-asserts-a-non-call
+    binding: capability→producer (wired) — is_ancestor / find_merge_marker exist in
+      git_ops.py today; B5 asserts this module does NOT call them (invariant I5),
+      checkable by spy
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a non-call is asserted with a spy in the suite; no static pattern expresses
+        it
+  - name: B10-latency-bound-is-above-the-floor
+    binding: 'numeric floor — floor: p99 < 50 ms > ~0.05 ms measured; ~3 orders of
+      margin'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the bound is asserted by boundary row B10 itself against a seeded production-sized
+        store
