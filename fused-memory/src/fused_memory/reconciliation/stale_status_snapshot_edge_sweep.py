@@ -1879,6 +1879,36 @@ async def sweep_stale_status_snapshot_edges(
         contradicted tasks left without a superseding fact because
         ``_MAX_SUPERSEDE_WRITES_PER_CYCLE`` was reached).
 
+        Plus two keys describing the READ that produced ``scanned`` rather
+        than counting anything (task 4386):
+
+        ``enumeration_complete`` (``bool | None``) — TRI-STATE, because three
+        outcomes are genuinely distinct and collapsing any pair loses
+        information the reader needs. ``True`` = the read was PROVEN
+        complete; ``False`` = a corpus was observed and it was INCOMPLETE;
+        ``None`` = NO corpus was observed at all, either because this call
+        short-circuited on a falsy *taskmaster*/*project_root* or because the
+        enumeration itself failed (``errors`` tells those two apart). The
+        ONLY predicate a caller may gate on is ``is True``: an ``is not
+        False`` test would admit both UNKNOWN cases, which would let a cycle
+        that never looked pass as one that looked and found everything.
+
+        ``enumeration_incomplete_kind`` (``str | None``) — the backend's
+        ``INCOMPLETE_*`` constant (``graphiti_client.py::INCOMPLETE_PAGE_CAP``
+        and siblings), which is the documented STABLE discriminator. Callers
+        should branch on membership in
+        ``graphiti_client.py::INCOMPLETE_STRUCTURAL_KINDS`` rather than on a
+        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced: the
+        backend documents its wording as diagnostic prose and an unstable
+        interface, so projecting it into stats would invite consumers to
+        parse it.
+
+        Both keys describe the read, NOT the counted funnel, so they leave
+        the ``invalidated == candidate_edges - errors`` identity below
+        exactly true. An EMPIRICAL incompleteness in particular does not
+        touch ``errors``: the sweep proceeds on what it fetched, and the
+        cycle merely says the corpus was partial.
+
         ``errors`` stays scoped to the enumerate / cross-reference /
         INVALIDATE paths, which is what keeps the identity
         ``invalidated == candidate_edges - errors`` exactly true: every
@@ -1896,6 +1926,11 @@ async def sweep_stale_status_snapshot_edges(
     stats = {
         'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0,
         'superseded': 0, 'supersede_errors': 0, 'supersede_skipped': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. Every early return below therefore reports the honest
+        # 'no corpus observed' rather than a fabricated clean read. (task 4386)
+        'enumeration_complete': None, 'enumeration_incomplete_kind': None,
     }
 
     if not taskmaster or not project_root:
@@ -1905,6 +1940,14 @@ async def sweep_stale_status_snapshot_edges(
         grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
             group_id=project_id,
         )
+        # Recorded BEFORE the policy is applied, and the ordering is
+        # load-bearing: apply_incompleteness_policy RAISES on a structural
+        # incompleteness, so assigning after it would leave the aborted cycle
+        # reporting errors=1 with no stated reason and the operator
+        # reconstructing the cause from logs — the exact reconstruction this
+        # signal exists to remove. (task 4386)
+        stats['enumeration_complete'] = paged.complete
+        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
         # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
         # so the fail-closed structural guard the ``get_all_valid_edges`` shim
         # applied on this sweep's behalf has to be re-applied here, or a
