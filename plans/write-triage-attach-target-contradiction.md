@@ -160,7 +160,10 @@ edges `4762 -> 4810` and `4762 -> 4822`, added before any other mutation.
 ## APPLIED
 
 Task 4822, 2026-08-28, at main `753ea8bd1b`. Observed return values, not
-intended ones. **5d is BLOCKED — read §APPLIED-5d before acting on this task.**
+intended ones. **All of 5a-5e are now APPLIED. 5d was blocked for two
+attempts and was finally run handler-side — the two APPLIED-5d sections
+below are kept as the record of why, and §APPLIED-5d, COMPLETE is the
+current state.**
 
 ### Premises re-verified before any mutation (pre-1)
 
@@ -388,3 +391,67 @@ peer subcase `lever_b_skip_bypasses_architect_entirely`
 `478a8029-e285-445e-8b36-46b5cf1386f4`. Recording them here as well because the
 lesson this whole file exists to carry is that an escalation's `detail` field
 must never be the only copy.
+
+### APPLIED-5d, COMPLETE — 2026-08-28, run handler-side by the steward
+
+The archive was performed **outside this lane** by the steward resolving
+`esc-4822-3`, from `/home/leo/src/dark-factory` (the main checkout), because
+FINDING 1 above is confirmed: `granted_files` cannot widen a lane's sandbox
+write set, so no retry from this worktree could ever have succeeded. The three
+commands are the ones §APPLIED-5d attempt #2 specified, unmodified.
+
+| step | observed |
+| --- | --- |
+| `cp plan.json plan.superseded-by-4822.json` | done |
+| `cmp` the two, **before** the `rm` | **rc=0, byte-identical** |
+| sha256, both files | **`b76c3c425689dbf9cc51bca0ad7602fe6c673b1f7f6d32aab52d66dd42051e91`** |
+| `rm plan.json` | done |
+
+Pre-`rm` safety re-check by the steward: 4762 `status pending`,
+`claimant_run_id None`, `heartbeat_at None`, `dependencies [4810, 4822]`, no
+`plan.lock`, no `agent_session.json`, `main..task/4762` = 0 commits. The live
+runtime snapshot's 4762 entry (phase EXECUTE, lane null, loops 0, attempts 0)
+is stale residue from the aborted prior run, not an active claim.
+
+Post-state, re-verified independently from this lane (reads are permitted;
+only writes were denied): `.worktrees/.task-meta/4762/` now holds
+`metadata.json`, `plan.superseded-by-4822.json`, `reviews/`, `verdicts/` —
+`plan.json` is **gone**, and the on-disk archive's sha256 matches the value
+above. `metadata.json`, `reviews/` and `verdicts/` were not touched.
+`.worktrees/4762/.task/plan.json` is left dangling by design.
+
+**FINDING 2 is thereby closed at the source.** With `plan.json` absent,
+`workflow.py::_plan` selects the fresh-planning branch, so Lever B can no
+longer return `PLANNED` without an architect pass and the corrected
+description IS read. That absence, not the archive copy, is the load-bearing
+half.
+
+**The stale recon stamp was corrected too**, which this lane also could not
+reach. `metadata.x_4762_archive_claim_verification` had been stamped
+`result: "confirmed_absent"` with "Do not cite or attempt to read
+plan.superseded-by-4822.json". The steward rewrote that key via `update_task`
+(merge mode, nothing else altered) to `result:
+"present_since_2026-08-28_steward"`, carrying the sha256, an explicit "do not
+restore plan.json from the archive — audit copy only", and a note that the
+prior finding's ROOT CAUSE was correct and only its present-tense verdict went
+stale. Read back from `get_task(4762)` at the time of this commit: confirmed.
+
+Consequently 4762's description sentence "has been SUPERSEDED and archived to
+..." and `x_4762_option_contradiction.plan_superseded` are now TRUE as written,
+so the 7497-character description round-trip §APPLIED-5d attempt #2 declined is
+**not needed** — the recovered `esc-markup-residue-1` payload was never put at
+risk. Verified unchanged in the same read: description sentinels `ORDERING
+CONSTRAINT` and `reviews-cycle-2/` both present, `details` sentinels `RECOVERY
+PROVENANCE` and payload sha256
+`ebbbd9af07698fee05b46082aba64c89a441dc4449f391299ff62f0f9426b898` both
+present, `delivered_checks` still the three-entry list of §4 AFTER with the
+`kind='script'` descriptor first.
+
+FINDING 1 was filed as a standalone follow-up, ticket
+**`tkt_0RSZHH3H7K8KX99FVN7DRX5RPN`** (`agent-followup`, spawned_from 4822,
+`escalation_id` esc-4822-3, scoped to `orchestrator/src/orchestrator/agents/
+write_set.py` + `workflow.py` + `docs/task-authoring.md`): reject or flag at
+plan time any step naming a path under another task's `.task-meta/`, and
+provide an MCP-mediated mechanism if cross-task plan surgery is a legitimate
+recurring need. Marked not-combinable with 4762/4798/4810/4822. Curator
+decision lands asynchronously; ticket ids are not task ids.
