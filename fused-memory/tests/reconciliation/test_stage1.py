@@ -31,7 +31,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import complete_paged_read, incomplete_paged_read
 
+from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -81,6 +83,17 @@ def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     memory_mock.mem0 = AsyncMock()
     memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
     memory_mock.get_status = AsyncMock(return_value={})
+    # EXPLICIT, not auto-mocked. `memory_mock` is a bare AsyncMock, so
+    # `graphiti.enumerate_all_valid_edges` would otherwise be an auto-created
+    # child whose return value unpacks as `grouped, paged = <AsyncMock>` and
+    # raises ValueError — which both sweeps silently tally as errors += 1.
+    # That would change behaviour for EVERY test reaching the sweeps without
+    # an explicit stub, in the direction hardest to notice. Stubbing an empty,
+    # proven-complete read reproduces the pre-task-4386 outcome (0 scanned, no
+    # error) deterministically instead of depending on auto-mock semantics.
+    memory_mock.graphiti.enumerate_all_valid_edges = AsyncMock(
+        return_value=({}, complete_paged_read()),
+    )
 
     stage = MemoryConsolidator(
         StageId.memory_consolidator,
@@ -2979,8 +2992,11 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         healthy_edge = {
             'uuid': 'edge-healthy', 'fact': 'Task 999 is an active pending task', 'name': '',
         }
-        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge, healthy_edge]},
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_statuses = AsyncMock(
@@ -3020,6 +3036,17 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             f"Expected report.stats['stale_status_snapshot_edges_scanned'] == 2; "
             f'got stats={report.stats!r}'
         )
+        assert (
+            report.stats.get('stale_status_snapshot_edges_enumeration_complete') is True
+        ), (
+            'A proven-complete read must be surfaced as True — the consolidator '
+            'extracts sweep stats key by key, so a key it does not name dies at '
+            f'that boundary and never reaches the ledger; got stats={report.stats!r}'
+        )
+        assert (
+            report.stats.get('stale_status_snapshot_edges_enumeration_incomplete_kind')
+            is None
+        ), f'A complete read has no incompleteness kind; got stats={report.stats!r}'
 
     @pytest.mark.asyncio
     async def test_run_retires_a_stale_blocked_assertion_and_supersedes_it(self):
@@ -3053,8 +3080,11 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         still_blocked_edge = {
             'uuid': 'edge-3001', 'fact': 'Task 3001 is blocked.', 'name': '',
         }
-        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [unblocked_edge, still_blocked_edge]},
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [unblocked_edge, still_blocked_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_statuses = AsyncMock(
@@ -3215,8 +3245,11 @@ class TestStalePriorityOverrideEdgeSweepWiring:
             'fact': "Set priority override for task 999: {'boost_tier': 'high'}",
             'name': '',
         }
-        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
-            return_value={'entity-a': [stale_edge, healthy_edge]},
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [stale_edge, healthy_edge]},
+                complete_paged_read(rows_seen=2),
+            ),
         )
         stage.memory.update_edge = AsyncMock()
 
@@ -3252,6 +3285,18 @@ class TestStalePriorityOverrideEdgeSweepWiring:
             f"Expected report.stats['stale_priority_override_edges_scanned'] == 2; "
             f'got stats={report.stats!r}'
         )
+        assert (
+            report.stats.get('stale_priority_override_edges_enumeration_complete')
+            is True
+        ), (
+            'A proven-complete read must be surfaced as True; got '
+            f'stats={report.stats!r}'
+        )
+        assert (
+            report.stats.get(
+                'stale_priority_override_edges_enumeration_incomplete_kind'
+            ) is None
+        ), f'A complete read has no incompleteness kind; got stats={report.stats!r}'
 
     @pytest.mark.asyncio
     async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
@@ -3268,8 +3313,11 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         # orchestration. Give it an empty valid-edge set so it succeeds (0
         # scanned) and sets its stat — that stat is the "other post-processing
         # was untouched" proof asserted below. Without this mock the 2613 sweep
-        # itself fails on an unconfigured get_all_valid_edges and never sets it.
-        stage.memory.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        # itself fails on an unconfigured enumerate_all_valid_edges and never
+        # sets it.
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=({}, complete_paged_read()),
+        )
 
         base_report = StageReport(
             stage=StageId.memory_consolidator,
@@ -3304,11 +3352,195 @@ class TestStalePriorityOverrideEdgeSweepWiring:
             'stale_priority_override_edges_invalidated stat'
         )
         assert 'stale_priority_override_edges_scanned' not in report.stats
+        assert (
+            'stale_priority_override_edges_enumeration_complete' not in report.stats
+        ), (
+            'A raised sweep sets NO stat for this cycle, and the enumeration '
+            'keys are no exception: absent is honest, whereas False would claim '
+            'a corpus was observed and found incomplete, which never happened. '
+            f'Got stats={report.stats!r}'
+        )
+        assert (
+            'stale_priority_override_edges_enumeration_incomplete_kind'
+            not in report.stats
+        )
         # Proof other post-processing was untouched: the task 2613 sweep (which
         # runs immediately before this one) still set its stat.
         assert 'stale_status_snapshot_edges_scanned' in report.stats, (
             'The task 2613 sweep must still have run and set its stat even '
             f'though the 2781 sweep raised; got stats={report.stats!r}'
+        )
+
+
+class TestSweepEnumerationCompletenessWiring:
+    """The completeness signal must ESCAPE the consolidator's stat boundary.
+
+    ``MemoryConsolidator.run()`` copies sweep stats into ``report.stats`` key
+    by key, so a key the extraction block does not name dies right there and
+    never reaches the ledger, the journal or the judge — which would leave the
+    signal computed and thrown away. These tests pin the boundary itself.
+
+    They also pin that the two sweeps' key sets are INDEPENDENT: a truncated
+    corpus for one sweep says nothing about the other's, and marking both
+    would be a false claim about a read that was in fact complete. (This file
+    already asserts that shape of cross-sweep independence for ``scanned``.)
+    """
+
+    STALE_STATUS_EDGE = {
+        'uuid': 'edge-stale', 'fact': 'Task 142 is an active pending task', 'name': '',
+    }
+    STALE_OVERRIDE_EDGE = {
+        'uuid': 'edge-po-stale',
+        'fact': "Set priority override for task 5166: {'boost_tier': 'high'}",
+        'name': '',
+    }
+
+    @staticmethod
+    def _base_report() -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+    async def _run(self, stage) -> StageReport:
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-4386',
+            )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_read_surfaces_false_and_the_kind_for_both_sweeps(self):
+        """An EMPIRICALLY incomplete read reaches report.stats as False + kind.
+
+        Both sweeps read the SAME enumeration here, so both report the
+        truncation. `errors` stays 0 on both — an empirical incompleteness is
+        not a failure, it is a partial corpus — which is precisely why the
+        counters alone could not have carried this and a dedicated key was
+        needed.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'entity-a': [self.STALE_STATUS_EDGE, self.STALE_OVERRIDE_EDGE]},
+                incomplete_paged_read(INCOMPLETE_SHORT_READ, rows_seen=2, expected_rows=90),
+            ),
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        stage.memory.update_edge = AsyncMock()
+
+        report = await self._run(stage)
+
+        for prefix in ('stale_status_snapshot_edges', 'stale_priority_override_edges'):
+            assert report.stats.get(f'{prefix}_enumeration_complete') is False, (
+                f'Expected {prefix} to report the partial corpus as False; '
+                f'got stats={report.stats!r}'
+            )
+            assert (
+                report.stats.get(f'{prefix}_enumeration_incomplete_kind')
+                == INCOMPLETE_SHORT_READ
+            ), (
+                f'Expected {prefix} to carry the stable discriminator; '
+                f'got stats={report.stats!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_read_for_one_sweep_does_not_mark_the_other(self):
+        """Key sets are per-sweep, so one truncation cannot smear onto the other.
+
+        Constructed by making the enumeration return a TRUNCATED read the
+        first time (the status sweep) and a COMPLETE one the second (the
+        priority sweep), which is possible because the two sweeps issue
+        separate reads. Marking both would assert incompleteness about a read
+        that was in fact complete — exactly the false claim the tri-state
+        exists to avoid.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.graphiti.enumerate_all_valid_edges = AsyncMock(
+            side_effect=[
+                (
+                    {'entity-a': [self.STALE_STATUS_EDGE]},
+                    incomplete_paged_read(
+                        INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=90,
+                    ),
+                ),
+                ({'entity-a': [self.STALE_OVERRIDE_EDGE]}, complete_paged_read(rows_seen=1)),
+            ],
+        )
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_statuses = AsyncMock(return_value={'142': 'done'})
+        stage.memory.update_edge = AsyncMock()
+
+        report = await self._run(stage)
+
+        assert (
+            report.stats.get('stale_status_snapshot_edges_enumeration_complete') is False
+        ), f'The truncated read belongs to the status sweep; got stats={report.stats!r}'
+        assert (
+            report.stats.get('stale_priority_override_edges_enumeration_complete') is True
+        ), (
+            "The priority sweep's own read was complete and must not inherit the "
+            f'other sweep truncation; got stats={report.stats!r}'
+        )
+        assert (
+            report.stats.get(
+                'stale_priority_override_edges_enumeration_incomplete_kind'
+            ) is None
+        ), f'A complete read has no kind to report; got stats={report.stats!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_raised_status_sweep_sets_none_of_its_enumeration_keys(self):
+        """A raised sweep sets NO stat for this cycle, enumeration keys included.
+
+        ABSENT rather than ``False``: ``False`` would claim a corpus was
+        observed and found incomplete, which is not what happened. This
+        extends the existing "no stat set for this cycle" convention the
+        try/except/else blocks enforce, rather than carving an exception into
+        it for the new keys.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        sweep_mock = AsyncMock(side_effect=RuntimeError('graphiti backend down'))
+
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'sweep_stale_status_snapshot_edges',
+                new=sweep_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-4386',
+            )
+
+        assert (
+            'stale_status_snapshot_edges_enumeration_complete' not in report.stats
+        ), (
+            'A raised sweep must leave its enumeration keys absent, not False; '
+            f'got stats={report.stats!r}'
+        )
+        assert (
+            'stale_status_snapshot_edges_enumeration_incomplete_kind'
+            not in report.stats
+        )
+        # Proof the rest of the cycle was untouched: the priority sweep, which
+        # runs immediately after, still set its own enumeration key.
+        assert (
+            'stale_priority_override_edges_enumeration_complete' in report.stats
+        ), (
+            'The priority sweep must still have run and set its key even though '
+            f'the status sweep raised; got stats={report.stats!r}'
         )
 
 
@@ -4683,6 +4915,10 @@ class TestStage1PhantomCitationRecurrenceRegression:
         memory_mock.mem0 = AsyncMock()
         memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
         memory_mock.get_status = AsyncMock(return_value={})
+        # Same auto-mock hazard as _make_consolidator above; see the note there.
+        memory_mock.graphiti.enumerate_all_valid_edges = AsyncMock(
+            return_value=({}, complete_paged_read()),
+        )
 
         async def _resolve(project_id, memory_id):
             # The three prose-cited ids resolve; the phantom does not.
