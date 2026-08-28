@@ -197,3 +197,137 @@ class TestClassifyAmendTarget:
             first = _mod.classify_amend_target(target, fetched)
             second = _mod.classify_amend_target(target, fetched)
             assert first == second == {'id': target.memory_id, 'action': 'amend'}
+
+
+def _decision(memory_id: str, action: str) -> dict:
+    return {'id': memory_id, 'action': action}
+
+
+class TestBuildAmendReport:
+    """The report is the artifact an operator diffs and gates on."""
+
+    def test_report_carries_the_expected_top_level_keys(self):
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert set(report) == {
+            'dry_run', 'generated_at', 'targets', 'totals', 'changes',
+        }
+
+    def test_changes_preserve_amend_targets_order_not_id_sort(self):
+        # Order is SEMANTIC here (the precondition chain), so the report must
+        # not sort by id the way the sibling sweeps' reports do. d007aa46
+        # sorts before 6403e96b lexically, so an accidental sort is visible.
+        assert WARNING_ID < STALE_ID
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert [c['id'] for c in report['changes']] == [STALE_ID, WARNING_ID]
+
+    def test_one_change_entry_per_decision_including_skips_and_refusals(self):
+        # Unlike the sibling sweeps (whose reports list only the records they
+        # touched), every target here is load-bearing: an operator must see
+        # what happened to BOTH, including the ones that were refused.
+        report = _mod.build_amend_report(
+            [
+                _decision(STALE_ID, 'skip:already_amended'),
+                _decision(WARNING_ID, 'refuse:preimage_mismatch'),
+            ],
+            applied_ids=set(),
+            dry_run=False,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert [c['id'] for c in report['changes']] == [STALE_ID, WARNING_ID]
+        assert [c['action'] for c in report['changes']] == [
+            'skip:already_amended', 'refuse:preimage_mismatch',
+        ]
+        assert all(set(c) >= {'id', 'action', 'applied'} for c in report['changes'])
+
+    def test_totals_count_amended_skipped_and_refused(self):
+        report = _mod.build_amend_report(
+            [
+                _decision(STALE_ID, 'amend'),
+                _decision(WARNING_ID, 'refuse:precondition_failed'),
+            ],
+            applied_ids={STALE_ID},
+            dry_run=False,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert report['totals']['amended'] == 1
+        assert report['totals']['refused'] == 1
+        assert report['totals']['skipped'] == 0
+
+    def test_totals_count_skips_separately_from_refusals(self):
+        report = _mod.build_amend_report(
+            [
+                _decision(STALE_ID, 'skip:already_amended'),
+                _decision(WARNING_ID, 'skip:already_amended'),
+            ],
+            applied_ids=set(),
+            dry_run=False,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert report['totals']['skipped'] == 2
+        assert report['totals']['refused'] == 0
+        assert report['totals']['amended'] == 0
+
+    def test_dry_run_never_marks_anything_applied(self):
+        # The safety property: a dry-run report must not claim a write.
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert report['dry_run'] is True
+        assert all(c['applied'] is False for c in report['changes'])
+        assert report['totals']['amended'] == 0
+
+    def test_applied_flag_tracks_the_applied_id_set(self):
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
+            applied_ids={STALE_ID},
+            dry_run=False,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        by_id = {c['id']: c for c in report['changes']}
+        assert by_id[STALE_ID]['applied'] is True
+        assert by_id[WARNING_ID]['applied'] is False
+
+    def test_report_is_deterministic_so_two_dry_runs_diff_cleanly(self):
+        import json as _json
+        decisions = [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')]
+        kwargs = dict(
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        first = _json.dumps(_mod.build_amend_report(decisions, **kwargs), sort_keys=True)
+        second = _json.dumps(_mod.build_amend_report(decisions, **kwargs), sort_keys=True)
+        assert first == second
+
+    def test_report_is_json_serialisable_without_a_default_hook(self):
+        import json as _json
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend')],
+            applied_ids={STALE_ID},
+            dry_run=False,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        _json.dumps(report)  # no default= fallback: primitives only
+
+    def test_generated_at_and_targets_are_echoed(self):
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T12:34:56+00:00',
+        )
+        assert report['generated_at'] == '2026-08-28T12:34:56+00:00'
+        assert report['targets'] == 2
