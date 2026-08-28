@@ -433,6 +433,17 @@ def _canonical_opener(name: str) -> str:
 _CANONICAL_CLOSER = '\x3c/parameter>'
 
 
+def _invoke_opener(tool: str) -> str:
+    """The opening ``invoke`` tag that heads a whole tool-call block.
+
+    Not an envelope LITERAL (only the closing half is), but the head of a
+    following block is what distinguishes a genuinely doubly-corrupted tail
+    from prose that merely quotes markup — see ``TestQuotedReportIsRepairable``
+    negative control (a).
+    """
+    return '\x3cinvoke name="' + tool + '">'
+
+
 def _blend_opener(name: str) -> str:
     """Specimen 1's literal DIALECT BLEND — a stray quote before the bracket.
 
@@ -931,6 +942,234 @@ class TestQuotationIsNotATruncation:
         assert result.clean_value == clean
         assert result.recovered == {'priority': 'high'}
 
+
+
+class TestQuotedReportIsRepairable:
+    """Task **4502**: a report that QUOTES a leak pattern is still repairable.
+
+    PRD boundary row B5 refuses a tail whose recovered item is "itself doubly
+    corrupted, so its boundary is a guess". Its implementation was a BARE
+    SUBSTRING test — any closing-tag opening sequence anywhere in a recovered
+    item's value — which is strictly wider than that stated intent. The shape
+    it over-refuses is a faithful REPORT of a markup leak: such a report
+    necessarily quotes the pattern that tripped the tripwire (the
+    ``matched_pattern=...`` field of an escalation record), so the quote lands
+    inside the swallowed ``evidence`` argument and B5 fires on the caller's own
+    prose.
+
+    MEASURED POPULATION at this task's HEAD, so the carve-out's size is on the
+    record rather than assumed small: committed-corpus record
+    ``toolu_01XbCz5NFCA6pCvmseyqFgvy`` plus the two ``esc-3514`` specimens
+    (``escalation/tests/fixtures/markup_specimens/``) — and those are the SAME
+    underlying leaked call, so it is one call and its two filings.
+
+    The specimen below is hand-authored from the parsed-input column the way
+    ``TestRepairSpecimens``' S1-S4 are, NOT copied out of a fixture, so it
+    documents the SHAPE rather than one captured byte string.
+
+    The three negative controls pass BOTH before and after the narrowing. They
+    exist because the naive rule — ambiguity alone, or schema membership alone
+    — breaks exactly there, and it is far cheaper to read that as a red test
+    than to rediscover it as a corpus surprise.
+    """
+
+    # escalate_info's eleven parameters, and the five the corrupted call
+    # actually arrived with. Both siblings recovered below are disjoint from
+    # the supplied set, which is what stops the assertion going vacuous:
+    # repair() refuses any candidate whose recovered names intersect supplied.
+    _ESCALATE_INFO_PARAMS = frozenset(
+        {
+            'task_id',
+            'agent_role',
+            'category',
+            'summary',
+            'detail',
+            'suggested_action',
+            'evidence',
+            'severity',
+            'terminal_state_is_the_bug',
+            'workflow_state',
+            'worktree',
+        }
+    )
+    _SUPPLIED = frozenset({'task_id', 'agent_role', 'category', 'summary', 'detail'})
+
+    # The prose the caller meant to send as `detail`, and the two arguments the
+    # harness parser dropped into its tail. The evidence entry quotes the
+    # content closer verbatim, exactly as a real leak report does.
+    _CLEAN = (
+        'The write-time tripwire fired on a memory body that had absorbed its '
+        'siblings. Recording the raw observation here so the population is '
+        'countable.'
+    )
+    _ACTION = 'Re-file the escalation once the guard is narrowed; no data was lost.'
+    _EVIDENCE = (
+        '[{"observation": "tripwire matched_pattern=' + _closer('content')
+        + ', agent_id=claude-task-4502", "measured_at": "HEAD=b2035cf8c6", '
+        '"ref": "rerun#1"}]'
+    )
+
+    def _specimen(self) -> str:
+        """The leaked call as the harness delivered it, in one string.
+
+        Canonical dialect throughout: ``detail``'s prose is mis-closed with the
+        canonical ``parameter`` closer, a well-formed ``suggested_action`` pair
+        follows, and ``evidence`` is a FINAL UNTERMINATED opener whose value
+        runs to end-of-string — the parser consumed its closer as the
+        terminator. That last value is the one that quotes a literal.
+        """
+        return (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('suggested_action') + self._ACTION
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + self._EVIDENCE + '\n'
+            + INVOKE_CLOSER
+        )
+
+    def _repair(self, value: str) -> Repair | None:
+        return repair(
+            value,
+            param='detail',
+            schema_params=self._ESCALATE_INFO_PARAMS,
+            supplied=self._SUPPLIED,
+        )
+
+    def test_the_quoted_report_recovers_both_dropped_siblings(self):
+        """THE RED ASSERTION. Returns None today; must return a Repair.
+
+        Both dropped arguments are real caller text — 261 characters of
+        recommendation and a full evidence array in the live specimens — that
+        the current guard drops on the floor while reporting ``unrepairable``.
+        """
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert set(result.recovered) == {'suggested_action', 'evidence'}
+        assert result.recovered['suggested_action'] == self._ACTION
+        assert result.recovered['evidence'] == self._EVIDENCE
+
+    def test_the_recovered_evidence_still_QUOTES_the_literal_verbatim(self):
+        """The point of the carve-out, stated as an assertion.
+
+        A recovered value is the caller's OWN text — invariant D5 guarantees it
+        is a verbatim substring of the input — so it may legitimately contain a
+        literal. That is categorically different from ``clean_value``, which is
+        the value the guard REWROTE and whose envelope-free post-condition is
+        contract C1's and is unchanged by this task (pinned just below).
+        """
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert _closer('content') in result.recovered['evidence']
+
+    def test_clean_value_is_the_prose_prefix_and_stays_envelope_free(self):
+        """C1's post-condition, UNCHANGED. Stated against ``detect_for``, the
+        parameter-aware predicate the gates actually consume."""
+        result = self._repair(self._specimen())
+
+        assert result is not None
+        assert result.clean_value == self._CLEAN
+        assert detect_for(result.clean_value, 'detail', self._ESCALATE_INFO_PARAMS) is None
+
+    def test_d5_structural_invariants_hold(self):
+        """The same non-circular predicate the 504-record corpus replay uses,
+        so the new carve-out cannot pass here while failing there."""
+        value = self._specimen()
+
+        assert_repair_invariants(value, self._repair(value))
+
+    # -- negative controls -------------------------------------------------
+
+    def test_a_cross_dialect_self_close_is_still_refused(self):
+        """NEGATIVE CONTROL (a) — the shape of committed-corpus record 25.
+
+        ``rationale`` opens in the CANONICAL dialect but closes with the
+        name-echoing ``rationale`` closer, and is followed by an invoke closer
+        and then the head of a whole NEXT invoke block ending in an
+        unterminated opener. An ambiguity probe alone does not catch this (the
+        residue does not itself parse as pseudo-parameters), so a narrowing
+        that qualified inner closers only on ambiguity — or only on schema
+        membership — would ACCEPT it and silently swallow the next tool call's
+        fragment into the recovered ``rationale``. That is the
+        no-silent-partial-repair failure this module exists to prevent, and a
+        strictly worse outcome than the ``None`` returned here.
+
+        An item's OWN closing tag appearing inside its value is a cross-dialect
+        mis-close by definition, never prose about itself — which is why the
+        rule may state that condition categorically.
+        """
+        clean = 'Recording the rationale for the routing change.'
+        value = (
+            clean
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('rationale')
+            + 'The scheduler indexes merge markers instead of shelling out.'
+            + _closer('rationale')
+            + INVOKE_CLOSER + '\n'
+            + _invoke_opener('mcp__plan-tools__add_design_decision')
+            + _canonical_opener('decision')
+            + 'Index the markers.'
+        )
+
+        assert repair(
+            value,
+            param='decision',
+            schema_params=frozenset({'decision', 'rationale', 'task_id'}),
+            supplied=frozenset({'task_id', 'decision'}),
+        ) is None
+
+    def test_an_invoke_closer_inside_a_recovered_value_is_still_refused(self):
+        """NEGATIVE CONTROL (b) — same reason, stated on ``invoke`` alone.
+
+        ``_parse_tail`` strips ONE trailing invoke closer as the terminator it
+        expects; a SECOND one inside an item's value means the tail spans a
+        tool-call boundary, so the item's end is a guess and recovery would
+        swallow whatever follows.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'high'
+            + INVOKE_CLOSER
+            + ' trailing text from the next block'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied=frozenset({'project_root', 'title', 'description'}),
+        ) is None
+
+    def test_boundary_row_b5s_own_ambiguous_case_is_still_refused(self):
+        """NEGATIVE CONTROL (c) — B5's ORIGINAL case, unchanged.
+
+        Referenced by SHAPE rather than duplicated: this is exactly
+        ``TestRepairRefuses::test_doubly_corrupted_tail_is_refused`` — a
+        name-echoing ``agent_id`` item closed by the ``details`` closer, where
+        reading that closer as the terminator ALSO yields a valid parse of the
+        remainder. That is the genuine ambiguity B5 was written for ("its
+        boundary is a guess"), it is NOT quoted prose, and it stays refused.
+        Asserted here too so the two halves of the narrowed rule — own-name and
+        alternative-boundary — are both pinned inside this class.
+        """
+        clean = 'The reconciler re-reads the plan on every pass.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('priority') + 'medium' + _closer('priority') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _closer('details') + '\n'
+            + INVOKE_CLOSER
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
