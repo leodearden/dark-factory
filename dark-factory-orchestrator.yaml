@@ -531,6 +531,39 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # headroom) — see tests/scripts/test_fallback_verify_config.py::
 # MEASURED_FLEET_TYPE_SEGMENT_SECS. A dated snapshot, not a self-maintaining
 # invariant — same honesty as the test_command budget derivation below.
+#
+# THE VERSION THESE SEVEN CLAUSES RESOLVE IS PINNED — but NOT here, and that is
+# deliberate (task 4538). The pin's single authored home is the repo-root
+# `package.json`'s `devDependencies.pyright`; `verify_cold_preprovision_command`
+# below runs `npm ci` from the committed `package-lock.json` in every cold
+# worktree, which materialises that exact version into `<worktree>/node_modules/
+# .bin` — and npx, walking UP from each `cd`-ed member directory, finds it there
+# and never reaches the registry.
+#
+# Spelling it inline as `npx pyright@<version>` would put one version in SEVEN
+# places AND break the bare-clause invariant this block's previous paragraphs
+# exist to protect. It stays byte-identical.
+#
+# WHY A PIN AT ALL, measured 2026-08-28 from a directory whose parent already
+# declared `"pyright": "1.1.408"` but had no `node_modules/`:
+#   `npx pyright --version`           -> pyright 1.1.413   (the floating latest)
+#   `npx --offline pyright --version` -> npm error ENOTCACHED, request to
+#                                        https://registry.npmjs.org/pyright
+# So unpinned this chain (a) could go red on nothing but an npm publish, (b)
+# could disagree between two verify hosts with no detector, and (c) was checking
+# this repo with a DIFFERENT pyright than every other type gate in it — uv.lock
+# pins pyright-python at 1.1.408, which is what all nine <pkg>/orchestrator.yaml
+# module configs and hooks/project-checks resolve. The second line is also the
+# proof that a package.json alone is NOT the fix: npx reads an INSTALLED binary,
+# never the dependency spec, and a merge-verify worktree is fresh with
+# `node_modules/` gitignored. Hence the install step, not just the declaration.
+#
+# Held by tests/scripts/test_pyright_version_pin.py, which asserts the exact
+# pin, the lockfile agreement (by sha512 integrity), this chain staying bare,
+# the `npm ci` clause's presence AND its position, cross-lane agreement with
+# uv.lock — and, from a throwaway tree with an EMPTY npm cache (so no warm
+# `_npx` entry can supply a vacuous green), that `npx --offline pyright
+# --version` fails before the install and resolves the pin after it.
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
 
 # Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
@@ -677,7 +710,39 @@ verify_cold_command_timeout_secs: 5400
 # groups into the single root .venv. Verified against uv.lock (uv 0.11.6): it
 # resolves ruff 0.15.9 + pytest 9.0.3 + pytest-asyncio + aiosqlite + pyright —
 # the exact set the working shared venv already carries.
-verify_cold_preprovision_command: "uv sync --all-packages"
+#
+# THE `npm ci` CLAUSE (task 4538) is a SECOND, independent job riding the same
+# slot: it is what makes the TYPE chain's seven `npx pyright` clauses resolve a
+# PINNED pyright. A cold merge-verify worktree is fresh and `node_modules/` is
+# gitignored, so without it npx has no local binary to walk up to and fetches
+# `pyright@latest` — the committed root package.json would pin nothing at all.
+# `npm ci` installs strictly from the committed `package-lock.json` (sha512
+# integrity), so the result is reproducible across hosts and across time. Full
+# rationale + the measurement: the pin paragraphs above `type_check_command`.
+#
+# ORDER IS LOAD-BEARING and this chain is `&&`-joined, so a failing head skips
+# the tail. `uv sync` FIRST: a transient npm failure then still leaves the venv
+# populated (esc-2913-3's race stays closed) and merely fails the pre-provision
+# loudly — `_preprovision_shared_venv` logs rc != 0 and proceeds to the gather by
+# design, never raising. Reversed, an npm hiccup would silently take the venv
+# sync down with it. Asserted by tests/scripts/test_pyright_version_pin.py::
+# test_the_cold_worktree_install_step_runs_before_the_type_leg.
+#
+# `--no-audit --no-fund` are noise suppression only. `--prefer-offline` is a
+# correctness-free speed knob: the lockfile alone determines WHAT is installed
+# and npm's cache is keyed by integrity, so a cache hit is always the right
+# bytes — it just avoids a registry round-trip on every cold worktree.
+# MEASURED 2026-08-28 with an empty, isolated npm cache (the worst case, and the
+# one a fresh host actually sees): 15.9s. Warm cache: ~2s.
+#
+# DISK, stated because it is a real per-worktree cost and nobody should have to
+# rediscover it: this leaves a 37MB `node_modules/` in every cold-verified
+# worktree (gitignored, and pyright/ruff/pytest are all given explicit targets
+# so nothing walks it). Context, measured the same day on this host: the `.venv`
+# each worktree already carries is 156-803MB, so this adds roughly 5-24% to a
+# worktree's footprint, on 2.0T free. If that ever stops being a rounding error
+# the answer is worktree GC, not dropping the pin.
+verify_cold_preprovision_command: "uv sync --all-packages && npm ci --no-audit --no-fund --prefer-offline"
 
 # TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
 # verify-admission-slot contention with reify while task 2501 (per-project

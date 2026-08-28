@@ -69,9 +69,9 @@ Full fresh-machine walkthrough: `SETUP.md`.
 The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
 3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
 carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
-of main's, once it has been cold-verified — `verify_cold_preprovision_command:
-"uv sync --all-packages"` runs *inside* the worktree, and such a venv can even
-be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
+of main's, once it has been cold-verified — `verify_cold_preprovision_command`
+(`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
+venv can even be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
 3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
 an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
 the MAIN checkout's `.venv` even when cwd is a worktree.

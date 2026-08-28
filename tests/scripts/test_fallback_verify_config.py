@@ -627,16 +627,17 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     )
 
     # Internal coherence: a cold run does strictly MORE work than a warm one —
-    # the same chain PLUS verify_cold_preprovision_command (uv sync
-    # --all-packages) — so a warm ceiling above the cold one is incoherent by
-    # construction, regardless of what either value is.
+    # the same chain PLUS verify_cold_preprovision_command (`uv sync
+    # --all-packages && npm ci …`; task 4538 added the npm clause that installs
+    # the pinned pyright the TYPE chain resolves) — so a warm ceiling above the
+    # cold one is incoherent by construction, regardless of either value.
     cold = budgets['verify_cold_command_timeout_secs']
     assert warm <= cold, (
         f'verify_command_timeout_secs={warm} exceeds '
         f'verify_cold_command_timeout_secs={cold} (task 3350). A cold verify runs '
-        'the same command chain plus the uv sync --all-packages preprovision, so '
-        'it is strictly more expensive; a warm budget above the cold one is '
-        'incoherent by construction'
+        'the same command chain plus the verify_cold_preprovision_command '
+        'preprovision (uv sync + npm ci), so it is strictly more expensive; a '
+        'warm budget above the cold one is incoherent by construction'
     )
 
 
@@ -1017,9 +1018,10 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
         assert warm <= cold, (
             f"verify_command_timeout_secs={warm} exceeds "
             f"verify_cold_command_timeout_secs={cold} (task 3397). A cold "
-            "verify runs the same chains plus the uv sync --all-packages "
-            "preprovision, so it is strictly more expensive; a warm budget "
-            "above the cold one is incoherent by construction"
+            "verify runs the same chains plus the "
+            "verify_cold_preprovision_command preprovision (uv sync + npm ci), "
+            "so it is strictly more expensive; a warm budget above the cold one "
+            "is incoherent by construction"
         )
 
     def test_type_chain_table_matches_the_chain_it_measures(self) -> None:
