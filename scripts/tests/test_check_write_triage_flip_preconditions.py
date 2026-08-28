@@ -48,6 +48,7 @@ _UNVERIFIABLE = 'UNVERIFIABLE'
 _RESCUE_PATH = 'select_judge_candidates'
 _BYTE_IDENTICAL = 'byte-identical'
 _MARKS_FIRST = 'distinguishes slate[0]'
+_SWAP_HELD = 'rendering depends on which candidate is the attach target'
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +158,83 @@ def build_judge_prompt(content, candidates, attach_target_id=None):
 def parse_judge_verdict(raw):
     return _parse_bare_str(raw)
 ''',
+    # Takes an attach-target argument but labels candidates[0] regardless. On a
+    # hoisted-parent slate that is the WRONG candidate — the rescued evidence
+    # child is LAST — so this must FAIL. Its rendering is independent of the
+    # argument, and slate[0]'s id is mentioned one extra time.
+    'positional_target': r'''
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '']
+    lines.append('ATTACH TARGET: ' + str(candidates[0].id))
+    lines.append('')
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
+    # The PROSE-ONLY fix: the signature grew an attach-target argument and the
+    # prompt grew a sentence, but the rendering is byte-identical whichever
+    # candidate is named. A source-text grep would pass this; the swap test
+    # cannot.
+    'ignores_target': r'''
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    lines.append('')
+    lines.append('One of the candidates above is the one this write will attach to.')
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
+    # A real option (b): whichever candidate matches the passed target id is
+    # the one lifted out, wherever it sits in the slate.
+    'by_id': r'''
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    target = [c for c in candidates if c.id == attach_target_id]
+    others = [c for c in candidates if c.id != attach_target_id]
+    lines = ['NEW ENTRY:', str(content), '', 'THE CANDIDATE THIS WRITE WILL ATTACH TO:']
+    for candidate in target:
+        lines.extend(_render_candidate(candidate))
+    lines.append('')
+    lines.append('OTHER CANDIDATES (CONTEXT ONLY):')
+    for candidate in others:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
+    # Byte-different heading text, identical id-level behaviour. Proves the
+    # gate pins no prompt wording: reword freely, the check still passes.
+    'by_id_reworded': r'''
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    target = [c for c in candidates if c.id == attach_target_id]
+    others = [c for c in candidates if c.id != attach_target_id]
+    lines = ['submitted:', str(content), '', '>>> the record this attaches to <<<']
+    for candidate in target:
+        lines.extend(_render_candidate(candidate))
+    lines.append('')
+    lines.append('~~~ background only, do not attach ~~~')
+    for candidate in others:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
 }
 
 
@@ -235,3 +313,47 @@ class TestAttachTargetProbe:
         proc = _run_probe(src_root)
         assert proc.returncode != 0, f'probe passed on a raising module:\n{proc.stdout}'
         assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+
+class TestSwapAndRescuePath:
+    """The two properties that stop item 1 being satisfiable by prose, or by
+    the measured ``candidates[0]`` bug.
+
+    SWAP TEST — render the SAME slate twice against two different attach
+    targets and require the two renderings to DIFFER. A sentence added to the
+    prompt renders identically whichever candidate is the target, so a
+    prose-only change cannot pass by construction. Nothing here matches
+    heading text, so any rewording survives.
+
+    RESCUE PATH — the fixture's ``select_judge_candidates`` appends a rescued
+    hoisted-parent winner LAST (mirroring main). An implementation that labels
+    ``candidates[0]`` therefore names the WRONG candidate on this slate, which
+    is the same harm item 1 exists to prevent, merely relocated.
+    """
+
+    def test_marking_candidates_zero_fails_and_names_the_rescue_path(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='positional_target')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'probe blessed candidates[0]:\n{proc.stdout}'
+        assert _MARKS_FIRST in proc.stdout, proc.stdout
+        # The operator has to be told WHY slate[0] is not the attach target.
+        assert _RESCUE_PATH in proc.stdout, proc.stdout
+
+    def test_prose_only_change_fails_the_swap_test(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='ignores_target')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'probe passed a prose-only change:\n{proc.stdout}'
+        assert _BYTE_IDENTICAL in proc.stdout, proc.stdout
+
+    def test_marking_by_id_passes(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe failed a real fix:\n{proc.stdout}\n{proc.stderr}'
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+
+    def test_rewording_the_headings_still_passes(self, tmp_path):
+        """No prompt wording is pinned — only id-level behaviour."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id_reworded')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe pinned prompt wording:\n{proc.stdout}\n{proc.stderr}'
+        assert _SWAP_HELD in proc.stdout, proc.stdout
