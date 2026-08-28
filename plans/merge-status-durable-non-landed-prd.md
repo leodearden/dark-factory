@@ -176,8 +176,21 @@ pass, one place, no per-tier duplication.
 5. event store, **cross-run** → `stale_record` + `last_outcome`
 6. `no_record` — or `unknown` when a probe raised
 
-`done` outranks `journaled`: a proven landing is terminal truth, a journal entry is only a pending
-expectation. Cost is immaterial — measured below.
+`done` outranks `journaled` and `stale_record`: a proven landing is terminal truth, while a journal
+entry is only a pending expectation and a prior-run row is only history. Putting either cheap tier
+ahead of git would re-create the 6873 failure — a landed branch reported as `stale_record` because a
+stale `blocked` row answered first.
+
+**That ordering is not free, and the honest cost is stated here rather than waved away.** The git
+tier's miss path is a full-history scan: measured 2026-08-28 on this repo (62,928 commits) at
+**0.84–1.11 s** per `find_merge_marker`-shaped scan. So every `stale_record` and `journaled` answer
+pays ~1 s before reaching its tier. Accepted, because `merge_status` is an interactive/poll probe on
+a 15 s–60 s backoff, not a hot loop — one second per poll is invisible against that cadence, and the
+correctness the ordering buys is exactly the defect this PRD exists to fix. **What would change the
+calculus:** a caller putting this tool on a tight loop, or the git tier gaining a per-candidate
+fan-out. Both are out of scope here, and the second is already the subject of separate scheduler
+work — note it, do not design around it. B10 pins the cross-run read's cost; it deliberately does
+**not** pin the git tier's, which this PRD neither introduces nor changes.
 
 **D6 — the retention ring is deleted, not wired.** Task 3149 poses this as an explicit
 wire-it-vs-delete-it judgement call and this PRD rules **delete**. A cross-run event-store read
