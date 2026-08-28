@@ -19,8 +19,9 @@ CONTENT arrives as a string (or None), and the composed entry point takes a
 seam exactly rather than introducing a second I/O seam.
 
 FAIL-SAFE IN EXACTLY ONE DIRECTION.  Any unreadable file, TOML/AST/shlex failure,
-unsupported expression node, merely-unknown marker, module shape the per-item
-tier cannot exhaustively enumerate (see :func:`per_item_marker_names`), or a
+unsupported expression node, merely-unknown marker, module shape neither the
+per-item nor the class-level tier can exhaustively enumerate (see
+:func:`per_item_marker_names` and :func:`guaranteed_marker_names`), or a
 module with zero collected items resolves to "no widening" — i.e. precisely
 today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
 here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
@@ -227,10 +228,17 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     A name ABSENT from this set is therefore UNKNOWN, not absent — which is
     precisely what makes :func:`expression_definitely_deselects`' Kleene
     treatment sound.  Excluding decorators makes the detector under-fire on some
-    genuinely-deselected files, which is the safe direction.  Per-function and
-    per-class decorators are instead handled by the separate, enumeration-guarded
-    tier :func:`per_item_marker_names`, which this function's own contract is
-    unaffected by.
+    genuinely-deselected files, which is the safe direction.  Those decorators are
+    instead handled by two separate, enumeration-guarded tiers, neither of which
+    affects this function's own contract: per-FUNCTION decorators by
+    :func:`per_item_marker_names`, and per-CLASS markers by
+    :func:`guaranteed_marker_names`.
+
+    :func:`guaranteed_marker_names` is deliberately a SIBLING that widens this
+    bound rather than an edit to it (task 4561, esc-3513-2).  Consumers reason
+    about the set returned HERE as the strict module-only bound — it is what
+    each of those tiers is defined as a superset OF — so widening it in place
+    would move the baseline every one of them is stated against.
 
     Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
     call, or a list/tuple of either.  Only ``tree.body`` is walked (never
@@ -507,19 +515,24 @@ def _assign_binds_test_prefixed_name(node: ast.Assign | ast.AnnAssign) -> bool:
 def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
     """Same result as :func:`module_level_marker_names`, from an already-parsed *tree*.
 
-    Deliberately a SEPARATE, small duplicate of that function's body rather
-    than a shared helper the two delegate to: ``module_level_marker_names``
-    is the exact edit site of task 4561, the still-pending owner of Gap 2
-    (class-level markers), and this task leaves that function byte-identical
-    to avoid a textual merge conflict with it (see the plan's design
-    decisions).  Used only by :func:`per_item_marker_names`, which already
-    holds a parsed *tree* and would otherwise pay a second, wholly redundant
-    ``ast.parse`` of the same source purely to re-derive this set.  A later
-    reader may collapse the two into one shared tree-walker once 4561 has
-    landed and that merge-conflict risk is gone.  Sequencing: whichever of
-    this task (Gap 3) and 4561 lands second should fold its walk into the
-    tier the other already added — :func:`per_item_marker_names` or
-    :func:`module_level_marker_names` — rather than adding a third.
+    THE SHARED tree-consuming walk: both :func:`per_item_marker_names` and
+    :func:`guaranteed_marker_names` call it off a tree they already hold,
+    rather than calling ``module_level_marker_names(source)`` and paying a
+    second, wholly redundant ``ast.parse`` of the same source purely to
+    re-derive this set.
+
+    It was introduced (task 3513 Gap 3) as a deliberate small duplicate of
+    ``module_level_marker_names``' body, on the then-current understanding
+    that task 4561 would edit that function IN PLACE, and it left a
+    sequencing note asking whichever task landed second to fold its walk into
+    the tier the other had added rather than adding a THIRD copy.  4561 has
+    since landed and did NOT edit ``module_level_marker_names``: esc-3513-2
+    re-specced Gap 2 as a SIBLING, :func:`guaranteed_marker_names`, which
+    consumes this helper.  The note's instruction was therefore honoured —
+    there are two copies of this walk, not three, and the remaining
+    duplication is exactly the source-consuming/tree-consuming pair.
+    Collapsing that last pair would mean giving ``module_level_marker_names``
+    a body that delegates here; nothing blocks it, and nothing requires it.
     """
     value: ast.expr | None = None
     for statement in tree.body:
