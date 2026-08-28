@@ -56,6 +56,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
+    guaranteed_marker_names,
     module_level_marker_names,
     per_item_marker_names,
     resolve_marker_expression,
@@ -615,6 +616,128 @@ class TestPerItemMarkerNames:
             'def test_a():\n    pass\n'
         )
         assert per_item_marker_names(source) is not None
+
+
+# ---------------------------------------------------------------------------
+# guaranteed_marker_names (step-1: RED)
+# ---------------------------------------------------------------------------
+
+#: The real class-level shape at ``fused-memory/tests/test_mem0_client.py:1854``
+#: -- ``pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]``
+#: -- generalised to one class per accepted spelling: the class-BODY ``pytestmark``
+#: list (whose leading ``qdrant_skipif()`` is a non-marker ``Call`` on a bare
+#: ``Name``, which ``_marker_name`` must keep skipping WITHOUT suppressing its
+#: siblings) and the class DECORATOR.  No module-level ``pytestmark`` and no
+#: module-level test function, so the whole answer comes from the class tier.
+_ALL_CLASSES_MARKED_SOURCE = """\
+import pytest
+
+from helpers import qdrant_skipif
+
+
+class TestBodyPytestmark:
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.slow]
+
+    def test_one(self):
+        pass
+
+    def test_two(self):
+        pass
+
+
+@pytest.mark.slow
+class TestClassDecorator:
+
+    def test_three(self):
+        pass
+
+    def test_four(self):
+        pass
+"""
+
+#: The minimal acceptance shape: one marked class and nothing else.
+_ONE_CLASS_MARKED_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestOnly:
+
+    def test_a(self):
+        pass
+
+    def test_b(self):
+        pass
+"""
+
+
+class TestGuaranteedMarkerNames:
+    """``guaranteed_marker_names(source) -> frozenset[str]``.
+
+    THE THIRD, ADDITIVE PROOF TIER: a module-wide LOWER BOUND on EVERY item
+    collected from *source* -- ``module_level_marker_names(source)`` unioned
+    with the INTERSECTION of every collectable class's own markers, and only
+    when an all-items-accounted-for guard proves no collected item can live
+    outside those classes -- never a per-item enumeration, which is
+    ``per_item_marker_names``' job.  Every guard failure degrades to exactly
+    ``module_level_marker_names``' answer, never less.
+    """
+
+    def test_one_marked_class_is_the_minimal_acceptance_shape(self):
+        """The class-level marker is unioned into the module-wide bound."""
+        assert guaranteed_marker_names(_ONE_CLASS_MARKED_SOURCE) == frozenset({'slow'})
+
+    def test_both_class_marker_spellings_are_read_and_intersected(self):
+        """The real ``test_mem0_client.py`` body shape alongside the decorator spelling.
+
+        ``TestBodyPytestmark`` carries ``{timeout, slow}`` and
+        ``TestClassDecorator`` carries ``{slow}``; only the SHARED marker is a
+        module-wide bound, so the fold is an INTERSECTION and ``timeout`` is
+        correctly absent.  The leading ``qdrant_skipif()`` contributes nothing
+        and must not suppress its siblings.
+        """
+        assert guaranteed_marker_names(_ALL_CLASSES_MARKED_SOURCE) == frozenset({'slow'})
+
+    def test_module_level_and_class_level_markers_are_unioned(self):
+        """The two tiers compose rather than compete."""
+        source = (
+            'import pytest\n\n'
+            'pytestmark = pytest.mark.timeout(60)\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'timeout', 'slow'})
+
+    def test_reproduces_the_module_level_answer_on_the_real_pytestmark_shape(self):
+        """The primary tier is untouched and still decisive on its own.
+
+        ``_REAL_PYTESTMARK_SOURCE`` has no collectable class at all, so the
+        class tier refuses and the answer is exactly the module-level one --
+        the degradation contract, pinned non-vacuously (the shared answer is
+        a NON-empty set, so an accidental ``frozenset()`` would fail).
+        """
+        assert guaranteed_marker_names(_REAL_PYTESTMARK_SOURCE) == module_level_marker_names(
+            _REAL_PYTESTMARK_SOURCE,
+        )
+        assert guaranteed_marker_names(_REAL_PYTESTMARK_SOURCE) != frozenset()
+
+    def test_reproduces_the_module_level_answer_on_a_module_level_marked_module(self):
+        """``_MARKED_SOURCE`` -- a module-level ``pytestmark`` plus a module-level test.
+
+        The module-level test function means the accounted-for guard refuses
+        the class tier, and the module-level bound alone still proves
+        ``warm_lane_bash`` exactly as it does today.
+        """
+        assert guaranteed_marker_names(_MARKED_SOURCE) == module_level_marker_names(_MARKED_SOURCE)
+        assert guaranteed_marker_names(_MARKED_SOURCE) == frozenset({'warm_lane_bash'})
+
+    def test_unmarked_module_is_empty(self):
+        assert guaranteed_marker_names(_UNMARKED_SOURCE) == frozenset()
 
 
 # ---------------------------------------------------------------------------
