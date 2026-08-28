@@ -553,6 +553,56 @@ def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
     )
 
 
+# Task 4902 RE-MEASUREMENT of the `orchestrator` fleet segment, in seconds.
+#
+# WHY THIS EXISTS: the table below was frozen at a task-3062 single run from
+# 2026-07-31. On 2026-08-20 commit 685f558728 landed
+# `verify_admission_pytest_n: "8"`, capping orchestrator's xdist fanout, and
+# the segment's cost stepped up ~2.6x. Nothing re-measured it, because nothing
+# in this file CAN — see the SCOPE paragraph on
+# ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor`` below.
+# So it was re-measured by hand, once, and the result recorded here.
+#
+# CORPUS: `.worktrees/*/.task/verify/*.orchestrator.summary.json` — 246 files
+# across 1354 worktrees at the time of the mine (2026-08-28, main 07eebf1c26),
+# yielding 244 records carrying a `test`-label command with both a numeric
+# `duration_secs` and a `started_at`.
+#
+# SELECTION (both filters are load-bearing):
+#   FULL-SUITE only. Of the 244 test-leg records, 110 target the bare `tests/`
+#     directory and 134 are file-scoped rescopes listing explicit
+#     orchestrator/tests/*.py paths. A rescope's duration measures one diff's
+#     blast radius, not a fleet segment; folding them in drags the median down
+#     by an order of magnitude. The discriminator is the positional pytest
+#     target: tokens after the last `pytest` that are non-flag, non-`k=v` and
+#     non-numeric, kept only when that list is exactly ['tests/'].
+#   GREEN only (rc == 0 and not timed_out). The table records honest green wall
+#     clock: a timed-out run contributes its 3600s ceiling instead of its true
+#     cost, and a red run may abort early — biases in opposite directions.
+#
+# REGIME SPLIT at started_at >= 2026-08-21T00:00:00Z (the day after 685f558728):
+#   pre-cap  green: n=70, 2026-07-07..2026-08-20, min 218.62  p50  691.40  max 1783.83, 0 of 70 over 1800s
+#   post-cap green: n=28, 2026-08-22..2026-08-28, min 864.83  p50 1765.95  max 3310.50, 14 of 28 over 1800s
+# The 2.6x step in the median straddles the cap and is confirmed on the
+# unfiltered arm too (all full-suite: before n=79 p50 698.04, after n=31
+# p50 1803.40 with one 3600.65s timeout). This task does NOT reopen its
+# attribution — tasks 3589 and 4456 own the -n cap and its memory ground.
+#
+# PERCENTILE CONVENTIONS, stated so the next re-measurement is a repeat rather
+# than a re-derivation: p50 is ``statistics.median`` (n is even, so it is the
+# mean of the two central observations and is NOT itself an observed run);
+# p90 is the lower order statistic ``sorted[floor(0.90 * n) - 1]`` =
+# ``sorted[24]`` of 28, which IS an observed run; max is the observed maximum.
+POST_CAP_ORCHESTRATOR_GREEN_SECS = {
+    'p50': 1765.95,
+    'p90': 2552.09,
+    'max': 3310.50,
+}
+
+# Sample size behind POST_CAP_ORCHESTRATOR_GREEN_SECS, kept next to it so the
+# percentiles and the n that produced them cannot drift apart.
+POST_CAP_ORCHESTRATOR_GREEN_N = 28
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
@@ -575,6 +625,39 @@ MEASURED_FLEET_SEGMENT_SECS = {
 
 def _verify_budgets() -> dict:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding='utf-8'))
+
+
+def test_measured_fleet_segment_table_reflects_the_post_cap_orchestrator_regime() -> None:
+    """The ``orchestrator`` table entry must not predate the -n 8 fanout cap.
+
+    Task 4902. ``MEASURED_FLEET_SEGMENT_SECS['orchestrator']`` was a single
+    logged run from 2026-07-31 (task 3062). On 2026-08-20 commit 685f558728
+    landed ``verify_admission_pytest_n: "8"``, and the segment's median green
+    full-suite cost stepped from 691.40s to 1765.95s. The table stayed frozen.
+
+    This is the smallest honest guard against that: the entry may not sit below
+    the measured median of the CURRENT regime. It compares two recorded
+    constants and reads nothing live — see the module comment on
+    ``POST_CAP_ORCHESTRATOR_GREEN_SECS`` for why the corpus is mined by hand
+    rather than at test time (those records are pruned with their worktrees, so
+    a corpus-globbing assertion would be non-deterministic and would eventually
+    collect n=0 and pass vacuously).
+    """
+    entry = MEASURED_FLEET_SEGMENT_SECS['orchestrator']
+    p50 = POST_CAP_ORCHESTRATOR_GREEN_SECS['p50']
+
+    assert entry >= p50, (
+        f"MEASURED_FLEET_SEGMENT_SECS['orchestrator']={entry} predates the "
+        f'pytest -n 8 fanout cap (commit 685f558728, 2026-08-20) and is below '
+        f'the current median green run of {p50}s, measured over '
+        f'{POST_CAP_ORCHESTRATOR_GREEN_N} full-suite green runs in the window '
+        f'2026-08-22..2026-08-28 (task 4902). A table entry below the median '
+        f'green run understates the fleet-chain floor by roughly '
+        f'{p50 - entry:.0f}s: the floor is summed from this table, so every '
+        f'derived headroom claim is overstated by the same amount. Re-measure '
+        f'the segment and raise this entry — and raise the republished copy in '
+        f'dark-factory-orchestrator.yaml in the same commit.'
+    )
 
 
 def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
