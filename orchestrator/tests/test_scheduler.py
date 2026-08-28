@@ -1711,14 +1711,52 @@ class TestUpdateTaskMetadataSerialization:
         # that the caller is told about the actionable 'additive' resolution.
 
     @pytest.mark.asyncio
+    async def test_update_task_merge_plus_truthy_non_bool_append_raises(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A TRUTHY non-bool append is rejected alongside 'merge' too, not just ``True``.
+
+        The guard and the mode resolver it protects must agree on what counts
+        as additive intent.  The resolver reads ``'additive' if append`` —
+        plain truthiness — so an identity check (``append is True``) would let
+        ``append=1`` (a dict-splat, or a flag round-tripped through JSON) slip
+        past the guard while STILL reading as additive intent to the resolver,
+        which would then resolve to 'merge' and forward the exact shallow
+        clobber this rejection exists to prevent.  ``append`` is annotated
+        ``bool``, so this is a narrow hole rather than a live caller, but the
+        identity check bought nothing over truthiness: falsy ``append`` is
+        untouched either way, so the one-cell narrowness is preserved.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with pytest.raises(ValueError) as excinfo:
+            await scheduler.update_task(
+                '1',
+                {'files': ['backend']},
+                append=1,  # type: ignore[arg-type]  # truthy non-bool, on purpose
+                metadata_mode='merge',
+            )
+
+        assert 'additive' in str(excinfo.value)
+        assert captured_args == [], (
+            f'A rejected update_task must not reach the wire; got: {captured_args}'
+        )
+
+    @pytest.mark.asyncio
     async def test_update_task_explicit_merge_without_append_forwards_merge(
         self, scheduler: Scheduler, monkeypatch
     ):
         """An explicit metadata_mode='merge' with append omitted is honored.
 
-        Non-regression cell pinning the guard's narrowness: it keys on
-        ``append is True``, so the default-safe explicit-merge path (the #4271
-        contract) is untouched.
+        Non-regression cell pinning the guard's narrowness: it rejects only a
+        TRUTHY ``append``, so the default-safe explicit-merge path (the #4271
+        contract) — where ``append`` defaults to falsy — is untouched.
         """
         captured_args: list[dict] = []
 
@@ -1808,7 +1846,37 @@ class TestFakeMetadataBackendMirrorsUpdateTaskRejection:
     state that production now refuses to produce.  These tests sit beside the
     production contract in ``TestUpdateTaskMetadataSerialization`` above so the
     two cannot drift apart again.
+
+    The fake no longer restates the condition — it calls production's own
+    ``_reject_contradictory_metadata_mode`` — so the drift is closed BY
+    CONSTRUCTION rather than by these tests happening to cover today's single
+    cell.  ``test_fake_metadata_backend_delegates_to_production_guard`` pins
+    that delegation; the behavioural tests below then confirm the fake calls it
+    at the right moment (before recording or mutating) and that its narrowness
+    carries through.
     """
+
+    def test_fake_metadata_backend_delegates_to_production_guard(self):
+        """The fake's guard IS the production guard — not a hand-copied mirror.
+
+        Load-bearing: a copied condition drifts silently the moment production's
+        rule is narrowed or widened (say, to reject another contradictory pair),
+        leaving the double over-permissive again — the exact
+        test-infrastructure-lies-about-production failure class this guard
+        exists to close.  Binding the same function object means a future change
+        lands in both callers at once.
+        """
+        import _workflow_helpers
+
+        from orchestrator.scheduler import _reject_contradictory_metadata_mode
+
+        assert (
+            _workflow_helpers._reject_contradictory_metadata_mode
+            is _reject_contradictory_metadata_mode
+        ), (
+            'FakeMetadataBackend must call production\'s '
+            '_reject_contradictory_metadata_mode, not a local restatement of it'
+        )
 
     @pytest.mark.asyncio
     async def test_fake_metadata_backend_merge_plus_append_true_raises(self):
