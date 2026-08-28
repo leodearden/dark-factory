@@ -587,3 +587,110 @@ class TestApplyStoreMutationPreflight:
         ]
         assert all(c['applied'] is False for c in report['changes'])
         assert report['totals']['refused'] == 2
+
+
+class TestPreconditionOrdering:
+    """d007aa46 asserts that 6403e96b was corrected, so it must never be
+    written unless that is TRUE.
+
+    If the two writes were independent and the first failed, the corpus would
+    carry a hygiene warning saying "corrected" while the top-ranked stale
+    record still misleads -- strictly worse than the status quo, and invisible
+    to anyone who trusts the warning. Making the second conditional on the
+    first is the only ordering under which a partial failure leaves the corpus
+    honest.
+    """
+
+    @staticmethod
+    def _actions(report):
+        return {c['id']: c['action'] for c in report['changes']}
+
+    @pytest.mark.asyncio
+    async def test_error_envelope_on_first_write_blocks_the_second(self):
+        service = _memory_service()
+
+        async def _update(**kwargs):
+            if kwargs['memory_id'] == STALE_ID:
+                return {'error': 'nope', 'error_type': 'Mem0UpdateNotAuthorized'}
+            return {'status': 'updated'}
+
+        service.update_memory.side_effect = _update
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [c.kwargs['memory_id'] for c in service.update_memory.await_args_list]
+        assert written == [STALE_ID]
+        assert self._actions(report)[WARNING_ID] == 'refuse:precondition_failed'
+
+    @pytest.mark.asyncio
+    async def test_raised_first_write_blocks_the_second_and_is_reported(self):
+        service = _memory_service()
+
+        async def _update(**kwargs):
+            if kwargs['memory_id'] == STALE_ID:
+                raise RuntimeError('qdrant unreachable')
+            return {'status': 'updated'}
+
+        service.update_memory.side_effect = _update
+        # Reported, not propagated.
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [c.kwargs['memory_id'] for c in service.update_memory.await_args_list]
+        assert written == [STALE_ID]
+        actions = self._actions(report)
+        assert actions[STALE_ID].startswith('refuse:')
+        assert actions[WARNING_ID] == 'refuse:precondition_failed'
+
+    @pytest.mark.asyncio
+    async def test_preimage_mismatch_on_first_target_blocks_all_writes(self):
+        # The corpus changed underneath us: somebody else already edited
+        # 6403e96b. Nothing may be written at all.
+        service = _memory_service({
+            STALE_ID: 'a different correction somebody else wrote',
+            WARNING_ID: _mod.AMEND_TARGETS[1].expected_preimage,
+        })
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        service.update_memory.assert_not_awaited()
+        actions = self._actions(report)
+        assert actions[STALE_ID] == 'refuse:preimage_mismatch'
+        assert actions[WARNING_ID] == 'refuse:precondition_failed'
+
+    @pytest.mark.asyncio
+    async def test_missing_first_target_blocks_the_second(self):
+        service = _memory_service({
+            WARNING_ID: _mod.AMEND_TARGETS[1].expected_preimage,
+        })
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        service.update_memory.assert_not_awaited()
+        actions = self._actions(report)
+        assert actions[STALE_ID] == 'refuse:not_found'
+        assert actions[WARNING_ID] == 'refuse:precondition_failed'
+
+    @pytest.mark.asyncio
+    async def test_happy_path_still_writes_the_second(self):
+        # The guard must not be so eager that it blocks the case it exists to
+        # protect.
+        service = _memory_service()
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [c.kwargs['memory_id'] for c in service.update_memory.await_args_list]
+        assert written == [STALE_ID, WARNING_ID]
+        assert self._actions(report)[WARNING_ID] == 'amend'
+
+    @pytest.mark.asyncio
+    async def test_already_amended_first_target_satisfies_the_precondition(self):
+        # A skip is not a failure: if 6403e96b already carries the correction
+        # then the claim d007aa46 makes about it is TRUE, so the second write
+        # is licensed. This is the partial-failure re-run case.
+        service = _memory_service({
+            STALE_ID: _mod.AMEND_TARGETS[0].new_content,
+            WARNING_ID: _mod.AMEND_TARGETS[1].expected_preimage,
+        })
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [c.kwargs['memory_id'] for c in service.update_memory.await_args_list]
+        assert written == [WARNING_ID]
+        actions = self._actions(report)
+        assert actions[STALE_ID] == 'skip:already_amended'
+        assert actions[WARNING_ID] == 'amend'
