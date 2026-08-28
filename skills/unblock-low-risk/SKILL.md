@@ -316,13 +316,56 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
   the branch was not in main before `$c`, so `$c` **is** the merge that brought it in — stamp
   `{"kind": "found_on_main", "commit": "$c", "note": "absorbed into group merge; sha verified
   by ancestry containment"}`. `contained-before rc=0` (or `$c` empty) → no merge commit exists
-  for this branch: a fast-forward landing. Stamp the branch tip,
-  `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note": "fast-forward
-  merge, no separate merge commit"}`. `kind='found_on_main'` requires `commit` and `note`, so
-  declining to stamp is not an available option on this arm.
-- **rc=1** (branch exists, not an ancestor of main), or **rc=128** (branch ref gone) *with an
-  empty marker search* → *these* are the genuine not-landed outcomes. Treat as **NOT landed**,
-  `merge_cancel(request_id)` where the call site says so, and **ABORT**.
+  for this branch. **Do not stamp the tip yet.** rc=0 does not by itself prove this branch
+  carries any work: a branch that never advanced past its creation point has main's own old base
+  commit as its tip, so it passes ancestry trivially, searches marker-empty, and yields no
+  rev-list candidate — exactly this arm — while carrying none of the task's work. Stamping it
+  would fabricate landing evidence for a phantom branch, and the server's only backstop
+  (`git merge-base --is-ancestor <sha> main`) passes for it. Prove content first, with the same
+  patch-id test merge-queue/SKILL.md rule 2b prescribes:
+
+  ```bash
+  git cherry main task/<TASK_ID>
+  ```
+
+  - **Non-empty and every line starts with `-`** (each of this branch's commits is already
+    patch-equivalent on main) → a genuine fast-forward / already-contained landing. Stamp the
+    branch tip, `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note":
+    "fast-forward merge, no separate merge commit; branch content confirmed on main by git
+    cherry"}`.
+  - **Empty output** → the branch never advanced past its creation point. This is the
+    **phantom-branch** case, NOT a landing. Do **not** stamp. Stop and report it as
+    not-landed/phantom-branch, citing the empty `git cherry` output. This is the same signal
+    `skills/unblock/SKILL.md`'s `already_merged` guidance treats as **not done** — the two rules
+    agree, and neither may be overridden by the other.
+  - **Any line starting with `+`** → at least one commit is genuinely absent from main. Do
+    **not** stamp; stop and report.
+
+  `kind='found_on_main'` requires `commit` and `note`, so where this gate finds no honest commit
+  the answer is to write **nothing at all** — never to substitute a convenient sha. Declining to
+  stamp *is* an available option on this arm, and on the two failing branches it is the required
+  one.
+- **rc=1** (branch exists, not an ancestor of main) → **not a not-landed verdict on its own.**
+  Carve out the coalesce case before aborting: if this task was ever `superseded` by a
+  `coalesce-*` train (or absorption is otherwise plausible), rc=1 is the **normal and permanent**
+  post-landing state for a non-tip train member — the tip is rebased onto main before the merge,
+  rewriting every stacked commit's sha, and this member's own ref is never advanced to them, so
+  it can never become an ancestor of main (`_delete_branch_if_on_main` also retains the ref,
+  making rc=128 the *rare* outcome here, not the common one). Reading rc=1 as not-landed there
+  would abandon landed work un-credited — the very failure this section exists to prevent, and
+  especially damaging at the call sites where you are already holding a server-issued
+  `done`/`already_merged` verdict. Instead follow merge-queue/SKILL.md rules 2–3: check the
+  **TIP's** merge marker and this task's own scheduler status, honour rule 2b's **veto** (any
+  non-`done` status means never self-stamp), confirm by content with `git cherry main
+  task/<TASK_ID>`, and take rule 2b's **landed-but-not-credited** exit rather than reporting
+  not-landed. **rc=1 is NOT not-landed on the `coalesce-*` arm; see merge-queue/SKILL.md rules
+  2–3.** Only outside that arm — no train absorption anywhere in this task's history — is rc=1
+  a genuine not-landed outcome.
+- **rc=128** (branch ref gone) *with an empty marker search* → a genuine not-landed outcome:
+  nothing on main cites the task, and no ref remains that could prove otherwise.
+
+On a genuine not-landed outcome (and only there): `merge_cancel(request_id)` where the call site
+says so, and **ABORT**.
 
 **Never** derive the sha from `git log --format=%H -1 main` <!-- provenance-guard: negative --> or by eyeballing
 `git log main --oneline -20` <!-- provenance-guard: negative -->. Neither is

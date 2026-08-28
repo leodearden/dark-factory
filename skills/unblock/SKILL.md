@@ -386,7 +386,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — rc=128 marker search included — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — rc=128 marker search included — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **The canonical check's rc=0 arm agrees with this and does not override it:** its step (3) will not stamp a branch tip until `git cherry main task/<TASK_ID>` proves the branch's commits are actually on main, so a branch that never advanced fails there too and is likewise reported not-landed/phantom-branch. Neither rule licenses stamping the other's way out. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
      - Whatever the source, stamp the SHA **exactly as the tool returned it**. This applies with full force to a `found_on_main` `merge_sha` from the poll loop below: it is already a verified commit on main, so never substitute the branch tip or a `git merge-base` result for it. (The one exception is a project that sets `git.commit_citation_pattern: ""`, where the tier runs un-gated and `merge_sha` *is* the branch tip — see the polled-done note below.)
 
      Go directly to step 8.
@@ -527,16 +527,33 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #                                      is the group/train-merge case.)
      #              contained-before rc=0 → the branch was ALREADY in main before $c, so $c
      #                                      is an unrelated later merge. Fall through to (3).
-     #        (3) No merge commit exists for this branch — a fast-forward (or
-     #            already-contained) landing. Stamp the branch tip,
-     #            `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists),
-     #            with note "fast-forward merge, no separate merge commit". That is the
-     #            rule `orchestrator/src/orchestrator/agents/briefing.py` already states.
-     #          Reaching (3) is NOT "not landed": rc=0 already proved the branch is on
-     #          main, and `kind='found_on_main'` REQUIRES a commit (there is no
-     #          commit-less/note-only fallback), so "do not stamp" is not an option on
-     #          this arm. Reserve it for the rc=1 and empty-marker rc=128 arms below,
-     #          where nothing has proved a landing.
+     #        (3) No merge commit exists for this branch. DO NOT stamp the tip yet —
+     #            rc=0 does not prove this branch carries any work. A branch that never
+     #            advanced past its creation point has main's own old base commit as its
+     #            tip: it passes ancestry trivially, searches marker-empty, and yields no
+     #            rev-list candidate — exactly this arm — while carrying NONE of the
+     #            task's work. Prove content first, with the same patch-id test
+     #            merge-queue/SKILL.md rule 2b prescribes:
+     #              git cherry main task/<TASK_ID>
+     #            NON-EMPTY and every line starts with `-` (each commit already
+     #              patch-equivalent on main) → genuine fast-forward / already-contained
+     #              landing. Stamp the branch tip, `git rev-parse task/<TASK_ID>` (rc=0
+     #              guarantees the ref still exists), with note "fast-forward merge, no
+     #              separate merge commit; branch content confirmed on main by git
+     #              cherry". That is the rule
+     #              `orchestrator/src/orchestrator/agents/briefing.py` already states.
+     #            EMPTY output → the branch never advanced: the PHANTOM-BRANCH case, NOT
+     #              a landing. Do NOT stamp. Stop and report as not-landed/phantom-branch,
+     #              citing the empty `git cherry` output. This is the same signal the
+     #              `already_merged` guidance above treats as NOT done — the two rules
+     #              agree, and neither may be overridden by the other.
+     #            ANY line starting with `+` → a commit is genuinely absent from main. Do
+     #              NOT stamp; stop and report.
+     #          `kind='found_on_main'` REQUIRES a commit (there is no commit-less/note-only
+     #          fallback), so where this gate finds no honest commit the answer is to write
+     #          NOTHING AT ALL — never to substitute a convenient sha. "Do not stamp" IS an
+     #          available option on this arm, and on the two failing branches it is the
+     #          required one.
      #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's
      #          CURRENT HEAD, which is this task's merge commit only when this merge
      #          happens to be the newest commit on main — on a live queue it usually is
@@ -610,12 +627,20 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #         `git merge-base --is-ancestor task/<TASK_ID> "$c^1"` — rc=1 means $c really is
   #         the merge that brought this branch in (stamp $c); rc=0 means $c is an
   #         unrelated LATER merge that merely descends from this branch (do NOT stamp it);
-  #     (3) otherwise no merge commit exists → fast-forward landing: stamp the branch tip
-  #         `git rev-parse task/<TASK_ID>` with note "fast-forward merge, no separate
-  #         merge commit".
-  #   Reaching (3) is NOT "not landed": rc=0 already proved the branch IS on main, and
-  #   kind='found_on_main' REQUIRES a commit, so "do not stamp" is not an available option on
-  #   this arm. Reserve not-landed for rc=1 and for rc=128 with an empty marker search.
+  #     (3) otherwise no merge commit exists → GATE ON CONTENT before stamping, because
+  #         rc=0 does not prove this branch carries any work: a branch that never advanced
+  #         past its creation point reaches this exact arm with main's old base commit as
+  #         its tip. Run `git cherry main task/<TASK_ID>`:
+  #           non-empty AND every line starts with `-` → genuine fast-forward landing;
+  #             stamp the branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward
+  #             merge, no separate merge commit; branch content confirmed on main by git
+  #             cherry";
+  #           empty → PHANTOM BRANCH, never advanced. Do NOT stamp; stop and report as
+  #             not-landed/phantom-branch (the same verdict the `already_merged` guidance
+  #             above reaches on "nothing on main cites this task");
+  #           any `+` line → a commit is genuinely absent from main. Do NOT stamp; report.
+  #   kind='found_on_main' REQUIRES a commit, so where the gate finds no honest commit,
+  #   write NOTHING — never substitute a convenient sha. "Do not stamp" IS available here.
   #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
   #   HEAD, which is this task's merge commit only when this merge happens to be the
   #   newest commit on main — on a live queue it usually is not, so you would stamp an
@@ -803,12 +828,17 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #       | tail -1)`, then CONFIRM with `git merge-base --is-ancestor task/<TASK_ID> "$c^1"`:
 #       rc=1 → $c is the merge that brought this branch in, stamp it; rc=0 → $c is an
 #       unrelated later merge that merely descends from this branch, do NOT stamp it;
-#   (3) otherwise no merge commit exists → fast-forward (or already-contained) landing:
-#       stamp the branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward merge,
-#       no separate merge commit".
-#   Reaching (3) is NOT "not landed" — ancestry already proved otherwise. kind='found_on_main'
-#   requires a commit; there is no note-only fallback, and "not landed" belongs only to the
-#   rc=1 / empty-marker rc=128 arms.
+#   (3) otherwise no merge commit exists → GATE ON CONTENT before stamping. rc=0 does not
+#       prove this branch carries work: a branch that never advanced past its creation point
+#       reaches this exact arm with main's old base commit as its tip. Run
+#       `git cherry main task/<TASK_ID>` — non-empty AND every line starts with `-` → genuine
+#       fast-forward (or already-contained) landing, stamp the branch tip
+#       `git rev-parse task/<TASK_ID>` with note "fast-forward merge, no separate merge
+#       commit; branch content confirmed on main by git cherry"; EMPTY → PHANTOM BRANCH, do
+#       NOT stamp, stop and report as not-landed/phantom-branch; any `+` line → a commit is
+#       genuinely absent from main, do NOT stamp.
+#   kind='found_on_main' requires a commit; there is no note-only fallback, so where the gate
+#   finds no honest commit, write NOTHING rather than substituting a convenient sha.
 #   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
 #   task's merge commit.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —

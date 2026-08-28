@@ -163,13 +163,24 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #                                    merge that brought it in. Stamp $c (group/train case).
 #            contained-before rc=0 → already in main before $c, so $c is an unrelated later
 #                                    merge. Do NOT stamp it; fall through.
-#          Falling through means no merge commit exists for this branch — a fast-forward
-#          (or already-contained) landing. That is NOT "not landed": rc=0 already proved the
-#          branch IS on main. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
-#          guarantees the ref still exists) — with note "fast-forward merge, no separate
-#          merge commit". kind='found_on_main' REQUIRES a commit (no note-only fallback
-#          since the post-3092 hardening), so "do not stamp" is not an option on this arm;
-#          it belongs to rc=1 and to rc=128 with an empty marker search only.
+#          Falling through means no merge commit exists for this branch. DO NOT stamp the
+#          tip yet: rc=0 proves the tip is reachable from main, NOT that this branch carries
+#          any work. A branch that never advanced past its creation point has main's own old
+#          base commit as its tip and reaches this exact arm — ancestry rc=0, marker empty,
+#          no verified rev-list candidate — carrying none of the task's work. Gate on
+#          content with rule 2b's patch-id test below:
+git cherry main task/<TASK_ID>
+#            NON-EMPTY and every line starts with `-` → each commit is already
+#              patch-equivalent on main: a genuine fast-forward (or already-contained)
+#              landing. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
+#              guarantees the ref still exists) — with note "fast-forward merge, no separate
+#              merge commit; branch content confirmed on main by git cherry".
+#            EMPTY output → the branch never advanced: the PHANTOM-BRANCH case, NOT a
+#              landing. Do NOT stamp. Stop and report as not-landed/phantom-branch.
+#            ANY `+` line → a commit is genuinely absent from main. Do NOT stamp; report.
+#          kind='found_on_main' REQUIRES a commit (no note-only fallback since the post-3092
+#          hardening), so where this gate finds no honest commit the answer is to write
+#          NOTHING AT ALL — never to substitute a convenient sha.
 # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
 #          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
 #          branch's merge commit, by exact subject:
