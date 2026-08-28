@@ -206,6 +206,24 @@ FLEET_DEPLOY_CLOCK_PATH = os.environ.get(
 # wall-clock seconds instead, bucketed purely off time.time() (no persisted
 # state needed) — deliberately much coarser than the ~60s tick cadence so most
 # ticks land inside an already-logged bucket and stay silent.
+#
+# The head-start skip lines (task 4754) reuse this same bucket, and their
+# window is exactly ONE bucket period long (STALENESS_GRACE_SECS is also 1800),
+# so it contains exactly one bucket boundary. That is still guaranteed to
+# emit, and the reason is worth stating because it looks like an off-by-one:
+# when the boundary lands d seconds before a head start closes, the PREVIOUS
+# bucket's slot covers the first (120-d) seconds of the SAME window, so the
+# logging coverage inside a window of exactly one period is always exactly
+# 120s — merely split across the window's two ends when d is small. Measured:
+# exactly 2 emissions per head start per tier at the 60s tick cadence, for
+# EVERY combination of window phase and timer phase (pinned by
+# test_head_start_skip_log_bucket_covers_every_window_phase). The guarantee
+# rests on the 120s slot being >= 2x that cadence and on this period being a
+# whole multiple of it; narrowing the slot or lengthening the tick would make
+# some head starts journal-silent — and a head start is precisely the one
+# ~30-minute stretch per window in which the backstop deliberately does
+# nothing, i.e. the stretch an operator asking "why didn't the backstop fire?"
+# needs evidence of.
 SKIP_LOG_INTERVAL_SECS = 1800
 
 # Freshness window for report()'s MERGE-IDLE column (_classify_unit_heartbeat
@@ -1877,7 +1895,9 @@ def staleness_pass() -> None:
     # rather than threading one epoch through both (task 4754).
     if _within_fleet_staleness_head_start():
         # Same bucket idiom as the gate above: the gate CHECK still runs every
-        # tick, only the log EMISSION is throttled.
+        # tick, only the log EMISSION is throttled. This window is exactly one
+        # bucket period long — see SKIP_LOG_INTERVAL_SECS for why that still
+        # emits (twice, measured), and what would break it.
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 f"skip: holding the {STALENESS_GRACE_SECS}s coordinator head start "
@@ -2001,7 +2021,9 @@ def fused_memory_staleness_pass() -> None:
     # rather than threading one epoch through both (task 4754).
     if _within_fm_staleness_head_start():
         # Same bucket idiom as the gate above: the gate CHECK still runs every
-        # tick, only the log EMISSION is throttled.
+        # tick, only the log EMISSION is throttled. This window is exactly one
+        # bucket period long — see SKIP_LOG_INTERVAL_SECS for why that still
+        # emits (twice, measured), and what would break it.
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 f"skip: holding the {STALENESS_GRACE_SECS}s fm-coordinator head start "

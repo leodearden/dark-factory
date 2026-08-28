@@ -2516,6 +2516,190 @@ def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
     )
 
 
+#: orchestrator-watchdog.timer's OnUnitActiveSec — the staleness passes' tick
+#: cadence, and the resolution at which a throttled skip line can be emitted.
+_WATCHDOG_TICK_SECS = 60
+
+
+def _count_head_start_skip_lines(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pass_fn_name: str,
+    window_start: float,
+    tick_phase: float = 0.0,
+) -> int:
+    """Tick a staleness pass across one WHOLE head start; count skip lines emitted.
+
+    Drives *pass_fn_name* once per _WATCHDOG_TICK_SECS from the first tick at
+    or after *window_start* until the window closes STALENESS_GRACE_SECS later
+    — the full length of a head start — with that tier's head-start gate held
+    True and its min-interval gate held False, i.e. the state the pass is in
+    for every tick of that window. *tick_phase* offsets the tick grid relative
+    to the window (systemd's timer phase is unrelated to when a min-interval
+    window happens to open, so it must not be assumed to be 0). Returns how
+    many journal lines the throttle let through.
+
+    Both gates are stubbed because this exercises the LOG-THROTTLE arithmetic,
+    not the gates: what is under test is whether a window of exactly
+    STALENESS_GRACE_SECS is guaranteed to contain a logging slot at all.
+    """
+    log_messages: list[str] = []
+    tier = "fm" if pass_fn_name.startswith("fused_memory") else "fleet"
+    monkeypatch.setattr(wdog, f"_within_{tier}_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, f"_within_{tier}_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    now = {"t": window_start + tick_phase}
+    monkeypatch.setattr(wdog.time, "time", lambda: now["t"])
+    pass_fn = getattr(wdog, pass_fn_name)
+    while now["t"] < window_start + wdog.STALENESS_GRACE_SECS:
+        pass_fn()
+        now["t"] += _WATCHDOG_TICK_SECS
+    return len(log_messages)
+
+
+def _head_start_skip_line_emitted_at(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, when: float
+) -> bool:
+    """Run staleness_pass for exactly ONE tick at *when*; True iff it logged.
+
+    Single-tick sibling of _count_head_start_skip_lines, used to MEASURE the
+    real width of the logging slot against the code rather than assuming it.
+    """
+    log_messages: list[str] = []
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+    monkeypatch.setattr(wdog.time, "time", lambda: when)
+    wdog.staleness_pass()
+    return bool(log_messages)
+
+
+def _boundary_late_head_start_window_start(wdog: types.ModuleType) -> float:
+    """A head-start window whose bucket boundary lands 1s before the window closes.
+
+    Returns W with ``(W + STALENESS_GRACE_SECS - 1) % SKIP_LOG_INTERVAL_SECS ==
+    0``: the sole bucket boundary strictly inside the window opens its 120s
+    logging slot 1 second before the window closes, so only ~1s of THAT slot
+    overlaps the head start and no tick on a 60s grid anchored at W can land
+    in it. The naive reading is that the line is then never emitted; see
+    test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start
+    for why the complementary 119s at the START of the window makes that false.
+    """
+    base = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    return base - wdog.STALENESS_GRACE_SECS + 1.0
+
+
+def test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FLEET head-start skip line is emitted at least once per head start.
+
+    REGRESSION PIN (review of task 4754). A head start is exactly
+    STALENESS_GRACE_SECS (1800s) long and SKIP_LOG_INTERVAL_SECS is also
+    1800s, which invites the reading that a window containing exactly ONE
+    bucket boundary can be journal-silent: put that boundary 1s before the
+    window closes (_boundary_late_head_start_window_start) and only ~1s of its
+    120s logging slot lies inside the head start.
+
+    That reading is wrong, and this test is the pin for WHY: when the window
+    length EQUALS the bucket period, a boundary landing d seconds before the
+    close leaves the PREVIOUS bucket's slot covering the first (120-d) seconds
+    of the same window. Measured at this phase: 1s of trailing slot plus 119s
+    of leading slot — the coverage inside the window is always exactly 120s,
+    merely split across its two ends. So the line is emitted exactly twice per
+    head start at the 60s tick cadence, for every combination of window phase
+    and timer phase (test_head_start_skip_log_bucket_covers_every_window_phase
+    below scans them).
+
+    Operationally this is the one ~30-minute period per min-interval window in
+    which the backstop is deliberately silent, so an operator asking "why
+    didn't the backstop fire?" is asking about exactly this window: it must
+    leave evidence in the journal. The paired suppression case — the line must
+    stay THROTTLED, not unthrottled — is
+    test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket
+    above.
+    """
+    wdog = _load_watchdog()
+    window_start = _boundary_late_head_start_window_start(wdog)
+
+    # tick_phase 30 puts the timer grid deliberately out of step with both the
+    # window and the bucket, so a pass here cannot come from a lucky alignment.
+    emitted = _count_head_start_skip_lines(
+        wdog,
+        monkeypatch,
+        pass_fn_name="staleness_pass",
+        window_start=window_start,
+        tick_phase=30.0,
+    )
+
+    assert emitted >= 1, (
+        "the fleet head-start skip line must be emitted at least once during a "
+        f"{wdog.STALENESS_GRACE_SECS}s head start, even when the bucket boundary "
+        "lands 1s before the window closes; got zero — the whole window would be "
+        "silent in the journal"
+    )
+    # ...and still throttled: the window is 30 ticks long at the 60s cadence.
+    assert emitted <= 4, (
+        f"the fleet head-start skip line must stay throttled; {emitted} lines "
+        f"per {wdog.STALENESS_GRACE_SECS}s head start is approaching unthrottled"
+    )
+
+
+def test_head_start_skip_log_bucket_covers_every_window_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARITHMETIC pin: NO (window phase, timer phase) pair yields a silent head start.
+
+    Generalizes the two behavioural tests (fleet above, fm below) from one
+    adversarial phase to the whole phase space, so a later edit to
+    SKIP_LOG_INTERVAL_SECS, STALENESS_GRACE_SECS or the 120s slot that would
+    make some head start journal-silent fails here naming the exact phase,
+    rather than being discovered by an operator finding no evidence of a
+    window in which the backstop deliberately did nothing.
+
+    The guarantee currently rests on THREE relations, any of which a future
+    edit could break: the slot (120s) is at least twice the tick cadence; the
+    bucket period is a whole multiple of that cadence; and the window length
+    is a whole multiple of the bucket period (here exactly one), so the
+    coverage lost off the window's end wraps back onto its start. Both tiers
+    share all three constants, so one pin covers both.
+    """
+    wdog = _load_watchdog()
+    period = wdog.SKIP_LOG_INTERVAL_SECS
+    grace = wdog.STALENESS_GRACE_SECS
+    tick = _WATCHDOG_TICK_SECS
+
+    # MEASURE the slot width off the real pass instead of restating the source
+    # literal, so this scan cannot keep passing against a stale assumption if
+    # that literal is ever changed.
+    slot = 120
+    boundary = period * 1000.0
+    assert _head_start_skip_line_emitted_at(wdog, monkeypatch, boundary + slot - 1), (
+        f"expected the skip line {slot - 1}s into a bucket; the logging slot is "
+        f"narrower than the {slot}s this scan assumes"
+    )
+    assert not _head_start_skip_line_emitted_at(wdog, monkeypatch, boundary + slot), (
+        f"expected no skip line {slot}s into a bucket; the logging slot is wider "
+        f"than the {slot}s this scan assumes"
+    )
+
+    for window_phase in range(period):  # window start, mod the bucket period
+        for tick_phase in range(tick):  # systemd timer grid, mod the cadence
+            first = window_phase + tick_phase
+            logging_ticks = [
+                t
+                for t in range(first, window_phase + grace, tick)
+                if t % period < slot
+            ]
+            assert logging_ticks, (
+                f"a head start opening at phase {window_phase} (mod {period}) with "
+                f"timer phase {tick_phase} would emit the skip line ZERO times "
+                f"across its {grace}s: no tick lands in a logging slot"
+            )
+
+
 def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6606,6 +6790,41 @@ def test_fm_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
     assert log_messages == [], (
         f"Expected no fm head-start skip line outside the log-rate-limit bucket: "
         f"{log_messages}"
+    )
+
+
+def test_fm_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FM head-start skip line is emitted at least once per head start.
+
+    fm mirror of
+    test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start
+    — the same property, since both tiers' head starts are exactly
+    STALENESS_GRACE_SECS long and both skip lines share one bucket period. See
+    that test's docstring for the wrap arithmetic and the operator cost, and
+    test_head_start_skip_log_bucket_covers_every_window_phase for the pin over
+    the whole phase space.
+    """
+    wdog = _load_watchdog()
+
+    emitted = _count_head_start_skip_lines(
+        wdog,
+        monkeypatch,
+        pass_fn_name="fused_memory_staleness_pass",
+        window_start=_boundary_late_head_start_window_start(wdog),
+        tick_phase=30.0,
+    )
+
+    assert emitted >= 1, (
+        "the fm head-start skip line must be emitted at least once during a "
+        f"{wdog.STALENESS_GRACE_SECS}s head start, even when the bucket boundary "
+        "lands 1s before the window closes; got zero — the whole window would be "
+        "silent in the journal"
+    )
+    assert emitted <= 4, (
+        f"the fm head-start skip line must stay throttled; {emitted} lines per "
+        f"{wdog.STALENESS_GRACE_SECS}s head start is approaching unthrottled"
     )
 
 
