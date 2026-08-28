@@ -7344,6 +7344,13 @@ class Scheduler:
             )
             return None
 
+        # Tick clock starts HERE, not at the phase loop: the get_tasks preamble
+        # below is a real per-tick cost (an ~11.6MB MCP payload on this repo)
+        # and both early returns under it are ticks that happened.  Deliberately
+        # after the paused / warm-base-hard-down returns above, which are not
+        # dispatch attempts and would otherwise emit every idle_poll_secs for as
+        # long as the pause lasts.
+        tick_started = time.perf_counter()
         tasks = await self.get_tasks(
             statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True,
         )
@@ -7356,6 +7363,7 @@ class Scheduler:
             # during exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
+            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
             return None
         self._reset_fm_read_failure_streak()
         if not tasks:
@@ -7367,6 +7375,7 @@ class Scheduler:
             # eviction for a stranded park sits in the table indefinitely until
             # some active task happens to appear and trigger a normal tick.
             self._drain_park_eviction_requests({}, {})
+            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
             return None
 
         # Status + id indices, built once per tick.
@@ -7406,21 +7415,78 @@ class Scheduler:
         # each `_phase_<label>` method's own docstring rather than inline
         # here, since a generic loop has no single call site to hang
         # per-phase commentary off of.
-        for label in self._TICK_PHASE_ORDER:
-            r = await getattr(self, f'_phase_{label}')(ctx)
-            # Explicit check (not a bare `assert`) so the contract is still
-            # enforced under `python -O` (asserts stripped) — without it, a
-            # phase that forgets to return would fall through to
-            # `return r.assignment` on `None` and raise an opaque
-            # AttributeError instead of this descriptive error.
-            if not (r is _CONTINUE or isinstance(r, TickOutcome)):
-                raise RuntimeError(
-                    f'_phase_{label} returned {r!r} — every _phase_* method must '
-                    f'return _CONTINUE or a TickOutcome (did it forget a return?)'
-                )
-            if r is not _CONTINUE:
-                return r.assignment
-        return None
+        # Tick telemetry (see EventType.scheduler_tick): the loop below is the
+        # orchestrator's throughput constraint and was previously untimed, so a
+        # regression to ~14min/tick went unnoticed for months.  try/finally
+        # because the common exit is the short-circuit `return` mid-loop, not
+        # the fall-through.  `tick_started` was stamped before get_tasks above,
+        # so duration_ms covers the whole tick and not just the phases.
+        phase_ms: dict[str, int] = {}
+        terminal_phase: str | None = None
+        assignment: TaskAssignment | None = None
+        try:
+            for label in self._TICK_PHASE_ORDER:
+                phase_started = time.perf_counter()
+                try:
+                    r = await getattr(self, f'_phase_{label}')(ctx)
+                finally:
+                    phase_ms[label] = round(
+                        (time.perf_counter() - phase_started) * 1000
+                    )
+                # Explicit check (not a bare `assert`) so the contract is still
+                # enforced under `python -O` (asserts stripped) — without it, a
+                # phase that forgets to return would fall through to
+                # `return r.assignment` on `None` and raise an opaque
+                # AttributeError instead of this descriptive error.
+                if not (r is _CONTINUE or isinstance(r, TickOutcome)):
+                    raise RuntimeError(
+                        f'_phase_{label} returned {r!r} — every _phase_* method must '
+                        f'return _CONTINUE or a TickOutcome (did it forget a return?)'
+                    )
+                if r is not _CONTINUE:
+                    terminal_phase = label
+                    assignment = r.assignment
+                    return assignment
+            return None
+        finally:
+            self._emit_tick_telemetry(
+                ctx, tick_started, phase_ms, terminal_phase, assignment,
+            )
+
+    def _emit_tick_telemetry(
+        self,
+        ctx: TickContext | None,
+        tick_started: float,
+        phase_ms: dict[str, int],
+        terminal_phase: str | None,
+        assignment: TaskAssignment | None,
+    ) -> None:
+        """Emit one ``scheduler_tick`` event summarising the tick just finished.
+
+        Called from ``acquire_next``'s ``finally``, so it also runs for a tick
+        that raised, and from the two task-fetch early returns above the phase
+        loop — where *ctx* does not exist yet and ``terminal_phase`` carries the
+        pseudo-label (``'get_tasks_failed'`` / ``'no_active_tasks'``) naming why
+        the tick ended early.  Total-silent on any failure: telemetry must never
+        be able to break dispatch, which is the same PROPERTY-1 fail-open rule
+        the consult gates follow.
+        """
+        if self.event_store is None:
+            return
+        try:
+            candidates = ctx.candidates if ctx is not None else None
+            self.event_store.emit(
+                EventType.scheduler_tick,
+                task_id=assignment.task_id if assignment is not None else None,
+                data={
+                    'duration_ms': round((time.perf_counter() - tick_started) * 1000),
+                    'phases': phase_ms,
+                    'terminal_phase': terminal_phase,
+                    'candidates': len(candidates) if candidates is not None else None,
+                },
+            )
+        except Exception:
+            logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.

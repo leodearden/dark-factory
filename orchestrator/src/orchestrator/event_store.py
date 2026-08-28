@@ -610,6 +610,37 @@ class EventType(StrEnum):
     #   floor:     config.psi_admission.min_inflight_floor (int)
     dispatch_deferred = 'dispatch_deferred'
 
+    # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at
+    # the END of every tick (including the ones that dispatch nothing) from a
+    # `finally`, so a tick that short-circuits out of the phase loop is
+    # measured too.  Scheduler-scoped: task_id is the dispatched task when the
+    # tick produced an assignment, else None (same shape as
+    # park_eviction_deferred_fm_unavailable).
+    #
+    # EXISTS BECAUSE THE TICK WAS PREVIOUSLY UNINSTRUMENTED.  There was no
+    # perf_counter anywhere in scheduler.py or harness.py and no duration event
+    # of any kind, so a regression that took the tick from seconds to ~14
+    # MINUTES — one uncached full-history `git log` per candidate in the
+    # already-landed gate — ran unnoticed for months and was only ever found by
+    # reconstructing a clock from an unrelated WARNING's cadence.  Dispatch
+    # rate is the orchestrator's headline throughput constraint; it should not
+    # be inferred from log archaeology.
+    #
+    # duration_ms is carried INSIDE data, not as the emit() column kwarg,
+    # because orchestrator/tests/_recording_event_store.py retains only
+    # (event_type, {task_id, data}) — a column-only duration is invisible to
+    # every existing test double.  verify_runner.py's merge_verify event sets
+    # the same precedent.
+    # data keys: {duration_ms, phases, terminal_phase, candidates}
+    #   duration_ms:    whole-tick wall time in ms (int)
+    #   phases:         {phase_label: ms} for each phase that ran (dict);
+    #                   a short-circuiting tick lists only the phases reached
+    #   terminal_phase: label of the phase that ended the tick, or None when
+    #                   the loop ran to completion without dispatching
+    #   candidates:     len(ctx.candidates) at the end of the tick, or None if
+    #                   the tick ended before candidates were built
+    scheduler_tick = 'scheduler_tick'
+
     # Paired (rebase → immediately-following verify) cost record.
     # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.
     # Data payload: {

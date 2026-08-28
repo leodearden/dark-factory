@@ -4221,6 +4221,166 @@ class TestFindMergeMarker:
 
 
 @pytest.mark.asyncio
+class TestMergeMarkerIndex:
+    """The per-main-sha marker index behind GitOps.find_merge_marker.
+
+    The index replaced a full-history ``git log --grep`` that ran once per
+    dispatch candidate (~2.0s x ~721 candidates = the entire ~14min scheduler
+    tick).  It is a PERFORMANCE change only, so the load-bearing property is
+    that :meth:`GitOps._lookup_merge_marker` and the retained direct scan
+    :meth:`GitOps._scan_merge_marker` agree on every input.
+
+    ``TestFindMergeMarker`` above already exercises the indexed path end-to-end
+    through real merges (including substring safety and most-recent-wins for a
+    twice-merged branch); these tests pin the index's own seams.
+    """
+
+    async def test_index_and_direct_scan_agree(self, git_ops: GitOps):
+        """Indexed lookup == direct scan, for both a hit and a miss."""
+        repo = git_ops.project_root
+        marker = _merge_subject('task/agree', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'agree.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/agree') == sha
+        assert await git_ops._scan_merge_marker('task/agree') == sha
+
+        assert await git_ops.find_merge_marker('task/absent') is None
+        assert await git_ops._scan_merge_marker('task/absent') is None
+
+    async def test_marker_in_commit_BODY_is_found(self, git_ops: GitOps):
+        """A marker in the body, not the subject, must still be found.
+
+        ``git log --grep`` matches anywhere in the commit message, so the index
+        reads ``%B`` rather than ``%s``.  Measured on dark-factory's own main:
+        19 of 62,950 commits carry a marker only in the body, so a subject-only
+        index would silently change those verdicts.
+        """
+        repo = git_ops.project_root
+        marker = _merge_subject('task/body-only', git_ops.config.main_branch)
+        message = f'chore: record a landing\n\n{marker}\n'
+        sha = await _seed_on_main(repo, {'body.txt': 'x\n'}, message)
+
+        assert await git_ops.find_merge_marker('task/body-only') == sha
+        # Equivalence with the path it replaced.
+        assert await git_ops._scan_merge_marker('task/body-only') == sha
+
+    async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
+        """A hand-written ``Merge task/x: ...`` subject is not a marker.
+
+        dark-factory's main carries 46 such commits against 2,972 canonical
+        ones.  They do not match ``_merge_subject``'s ``into <main>`` shape and
+        are invisible to the grep, so the index must not surface them either.
+        """
+        repo = git_ops.project_root
+        await _seed_on_main(
+            repo, {'nc.txt': 'x\n'}, 'Merge task/noncanon: isolate the thing',
+        )
+
+        assert await git_ops.find_merge_marker('task/noncanon') is None
+        assert await git_ops._scan_merge_marker('task/noncanon') is None
+
+    async def test_index_rebuilds_when_main_advances(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A marker landing after the index was built is found on a later call."""
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+
+        # Builds an index at a main sha that has no such marker.
+        assert await git_ops.find_merge_marker('task/later') is None
+
+        marker = _merge_subject('task/later', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'later.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/later') == sha
+
+    async def test_index_is_not_rebuilt_on_every_lookup(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Repeated lookups reuse one index — the whole point of the change.
+
+        Without this the fix would be a no-op: rebuilding per candidate is
+        strictly worse than the per-candidate grep it replaced.
+        """
+        builds: list[int] = []
+        real = GitOps._build_merge_marker_index
+
+        async def _counting(self: GitOps) -> dict[str, str] | None:
+            builds.append(1)
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _counting)
+
+        for i in range(6):
+            assert await git_ops.find_merge_marker(f'task/miss-{i}') is None
+
+        assert len(builds) == 1, f'expected one index build, got {len(builds)}'
+
+    async def test_falls_back_to_scan_when_index_cannot_be_built(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A failed index build degrades to the direct scan, not to a wrong answer."""
+        repo = git_ops.project_root
+        marker = _merge_subject('task/fallback', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'fb.txt': 'x\n'}, marker)
+
+        async def _no_index(self: GitOps) -> dict[str, str] | None:
+            return None
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _no_index)
+
+        assert await git_ops.find_merge_marker('task/fallback') == sha
+        assert git_ops._merge_marker_index is None
+
+    async def test_transient_build_failure_is_not_cached(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A one-off build failure must not pin a marker-absent verdict.
+
+        Same rule as :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`: caching a
+        subprocess failure would freeze a spurious answer for the life of the
+        current HEAD instead of self-healing on the next call.
+        """
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+        marker = _merge_subject('task/flaky', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'flaky.txt': 'x\n'}, marker)
+
+        real = GitOps._build_merge_marker_index
+        state = {'fail_next': True}
+
+        async def _flaky(self: GitOps) -> dict[str, str] | None:
+            if state['fail_next']:
+                state['fail_next'] = False
+                return None
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _flaky)
+
+        # First call: build fails, answered by the direct scan, nothing cached.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is None
+        # Second call: build succeeds and is cached — no failure was pinned.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is not None
+
+    async def test_pattern_is_derived_from_merge_subject(self, git_ops: GitOps):
+        """The index's regex tracks _merge_subject rather than a hard-coded format."""
+        from orchestrator.git_ops import _merge_marker_pattern
+
+        pattern = _merge_marker_pattern(git_ops.config.main_branch)
+        subject = _merge_subject('task/derived', git_ops.config.main_branch)
+        match = pattern.search(subject)
+
+        assert match is not None
+        assert match.group(1) == 'task/derived'
+
+
+@pytest.mark.asyncio
 class TestBranchContentInMain:
     """Real-git tests for GitOps.branch_content_in_main (task 2313).
 

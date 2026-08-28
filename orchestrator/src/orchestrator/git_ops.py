@@ -1207,6 +1207,47 @@ _EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
     'main_sha_unresolved',
 })
 
+#: How long GitOps._lookup_merge_marker may reuse its marker index without
+#: re-resolving main's sha.  The staleness check is one `git rev-parse`, and
+#: `git rev-parse main` was measured at ~29ms on the dark-factory repo — paid
+#: once per CANDIDATE (~721 branch-absent candidates on a scheduler tick) that
+#: is ~21s of pure subprocess, which would eat the entire latency budget this
+#: index exists to reclaim.  A short recheck window collapses that to one or
+#: two calls per tick.
+#:
+#: Reusing a marginally stale index is SAFE IN ONE DIRECTION, which is what
+#: makes this sound rather than merely cheap: git history is append-only here,
+#: so an index built at an older main sha can only LACK markers that landed
+#: since — it can never contain a marker that is not on main.  A missing marker
+#: makes find_merge_marker return None, which is exactly its behaviour on a
+#: genuine miss: the gate declines to auto-done and the task dispatches
+#: normally, and the next tick sees the rebuilt index.  The failure mode is
+#: therefore a one-tick delay in an auto-done that has never once fired in
+#: production, not a false positive that could mark unlanded work complete.
+_MERGE_MARKER_INDEX_RECHECK_SECS = 2.0
+
+
+@functools.lru_cache(maxsize=8)
+def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
+    """Compile the regex that recovers a branch name from a merge marker.
+
+    DERIVED FROM ``git_ops.py::_merge_subject`` rather than hand-written, so the
+    marker index and the merge-commit writer can never drift apart — the same
+    single-source-of-truth property that ``find_merge_marker``'s original
+    ``--grep`` spelling had by construction.  A sentinel is substituted for the
+    branch, then split back out, so only ``_merge_subject`` decides the literal
+    format.
+
+    The capture is ``\\S+`` because a git branch name can never contain
+    whitespace, and the pattern is deliberately UNANCHORED to mirror
+    ``git log --fixed-strings --grep=...``, which matches anywhere in the commit
+    message rather than only at the start of the subject.
+    """
+    sentinel = '\x00BRANCH\x00'
+    template = _merge_subject(sentinel, main_branch)
+    prefix, _, suffix = template.partition(sentinel)
+    return re.compile(re.escape(prefix) + r'(\S+)' + re.escape(suffix))
+
 
 @dataclass(frozen=True)
 class CommitEffectProbe:
@@ -2658,6 +2699,21 @@ class GitOps:
         # that changes the answer, so a commit_sha-only key would freeze a
         # stale verdict across it.  See describe_commit_effect_in_main.
         self._effect_probe_memo: dict[tuple[str, str], CommitEffectProbe] = {}
+        # Merge-marker index: {branch: merge_commit_sha} for every marker on
+        # main, built in ONE `git log` pass and reused until main advances.
+        # Replaces a full-history `git log --grep` PER CANDIDATE — measured on
+        # this repo at ~2.0s a miss against 62,942 commits, x ~721 branch-absent
+        # candidates a tick, i.e. the whole ~14min scheduler tick.  One index
+        # build costs ~6.3s and serves every lookup at that main sha.
+        #
+        # Unbounded by design, unlike _effect_probe_memo above: its size is the
+        # number of merge markers in history (~3,000 here), not a function of
+        # how many candidates arrive, and exactly one index is live at a time.
+        # _merge_marker_index_checked_at is a time.monotonic() stamp guarding
+        # the rev-parse staleness check — see _MERGE_MARKER_INDEX_RECHECK_SECS.
+        self._merge_marker_index: dict[str, str] | None = None
+        self._merge_marker_index_sha: str | None = None
+        self._merge_marker_index_checked_at: float | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -8643,6 +8699,15 @@ class GitOps:
         cannot appear inside ``'Merge task/10 into main'`` because the ``0``
         after ``task/1`` falls where the pattern has a space.
 
+        **Lookup is indexed, not re-scanned.** The search half delegates to
+        :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
+        sha (:meth:`_build_merge_marker_index`) and answers from it.  The
+        per-call ``git log`` this replaces cost ~2.0s against 62,942 commits
+        and ran once per candidate on every scheduler dispatch tick;
+        :meth:`_scan_merge_marker` retains it verbatim as the fallback for when
+        an index cannot be built.  Verdicts are unchanged by construction — the
+        index reads full commit messages, exactly as ``--grep`` does.
+
         Args:
             branch: Full prefixed branch name, e.g. ``'task/123'``.
                     Same convention as ``is_ancestor`` and ``resolve_branch_sha``.
@@ -8657,8 +8722,22 @@ class GitOps:
         if gate_on_existing_ref and await self.resolve_branch_sha(branch) is not None:
             return None
 
-        # Branch is gone — search main for a merge commit with the expected subject.
-        # Pattern derivation shared with merge_to_main — see docstring for substring-safety argument.
+        # Branch is gone — resolve the marker from the shared index, which
+        # falls back to the direct scan whenever it cannot build one.
+        return await self._lookup_merge_marker(branch)
+
+    async def _scan_merge_marker(self, branch: str) -> str | None:
+        """Direct, uncached full-history scan for *branch*'s merge marker.
+
+        The original implementation of :meth:`find_merge_marker`'s search half,
+        preserved verbatim as the authoritative fallback whenever the index in
+        :meth:`_lookup_merge_marker` cannot be built (a git failure, or main
+        refusing to resolve).  Answers must agree exactly — the index is a
+        performance change, never a semantic one — so this is also what the
+        equivalence tests compare against.
+        """
+        # Pattern derivation shared with merge_to_main — see find_merge_marker's
+        # docstring for the substring-safety argument.
         grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [
@@ -8673,6 +8752,82 @@ class GitOps:
         if rc != 0 or not out:
             return None
         return out
+
+    async def _build_merge_marker_index(self) -> dict[str, str] | None:
+        """Scan main once and map every merged branch to its merge-commit sha.
+
+        Returns ``None`` on a git failure so the caller can fall back to
+        :meth:`_scan_merge_marker` rather than cache an empty index — the same
+        never-memoize-a-subprocess-failure rule as
+        :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`, and for the same reason: a
+        cached empty index would pin a spurious marker-absent verdict for the
+        life of the current HEAD.
+
+        Reads the FULL commit message (``%B``), not just the subject, because
+        ``git log --grep`` matches anywhere in the message.  Measured on this
+        repo: 19 of 62,950 commits carry a marker only in the body, so a
+        subject-only index would silently change 19 verdicts.
+
+        ``git log`` walks newest-first and :meth:`find_merge_marker` passes
+        ``--max-count=1``, so the first match wins — ``setdefault`` reproduces
+        that for a branch merged more than once (measured: ``task/958``,
+        ``task/924`` and ``task/791`` each appear twice).
+        """
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--format=%H%x1f%B%x00',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        pattern = _merge_marker_pattern(self.config.main_branch)
+        index: dict[str, str] = {}
+        for record in out.split('\x00'):
+            sha, sep, message = record.partition('\x1f')
+            sha = sha.strip()
+            if not sep or not sha:
+                continue
+            for match in pattern.finditer(message):
+                index.setdefault(match.group(1), sha)
+        return index
+
+    async def _lookup_merge_marker(self, branch: str) -> str | None:
+        """Resolve *branch*'s merge marker from the per-main-sha index.
+
+        Rebuilds the index when main has advanced, but checks for that at most
+        once per :data:`_MERGE_MARKER_INDEX_RECHECK_SECS` — see that constant
+        for why a briefly stale index is safe (append-only history means it can
+        only miss markers, never invent them) and why the naive
+        rev-parse-per-candidate would cost more than the scan it replaces.
+
+        Falls back to :meth:`_scan_merge_marker` on any failure to resolve main
+        or build the index, so a git hiccup degrades to the previous behaviour
+        instead of failing the lookup.
+        """
+        now = time.monotonic()
+        checked_at = self._merge_marker_index_checked_at
+        recheck_due = (
+            self._merge_marker_index is None
+            or checked_at is None
+            or (now - checked_at) >= _MERGE_MARKER_INDEX_RECHECK_SECS
+        )
+        if recheck_due:
+            main_sha = await self.get_main_sha()
+            self._merge_marker_index_checked_at = now
+            if not main_sha:
+                # No HEAD to key an index on — do not cache, just scan.
+                return await self._scan_merge_marker(branch)
+            if main_sha != self._merge_marker_index_sha or self._merge_marker_index is None:
+                index = await self._build_merge_marker_index()
+                if index is None:
+                    return await self._scan_merge_marker(branch)
+                self._merge_marker_index = index
+                self._merge_marker_index_sha = main_sha
+        if self._merge_marker_index is None:
+            return await self._scan_merge_marker(branch)
+        return self._merge_marker_index.get(branch)
 
     async def find_task_citation_commit(
         self, tid: str, *, pattern_template: str | None = None,
@@ -12313,14 +12468,16 @@ class GitOps:
     async def _interactive_worktree_landed(self, full_branch: str) -> bool:
         """True if a ``Merge {full_branch} into {main_branch}`` marker exists on main.
 
-        Reproduces :func:`find_merge_marker`'s grep core (``git log
-        <main_branch> --fixed-strings --grep=<subject> --max-count=1
-        --format=%H``) but deliberately WITHOUT its branch-existence gate:
-        :meth:`find_merge_marker` returns ``None`` immediately whenever the
-        branch ref still resolves, on the assumption that a live branch means
-        ``is_ancestor`` is the right check — but an ``_iact-*`` branch is
-        *always* still checked out in its own worktree at reap time, so that
-        gate would short-circuit to ``False`` here every single time.
+        Shares :meth:`_lookup_merge_marker` with :meth:`find_merge_marker` —
+        the same marker lookup, and deliberately WITHOUT the branch-existence
+        gate that :meth:`find_merge_marker` applies before delegating to it.
+        That gate returns ``None`` immediately whenever the branch ref still
+        resolves, on the assumption that a live branch means ``is_ancestor`` is
+        the right check — but an ``_iact-*`` branch is *always* still checked
+        out in its own worktree at reap time, so it would short-circuit to
+        ``False`` here every single time.  Calling the ungated lookup directly
+        is what preserves that distinction now that the grep core is no longer
+        duplicated here.
 
         Deliberately NOT ``is_ancestor(HEAD, main)``: a freshly-created
         ``_iact-*`` worktree has zero commits of its own, so its HEAD trivially
@@ -12332,18 +12489,7 @@ class GitOps:
         ``find_task_citation_commit`` for the same is_ancestor pitfall
         elsewhere in this module).
         """
-        grep_pattern = _merge_subject(full_branch, self.config.main_branch)
-        rc, out, _ = await _run(
-            [
-                'git', 'log', self.config.main_branch,
-                '--fixed-strings',
-                f'--grep={grep_pattern}',
-                '--max-count=1',
-                '--format=%H',
-            ],
-            cwd=self.project_root,
-        )
-        return rc == 0 and bool(out.strip())
+        return await self._lookup_merge_marker(full_branch) is not None
 
     async def _worktree_dirty(self, worktree: Path) -> bool:
         """True if *worktree* has uncommitted changes (``git status --porcelain``).
