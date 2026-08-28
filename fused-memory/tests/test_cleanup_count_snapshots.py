@@ -16,6 +16,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import complete_paged_read
+
+from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
@@ -368,6 +371,150 @@ class TestBuildAuditReport:
         report = _mod.build_audit_report({}, set(), [], True, 1000, 'now')
         assert report['failed_invalidations'] == []
 
+    # -- enumeration completeness (task 4386) -------------------------------
+    #
+    # ``run()`` reads the whole graph twice per project and the counts above
+    # describe whatever those two reads returned.  Threading the per-read
+    # completeness into the report is what lets an operator tell a clean audit
+    # over the WHOLE corpus from an equally clean-looking audit over a
+    # truncated one.  Exercised here against the pure helper, so the shape is
+    # pinned independently of the async plumbing that supplies it.
+
+    def test_enumeration_keys_are_merged_into_the_named_project(self):
+        """Each project gets ITS OWN read's verdict, not a run-wide one."""
+        results = {
+            'p1': [self._make_result('p1', 'e1', 'edg1')],
+            'p2': [self._make_result('p2', 'e2', 'edg2')],
+        }
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'p1': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': False,
+                    'edges_incomplete_kind': INCOMPLETE_SHORT_READ,
+                },
+                'p2': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['projects']['p1']['edges_complete'] is False, (
+            f"p1's edge read was partial; got {report['projects']['p1']!r}"
+        )
+        assert report['projects']['p1']['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert report['projects']['p2']['edges_complete'] is True, (
+            "p2's own read was complete — a partial read for p1 must not mark "
+            f"it; got {report['projects']['p2']!r}"
+        )
+        assert report['projects']['p2']['edges_incomplete_kind'] is None
+
+    def test_a_project_absent_from_the_mapping_still_gets_all_four_keys(self):
+        """Uniform shape on EVERY path, so a consumer never has to branch.
+
+        The keys are absent from the mapping for the paths that return before
+        a read happens at all.  Defaulting to None there — rather than
+        omitting them — keeps `report['projects'][pid]['edges_complete']` a
+        safe subscript everywhere, and None already means exactly the right
+        thing: no corpus was observed, so nothing is claimed about it.
+        """
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={},
+        )
+        p = report['projects']['proj']
+        for key in (
+            'entities_complete', 'entities_incomplete_kind',
+            'edges_complete', 'edges_incomplete_kind',
+        ):
+            assert key in p, f'{key} must be present even when unknown; got {p!r}'
+            assert p[key] is None, f'{key} must default to None (unknown); got {p!r}'
+
+    def test_enumeration_defaults_to_unknown_when_the_argument_is_omitted(self):
+        """The parameter is optional, and omitting it is not a completeness claim."""
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(results, set(), [], True, 1000, 'now')
+        p = report['projects']['proj']
+        assert p['entities_complete'] is None
+        assert p['edges_complete'] is None
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            'A project whose reads are UNKNOWN is not a project known to be '
+            f"whole; got totals={report['totals']!r}"
+        )
+
+    def test_incomplete_enumerations_counts_projects_not_reads(self):
+        """One project with BOTH reads partial counts ONCE, not twice.
+
+        The total answers "how many projects is this report unreliable for",
+        which is a per-project question.  Counting reads would report 2 for a
+        single affected project and read as twice the damage.
+        """
+        results = {
+            'p1': [self._make_result('p1', 'e1', 'edg1')],
+            'p2': [self._make_result('p2', 'e2', 'edg2')],
+        }
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': False,
+                    'edges_incomplete_kind': INCOMPLETE_SHORT_READ,
+                },
+                'p2': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            'p1 is ONE partial project even though BOTH of its reads were '
+            f"partial; got totals={report['totals']!r}"
+        )
+
+    def test_incomplete_enumerations_is_zero_when_every_read_is_proven_complete(self):
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'proj': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['totals']['incomplete_enumerations'] == 0
+
 
 class TestFormatSummaryTable:
     """Tests for format_summary_table(report)."""
@@ -614,15 +761,35 @@ class TestRun:
     """Async end-to-end tests for run(args, *, memory)."""
 
     def _make_memory(self, entities=None, edges_by_entity=None):
-        """Build an AsyncMock memory whose graphiti returns fixture data."""
+        """Build an AsyncMock memory whose graphiti returns fixture data.
+
+        Both whole-graph reads are the ``enumerate_*`` pair, which returns
+        ``(collection, PagedRead)`` — the script reads them directly for the
+        completeness signal rather than through the ``list_entity_nodes`` /
+        ``get_all_valid_edges`` shims, which discard it (task 4386).  The
+        default here is a PROVEN-complete read, matching what the shims
+        guaranteed by raising: every pre-existing test in this class asserts
+        behaviour over a whole corpus, so that is the honest double for them.
+        ``incomplete_paged_read`` is what a test wanting a partial corpus
+        passes instead.
+        """
         m = MagicMock()
         m.update_edge = AsyncMock(return_value=None)
         m.add_memory = AsyncMock(return_value=None)
         m.refresh_entity_summary = AsyncMock(return_value=None)
         # graphiti sub-object
         g = MagicMock()
-        g.list_entity_nodes = AsyncMock(return_value=entities or [])
-        g.get_all_valid_edges = AsyncMock(return_value=edges_by_entity or {})
+        entities = entities or []
+        edges_by_entity = edges_by_entity or {}
+        g.enumerate_entity_nodes = AsyncMock(
+            return_value=(entities, complete_paged_read(rows_seen=len(entities))),
+        )
+        g.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                edges_by_entity,
+                complete_paged_read(rows_seen=sum(len(v) for v in edges_by_entity.values())),
+            ),
+        )
         m.graphiti = g
         return m
 
@@ -658,6 +825,28 @@ class TestRun:
         matched_uuids = [m['edge_uuid'] for m in report.get('matches', [])]
         assert 'snap-edge' in matched_uuids
 
+        # Per-project read completeness (task 4386). The counts above describe
+        # SOME corpus; without these keys the report never says which one, so a
+        # clean audit over the whole graph is indistinguishable in the JSON from
+        # a clean audit over whatever half of it a truncated read returned.
+        proj = report['projects']['dark_factory']
+        assert proj['entities_complete'] is True, (
+            f'A proven-complete node read must be surfaced as True; got {proj!r}'
+        )
+        assert proj['entities_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind; got {proj!r}'
+        )
+        assert proj['edges_complete'] is True, (
+            f'A proven-complete edge read must be surfaced as True; got {proj!r}'
+        )
+        assert proj['edges_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind; got {proj!r}'
+        )
+        assert report['totals']['incomplete_enumerations'] == 0, (
+            'Both reads were proven complete, so no project is partial; got '
+            f"totals={report['totals']!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_apply_invokes_writes(self):
         """--apply flag causes update_edge to be awaited."""
@@ -687,7 +876,7 @@ class TestRun:
         result = await _mod.run(args, memory=memory, known_projects_map=known_map)
 
         memory.update_edge.assert_not_awaited()
-        memory.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_not_awaited()
         # Result should indicate abort
         assert result.get('aborted') is True
         assert result.get('exceeding_projects') == ['dark_factory']
@@ -718,7 +907,7 @@ class TestRun:
         assert 'unknown-id' in captured.err
 
         # (iv) enumeration did NOT happen (abort before the entity-fetch loop)
-        memory.graphiti.list_entity_nodes.assert_not_awaited()
+        memory.graphiti.enumerate_entity_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_limit_cap_abort_emits_abort_output(self, capsys):
@@ -778,12 +967,14 @@ class TestRunApplyStoreMutationPreflight:
         m.add_memory = AsyncMock(return_value=None)
         m.refresh_entity_summary = AsyncMock(return_value=None)
         g = MagicMock()
-        g.list_entity_nodes = AsyncMock(return_value=[
-            _entity('e1', 'E1'),
-        ])
-        g.get_all_valid_edges = AsyncMock(return_value={
-            'e1': [{'uuid': 'snap-edge', 'fact': '1505 done / 148 cancelled', 'name': ''}],
-        })
+        g.enumerate_entity_nodes = AsyncMock(return_value=(
+            [_entity('e1', 'E1')],
+            complete_paged_read(rows_seen=1),
+        ))
+        g.enumerate_all_valid_edges = AsyncMock(return_value=(
+            {'e1': [{'uuid': 'snap-edge', 'fact': '1505 done / 148 cancelled', 'name': ''}]},
+            complete_paged_read(rows_seen=1),
+        ))
         m.graphiti = g
         return m
 
@@ -875,8 +1066,8 @@ class TestRunApplyStoreMutationPreflight:
                 known_projects_map=self._known_map(),
             )
 
-        memory.graphiti.list_entity_nodes.assert_not_awaited()
-        memory.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory.graphiti.enumerate_entity_nodes.assert_not_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
@@ -894,8 +1085,8 @@ class TestRunApplyStoreMutationPreflight:
 
         assert report['dry_run'] is True
         assert not report.get('aborted')
-        memory.graphiti.list_entity_nodes.assert_awaited()
-        memory.graphiti.get_all_valid_edges.assert_awaited()
+        memory.graphiti.enumerate_entity_nodes.assert_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_awaited()
         memory.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
