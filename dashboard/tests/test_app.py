@@ -906,10 +906,18 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
 
 
 async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
-    monkeypatch, dummy_client, dummy_config
+    monkeypatch, dummy_client, dummy_config, caplog
 ):
-    """A fetch that never returns degrades to [] and is not cached."""
+    """A fetch that never returns degrades to [] — loudly, and uncached.
+
+    The WARNING is asserted, not incidental: ``[]`` is exactly what an
+    ordinary empty result looks like, so the log line is the ONLY thing that
+    distinguishes "this project has no task cards" from "we ran out of budget
+    and never found out". Without it a timeout is invisible to an operator,
+    which is the 19.8 h failure mode in miniature.
+    """
     import asyncio
+    import logging
 
     import dashboard.app as _app
     from dashboard.app import _load_task_cards, _task_cards_cache_clear
@@ -926,7 +934,10 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
 
     monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', 0.05)
 
-    with patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks):
+    with (
+        patch('dashboard.app.fetch_tasks', new=hang_fetch_tasks),
+        caplog.at_level(logging.WARNING, logger='dashboard.app'),
+    ):
         result = await asyncio.wait_for(
             _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
             timeout=2.0,
@@ -947,6 +958,19 @@ async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
     assert call_count == 2, (
         'the second call must re-enter the stub — a timeout that cached its '
         '[] would blank the tab for the whole TTL window'
+    )
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert any('whole-operation budget' in m for m in warnings), (
+        f'no timeout WARNING was logged (records: {warnings}) — the returned '
+        '[] is indistinguishable from an ordinary empty result, so the log '
+        'line is the only operator-visible trace that the budget expired'
+    )
+    assert any('/proj/HANG' in m for m in warnings), (
+        f'the WARNING must name the project root that degraded: {warnings}'
     )
 
 

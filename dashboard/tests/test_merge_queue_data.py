@@ -1615,10 +1615,18 @@ class TestLoadTaskTitles:
     # trip on a real regression, never on scheduling jitter.
 
     async def test_a_hanging_fetch_tasks_does_not_hang_load_task_titles(
-        self, monkeypatch, dummy_client, dummy_config
+        self, monkeypatch, dummy_client, dummy_config, caplog
     ):
-        """A fetch that never returns degrades to {} and is not cached."""
+        """A fetch that never returns degrades to {} — loudly, and uncached.
+
+        The WARNING is asserted, not incidental: ``{}`` is exactly what an
+        ordinary title-less result looks like, so the log line is the ONLY
+        thing that distinguishes "this project has no titles" from "we ran out
+        of budget and never found out". Without it a timeout is invisible to
+        an operator, which is the 19.8 h failure mode in miniature.
+        """
         import asyncio
+        import logging
 
         import dashboard.data.merge_queue as _mq
 
@@ -1634,7 +1642,10 @@ class TestLoadTaskTitles:
 
         monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', 0.05)
 
-        with patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks):
+        with (
+            patch('dashboard.data.merge_queue.fetch_tasks', new=hang_fetch_tasks),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'),
+        ):
             result = await asyncio.wait_for(
                 _mq.load_task_titles(
                     client=dummy_client, config=dummy_config,
@@ -1661,6 +1672,21 @@ class TestLoadTaskTitles:
         assert call_count == 2, (
             'the second call must re-enter the stub — a timeout that cached '
             'its {} would blank the tab for the whole TTL window'
+        )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and r.name == 'dashboard.data.merge_queue'
+        ]
+        assert any('whole-operation budget' in m for m in warnings), (
+            f'no timeout WARNING was logged (records: {warnings}) — the '
+            'returned {} is indistinguishable from an ordinary title-less '
+            'result, so the log line is the only operator-visible trace that '
+            'the budget expired'
+        )
+        assert any('/proj/HANG' in m for m in warnings), (
+            f'the WARNING must name the project root that degraded: {warnings}'
         )
 
     async def test_a_concurrent_caller_on_the_same_root_is_bounded_too(

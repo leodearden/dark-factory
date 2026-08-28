@@ -925,6 +925,16 @@ async def load_task_titles(
     ``wait_for`` cancels the inner task, cancellation unwinds
     ``async with lock``, and ``__aexit__`` releases it rather than leaking it.
 
+    The five-line ``wait_for``/``except TimeoutError``/warn/degrade construct
+    below, and the lock-placement rationale above, are duplicated verbatim at
+    the sibling call site (``app._load_task_cards``). That duplication is
+    KNOWN and deliberate for now: the mechanism is a property of
+    ``TTLCache`` — not of either call site — so the idiom belongs on
+    ``dashboard/src/dashboard/data/mcp_fanout.py::TTLCache`` as a
+    ``get_or_refresh_bounded`` that owns the timeout, the warning and the
+    degraded return. That file is outside this change's lock set, so the
+    extraction is left to the sibling TTLCache task referenced below.
+
     This bounds THIS caller only. It does not fix the general TTLCache
     queue-amplifier class across all of its call sites; that is the sibling
     task filed in the same batch.
@@ -944,6 +954,12 @@ async def load_task_titles(
             timeout=_TASK_TITLES_BUDGET,
         )
     except TimeoutError:
+        # Broader than the ``wait_for`` expiry, deliberately. On 3.11+
+        # ``asyncio.TimeoutError`` IS the builtin, and ``socket.timeout`` is
+        # too, so a ``TimeoutError`` raised INSIDE the refresh is folded into
+        # this same budget path rather than 500ing the merge-queue tab. The
+        # message below is therefore authoritative about the OUTCOME — the
+        # titles are unknown for this poll — and not about the cause.
         logger.warning(
             'load_task_titles %s: exceeded the %.1fs whole-operation budget — '
             'merge rows render with empty titles for this poll (titles are '
