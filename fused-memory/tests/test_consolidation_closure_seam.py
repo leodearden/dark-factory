@@ -56,8 +56,16 @@ _WELL_FORMED = [_member(_uuid(1), canonical=True), _member(_uuid(2))]
 _MALFORMED = [_member(_uuid(1)), _member(_uuid(2))]  # no canonical
 
 
-def _scroll(members, *, total=None, raises=None):
-    """A stand-in for the injected memory scroll."""
+def _scroll(members, *, total=None, raises=None, live_ids=None, probe_raises=None):
+    """A stand-in for the injected memory scroll.
+
+    *live_ids* (task 4808) arms the third collaborator: an ``exists`` probe
+    reporting those ids LIVE and everything else ABSENT.  It is hung off the
+    same object as ``count`` so the interceptor's ``getattr(scroll, 'exists',
+    None)`` fallback picks it up from ONE bound collaborator, mirroring the
+    ``scroll.count`` idiom this file already uses.  Passing no *live_ids* and
+    no *probe_raises* leaves ``exists`` unset, which is the DORMANT shape.
+    """
     calls = []
 
     async def scroll(filters, *, limit, project_id):
@@ -74,7 +82,36 @@ def _scroll(members, *, total=None, raises=None):
 
     scroll.calls = calls
     scroll.count = count
+
+    if live_ids is not None or probe_raises is not None:
+        probes = []
+        known = {str(i).lower() for i in (live_ids or ())}
+
+        async def exists(memory_id, *, project_id):
+            probes.append((memory_id, project_id))
+            if probe_raises is not None:
+                raise probe_raises
+            return str(memory_id).lower() in known
+
+        exists.calls = probes
+        scroll.exists = exists
+        scroll.probes = probes
     return scroll
+
+
+def _prov_gate(observed, **overrides):
+    """Gate metadata whose inert provenance enumerates *observed*."""
+    block = {
+        'topic': _TOPIC,
+        'provenance': {
+            'report_run': 'run-abc',
+            'observed_members': list(observed),
+            'detector': 'topic-cluster-scan',
+            'authoritative': False,
+        },
+    }
+    block.update(overrides)
+    return _gate_metadata(**{GATE_METADATA_KEY: block})
 
 
 @pytest.fixture
@@ -285,3 +322,110 @@ class TestSeamShapeAndPrecedence:
         await _set_done(interceptor)
         expected = resolve_project_id(_PROJECT_ROOT)
         assert all(call['project_id'] == expected for call in scroll.calls)
+
+
+# --------------------------------------------------------------------------- #
+# Task 4808 — ACCEPTANCE 1: the seam now DERIVES `unstamped_live_ids` from the
+# gate block's inert provenance, so `unstamped_cluster_member` is reachable in
+# production for the first time.
+# --------------------------------------------------------------------------- #
+
+
+class TestSeamUnstampedClusterMember:
+    """A cluster member the detector observed live but which never got
+    stamped into the topic is invisible to the topic scroll, so it can reach
+    the predicate ONLY through the gate block's provenance."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_and_names_the_unstamped_id(
+        self, interceptor, taskmaster
+    ):
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        interceptor.set_consolidation_scroll(_scroll(_WELL_FORMED, live_ids=[stray]))
+        result = await _set_done(interceptor)
+
+        assert result['success'] is False
+        assert result['error'] == 'consolidation_not_closed'
+        codes = [r['code'] for r in result['reasons']]
+        assert 'unstamped_cluster_member' in codes
+        named = [
+            r for r in result['reasons'] if r['code'] == 'unstamped_cluster_member'
+        ]
+        assert named[0]['ids'] == [stray]
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_mutates_nothing(self, interceptor, taskmaster):
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        interceptor.set_consolidation_scroll(_scroll(_WELL_FORMED, live_ids=[stray]))
+        await _set_done(interceptor)
+        taskmaster.set_task_status.assert_not_called()
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_observed_member_still_closes(
+        self, interceptor, taskmaster
+    ):
+        """The measured 2026-08-27 corpus shape: every observed member is
+        already in the scroll, so nothing is probed and nothing is refused."""
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([_uuid(1), _uuid(2)]),
+        }
+        scroll = _scroll(_WELL_FORMED, live_ids=[_uuid(1), _uuid(2)])
+        interceptor.set_consolidation_scroll(scroll)
+        result = await _set_done(interceptor)
+        assert result.get('error') is None
+        assert taskmaster.set_task_status.await_count == 1
+        assert scroll.probes == []
+
+    @pytest.mark.asyncio
+    async def test_the_probe_is_scoped_to_the_gates_project(
+        self, interceptor, taskmaster
+    ):
+        """A cross-project probe would judge one project\'s gate against
+        another project\'s memories — the same argument
+        ``set_consolidation_scroll`` already makes for the scroll."""
+        stray = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        scroll = _scroll(_WELL_FORMED, live_ids=[stray])
+        interceptor.set_consolidation_scroll(scroll)
+        await _set_done(interceptor)
+        assert scroll.probes == [(stray, resolve_project_id(_PROJECT_ROOT))]
+
+    @pytest.mark.asyncio
+    async def test_exists_may_be_passed_explicitly(self, interceptor, taskmaster):
+        """``exists=`` is a keyword with a default, so existing POSITIONAL
+        callers of ``set_consolidation_scroll(scroll)`` / ``(scroll, count)``
+        keep working untouched."""
+        stray = _uuid(42)
+        probes = []
+
+        async def exists(memory_id, *, project_id):
+            probes.append((memory_id, project_id))
+            return True
+
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([stray]),
+        }
+        scroll = _scroll(_WELL_FORMED)
+        interceptor.set_consolidation_scroll(scroll, exists=exists)
+        result = await _set_done(interceptor)
+        assert result['error'] == 'consolidation_not_closed'
+        assert probes == [(stray, resolve_project_id(_PROJECT_ROOT))]
