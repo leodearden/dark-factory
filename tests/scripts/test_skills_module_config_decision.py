@@ -156,7 +156,10 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # findable.
 DF_CONFIG_NAME = "dark-factory-orchestrator.yaml"
 
-_PYTEST = "pytest"
+# Aliased from the shared parser rather than restated as a literal (task 3745):
+# the keyword is what selects that parser's anchor, so it belongs to the shared
+# contract, while _PYTEST_VALUE_FLAGS below is this guard's own policy.
+_PYTEST = vci.PYTEST
 
 # The probe that actually runs ruff over skills/**/*.py. Named as a path
 # because what matters is which module config COLLECTS it, not what it

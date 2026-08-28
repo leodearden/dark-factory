@@ -198,8 +198,14 @@ def _root_carve_outs_naming(segment: str) -> list[str]:
 # `pyright <targets>` with no subcommand at all, so the anchor is the program
 # name itself. Nothing else about the two invocations differs for these
 # purposes.
-_RUFF = 'ruff check'
-_PYRIGHT = 'pyright'
+#
+# All three keyword constants in this section (_PYTEST included) are ALIASED
+# from the shared parser rather than restated as literals (task 3745): the
+# keyword is what selects that parser's anchor, so it belongs to the shared
+# contract, while _NARROWING_FLAGS below is this file's own policy and stays
+# local. The local names keep every helper and test below reading unchanged.
+_RUFF = vci.RUFF
+_PYRIGHT = vci.PYRIGHT
 
 # pytest's invocation is `pytest <targets>` with no subcommand, so — like
 # pyright's and unlike ruff's — the anchor is the program name itself. Note the
@@ -215,7 +221,7 @@ _PYRIGHT = 'pyright'
 # pyright. The pytest gate's real failure mode is a MISSING target, which
 # assertions (2)-(5) of test_scripts_full_suite_pytest_covers_scripts_tests
 # test directly.
-_PYTEST = 'pytest'
+_PYTEST = vci.PYTEST
 
 # Flag PREFIXES that narrow what a directory-wide target actually gets checked,
 # per checker. Prefix-matched, so each entry covers both the `--flag value` and

@@ -264,9 +264,13 @@ _RUFF_FLAGS_TAKING_A_VALUE = frozenset(
     }
 )
 
-# The keyword whose segment both helpers below read, and what selects the shared
-# parser's anchor (``keyword.split()[-1]`` — here, ``check``).
-_RUFF_KEYWORD = "ruff check"
+# The keyword whose segment both helpers below read, ALIASED from the shared
+# parser rather than restated as a literal (task 3745). It is what selects that
+# parser's anchor (``keyword.split()[-1]`` — here, ``check``), so it belongs to
+# the shared contract; the value-flag set above, by contrast, is this guard's
+# own policy and stays local. The local name keeps the helpers reading
+# unchanged.
+_RUFF_KEYWORD = vci.RUFF
 
 
 def _root_lint_command() -> str:

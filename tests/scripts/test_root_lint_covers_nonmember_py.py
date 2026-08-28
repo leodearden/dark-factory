@@ -182,10 +182,13 @@ def _root_lint_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
 
 
-# The keyword whose segment this guard reads. Single-sourced because both
-# helpers below need it, and because it is what selects the shared parser's
-# anchor (``keyword.split()[-1]`` — here, ``check``).
-_RUFF_KEYWORD = "ruff check"
+# The keyword whose segment this guard reads, ALIASED from the shared parser
+# rather than restated as a literal (task 3745). The keyword is what selects
+# that parser's anchor (``keyword.split()[-1]`` — here, ``check``), so it is
+# part of the shared contract, not this guard's policy; four files spelling the
+# same literal under three names was the N-copy shape the extraction closed.
+# The local name stays so the helpers below read unchanged.
+_RUFF_KEYWORD = vci.RUFF
 
 
 def _ruff_segment(cmd: str) -> str:
@@ -221,12 +224,27 @@ def _ruff_targets(cmd: str) -> list[str]:
 
     NO ``value_flags`` are passed, deliberately: this guard keeps the naive
     ``-``-prefix filter it has always had, under which a space-separated flag
-    VALUE is admitted as a phantom target. That is safe HERE — a phantom can
-    only ever make ``_is_covered`` pass spuriously, and every assertion below
-    reads the target list for what it CONTAINS, never for what it omits — and
-    the shared extractor with an empty set is byte-for-byte that filter
-    (``test_verify_command_invariants.py`` pins the equivalence). The stricter
-    callers supply their own set.
+    VALUE is admitted as a phantom target. The shared extractor with an empty set
+    is byte-for-byte that filter (``test_verify_command_invariants.py`` pins the
+    equivalence), so the task-3745 migration changed nothing here.
+
+    WHAT THAT COSTS, stated accurately rather than waved away. A phantom is inert
+    against the coverage loop — an extra target can only make ``_is_covered``
+    pass spuriously, never fail. It is NOT inert against assertion (c) below,
+    which reads the list for exactly what a phantom adds and requires every
+    target to EXIST on disk. So if the root ``lint_command``'s ruff head ever
+    gains a space-separated value flag (``--select E,F``, ``--line-length 100``,
+    ``--config X``), this guard goes red with "names 'E,F', which does not exist
+    under <repo root>" — a misleading diagnosis on a change that broke nothing,
+    the exact failure ``test_contributing_lint_command_drift.py``'s
+    ``_RUFF_FLAGS_TAKING_A_VALUE`` was introduced to prevent.
+
+    That exposure is ACCEPTED, not overlooked. The live head carries no
+    space-separated value flag today (only bare targets), and task 3745 was a
+    de-duplication required to preserve every call site's behaviour bit-for-bit,
+    so widening this one was out of its scope. The fix, when the head does gain
+    such a flag, is to pass a ruff value-flag set here — not to relax assertion
+    (c), which is the stale-target guard.
     """
     return vci.positional_targets(
         _ruff_segment(cmd), _RUFF_KEYWORD, label="the root lint_command (task 3485)"
