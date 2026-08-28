@@ -743,18 +743,30 @@ def deselecting_expression_for_targets(
     provably fully deselected by it under a TWO-TIER proof, tried in order per
     target:
 
-    1. the PRIMARY tier — :func:`module_level_marker_names` +
-       :func:`expression_definitely_deselects` — a module-wide lower bound that
-       alone covers test classes, imported test classes and dynamically
-       generated items;
+    1. the PRIMARY tier — :func:`guaranteed_marker_names` +
+       :func:`expression_definitely_deselects` — a MODULE-WIDE lower bound,
+       covering a module-level ``pytestmark`` and, under that function's
+       all-items-accounted-for guard, CLASS-level markers too (task 4561);
     2. only if that fails to prove deselection, the FALLBACK tier —
        :func:`per_item_marker_names` — which enumerates every collected item's
        own (module-level union per-decorator) marker set and requires EVERY
        one of them to be individually, definitely deselected.
 
-    The second tier is strictly ADDITIVE: it only ever turns a tier-1 refusal
-    into a proof, never the reverse, so this function can never refuse a
-    target it already accepts today.  ALL, not ANY — across both tiers and
+    WHAT TIER 1 DOES WITH THE HARD SHAPES.  It covers test classes, imported
+    test classes and dynamically generated items by REFUSING to widen on
+    them, unless its guard can prove every collected item lives inside a
+    marked class.  An imported test class and a dynamic top-level binding
+    still refuse OUTRIGHT — no guard can see what they bring in — so only the
+    all-classes-marked shape is newly provable.
+
+    Both tiers are strictly ADDITIVE: each only ever turns a refusal into a
+    proof, never the reverse, so this function can never refuse a target it
+    already accepts today.  For tier 2 that holds because it is consulted only
+    after tier 1 declines; for tier 1 it holds because
+    :func:`guaranteed_marker_names` returns exactly
+    :func:`module_level_marker_names`' answer on every guard failure and a
+    SUPERSET of it otherwise, and :func:`expression_definitely_deselects` is
+    monotone in its marker set.  ALL, not ANY — across both tiers and
     across every target — a single target (or a single item within a target)
     that still collects means the file-scoped run is not empty.  The
     EXPRESSION is returned rather than a bool so the caller can name it in the
@@ -785,7 +797,7 @@ def deselecting_expression_for_targets(
         return None
     for target in targets:
         source = read_source(target)
-        if expression_definitely_deselects(expr, module_level_marker_names(source)):
+        if expression_definitely_deselects(expr, guaranteed_marker_names(source)):
             continue
         item_markers = per_item_marker_names(source)
         if not item_markers:
