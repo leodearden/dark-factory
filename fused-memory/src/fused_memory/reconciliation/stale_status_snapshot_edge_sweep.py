@@ -249,6 +249,7 @@ from typing import NamedTuple
 
 from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     STRICT_CLAUSE_BOUNDARY_RE,
@@ -1806,7 +1807,7 @@ async def sweep_stale_status_snapshot_edges(
     """Enumerate valid status-snapshot edges and invalidate the stale ones.
 
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
-    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    ``memory_service.graphiti.enumerate_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
     each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
@@ -1821,7 +1822,8 @@ async def sweep_stale_status_snapshot_edges(
     retired assertion instead of merely losing it.
 
     Args:
-        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
+        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``
+            and
             ``.update_edge``.
         taskmaster: Object exposing ``.get_statuses``. A falsy value (e.g.
             unavailable backend) short-circuits to all-zero stats.
@@ -1835,7 +1837,7 @@ async def sweep_stale_status_snapshot_edges(
 
     Best-effort (mirrors
     ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): a transient
-    backend error enumerating (``get_all_valid_edges``), cross-referencing
+    backend error enumerating (``enumerate_all_valid_edges``), cross-referencing
     (``get_statuses``), or invalidating (``update_edge``) is caught, logged,
     and tallied into ``stats['errors']``. An enumeration or cross-reference
     failure aborts the rest of this cycle's sweep (there is nothing left to
@@ -1900,12 +1902,37 @@ async def sweep_stale_status_snapshot_edges(
         return stats
 
     try:
-        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
+            group_id=project_id,
+        )
+        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
+        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
+        # applied on this sweep's behalf has to be re-applied here, or a
+        # page-capped read is taken for the whole corpus and every edge the
+        # missing pages carry is scanned as absent: a silently clean cycle that
+        # retires nothing. Deliberately INSIDE the same try, so a structural
+        # incompleteness lands in the existing handler below exactly as the
+        # shim's raise did (``IncompleteEnumerationError`` subclasses
+        # ``Exception``, never ``BaseException``, precisely so it is caught
+        # here). An EMPIRICAL incompleteness only warns — through this sweep's
+        # injected ``log``, so the one message about a truncated corpus
+        # surfaces with the rest of the cycle's diagnostics — and the sweep
+        # proceeds on what it did get. (task 4386)
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_all_valid_edges',
+            group_id=project_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not drive a staleness verdict',
+            log=log,
+        )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         log.exception(
-            'stale_status_snapshot_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            'stale_status_snapshot_edge_sweep: enumerate_all_valid_edges failed for '
+            'group_id=%s',
             project_id,
         )
         stats['errors'] += 1
