@@ -115,7 +115,7 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py:82-83`` returns
+    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
     ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
     serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and
@@ -779,7 +779,16 @@ class TestFetchCacheRefusesAStaleCorpus:
                 path, {'c_peers': _seeded('c_peers', records)},
                 expect_query_ids=['q1', 'q2-never-cached'],
             )
-        assert 'q2-never-cached' in str(excinfo.value)
+        message = str(excinfo.value)
+        assert 'q2-never-cached' in message
+        assert 'c_peers' in message
+        # The other half of the class docstring's promise, symmetric with the
+        # probes refusal below.  `_check_kind_coverage` is parameterised by
+        # *kind*, so a mislabelled call site here — passing 'probes' for the
+        # queries block — still raises, and every other assertion in this
+        # suite still passes.  The label is the only thing that tells the two
+        # truncations apart, so it is the thing to assert.
+        assert 'queries' in message
 
     def test_the_full_requested_query_set_loads(self, tmp_path):
         """The converse, so the refusal above is not vacuously always-on."""
