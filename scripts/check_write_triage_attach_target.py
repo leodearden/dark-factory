@@ -38,6 +38,7 @@ EXIT-CODE CONTRACT
 from __future__ import annotations
 
 import argparse
+import difflib
 import importlib
 import inspect
 import json
@@ -255,8 +256,8 @@ def _render(fn: Any, param: Any, slate: list[Any], target: Any, spelling: str) -
 # very defect (mirrored) that task 4810 exists to remove.
 
 #: Field names an option-(a) wire contract plausibly uses for the candidate.
-#: Tried only as EXTRA keys on the probe payload: main ignores them, and a
-#: parser that demands one is not thereby failed.
+#: Every probe payload carries one — a payload naming NO candidate can never be
+#: evidence that the verdict binds to one, so the id-less shape is not tried.
 _ID_FIELDS = ('candidate_id', 'id')
 
 #: A verdict that is one of these is a bare outcome, not a binding to a
@@ -266,13 +267,56 @@ _NOT_A_CANDIDATE_BINDING = (str, bytes, bool, int, float)
 
 
 def _binds_candidate(result: Any) -> bool:
-    """True when *result* is something that can carry a candidate id.
+    """True when *result* is a shape that COULD carry a candidate id.
 
-    ``None`` and the scalar types are excluded so a parser that quietly
+    Necessary, never sufficient: ``_carries_id`` is what actually decides the
+    branch. ``None`` and the scalars are excluded so a parser that quietly
     returns ``None`` on an unrecognised payload — rather than raising — is not
     mistaken for one that returns an ``(outcome, candidate_id)`` pair.
     """
     return result is not None and not isinstance(result, _NOT_A_CANDIDATE_BINDING)
+
+
+def _carries_id(result: Any, ident: str) -> bool:
+    """True when the supplied *ident* is RECOVERABLE from *result*.
+
+    This is the evidence half of the option-(a) branch. A non-scalar return is
+    only a SHAPE that could carry a candidate; unless the id actually handed in
+    comes back out, the value proves nothing — an ordinary refactor returning a
+    dataclass or a ``{'outcome': ...}`` dict for the outcome alone would
+    otherwise read as satisfied and authorise a production flag flip.
+
+    Structural sources are checked first (mapping values, sequence items,
+    ``__dict__``/``__slots__`` attributes) and ``repr`` is the last resort, so
+    an object whose ``repr`` hides its fields is not failed for that alone.
+    """
+    seen: list[Any] = []
+    if isinstance(result, dict):
+        seen.extend(result.values())
+        seen.extend(result.keys())
+    elif isinstance(result, (list, tuple, set, frozenset)):
+        seen.extend(result)
+    seen.extend(getattr(result, '__dict__', {}).values())
+    for name in getattr(type(result), '__slots__', ()) or ():
+        seen.append(getattr(result, name, None))
+    for value in seen:
+        try:
+            if isinstance(value, str) and value == ident:
+                return True
+        except Exception:  # noqa: BLE001 - a hostile __eq__ is not evidence
+            continue
+    try:
+        return ident in repr(result)
+    except Exception:  # noqa: BLE001 - a raising __repr__ is not evidence
+        return False
+
+
+def _same_result(left: Any, right: Any) -> bool:
+    """``left == right``, treating a raising/ambiguous ``__eq__`` as 'differs'."""
+    try:
+        return bool(left == right)
+    except Exception:  # noqa: BLE001 - numpy-style ambiguity is not sameness
+        return False
 
 
 def _verdict_key(module: Any) -> str:
@@ -291,46 +335,95 @@ def _verdict_words(module: Any) -> tuple[str, ...]:
 def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
     """``(holds, reason)`` for the option-(a) branch.
 
+    An EVIDENCE test, not a type test. Two payloads differing ONLY in the
+    candidate id are parsed, and the branch is satisfied only when all three
+    hold: both parses succeed, the two results DIFFER, and each supplied id is
+    recoverable from its own result. Anything weaker — including a non-scalar
+    return on a payload that named no candidate — is inconclusive and falls
+    through to option (b).
+
     A raise on every payload is INCONCLUSIVE, not a failure: a stricter
     option-(a) parser may demand a slate argument this probe cannot supply.
-    The caller falls through to option (b) in that case.
     """
     parse = getattr(module, 'parse_judge_verdict', None)
     if parse is None:
         return False, 'parse_judge_verdict is absent from the module'
     key = _verdict_key(module)
-    ident = str(getattr(slate[0], 'id', ''))
+    first = str(getattr(slate[0], 'id', ''))
+    last = str(getattr(slate[-1], 'id', ''))
+    if not first or not last or first == last:
+        return False, (
+            'inconclusive — the slate carries fewer than two distinct candidate '
+            'ids, so no two payloads differing only in the id can be built'
+        )
     saw_bare_str = False
+    inert: list[str] = []
     errors: list[str] = []
     for word in _verdict_words(module):
-        payloads: list[dict[str, str]] = [{key: word}]
-        payloads.extend({key: word, field: ident} for field in _ID_FIELDS)
-        for payload in payloads:
-            try:
-                result = parse(json.dumps(payload))
-            except Exception as exc:  # noqa: BLE001 - a rejection is inconclusive here
-                errors.append(f'{payload!r} -> {exc!r}')
+        for field in _ID_FIELDS:
+            parsed: list[tuple[str, Any]] = []
+            for ident in (first, last):
+                payload = {key: word, field: ident}
+                try:
+                    result = parse(json.dumps(payload))
+                except Exception as exc:  # noqa: BLE001 - a rejection is inconclusive
+                    errors.append(f'{payload!r} -> {exc!r}')
+                    break
+                if isinstance(result, str):
+                    saw_bare_str = True
+                if not _binds_candidate(result):
+                    inert.append(
+                        f'{payload!r} -> returned {type(result).__name__}, which '
+                        'cannot carry a candidate id',
+                    )
+                    break
+                parsed.append((ident, result))
+            if len(parsed) != 2:
                 continue
-            if _binds_candidate(result):
-                return True, (
-                    f'satisfied — parse_judge_verdict returned '
-                    f'{type(result).__name__} {result!r} for {payload!r}, so the '
-                    'verdict itself names its candidate and the position of the '
-                    'attach target in the slate stops mattering'
+            (id_a, res_a), (id_b, res_b) = parsed
+            if _same_result(res_a, res_b):
+                inert.append(
+                    f'{field!r} — two payloads naming {id_a!r} and {id_b!r} parsed '
+                    f'to the SAME value {res_a!r}, so the id is discarded',
                 )
-            if isinstance(result, str):
-                saw_bare_str = True
-            else:
-                errors.append(f'{payload!r} -> returned {type(result).__name__}')
+                continue
+            missing = [
+                ident
+                for ident, result in parsed
+                if not _carries_id(result, ident)
+            ]
+            if missing:
+                inert.append(
+                    f'{field!r} — the results differ but the supplied id(s) '
+                    f'{missing!r} are not recoverable from them, so the difference '
+                    'is not the candidate binding',
+                )
+                continue
+            return True, (
+                f'satisfied — parse_judge_verdict round-trips the candidate id: '
+                f'payloads naming {id_a!r} and {id_b!r} (field {field!r}) parsed to '
+                f'the distinct values {res_a!r} and {res_b!r}, each carrying the id '
+                'it was given, so the verdict itself names its candidate and the '
+                'position of the attach target in the slate stops mattering'
+            )
+    if inert:
+        return False, 'inconclusive — ' + _first_few(inert)
     if saw_bare_str:
         return False, (
             'parse_judge_verdict returns a bare str — the verdict names no '
             'candidate, so the attach must guess one from the slate'
         )
-    shown = '; '.join(errors[:3])
-    if len(errors) > 3:
-        shown += f'; …{len(errors) - 3} more'
-    return False, f'inconclusive — parse_judge_verdict accepted no probe payload ({shown})'
+    return False, (
+        f'inconclusive — parse_judge_verdict accepted no probe payload '
+        f'({_first_few(errors)})'
+    )
+
+
+def _first_few(reasons: list[str], limit: int = 3) -> str:
+    shown = '; '.join(reasons[:limit])
+    if len(reasons) > limit:
+        shown += f'; …{len(reasons) - limit} more'
+    return shown
 
 
 # --- the swap test ----------------------------------------------------------
@@ -340,9 +433,41 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
 # text is ever matched, so any rewording survives.
 
 
-def _id_lines(rendering: str, ident: str) -> tuple[int, ...]:
-    """The line indices where *ident* appears — its rendered footprint."""
-    return tuple(i for i, line in enumerate(rendering.splitlines()) if ident in line)
+def _divergent_lines(left: str, right: str) -> list[str]:
+    """Every line either rendering carries that the other does not, IN CONTENT.
+
+    ``SequenceMatcher`` rather than a set difference, because the hoist shape is
+    a PERMUTATION: both renderings contain exactly the same SET of lines, so a
+    set difference is empty for a correct fix (measured on this probe's own
+    ``by_id`` fixture). The opcode blocks keep that reordering visible.
+    """
+    left_lines = left.splitlines()
+    right_lines = right.splitlines()
+    divergent: list[str] = []
+    matcher = difflib.SequenceMatcher(None, left_lines, right_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        divergent.extend(left_lines[i1:i2])
+        divergent.extend(right_lines[j1:j2])
+    return divergent
+
+
+def _id_footprint(rendering: str, ident: str) -> tuple[tuple[int, str], ...]:
+    """Where *ident* appears AND what those lines say — its rendered footprint.
+
+    Content is part of the footprint, not just the line index. An index-only
+    footprint (which this replaces) rejected the most natural minimal option
+    (b) — marking the target INLINE on its own line, e.g.
+    ``'- id: ' + c.id + (' <-- ATTACH TARGET' if c.id == target else '')`` —
+    because the target id keeps its line index there while the line's text
+    changes. That asserted a MECHANISM (the target must be RELOCATED) rather
+    than the invariant, the very defect task 4810 exists to remove, and would
+    have permanently re-blocked task 3169 against a valid fix.
+    """
+    return tuple(
+        (i, line) for i, line in enumerate(rendering.splitlines()) if ident in line
+    )
 
 
 def _distinguished_by_repetition(rendering: str, slate: list[Any]) -> str | None:
@@ -368,7 +493,14 @@ def _swap_verdict(
     rendered_target: str,
     rendered_other: str,
 ) -> str | None:
-    """``None`` when the swap test holds, else the reason it does not."""
+    """``None`` when the swap test holds, else the reason it does not.
+
+    Two independent conditions, both necessary. Together they accept either
+    natural option-(b) shape — hoisting the target out of the list, or marking
+    it inline — while still rejecting a prose-only change, a rendering that
+    varies for a reason unrelated to the candidates, and the ``candidates[0]``
+    bug.
+    """
     if rendered_target == rendered_other:
         marked = _distinguished_by_repetition(rendered_target, slate)
         if marked is not None and marked == str(other.id):
@@ -382,15 +514,33 @@ def _swap_verdict(
             'attach targets, so its output does not depend on the argument at all '
             '(a prose-only change renders identically whichever candidate is named)'
         )
-    for named, unnamed, ident in (
-        (rendered_target, rendered_other, str(target.id)),
-        (rendered_other, rendered_target, str(other.id)),
-    ):
-        if _id_lines(named, ident) == _id_lines(unnamed, ident):
+
+    # (1) The divergence must touch the CANDIDATES at all. A rendering that
+    #     merely varies run to run (a nonce, a timestamp) differs without any
+    #     divergent line ever mentioning a candidate — and an INSERTED such line
+    #     shifts every id's index, which is why condition (2) alone is not
+    #     enough.
+    slate_ids = [str(c.id) for c in slate]
+    divergent = _divergent_lines(rendered_target, rendered_other)
+    if not any(ident in line for line in divergent for ident in slate_ids):
+        return (
+            'the two renderings differ, but no differing line mentions any candidate '
+            f'id ({slate_ids!r}) — the difference is not attributable to the attach '
+            'target at all (a rendering that varies for an unrelated reason differs '
+            'without ever naming what it was asked for)'
+        )
+
+    # (2) And the divergence must track the NAMED candidate specifically: each
+    #     id's footprint has to change when it goes from being the attach target
+    #     to being context. Content counts as much as position, so hoisting and
+    #     inline marking are both accepted.
+    for ident in (str(target.id), str(other.id)):
+        if _id_footprint(rendered_target, ident) == _id_footprint(rendered_other, ident):
             return (
-                'the two renderings differ, but the id ' + repr(ident) + ' occupies '
-                'the SAME lines whether or not it is the named attach target, so the '
-                'difference is not attributable to the candidate being named'
+                f'the two renderings differ, but the id {ident!r} occupies the same '
+                'lines with the same text whether or not it is the named attach '
+                'target, so the difference is not attributable to the candidate '
+                'being named'
             )
     return None
 

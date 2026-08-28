@@ -241,6 +241,75 @@ def parse_judge_verdict(raw):
     # candidate, so the model's answer names its own candidate and slate
     # position becomes irrelevant. The shape task 4762's own design decision
     # says option (a) produces: an (outcome, candidate_id) pair.
+    # An id-less non-scalar return: the outcome grew a richer shape (a dict, a
+    # dataclass, an (outcome, None) pair) for reasons having nothing to do with
+    # candidate binding. Non-scalar is a SHAPE that could carry an id, never
+    # evidence that it does — this must NOT satisfy option (a).
+    'idless_non_scalar': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return {'outcome': _parse_bare_str(raw)}
+''',
+    # The same trap wearing a tuple: the ARITY of an (outcome, candidate_id)
+    # pair without the id. A type test passes it; an evidence test cannot.
+    'idless_pair': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return (_parse_bare_str(raw), None)
+''',
+    # A REAL option (b) that marks the target INLINE on its own line rather than
+    # hoisting it. Arguably the most natural minimal fix. The target id keeps
+    # its line INDEX and changes only its TEXT, so an index-only footprint
+    # rejects it — which would re-block 3169 against a valid fix.
+    'inline_marker': r'''
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
+    # Renders differently every call for a reason unrelated to the attach
+    # target, and does it by INSERTING lines — which shifts every candidate's
+    # line index. Byte-inequality and a shifted footprint are both present, so
+    # only the 'does any differing line mention a candidate' condition rejects
+    # it.
+    'spurious_inserted_lines': r'''
+_CALLS = [0]
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    _CALLS[0] += 1
+    lines = ['NEW ENTRY:', str(content)]
+    lines.extend('pad %d' % i for i in range(_CALLS[0]))
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+''',
     'option_a': r'''
 
 def build_judge_prompt(content, candidates):
@@ -435,6 +504,45 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, f'probe failed a strict option (a):\n{proc.stdout}\n{proc.stderr}'
         assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_idless_non_scalar_return_does_not_satisfy_option_a(self, tmp_path):
+        """A non-scalar return is a SHAPE that COULD carry a candidate id, never
+        evidence that it does. Reviewer-reported false pass: a parser returning
+        a plain ``{'outcome': ...}`` dict — no candidate anywhere in the
+        contract — made the probe report option (a) satisfied and exit 0, in a
+        gate whose exit 0 authorises a production write_triage.enabled flip."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='idless_non_scalar')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'id-less dict passed option (a):\n{proc.stdout}'
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
+        assert _INDETERMINATE in proc.stdout, proc.stdout
+
+    def test_idless_pair_does_not_satisfy_option_a(self, tmp_path):
+        """The arity of an (outcome, candidate_id) pair without the id."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='idless_pair')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'(outcome, None) passed option (a):\n{proc.stdout}'
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
+
+    def test_inline_marker_is_a_valid_option_b(self, tmp_path):
+        """Marking the target inline on its own line is a correct option (b).
+
+        The invariant is that the rendering DEPENDS on which candidate is
+        named — not that the named candidate is RELOCATED. Rejecting the inline
+        shape would assert a mechanism, the very defect task 4810 removes, and
+        would re-block task 3169 against a valid fix."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='inline_marker')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe rejected inline option (b):\n{proc.stdout}\n{proc.stderr}'
+
+    def test_difference_unrelated_to_the_candidates_still_fails(self, tmp_path):
+        """Byte-inequality alone is not attribution. A prompt that inserts an
+        unrelated line each call renders differently AND shifts every
+        candidate's line index, yet names no attach target."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='spurious_inserted_lines')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'unrelated variance passed:\n{proc.stdout}'
+        assert _INDETERMINATE in proc.stdout, proc.stdout
 
     def test_todays_main_shape_still_fails(self, tmp_path):
         """Regression guard: the option-(a) branch must not accidentally pass
