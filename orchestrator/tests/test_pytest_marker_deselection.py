@@ -1530,10 +1530,42 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _DESELECTING_PYPROJECT = _pyproject('"-n auto -m \'not slow\'"')
 _PLAIN_PYPROJECT = _pyproject('"-n auto -q"')
 
+#: A CLASS-marked module under ``mod``: every top-level class carries ``slow``,
+#: with no module-level ``pytestmark`` and no module-level test function — so
+#: only `guaranteed_marker_names` can prove it fully deselected (task 4561).
+_CLASS_MARKED_MODULE_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestGamma:
+
+    def test_g(self):
+        pass
+
+
+class TestDelta:
+
+    pytestmark = [pytest.mark.slow]
+
+    def test_d(self):
+        pass
+"""
+
+#: THE NON-VACUITY CONTROL for the golden below: identical but for ONE unmarked
+#: collectable class.  Without it the golden could pass because the widening had
+#: become unconditional rather than because the classes are all marked.
+_CLASS_PARTLY_MARKED_MODULE_SOURCE = _CLASS_MARKED_MODULE_SOURCE + (
+    '\n\nclass TestEpsilon:\n    def test_e(self):\n        pass\n'
+)
+
+
 _SYNTHETIC_CONTENTS: dict[str, str] = {
     'mod/pyproject.toml': _DESELECTING_PYPROJECT,
     'mod/tests/test_a.py': 'import pytest\npytestmark = pytest.mark.slow\n',
     'mod/tests/test_b.py': 'import pytest\n\n\ndef test_b():\n    pass\n',
+    'mod/tests/test_c.py': _CLASS_MARKED_MODULE_SOURCE,
+    'mod/tests/test_d.py': _CLASS_PARTLY_MARKED_MODULE_SOURCE,
     # 'other' declares no -m at all — the control for "module without a marker
     # expression is never widened", even with an identically-marked target.
     'other/pyproject.toml': _PLAIN_PYPROJECT,
@@ -1647,6 +1679,69 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == ('mod/tests/test_a.py', 'mod/tests/test_b.py')
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_class_marked_target_widens_at_both_roles(self, role):
+        """END-TO-END: a class-marked diff reaches FULL_SUITE through the real planner.
+
+        Every unit below this point already passes; this is the pin that the
+        widening actually SURVIVES `derive_verify_plan` — that arm 4 consults
+        the probe, believes it, and emits a plan record an operator can read.
+        """
+        mc = _mc('mod')
+        plan = derive_verify_plan(
+            ['mod/tests/test_c.py'], [mc], None, _synthetic_reader, role=role,
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        # PlannedRun's invariant: scoped_targets is non-empty iff FILE_SCOPED.
+        assert run.scoped_targets == ()
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'not slow' in run.reason
+        assert 'mod/tests/test_c.py' in run.reason, 'the reason names the still-unrun file'
+        assert 'NOT executed' in run.reason
+
+    def test_one_unmarked_class_keeps_the_run_file_scoped(self):
+        """THE NON-VACUITY CONTROL, run alongside the golden above.
+
+        The same diff shape against a module whose classes are all marked BUT
+        ONE stays FILE_SCOPED.  Without this, the golden could pass because the
+        widening had become unconditional — which would be the over-fire that
+        reopens esc-3292-1 / task 1852, not a fix.
+        """
+        plan = derive_verify_plan(
+            ['mod/tests/test_d.py'], [_mc('mod')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == ('mod/tests/test_d.py',)
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
+
+    def test_no_real_module_in_this_repo_is_all_classes_marked_yet(self):
+        """A REGRESSION GUARD POINTED AT AN ABSENCE, in place of a real-file golden.
+
+        The two existing real-config goldens
+        (``TestWarmLaneBashRealConfigRegression``,
+        ``TestTestsScriptsAllIntegrationDecoratedRealConfigRegression``) guard
+        live premises.  This tier has none: ``fused-memory/tests/test_mem0_client.py``
+        is the repo's most class-organised marked suite and it marks only a
+        MINORITY of its top-level classes, so it correctly refuses and the
+        synthetic goldens above are the honest way to pin the behaviour.
+
+        Asserting the absence keeps that fact checked rather than assumed.  The
+        day someone marks the remaining classes, this pin FLIPS — and that is
+        the signal to promote the shape to a real-file golden, because the
+        widening will have become live on real code.
+        """
+        source = (REPO_ROOT / 'fused-memory' / 'tests' / 'test_mem0_client.py').read_text()
+        top_level_classes = [
+            node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+        ]
+        assert len(top_level_classes) > 1, 'premise: this file really is class-organised'
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
 
     def test_module_without_a_marker_expression_is_never_widened(self):
         """CONTROL: an identically-marked target under a module declaring no ``-m``."""
