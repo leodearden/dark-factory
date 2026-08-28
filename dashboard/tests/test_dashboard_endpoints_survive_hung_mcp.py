@@ -46,10 +46,13 @@ def _dashboard_get_paths() -> list[str]:
     """Every GET route under /api/v2/dashboard/, read off the live app."""
     from dashboard.app import app
 
+    # ``app.routes`` is typed ``list[BaseRoute]``, which declares no ``path``
+    # — bind it once via getattr (as the filter already did) so the duck-typed
+    # sweep still covers every route class, Mount included.
     return sorted({
-        route.path
+        path
         for route in app.routes
-        if getattr(route, 'path', '').startswith('/api/v2/dashboard/')
+        if (path := getattr(route, 'path', '')).startswith('/api/v2/dashboard/')
         and 'GET' in (getattr(route, 'methods', None) or set())
     })
 
