@@ -685,7 +685,7 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
-# The 16 real fields of orchestrator.verify.VerifyResult (verify.py:3216).
+# The 16 real fields of orchestrator/src/orchestrator/verify.py::VerifyResult.
 # Duplicated here deliberately: this test is the thing that would notice if the
 # script's registry copy silently drifted from the real dataclass.
 _VERIFY_RESULT_FIELDS = frozenset({
@@ -731,7 +731,7 @@ class TestDataclassShapeRegistry:
         """The registry's field literal equals VerifyResult's 16 real field names."""
         shape = _checker._DATACLASS_SHAPES[0]
         assert shape.fields == _VERIFY_RESULT_FIELDS, (
-            'Registry field set drifted from orchestrator/src/orchestrator/verify.py:3216.\n'
+            'Registry field set drifted from orchestrator/src/orchestrator/verify.py::VerifyResult.\n'
             f'  missing from registry: {sorted(_VERIFY_RESULT_FIELDS - shape.fields)}\n'
             f'  extra in registry:     {sorted(shape.fields - _VERIFY_RESULT_FIELDS)}'
         )
@@ -948,8 +948,10 @@ class TestDataclassDoubleNegatives:
         )
 
 
-# The verbatim shape task 3980 removed from ten sites (test_merge_speculation.py:4275).
-# Note `verify_skipped=`, which is a MergeOutcome field (merge_types.py:945), NOT a
+# The verbatim shape task 3980 removed from ten sites, preserved at
+# orchestrator/tests/test_merge_speculation.py::TestDispositionDoubleFidelity.test_bare_double_makes_classifier_fail_open.
+# Note `verify_skipped=`, which is a MergeOutcome field
+# (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped), NOT a
 # VerifyResult field — a bare MagicMock accepts it without objection. This is the case
 # the "kwargs are a subset of the dataclass's fields" rule would have MISSED.
 _TASK_3980_SHAPE = (

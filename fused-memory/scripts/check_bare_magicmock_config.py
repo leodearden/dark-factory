@@ -99,7 +99,8 @@ A kwarg that is not a field is *drift evidence* named in the message, never an
 exemption — a bare MagicMock accepts any keyword silently, so an unrecognised one is
 the strongest signal the double has drifted from the type it impersonates.  A subset
 rule would have missed all ten sites behind task 3980, every one of which passed
-``verify_skipped=`` (a MergeOutcome field, merge_types.py:945).
+``verify_skipped=`` (a MergeOutcome field:
+orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped).
 
 Why this rule exists: Rule A provably cannot see the shape, for three independent
 reasons, any one of them fatal — it inspects only ``ast.Assign``/``ast.AnnAssign``
@@ -108,7 +109,8 @@ matches only config/cfg/*_config/*_cfg targets; and its remedies read pydantic
 ``model_fields`` while ``VerifyResult`` is a stdlib dataclass.
 
 Preferred alternatives named in the rejection message:
-  • ``_fake_verify_result(...)`` (orchestrator/tests/test_merge_queue_concurrent_verify.py:484)
+  • ``_fake_verify_result(...)``
+    (orchestrator/tests/test_merge_queue_concurrent_verify.py::_fake_verify_result)
   • ``MagicMock(spec=VerifyResult)`` seeded from ``dataclasses.fields(VerifyResult)``
 
 Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
@@ -158,8 +160,9 @@ class _DataclassShape(NamedTuple):
     A kwarg that is NOT a field does not exempt the call — it is *additional drift
     evidence* and gets named in the violation message.  This is load-bearing: all ten
     sites behind task 3980 passed ``verify_skipped=``, a MergeOutcome field
-    (merge_types.py:945) that VerifyResult does not have, so a subset rule would have
-    missed precisely the defect this rule exists to catch.
+    (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped) that
+    VerifyResult does not have, so a subset rule would have missed precisely the
+    defect this rule exists to catch.
     """
 
     name: str
@@ -175,7 +178,7 @@ class _DataclassShape(NamedTuple):
 # all seven package lint_commands can run it under bare ``python3`` with no venv
 # resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
 #
-# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py:3216.
+# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py::VerifyResult.
 # Drift is absorbed structurally rather than by keeping this list exhaustive:
 # matching keys on the ``passed`` anchor plus a 2-field overlap floor, so adding,
 # renaming or removing a peripheral field cannot silently disable detection.  Only

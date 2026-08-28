@@ -4277,7 +4277,8 @@ class TestDispositionDoubleFidelity:
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # Paired with the _BARE_DOUBLE_EXEMPT_SCOPES entry at test_merge_speculation.py:4062,
+        # Paired with the entry in
+        # orchestrator/tests/test_merge_speculation.py::_BARE_DOUBLE_EXEMPT_SCOPES,
         # which exempts this same scope from task 3980's file-local guard. This module is
         # deliberately OFF _DATACLASS_DOUBLE_DEBT so every other double here stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
