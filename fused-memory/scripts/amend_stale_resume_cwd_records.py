@@ -512,6 +512,23 @@ async def run(
     )
 
 
+def _precondition_satisfied(decision: dict[str, Any]) -> bool:
+    """Does *decision* leave the corpus in a state later targets may assert?
+
+    True for a landed amendment and for ``'skip:already_amended'``. The skip
+    counts BECAUSE the claim a later record makes -- "6403e96b was corrected"
+    -- is equally true whether this run corrected it or a previous run did.
+    Treating a skip as a failure would make the script unable to finish what a
+    partially-failed earlier run started, which is precisely the re-run an
+    operator needs after a transient backend fault.
+
+    False for every ``'refuse:*'`` outcome, including a pre-image mismatch: if
+    somebody else edited the record underneath us we do not know what it now
+    says, and asserting it carries our correction would be a guess.
+    """
+    return decision['action'] in ('amend', 'skip:already_amended')
+
+
 async def _apply_amendments(
     memory_service: Any,
     decisions: list[dict[str, Any]],
@@ -566,9 +583,30 @@ async def _apply_amendments(
 
     targets_by_id = {t.memory_id: t for t in AMEND_TARGETS}
     updated: list[dict[str, Any]] = []
+    # The precondition chain. Every target after the first asserts, in its own
+    # text, that the earlier correction landed -- so once one link fails, no
+    # later one may be written. See _precondition_satisfied for what counts.
+    chain_intact = True
     for decision in decisions:
         if decision['action'] != 'amend':
+            # A non-amend outcome still decides the chain: a skip keeps it
+            # intact (the record already carries the correction), a refusal
+            # breaks it.
+            chain_intact = chain_intact and _precondition_satisfied(decision)
             updated.append(decision)
+            continue
+
+        if not chain_intact:
+            # Deliberately BEFORE the await: an unsatisfied precondition means
+            # the write must not be attempted at all, not attempted and undone.
+            updated.append({
+                **decision,
+                'action': 'refuse:precondition_failed',
+                'detail': (
+                    'an earlier target in AMEND_TARGETS was not corrected, so '
+                    "this record's claim that it was would be false"
+                ),
+            })
             continue
 
         target = targets_by_id[decision['id']]
@@ -586,6 +624,7 @@ async def _apply_amendments(
                 'amend_stale_resume_cwd_records: write RAISED for %s: %r',
                 target.memory_id, exc,
             )
+            chain_intact = False
             updated.append({
                 **decision,
                 'action': 'refuse:write_error',
@@ -601,6 +640,7 @@ async def _apply_amendments(
                 'amend_stale_resume_cwd_records: write REFUSED for %s: %s',
                 target.memory_id, response.get('error'),
             )
+            chain_intact = False
             updated.append({
                 **decision,
                 'action': 'refuse:write_failed',
