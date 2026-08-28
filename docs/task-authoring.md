@@ -795,14 +795,17 @@ systemd timer. See `docs/prds/recurring-deterministic-tasks.md`.
 ```
 {
   key: "<stable kebab-case chain id>",  # required; shared by EVERY link of one chain
-  interval_secs: <int>,                 # required and > 0; cadence
-  minted_from: "<predecessor task id>", # mint-stamped; ABSENT on the seed link
+  interval_secs: <int>,                 # required and > 0; cadence. Strict int:
+                                        #   true / "86400" / 86400.0 are REJECTED,
+                                        #   not coerced.
+  minted_from: "<predecessor task id>", # mint-stamped; null on the seed link
 }
 ```
 
 `key` is the chain's identity: every link of one chain carries the same
 value, so it doubles as a slug and a grep anchor (lowercase alphanumeric
-segments joined by single hyphens — the same shape as a memory topic slug).
+segments joined by single hyphens, at most 100 characters — the same shape,
+regex *and* length cap, as a memory topic slug).
 
 `interval_secs` is measured from the predecessor's **terminal** time, never
 from a missed slot: a late or long-running link shifts the whole chain
@@ -812,6 +815,14 @@ forward instead of accruing catch-up runs. There is no backfill.
 predecessor's task id. An author writes the seed link *without* it and it is
 stamped on every successor — the same author-never-sets-it rule as §6's
 `milestone_deps_satisfied_at`.
+
+**Read it by VALUE, never by key presence.** `minted_from` is declared with a
+`None` default, so a seed link an author wrote *without* the key comes back
+out of any `parse_metadata` round-trip carrying an explicit
+`"minted_from": null`. The seed-vs-successor discriminator is therefore
+`minted_from is None`, which holds on both the as-authored and the
+round-tripped form; `'minted_from' in recurrence` reads **true** for a
+round-tripped seed and would misclassify it as a minted successor.
 
 **Carrier contract.** A task carrying `recurrence` MUST be all three of:
 
@@ -827,6 +838,16 @@ shape by `shared/src/shared/task_metadata.py::Recurrence` and the
 cross-field carrier rules by
 `fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_recurrence`,
 exactly the split §6's `Milestone` already uses.
+
+**The carrier contract is submit-time only.** `submit_task` is the sole
+boundary that checks the three-way relation above. `update_task` never runs
+that guard, and the check the submodel registration buys at the write
+boundary covers the `recurrence` *shape* alone. So a later `update_task`
+that flips `before_done.kind` to `deploy`, deletes `metadata.milestone`, or
+attaches `recurrence` to an existing normal task lands exactly the state
+this contract forbids, with no error raised. Don't do it — and any consumer
+acting on a chain link (the mint above all) should re-verify the carrier
+rather than assume submit-time validation still holds.
 
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —

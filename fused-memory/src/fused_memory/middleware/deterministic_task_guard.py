@@ -188,6 +188,21 @@ def _validate_recurrence(
     clauses are guard-only, because they read ``task_kind``, ``before_done``
     and ``milestone`` TOGETHER — a relation ``Recurrence`` alone cannot see.
 
+    RESIDUAL GAP, named rather than left implicit: the CARRIER contract is
+    submit-time ONLY. Registration buys the shape at the write boundary
+    (``backends.sqlite_task_backend::SqliteTaskBackend._validate_metadata_on_write``,
+    and only while ``_task_metadata_enforce`` is on), but nothing re-checks
+    the cross-field relation there — and ``update_task`` never runs this
+    guard at all. So an update that flips ``before_done.kind`` to
+    ``'deploy'``, deletes ``metadata.milestone``, or attaches ``recurrence``
+    to an existing normal task lands exactly the state C-1 forbids, and no
+    error is raised. Closing the gap means hoisting these three clauses into
+    a helper the update path also calls; that is beyond task 4676, which
+    rules the submit boundary. Until it is closed, r2's mint MUST re-verify
+    the carrier of the link it is about to renew instead of trusting that
+    submit-time validation still holds — ``docs/task-authoring.md`` §6.1
+    carries the same warning for authors.
+
     ``TypeError`` is caught alongside ``ValidationError`` for the same reason
     as milestone's: a bare string or list value cannot be splatted into the
     model's keyword arguments.

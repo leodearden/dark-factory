@@ -749,9 +749,11 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         _assert_recurrence_rejection(result)
         assert result is not None
         assert 'deploy' in result['error']
-        hint = result['hint'].lower()
-        assert 'unruled' in hint
-        assert 'until' in hint
+        # 'unruled' only — a load-bearing, non-generic term. An `'until' in
+        # hint` pin was dropped as near-vacuous: an ordinary English word the
+        # hint could keep while losing the whole rationale, and which any
+        # innocuous rewording flips red.
+        assert 'unruled' in result['hint'].lower()
 
     def test_recurrence_on_omitted_kind_rejects(self, tmp_path):
         """before_done with NO kind key → reject identically ('deploy' is the default).
@@ -814,6 +816,29 @@ class TestDeterministicTaskErrorRecurrenceCarrier:
         _assert_recurrence_rejection(result)
         assert result is not None
         assert 'dated' in result['error']
+
+    def test_bad_script_wins_over_a_simultaneous_recurrence_violation(self, tmp_path):
+        """First-violation-wins: invariant 4 is reported, not invariant 5.
+
+        Pins the ordering claim the invariant-5 block comment makes in
+        ``deterministic_task_error`` ("a bad script path is still reported
+        first"), which nothing else covers.
+
+        BOTH invariants have something to say here — the script does not
+        exist AND the well-formed recurrence rides a deploy-kind before_done
+        — which is what makes the row discriminating: swap the two blocks
+        and the user gets the recurrence complaint instead. Every other row
+        in this class starts from a VALID script, so without this one a
+        reorder would change the user-visible error in silence.
+        """
+        meta = _predicate_carrier(tmp_path, dict(self._VALID))
+        meta['before_done']['kind'] = 'deploy'
+        meta['before_done']['script'] = 'does-not-exist.sh'
+        result = deterministic_task_error('deterministic', meta, str(tmp_path))
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'does-not-exist.sh' in result['error']
+        assert 'recurrence' not in result['error']
 
     # -- acceptance ------------------------------------------------------
 
