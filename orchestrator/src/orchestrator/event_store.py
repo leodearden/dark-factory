@@ -427,7 +427,8 @@ class EventType(StrEnum):
     #                which a plain fresh dispatch can reach, and counting those
     #                would inflate the ratio below past 1.
     #
-    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    # SQL split, alongside session_resume_fallback's '$.reasons' /
+    # '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
     #     FROM events WHERE event_type = 'session_resume_failed'
     #    GROUP BY stage;
