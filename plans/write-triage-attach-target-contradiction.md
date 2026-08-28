@@ -265,3 +265,104 @@ cycle-2 item 1, part 2 of 2] In write_triage_judge.py: (1) restructure
 build_judge_prompt (:314-362".
 
 Filed as a `scope_violation` blocker by task 4822.
+
+### APPLIED-5d, attempt #2 — 2026-08-28T05:58Z, main `49e9b5c1e6`
+
+Still BLOCKED. Three things are now known that were not known at attempt #1,
+and two of them make the archive MORE load-bearing, not less.
+
+**The attempt-#1 blocker was never adjudicated.** `esc-4822-2` reads
+`status: dismissed`, `resolved_by: "auto-dismissed"`,
+`resolution: "Auto-dismissed: orchestrator restarted — stale from prior run"`,
+`resolved_at 2026-08-28T02:22:46Z` — twelve minutes after it was filed. So is
+`esc-4822-1`. Neither was read by a handler; both were swept by a restart. The
+absence of a handler response is NOT a ruling that the archive should be
+skipped.
+
+**Denial reproduced.** `touch .worktrees/.task-meta/4762/.probe-4822` ->
+`Permission denied`. Directory listing still succeeds (reads are allowed;
+writes are not).
+
+**FINDING 1 — `granted_files` cannot fix this; only a handler-side run can.**
+The OS sandbox write set is `write_set.writable_paths()`
+(`orchestrator/src/orchestrator/agents/write_set.py::WriteSet.writable_paths`),
+a FIXED contract list — worktree, **its own** `task_meta`, the git object/ref/
+reflog/admin dirs, uv cache, claude_fleet, tmp, dev — built by
+`compute_write_set(cwd)` at `workflow.py` (the `sandbox_extras` construction
+site) and derived **entirely from `cwd`**. `granted_files` is a different
+mechanism: `_collect_granted_files` folds it into `plan.files` /
+`metadata.files` / locks, and touches the sandbox write set not at all. So
+there is no escalation-resolution knob, and no operator config knob, that lets
+a task lane write a SIBLING task's `.task-meta/`. **Cross-task plan surgery is
+architecturally unreachable from any implementer lane** — the attempt-#1
+hypothesis, now read off the code rather than inferred from one denial. Any
+future plan scheduling it needs an MCP-mediated mechanism or a handler-side
+step; the filesystem route will always fail.
+
+**FINDING 2 — the stale plan can dispatch with NO architect pass at all.**
+This is the consequence attempt #1 understated, and it is the reason the
+archive matters. `workflow.py::_plan` picks its branch from the plan file:
+
+| branch | requires | 4762's plan |
+| --- | --- | --- |
+| completion pass | `not _finalized_at and not _session_id` | no — both set |
+| **revalidation** | `steps and _session_id and _old_plan_base` | **yes** |
+| fresh planning | falsy `existing_plan` | only if `plan.json` is ABSENT |
+
+Inside the revalidation branch sits **Lever B**, a short-circuit that stamps
+`_revalidated_at`, bumps `base_commit` and returns `PLANNED` *without invoking
+the architect* when `revalidation_skip_enabled and not overlap and
+_can_skip_revalidation(plan)`. Measured just now, **all three hold**:
+
+| condition | value |
+| --- | --- |
+| `revalidation_skip_enabled` | **True** (`config.py` default) |
+| `_schema_version` vs `PLAN_SCHEMA_VERSION` | **1 == 1** |
+| all 8 plan files exist in worktree | **yes** |
+| plan age vs `max_revalidation_age_hours` 24.0 | **15.06h** — under the bound until 2026-08-28T14:54:41Z |
+| commits on main touching any of the 8 plan files since the plan base | **0, 0, 0, 0, 0, 0, 0, 0** — overlap is EMPTY |
+
+So if 4762 were dispatched right now, the corrected description this task wrote
+in 5c would be **read by nobody**, and the superseded 24-step plan — step 2 of
+which requires the refuted `candidates[0]` marking — would go straight to an
+implementer. Prose corrections to the task record do not mitigate this; only
+removing `plan.json` does, because absence is what selects the fresh-planning
+branch. The freeze from pre-2 (`dependencies [4810, 4822]`) is the ONLY thing
+currently preventing it.
+
+**Recon independently confirmed the false claim.** `metadata.
+x_4762_archive_claim_verification` was stamped by
+`recon-stage-task_knowledge_sync`: `result: "confirmed_absent"`, "Do not cite
+or attempt to read plan.superseded-by-4822.json; it will not be found on disk."
+Its `IMPACT: low` assessment rests on the corrected requirement already being
+inlined in 4762's description — true, but it addresses only the *readability*
+of the archived file and not FINDING 2, where nothing in the record is read.
+
+**Deliberately NOT done this iteration: a second description round-trip.**
+4762's description still contains 5c's now-false sentence "That plan has been
+SUPERSEDED and archived to ...". Correcting it would mean re-emitting all 7497
+characters by hand — `update_task`'s `description` is a column overwrite, and
+its `append=True` applies to `details` only — putting the recovered
+esc-markup-residue-1 payload at risk to fix prose that FINDING 2 shows is not
+read on the failure path that matters. The falsehood is already flagged
+adjacent to itself by `x_4762_archive_claim_verification`. `details` was left
+untouched per step 5c. The record stays as attempt #1 left it.
+
+**Still the whole of what remains** (unchanged, from a context that can write
+`.worktrees/.task-meta/4762/`):
+
+```
+cp .worktrees/.task-meta/4762/plan.json .worktrees/.task-meta/4762/plan.superseded-by-4822.json
+cmp .worktrees/.task-meta/4762/plan.json .worktrees/.task-meta/4762/plan.superseded-by-4822.json
+rm .worktrees/.task-meta/4762/plan.json
+```
+
+Re-check 4762 is still unclaimed immediately before the `rm`. At this
+measurement it is: `status pending`, `claimant_run_id None`,
+`heartbeat_at None`, no `plan.lock`, no `agent_session.json`.
+
+Premises re-verified at `49e9b5c1e6`: `candidate_id` count on
+`main:write_triage_judge.py` = **0**; `main..task/4762` = **0** commits;
+`test_write_triage_flip_gate_invariants.py` = **8 passed**.
+
+Re-filed as a `scope_violation` blocker by task 4822 (attempt #2).
