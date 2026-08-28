@@ -93,6 +93,7 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     evaluate_closure,
+    handrolled_member_enumeration,
     resolve_unstamped_live_ids,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -684,6 +685,29 @@ class TaskInterceptor:
             return None
         block = meta.get(GATE_METADATA_KEY)
         if not isinstance(block, dict):
+            # Task 4808, the SECOND gap. `operational_mode == 'gate'` is a
+            # GENERIC human-gate marker, so a block-less gate cannot be
+            # refused — that would brick the 123 measured gates that
+            # legitimately carry no block. But a gate that hand-rolled its own
+            # member list under `memory_ids`/`related_memory_ids` is very
+            # likely a consolidation gate the seam simply cannot see, so it is
+            # FLAGGED rather than silently skipped. See
+            # `consolidation_gate.py::handrolled_member_enumeration` for the
+            # measured basis and the flag-don't-refuse decision.
+            handrolled = handrolled_member_enumeration(meta)
+            if handrolled is not None:
+                key, ids = handrolled
+                logger.warning(
+                    'task=%s enumerates cluster members under `metadata.%s` '
+                    '(%s) but carries no `%s` block, so the consolidation '
+                    'gate is DORMANT for it and this `done` transition '
+                    'closes it unchecked. File it through '
+                    '`build_consolidation_gate_task` to arm the gate.',
+                    task_id,
+                    key,
+                    ', '.join(str(i) for i in ids),
+                    GATE_METADATA_KEY,
+                )
             return None
         topic = block.get('topic')
         if not isinstance(topic, str) or not topic:

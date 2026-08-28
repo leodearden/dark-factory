@@ -64,11 +64,13 @@ __all__ = [
     'EXIT_CLOSED',
     'EXIT_NOT_CLOSED',
     'GATE_METADATA_KEY',
+    'HANDROLLED_MEMBER_KEYS',
     'WAIVABLE_REASON_CODES',
     'ClosureVerdict',
     'ConsolidationGateSpec',
     'build_consolidation_gate_task',
     'evaluate_closure',
+    'handrolled_member_enumeration',
     'render_consolidation_gate_section',
     'render_end_state_brief',
     'resolve_unstamped_live_ids',
@@ -234,6 +236,72 @@ def _payload_id(payload: Any) -> str:
         return ''
     value = payload.get('id')
     return str(value) if value is not None else ''
+
+
+#: Hand-rolled member-enumeration keys observed on real BLOCK-LESS gates.
+#: Measured from the live tasks.db on 2026-08-28 — see
+#: :func:`handrolled_member_enumeration` for the census and the decision.
+HANDROLLED_MEMBER_KEYS = frozenset({'memory_ids', 'related_memory_ids'})
+
+
+def handrolled_member_enumeration(metadata: Any) -> tuple[str, list[Any]] | None:
+    """Detect a consolidation gate that hand-rolled its own member list.
+
+    Returns ``(key, ids)`` when *metadata* declares
+    ``operational_mode == 'gate'``, carries NO :data:`GATE_METADATA_KEY`
+    block, and carries a non-empty :data:`HANDROLLED_MEMBER_KEYS` entry —
+    otherwise ``None``.  PURE, and defensive on every shape.
+
+    THE DECISION THIS ENCODES: FLAG, DO NOT REFUSE.
+
+    (i) ``operational_mode == 'gate'`` is a GENERIC human-gate marker, not a
+    consolidation marker — ``scripts/curator_gate_resolution_sweep.py::
+    extract_open_gate_task_ids`` selects on exactly that value across the
+    whole population.  So a blanket seam refusal for a block-less gate is not
+    available: it would brick every unrelated gate.
+
+    (ii) MEASURED BASIS, live tasks.db, 2026-08-28.  127 tasks carry
+    ``operational_mode == 'gate'``.  Only 4 carry a real gate block (4747,
+    4750, 4768, 4774).  Of the 123 that do not, exactly 5 carry a hand-rolled
+    enumeration at metadata top level — 3036 and 3974 under ``memory_ids``,
+    3796, 3809 and 3810 under ``related_memory_ids``.  All 5 are already
+    ``done``; 3 are genuine consolidation gates (3036 is the very gate this
+    module's docstring indicts for inventing ``metadata.memory_ids``) and 2
+    (3796, 3810) are not.  4747 has since been retro-fitted with a real
+    block, so nothing currently open matches.
+
+    (iii) That is a ~40% historical FALSE-POSITIVE rate.  Unacceptable for a
+    refusal; entirely fine for a log line.  Flagging converts a SILENT
+    dormancy into a VISIBLE one at zero brick risk, which is the whole point.
+
+    (iv) The operator-facing half already exists and is unchanged:
+    ``scripts/check_consolidation_closure.py::extract_gate_block`` raises
+    ``UsageError`` (exit 2) for a block-less task, with a message that
+    already says the seam is dormant for it and would let it close untouched.
+
+    (v) ``consolidation_gate.py::build_consolidation_gate_task`` emits a block
+    UNCONDITIONALLY, so the recon filing path is already compliant.  The
+    residual hole is hand-filed gates only, which is why a detector plus a
+    warning is proportionate to what is actually left.
+
+    Key selection is deterministic (sorted, first match) when a task carries
+    more than one, so the emitted warning text is stable across runs.
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    if metadata.get('operational_mode') != _GATE_OPERATIONAL_MODE:
+        return None
+    if isinstance(metadata.get(GATE_METADATA_KEY), Mapping):
+        return None
+    for key in sorted(HANDROLLED_MEMBER_KEYS):
+        value = metadata.get(key)
+        if (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes))
+            and len(value) > 0
+        ):
+            return key, list(value)
+    return None
 
 
 def unstamped_candidates(

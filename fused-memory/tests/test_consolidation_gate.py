@@ -1113,9 +1113,10 @@ class TestHandrolledMemberEnumeration:
         )
 
     def test_the_measured_key_set_is_exported(self):
-        assert consolidation_gate.HANDROLLED_MEMBER_KEYS == frozenset(
-            {'memory_ids', 'related_memory_ids'}
-        )
+        assert set(consolidation_gate.HANDROLLED_MEMBER_KEYS) == {
+            'memory_ids',
+            'related_memory_ids',
+        }
         assert 'HANDROLLED_MEMBER_KEYS' in consolidation_gate.__all__
         assert 'handrolled_member_enumeration' in consolidation_gate.__all__
 
