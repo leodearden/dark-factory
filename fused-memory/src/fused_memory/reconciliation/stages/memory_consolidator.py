@@ -761,9 +761,20 @@ class MemoryConsolidator(BaseStage):
         # "the per-cycle write ceiling truncated them" — the same
         # 0-vs-N ambiguity this task was filed against.  (amendment,
         # reviewer_comprehensive observability finding)
+        # The enumeration-completeness pair is surfaced for the SAME reason
+        # and by the same argument (task 4386): a bare _scanned/_invalidated
+        # pair cannot distinguish a clean cycle over the WHOLE corpus from a
+        # clean cycle over whatever part of it could be fetched.  When
+        # `..._enumeration_complete` is not True, this cycle's counts describe
+        # a partial corpus and its absences are not evidence;
+        # `..._enumeration_incomplete_kind` names which way it was partial.
+        # Two additions, one pattern — 0-vs-N ambiguities resolved in the
+        # stats rather than left for a reader to reconstruct from logs.
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
-        # these stats is set for this cycle.
+        # these stats is set for this cycle.  That includes the enumeration
+        # pair: ABSENT is honest for a sweep that raised, where False would
+        # claim a corpus was observed and found incomplete.
         try:
             snapshot_sweep_stats = await sweep_stale_status_snapshot_edges(
                 self.memory, self.taskmaster, self.project_id, self.project_root,
@@ -795,6 +806,12 @@ class MemoryConsolidator(BaseStage):
             report.stats['stale_blocked_edges_supersede_skipped'] = (
                 snapshot_sweep_stats['supersede_skipped']
             )
+            report.stats['stale_status_snapshot_edges_enumeration_complete'] = (
+                snapshot_sweep_stats['enumeration_complete']
+            )
+            report.stats['stale_status_snapshot_edges_enumeration_incomplete_kind'] = (
+                snapshot_sweep_stats['enumeration_incomplete_kind']
+            )
 
         # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────
         # Invalidate VALID (invalid_at IS NULL) priority-override / pin-queue
@@ -802,6 +819,11 @@ class MemoryConsolidator(BaseStage):
         # (override consumed by dispatch/clear_terminal or expired-and-cleared by
         # clear_expired) or whose TTL edge's live ttl_until has elapsed, via a
         # deterministic direct-lookup sweep beside the task 2613 sweep above.
+        # Carries the same enumeration-completeness pair as the task 2613
+        # sweep above, under its own prefix and from its own read: the two key
+        # sets are INDEPENDENT, so a truncated corpus for one sweep never
+        # marks the other.  Same meaning in both places — not True means this
+        # cycle's counts describe whatever corpus could be fetched.  (4386)
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and no
         # stale_priority_override_edges_* stat is set for this cycle.
@@ -827,6 +849,12 @@ class MemoryConsolidator(BaseStage):
             report.stats['stale_priority_override_edges_scanned'] = (
                 priority_override_sweep_stats['scanned']
             )
+            report.stats['stale_priority_override_edges_enumeration_complete'] = (
+                priority_override_sweep_stats['enumeration_complete']
+            )
+            report.stats[
+                'stale_priority_override_edges_enumeration_incomplete_kind'
+            ] = priority_override_sweep_stats['enumeration_incomplete_kind']
 
         # ── Deterministic per-cycle summary write (task 2229 W5-λ) ────────────
         # Python writes the authoritative cycle_summary ledger row directly
