@@ -122,7 +122,7 @@ The Greek form is the convention, not an arbitrary pick:
   `"prd_task_label": "α"`.
 
 So `gamma-1/2/3` are the deviants. **This task remediates them by realigning the task metadata to
-the sidecar** — never by renaming the sidecar's
+the sidecar** (see [What was changed](#what-was-changed)) — never by renaming the sidecar's
 labels, which belongs to task 4545. Task **4628** is the source-level fix that stops the class
 recurring, by making `missing_labels` non-advisory at `commit_planning` time; this sweep repairs
 the three existing rows, which 4628 does not do.
@@ -148,6 +148,41 @@ records the divergence as **measured properties** — length, angle-bracket and 
 a `sha256` prefix for each side — which is reproducible by a third party without either value
 ever being written down. Verified after generation by hashing every substring of both artifacts:
 neither literal appears.
+
+## What was changed
+
+The one remediation this sweep applied. It is recorded here because a task-store write leaves no
+diff — these three files are its only durable trace.
+
+| task | `metadata.prd_task_label` before | after | status |
+|---|---|---|---|
+| 3690 | `gamma-1` | `γ1` | done |
+| 4457 | `gamma-2` | `γ2` | done |
+| 4458 | `gamma-3` | `γ3` | done |
+
+Applied as three `update_task` calls passing **only** `{"prd_task_label": "<greek>"}`, inheriting
+the default shallow last-write-wins metadata merge so every sibling key survives. The whole
+metadata blob was deliberately *not* sent back: this repo has a documented class of whole-blob
+metadata writers clobbering sibling keys (tasks 3260, 3933, 4507).
+
+**Verified rather than assumed**, both ways:
+
+- Re-read all three records afterwards and byte-compared *every* metadata key against the
+  pre-write capture. `keys_changed` is exactly `["prd_task_label"]` on all three; key counts are
+  unchanged (21 / 21 / 20); `delivered_checks` and `prd_path` are byte-identical. Zero sibling
+  keys clobbered.
+- Re-ran the corpus-wide label sweep. Unmatched labels fell **24 → 21**, a delta of exactly −3,
+  clearing exactly `{3690, 4457, 4458}` with **no** row newly appearing. A larger drop would have
+  meant something else moved, and would have stopped this step.
+- The unrelated findings are unchanged: `unstamped_labels` still `[]`, `missing_delivered_checks`
+  still `[]`, and the δ/3691 descriptor divergence still present and still deferred.
+
+All three tasks are `done`, and the change is still safe: `prd_task_label` is provenance-only — a
+blessed key in `shared/src/shared/task_metadata.py` whose sole functional consumer is
+`manifest_stamping` (verified by grep across every `*.py`). Nothing re-reads it to make a decision
+about a completed task.
+
+See `report.json` → `remediation` for the full before/after record.
 
 ## Reproducing
 

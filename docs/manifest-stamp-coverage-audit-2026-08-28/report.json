@@ -609,5 +609,73 @@
         ]
       }
     ]
+  },
+  "remediation": {
+    "applied_at": "2026-08-28T22:54:52Z",
+    "what": "Realigned metadata.prd_task_label to the sidecar's own label spelling on the three transliterated tasks.",
+    "direction": "tasks -> sidecar (the sidecar is owned by in-flight task 4545; the Greek form is the convention)",
+    "procedure": "three mcp__fused-memory__update_task calls passing ONLY {'prd_task_label': '<greek>'}, inheriting the default shallow last-write-wins metadata merge ({**existing, **incoming}). The whole metadata blob was deliberately NOT sent back — this repo has a documented class of whole-blob writers clobbering sibling keys (tasks 3260, 3933, 4507).",
+    "changes": [
+      {
+        "task_id": "3690",
+        "prd_task_label_before": "gamma-1",
+        "prd_task_label_after": "γ1",
+        "task_status": "done",
+        "metadata_key_count_before": 21,
+        "metadata_key_count_after": 21,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      },
+      {
+        "task_id": "4457",
+        "prd_task_label_before": "gamma-2",
+        "prd_task_label_after": "γ2",
+        "task_status": "done",
+        "metadata_key_count_before": 21,
+        "metadata_key_count_after": 21,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      },
+      {
+        "task_id": "4458",
+        "prd_task_label_before": "gamma-3",
+        "prd_task_label_after": "γ3",
+        "task_status": "done",
+        "metadata_key_count_before": 20,
+        "metadata_key_count_after": 20,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      }
+    ],
+    "verification": {
+      "method": "re-read all three records after the writes and byte-compared every metadata key against the pre-write capture, then re-ran the corpus-wide label sweep",
+      "sibling_keys_clobbered": 0,
+      "keys_changed_across_all_three": [
+        "prd_task_label"
+      ],
+      "corpus_unmatched_labels_before": 24,
+      "corpus_unmatched_labels_after": 21,
+      "expected_delta": -3,
+      "observed_delta": -3,
+      "rows_cleared": [
+        "3690",
+        "4457",
+        "4458"
+      ],
+      "rows_newly_appeared": [],
+      "this_sidecar_label_mismatches_after": 0,
+      "unrelated_findings_unchanged": "unstamped_labels still []; missing_delivered_checks still []; the single delta/3691 pattern divergence is unchanged and still deferred to task 4545"
+    },
+    "safety_basis": "prd_task_label is provenance-only: a blessed key in shared/src/shared/task_metadata.py whose sole functional consumer is manifest_stamping (verified by grep across all *.py). That is why realigning it is safe even though all three tasks are already done.",
+    "note_on_corpus_rows": "corpus_unmatched_labels above records the PRE-remediation measurement (24 rows), which is the audit's finding. Post-remediation the same sweep returns 21; the 3 rows for this sidecar are cleared. The remaining 21 are out of scope and filed as a follow-up."
   }
 }
