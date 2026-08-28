@@ -30,6 +30,18 @@ cluster MALFORMEDNESS (wrong canonical count, an "absorbed" id still live, an
 unstamped cluster member) or on a view too incomplete to judge — never on peer
 count.
 
+The "unstamped cluster member" refusal in that list is REACHABLE IN
+PRODUCTION as of task 4808.  ``consolidation_gate.py::unstamped_candidates``
+narrows the gate's inert ``provenance.observed_members`` to the ids the live
+topic scroll cannot account for, and
+``consolidation_gate.py::resolve_unstamped_live_ids`` settles each with one
+injected point read.  Both production callers --
+``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
+and ``scripts/check_consolidation_closure.py::run`` -- now pass the result to
+``consolidation_gate.py::evaluate_closure``.  Before 4808 the reader and the
+writer both existed and nothing joined them, so the refusal was unreachable
+outside tests.
+
 ## Import-LEAF, deliberately
 
 ``middleware/task_interceptor.py`` imports this module, so this module's import
@@ -463,6 +475,12 @@ def evaluate_closure(
     why enforcing here subsumes task 3084's proposed auto-close by
     construction.
 
+    *unstamped_live_ids* are cluster members that are LIVE but do not carry
+    the gate's ``metadata.topic``, so the scroll cannot see them.  They are
+    derived by ``consolidation_gate.py::resolve_unstamped_live_ids`` from the
+    gate block's inert provenance, and BOTH production callers pass them as of
+    task 4808 -- the parameter is no longer test-only.
+
     It therefore refuses ONLY on cluster malformedness:
 
     * ``no_canonical`` / ``multiple_canonicals`` — the canonical count is not
@@ -885,7 +903,12 @@ def build_consolidation_gate_task(
     never stamped into the topic), never grant a pass.  That is what makes
     "inert" a structural property rather than a promise — pinned by the test
     asserting :func:`evaluate_closure` returns an identical verdict with and
-    without it.  Contrast DF gate 3036, whose hand-written enumeration under an
+    without it.  As of task 4808 the ADD half is MECHANICALLY true rather than
+    only intended: the two readers of this provenance are
+    ``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
+    and ``scripts/check_consolidation_closure.py::run``, both of which route
+    it through ``consolidation_gate.py::resolve_unstamped_live_ids`` -- a path
+    whose only possible output is a refusal reason.  Contrast DF gate 3036, whose hand-written enumeration under an
     invented ``metadata.memory_ids`` key was extended 7 to 8 by a later cycle
     while it still defined "done".
 
