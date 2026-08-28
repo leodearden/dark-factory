@@ -1779,6 +1779,183 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
         assert '42' in harness._recovered_plans
 
 
+class TestSessionResumeReasons:
+    """The composite eligibility predicate itself (task 3728, β / D5).
+
+    ``_session_resume_reasons`` returns a ``frozenset[str]`` of EVERY reason a
+    recovered session is ineligible; the EMPTY set means eligible. Called
+    directly here (no ``_run_slot``) because the point under test is the
+    predicate's own reporting fidelity, not the caller's routing.
+
+    The predecessor ``_session_resume_eligible`` returned ``(bool, reason)``
+    on the FIRST matching branch, so a session that was both stale AND
+    uncorroborated reported only ``stale`` — sending an operator to check NTP
+    for a session whose transcript had also vanished. Case (a) below is that
+    hidden co-occurrence, asserted directly.
+    """
+
+    def test_stale_and_no_transcript_co_occur(self, harness: Harness, tmp_path: Path):
+        """(a) HEADLINE — an AGED sidecar whose transcript is ALSO gone reports
+        BOTH reasons, not just the first one branch order happened to reach.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-both',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        # The config dir SURVIVES (so this is 'no_transcript', not 'reseeded')
+        # but holds no transcript for this session — mirrors
+        # test_transcript_absent_falls_back_no_transcript's fixture.
+        empty_cfg = tmp_path / 'claude-config-both'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+
+        assert reasons == frozenset({'stale', 'no_transcript'})
+
+    def test_eligible_is_the_empty_set(self, harness: Harness, tmp_path: Path):
+        """(b) Fresh + under cap + corroborated → NO reasons. Empty == eligible;
+        there is no 'eligible' pseudo-reason to disagree with a bool.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-ok',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
+
+        reasons = harness._session_resume_reasons(session, str(cfg_dir))
+
+        assert reasons == frozenset()
+        assert not reasons  # the eligibility predicate itself
+
+    def test_three_reasons_co_occur(self, harness: Harness, tmp_path: Path):
+        """(c) Aged AND capped AND provably-wiped store → all three."""
+        harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+        session = {
+            'session_id': 'uuid-three',
+            'role': 'implementer',
+            'started_at': (datetime.now(UTC) - timedelta(days=2)).isoformat(),
+            'resume_count': 3,
+        }
+        gone = tmp_path / 'gone-three' / 'claude-config-x'
+        assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
+
+        reasons = harness._session_resume_reasons(session, str(gone))
+
+        assert reasons == frozenset({'stale', 'capped', 'reseeded'})
+
+    def test_disabled_short_circuits_exactly(self, harness: Harness, tmp_path: Path):
+        """(d) The B6 kill switch is a property of the FEATURE, not the session:
+        it reports 'disabled' ALONE over the very inputs that would otherwise
+        yield {'stale','no_transcript'} (case a). Exact equality, so the
+        short-circuit exemption cannot silently widen to other predicates.
+        """
+        real = SessionResumeConfig()
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+        session = {
+            'session_id': 'uuid-dis',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * real.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-dis'
+        (empty_cfg / 'projects').mkdir(parents=True)
+
+        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+
+        assert reasons == frozenset({'disabled'})
+
+    def test_unparseable_or_absent_started_at_is_stale_only(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(e) Fail-safe freshness still degrades to 'stale' — and now WITHOUT
+        swallowing the corroboration leg: over a CORROBORATED dir the set is
+        exactly {'stale'}, proving the parse failure no longer returns early.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+
+        cfg1 = _make_transcript(tmp_path, 'uuid-bad')
+        r1 = harness._session_resume_reasons(
+            {'session_id': 'uuid-bad', 'role': 'r',
+             'started_at': 'not-a-date', 'resume_count': 0},
+            str(cfg1),
+        )
+        assert 'stale' in r1
+        assert 'no_transcript' not in r1
+
+        cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
+        r2 = harness._session_resume_reasons(
+            {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
+            str(cfg2),
+        )
+        assert 'stale' in r2
+        assert 'no_transcript' not in r2
+
+    def test_missing_corroboration_inputs_are_no_transcript(self, harness: Harness):
+        """(f1) No stashed config_dir, and no session_id, both stay 'no_transcript'
+        — an adopted session with nothing to corroborate against is pathological
+        and must stay LOUD rather than land in the silent 'reseeded' arm.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        fresh = datetime.now(UTC).isoformat()
+
+        no_dir = harness._session_resume_reasons(
+            {'session_id': 'uuid-nocfg', 'role': 'r',
+             'started_at': fresh, 'resume_count': 0},
+            None,
+        )
+        assert 'no_transcript' in no_dir
+
+        no_sid = harness._session_resume_reasons(
+            {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
+            '/some/where',
+        )
+        assert 'no_transcript' in no_sid
+
+    def test_unreadable_config_dir_stays_no_transcript_and_never_raises(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """(f2) I3 totality survives the rewrite: a PRESENT-but-UNREADABLE config
+        dir is a filesystem fault, not a lane wipe, so it stays a loud
+        'no_transcript' and the call does not raise.
+
+        The EACCES is INJECTED rather than produced with ``chmod(0o000)``, for
+        the reason :meth:`TestSessionResumeGuard.
+        test_unreadable_config_dir_stays_no_transcript` records: a root process
+        can stat through a 0o000 parent, which would make the row vacuous.
+        """
+        blocked = tmp_path / 'unreadable-r' / 'claude-config-x'
+        blocked.mkdir(parents=True)
+        real_stat = Path.stat
+
+        def fake_stat(self: Path, *args, **kwargs):
+            if self == blocked:
+                raise PermissionError(13, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', fake_stat)
+        harness.config.session_resume = SessionResumeConfig()
+
+        reasons = harness._session_resume_reasons(
+            {'session_id': 'uuid-eacces', 'role': 'r',
+             'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
+            str(blocked),
+        )
+
+        assert 'no_transcript' in reasons
+        assert 'reseeded' not in reasons
+
+
 @pytest.mark.asyncio
 class TestSessionResumeGuard:
     """γ eligibility guard in _run_slot (task 2774): an ineligible recovered
