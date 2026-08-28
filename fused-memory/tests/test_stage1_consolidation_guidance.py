@@ -34,7 +34,10 @@ from __future__ import annotations
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
 from fused_memory.reconciliation.prompts import STALE_KNOWLEDGE_ANNOTATION_NORM
-from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage1 import (
+    EXECUTING_A_CLUSTER_FOLD_HEADING,
+    STAGE1_SYSTEM_PROMPT,
+)
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
 # The MCP-prefixed tool id, as an agent must actually type it.  The BARE name
@@ -101,12 +104,15 @@ class TestStage1ExecutionContract:
     closed.
     """
 
-    def test_the_section_exists_exactly_once(self) -> None:
-        assert '## Executing a Cluster Fold' in STAGE1_SYSTEM_PROMPT
-        assert STAGE1_SYSTEM_PROMPT.count('## Executing a Cluster Fold') == 1
+    def test_the_section_is_not_duplicated(self) -> None:
+        # Presence is covered twice over already: `count(...) == 1` implies
+        # it, and `_section()` raises ValueError from `.index()` if the
+        # heading vanishes.  What is NOT otherwise covered is a SECOND copy,
+        # which would make every slice below silently scope to the first one.
+        assert STAGE1_SYSTEM_PROMPT.count(EXECUTING_A_CLUSTER_FOLD_HEADING) == 1
 
     def test_the_load_bearing_call_and_outcome_names_are_present(self) -> None:
-        section = _section('## Executing a Cluster Fold')
+        section = _section(EXECUTING_A_CLUSTER_FOLD_HEADING)
         # `canonical_content` and `topic` are REQUIRED parameters of the
         # shipped op — a caller cannot succeed without naming them — and the
         # rest are the id arms, the run attribution and the outcome field that
@@ -227,7 +233,7 @@ class TestSharedNormNamesTheSanctionedPath:
         # tool name — a fact true in both stages — never by that heading.
         # Same rule the constant's comment block already states for
         # "## UUID Resolution Discipline".
-        assert '## Executing a Cluster Fold' not in STALE_KNOWLEDGE_ANNOTATION_NORM
+        assert EXECUTING_A_CLUSTER_FOLD_HEADING not in STALE_KNOWLEDGE_ANNOTATION_NORM
 
     def test_it_keeps_the_survivor_naming_rule(self) -> None:
         # Anti-over-correction: `replacement_memory_id` stays right for the
@@ -257,7 +263,7 @@ class TestStage1IsToldTheGuardNowAppliesToIt:
         # It must be named where the fold is executed, not left to be
         # discovered from a refusal envelope — by then the agent is choosing
         # between "set the flag" and "give up", with no third option stated.
-        assert 'allow_near_duplicate' in _section('## Executing a Cluster Fold')
+        assert 'allow_near_duplicate' in _section(EXECUTING_A_CLUSTER_FOLD_HEADING)
 
     def test_the_soft_block_is_named_by_its_wire_identity(self) -> None:
         # `server/near_duplicate_guard.py` emits this exact `error_type`.
@@ -265,7 +271,7 @@ class TestStage1IsToldTheGuardNowAppliesToIt:
         # receives, rather than pattern-matching an English paraphrase.
         assert (
             'ProceduralKnowledgeNearDuplicateWriteRejected'
-            in _section('## Executing a Cluster Fold')
+            in _section(EXECUTING_A_CLUSTER_FOLD_HEADING)
         )
 
     def test_a_soft_block_is_routed_to_the_op_not_to_the_override(self) -> None:
@@ -273,7 +279,7 @@ class TestStage1IsToldTheGuardNowAppliesToIt:
         # prompt cannot name the escape hatch in one place and the sanctioned
         # path in another and leave the agent to connect them.  A soft-block
         # means the cluster already exists — which is a FOLD signal.
-        section = _section('## Executing a Cluster Fold')
+        section = _section(EXECUTING_A_CLUSTER_FOLD_HEADING)
         assert 'allow_near_duplicate' in section
         assert 'consolidate_memories' in section
 
@@ -286,4 +292,4 @@ class TestStage1IsToldTheGuardNowAppliesToIt:
         literal = "metadata={'allow_near_duplicate': True}"
         assert STAGE1_SYSTEM_PROMPT.count(literal) <= 1
         if literal in STAGE1_SYSTEM_PROMPT:
-            assert literal in _section('## Executing a Cluster Fold')
+            assert literal in _section(EXECUTING_A_CLUSTER_FOLD_HEADING)

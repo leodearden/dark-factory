@@ -19,6 +19,14 @@ from fused_memory.reconciliation.recon_self_model import (
     render_suppression_schema_section,
 )
 
+#: The cluster-fold execution section's title and heading (task 3134), exported
+#: so a rename moves the prompt and the wiring pins in
+#: ``tests/test_stage1_consolidation_guidance.py`` together.  Those tests slice
+#: the prompt by this heading; without the shared constant a pure rename with a
+#: byte-identical body turns them red for no behavioural reason.
+EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
+EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
 consolidate memories across two stores:
@@ -45,7 +53,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__consolidate_memories` — the SANCTIONED path for folding a \
 duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
 `add_memory`/`update_memory` plus N `delete_memory` sequence; see the \
-**Executing a Cluster Fold** section below for the contract.
+**{EXECUTING_A_CLUSTER_FOLD_TITLE}** section below for the contract.
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 {AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
@@ -77,7 +85,7 @@ invalidates task assumptions, completed work not reflected in tasks).
 
 {render_consolidation_gate_section(can_file_tasks=False)}
 
-## Executing a Cluster Fold
+{EXECUTING_A_CLUSTER_FOLD_HEADING}
 The section above states WHAT a folded cluster must look like when you are done. \
 This one states HOW to get there. Do not hand-roll it.
 
