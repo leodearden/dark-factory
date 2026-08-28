@@ -883,6 +883,158 @@ class TestUnstampedCandidates:
     def test_it_is_exported(self):
         assert 'unstamped_candidates' in consolidation_gate.__all__
 
+class _RecordingProbe:
+    """An ``exists`` collaborator that records every call it is given.
+
+    Hand-rolled rather than an ``AsyncMock`` so the recorded shape is the
+    exact ``(memory_id, *, project_id)`` contract under test — an AsyncMock
+    would accept any signature and pass a scoping slip silently.
+    """
+
+    def __init__(self, live=(), raises=None):
+        self.live = {str(i).lower() for i in live}
+        self.raises = raises
+        self.calls = []
+
+    async def __call__(self, memory_id, *, project_id):
+        self.calls.append((memory_id, project_id))
+        if self.raises is not None:
+            raise self.raises
+        return str(memory_id).lower() in self.live
+
+
+class TestResolveUnstampedLiveIds:
+    """The PROBE half of the bridge: which candidates are genuinely live.
+
+    A candidate absent from the scroll is either absorbed-and-deleted or
+    live-but-unstamped.  One point read per candidate settles it — and the
+    candidate list is empty on every well-formed gate, so the common path
+    issues no reads at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_live_candidate_is_returned(self):
+        """THE defect: live, but never stamped into the topic, therefore
+        invisible to the topic scroll."""
+        stray = _uuid(42)
+        probe = _RecordingProbe(live=[stray])
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([stray]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        ) == (stray,)
+
+    @pytest.mark.asyncio
+    async def test_an_absent_candidate_is_not_returned(self):
+        """Deleted without being claimed in `supersedes` is still an ABSORBED
+        id, not a stray — so the delete arm still closes."""
+        gone = _uuid(42)
+        probe = _RecordingProbe(live=[])
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([gone]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert len(probe.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_each_candidate_is_probed_exactly_once_and_scoped(self):
+        """A cross-project probe would judge one project\'s gate against
+        another project\'s memories — the same scoping argument
+        `TaskInterceptor.set_consolidation_scroll` makes for the scroll."""
+        a, b = _uuid(42), _uuid(43)
+        probe = _RecordingProbe(live=[a, b])
+        await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([a, b, a]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert probe.calls == [(a, 'dark_factory'), (b, 'dark_factory')]
+
+    @pytest.mark.asyncio
+    async def test_suppressed_ids_are_never_probed(self):
+        """The cheap subtraction runs FIRST: stamped, claimed and non-uuid ids
+        cost nothing."""
+        stamped, absorbed = _uuid(1), _uuid(42)
+        members = [
+            _member(stamped, canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2)),
+        ]
+        probe = _RecordingProbe(live=[stamped, absorbed])
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([stamped, absorbed, 'not-a-uuid']),
+                members=members,
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert probe.calls == []
+
+    @pytest.mark.asyncio
+    async def test_zero_candidates_never_awaits_the_probe(self):
+        """The measured 2026-08-27 corpus shape: every observed member is
+        already stamped, so all four known-good gates cost zero reads."""
+        probe = _RecordingProbe()
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(1), _uuid(2)]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+        assert probe.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_probe_is_dormant(self):
+        """Without a probe we cannot tell absorbed from unstamped, and guessing
+        \'unstamped\' would make every delete-arm consolidation uncloseable."""
+        assert (
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(42)]),
+                members=_well_formed_cluster(2),
+                exists=None,
+                project_id='dark_factory',
+            )
+            == ()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_propagates(self):
+        """Both callers own the fail-closed policy; swallowing here would let
+        an unreadable store read as \'no strays\'."""
+        probe = _RecordingProbe(raises=TimeoutError('qdrant timed out'))
+        with pytest.raises(TimeoutError):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov([_uuid(42)]),
+                members=_well_formed_cluster(2),
+                exists=probe,
+                project_id='dark_factory',
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_result_preserves_candidate_order(self):
+        a, b, c = _uuid(42), _uuid(43), _uuid(44)
+        probe = _RecordingProbe(live=[a, c])
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([c, b, a]),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        ) == (c, a)
+
+    def test_it_is_exported(self):
+        assert 'resolve_unstamped_live_ids' in consolidation_gate.__all__
+
 # --------------------------------------------------------------------------- #
 # Guard: the seam's import weight, and INV-5's single homes (step-15a)
 # --------------------------------------------------------------------------- #
