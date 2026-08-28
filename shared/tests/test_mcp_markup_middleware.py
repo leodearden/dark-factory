@@ -3930,6 +3930,151 @@ class TestOnePatternPerEvent:
         assert payload['recovered_params'] == ['where']
 
 
+class TestQuotedMarkupIsSurfacedNotSilent:
+    """Task **4502**: a recovery whose RECOVERED value still trips ``detect``.
+
+    Boundary row B5 was narrowed so that a faithful REPORT of a markup leak is
+    repaired rather than refused. That necessarily delivers a recovered value
+    still carrying a literal — the report quotes the pattern that tripped the
+    tripwire, and a recovered value is verbatim caller text under invariant D5.
+    Delivering it is the correct outcome: refusing drops exactly the characters
+    the PRD exists to stop dropping.
+
+    But it must be COUNTABLE. Per INV-2 and the repo's loud-over-silent-
+    degradation norm, the guard publishes ``quoted_markup_params`` — the SORTED
+    names of the recovered parameters whose delivered value still trips
+    ``detect`` — on the ``markup_detected`` fact and on BOTH policy payloads. A
+    caller mechanically retrying an offered ``repaired_call`` can then see WHY
+    it still carries a literal, and reach for the existing
+    ``allow_mcp_markup`` override, instead of looping against its own rejection.
+
+    NAMES ONLY, like ``recovered_params``: no fact or payload ever becomes a
+    second copy of the caller's data.
+    """
+
+    #: ``detail`` mis-closes with its own tag, a clean ``project_root`` pair
+    #: follows, and ``suggested_action`` is a final unterminated opener whose
+    #: value QUOTES the content closer — the shape of a leak report. Two
+    #: recovered siblings, exactly ONE of them quoting, so the new field cannot
+    #: pass by accidentally echoing ``recovered_params``.
+    CLEAN = 'The write-time tripwire fired on a value that had absorbed its siblings.'
+    ACTION = (
+        'Narrow the guard; the report quotes matched_pattern='
+        + _closer('content')
+        + ' verbatim, which is caller text, not a leak.'
+    )
+    DETAIL = (
+        CLEAN
+        + _closer('detail') + '\n'
+        + _canonical_opener('project_root') + '/home/leo/src/dark-factory'
+        + '\x3c/parameter>' + '\n'
+        + _canonical_opener('suggested_action') + ACTION
+    )
+
+    ARGS = {'summary': 'A markup leak was reported', 'detail': DETAIL}
+
+    async def _forwarded(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('escalate_info', dict(self.ARGS))
+        return h, result
+
+    async def test_the_call_is_FORWARDED_not_refused(self):
+        """(a) The whole point of the narrowing: those characters land.
+
+        Before task 4502 this shape returned ``None`` from ``repair`` and
+        routed to the unrepairable path, so the recommendation and the evidence
+        were dropped on the floor while the guard reported success at refusing.
+        """
+        h, _ = await self._forwarded()
+
+        assert [f['outcome'] for f in h.facts] == ['repaired']
+        assert h.facts[0]['recovered_params'] == ['project_root', 'suggested_action']
+        assert h.recorder.args == {
+            'tool': 'escalate_info',
+            'summary': 'A markup leak was reported',
+            'detail': self.CLEAN,
+            'suggested_action': self.ACTION,
+            'project_root': '/home/leo/src/dark-factory',
+        }
+
+    async def test_the_fact_names_the_quoting_parameter(self):
+        """(b) The new tenth key on the ``markup_detected`` fact.
+
+        ``project_root`` is recovered too and is clean, so this cannot pass by
+        echoing ``recovered_params``.
+        """
+        h, _ = await self._forwarded()
+
+        assert h.facts[0]['quoted_markup_params'] == ['suggested_action']
+
+    async def test_the_forward_meta_names_the_quoting_parameter(self):
+        """(c) Same list on the ToolResult meta a forwarded caller reads."""
+        _, result = await self._forwarded()
+
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == [
+            'suggested_action'
+        ]
+
+    async def test_the_reject_payload_names_the_quoting_parameter(self):
+        """(d) Same list on the refusal payload, which is the load-bearing one.
+
+        Under ``REJECT_WITH_REPAIR`` the caller is handed a ``repaired_call``
+        to resubmit verbatim — and that call still carries a literal, so a
+        caller retrying it mechanically would be rejected again. Naming the
+        parameter is what turns an infinite retry loop into an adjudicable
+        report.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('escalate_info', dict(self.ARGS))
+        payload = _reject_payload(excinfo)
+
+        assert payload['quoted_markup_params'] == ['suggested_action']
+        # The claim is TRUE of the offered call, not merely asserted about it.
+        assert detect(payload['repaired_call']['suggested_action']) is not None
+        assert detect(payload['repaired_call']['project_root']) is None
+
+    async def test_an_ordinary_repair_reports_the_field_PRESENT_AND_EMPTY(self):
+        """(e) THE NEGATIVE CONTROL, and the shape convention.
+
+        Present-and-empty rather than absent, matching this file's existing
+        convention that ``misclose`` is present-and-null on the unrepairable
+        path: a consumer must never have to tell "nothing quoted" apart from
+        "that emitter forgot the key".
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'submit_task',
+            {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+        )
+
+        assert h.facts[0]['recovered_params'] == ['priority']
+        assert h.facts[0]['quoted_markup_params'] == []
+        assert meta_of(result)['markup_repair']['quoted_markup_params'] == []
+
+    async def test_an_unrepairable_value_reports_it_present_and_empty_too(self):
+        """(e), continued — the path with no ``Repair`` at all.
+
+        There is nothing recovered to inspect, so the answer is the empty list
+        for the same present-and-empty reason, not an omitted key.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_reuse_item',
+                {
+                    'what': 'w',
+                    'how': specimen(TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID)['value'],
+                    'where': 'shared/',
+                },
+            )
+
+        assert h.facts[0]['outcome'] == 'unrepairable'
+        assert h.facts[0]['quoted_markup_params'] == []
+
+
 def test_this_module_spells_no_raw_envelope_literal():
     """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
 
