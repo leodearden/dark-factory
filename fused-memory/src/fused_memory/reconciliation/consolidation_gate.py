@@ -71,6 +71,7 @@ __all__ = [
     'evaluate_closure',
     'render_consolidation_gate_section',
     'render_end_state_brief',
+    'unstamped_candidates',
 ]
 
 # The Tier-C ``x_``-prefixed gate block under which a consolidation gate carries
@@ -232,6 +233,84 @@ def _payload_id(payload: Any) -> str:
         return ''
     value = payload.get('id')
     return str(value) if value is not None else ''
+
+
+def unstamped_candidates(
+    gate_block: Any,
+    *,
+    members: Sequence[Any],
+) -> tuple[str, ...]:
+    """The observed ids that must be PROBED before the cluster can be judged.
+
+    PURE — no I/O.  Returns ``provenance.observed_members`` MINUS the live
+    topic-scroll ids MINUS the canonical's ``supersedes`` claim.
+
+    THESE ARE NOT "THE UNSTAMPED IDS".  An observed id missing from the topic
+    scroll is AMBIGUOUS: it was either absorbed and deleted (correct), or it
+    is still live and simply never got stamped into the topic (the defect
+    ``consolidation_gate.py::evaluate_closure`` names
+    ``unstamped_cluster_member``).  Nothing readable here can tell those
+    apart, so this function narrows the set and
+    ``consolidation_gate.py::resolve_unstamped_live_ids`` settles it with one
+    point read per survivor.
+
+    WHY THE CANONICAL'S ``supersedes`` IS SUBTRACTED HERE.  A delete-arm
+    consolidation deletes its absorbed members and records them in the
+    canonical's ``supersedes``; every one of those ids is, correctly, absent
+    from the scroll.  Reporting them would make a correctly executed
+    consolidation permanently uncloseable — the same class of error
+    ``consolidation_gate.py::evaluate_closure`` warns about in its central
+    membership property when it explains why peer COUNT is never a refusal.
+    Only the CANONICAL's claim counts, and only when exactly one canonical
+    exists, exactly as ``consolidation_gate.py::_classify_supersedes`` rules:
+    a non-canonical peer's stale ``supersedes`` is not what the gate asserted.
+
+    Defensive on every shape.  A ``gate_block`` that is not a Mapping, a
+    missing/non-Mapping ``provenance``, and an ``observed_members`` that is
+    absent, not a Sequence, or a bare ``str``/``bytes`` all yield ``()``
+    rather than raising — this predicate's job is to REPORT malformedness,
+    and one that dies on bad input blocks the very gates it exists to
+    adjudicate (the same reasoning as :func:`_payload_meta`).
+
+    Non-uuid observed ids are dropped: they cannot be probed, so a refusal
+    over them could never be substantiated.  The returned ids keep their
+    ORIGINAL spelling (matching is case-folded, reporting is not) so a
+    refusal names the id exactly as the gate recorded it.
+    """
+    block = gate_block if isinstance(gate_block, Mapping) else {}
+    provenance = block.get('provenance')
+    if not isinstance(provenance, Mapping):
+        return ()
+    observed = provenance.get('observed_members')
+    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
+        return ()
+
+    # Identical comprehension to `evaluate_closure`'s own `live_ids`, so the
+    # derivation and the predicate cannot disagree about what the scroll saw.
+    live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
+
+    # Only the canonical's claim, and only when there is exactly one — with
+    # two canonicals there is no single cluster claim to trust (the gate is
+    # refusing on `multiple_canonicals` regardless).
+    claimed: set[str] = set()
+    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
+    if len(canonicals) == 1:
+        claimed = {
+            str(m).lower()
+            for m in normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
+        }
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in observed:
+        if not is_full_uuid(raw):
+            continue
+        folded = str(raw).lower()
+        if folded in live_ids or folded in claimed or folded in seen:
+            continue
+        seen.add(folded)
+        candidates.append(str(raw))
+    return tuple(candidates)
 
 
 def evaluate_closure(
