@@ -1862,10 +1862,7 @@ def staleness_pass() -> None:
     """
     if _within_fleet_deploy_min_interval():
         # Bucket on wall-clock time (not elapsed-since-deploy) — see
-        # SKIP_LOG_INTERVAL_SECS above. The head-start gate below takes a
-        # SECOND small-JSON clock read on ticks where this first gate is open,
-        # deliberately: each gate keeps its own named reader seam rather than
-        # threading one epoch through both (task 4754).
+        # SKIP_LOG_INTERVAL_SECS above.
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 "skip: within fleet-deploy min-interval "
@@ -1873,6 +1870,11 @@ def staleness_pass() -> None:
             )
         return
 
+    # This gate takes a SECOND small-JSON clock read, on exactly those ticks
+    # where the min-interval gate above has already expired and let the tick
+    # through (a blocked tick returns above and never reaches here). That
+    # second read is deliberate: each gate keeps its own named reader seam
+    # rather than threading one epoch through both (task 4754).
     if _within_fleet_staleness_head_start():
         # Same bucket idiom as the gate above: the gate CHECK still runs every
         # tick, only the log EMISSION is throttled.
@@ -1984,11 +1986,7 @@ def fused_memory_staleness_pass() -> None:
     """
     if _within_fm_deploy_min_interval():
         # Bucket on wall-clock time — see SKIP_LOG_INTERVAL_SECS. The gate
-        # check still runs every tick; only the log emission is throttled. The
-        # head-start gate below takes a SECOND small-JSON clock read on ticks
-        # where this first gate is open, deliberately: each gate keeps its own
-        # named reader seam rather than threading one epoch through both
-        # (task 4754).
+        # check still runs every tick; only the log emission is throttled.
         if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
             log(
                 "skip: within fm-deploy min-interval "
@@ -1996,6 +1994,11 @@ def fused_memory_staleness_pass() -> None:
             )
         return
 
+    # This gate takes a SECOND small-JSON clock read, on exactly those ticks
+    # where the fm min-interval gate above has already expired and let the tick
+    # through (a blocked tick returns above and never reaches here). That
+    # second read is deliberate: each gate keeps its own named reader seam
+    # rather than threading one epoch through both (task 4754).
     if _within_fm_staleness_head_start():
         # Same bucket idiom as the gate above: the gate CHECK still runs every
         # tick, only the log EMISSION is throttled.
