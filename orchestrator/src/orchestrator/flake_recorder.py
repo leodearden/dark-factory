@@ -34,6 +34,7 @@ import cycle with either.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -119,6 +120,27 @@ def _bump_suppression_streak_and_maybe_escalate(
     function at all — recording happens on the dispatcher, which HAS a queue —
     so a ``None`` queue now means only a CLI or test caller, not the
     CPU-starvation target this gate addresses (the α scope fence).
+
+    ONE MERGE CAN CONTRIBUTE MORE THAN ONE UNIT TO THE WINDOW, and that is
+    deliberate: the unit is a SUPPRESSION (one red masked), never a merge.  Two
+    routes reach two units for a single merge SHA, both of which really did mask
+    two separate reds:
+
+    * a REMOTE green that suppressed, then cross-checked by the local trust
+      anchor (``merge_queue._run_post_merge_verify``'s task-2822 branch) whose
+      own gate also suppressed — two independent gate runs on two different
+      hosts.  Recording both is what makes ``FlakeSuppression.runner`` able to
+      answer θ's class-3 question (same tests suppressed on BOTH hosts ⇒ the
+      SUITE, not the host);
+    * a suppressed scoped red whose attempt was then superseded by an
+      infra-transient retry — the superseded observation is still an
+      observation (§5.5).
+
+    Before ε the remote leg emitted nothing at all on the first route, so that
+    path effectively bumped once per merge; the count is now higher there
+    because it is now COMPLETE, not because it is double-counting.  Anything
+    reading this counter as "merges since reset" is misreading it — read the
+    ``flake_occurrence`` rows, which carry ``merge_sha`` and can be grouped.
     """
     global _merge_flake_suppression_streak
     _merge_flake_suppression_streak += 1
@@ -215,10 +237,14 @@ def record_merge_flake_suppression(
 
     NEVER RAISES (B12).  A ledger write, an event emit or an escalation submit
     failing is a lost measurement; letting it propagate would fail a VERIFY, or
-    stall the merge queue, over bookkeeping.  The catch-all is the outer boundary —
-    ``record_flake_occurrence`` has its own B12 guard inside it, so a broken ledger
-    degrades to a warning and the event and streak still fire, which is why losing
-    one signal here does not cost the other two.
+    stall the merge queue, over bookkeeping.
+
+    The three side-effects are INDEPENDENTLY guarded — one ``try`` each — so losing
+    one really does not cost the others.  A single shared ``try`` made that claim
+    false by ordering alone: an ``event_store.emit`` that raised (a locked or closed
+    sqlite store) would skip straight to the catch-all and the streak bump would
+    never run, so a broken event store silently disarmed the INV-4 storm detector —
+    the one signal whose whole job is to fire when something is going wrong.
 
     None-safe on both stores: the CLI and any storeless caller still contribute the
     durable row.
@@ -231,27 +257,62 @@ def record_merge_flake_suppression(
         # sentinel row for it would put fiction in the evidence trail.
         return
 
-    try:
-        record_flake_occurrence(
+    def _guarded(what: str, fn: Callable[[], None]) -> None:
+        """Run one side-effect under its OWN catch-all, so a failure costs exactly
+        that signal.  Also guards the verdict read itself: `s` is an un-validated
+        wire object, so even `s.verdict` can fail on a malformed payload."""
+        try:
+            fn()
+        except Exception:
+            logger.warning(
+                'flake_recorder: failed to record merge flake suppression [%s] '
+                '(merge_sha=%s, task_id=%s); the merge/verify is unaffected',
+                what,
+                merge_sha,
+                task_id,
+                exc_info=True,
+            )
+
+    _guarded(
+        'ledger',
+        lambda: record_flake_occurrence(
             ledger_db_path(project_root),
             project_id,
             s,
             merge_sha=merge_sha or None,
             task_id=task_id,
-        )
+        ),
+    )
 
-        if s.verdict == FlakeVerdict.passes_in_isolation:
-            _emit_merge_flake_suppressed(
-                event_store, task_id, merge_sha, list(s.test_ids),
-            )
-            _bump_suppression_streak_and_maybe_escalate(
-                escalation_queue, task_id, merge_sha,
-            )
+    # Read the verdict once, under its own guard, so a malformed observation cannot
+    # decide the two live signals by raising.  Defaults to False = "not a suppression",
+    # which is the fail-safe reading: a bogus event and a phantom streak bump would be
+    # worse than a missing one.
+    suppressed = False
+    try:
+        suppressed = s.verdict == FlakeVerdict.passes_in_isolation
     except Exception:
         logger.warning(
-            'flake_recorder: failed to record merge flake suppression '
-            '(merge_sha=%s, task_id=%s); the merge/verify is unaffected',
+            'flake_recorder: unreadable verdict on the carried observation '
+            '(merge_sha=%s, task_id=%s); skipping the event and the streak bump',
             merge_sha,
             task_id,
             exc_info=True,
+        )
+
+    if suppressed:
+        _guarded(
+            'event',
+            lambda: _emit_merge_flake_suppressed(
+                event_store, task_id, merge_sha, list(s.test_ids),
+            ),
+        )
+        # Its OWN guard, and deliberately AFTER the emit rather than inside it: the
+        # storm detector is the escape hatch for "α is masking too much", so it must
+        # survive a broken event store rather than being taken down with it.
+        _guarded(
+            'streak',
+            lambda: _bump_suppression_streak_and_maybe_escalate(
+                escalation_queue, task_id, merge_sha,
+            ),
         )

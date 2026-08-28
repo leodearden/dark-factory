@@ -317,6 +317,37 @@ class TestRecordMergeFlakeSuppression:
         assert len(es.emits) == 1, es.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
 
+    def test_a_raising_event_store_does_not_disarm_the_storm_detector(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """B12, the other ordering: a broken EVENT store must not take the INV-4
+        streak down with it.
+
+        The three side-effects share a never-raise contract, but with ONE shared
+        ``try`` that contract was order-dependent: an ``emit`` that raised (a locked
+        or closed sqlite store) jumped straight to the catch-all and the bump never
+        ran — so the one signal whose entire job is to fire when something is going
+        wrong was the first thing a failure switched off.  Each side-effect gets its
+        own guard, so the ledger row and the streak both survive.
+        """
+
+        class _ExplodingEventStore:
+            def emit(self, *a, **kw):
+                raise RuntimeError('database is locked')
+
+        q = _FakeEscalationQueue()
+        with caplog.at_level(logging.WARNING):
+            _record(
+                _result(_suppression()), tmp_path,
+                event_store=_ExplodingEventStore(), escalation_queue=q,
+            )
+
+        assert len(_occurrences(tmp_path)) == 2, 'the ledger row is independent'
+        assert flake_recorder._merge_flake_suppression_streak == 1, (
+            'a broken event store must not disarm the storm detector'
+        )
+        assert 'database is locked' in caplog.text, 'the loss must be loud'
+
     # -- (g) the CLI / storeless caller ---------------------------------------
 
     def test_none_stores_still_write_the_ledger_row(self, tmp_path: Path) -> None:
