@@ -769,3 +769,77 @@ class TestIdempotency:
         )
         assert first['changes'] == second['changes']
         assert first['totals'] == second['totals']
+
+
+class TestBuildParser:
+    def test_dry_run_is_the_default(self):
+        # THE safety property of the CLI surface: an operator who forgets the
+        # flag gets a report, not a corpus mutation.
+        args = _mod.build_parser().parse_args([])
+        assert args.apply is False
+
+    def test_apply_is_opt_in(self):
+        args = _mod.build_parser().parse_args(['--apply'])
+        assert args.apply is True
+
+    def test_project_id_defaults_to_dark_factory(self):
+        args = _mod.build_parser().parse_args([])
+        assert args.project_id == 'dark_factory'
+
+    def test_project_id_is_overridable(self):
+        args = _mod.build_parser().parse_args(['--project-id', 'reify'])
+        assert args.project_id == 'reify'
+
+
+class TestResolveExitCode:
+    """An operator must be able to gate on the exit code without parsing."""
+
+    @staticmethod
+    def _report(*actions, dry_run=False, applied=()):
+        decisions = [
+            _decision(f'id-{i}', action) for i, action in enumerate(actions)
+        ]
+        return _mod.build_amend_report(
+            decisions, applied_ids=set(applied), dry_run=dry_run,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+
+    def test_clean_dry_run_exits_zero(self):
+        assert _mod.resolve_exit_code(self._report('amend', 'amend', dry_run=True)) == 0
+
+    def test_fully_applied_run_exits_zero(self):
+        report = self._report('amend', 'amend', applied=('id-0', 'id-1'))
+        assert _mod.resolve_exit_code(report) == 0
+
+    def test_all_skipped_run_exits_zero(self):
+        report = self._report('skip:already_amended', 'skip:already_amended')
+        assert _mod.resolve_exit_code(report) == 0
+
+    def test_any_refusal_exits_one(self):
+        report = self._report('amend', 'refuse:precondition_failed', applied=('id-0',))
+        assert _mod.resolve_exit_code(report) == 1
+
+    @pytest.mark.parametrize('action', sorted(_mod.ERROR_OUTCOMES))
+    def test_every_named_error_outcome_exits_one(self, action):
+        assert _mod.resolve_exit_code(self._report(action)) == 1
+
+    def test_error_outcomes_is_exactly_the_refuse_namespace(self):
+        # Named ONCE so the report and the exit code cannot drift on what
+        # "clean" means. Every member is a refusal and nothing else is.
+        assert all(a.startswith('refuse:') for a in _mod.ERROR_OUTCOMES)
+
+    def test_exit_code_and_report_totals_agree_on_what_is_clean(self):
+        # The agreement itself, not two independently-maintained lists.
+        for action in sorted(_mod.ERROR_OUTCOMES):
+            report = self._report(action)
+            assert report['totals']['refused'] == 1
+            assert _mod.resolve_exit_code(report) == 1
+
+    def test_every_refusal_the_code_can_emit_is_named_in_error_outcomes(self):
+        # Guards the drift this set exists to prevent: a new refuse:* outcome
+        # added to the script but not to ERROR_OUTCOMES would exit 0 and read
+        # to an automated caller as success.
+        import re
+        source = SCRIPT_PATH.read_text()
+        emitted = set(re.findall(r"'(refuse:[a-z_]+)'", source))
+        assert emitted <= set(_mod.ERROR_OUTCOMES)
