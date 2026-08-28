@@ -49,6 +49,7 @@ _RESCUE_PATH = 'select_judge_candidates'
 _BYTE_IDENTICAL = 'byte-identical'
 _MARKS_FIRST = 'distinguishes slate[0]'
 _SWAP_HELD = 'rendering depends on which candidate is the attach target'
+_OPTION_A_HELD = 'the verdict itself names its candidate'
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +236,54 @@ def build_judge_prompt(content, candidates, attach_target_id=None):
 def parse_judge_verdict(raw):
     return _parse_bare_str(raw)
 ''',
+    # OPTION (a): the prompt marks nothing — main's two-argument
+    # build_judge_prompt and its flat list — but the VERDICT carries the judged
+    # candidate, so the model's answer names its own candidate and slate
+    # position becomes irrelevant. The shape task 4762's own design decision
+    # says option (a) produces: an (outcome, candidate_id) pair.
+    'option_a': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw, candidate_ids=None):
+    payload = json.loads(raw)
+    word = payload.get(VERDICT_KEY)
+    verdict = JUDGE_VERDICTS.get(str(word).strip().lower())
+    if verdict is None:
+        raise ValueError('not a judge verdict word')
+    return (verdict, payload.get('candidate_id'))
+''',
+    # A STRICTER option (a): the parser refuses a verdict that carries no
+    # candidate id at all, and refuses one naming a candidate outside the
+    # slate. It therefore RAISES on a bare {"verdict": ...} payload — which
+    # must be read as inconclusive for the branch, not as a failure.
+    'option_a_rejects_dangling': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw, candidate_ids=None):
+    payload = json.loads(raw)
+    word = payload.get(VERDICT_KEY)
+    verdict = JUDGE_VERDICTS.get(str(word).strip().lower())
+    if verdict is None:
+        raise ValueError('not a judge verdict word')
+    candidate_id = payload.get('candidate_id')
+    if not isinstance(candidate_id, str):
+        raise ValueError('verdict carries no candidate_id')
+    if candidate_ids is not None and candidate_id not in candidate_ids:
+        raise ValueError('verdict names a candidate outside the slate')
+    return (verdict, candidate_id)
+''',
 }
 
 
@@ -357,3 +406,40 @@ class TestSwapAndRescuePath:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, f'probe pinned prompt wording:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
+
+
+class TestOptionAAcceptance:
+    """The gate is MECHANISM-AGNOSTIC: it asserts the invariant, not which fix
+    landed.
+
+    Task 4810's root defect is that item 1 hard-required option (a) while its
+    only dependency (4762) implements option (b). Pinning option (b) instead
+    would reproduce that defect mirrored — task 4798 item 7 still carries
+    option (a) as the better long-term design, and an option-(b)-shaped gate
+    would fail it and re-block 3169 all over again. So EITHER remedy closes
+    the gate, and a later option-(a) landing needs no further gate edit.
+    """
+
+    def test_verdict_carrying_its_candidate_passes_with_an_unmarked_prompt(self, tmp_path):
+        """Position is irrelevant once the answer names its own candidate."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe failed option (a):\n{proc.stdout}\n{proc.stderr}'
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_stricter_parser_demanding_a_candidate_id_also_passes(self, tmp_path):
+        """A parser that REJECTS a verdict carrying no candidate id — and one
+        naming a candidate outside the slate — is a stronger option (a), not a
+        failure. Raising on the probe's plainest payload must not be misread."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a_rejects_dangling')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe failed a strict option (a):\n{proc.stdout}\n{proc.stderr}'
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_todays_main_shape_still_fails(self, tmp_path):
+        """Regression guard: the option-(a) branch must not accidentally pass
+        a bare-str verdict paired with an unmarked prompt, i.e. main today."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='flat')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'option (a) branch passed main:\n{proc.stdout}'
+        assert _INDETERMINATE in proc.stdout, proc.stdout
