@@ -1684,6 +1684,46 @@ def test_wait_for_path_require_nonempty_waits_for_content_to_land(
     assert int(pidfile.read_text().strip()) == 12345
 
 
+def test_wait_for_path_scaled_forwards_require_nonempty(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both production pidfile gates
+    (test_window_close_yields_129_not_hang and
+    test_window_close_129_robust_to_delayed_trap_install) reach
+    require_nonempty=True through _wait_for_path_scaled, never through
+    _wait_for_path directly -- so the two tests above, which call
+    _wait_for_path directly, cannot catch a dropped forwarding (or a
+    default of False re-hardcoded at the call site inside
+    _wait_for_path_scaled). Mirrors the extra_secs-forwarding precedent in
+    test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base:
+    an argument must be proven to reach _wait_for_path itself, not just the
+    return value.
+
+    Idle-host load settings (mirroring
+    test_wait_for_path_scaled_idle_host_floors_at_base) keep the budget
+    floored at base_secs, so this stays fast and host-load-independent
+    instead of scaling unpredictably. An exists-only predicate would return
+    instantly on this existing-but-empty file; forwarding must make it
+    time out instead.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing_empty = tmp_path / "empty"
+    existing_empty.touch()
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="become non-empty"):
+        _wait_for_path_scaled(existing_empty, 1, require_nonempty=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 1.0, (
+        f"expected the base_secs=1 budget to be spent waiting for content "
+        f"(exists-only would have returned instantly); only waited "
+        f"{elapsed:.2f}s"
+    )
+
+
 # ===========================================================================
 # Task 3599: _spawn_run_budget -- load-scaled must-not-hang guard for _run_spawn
 # ===========================================================================
