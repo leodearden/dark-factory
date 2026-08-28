@@ -262,6 +262,88 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     )
 
 
+def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
+    """Marker names *node* applies to every item collected from its own body.
+
+    Reads BOTH spellings pytest honours on a class, and unions them: the
+    ``@pytest.mark.NAME`` DECORATORS on the class itself, and a ``pytestmark``
+    bound in the class BODY.  The body form accepts exactly the value shapes
+    :func:`module_level_marker_names` accepts at module scope — a bare
+    ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)`` call, or a list/tuple of
+    either — and applies the same LAST-binding-wins rule, so the two readings
+    of ``pytestmark`` syntax cannot drift apart.  Only DIRECT children of
+    ``node.body`` are considered, mirroring that function's ``tree.body``-only
+    rule: a ``pytestmark`` bound inside an ``if`` in the class body is not the
+    class's marker.
+
+    A non-marker element (e.g. the ``qdrant_skipif()`` call heading the real
+    shape at ``fused-memory/tests/test_mem0_client.py``) yields None from
+    :func:`_marker_name` and is skipped silently, without suppressing its
+    siblings.
+    """
+    markers = {
+        name
+        for name in (_marker_name(decorator) for decorator in node.decorator_list)
+        if name is not None
+    }
+
+    value: ast.expr | None = None
+    for statement in node.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is not None:
+        elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+        markers.update(
+            name for name in (_marker_name(element) for element in elements) if name is not None
+        )
+    return frozenset(markers)
+
+
+def guaranteed_marker_names(source: str | None) -> frozenset[str]:
+    """Marker names that provably apply to EVERY item collected from *source*.
+
+    THE LOAD-BEARING CONTRACT, inherited unchanged from
+    :func:`module_level_marker_names`: the return value is a **LOWER BOUND** on
+    every collected item's marker set, so a name ABSENT from it is UNKNOWN
+    rather than absent — which is what keeps
+    :func:`expression_definitely_deselects`' Kleene reading sound.
+
+    This is a THIRD, additive proof tier.  It returns
+    ``module_level_marker_names(source)`` unioned with the INTERSECTION of the
+    marker sets of every collectable top-level class, and only when an
+    all-items-accounted-for guard proves no collected item can exist outside
+    those classes.
+
+    INTERSECTION, never union.  If ``TestA`` carries ``slow`` and ``TestB``
+    carries ``integration``, neither marker is a module-wide bound: a union
+    would claim ``slow`` for ``TestB``'s items and widen away a run that
+    genuinely collects them.
+
+    STRICTLY ADDITIVE.  Every guard failure returns exactly
+    ``module_level_marker_names``' answer — never a smaller set — so this
+    function is a provable SUPERSET of that tier on every input and can never
+    refuse a file the primary tier already proves.
+
+    ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields an empty
+    set.  Never raises.
+    """
+    if not source:
+        return frozenset()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return frozenset()
+
+    module_markers = _module_level_marker_names_from_tree(tree)
+
+    collectable = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    if not collectable:
+        return module_markers
+    shared = frozenset.intersection(*(_class_marker_names(node) for node in collectable))
+    return module_markers | shared
+
+
 def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
     """True iff any alias in *node* binds a name starting with ``test`` (case-insensitive).
 
