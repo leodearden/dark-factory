@@ -527,10 +527,28 @@ kind, so a future fifth structural path is covered by construction.
 # written back over real summaries) and WARN-and-return on an EMPIRICAL one
 # (a census disagreement, transient on a continuously-written graph).  The
 # completeness signal itself is a first-class return value on the enumerate_*
-# methods, which never raise.  No consumer ACTS on it yet — the two
-# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
-# they cannot yet distinguish "swept a complete corpus" from "swept what we
-# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
+# methods, which never raise.
+#
+# CONSUMERS NOW ACT ON IT (task 4386, discharging ticket
+# tkt_0RSJP8CH1M9GAAJTABV8FZB4AH).  All three whole-graph consumers call the
+# enumerate_* methods directly and each applies apply_incompleteness_policy at
+# its OWN call site — the policy was SHARED, not migrated, so the raise/warn
+# split stays one implementation (see that function's docstring for why).
+# Each then reports what it read:
+#   - stale_status_snapshot_edge_sweep and stale_priority_override_edge_sweep
+#     project it into TRI-STATE per-cycle stats 'enumeration_complete' /
+#     'enumeration_incomplete_kind', which MemoryConsolidator surfaces on
+#     report.stats under the 'stale_status_snapshot_edges_' and
+#     'stale_priority_override_edges_' prefixes.  The two key sets are
+#     INDEPENDENT: a truncated corpus for one sweep never marks the other.
+#   - scripts/cleanup_count_snapshots.py reports it per project (four keys on
+#     each report['projects'][pid]) plus a totals['incomplete_enumerations']
+#     roll-up counting PROJECTS, and renders it as a Corpus column with a
+#     warning line on the operator-facing summary table.
+# So "swept a complete corpus" and "swept what we could fetch" are now
+# distinguishable at every consumer.  The ONLY safe predicate is `is True`:
+# `is not False` would admit the UNKNOWN case, letting a cycle that never
+# looked pass as one that looked and found everything.
 #
 # MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
 # 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
@@ -974,9 +992,21 @@ def apply_incompleteness_policy(
     per-method opinion: copies drift, and the drift would be silent in exactly
     the direction that matters — a caller that forgot to raise takes a
     fabricated empty for an answer and the write-back path blanks summaries
-    with it.  It is also the single seam the follow-up ticket
-    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
-    consumers) has to move when the policy migrates to the consumer.
+    with it.
+
+    THE SEAM DID NOT MOVE.  This function was once described here as the
+    single seam that the follow-up ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH
+    (wire the completeness signal through to consumers) would have to move
+    when the policy migrated to the consumer.  Task 4386 discharged that
+    ticket, and the policy was SHARED rather than migrated: it was promoted
+    to public and is applied UNCHANGED at each of the three whole-graph
+    consumers' own call sites.  Migrating would have meant three hand-written
+    copies of the raise/warn decision — exactly the drift the paragraph above
+    names, at consumer scale, and silent in the corrupting direction.  What
+    moved to the consumers is the REPORTING of the signal, not the DECISION
+    about it; the ``log`` parameter below exists for the same reason, so a
+    sweep's warning surfaces with the rest of its cycle's diagnostics without
+    the policy itself being duplicated.
 
     PUBLIC because ``enumerate_*`` never raises: a consumer that switches to
     one for the completeness signal must re-apply this policy itself, or it

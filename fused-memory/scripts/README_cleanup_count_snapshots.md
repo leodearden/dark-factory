@@ -34,7 +34,18 @@ This is the **default mode** (`--apply` is NOT set).  No writes are made.
 Output:
 - **stdout** — JSON audit report with keys `dry_run`, `generated_at`, `projects`,
   `matches`, `totals`, `summaries_matched`, `failed_refreshes`, `failed_invalidations`.
-- **stderr** — Human-readable per-project summary table (not part of the JSON).
+  - Each `projects[<id>]` entry carries `entities_scanned`, `edges_matched`,
+    `edges_invalidated`, `refresh_failures`, plus the read-completeness pair for
+    each of that project's two whole-graph reads: `entities_complete` /
+    `entities_incomplete_kind` and `edges_complete` / `edges_incomplete_kind`.
+    Each `*_complete` is **tri-state**: `true` = the read was proven whole,
+    `false` = a corpus was observed and found incomplete, `null` = nothing was
+    observed, so nothing is claimed. The only safe test is `is true`.
+  - `totals` carries `incomplete_enumerations` — the count of **projects** (not
+    reads) whose corpus was not proven whole.
+- **stderr** — Human-readable per-project summary table (not part of the JSON),
+  with a `Corpus` column (`ok` / `PARTIAL` / `?`) and, when any project is not
+  `ok`, a trailing warning naming them.
 
 Redirect the JSON to a file for review (summary table stays on terminal via stderr):
 
@@ -61,11 +72,22 @@ Open `/tmp/snapshot_audit.json` and check:
    - Entity `96cddd4d`
 
 2. **`totals`** — `edges_matched` should be non-zero if pollution exists.
+   `incomplete_enumerations` should be `0`.
 
-3. **`projects`** — per-project `entities_scanned` vs `edges_matched` summary.
+3. **`projects`** — per-project `entities_scanned` vs `edges_matched` summary,
+   and the four completeness keys for that project's two reads.
 
 4. **`matches[*].fact_excerpt`** — review each matched edge text to confirm they
    are genuine count-snapshot strings, not false positives.
+
+5. **Corpus completeness — check this BEFORE concluding a project is clean.**
+   Every count above describes whatever the two whole-graph reads returned. For
+   any project whose `Corpus` cell is not `ok` (equivalently:
+   `entities_complete` or `edges_complete` is not `true`), the scan covered only
+   part of the graph — so a low `edges_matched`, or zero, is **not** evidence
+   that little is wrong there. Re-run and confirm the corpus is whole before
+   proceeding to Step 3 for that project. A read can be partial without any
+   error being reported: incompleteness is a value on the read, not a failure.
 
 If the report looks correct, proceed to Step 3.
 
