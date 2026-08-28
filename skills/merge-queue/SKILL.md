@@ -141,7 +141,10 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
 #          commit=<landing sha from the SAME exact-subject marker search used by the rc=128
 #          arm below: git log main --fixed-strings
-#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>
+#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>,
+#          note="merge commit located by exact-subject marker search".
+#          The NOTE IS MANDATORY, not decoration: DoneProvenance rejects
+#          kind='found_on_main' without one (see the summary at the end of this arm).
 #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT HEAD, which
 #          is this task's merge commit only when this merge happens to be the newest commit
 #          on main — on a live queue it usually is not, so you would stamp an unrelated
@@ -160,7 +163,9 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #          `tail -1` returns the OLDEST of those — the first unrelated task's merge. The
 #          containment check on $c's FIRST PARENT (main just before that merge) decides:
 #            contained-before rc=1 → the branch was NOT in main before $c, so $c IS the
-#                                    merge that brought it in. Stamp $c (group/train case).
+#                                    merge that brought it in. Stamp $c (group/train case)
+#                                    with note="absorbed into group merge; sha verified by
+#                                    ancestry containment" — the note is mandatory here too.
 #            contained-before rc=0 → already in main before $c, so $c is an unrelated later
 #                                    merge. Do NOT stamp it; fall through.
 #          Falling through means no merge commit exists for this branch. DO NOT stamp the
@@ -194,14 +199,21 @@ git log main --extended-regexp --format='%H %s' \
 #              commit IS reachable from main — so it prints nothing for a genuine
 #              fast-forward and a phantom branch alike. Rule 2b's use of it on the rc=1 arm
 #              (where the branch is NOT an ancestor) is correct and unaffected.
-#          kind='found_on_main' REQUIRES a commit (no note-only fallback since the post-3092
-#          hardening), so where this gate finds no honest commit the answer is to write
-#          NOTHING AT ALL — never to substitute a convenient sha.
+#          kind='found_on_main' REQUIRES BOTH A COMMIT AND A NOTE — DoneProvenance
+#          (shared/src/shared/task_metadata.py::DoneProvenance) raises "commit is required
+#          when kind='found_on_main'" and "note is required when kind='found_on_main'"
+#          independently, so a commit-less blob AND a note-less blob are BOTH rejected.
+#          There is no note-only fallback since the post-3092 hardening, and no
+#          commit-only one either. Every stamp on this arm must carry both; where this
+#          gate finds no honest commit the answer is to write NOTHING AT ALL — never to
+#          substitute a convenient sha. (kind='merged' requires only a commit.)
 # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
 #          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
 #          branch's merge commit, by exact subject:
 git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
-#          Non-empty output → that SHA IS the true merge commit; treat as done/found_on_main.
+#          Non-empty output → that SHA IS the true merge commit; treat as done/found_on_main,
+#            stamping commit=<that sha> AND note="merge commit located by exact-subject
+#            marker search" (both required — see the rc=0 summary above).
 #          Empty output    → not landed (branch never existed, or never merged).
 # rc=1   → not an ancestor of main. Outside the coalesce arm (see "Follow
 #          the superseded successor" below) and with the queue healthy:

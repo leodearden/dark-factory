@@ -283,7 +283,10 @@ main's current HEAD and never from an eyeballed listing:
 git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
 ```
 
-Non-empty → that sha IS this task's true merge commit; stamp it and stop here.
+Non-empty → that sha IS this task's true merge commit. Stamp
+`{"kind": "found_on_main", "commit": "<that sha>", "note": "merge commit located by
+exact-subject marker search"}` and stop here. The `note` is **mandatory**, not decoration —
+`DoneProvenance` rejects `kind='found_on_main'` without one (see the contract restated below).
 
 **An empty marker search is NOT a not-landed verdict.** Two kinds of genuinely-landed work
 carry no `Merge task/<TASK_ID> into main` marker at all: a **fast-forward / already-contained**

@@ -506,7 +506,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #        (1) Exact-subject marker search (the same one the rc=128 arm below runs):
      #              git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
      #                  --max-count=1 --format=%H
-     #            Non-empty → that IS this task's merge commit. Stamp it; stop here.
+     #            Non-empty → that IS this task's merge commit. Stamp it with
+     #              note="merge commit located by exact-subject marker search"; stop here.
+     #              The note is MANDATORY, not decoration — see the contract at the end
+     #              of this arm.
      #        (2) Marker empty is not "no sha": a coalesce-absorbed non-tip member is
      #            merged under the TIP branch's subject and carries no marker of its own,
      #            so look for the group merge — but VERIFY it before stamping:
@@ -523,8 +526,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #            on $c's FIRST PARENT (main as it stood just before that merge)
      #            disambiguates:
      #              contained-before rc=1 → the branch was NOT in main before $c, so $c IS
-     #                                      the merge that brought it in. Stamp $c. (This
-     #                                      is the group/train-merge case.)
+     #                                      the merge that brought it in. Stamp $c with
+     #                                      note="absorbed into group merge; sha verified
+     #                                      by ancestry containment". (This is the
+     #                                      group/train-merge case.) Note mandatory here too.
      #              contained-before rc=0 → the branch was ALREADY in main before $c, so $c
      #                                      is an unrelated later merge. Fall through to (3).
      #        (3) No merge commit exists for this branch. DO NOT stamp the tip yet —
@@ -569,11 +574,16 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #              proved every branch commit IS reachable from main — so it prints
      #              nothing for a genuine fast-forward and a phantom branch alike. (It is
      #              correct where merge-queue/SKILL.md rule 2b uses it, on the rc=1 arm.)
-     #          `kind='found_on_main'` REQUIRES a commit (there is no commit-less/note-only
-     #          fallback), so where this gate finds no honest commit the answer is to write
-     #          NOTHING AT ALL — never to substitute a convenient sha. "Do not stamp" IS an
-     #          available option on this arm, and on the two failing branches it is the
-     #          required one.
+     #          `kind='found_on_main'` REQUIRES BOTH A COMMIT AND A NOTE.
+     #          DoneProvenance (shared/src/shared/task_metadata.py::DoneProvenance) raises
+     #          "commit is required when kind='found_on_main'" and "note is required when
+     #          kind='found_on_main'" INDEPENDENTLY, so a commit-less blob and a note-less
+     #          blob are BOTH rejected: there is no note-only fallback and no commit-only
+     #          one. EVERY stamp in steps (1)-(3) above must carry both. Where this gate
+     #          finds no honest commit the answer is to write NOTHING AT ALL — never to
+     #          substitute a convenient sha. "Do not stamp" IS an available option on this
+     #          arm, and on the two failing branches it is the required one.
+     #          (kind='merged' requires only a commit — the note rule is found_on_main's.)
      #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's
      #          CURRENT HEAD, which is this task's merge commit only when this merge
      #          happens to be the newest commit on main — on a live queue it usually is
@@ -641,7 +651,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   landing sha derived by the THREE-STEP ladder in the [canonical ancestry
   #   check](#branch-on-main) above — do not improvise a shorter version of it:
   #     (1) marker search `git log main --fixed-strings
-  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → stamp it;
+  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → stamp it
+  #         with note="merge commit located by exact-subject marker search";
   #     (2) marker empty → `c=$(git rev-list --ancestry-path --merges
   #         task/<TASK_ID>..main | tail -1)`, then CONFIRM with
   #         `git merge-base --is-ancestor task/<TASK_ID> "$c^1"` — rc=1 means $c really is
@@ -664,8 +675,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #             verdict; do NOT stamp, report the gate as un-evaluable.
   #         NOT `git cherry` here — on the rc=0 arm it is empty by construction for both
   #         cases; it is correct only on rule 2b's rc=1 arm.
-  #   kind='found_on_main' REQUIRES a commit, so where the gate finds no honest commit,
-  #   write NOTHING — never substitute a convenient sha. "Do not stamp" IS available here.
+  #   kind='found_on_main' REQUIRES BOTH A COMMIT AND A NOTE (DoneProvenance raises on each
+  #   independently) — every stamp above must carry both, and a note-less blob is rejected
+  #   just as a commit-less one is. Where the gate finds no honest commit, write NOTHING —
+  #   never substitute a convenient sha. "Do not stamp" IS available here.
   #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
   #   HEAD, which is this task's merge commit only when this merge happens to be the
   #   newest commit on main — on a live queue it usually is not, so you would stamp an
@@ -676,7 +689,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   check above:
   #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
   #         --max-count=1 --format=%H
-  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main'.
+  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main', with
+  #     note="merge commit located by exact-subject marker search" (both required).
   #   Empty     → not landed. (Do NOT substitute an unfiltered `git log main --merges`:
   #                it takes no task argument and would report "landed" for every rc=128.)
   # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
@@ -848,7 +862,8 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #   and the landing sha derived by the THREE-STEP ladder in the [canonical ancestry
 #   check](#branch-on-main) — run it in full, do not shortcut it:
 #   (1) marker search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
-#       --max-count=1 --format=%H` → stamp it;
+#       --max-count=1 --format=%H` → stamp it with note="merge commit located by
+#       exact-subject marker search";
 #   (2) marker empty → `c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main
 #       | tail -1)`, then CONFIRM with `git merge-base --is-ancestor task/<TASK_ID> "$c^1"`:
 #       rc=1 → $c is the merge that brought this branch in, stamp it; rc=0 → $c is an
@@ -864,8 +879,10 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #       not-landed/phantom-branch; `git.commit_citation_pattern: ""` → empty by configuration,
 #       proves neither verdict, do NOT stamp. NOT `git cherry` here — on the rc=0 arm it is
 #       empty by construction for both cases.
-#   kind='found_on_main' requires a commit; there is no note-only fallback, so where the gate
-#   finds no honest commit, write NOTHING rather than substituting a convenient sha.
+#   kind='found_on_main' requires BOTH a commit AND a note (DoneProvenance raises on each
+#   independently); there is no note-only fallback and no commit-only one, so every stamp
+#   above must carry both. Where the gate finds no honest commit, write NOTHING rather than
+#   substituting a convenient sha.
 #   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
 #   task's merge commit.
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
