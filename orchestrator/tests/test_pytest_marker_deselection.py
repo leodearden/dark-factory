@@ -1258,6 +1258,35 @@ _ALL_DECORATED_SOURCE_WITH_CLASS = _ALL_DECORATED_SOURCE + (
     '\n\nclass TestThing:\n    def test_method(self):\n        pass\n'
 )
 
+#: The CLASS-LEVEL twin of `_MARKED_SOURCE`: no module-level `pytestmark` and no
+#: module-level test function, so ONLY the class tier can prove this file fully
+#: deselected.  Both classes carry the incident's own `warm_lane_bash`, one per
+#: accepted spelling.
+_CLASS_MARKED_SOURCE = """\
+import pytest
+
+
+@pytest.mark.warm_lane_bash
+class TestOne:
+
+    def test_a(self):
+        pass
+
+
+class TestTwo:
+
+    pytestmark = [pytest.mark.warm_lane_bash]
+
+    def test_b(self):
+        pass
+"""
+
+#: `_CLASS_MARKED_SOURCE` plus ONE unmarked collectable class — ALL-not-ANY at
+#: class granularity, at this composed entry point rather than in isolation.
+_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE = _CLASS_MARKED_SOURCE + (
+    '\n\nclass TestThree:\n    def test_c(self):\n        pass\n'
+)
+
 
 class _RecordingReader:
     """A dict-backed ``read_source`` that RECORDS every path it is asked for.
@@ -1399,6 +1428,94 @@ class TestDeselectingExpressionForTargets:
         assert deselecting_expression_for_targets(
             ['a/test_a.py', 'a/test_b.py'], _ROOT_PYPROJECT, None, read,
         ) == 'not smoke and not integration and not warm_lane_bash'
+        assert read.paths == ['a/test_a.py', 'a/test_b.py']
+
+    # -- class-level markers, via the widened primary tier --------------------
+
+    def test_an_all_classes_marked_target_widens(self):
+        """THE ACCEPTANCE CASE for task 4561 — the shape that returns rc=5 today.
+
+        Neither tier can prove this file today: tier 1 sees only the
+        module-level set (empty) and tier 2 refuses on the ClassDef.  Yet
+        every item it collects carries ``warm_lane_bash`` and the module's own
+        addopts say ``-m 'not warm_lane_bash'``, so the file-scoped run
+        collects ZERO items and exits rc=5 — a false RED on a diff that
+        touched a real, passing test file.
+        """
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) == 'not warm_lane_bash'
+
+    def test_one_unmarked_class_among_marked_ones_is_refused(self):
+        """ALL, not ANY, at class granularity: ``TestThree``'s items still collect."""
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_one_unmarked_target_beside_a_class_marked_one_is_refused(self):
+        """ALL, not ANY, ACROSS targets — the widened tier does not weaken that."""
+        read = _RecordingReader({
+            'a/test_a.py': _CLASS_MARKED_SOURCE,
+            'a/test_b.py': _UNMARKED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_a_class_marked_target_under_a_non_deselecting_expression_is_refused(self):
+        """THE EXPRESSION decides, not the mere presence of a class-level marker.
+
+        ``not smoke`` leaves ``smoke`` UNKNOWN on a ``warm_lane_bash``-marked
+        file, so nothing is proven and today's FILE_SCOPED behaviour stands.
+        """
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _pyproject('"-m \'not smoke\'"'), None, read,
+        ) is None
+
+    def test_a_cli_dash_m_that_reselects_the_bucket_refuses_a_class_marked_target(self):
+        """Last-wins survives the new tier: the lane's own ``-m`` SELECTS these items."""
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'],
+            _WARM_LANE_PYPROJECT,
+            'uv run pytest tests/ -m warm_lane_bash',
+            read,
+        ) is None
+
+    def test_the_existing_class_refusal_survives_because_both_tiers_still_refuse(self):
+        """UNCHANGED CONTROL, with its mechanism made explicit.
+
+        ``_ALL_DECORATED_SOURCE_WITH_CLASS`` carries module-level test
+        functions, so the widened tier 1's accounted-for guard refuses (those
+        items live OUTSIDE the class), and tier 2 still refuses on the
+        ClassDef.  Both arms decline, which is why
+        ``test_all_decorated_source_with_a_test_class_is_refused`` above stays
+        green — the widening is ADDITIVE, not a loosening.
+        """
+        assert guaranteed_marker_names(_ALL_DECORATED_SOURCE_WITH_CLASS) == frozenset()
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE_WITH_CLASS) is None
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE_WITH_CLASS})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_a_class_marked_target_still_costs_exactly_one_read(self):
+        """THE COST BOUND extended to the new tier: one read per target, not two.
+
+        ``guaranteed_marker_names`` replaces the ``module_level_marker_names``
+        call at tier 1 rather than joining it, so neither the read count nor
+        the per-target parse count moves.
+        """
+        read = _RecordingReader({
+            'a/test_a.py': _CLASS_MARKED_SOURCE,
+            'a/test_b.py': _CLASS_MARKED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) == 'not warm_lane_bash'
         assert read.paths == ['a/test_a.py', 'a/test_b.py']
 
 
