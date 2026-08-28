@@ -896,7 +896,10 @@ class SessionResumeConfig(BaseModel):
         description=(
             'A recovered sidecar is eligible only if (now - started_at) is '
             'below this many seconds; a staler sidecar degrades to fresh '
-            'dispatch with a session_resume_fallback(reason=stale) event. '
+            'dispatch with a session_resume_fallback event carrying "stale" in '
+            'its data.reasons list — alongside any OTHER reason the same '
+            'session failed, since the reasons are reported as a set rather '
+            'than a first match (task 3728). '
             'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'

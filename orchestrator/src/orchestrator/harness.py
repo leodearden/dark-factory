@@ -726,15 +726,6 @@ _MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
 })
 
 
-# TRANSITIONAL (task 3728, deleted in the same task's step-4): projects the
-# composite reason set returned by `Harness._session_resume_reasons` back onto
-# the single first-match `reason` string the session_resume_fallback payload
-# used to carry, so the rename lands as one green commit ahead of the payload
-# rewrite. Order reproduces the predecessor's branch order exactly.
-_SESSION_RESUME_REASON_PRECEDENCE: tuple[str, ...] = (
-    'disabled', 'stale', 'capped', 'no_transcript', 'reseeded',
-)
-
 
 def _is_terminal_merged(task: dict | None) -> bool:
     """Return True iff *task* is a done task whose content is confirmed merged.
@@ -9003,14 +8994,23 @@ class Harness:
             # dispatch WITH the recovered plan (I3 — never a stall, never a
             # scheduler-visible error), emitting a reason-carrying event.
             #
-            # The outcome is a FOUR-way split (task 3256):
-            #   eligible                     → inject; resets the storm streak.
-            #   disabled                     → silent: no event, no streak (B6).
-            #   BY DESIGN {capped, reseeded} → own event, streak untouched
-            #                                  (neither fed nor reset).
-            #   GENUINE {stale, no_transcript} → session_resume_fallback, feeds
-            #                                  the streak, storm-escape at
-            #                                  fallback_storm_threshold (INV-4).
+            # _session_resume_reasons returns the FULL set of reasons the
+            # session is ineligible (task 3728) — empty means eligible — and
+            # the outcome is routed off that SET, not off a first-match string:
+            #   reasons == set()        → inject; resets the storm streak.
+            #   'disabled' in reasons   → silent: no event, no streak (B6).
+            #                             (it is returned alone, so membership
+            #                             and equality coincide here.)
+            #   reasons == {'capped'}   → session_resume_capped: by-design
+            #                             throttling of an otherwise HEALTHY
+            #                             session, streak untouched.
+            #   otherwise               → session_resume_fallback carrying
+            #                             sorted(reasons) — including a capped
+            #                             session that ALSO failed another leg,
+            #                             which would not have resumed anyway.
+            # Which reasons then FEED the fallback-storm streak (INV-4,
+            # storm-escape at fallback_storm_threshold) is a separate question
+            # from which event is emitted: see the streak branch below.
             #
             # Both session_resume_fallback emits also carry archive_available
             # (task 3727) — was this session still recoverable from the durable
@@ -9023,14 +9023,6 @@ class Harness:
             if recovered_session is not None:
                 reasons = self._session_resume_reasons(
                     recovered_session, recovered_config_dir
-                )
-                # TRANSITIONAL (task 3728, removed in step-4): project the set
-                # back onto the legacy first-match string so this commit is
-                # the rename ONLY and every existing payload assertion stays
-                # byte-identically green.
-                reason = next(
-                    (r for r in _SESSION_RESUME_REASON_PRECEDENCE if r in reasons),
-                    'eligible',
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
@@ -9051,11 +9043,21 @@ class Harness:
                         )
                 else:
                     recovered_session = None  # fresh dispatch, recovered plan kept
-                    if reason == 'disabled':
+                    if 'disabled' in reasons:
                         pass  # kill switch — silent, no event, no streak (B6)
-                    elif reason == 'capped':
+                    elif reasons == {'capped'}:
                         # By-design throttling — its own event, does NOT feed
                         # the storm streak.
+                        #
+                        # EXACT equality, not membership (task 3728): config.py
+                        # documents this event as throttling of an otherwise
+                        # HEALTHY, resumable session. One that is capped AND
+                        # uncorroborated would not have resumed anyway, so
+                        # filing it here would both overstate the throttle
+                        # population and bury the corroboration failure — the
+                        # same information loss as first-match reporting, one
+                        # level up. It routes to the fallback below instead,
+                        # where 'capped' is still visible in the set.
                         if self.event_store:
                             self.event_store.emit(
                                 EventType.session_resume_capped,
@@ -9063,11 +9065,13 @@ class Harness:
                                 data=resume_event_data,
                             )
                     else:
-                        # Both remaining reasons emit session_resume_fallback:
-                        # 'reseeded' (by design) and {stale, no_transcript}
-                        # (genuine). The emit is shared by both — ONE archive
-                        # lookup, one filesystem glob per dispatch rather than
-                        # two, and no chance of the two sites drifting apart.
+                        # EVERY other outcome emits session_resume_fallback
+                        # carrying the whole reason set — by-design ones
+                        # ('reseeded', a co-occurring 'capped') and genuine
+                        # ones alike. The emit is shared by all of them — ONE
+                        # archive lookup, one filesystem glob per dispatch
+                        # rather than several, and no chance of separate sites
+                        # drifting apart.
                         #
                         # Built INSIDE the event_store guard, not above it.
                         # archive_available costs a filesystem glob, and with no
@@ -9087,14 +9091,26 @@ class Harness:
                                 task_id=assignment.task_id,
                                 data={
                                     **resume_event_data,
-                                    'reason': reason,
+                                    # SORTED, so json_extract(data,'$.reasons')
+                                    # is a stable composite group key and a
+                                    # plain GROUP BY 1 is a co-occurrence
+                                    # census. A list, not a set — it has to
+                                    # survive the JSON round-trip into runs.db.
+                                    'reasons': sorted(reasons),
                                     'archive_available': self._archive_available(
                                         assignment.task_id,
                                         resume_event_data['session_id'],
                                     ),
                                 },
                             )
-                        if reason != 'reseeded':
+                        # TRANSITIONAL (task 3728, generalised in step-6):
+                        # the feeder still excludes exactly the reseed-only
+                        # set, which is what the retired first-match string
+                        # meant — 'reseeded' sat LAST in the precedence order,
+                        # so `reason == 'reseeded'` was reachable only when it
+                        # was the sole reason. Step-6 replaces this with the
+                        # by-design subtraction.
+                        if reasons != {'reseeded'}:
                             # 'stale' / 'no_transcript' — a GENUINE corroboration
                             # failure, so it feeds the storm streak below.
                             #
