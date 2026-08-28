@@ -120,8 +120,8 @@ from typing import Any
 # mirroring tag_cgl_eta_rehome_scope, so importing this module for tests never
 # touches config or a backend.
 from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,  # noqa: F401 -- used by the --apply path below
-    assert_store_mutation_allowed,  # noqa: F401 -- ditto; see run()
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
 )
 
 logger = logging.getLogger('amend_stale_resume_cwd_records')
@@ -498,9 +498,118 @@ async def run(
 
     applied_ids: set[str] = set()
 
+    if apply:
+        decisions = await _apply_amendments(
+            memory_service, decisions, project_id=project_id,
+            applied_ids=applied_ids,
+        )
+
     return build_amend_report(
         decisions=decisions,
         applied_ids=applied_ids,
         dry_run=not apply,
         generated_at=generated_at,
     )
+
+
+async def _apply_amendments(
+    memory_service: Any,
+    decisions: list[dict[str, Any]],
+    *,
+    project_id: str,
+    applied_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Write every ``'amend'`` decision, in order, behind one capability probe.
+
+    Returns the decision list with write outcomes folded in; mutates
+    *applied_ids* to hold the ids actually written.
+
+    The capability probe runs ONCE, before the first write, and only if there
+    is something to write:
+
+    * ``once`` rather than per-write because it is a real filesystem probe and
+      one refusal is the whole answer;
+    * ``before`` the first write because
+      ``store_mutation_preflight`` exists to turn a half-written batch into an
+      up-front refusal -- ``repair_recon_citation.py`` records this exact class
+      of write silently failing from a task worktree on a read-only data dir;
+    * and only ``if there is something to write`` so an all-skip re-run needs
+      no capability at all (pinned in step-13).
+
+    A refusal converts every pending target to ``'refuse:store_unavailable'``
+    rather than raising, so a sandboxed operator still gets the report and can
+    see why nothing happened.
+    """
+    amendable = [d for d in decisions if d['action'] == 'amend']
+    if not amendable:
+        return decisions
+
+    try:
+        assert_store_mutation_allowed(
+            operation='amend_stale_resume_cwd_records --apply',
+        )
+    except StoreMutationUnavailable as exc:
+        logger.error(
+            'amend_stale_resume_cwd_records: --apply NOT started (fail-closed) '
+            "-- this process cannot write mem0's history directory, so an "
+            'amendment would rewrite a record and then fail to journal the '
+            'change. Nothing was written. Re-run from the fused-memory MCP '
+            "server's environment or an unsandboxed operator shell; to obtain "
+            'the report safely from anywhere, re-run without --apply. (%r)',
+            exc,
+        )
+        return [
+            {**d, 'action': 'refuse:store_unavailable', 'error': str(exc)}
+            if d['action'] == 'amend' else d
+            for d in decisions
+        ]
+
+    targets_by_id = {t.memory_id: t for t in AMEND_TARGETS}
+    updated: list[dict[str, Any]] = []
+    for decision in decisions:
+        if decision['action'] != 'amend':
+            updated.append(decision)
+            continue
+
+        target = targets_by_id[decision['id']]
+        try:
+            response = await memory_service.update_memory(
+                memory_id=target.memory_id,
+                project_id=project_id,
+                content=target.new_content,
+                metadata_patch=target.metadata_patch or None,
+                reason=WRITE_REASON,
+                _source=WRITE_SOURCE,
+            )
+        except Exception as exc:  # noqa: BLE001 -- report, never propagate
+            logger.warning(
+                'amend_stale_resume_cwd_records: write RAISED for %s: %r',
+                target.memory_id, exc,
+            )
+            updated.append({
+                **decision,
+                'action': 'refuse:write_error',
+                'error': f'{type(exc).__name__}: {exc}',
+            })
+            continue
+
+        # `update_memory` reports a refusal by RETURNING a structured envelope
+        # rather than raising, so a caller that only guarded against exceptions
+        # would score a rejected write as an amendment.
+        if isinstance(response, dict) and response.get('error_type'):
+            logger.warning(
+                'amend_stale_resume_cwd_records: write REFUSED for %s: %s',
+                target.memory_id, response.get('error'),
+            )
+            updated.append({
+                **decision,
+                'action': 'refuse:write_failed',
+                'error': response.get('error'),
+                'error_type': response.get('error_type'),
+            })
+            continue
+
+        applied_ids.add(target.memory_id)
+        updated.append(decision)
+
+    return updated
