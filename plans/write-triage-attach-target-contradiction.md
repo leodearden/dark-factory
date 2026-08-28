@@ -365,4 +365,26 @@ Premises re-verified at `49e9b5c1e6`: `candidate_id` count on
 `main:write_triage_judge.py` = **0**; `main..task/4762` = **0** commits;
 `test_write_triage_flip_gate_invariants.py` = **8 passed**.
 
-Re-filed as a `scope_violation` blocker by task 4822 (attempt #2).
+Re-filed as `esc-4822-3` (`scope_violation`, `blocking`, level 0) by task 4822,
+attempt #2 — queued, `action: terminate_cleanly`.
+
+FINDING 2 was also filed as a standalone follow-up against the orchestrator,
+ticket **`tkt_0RSZHCP45CV2DADKJ76CYMCMMC`** (`agent-followup`, spawned_from
+4822, files `orchestrator/src/orchestrator/workflow.py` +
+`config.py`): `_can_skip_revalidation` checks schema, plan-file existence and
+plan age, but never whether the TASK RECORD was rewritten after the plan was
+finalized — and a record-only rewrite is exactly the case that leaves `overlap`
+empty, which is what enables the skip. Task 4762 is the worked instance: task
+`updatedAt` 2026-08-28T05:50:12Z against plan `_finalized_at`
+2026-08-27T14:52:57Z, with every skip condition holding anyway. Suggested fix
+there: decline the skip when the record is newer than the plan, consistent with
+`_can_skip_revalidation`'s documented "on any uncertainty, return False"
+posture. Ticket ids are curator tickets, not task ids — the curator decides
+create/combine/drop asynchronously.
+
+Both findings are also in memory: `architect_plan_revalidation` gained a stamped
+peer subcase `lever_b_skip_bypasses_architect_entirely`
+(`d9652828-09ee-48de-a3c5-46020c40ab1f`), and the granted_files trap is
+`478a8029-e285-445e-8b36-46b5cf1386f4`. Recording them here as well because the
+lesson this whole file exists to carry is that an escalation's `detail` field
+must never be the only copy.
