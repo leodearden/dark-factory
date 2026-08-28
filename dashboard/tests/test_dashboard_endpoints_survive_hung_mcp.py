@@ -43,7 +43,22 @@ _TARGET_MODULES = {
 
 
 def _dashboard_get_paths() -> list[str]:
-    """Every GET route under /api/v2/dashboard/, read off the live app."""
+    """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
+
+    Templated routes (``/api/v2/dashboard/task/{task_id}``) are excluded: this
+    sweep requests each path verbatim, so a templated one would be fetched as
+    the literal string ``.../{task_id}`` and answer 404/422 — a false failure
+    about path construction, reported under a message about hung dependencies,
+    in a probe whose whole point is to be self-maintaining. A templated route
+    needs its own probe that binds real parameter values; see the guard in
+    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
+    fails loudly if one is ever added rather than letting it go unswept.
+    """
+    return [p for p in _all_dashboard_get_paths() if '{' not in p]
+
+
+def _all_dashboard_get_paths() -> list[str]:
+    """Every GET route under /api/v2/dashboard/, templated ones included."""
     from dashboard.app import app
 
     # ``app.routes`` is typed ``list[BaseRoute]``, which declares no ``path``
@@ -176,4 +191,25 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
         f'(reached: {sorted(modules_reached)}) — the sweep passed without '
         'exercising the defect, so it proves nothing. Check the endpoint '
         'preconditions in the hung_mcp fixture.'
+    )
+
+
+def test_templated_dashboard_routes_are_not_silently_unswept():
+    """A templated route must be noticed, not quietly dropped from the sweep.
+
+    ``_dashboard_get_paths`` filters out ``{``-bearing paths because the sweep
+    cannot request them verbatim. That filter is the right call — but a silent
+    filter is how coverage rots, so this test fails the moment one appears and
+    says what to do about it. Extend the expected set below ONLY together with
+    a probe that exercises the new route with real parameter values under the
+    same ``hung_mcp`` fixture.
+    """
+    templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
+
+    assert templated == [], (
+        f'templated GET route(s) {templated} exist under /api/v2/dashboard/ '
+        'and are NOT covered by the hung-MCP sweep, which requests every path '
+        'verbatim and would fetch the literal brace string. Add a dedicated '
+        'probe that binds real parameter values (reusing the hung_mcp '
+        'fixture), then list the route here.'
     )
