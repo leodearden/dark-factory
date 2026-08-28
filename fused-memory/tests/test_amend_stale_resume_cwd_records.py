@@ -120,3 +120,80 @@ class TestAmendTargetShape:
         target = _mod.AMEND_TARGETS[0]
         with pytest.raises(dataclasses.FrozenInstanceError):
             target.memory_id = 'mutated'  # type: ignore[misc]
+
+
+class TestClassifyAmendTarget:
+    """The pure classifier: what a live read means for one target.
+
+    Inputs are ``get_memory_by_id``-shaped envelopes -- ``{'found': True,
+    'content': ...}`` on a hit, ``{'found': False}`` on a genuine miss, and
+    ``{'error', 'error_type'}`` with ``found`` ABSENT on a backend failure.
+    That three-way shape is the tool's documented no-silent-fail contract, and
+    the classifier must preserve the distinction rather than collapse it.
+    """
+
+    def test_exact_preimage_classifies_amend(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': target.expected_preimage},
+        )
+        assert decision['action'] == 'amend'
+        assert decision['id'] == target.memory_id
+
+    def test_already_amended_content_classifies_skip(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': target.new_content},
+        )
+        assert decision['action'] == 'skip:already_amended'
+
+    def test_sentinel_is_checked_before_the_preimage_comparison(self):
+        # A re-run reads back content that no longer equals the pre-image (it
+        # equals the replacement). If the pre-image check ran first, every
+        # re-run would report a mismatch REFUSAL and an operator would have to
+        # decide whether the corpus had been tampered with. The sentinel test
+        # must therefore win -- assert it with text that is neither the
+        # pre-image nor the exact replacement, so only ordering can explain it.
+        target = _mod.AMEND_TARGETS[0]
+        drifted = f'prefix added later. {target.new_content} suffix added later.'
+        assert drifted != target.expected_preimage
+        assert drifted != target.new_content
+        decision = _mod.classify_amend_target(target, {'found': True, 'content': drifted})
+        assert decision['action'] == 'skip:already_amended'
+
+    def test_unrecognised_content_classifies_preimage_mismatch(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': 'something else entirely'},
+        )
+        assert decision['action'] == 'refuse:preimage_mismatch'
+
+    def test_genuine_miss_classifies_not_found(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(target, {'found': False})
+        assert decision['action'] == 'refuse:not_found'
+
+    def test_backend_error_classifies_read_error_not_not_found(self):
+        # 'found' is ABSENT on an error envelope. Unknown is not absent: a
+        # timed-out read must never be reported as a vanished record.
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'error': 'read timed out', 'error_type': 'TimeoutError'},
+        )
+        assert decision['action'] == 'refuse:read_error'
+
+    def test_read_error_and_not_found_are_distinct_actions(self):
+        target = _mod.AMEND_TARGETS[0]
+        missing = _mod.classify_amend_target(target, {'found': False})
+        errored = _mod.classify_amend_target(
+            target, {'error': 'boom', 'error_type': 'TimeoutError'},
+        )
+        assert missing['action'] != errored['action']
+
+    def test_classifier_is_pure_over_both_targets(self):
+        # Same input twice -> same answer, and no target is special-cased.
+        for target in _mod.AMEND_TARGETS:
+            fetched = {'found': True, 'content': target.expected_preimage}
+            first = _mod.classify_amend_target(target, fetched)
+            second = _mod.classify_amend_target(target, fetched)
+            assert first == second == {'id': target.memory_id, 'action': 'amend'}
