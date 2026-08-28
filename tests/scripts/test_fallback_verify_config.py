@@ -28,12 +28,14 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
+import datetime
 import os
 import pathlib
 import re
 import shlex
 import sys
 import tomllib
+from typing import NamedTuple
 
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
@@ -652,6 +654,47 @@ MEASURED_FLEET_SEGMENT_SECS = {
     'orchestrator': 1765.95,
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
+}
+
+
+class _SegmentProvenance(NamedTuple):
+    """Where one MEASURED_FLEET_SEGMENT_SECS figure came from."""
+
+    measured_at: str      # ISO YYYY-MM-DD
+    sample_size: int      # number of runs actually observed
+    task_id: str
+    corpus: str
+
+
+# Task 4902. The measurement table above now spans two epochs, and a bare
+# {name: float} mapping cannot say which entry belongs to which. This records
+# each figure's age and sample so the next reader — and the next re-measurement
+# — can see at a glance what is being replaced, without archaeology.
+#
+# Read the sample sizes literally. Three of these are n=1: a single logged run
+# each, which is exactly why a single later regime change (commit 685f558728's
+# `pytest -n 8` cap) invalidated the table wholesale and nothing noticed for
+# eight days. `tests/scripts` is n=4 because the comment above records it as
+# the lowest of four independent measurements. Only `orchestrator` rests on a
+# real sample, and only because task 4902 mined one.
+#
+# This makes the table DATED, not CURRENT. Nothing here re-measures anything —
+# see the SCOPE paragraph on the floor guard below.
+MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
+    'shared': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'escalation': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'orchestrator': _SegmentProvenance(
+        # Literal, NOT a reference to POST_CAP_ORCHESTRATOR_GREEN_N: this is a
+        # second independent record of the same n, which is what lets the
+        # sample/percentile agreement check below actually fail.
+        '2026-08-28', 28, '4902',
+        '.worktrees/*/.task/verify/*.orchestrator.summary.json'),
+    'fused-memory': _SegmentProvenance(
+        '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'tests/scripts': _SegmentProvenance(
+        '2026-07-31', 4, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
 }
 
 
