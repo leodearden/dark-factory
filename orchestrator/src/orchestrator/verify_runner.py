@@ -74,6 +74,7 @@ __all__ = [
     "VerifyRunnerPool",
     # INV-2 (task 2884) — contract-currency auto-sync at dispatch
     "SyncOutcome",
+    "REMOTE_LIVENESS_CMD",
     "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -887,6 +888,21 @@ _SSH_BASE_OPTS = [
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
 
+# Post-sync entry-point liveness probe (task 4539), issued by
+# RemoteRunner.sync_if_stale after a mutating sync of the remote Dark-Factory
+# CODE checkout.
+#
+# Deliberately a BARE command with NO `cd` and no absolute venv path: that is
+# exactly how run_merge_verify builds its dispatch argv (`orchestrator
+# verify-merge --sha ... --spec ...` handed straight to ssh), so the probe
+# exercises the SAME PATH resolution the real dispatch will.  A probe that cd'd
+# into the checkout, or invoked `<df_remote>/.venv/bin/orchestrator` directly,
+# could answer rc=0 while the dispatch still hit rc=127.
+#
+# `verify-merge --help` is a pure click help print — it never touches config,
+# git, or a worktree — so the probe is side-effect-free and cheap.
+REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
+
 
 def _sanitize_runner_name(name: str) -> str:
     """Sanitize a runner name for filesystem use in archive filenames.
@@ -1030,7 +1046,10 @@ class SyncOutcome:
         fail-closed (PRD §3.1).
 
     ``stale`` records whether a HEAD mismatch was detected; ``synced`` whether a
-    pull+uv-sync actually completed ok.  ``local_head``/``remote_head`` carry the
+    pull+uv-sync actually completed ok AND left the remote with a working
+    ``orchestrator`` CLI (task 4539's post-sync liveness assertion — a sync can
+    exit 0 and still have destroyed the entry point).
+    ``local_head``/``remote_head`` carry the
     compared shas (for the ``runner_stale`` payload / operator triage);
     ``detail`` is a short human string.  Frozen so an outcome cannot be mutated
     after the fact.
@@ -1115,9 +1134,10 @@ class RemoteRunner:
         # _git_remote/_cwd, which are the PROJECT checkout.
         self._df_remote_checkout = df_remote_checkout
         self._df_local_checkout = df_local_checkout
-        # Per-runner lock serialising the mutating sync (pull + uv sync) so two
-        # concurrent dispatches never `git pull` the same checkout at once
-        # (PRD §3.1).  Read-only HEAD probes run outside it.
+        # Per-runner lock serialising the mutating sync (pull + `uv sync
+        # --all-packages` + the post-sync liveness probe) so two concurrent
+        # dispatches never `git pull` the same checkout at once (PRD §3.1).
+        # Read-only HEAD probes run outside it.
         self._sync_lock = asyncio.Lock()
         self._run = run if run is not None else _default_subprocess_run
         # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
@@ -1198,15 +1218,25 @@ class RemoteRunner:
         bb834dd42a).  Different AND the remote does not match origin ⇒ emit
         ``runner_stale`` and, serialised on the per-runner lock and only when NO
         verify is in flight (never ``git pull`` under a live verify), run ``git
-        pull --ff-only`` + ``uv sync`` on the remote DF checkout, emitting
-        ``runner_synced`` (kind='df_checkout') on success.  Success is keyed on
-        the two return codes, NOT a post-sync HEAD-equality check — the
-        dispatcher's local DF HEAD may legitimately lead origin (unpushed
-        commits), and the remote pulls from origin (design_decisions[3]).
+        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout,
+        then ASSERT the checkout is still runnable via ``REMOTE_LIVENESS_CMD``
+        over ssh, emitting ``runner_synced`` (kind='df_checkout') on success.
 
-        Fail-closed and never-raises: staleness with a failed pull/uv-sync, or
-        any subprocess/transport error, returns ``ok=False`` so the pool benches
-        the runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
+        The sync command is ``--all-packages`` and the liveness assertion exists
+        because of the same defect (task 4539): a DF checkout's root
+        pyproject.toml declares a uv WORKSPACE, in which a bare ``uv sync``
+        prunes the workspace members' console scripts — deleting the very
+        ``orchestrator`` entry point this runner then invokes over ssh — while
+        still EXITING 0.  So success is NOT keyed on the return codes alone; it
+        is keyed on the codes plus a probe that the CLI still answers.  It is
+        still not keyed on a post-sync HEAD-equality check — the dispatcher's
+        local DF HEAD may legitimately lead origin (unpushed commits), and the
+        remote pulls from origin (design_decisions[3]).
+
+        Fail-closed and never-raises: staleness with a failed pull/uv-sync, a
+        post-sync liveness probe that does not return 0, or any
+        subprocess/transport error, returns ``ok=False`` so the pool benches the
+        runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
         resolvable ``df_local_checkout``) returns ``configured=False, ok=True``
         and issues ZERO ssh/git calls — byte-identical to the pre-INV-2 path.
         ``event_store`` is None-safe (emit only when set), mirroring LocalRunner.
@@ -1311,15 +1341,68 @@ class RemoteRunner:
                         detail=f'git pull --ff-only failed (rc={pull_rc}): {pull_err}',
                     )
 
+                # `--all-packages`, NOT a bare `uv sync` (task 4539).  A
+                # Dark-Factory checkout's root pyproject.toml declares a uv
+                # WORKSPACE ([tool.uv.workspace].members), and in a workspace a
+                # bare `uv sync` syncs only the ROOT project's environment and
+                # PRUNES what the root does not declare — including the
+                # workspace MEMBERS' console-script entry points, among them the
+                # `orchestrator` script that run_merge_verify invokes over ssh a
+                # few lines below.  Measured on the second host: before,
+                # `.venv/bin/orchestrator` existed and the entry point answered
+                # rc=0; after a bare `uv sync` it was GONE and the ssh dispatch
+                # failed rc=127; `uv sync --all-packages` restored it.  So the
+                # sync that exists to make the remote CURRENT was instead
+                # DELETING the very CLI whose verdict it was preparing to adopt.
+                #
+                # `--all-packages` is correct for a workspace and harmless for a
+                # single-package repo (uv treats such a project as a one-member
+                # workspace), so it is issued unconditionally rather than being
+                # made a per-runner knob nobody would ever set differently.
+                # CONTRIBUTING.md already names it as the whole-repo sync, and
+                # it is the same spelling `verify_cold_preprovision_command`
+                # uses in dark-factory-orchestrator.yaml.
                 uv_rc, _, uv_err = await self._run(
                     ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                     f'cd {shlex.quote(df_remote)} && uv sync'],
+                     f'cd {shlex.quote(df_remote)} && uv sync --all-packages'],
                 )
                 if uv_rc != 0:
                     return SyncOutcome(
                         configured=True, ok=False, stale=True, synced=False,
                         local_head=local_head, remote_head=remote_head,
-                        detail=f'uv sync failed (rc={uv_rc}): {uv_err}',
+                        detail=f'uv sync --all-packages failed (rc={uv_rc}): {uv_err}',
+                    )
+
+                # Post-sync LIVENESS assertion (task 4539).  The two return codes
+                # above are NOT sufficient evidence that the host still works: the
+                # destructive bare `uv sync` this call site used to issue exited 0
+                # while deleting the entry point.  A sync whose rc says "fine" but
+                # which left no runnable `orchestrator` must bench the runner HERE,
+                # loudly and attributably — otherwise the breakage is rediscovered
+                # one dispatch later as an rc=127 RunnerUnavailable, which is
+                # fail-safe (the pool falls back to local) but indistinguishable
+                # from ssh flakiness, so the remote host stays silently disabled.
+                #
+                # Scoped to the post-sync path: a current checkout and an
+                # in-flight skip mutate nothing, so they issue no probe and the
+                # common per-dispatch case pays zero extra ssh round-trips.
+                #
+                # Fail-closed like every other leg here, and the probe raising is
+                # caught by the outer handler as a transport error.
+                live_rc, _, live_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host, REMOTE_LIVENESS_CMD],
+                )
+                if live_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=(
+                            f'post-sync liveness probe failed: '
+                            f'`{REMOTE_LIVENESS_CMD}` on {self._ssh_host!r} '
+                            f'returned rc={live_rc} — the sync left '
+                            f'{df_remote!r} without a working orchestrator CLI: '
+                            f'{live_err}'
+                        ),
                     )
 
                 # Best-effort post-sync HEAD for the runner_synced.to_head

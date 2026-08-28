@@ -2558,7 +2558,12 @@ class VerifyRunnerConfig(BaseModel):
             'PROJECT checkout where the merge sha is pushed/tested).  When set, '
             'enables the INV-2 contract-currency auto-sync at dispatch '
             '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
-            'when stale; plans/merge-verdict-integrity-prd.md §1, §3.1).  '
+            '--all-packages when stale, then a probe that the remote '
+            '`orchestrator` CLI still answers; plans/merge-verdict-integrity-prd.md '
+            '§1, §3.1).  The sync is --all-packages because a DF checkout is a uv '
+            'WORKSPACE, in which a bare `uv sync` exits 0 while pruning the '
+            'members\' console scripts — including the very entry point this '
+            'runner invokes over ssh (task 4539).  '
             'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
             'pre-INV-2 behaviour for every not-yet-migrated runner.'
         ),
