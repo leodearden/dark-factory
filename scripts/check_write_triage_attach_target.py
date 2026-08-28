@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import inspect
+import json
 import sys
 import traceback
 from pathlib import Path
@@ -244,6 +245,94 @@ def _render(fn: Any, param: Any, slate: list[Any], target: Any, spelling: str) -
     return rendered
 
 
+# --- option (a): the verdict names its own candidate --------------------------
+#
+# Evaluated FIRST, and deliberately tolerant. Option (a) — a verdict that
+# carries the judged candidate id — makes slate position irrelevant, so it
+# closes item 1 with a prompt that marks nothing at all. Task 4798 item 7
+# still carries option (a) as the better long-term design; a gate shaped
+# around option (b) alone would fail it and re-block task 3169, which is the
+# very defect (mirrored) that task 4810 exists to remove.
+
+#: Field names an option-(a) wire contract plausibly uses for the candidate.
+#: Tried only as EXTRA keys on the probe payload: main ignores them, and a
+#: parser that demands one is not thereby failed.
+_ID_FIELDS = ('candidate_id', 'id')
+
+#: A verdict that is one of these is a bare outcome, not a binding to a
+#: candidate. ``bool`` is listed before ``int`` reaches it for clarity only —
+#: ``isinstance`` covers the subclass either way.
+_NOT_A_CANDIDATE_BINDING = (str, bytes, bool, int, float)
+
+
+def _binds_candidate(result: Any) -> bool:
+    """True when *result* is something that can carry a candidate id.
+
+    ``None`` and the scalar types are excluded so a parser that quietly
+    returns ``None`` on an unrecognised payload — rather than raising — is not
+    mistaken for one that returns an ``(outcome, candidate_id)`` pair.
+    """
+    return result is not None and not isinstance(result, _NOT_A_CANDIDATE_BINDING)
+
+
+def _verdict_key(module: Any) -> str:
+    key = getattr(module, 'VERDICT_KEY', None)
+    return key if isinstance(key, str) and key else 'verdict'
+
+
+def _verdict_words(module: Any) -> tuple[str, ...]:
+    """The judge's own vocabulary, read from the module where it exposes one."""
+    words = getattr(module, 'JUDGE_VERDICTS', None)
+    if isinstance(words, dict) and words:
+        return tuple(str(word) for word in words)
+    return ('distinct', 'restates', 'amends', 'contests')
+
+
+def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
+    """``(holds, reason)`` for the option-(a) branch.
+
+    A raise on every payload is INCONCLUSIVE, not a failure: a stricter
+    option-(a) parser may demand a slate argument this probe cannot supply.
+    The caller falls through to option (b) in that case.
+    """
+    parse = getattr(module, 'parse_judge_verdict', None)
+    if parse is None:
+        return False, 'parse_judge_verdict is absent from the module'
+    key = _verdict_key(module)
+    ident = str(getattr(slate[0], 'id', ''))
+    saw_bare_str = False
+    errors: list[str] = []
+    for word in _verdict_words(module):
+        payloads: list[dict[str, str]] = [{key: word}]
+        payloads.extend({key: word, field: ident} for field in _ID_FIELDS)
+        for payload in payloads:
+            try:
+                result = parse(json.dumps(payload))
+            except Exception as exc:  # noqa: BLE001 - a rejection is inconclusive here
+                errors.append(f'{payload!r} -> {exc!r}')
+                continue
+            if _binds_candidate(result):
+                return True, (
+                    f'satisfied — parse_judge_verdict returned '
+                    f'{type(result).__name__} {result!r} for {payload!r}, so the '
+                    'verdict itself names its candidate and the position of the '
+                    'attach target in the slate stops mattering'
+                )
+            if isinstance(result, str):
+                saw_bare_str = True
+            else:
+                errors.append(f'{payload!r} -> returned {type(result).__name__}')
+    if saw_bare_str:
+        return False, (
+            'parse_judge_verdict returns a bare str — the verdict names no '
+            'candidate, so the attach must guess one from the slate'
+        )
+    shown = '; '.join(errors[:3])
+    if len(errors) > 3:
+        shown += f'; …{len(errors) - 3} more'
+    return False, f'inconclusive — parse_judge_verdict accepted no probe payload ({shown})'
+
+
 # --- the swap test ----------------------------------------------------------
 #
 # Render the SAME slate twice against two DIFFERENT attach targets. Everything
@@ -314,8 +403,13 @@ _FAIL_NEITHER = [
     '      one of them, so a verdict reasoned about one candidate is filed',
     '      against another and x_contested lands on a canonical the entry never',
     '      contradicted.',
-    '      Remedy (b): give build_judge_prompt a parameter naming the attach',
-    '      target, and make its rendering DEPEND on which candidate that names.',
+    '      EITHER remedy closes this — what is asserted is the INVARIANT, not',
+    '      which mechanism landed:',
+    '        (a) make parse_judge_verdict return the judged candidate alongside',
+    '            the outcome (an (outcome, candidate_id) pair), so the verdict',
+    '            names its own candidate and slate position stops mattering; or',
+    '        (b) give build_judge_prompt a parameter naming the attach target,',
+    '            and make its rendering DEPEND on which candidate that names.',
 ]
 
 
@@ -342,6 +436,15 @@ def _probe(src_root: Path, out: list[str]) -> int:
         f'slate: {slate_ids!r} — attach target {target.id!r} at index {index} '
         f'of {len(slate)}',
     )
+
+    holds_a, reason_a = _option_a_verdict(module, slate)
+    out.append(f'option (a): {reason_a}')
+    if holds_a:
+        out.append(
+            'PASS  the judge path binds a verdict to a determinate candidate '
+            '(option (a)).',
+        )
+        return EXIT_OK
 
     build = _require(module, 'build_judge_prompt')
     param = _target_parameter(build)
@@ -378,7 +481,10 @@ def _probe(src_root: Path, out: list[str]) -> int:
         f'{param.name!r} (spelled as the candidate {spelling}) and its rendering '
         f'depends on which candidate is the attach target',
     )
-    out.append('PASS  the judge path binds a verdict to a determinate candidate.')
+    out.append(
+        'PASS  the judge path binds a verdict to a determinate candidate '
+        '(option (b)).',
+    )
     return EXIT_OK
 
 
