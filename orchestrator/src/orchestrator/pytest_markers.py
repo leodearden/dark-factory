@@ -301,14 +301,17 @@ def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
 
     Deliberately a SEPARATE, small duplicate of that function's body rather
     than a shared helper the two delegate to: ``module_level_marker_names``
-    is the exact edit site of task 3513's still-in-progress Gap-2
+    is the exact edit site of task 4561, the still-pending owner of Gap 2
     (class-level markers), and this task leaves that function byte-identical
     to avoid a textual merge conflict with it (see the plan's design
     decisions).  Used only by :func:`per_item_marker_names`, which already
     holds a parsed *tree* and would otherwise pay a second, wholly redundant
     ``ast.parse`` of the same source purely to re-derive this set.  A later
-    reader may collapse the two into one shared tree-walker once 3513 has
-    landed and that merge-conflict risk is gone.
+    reader may collapse the two into one shared tree-walker once 4561 has
+    landed and that merge-conflict risk is gone.  Sequencing: whichever of
+    this task (Gap 3) and 4561 lands second should fold its walk into the
+    tier the other already added — :func:`per_item_marker_names` or
+    :func:`module_level_marker_names` — rather than adding a third.
     """
     value: ast.expr | None = None
     for statement in tree.body:
