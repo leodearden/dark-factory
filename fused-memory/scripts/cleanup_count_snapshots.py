@@ -233,6 +233,7 @@ def build_audit_report(
     limit_per_project: int,
     generated_at: str,
     failed_invalidations: list[dict[str, Any]] | None = None,
+    enumeration_by_project: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the structured JSON audit report.
 
@@ -253,11 +254,28 @@ def build_audit_report(
     failed_invalidations:
         List of ``{edge_uuid, project_id, error, phase}`` dicts for edges that
         could not be invalidated or whose audit memory could not be written.
+    enumeration_by_project:
+        ``{project_id: {entities_complete, entities_incomplete_kind,
+        edges_complete, edges_incomplete_kind}}`` — how COMPLETE each
+        project's two whole-graph reads were (task 4386).  Every count in this
+        report describes whatever those reads returned; without this, a clean
+        audit over the WHOLE corpus is indistinguishable in the JSON from an
+        equally clean-looking audit over a truncated one.  A project absent
+        from the mapping still gets all four keys, valued ``None`` — the shape
+        is uniform on every path (including the cap abort, which returns
+        before the edge read happens), and ``None`` already means "no corpus
+        observed, so nothing is claimed about it".
 
     Returns
     -------
     Dict with keys: dry_run, generated_at, limit_per_project, projects, matches,
     totals, summaries_matched, failed_invalidations.
+
+    Each ``projects[pid]`` entry carries entities_scanned, edges_matched,
+    edges_invalidated, refresh_failures and the four enumeration keys above.
+    ``totals`` carries entities_scanned, edges_matched, edges_invalidated,
+    refresh_failures and ``incomplete_enumerations`` — the count of PROJECTS
+    (not reads) whose corpus was not proven whole.
     """
     # Collect all matches in deterministic order (by edge_uuid globally)
     all_matches: list[dict[str, Any]] = []
@@ -292,11 +310,19 @@ def build_audit_report(
         proj_refresh_failures = [
             f for f in failed_refreshes if f.get('project_id') == pid
         ]
+        # Read completeness for THIS project's own two reads, defaulting to
+        # UNKNOWN (None) rather than omitted, so the entry shape is identical
+        # on every path a caller can reach.  (task 4386)
+        proj_enumeration = (enumeration_by_project or {}).get(pid) or {}
         per_project_summary[pid] = {
             'entities_scanned': entities_scanned,
             'edges_matched': len(project_edge_matches),
             'edges_invalidated': edges_invalidated,
             'refresh_failures': len(proj_refresh_failures),
+            'entities_complete': proj_enumeration.get('entities_complete'),
+            'entities_incomplete_kind': proj_enumeration.get('entities_incomplete_kind'),
+            'edges_complete': proj_enumeration.get('edges_complete'),
+            'edges_incomplete_kind': proj_enumeration.get('edges_incomplete_kind'),
         }
 
         for r in results:
@@ -315,6 +341,17 @@ def build_audit_report(
         'edges_matched': sum(v['edges_matched'] for v in per_project_summary.values()),
         'edges_invalidated': sum(v['edges_invalidated'] for v in per_project_summary.values()),
         'refresh_failures': len(failed_refreshes),
+        # PROJECTS, not reads: a project with BOTH reads partial counts once.
+        # This answers "how many projects is this report unreliable for", which
+        # is a per-project question -- counting reads would report 2 for a
+        # single affected project and read as twice the damage.  `is not True`
+        # and not `is False` on purpose: UNKNOWN is not a project known to be
+        # whole, and admitting it here would let a run that never looked pass
+        # as one that looked and found everything.  (task 4386)
+        'incomplete_enumerations': sum(
+            1 for v in per_project_summary.values()
+            if v['entities_complete'] is not True or v['edges_complete'] is not True
+        ),
     }
 
     return {
@@ -627,17 +664,60 @@ async def run(
             )
             raise
 
+    # Both whole-graph reads below go through the ``enumerate_*`` API rather
+    # than the ``list_entity_nodes`` / ``get_all_valid_edges`` shims, which
+    # return the collection alone and discard the completeness signal.  The
+    # audit report is an OPERATOR-facing artefact whose every count describes
+    # whatever the reads returned, so "was this the whole corpus?" belongs in
+    # it -- see build_audit_report's enumeration_by_project.  (task 4386)
+    #
+    # ``enumerate_*`` NEVER raises: it reports incompleteness as a value.  So
+    # the fail-closed structural guard the shims applied on this script's
+    # behalf has to be re-applied here, through the SAME shared policy, or a
+    # page-capped read is taken for the whole corpus and every entity the
+    # missing pages carry is scanned as absent.  Deliberately left UNCAUGHT,
+    # which preserves today's behaviour exactly: ``run()`` has no try/except
+    # around these reads, so a structural incompleteness propagates out and
+    # aborts BEFORE apply_cleanup -- precisely what the shim's raise does
+    # today.  An EMPIRICAL incompleteness only warns, and the scan proceeds on
+    # what was fetched with the report saying so.
+    from fused_memory.backends.graphiti_client import (  # noqa: PLC0415
+        apply_incompleteness_policy,
+    )
+
+    enumeration_by_project: dict[str, dict[str, Any]] = {}
+
     # First pass: fetch entity counts for the safety cap check.
-    # We do this BEFORE calling get_all_valid_edges / scanning so that an
+    # We do this BEFORE enumerating edges / scanning so that an
     # oversized project is rejected cheaply, without enumerating its edges.
     per_project_counts: dict[str, int] = {}
     entities_by_project: dict[str, list[Any]] = {}
     for pid in project_ids:
-        entities = await memory.graphiti.list_entity_nodes(group_id=pid)
+        entities, paged = await memory.graphiti.enumerate_entity_nodes(group_id=pid)
+        # Recorded BEFORE the policy is applied, and the ordering is
+        # load-bearing: apply_incompleteness_policy RAISES on a structural
+        # incompleteness, so recording after it would leave the aborted run
+        # with no stated reason.  The two edge keys are seeded here in the
+        # SAME record, so the cap-abort path below -- which returns before the
+        # edge loop ever runs -- still yields the uniform four-key shape.
+        enumeration_by_project[pid] = {
+            'entities_complete': paged.complete,
+            'entities_incomplete_kind': paged.incomplete_kind,
+            'edges_complete': None,
+            'edges_incomplete_kind': None,
+        }
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_entity_nodes',
+            group_id=pid,
+            returned_count=len(entities),
+            noun='nodes',
+            consequence='must not drive a staleness verdict or a summary rewrite',
+        )
         entities_by_project[pid] = entities
         per_project_counts[pid] = len(entities)
 
-    # Safety cap — abort before issuing get_all_valid_edges / scanning
+    # Safety cap — abort before issuing enumerate_all_valid_edges / scanning
     exceeding, abort = check_limit_cap(
         per_project_counts,
         args.limit_per_project,
@@ -662,7 +742,21 @@ async def run(
     # Second pass: scan only projects that passed the cap
     scan_results_by_project: dict[str, list[EntityScanResult]] = {}
     for pid in project_ids:
-        edges_by_entity = await memory.graphiti.get_all_valid_edges(group_id=pid)
+        edges_by_entity, paged = await memory.graphiti.enumerate_all_valid_edges(
+            group_id=pid,
+        )
+        # Recorded before the policy call, for the same reason as the node
+        # read above.
+        enumeration_by_project[pid]['edges_complete'] = paged.complete
+        enumeration_by_project[pid]['edges_incomplete_kind'] = paged.incomplete_kind
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_all_valid_edges',
+            group_id=pid,
+            returned_count=len(edges_by_entity),
+            noun='entities',
+            consequence='must not be written back',
+        )
         scan_results_by_project[pid] = scan_entities_for_snapshots(
             pid, entities_by_project[pid], edges_by_entity
         )
@@ -688,6 +782,7 @@ async def run(
         dry_run=not args.apply,
         limit_per_project=args.limit_per_project,
         generated_at=generated_at,
+        enumeration_by_project=enumeration_by_project,
     )
 
     # JSON report goes to stdout (machine-readable); summary table to stderr.
