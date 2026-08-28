@@ -167,17 +167,33 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #          tip yet: rc=0 proves the tip is reachable from main, NOT that this branch carries
 #          any work. A branch that never advanced past its creation point has main's own old
 #          base commit as its tip and reaches this exact arm — ancestry rc=0, marker empty,
-#          no verified rev-list candidate — carrying none of the task's work. Gate on
-#          content with rule 2b's patch-id test below:
-git cherry main task/<TASK_ID>
-#            NON-EMPTY and every line starts with `-` → each commit is already
-#              patch-equivalent on main: a genuine fast-forward (or already-contained)
-#              landing. Stamp the branch tip — `git rev-parse task/<TASK_ID>` (rc=0
-#              guarantees the ref still exists) — with note "fast-forward merge, no separate
-#              merge commit; branch content confirmed on main by git cherry".
-#            EMPTY output → the branch never advanced: the PHANTOM-BRANCH case, NOT a
-#              landing. Do NOT stamp. Stop and report as not-landed/phantom-branch.
-#            ANY `+` line → a commit is genuinely absent from main. Do NOT stamp; report.
+#          no verified rev-list candidate — carrying none of the task's work. Gate on a
+#          POSITIVE TASK CITATION on main — the shell form of
+#          `GitOps.find_task_citation_commit` (orchestrator/src/orchestrator/git_ops.py),
+#          which exists for exactly this degenerate case (its docstring: is_ancestor
+#          "returns True trivially for zero-commit branches whose tip equals the main HEAD
+#          at branch-create time... Requiring a positive citation on main rejects that
+#          degenerate case"); the pattern is DEFAULT_COMMIT_CITATION_PATTERN in that module:
+git log main --extended-regexp --format='%H %s' \
+    --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\(\b<TASK_ID>\b[):]|.*\btask/<TASK_ID>\b)|^Merge task/<TASK_ID> into |\(#?<TASK_ID>\)|\(task <TASK_ID>\)'
+#            READ THE %s SUBJECT, not just the count: --grep matches the whole message and
+#              git applies ^/$ per LINE, so a body line can match spuriously. The function
+#              uses --grep only as a coarse pre-filter and re-tests each candidate's SUBJECT
+#              alone — do the same, most-recent-first, first subject match wins.
+#            A SUBJECT-MATCHING ROW EXISTS → real work citing this task is on main: a
+#              genuine fast-forward (or already-contained) landing. Stamp the branch tip —
+#              `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists) — with
+#              note "fast-forward merge, no separate merge commit; landing confirmed by task
+#              citation <citing sha> on main".
+#            NO SUBJECT-MATCHING ROW → nothing on main cites this task: the PHANTOM-BRANCH
+#              case, NOT a landing. Do NOT stamp. Stop and report as not-landed/phantom-branch.
+#            PROJECT SETS `git.commit_citation_pattern: ""` → empty BY CONFIGURATION, proving
+#              neither verdict. Do NOT stamp; report the gate as un-evaluable.
+#            Do NOT substitute `git cherry` on THIS arm: it reports only commits reachable
+#              from the branch but NOT from main, and rc=0 has just proved every branch
+#              commit IS reachable from main — so it prints nothing for a genuine
+#              fast-forward and a phantom branch alike. Rule 2b's use of it on the rc=1 arm
+#              (where the branch is NOT an ancestor) is correct and unaffected.
 #          kind='found_on_main' REQUIRES a commit (no note-only fallback since the post-3092
 #          hardening), so where this gate finds no honest commit the answer is to write
 #          NOTHING AT ALL — never to substitute a convenient sha.

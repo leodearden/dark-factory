@@ -321,29 +321,52 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
   commit as its tip, so it passes ancestry trivially, searches marker-empty, and yields no
   rev-list candidate — exactly this arm — while carrying none of the task's work. Stamping it
   would fabricate landing evidence for a phantom branch, and the server's only backstop
-  (`git merge-base --is-ancestor <sha> main`) passes for it. Prove content first, with the same
-  patch-id test merge-queue/SKILL.md rule 2b prescribes:
+  (`git merge-base --is-ancestor <sha> main`) passes for it. Require a **positive task citation
+  on main** first:
 
   ```bash
-  git cherry main task/<TASK_ID>
+  git log main --extended-regexp --format='%H %s' \
+      --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\(\b<TASK_ID>\b[):]|.*\btask/<TASK_ID>\b)|^Merge task/<TASK_ID> into |\(#?<TASK_ID>\)|\(task <TASK_ID>\)'
   ```
 
-  - **Non-empty and every line starts with `-`** (each of this branch's commits is already
-    patch-equivalent on main) → a genuine fast-forward / already-contained landing. Stamp the
-    branch tip, `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note":
-    "fast-forward merge, no separate merge commit; branch content confirmed on main by git
-    cherry"}`.
-  - **Empty output** → the branch never advanced past its creation point. This is the
+  This is the shell form of `GitOps.find_task_citation_commit`
+  (`orchestrator/src/orchestrator/git_ops.py`), which exists for **exactly this degenerate
+  case** — its docstring: `is_ancestor` "returns True trivially for zero-commit branches whose
+  tip equals the main HEAD at branch-create time... Requiring a positive citation on main
+  rejects that degenerate case." The pattern is `DEFAULT_COMMIT_CITATION_PATTERN` in the same
+  module.
+
+  **Read the `%s` subject, not just the count.** `--grep` matches the *whole message* and git
+  applies `^`/`$` per line, so a body line can match spuriously; the function uses `--grep` only
+  as a coarse pre-filter and re-tests each candidate's **subject** alone. Do the same: walk the
+  output most-recent-first and take the first row whose **subject** cites this task.
+
+  - **A subject-matching row exists** → a genuine fast-forward / already-contained landing:
+    real work citing this task is on main. Stamp the branch tip per
+    `orchestrator/src/orchestrator/agents/briefing.py`'s fast-forward rule,
+    `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note": "fast-forward
+    merge, no separate merge commit; landing confirmed by task citation <citing sha> on main"}`.
+    Recording the citing sha in the note is what makes the stamp auditable.
+  - **No subject-matching row** → nothing on main cites this task. This is the
     **phantom-branch** case, NOT a landing. Do **not** stamp. Stop and report it as
-    not-landed/phantom-branch, citing the empty `git cherry` output. This is the same signal
-    `skills/unblock/SKILL.md`'s `already_merged` guidance treats as **not done** — the two rules
-    agree, and neither may be overridden by the other.
-  - **Any line starting with `+`** → at least one commit is genuinely absent from main. Do
-    **not** stamp; stop and report.
+    not-landed/phantom-branch. This is the same signal `skills/unblock/SKILL.md`'s
+    `already_merged` guidance treats as **not done** — the two rules agree, and neither may be
+    overridden by the other.
+  - **The project sets `git.commit_citation_pattern: ""`** (citation checking opted out) → the
+    check returns nothing *by configuration*, so it proves neither landing nor phantom. No
+    content proof is available on this arm: do **not** stamp, and report that the gate could not
+    be evaluated rather than reading the empty result as either verdict.
+
+  Do **not** substitute `git cherry main task/<TASK_ID>` here. That test reports only commits
+  reachable from the branch but **not** from main; on this arm ancestry rc=0 has just proved
+  every branch commit *is* reachable from main, so it prints nothing for a genuine
+  fast-forward and a phantom branch alike and cannot separate them. (`git cherry` is correct
+  where merge-queue/SKILL.md rule 2b uses it — the rc=1 arm, where the branch is *not* an
+  ancestor — and that usage stands.)
 
   `kind='found_on_main'` requires `commit` and `note`, so where this gate finds no honest commit
   the answer is to write **nothing at all** — never to substitute a convenient sha. Declining to
-  stamp *is* an available option on this arm, and on the two failing branches it is the required
+  stamp *is* an available option on this arm, and on the failing branches it is the required
   one.
 - **rc=1** (branch exists, not an ancestor of main) → **not a not-landed verdict on its own.**
   Carve out the coalesce case before aborting: if this task was ever `superseded` by a
