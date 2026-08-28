@@ -12659,6 +12659,51 @@ def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
     return spy_replay, spy_complete, call_order, lock_held_during_replay
 
 
+async def _drive_project_loop_until(
+    harness,
+    predicate,
+    *,
+    project_id: str = 'test-project',
+    timeout: float = 15.0,
+) -> None:
+    """Run ``_project_loop`` until ``predicate()`` holds, then stop it.
+
+    ``_project_loop`` never returns on its own along the non-halt exit paths — it
+    loops forever — so a test driving it directly has to stop it.  Doing that with
+    a short fixed wall-clock budget (the original
+    ``wait_for(harness._project_loop(...), timeout=0.5)`` plus
+    ``suppress(TimeoutError)``) races: the budget is not a completion signal, and
+    on a loaded machine the loop simply had not reached ``mark_run_complete`` when
+    the budget expired.  The spy list was then still empty and the caller's
+    assertion reported the *ordering bug it guards against* rather than the
+    timeout that actually happened — a false failure that blames production code
+    for a slow test host (observed under the full 32-worker suite run).
+
+    So wait on the observable signal instead.  ``timeout`` is only a failsafe: if
+    the signal genuinely never arrives (the real regression these tests pin), the
+    predicate stays false and the caller's own assertion fires with its diagnostic
+    message instead of hanging.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    task = asyncio.create_task(harness._project_loop(project_id))
+    try:
+        while not predicate() and loop.time() < deadline:
+            if task.done():
+                break  # loop exited on its own; predicate won't change again
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    # Surface a genuine crash rather than letting it masquerade as "signal never
+    # arrived" in the caller's assertion.
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+
 # -- tests --------------------------------------------------------------------
 
 
@@ -12686,9 +12731,8 @@ async def test_project_loop_replays_deferred_writes_before_releasing_lock(
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
-        contextlib.suppress(TimeoutError),
     ):
-        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+        await _drive_project_loop_until(harness, lambda: 'complete' in call_order)
 
     assert call_order == ['replay', 'complete'], (
         f'Expected replay-then-complete, got {call_order!r}. '
@@ -12724,9 +12768,8 @@ async def test_project_loop_releases_lock_when_replay_raises(
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
-        contextlib.suppress(TimeoutError),
     ):
-        await asyncio.wait_for(harness._project_loop('test-project'), timeout=0.5)
+        await _drive_project_loop_until(harness, lambda: bool(complete_called))
 
     assert complete_called, (
         'mark_run_complete was never called after replay raised. '
@@ -12778,8 +12821,11 @@ async def test_project_loop_replays_before_releasing_lock_on_halt(
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
     ):
-        # Halt path returns naturally — no wait_for/suppress needed
-        await asyncio.wait_for(harness._project_loop('test-project'), timeout=1.0)
+        # Halt path returns naturally — no wait_for/suppress needed.  The timeout
+        # is a hang failsafe only, so keep it generous: a tight budget here just
+        # turns a loaded test host into a spurious TimeoutError (see
+        # _drive_project_loop_until for the same defect on the other exit paths).
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=15.0)
 
     assert call_order == ['replay', 'complete'], (
         f'Expected replay-then-complete on halt path, got {call_order!r}. '
