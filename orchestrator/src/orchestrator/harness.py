@@ -726,6 +726,36 @@ _MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
 })
 
 
+# Session-resume reasons that are BY DESIGN and therefore excluded from the
+# fallback-storm streak (task 3728 / D4). The _run_slot guard subtracts this
+# set from the reasons `Harness._session_resume_reasons` reports; whatever is
+# left is a GENUINE failure and feeds the INV-4 storm escape.
+#
+# It extends the `capped` precedent (config.py::SessionResumeConfig —
+# max_resumes_per_task throttling has never fed the streak) to the whole
+# currently-producible vocabulary, and closes a self-contradiction: the
+# predicate's own docstring documented `no_transcript` as covering the
+# anticipated reseed/wipe cases while the caller classified it a genuine
+# corroboration failure, so a run of expected outcomes filed an L1 telling the
+# operator to check host clock skew.
+#
+# EXTENSION RULE for PRD leaf ε (task 3733) and anything after it: a NEW reason
+# is a GENUINE feeder BY DEFAULT — you must add it HERE to exempt it. That is
+# the fail-loud direction: ε's archive-restore-failure feeder starts tripping
+# the storm escape with no second edit, whereas an allow-list of genuine
+# reasons would default it to silence, which is the failure mode this PRD is
+# about. `TestSessionResumeStorm::
+# test_by_design_constant_classifies_every_producible_reason` reads the
+# predicate's source and fails if a reason is added without being classified.
+_BY_DESIGN_SESSION_RESUME_REASONS: frozenset[str] = frozenset({
+    'disabled',       # kill switch — the feature is off (B6)
+    'capped',         # per-task resume throttle (B7)
+    'stale',          # sidecar older than the freshness window
+    'no_transcript',  # transcript absent / uncorroborable
+    'reseeded',       # warm-lane acquire wiped the transcript store (3256)
+})
+
+
 
 def _is_terminal_merged(task: dict | None) -> bool:
     """Return True iff *task* is a done task whose content is confirmed merged.
@@ -7207,13 +7237,20 @@ class Harness:
         ``_session_resume_fallback_streak`` reaches
         ``session_resume.fallback_storm_threshold``. A single isolated
         fallback never trips this — only a RUN does, which is the signature of
-        SYSTEMATIC corroboration breakage. Only UNEXPLAINED failures feed the
-        streak: since task 3256 a lane reseed is classified ``reseeded`` and
-        excluded by construction (as ``capped`` already was), so the causes
-        that can still trip this are clock skew making every sidecar look
-        stale, or transcripts vanishing while their config dir survives.
-        Deduped by ``has_open_l1`` so the operator sees exactly one open storm
-        L1 at a time.
+        SYSTEMATIC breakage. Only UNEXPLAINED failures feed the streak: EVERY
+        by-design outcome is excluded by construction (task 3728 —
+        :data:`_BY_DESIGN_SESSION_RESUME_REASONS`), extending the exclusion
+        that ``capped`` and then ``reseeded`` already had to the whole
+        currently-producible vocabulary. Reaching the threshold therefore means
+        a reason OUTSIDE that vocabulary fired repeatedly. Deduped by
+        ``has_open_l1`` so the operator sees exactly one open storm L1 at a
+        time.
+
+        With today's vocabulary nothing can feed the streak, so this is
+        unreachable in production until PRD leaf ε (task 3733) installs the
+        archive-restore-failure feeder — a deliberate, waived window. The
+        mechanism is RETAINED rather than deleted precisely so ε re-arms a
+        tested path instead of rebuilding one.
 
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
         failure is swallowed so filing never breaks the guard path (I3).
@@ -7233,8 +7270,8 @@ class Harness:
                 category='infra_issue',
                 summary=(
                     'Session-resume fallback storm — '
-                    f'{threshold}+ UNEXPLAINED resume corroboration failures '
-                    'in a row; resume degraded to fresh dispatch for all'
+                    f'{threshold}+ UNEXPLAINED resume failures in a row; '
+                    'resume degraded to fresh dispatch for all'
                 )[:200],
                 detail=(
                     f'{threshold} or more session-resume eligibility failures '
@@ -7242,30 +7279,34 @@ class Harness:
                     'session_resume.storm_window_secs of the previous, with no '
                     'intervening successful resume. Every recovered agent '
                     'session was rejected and degraded to a fresh dispatch — '
-                    'safe, but a RUN this tight suggests a systematic cause.\n\n'
-                    'By-design degradations are EXCLUDED BY CONSTRUCTION and '
-                    'cannot have contributed: a lane reseed (which always wipes '
-                    '.task/ and its transcript store) is classified '
-                    "reason='reseeded', and the per-task cap is "
-                    'session_resume_capped. So the remaining causes are:\n'
-                    "  - reason='stale' — host clock skew (NTP) making every "
-                    'sidecar look older than freshness_window_secs;\n'
-                    "  - reason='no_transcript' — transcripts vanishing while "
-                    'their claude-config dir SURVIVES, or an adopted sidecar '
-                    'with no config dir at all.\n\n'
+                    'safe, but a RUN this tight suggests a systematic cause.'
+                    '\n\n'
+                    'EVERY by-design degradation is excluded from this streak '
+                    'by construction (harness.py::'
+                    '_BY_DESIGN_SESSION_RESUME_REASONS), so none of them can '
+                    'have contributed and none is worth investigating here. '
+                    'Reaching the threshold means a reason OUTSIDE that '
+                    'vocabulary fired repeatedly — read it off the events '
+                    'rather than guessing, since the set is exactly what the '
+                    'guard classified as unexplained:\n'
+                    "  select json_extract(data,'$.reasons'), count(*) from "
+                    "events where event_type='session_resume_fallback' "
+                    'group by 1 order by 2 desc;\n'
+                    'The list is sorted, so each distinct combination is its '
+                    'own row and a co-occurring by-design reason is visible '
+                    'beside the unexplained one rather than hiding it.\n\n'
                     'Fresh dispatch loses the in-flight agent context that '
                     'resume would have preserved, so throughput/cost is '
-                    'degraded until the cause is fixed. Query the reasons: '
-                    "select json_extract(data,'$.reason'), count(*) from events "
-                    "where event_type='session_resume_fallback' group by 1."
+                    'degraded until the cause is fixed.'
                 ),
                 suggested_action=(
-                    'Check host clock skew (NTP) first, then whether '
-                    'transcripts are disappearing from a surviving '
-                    '.task/claude-config dir. The streak resets on the next '
-                    'successful resume, or decays after a storm_window_secs '
-                    'gap, so resolve this L1 once the underlying cause is '
-                    'fixed.'
+                    'Run the query above and identify the unexplained reason '
+                    'driving the run, then investigate that specific failure '
+                    'mode — do not start from the by-design population, which '
+                    'is excluded and did not contribute. The streak resets on '
+                    'the next successful resume, or decays after a '
+                    'storm_window_secs gap, so resolve this L1 once the '
+                    'underlying cause is fixed.'
                 ),
                 level=1,
                 filing_claimant_run_id=self._filing_claimant_run_id,
@@ -9103,25 +9144,34 @@ class Harness:
                                     ),
                                 },
                             )
-                        # TRANSITIONAL (task 3728, generalised in step-6):
-                        # the feeder still excludes exactly the reseed-only
-                        # set, which is what the retired first-match string
-                        # meant — 'reseeded' sat LAST in the precedence order,
-                        # so `reason == 'reseeded'` was reachable only when it
-                        # was the sole reason. Step-6 replaces this with the
-                        # by-design subtraction.
-                        if reasons != {'reseeded'}:
-                            # 'stale' / 'no_transcript' — a GENUINE corroboration
-                            # failure, so it feeds the storm streak below.
-                            #
-                            # 'reseeded' deliberately falls past this (task 3256):
-                            # the acquire that re-seeds from base wiped the
-                            # transcript store, so that fallback is EXPECTED, not
-                            # a corroboration failure. It keeps the event (the
-                            # fallback rate stays measurable — PRD open question 3)
-                            # but, like 'capped', neither feeds NOR resets the
-                            # streak: a drip of reseeds must not mask a genuine
-                            # systematic failure interleaved between them.
+                        # What FEEDS the storm streak is whatever survives
+                        # subtracting the BY-DESIGN vocabulary (task 3728 / D4)
+                        # — expressed as set subtraction against a named
+                        # constant rather than an inequality chain, so the
+                        # classification is one enumerable value instead of
+                        # control flow, and so this branch's shape does not
+                        # depend on how many reasons exist.
+                        #
+                        # A by-design outcome keeps its event (the fallback
+                        # rate stays measurable — PRD open question 3) but,
+                        # like 'capped' before it, neither feeds NOR resets the
+                        # streak: a drip of expected fallbacks must not mask a
+                        # genuine systematic failure interleaved between them
+                        # (task 3256's anti-masking rule). And because the
+                        # reasons are a SET rather than a first match, a
+                        # by-design reason co-occurring with a genuine one
+                        # cannot LAUNDER it — the difference is still non-empty.
+                        #
+                        # G7/INV-4 WAIVER, recorded honestly: with today's
+                        # vocabulary `genuine` is ALWAYS empty, so nothing
+                        # increments the streak and this branch is dead until
+                        # PRD leaf ε (task 3733) installs the
+                        # archive-restore-failure feeder. That window is
+                        # deliberate and waived, not an oversight — do not read
+                        # the unreachable body as a bug, and do not "fix" it by
+                        # putting a by-design reason back on the feeder.
+                        genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
+                        if genuine:
                             #
                             # Rolling-window decay (task 3256): "consecutive" means
                             # CHAINED within storm_window_secs, not merely

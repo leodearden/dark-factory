@@ -3071,8 +3071,10 @@ class TestSessionResumeArchiveAvailable:
     from the durable transcript archive — the measurement task 3619 will move
     and leaf δ may later gate on. It is instrumentation ONLY (D8 / INV-3
     instrument-before-acting): it must never change what dispatches, so every
-    assertion here also pins that the reason, the resume decision and the
-    storm streak are exactly what they were before the field existed.
+    assertion here also pins that the reasons, the resume decision and the
+    storm streak are exactly what they would be without the field. (Task 3728
+    later reclassified which reasons FEED that streak; the point these rows
+    make — that the instrument itself moves nothing — is unaffected.)
     """
 
     async def test_no_transcript_reports_archive_present(
@@ -3110,8 +3112,13 @@ class TestSessionResumeArchiveAvailable:
         # `is True`, not truthy: the field must be a real JSON bool for
         # json_extract(data, '$.archive_available') to be queryable in runs.db.
         assert kwargs['data']['archive_available'] is True
-        # D8: a genuine corroboration failure still feeds the storm streak.
-        assert harness._session_resume_fallback_streak == 1
+        # D8: the instrument still perturbs NOTHING — asserted here because the
+        # streak is the one piece of guard state a filesystem-touching
+        # instrument could plausibly disturb. The expected value is 0 rather
+        # than 1 since task 3728 carved 'no_transcript' (and every other
+        # by-design reason) out of the feeder; α's field is unchanged either
+        # way, which is exactly what this row exists to show.
+        assert harness._session_resume_fallback_streak == 0
 
     async def test_no_transcript_reports_archive_absent(
         self, harness: Harness, tmp_path: Path
@@ -3139,7 +3146,7 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['no_transcript']
         assert kwargs['data']['archive_available'] is False
-        assert harness._session_resume_fallback_streak == 1
+        assert harness._session_resume_fallback_streak == 0  # by design (3728)
 
     async def test_stale_also_carries_the_field(
         self, harness: Harness, tmp_path: Path
@@ -3167,7 +3174,7 @@ class TestSessionResumeArchiveAvailable:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['stale']
         assert kwargs['data']['archive_available'] is True
-        assert harness._session_resume_fallback_streak == 1
+        assert harness._session_resume_fallback_streak == 0  # by design (3728)
 
     async def test_reseeded_also_carries_the_field(
         self, harness: Harness, tmp_path: Path
