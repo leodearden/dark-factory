@@ -12782,6 +12782,109 @@ async def test_project_loop_releases_lock_when_replay_raises(
 
 
 @pytest.mark.asyncio
+async def test_completion_spy_records_after_the_wrapped_call_returns():
+    """_make_completion_spy's signal must denote the EFFECT, not the call's entry.
+
+    A timing-free contract test of the shape itself.  ``_drive_project_loop_until``
+    cancels the driven ``_project_loop`` on the first poll tick where its predicate
+    holds, so a predicate keyed on a signal raised on ENTRY hands the driver
+    permission to cancel the very write it is waiting for: the real
+    ``mark_run_complete`` has awaits after entry (``db.execute`` plus the commit in
+    ``EventBuffer._txn``), and ``_txn`` catches ``BaseException`` so the cancel
+    rolls the ``DELETE`` back and the lock row survives.
+
+    Pins the four properties that make the shape safe, none of which need a clock.
+    """
+    seen_at_entry: list[bool] = []
+
+    async def stub(*args, **kwargs):
+        # ``signal`` is bound below, before ``spy`` is ever awaited.
+        seen_at_entry.append(bool(signal))
+        return ('rowcount', args, kwargs)
+
+    spy, signal = _make_completion_spy(stub)
+
+    result = await spy('test-project', 42, keyword='value')
+
+    assert seen_at_entry == [False], (
+        f'Completion signal was already set on entry to the wrapped call, got {seen_at_entry!r}. '
+        'Bug: signalling on entry lets a poller cancel the write it is waiting for.'
+    )
+    assert signal == [True], (
+        f'Expected the completion signal set once the wrapped call returned, got {signal!r}.'
+    )
+    assert result == ('rowcount', ('test-project', 42), {'keyword': 'value'}), (
+        f'Expected the wrapped call\'s arguments and return value forwarded, got {result!r}. '
+        'mark_run_complete returns a rowcount callers use to detect a no-op release, '
+        'so a spy that swallows it would silently break any assertion on it.'
+    )
+
+    async def raising_stub(*args, **kwargs):
+        raise RuntimeError('boom')
+
+    raising_spy, raising_signal = _make_completion_spy(raising_stub)
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await raising_spy('test-project')
+
+    assert raising_signal == [], (
+        f'Expected no completion signal after the wrapped call raised, got {raising_signal!r}. '
+        'A mark_run_complete that raised did NOT release the lock, so it must not '
+        'be reported as complete.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_releases_lock_when_replay_raises_under_a_slow_complete(
+    journal, event_buffer, mock_memory_service
+):
+    """The lock-release guard must still hold when mark_run_complete is slow.
+
+    Same production invariant as
+    ``test_project_loop_releases_lock_when_replay_raises`` — that test keeps
+    running at its natural speed — but with the OBSERVATION race made
+    deterministic instead of load-dependent.  The real ``mark_run_complete``
+    spends only a few milliseconds inside its transaction against
+    ``_drive_project_loop_until``'s 10ms poll tick, so an entry-signalled spy
+    loses that race only under a loaded parallel run.
+
+    The injected 50ms delay — 5x the tick, three orders of magnitude inside the
+    15s failsafe — makes the failure certain: were the signal raised on entry,
+    the driver would cancel ``_project_loop`` mid-``DELETE``, ``EventBuffer._txn``
+    would roll it back, and the lock row would survive.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await _seed_recon_state(event_buffer)
+
+    original_complete = harness.buffer.mark_run_complete
+
+    async def slow_complete(pid, *args, **kwargs):
+        # Deterministic stand-in for a loaded host, injected BEFORE the real call
+        # so the whole of mark_run_complete still runs inside the spy.
+        await asyncio.sleep(0.05)
+        return await original_complete(pid, *args, **kwargs)
+
+    spy_complete, complete_signal = _make_completion_spy(slow_complete)
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
+        patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+    ):
+        await _drive_project_loop_until(harness, lambda: bool(complete_signal))
+
+    assert complete_signal, (
+        'mark_run_complete never completed after replay raised. '
+        'Bug: a bare reorder leaks the lock when _replay_deferred_writes raises.'
+    )
+    assert not await event_buffer.is_full_recon_active('test-project'), (
+        'Lock was not released after replay raised. '
+        'Bug: the completion signal fired before mark_run_complete had done its '
+        'work, so the driver cancelled the DELETE and _txn rolled it back.'
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_loop_replays_before_releasing_lock_on_halt(
     journal, event_buffer, mock_memory_service
 ):
