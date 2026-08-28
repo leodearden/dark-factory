@@ -770,8 +770,20 @@ escalation:
 # true demand may run higher — prefer generosity on the next re-baseline too.
 # The mislabeling that let this hide (cap exhaustion reported as
 # "infrastructure errors after retries") is tracked as task 3321.
+#
+# architect 120 -> 180 (2026-08-28, task-sizing investigation + E4 re-test).
+# Same doctrine as the reviewer raise: a cap is a runaway guard, not a
+# throttle. Measured over invocation_end events since the opus-5 cutover
+# (2026-07-24, n=1,459 successful architect runs): p50=42, p90=71, p95=78,
+# p99=95, max=114 — and the near-cap region is HEALTHY work, not runaways:
+# 27 successes at >=90 turns vs 2 failures. E4's architect-only re-test of
+# the retired cross-package pre-split rule showed complete combined-scope
+# plans need 96-105 turns while using under $13 of the $15 budget, i.e. the
+# turn cap, not the dollar cap, is the binding margin on large scope.
+# 180 = ~1.9x p99, matches reify's architect cap (raised 2026-08-19). The
+# dollar ceiling (15.0) still bounds true runaways independently.
 max_turns:
-  architect: 120
+  architect: 180
   reviewer: 60
 
 # Per-role per-invocation dollar ceilings. reviewer 5.0 -> 12.0, same
