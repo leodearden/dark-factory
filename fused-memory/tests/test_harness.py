@@ -4249,28 +4249,29 @@ class TestHarnessUnhaltClosesEscalation:
         assert harness.take_resolved_halt_escalations('test-project') == []
 
 
-async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
-    """Drive harness.run_loop() as a background task until every
-    ``asyncio.Event`` in *events* is set, then cancel the loop and return.
+async def _drive_until(loop_coro, *events, timeout: float = 10.0):
+    """Drive *loop_coro* as a background task until every ``asyncio.Event``
+    in *events* is set, then cancel the loop and return.
 
     Waits on the OBSERVABLE EVENTS the caller's assertions actually check,
-    rather than budgeting run_loop's startup path (release_stale_claims,
-    predecessor/resume passes, judge init — several SQLite awaits) inside a
-    fixed wall-clock ``wait_for``. Under ``pytest -n 16`` on a loaded box a
-    hardcoded budget can starve before the awaited condition is even
-    reached, flaking an assertion that has nothing to do with the behaviour
-    under test (precedent: commit 6dabee331f). ``timeout`` is a deadlock
-    backstop only — the happy path exits as soon as every event fires.
+    rather than budgeting the loop inside a fixed wall-clock ``wait_for``.
+    Under ``pytest -n 16`` on a loaded box a hardcoded budget can starve
+    before the awaited condition is even reached, flaking an assertion that
+    has nothing to do with the behaviour under test (precedent: commit
+    6dabee331f). ``timeout`` is a deadlock backstop only — the happy path
+    exits as soon as every event fires. Because the loop is cancelled that
+    instant, each event must mark an effect, not a call's entry: build it
+    with _witness_call.
 
-    Also races the events against ``loop_task`` itself completing: if
-    run_loop dies early (raises past its own startup guard, or returns)
-    before every event fires, waiting stops immediately instead of burning
-    the full backstop. The teardown then must not let that exception
-    re-raise past this helper — it suppresses it so a real regression
-    surfaces through the caller's own (descriptive) assertions instead of an
-    opaque exception out of this helper's teardown.
+    Also races the events against ``loop_task`` itself completing: if the
+    loop dies early (raises, or returns) before every event fires, waiting
+    stops immediately instead of burning the full backstop. The teardown
+    then must not let that exception re-raise past this helper — it
+    suppresses it so a real regression surfaces through the caller's own
+    (descriptive) assertions instead of an opaque exception out of this
+    helper's teardown.
     """
-    loop_task = asyncio.create_task(harness.run_loop())
+    loop_task = asyncio.create_task(loop_coro)
     waiters = [asyncio.ensure_future(event.wait()) for event in events]
     try:
         # TimeoutError → fall through and let the caller's assertions report it.
@@ -4292,15 +4293,24 @@ async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
             await loop_task
 
 
+async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
+    """_drive_until for harness.run_loop(), whose startup path
+    (release_stale_claims, predecessor/resume passes, judge init — several
+    SQLite awaits) is what a fixed wall-clock budget used to starve.
+    """
+    await _drive_until(harness.run_loop(), *events, timeout=timeout)
+
+
 def _witness_call(func):
     """Return ``(wrapper, event)``: an async *wrapper* delegating to *func*
-    that sets *event* in a ``finally``, once the real callee has RETURNED.
+    that sets *event* in a ``finally``, once the real callee has RETURNED —
+    or raised, which ends a drive at once rather than at its backstop.
 
-    Pair with _drive_run_loop_until to wait on a real call COMPLETING rather
-    than on a wall-clock budget. The set-after-the-await ordering is
-    load-bearing, not stylistic: the drive cancels run_loop the instant every
-    event fires, so any state the callee commits after its own inner awaits
-    would race the caller's assertions if the event were set any earlier. The
+    Pair with _drive_until to wait on a real call COMPLETING rather than on
+    a wall-clock budget. The set-after-the-await ordering is load-bearing,
+    not stylistic: the drive cancels the loop the instant every event fires,
+    so any state the callee commits after its own inner awaits would race
+    the caller's assertions if the event were set any earlier. The
     canonical trap is Judge.consume_grace_cycle, which assigns
     _unhalt_grace_remaining only AFTER awaiting journal.decrement_unhalt_grace:
     a witness on that inner journal call can be cancelled between the two, so
@@ -4385,6 +4395,41 @@ def _patch_halt_skip_witness(harness) -> asyncio.Event:
     falls through to the caller.
     """
     return _witness(harness, '_notify_judge_halt')
+
+
+@pytest.mark.asyncio
+async def test_witness_call_fires_only_once_the_wrapped_call_has_finished():
+    """A timing-free pin of _witness_call's set-after-the-await rule."""
+    seen_at_entry: list[bool] = []
+
+    async def stub(*args, **kwargs):
+        seen_at_entry.append(fired.is_set())
+        return ('result', args, kwargs)
+
+    wrapper, fired = _witness_call(stub)
+
+    result = await wrapper('test-project', 42, keyword='value')
+
+    assert seen_at_entry == [False], (
+        f'Witness event was already set on entry to the wrapped call, got {seen_at_entry!r}. '
+        'Bug: an entry-set event licenses a drive to cancel the work it is waiting for.'
+    )
+    assert fired.is_set(), 'Expected the witness event set once the wrapped call returned.'
+    assert result == ('result', ('test-project', 42), {'keyword': 'value'}), (
+        f"Expected the wrapped call's arguments and return value forwarded, got {result!r}."
+    )
+
+    async def raising_stub(*_a, **_k):
+        raise RuntimeError('boom')
+
+    raising_wrapper, raising_fired = _witness_call(raising_stub)
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await raising_wrapper()
+    assert raising_fired.is_set(), (
+        'Expected the witness event set after the wrapped call raised, so the '
+        'drive ends at once and the caller assertions report the failure.'
+    )
 
 
 @pytest.mark.asyncio
@@ -12653,97 +12698,10 @@ def _make_order_spies(harness, event_buffer, project_id: str = 'test-project'):
         return await original_replay(pid)
 
     async def spy_complete(pid, *args, **kwargs):
-        # Record AFTER the await, for the same reason as _make_completion_spy:
-        # a predicate keyed on this list must observe the effect, not the entry.
-        # Ordering semantics are unchanged — under the release-before-replay bug
-        # mark_run_complete both starts and returns before _replay_deferred_writes
-        # is entered, so call_order is still ['complete', 'replay'].
-        result = await original_complete(pid, *args, **kwargs)
         call_order.append('complete')
-        return result
+        return await original_complete(pid, *args, **kwargs)
 
     return spy_replay, spy_complete, call_order, lock_held_during_replay
-
-
-def _make_completion_spy(original):
-    """Wrap ``original``, recording completion AFTER it returns.
-
-    Returns ``(spy, signal)``.  ``signal`` gains a single ``True`` once — and
-    only once — ``original`` has actually returned, so a caller polling
-    ``bool(signal)`` observes "the effect happened", never "the call started".
-
-    That distinction is load-bearing for ``_drive_project_loop_until``, which
-    cancels the driven ``_project_loop`` on the first poll tick where its
-    predicate holds.  A signal raised on ENTRY lets that cancel land at an await
-    point inside the real ``mark_run_complete``, whose ``DELETE`` is then rolled
-    back by ``EventBuffer._txn`` (it catches ``BaseException`` so cancellation
-    cannot leave the sqlite writer lock open).  The caller's "lock was released"
-    assertion would then fail with the ordering-bug message it guards — blaming
-    correct production code for a slow test host.
-
-    Deliberately NOT ``try/finally``: a ``mark_run_complete`` that raised did not
-    release the lock, so it must not be reported as complete.
-    """
-    signal: list[bool] = []
-
-    async def spy(*args, **kwargs):
-        result = await original(*args, **kwargs)
-        signal.append(True)
-        return result
-
-    return spy, signal
-
-
-async def _drive_project_loop_until(
-    harness,
-    predicate,
-    *,
-    project_id: str = 'test-project',
-    timeout: float = 15.0,
-) -> None:
-    """Run ``_project_loop`` until ``predicate()`` holds, then stop it.
-
-    ``_project_loop`` never returns on its own along the non-halt exit paths — it
-    loops forever — so a test driving it directly has to stop it.  Doing that with
-    a short fixed wall-clock budget (the original
-    ``wait_for(harness._project_loop(...), timeout=0.5)`` plus
-    ``suppress(TimeoutError)``) races: the budget is not a completion signal, and
-    on a loaded machine the loop simply had not reached ``mark_run_complete`` when
-    the budget expired.  The spy list was then still empty and the caller's
-    assertion reported the *ordering bug it guards against* rather than the
-    timeout that actually happened — a false failure that blames production code
-    for a slow test host (observed under the full 32-worker suite run).
-
-    So wait on the observable signal instead.  ``timeout`` is only a failsafe: if
-    the signal genuinely never arrives (the real regression these tests pin), the
-    predicate stays false and the caller's own assertion fires with its diagnostic
-    message instead of hanging.
-
-    The other half of that contract is on the caller: ``predicate`` must observe
-    an EFFECT, not a call's entry.  This driver cancels the driven task on the
-    first tick where the predicate holds, so a predicate signalled on entry gives
-    it permission to cancel the very work it is waiting for — mid-transaction, in
-    the ``mark_run_complete`` case, where ``EventBuffer._txn`` then rolls the
-    write back.  Build such predicates with ``_make_completion_spy``.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    task = asyncio.create_task(harness._project_loop(project_id))
-    try:
-        while not predicate() and loop.time() < deadline:
-            if task.done():
-                break  # loop exited on its own; predicate won't change again
-            await asyncio.sleep(0.01)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    # Surface a genuine crash rather than letting it masquerade as "signal never
-    # arrived" in the caller's assertion.
-    if not task.cancelled():
-        exc = task.exception()
-        if exc is not None:
-            raise exc
 
 
 # -- tests --------------------------------------------------------------------
@@ -12768,13 +12726,14 @@ async def test_project_loop_replays_deferred_writes_before_releasing_lock(
     spy_replay, spy_complete, call_order, lock_held_during_replay = _make_order_spies(
         harness, event_buffer
     )
+    witnessed_complete, completed = _witness_call(spy_complete)
 
     with (
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
-        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=witnessed_complete),
     ):
-        await _drive_project_loop_until(harness, lambda: 'complete' in call_order)
+        await _drive_until(harness._project_loop('test-project'), completed)
 
     assert call_order == ['replay', 'complete'], (
         f'Expected replay-then-complete, got {call_order!r}. '
@@ -12787,137 +12746,44 @@ async def test_project_loop_replays_deferred_writes_before_releasing_lock(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('complete_delay', [0.0, 0.05], ids=['natural', 'slow_complete'])
 async def test_project_loop_releases_lock_when_replay_raises(
-    journal, event_buffer, mock_memory_service
+    journal, event_buffer, mock_memory_service, complete_delay
 ):
     """_project_loop (finally path) must release the lock even when replay raises.
 
     A bare statement reorder (_replay_deferred_writes then mark_run_complete)
     would leak the lock if _replay_deferred_writes raises.  The correct fix
     wraps the pair as try/finally so mark_run_complete always runs.
+
+    ``slow_complete`` delays mark_run_complete before it starts, so a witness
+    set on entry (see _witness_call) would certainly let the drive cancel the
+    loop inside that delay, before mark_run_complete had done its work.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     await _seed_recon_state(event_buffer)
+    original_complete = harness.buffer.mark_run_complete
 
-    spy_complete, complete_called = _make_completion_spy(harness.buffer.mark_run_complete)
+    async def delayed_complete(*args, **kwargs):
+        await asyncio.sleep(complete_delay)
+        return await original_complete(*args, **kwargs)
+
+    witnessed_complete, completed = _witness_call(delayed_complete)
 
     with (
         patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
         patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
-        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
+        patch.object(harness.buffer, 'mark_run_complete', side_effect=witnessed_complete),
     ):
-        await _drive_project_loop_until(harness, lambda: bool(complete_called))
+        await _drive_until(harness._project_loop('test-project'), completed)
 
-    assert complete_called, (
+    assert completed.is_set(), (
         'mark_run_complete was never called after replay raised. '
         'Bug: a bare reorder leaks the lock when _replay_deferred_writes raises.'
     )
     assert not await event_buffer.is_full_recon_active('test-project'), (
         'Lock was not released after replay raised. '
         'Bug: mark_run_complete must always run even if replay raises.'
-    )
-
-
-@pytest.mark.asyncio
-async def test_completion_spy_records_after_the_wrapped_call_returns():
-    """_make_completion_spy's signal must denote the EFFECT, not the call's entry.
-
-    A timing-free contract test of the shape itself.  ``_drive_project_loop_until``
-    cancels the driven ``_project_loop`` on the first poll tick where its predicate
-    holds, so a predicate keyed on a signal raised on ENTRY hands the driver
-    permission to cancel the very write it is waiting for: the real
-    ``mark_run_complete`` has awaits after entry (``db.execute`` plus the commit in
-    ``EventBuffer._txn``), and ``_txn`` catches ``BaseException`` so the cancel
-    rolls the ``DELETE`` back and the lock row survives.
-
-    Pins the four properties that make the shape safe, none of which need a clock.
-    """
-    seen_at_entry: list[bool] = []
-
-    async def stub(*args, **kwargs):
-        # ``signal`` is bound below, before ``spy`` is ever awaited.
-        seen_at_entry.append(bool(signal))
-        return ('rowcount', args, kwargs)
-
-    spy, signal = _make_completion_spy(stub)
-
-    result = await spy('test-project', 42, keyword='value')
-
-    assert seen_at_entry == [False], (
-        f'Completion signal was already set on entry to the wrapped call, got {seen_at_entry!r}. '
-        'Bug: signalling on entry lets a poller cancel the write it is waiting for.'
-    )
-    assert signal == [True], (
-        f'Expected the completion signal set once the wrapped call returned, got {signal!r}.'
-    )
-    assert result == ('rowcount', ('test-project', 42), {'keyword': 'value'}), (
-        f'Expected the wrapped call\'s arguments and return value forwarded, got {result!r}. '
-        'mark_run_complete returns a rowcount callers use to detect a no-op release, '
-        'so a spy that swallows it would silently break any assertion on it.'
-    )
-
-    async def raising_stub(*args, **kwargs):
-        raise RuntimeError('boom')
-
-    raising_spy, raising_signal = _make_completion_spy(raising_stub)
-
-    with pytest.raises(RuntimeError, match='boom'):
-        await raising_spy('test-project')
-
-    assert raising_signal == [], (
-        f'Expected no completion signal after the wrapped call raised, got {raising_signal!r}. '
-        'A mark_run_complete that raised did NOT release the lock, so it must not '
-        'be reported as complete.'
-    )
-
-
-@pytest.mark.asyncio
-async def test_project_loop_releases_lock_when_replay_raises_under_a_slow_complete(
-    journal, event_buffer, mock_memory_service
-):
-    """The lock-release guard must still hold when mark_run_complete is slow.
-
-    Same production invariant as
-    ``test_project_loop_releases_lock_when_replay_raises`` — that test keeps
-    running at its natural speed — but with the OBSERVATION race made
-    deterministic instead of load-dependent.  The real ``mark_run_complete``
-    spends only a few milliseconds inside its transaction against
-    ``_drive_project_loop_until``'s 10ms poll tick, so an entry-signalled spy
-    loses that race only under a loaded parallel run.
-
-    The injected 50ms delay — 5x the tick, three orders of magnitude inside the
-    15s failsafe — makes the failure certain: were the signal raised on entry,
-    the driver would cancel ``_project_loop`` mid-``DELETE``, ``EventBuffer._txn``
-    would roll it back, and the lock row would survive.
-    """
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    await _seed_recon_state(event_buffer)
-
-    original_complete = harness.buffer.mark_run_complete
-
-    async def slow_complete(pid, *args, **kwargs):
-        # Deterministic stand-in for a loaded host, injected BEFORE the real call
-        # so the whole of mark_run_complete still runs inside the spy.
-        await asyncio.sleep(0.05)
-        return await original_complete(pid, *args, **kwargs)
-
-    spy_complete, complete_signal = _make_completion_spy(slow_complete)
-
-    with (
-        patch.object(harness, 'run_full_cycle', side_effect=_make_fake_rfc()),
-        patch.object(harness, '_replay_deferred_writes', new=AsyncMock(side_effect=RuntimeError('boom'))),
-        patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
-    ):
-        await _drive_project_loop_until(harness, lambda: bool(complete_signal))
-
-    assert complete_signal, (
-        'mark_run_complete never completed after replay raised. '
-        'Bug: a bare reorder leaks the lock when _replay_deferred_writes raises.'
-    )
-    assert not await event_buffer.is_full_recon_active('test-project'), (
-        'Lock was not released after replay raised. '
-        'Bug: the completion signal fired before mark_run_complete had done its '
-        'work, so the driver cancelled the DELETE and _txn rolled it back.'
     )
 
 
@@ -12961,10 +12827,7 @@ async def test_project_loop_replays_before_releasing_lock_on_halt(
         patch.object(harness, '_replay_deferred_writes', side_effect=spy_replay),
         patch.object(harness.buffer, 'mark_run_complete', side_effect=spy_complete),
     ):
-        # Halt path returns naturally — no wait_for/suppress needed.  The timeout
-        # is a hang failsafe only, so keep it generous: a tight budget here just
-        # turns a loaded test host into a spurious TimeoutError (see
-        # _drive_project_loop_until for the same defect on the other exit paths).
+        # Halt path returns naturally; the timeout is only a hang failsafe.
         await asyncio.wait_for(harness._project_loop('test-project'), timeout=15.0)
 
     assert call_order == ['replay', 'complete'], (
