@@ -697,6 +697,193 @@ class TestInertProvenance:
 
 
 # --------------------------------------------------------------------------- #
+# Task 4808 — the BRIDGE: deriving `unstamped_live_ids` from inert provenance.
+#
+# `evaluate_closure` has always ACCEPTED `unstamped_live_ids`, and
+# `build_consolidation_gate_task` has always WRITTEN
+# `provenance.observed_members`, but nothing computed one from the other, so
+# `unstamped_cluster_member` was unreachable outside these tests.
+# --------------------------------------------------------------------------- #
+
+
+def _prov(observed):
+    """A gate block whose inert kappa-shaped provenance names *observed*."""
+    return {
+        'topic': _TOPIC,
+        'provenance': {
+            'report_run': 'run-abc',
+            'observed_members': list(observed),
+            'detector': 'topic-cluster-scan',
+            'authoritative': False,
+        },
+    }
+
+
+class TestUnstampedCandidates:
+    """The PURE half of the bridge: which observed ids must be PROBED.
+
+    `unstamped_candidates` is `observed_members` MINUS the live topic scroll
+    MINUS the canonical\'s `supersedes` claim.  It answers "which ids are
+    ambiguous", not "which ids are unstamped" — an id absent from the scroll
+    is either absorbed-and-deleted or live-but-unstamped, and only a probe
+    can tell those apart.
+    """
+
+    def test_a_stamped_observed_member_is_not_a_candidate(self):
+        """The measured 2026-08-27 corpus shape: every observed member is in
+        the scroll, so all four known-good gates derive ZERO candidates."""
+        members = _well_formed_cluster(3)
+        observed = [_uuid(1), _uuid(2), _uuid(3)]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov(observed), members=members
+            )
+            == ()
+        )
+
+    def test_an_observed_member_absent_from_the_scroll_is_a_candidate(self):
+        stray = _uuid(42)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([_uuid(1), stray]), members=_well_formed_cluster(2)
+        ) == (stray,)
+
+    def test_the_canonicals_supersedes_claim_suppresses_a_candidate(self):
+        """The DELETE arm.  Subtracting the cluster\'s own absorption claim is
+        what keeps a correctly executed delete-arm consolidation closeable."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2)),
+        ]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([_uuid(1), absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_the_legacy_bare_scalar_supersedes_spelling_also_suppresses(self):
+        """81 live records predate 3196\'s list migration; `normalize_supersedes`
+        accepts both spellings and this derivation must not disagree with it."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=absorbed),
+            _member(_uuid(2)),
+        ]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_a_non_canonical_peers_supersedes_does_not_suppress(self):
+        """Only the CANONICAL\'s claim is the cluster\'s claim — the same rule
+        `consolidation_gate.py::_classify_supersedes` already states."""
+        stray = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True),
+            _member(_uuid(2), supersedes=[stray]),
+        ]
+        assert consolidation_gate.unstamped_candidates(
+            _prov([stray]), members=members
+        ) == (stray,)
+
+    def test_supersedes_is_only_read_when_exactly_one_canonical_exists(self):
+        """With two canonicals there is no single cluster claim to trust; the
+        gate is refusing on `multiple_canonicals` anyway."""
+        absorbed = _uuid(42)
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2), canonical=True),
+        ]
+        assert consolidation_gate.unstamped_candidates(
+            _prov([absorbed]), members=members
+        ) == (absorbed,)
+
+    def test_a_non_uuid_observed_id_is_dropped(self):
+        """It cannot be probed, so it can never be substantiated."""
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov(['not-a-uuid', '', 'deadbeef', None]),
+                members=_well_formed_cluster(2),
+            )
+            == ()
+        )
+
+    def test_scroll_matching_is_case_insensitive(self):
+        """Mirrors `evaluate_closure`\'s own case-folded `live_ids`, so the two
+        cannot disagree about what the scroll saw."""
+        members = [_member(_uuid(1).upper(), canonical=True)]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([_uuid(1)]), members=members
+            )
+            == ()
+        )
+
+    def test_supersedes_matching_is_case_insensitive(self):
+        absorbed = _uuid(42)
+        members = [_member(_uuid(1), canonical=True, supersedes=[absorbed.upper()])]
+        assert (
+            consolidation_gate.unstamped_candidates(
+                _prov([absorbed]), members=members
+            )
+            == ()
+        )
+
+    def test_the_result_is_deduped_and_first_seen_ordered(self):
+        """Deterministic, so refusal messages and tests are stable."""
+        a, b = _uuid(42), _uuid(43)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([b, a, b, a]), members=_well_formed_cluster(2)
+        ) == (b, a)
+
+    def test_the_original_id_spelling_is_returned_not_the_folded_one(self):
+        """A refusal must name the id exactly as the gate recorded it."""
+        stray = _uuid(42).upper()
+        assert consolidation_gate.unstamped_candidates(
+            _prov([stray]), members=_well_formed_cluster(2)
+        ) == (stray,)
+
+    @pytest.mark.parametrize(
+        'block',
+        [
+            None,
+            'not-a-mapping',
+            42,
+            {},
+            {'topic': _TOPIC},
+            {'topic': _TOPIC, 'provenance': None},
+            {'topic': _TOPIC, 'provenance': 'not-a-mapping'},
+            {'topic': _TOPIC, 'provenance': {}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': None}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': 42}},
+            # A bare string is a Sequence but is NOT a member list; iterating
+            # it would yield 36 single characters, none of them a uuid.
+            {'topic': _TOPIC, 'provenance': {'observed_members': _uuid(42)}},
+            {'topic': _TOPIC, 'provenance': {'observed_members': b'bytes'}},
+        ],
+    )
+    def test_defensive_shapes_return_empty_rather_than_raising(self, block):
+        """This predicate\'s job is to REPORT malformedness; one that dies on
+        bad input blocks the very gates it exists to adjudicate."""
+        assert (
+            consolidation_gate.unstamped_candidates(
+                block, members=_well_formed_cluster(2)
+            )
+            == ()
+        )
+
+    def test_malformed_scroll_rows_do_not_raise(self):
+        assert consolidation_gate.unstamped_candidates(
+            _prov([_uuid(42)]), members=['not-a-mapping', None, {}, {'id': None}]
+        ) == (_uuid(42),)
+
+    def test_it_is_exported(self):
+        assert 'unstamped_candidates' in consolidation_gate.__all__
+
+# --------------------------------------------------------------------------- #
 # Guard: the seam's import weight, and INV-5's single homes (step-15a)
 # --------------------------------------------------------------------------- #
 
