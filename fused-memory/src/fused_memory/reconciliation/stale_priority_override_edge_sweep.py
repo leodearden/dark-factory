@@ -70,6 +70,7 @@ from pathlib import Path
 
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _SWEEP_AGENT_ID,
@@ -339,7 +340,7 @@ async def sweep_stale_priority_override_edges(
     """Enumerate valid priority-override edges and invalidate the stale ones.
 
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
-    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    ``memory_service.graphiti.enumerate_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), lexically extracts each edge's
     single subject task_id, reads LIVE override state via *read_live*, and
     invalidates (``memory_service.update_edge(..., invalid_at=...)``) every
@@ -347,8 +348,8 @@ async def sweep_stale_priority_override_edges(
     edge's live ``ttl_until`` has elapsed.
 
     Args:
-        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
-            ``.update_edge``.
+        memory_service: Object exposing ``.graphiti.enumerate_all_valid_edges``
+            and ``.update_edge``.
         project_id: Graphiti group_id to enumerate and invalidate within.
         project_root: Project root whose ``scheduler_overrides.db`` supplies
             live override state.
@@ -372,6 +373,31 @@ async def sweep_stale_priority_override_edges(
         failures). The scanned -> candidate_edges -> stale_selected ->
         invalidated funnel is monotonically narrowing, so each is a distinct,
         self-describing quantity.
+
+        Plus two keys describing the READ that produced ``scanned`` rather
+        than a stage of that funnel, so they narrow nothing (task 4386):
+
+        ``enumeration_complete`` (``bool | None``) — TRI-STATE. ``True`` = the
+        read was PROVEN complete; ``False`` = a corpus was observed and it was
+        INCOMPLETE; ``None`` = NO corpus was observed at all, either because
+        *project_root* was falsy or because the enumeration itself failed
+        (``errors`` tells those two apart). The ONLY predicate a caller may
+        gate on is ``is True``: an ``is not False`` test would admit both
+        UNKNOWN cases, letting a cycle that never looked pass as one that
+        looked and found everything.
+
+        ``enumeration_incomplete_kind`` (``str | None``) — the backend's
+        ``INCOMPLETE_*`` constant (``graphiti_client.py::INCOMPLETE_PAGE_CAP``
+        and siblings), the documented STABLE discriminator; callers should
+        branch on membership in
+        ``graphiti_client.py::INCOMPLETE_STRUCTURAL_KINDS`` rather than on a
+        specific kind. ``PagedRead.reason`` is deliberately NOT surfaced —
+        the backend documents its wording as an unstable diagnostic
+        interface.
+
+        Both keys carry the SAME contract as
+        ``stale_status_snapshot_edge_sweep``'s pair of the same names, so a
+        consumer reading both sweeps applies one rule rather than two.
     """
     stats = {
         'scanned': 0,
@@ -379,6 +405,12 @@ async def sweep_stale_priority_override_edges(
         'stale_selected': 0,
         'invalidated': 0,
         'errors': 0,
+        # Seeded UNKNOWN, not True: neither key is a count, and until the
+        # enumeration has actually returned nothing has been proven about the
+        # corpus. The falsy-project_root return below therefore reports the
+        # honest 'no corpus observed'. (task 4386)
+        'enumeration_complete': None,
+        'enumeration_incomplete_kind': None,
     }
 
     if not project_root:
@@ -390,14 +422,41 @@ async def sweep_stale_priority_override_edges(
     # Enumeration is a single bulk call the rest of the cycle depends on: a
     # failure here ends this cycle's sweep early with the stats gathered so
     # far (self-heals next cycle). CancelledError/KeyboardInterrupt/SystemExit
-    # are never swallowed.
+    # are never swallowed. A STRUCTURAL incompleteness lands in that same
+    # handler by design — see the policy call below. (task 4386)
     try:
-        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+        grouped, paged = await memory_service.graphiti.enumerate_all_valid_edges(
+            group_id=project_id,
+        )
+        # Recorded BEFORE the policy is applied, and the ordering is
+        # load-bearing: apply_incompleteness_policy RAISES on a structural
+        # incompleteness, so assigning after it would leave the aborted cycle
+        # reporting errors=1 with no stated reason. (task 4386)
+        stats['enumeration_complete'] = paged.complete
+        stats['enumeration_incomplete_kind'] = paged.incomplete_kind
+        # ``enumerate_*`` NEVER raises — it reports incompleteness as a value —
+        # so the fail-closed structural guard the ``get_all_valid_edges`` shim
+        # applied on this sweep's behalf has to be re-applied here. Without it
+        # a page-capped read is taken for the whole corpus, every override edge
+        # the missing pages carry is absent from the live cross-reference, and
+        # the sweep retires live overrides as stale: an incomplete READ turned
+        # into a destructive WRITE. An EMPIRICAL incompleteness only warns —
+        # through this sweep's injected ``log`` — and the sweep proceeds.
+        apply_incompleteness_policy(
+            paged,
+            method='enumerate_all_valid_edges',
+            group_id=project_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not drive a staleness verdict',
+            log=log,
+        )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         log.exception(
-            'stale_priority_override_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            'stale_priority_override_edge_sweep: enumerate_all_valid_edges failed '
+            'for group_id=%s',
             project_id,
         )
         stats['errors'] += 1
