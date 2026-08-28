@@ -890,8 +890,14 @@ async def run_server():
         # Task 3112: the consolidation-gate closure scroll. Dormant until
         # wired, so this is the ONLY thing that arms the close-time refusal.
         # memory_service is already in scope at both construction sites.
+        # Task 4808: `exists` is the THIRD collaborator, and it is what makes
+        # the `unstamped_cluster_member` refusal reachable in production at
+        # all — without it the derivation is dormant and an observed member
+        # that is live but never stamped into the topic stays invisible.
         task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
+            _closure_scroll,
+            count=_closure_count,
+            exists=_closure_exists_for(memory_service),
         )
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
@@ -973,8 +979,14 @@ async def run_server():
         # Task 3112: the consolidation-gate closure scroll. Dormant until
         # wired, so this is the ONLY thing that arms the close-time refusal.
         # memory_service is already in scope at both construction sites.
+        # Task 4808: `exists` is the THIRD collaborator, and it is what makes
+        # the `unstamped_cluster_member` refusal reachable in production at
+        # all — without it the derivation is dormant and an observed member
+        # that is live but never stamped into the topic stays invisible.
         task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
+            _closure_scroll,
+            count=_closure_count,
+            exists=_closure_exists_for(memory_service),
         )
 
     # Create MCP server with both memory and task tools
@@ -2157,6 +2169,35 @@ def _acquire_singleton_lock() -> None:
             'Kill it first or use systemctl --user restart fused-memory'
         )
         raise SystemExit(1) from None
+
+
+def _closure_exists_for(memory_service: Any):
+    """Task 4808: the consolidation-gate existence probe, bound to the store.
+
+    Returns an async ``(memory_id, *, project_id) -> bool`` over
+    ``MemoryService.get_memory_by_id(project_id, memory_id)``, which returns
+    ``{'id', 'content', 'metadata'}`` or ``None`` on a genuine miss — the two
+    outcomes that distinguish a live-but-unstamped cluster member from one
+    that was absorbed and deleted.
+
+    A read ``TimeoutError`` is deliberately NOT caught here. That method
+    propagates it rather than collapsing it into ``None`` precisely so a
+    caller can tell "genuinely absent" from "backend timed out", and
+    ``TaskInterceptor._consolidation_closure_error`` already converts it into
+    the same fail-closed refusal an unreadable scroll produces. Swallowing it
+    here would let an unreadable store read as "no strays".
+
+    MODULE-LEVEL rather than nested inside :func:`main` so
+    ``tests/test_consolidation_closure_seam.py::TestProductionProbeWiring``
+    can import and exercise it without a store. The existing
+    ``_closure_scroll`` / ``_closure_count`` stay exactly where they are;
+    this is strictly additive.
+    """
+
+    async def _closure_exists(memory_id: str, *, project_id: str) -> bool:
+        return (await memory_service.get_memory_by_id(project_id, memory_id)) is not None
+
+    return _closure_exists
 
 
 def main():
