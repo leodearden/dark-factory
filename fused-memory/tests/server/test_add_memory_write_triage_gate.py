@@ -743,8 +743,9 @@ class TestTheForceStoreArms:
 
         result = await _call(server, agent_id='recon-stage-1')
 
-        assert result[ROUTED_KEY] != OUTCOME_STORED, (
-            f'a recon-stage write must be band-routed, not force-stored: {result!r}'
+        assert result[ROUTED_KEY] == OUTCOME_RESTATED, (
+            f'a recon-stage write must be band-routed like any other caller, and '
+            f'0.99 is the deterministic high band: {result!r}'
         )
         assert result[CANONICAL_ID_KEY] == 'm1', (
             f'expected the band attach any other caller would get: {result!r}'
@@ -1649,7 +1650,9 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
         A recon-stage agent USED to be a third case here. Task 3134 retired
         that arm, so such a write is now band-routed and DOES reach the judge
         at `_MIDDLE_BAND` like any other caller's — which is why it is gone
-        from this loop rather than merely reworded.
+        from this loop rather than merely reworded. That is not left as a
+        claim: `test_a_recon_stage_write_now_pays_for_the_judge` below pins
+        the inverse.
         """
         judge = AsyncMock(return_value=OUTCOME_AMENDED)
         for label, overrides in [
@@ -1665,6 +1668,41 @@ class TestTheRealJudgeIsWiredAtTheToolSeam:
             assert judge.await_count == 0, (
                 f'{label}: a force-store is an exemption from SPEND too'
             )
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_write_now_pays_for_the_judge(self) -> None:
+        """The retirement's SPEND consequence, as a pin rather than a comment.
+
+        The loop above lost its recon-stage entry when task 3134 retired the
+        force-store arm, and this is the other half of that deletion: such a
+        write is now band-routed, so a MIDDLE-band one reaches the judge and
+        buys an LLM round-trip on the SYNCHRONOUS write path exactly like any
+        other caller's.
+
+        That is the half most likely to surprise an operator who flips
+        `write_triage.enabled` on — the recon stages write continuously — and
+        it is latent today only because the flag ships false. The surviving
+        recon-stage triage case (`TestTheForceStoreArms
+        ::test_a_recon_stage_agent_is_triaged_like_any_other_caller`) sits at
+        0.99, which the bands decide WITHOUT consulting the judge, so without
+        this test no recon-stage write in the suite ever meets one.
+        """
+        mock_service = self._service()
+        judge = AsyncMock(return_value=OUTCOME_AMENDED)
+
+        with patch(_JUDGE_PATH, new=judge):
+            server = create_mcp_server(mock_service)
+            result = await _call(server, agent_id='recon-stage-1')
+
+        assert judge.await_count == 1, (
+            f'a recon-stage middle-band write must reach the judge like any '
+            f'other caller: {result!r}'
+        )
+        # `amended` is unreachable from the bands alone at `_MIDDLE_BAND` (the
+        # stub judge answers `stored` unconditionally), so this says the
+        # verdict actually reached the ack rather than that a fake said it.
+        assert result[ROUTED_KEY] == OUTCOME_AMENDED, f'{result!r}'
+        assert result[CANONICAL_ID_KEY] == 'canonical-A', f'{result!r}'
 
 
 #: A verdict word no judge publishes and no table wires — the FIFTH outcome,
