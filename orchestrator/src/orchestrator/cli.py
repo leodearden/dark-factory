@@ -445,7 +445,10 @@ def check_config(config_path: Path | None):
         (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
         for existing names other tooling already greps for.
 
-    Exits 1 if any GENUINELY-unknown key is found, else 0.
+    Exits 1 if any GENUINELY-unknown key is found, or if the file could not be
+    read or parsed at all (a census of nothing is not a clean census); else 0.
+    An EMPTY project YAML is a legitimate clean result — it means "use all
+    defaults" — and still exits 0.
     """
     from orchestrator.config import census_config_keys
 
@@ -464,6 +467,21 @@ def check_config(config_path: Path | None):
             sys.exit(1)
 
     census = census_config_keys(config_path)
+
+    # An empty census has two very different causes.  Fail CLOSED when nothing
+    # could be parsed: the census's own fail-open contract (config.py) makes
+    # `unknown` empty for an unreadable/unparseable file, so printing the
+    # affirmative OK below would tell an operator a config is safe precisely
+    # when it could not be inspected at all.  The ignored/OK sections are both
+    # vacuous in this case, so return before either.
+    if census.parse_error:
+        click.echo(f'Error: {census.parse_error}', err=True)
+        click.echo(
+            'Could not lint this file, so its config keys are UNKNOWN — this is '
+            'NOT a clean result. Fix the file and re-run.',
+            err=True,
+        )
+        sys.exit(1)
 
     # Informational FIRST, and explicitly marked as such: these keys were
     # deliberately excused, so listing them keeps an over-broad glob auditable

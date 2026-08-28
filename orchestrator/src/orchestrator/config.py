@@ -2808,16 +2808,28 @@ class ConfigIgnoredKey(NamedTuple):
 
 
 class ConfigKeyCensus(NamedTuple):
-    """Both views produced by the ONE census walk (INV-5).
+    """The views produced by the ONE census walk (INV-5).
 
     ``unknown`` drives the loud paths (WARNING, born-at-L2, check-config exit
     code); ``ignored`` is informational only.  Because a single walk classifies
     every key into exactly one of the two, the escalation and the lint can never
     disagree about what is suppressed.
+
+    ``unknown``/``ignored`` keep their FAIL-OPEN meaning: both are empty when the
+    file could not be read or parsed at all, because the census cannot detect
+    keys it never saw and its non-CLI consumers must not have to catch.
+    ``parse_error`` is the sentinel that distinguishes the two causes of an empty
+    census — "parsed, nothing unknown" vs "no census was possible".  When it is
+    non-None the two key lists are VACUOUS, not clean, and any consumer that
+    reads emptiness as health is reading a lie.  ``check-config`` is that
+    consumer: it bypasses ``load_config`` deliberately, so it (and anything else
+    that does) MUST fail closed on this field rather than print an affirmative
+    OK for a file it never inspected.
     """
 
     unknown: list[ConfigUnknownKey]
     ignored: list[ConfigIgnoredKey]
+    parse_error: str | None = None
 
 
 class ConfigKeyCensusConfig(BaseModel):
@@ -5078,18 +5090,43 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     1) and walks it against ``OrchestratorConfig``'s schema in ONE pass,
     classifying every non-model key as either genuinely ``unknown`` or
     deliberately ``ignored`` (reserved ``x_``/``x-`` prefix, or an operator
-    ``config_key_census.ignore`` entry).  A ``None``/non-dict document or an
-    unreadable/malformed file yields an empty census (fail-open — the census
-    cannot detect keys it cannot parse; load_config surfaces parse errors loudly
-    on its own path).
+    ``config_key_census.ignore`` entry).
+
+    Three-way contract when no census is possible.  The KEY LISTS stay fail-open
+    — an unreadable file (missing, permission-denied, a directory, or bytes that
+    are not valid UTF-8), a malformed document, or a parsed-but-non-mapping
+    document all yield empty ``unknown``/``ignored`` and never raise, because the
+    census cannot detect keys it cannot parse and load_config surfaces parse
+    errors loudly on its own path.  But each of those shapes ALSO sets
+    ``parse_error``, so a consumer that must fail closed (check-config) can tell
+    "nothing unknown" from "nothing parsed".  Only a ``None`` document — an EMPTY
+    or comments-only project YAML, which legitimately means "use all defaults" —
+    is treated as a genuinely clean census with ``parse_error=None``.
     """
     try:
         with open(config_path) as f:
             tree = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, and it surfaces
+        # lazily from inside safe_load()'s read rather than from open() — so
+        # without it named here a non-UTF-8 file is the one "could not be read
+        # at all" shape that escapes BOTH handlers, propagating out of a
+        # function documented to never raise and giving check-config a
+        # traceback where the structured diagnostic belongs.
+        return ConfigKeyCensus([], [], f'cannot read {config_path}: {e}')
+    except yaml.YAMLError as e:
+        return ConfigKeyCensus([], [], f'invalid YAML in {config_path}: {e}')
+    if tree is None:
+        # An EMPTY (or comments-only) project YAML is legitimate — it means "all
+        # defaults", and pydantic-settings loads it without complaint — so it is
+        # a genuinely clean census, NOT a parse failure.
         return ConfigKeyCensus([], [])
     if not isinstance(tree, dict):
-        return ConfigKeyCensus([], [])
+        return ConfigKeyCensus(
+            [], [],
+            f'top-level YAML document in {config_path} is a '
+            f'{type(tree).__name__}, expected a mapping',
+        )
     shadow_index = _build_shadow_index(OrchestratorConfig)
     ignored: list[ConfigIgnoredKey] = []
     unknown = _walk_unknown_keys(
