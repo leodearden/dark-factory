@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""One-shot (idempotently re-runnable) corpus correction: version-scope the
+stale "Claude CLI --resume is broken because sessions are per-project-directory"
+claim in Mem0, and retire the hygiene warning's now-false STATUS clause
+(task 4610, esc-3578-5).
+
+Why a script exists at all
+--------------------------
+The same two writes are available as the ``update_memory`` MCP tool, and this
+script calls the SAME function underneath —
+``MemoryService.update_memory``. It owns no copy of the amendment logic; it
+parses flags, corroborates each pre-image, and delegates. It exists because
+NOBODY WHO CAN BE DISPATCHED AT THIS WORK MAY CALL THAT TOOL:
+
+  * ``update_memory``'s authorization gate admits only ``recon-stage-*`` and
+    ``curator-*`` agent ids. The task-3578 steward hit it on both the
+    ``content_amend`` and ``metadata_patch`` arms and recorded the refusal in
+    esc-3578-5 rather than working around it — which is why 6403e96b was still
+    uncorrected months later.
+  * An orchestrator-dispatched agent CANNOT clear that gate:
+    ``orchestrator/src/orchestrator/agents/briefing.py`` hardcodes
+    ``agent_id = f'claude-task-{task_id}-{role}'``, so every role this task
+    could route to fails both arms exactly as the steward did.
+  * And it MUST NOT try. ``skills/curate-fused-memories/SKILL.md`` names this
+    precise situation: adopting a ``curator-`` id "because you hit
+    ``Mem0UpdateNotAuthorized`` in the middle of unrelated work and want past
+    it" is "self-authorization for a silent-rewrite primitive ... not a key you
+    borrow". Widening the allowlist is closed too — the ``Mem0UpdateConfig``
+    field descriptions in ``fused_memory.config.schema`` record Leo's
+    esc-3524-1 ruling that the bar is deliberately narrow.
+
+The gate is MCP-TOOL-LAYER ONLY; the service seam beneath it carries no prefix
+check. So the sanctioned route — the one six sibling scripts in this directory
+already take — is to land the change as REVIEWABLE CODE and have a session that
+legitimately holds the capability run ``--apply``. That is the whole point: the
+corpus mutation stays visible in git history and in review, instead of
+happening once, invisibly, inside somebody's chat transcript.
+
+What it does
+------------
+Exactly TWO in-place CONTENT amendments, in a fixed order, and NO deletes:
+
+  **A — 6403e96b** ("Broken Claude CLI --resume due to sessions being
+  per-project-directory"). Replaced with a version-scoped rewording modelled on
+  the already-corrected Graphiti half of this same contradiction (edge
+  fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08, reworded 2026-08-22). It PRESERVES the
+  real 2026-04-10 incident and the commit that fixed it, labels the causal
+  explanation as an inference that was never measured, states the contrary
+  2026-08-19 measurement, and records what remains UNDETERMINED.
+
+  **B — d007aa46** (the esc-3578-5 corpus-hygiene warning). Its final STATUS
+  sentence claims 6403e96b "is STILL UNCORRECTED". Once A lands that sentence
+  is false, so it is replaced by one recording the correction. Every measured
+  score and the do-not-delete rationale are kept verbatim.
+
+Why an amend and not a delete
+-----------------------------
+The April incident was REAL: a steward CWD switch to project_root did break
+``--resume``, with instant "No conversation found" failures at 0 cost / 0 turns
+/ 0 duration on all three retries, and removing the switch (commit e001dd3746)
+fixed it. Only the CAUSE bolted onto that symptom was an unmeasured inference.
+Deleting the record — or flatly invalidating it — would retire a true
+historical observation, which is exactly the move the task-3578 steward
+declined on the Graphiti side after provenance showed a measured symptom with
+an inferred cause. There is no delete arm anywhere in this script, and the test
+suite asserts its absence.
+
+Safety properties
+-----------------
+* **Dry-run is the DEFAULT.** ``--apply`` is opt-in.
+* **Corroborate before acting.** Each target's exact pre-image is pinned here
+  and re-read live before any write; a mismatch REFUSES rather than clobbers.
+  An in-place amend is invisible to every downstream reader, so blindly
+  overwriting a record that changed underneath us (a curator sitting, a recon
+  Stage-1/2 consolidation) would destroy someone else's correction with no
+  trace.
+* **Idempotent.** Re-running after a successful apply finds the sentinel in
+  both records and writes nothing. Safe to re-run after a partial failure.
+* **Ordered.** B is written only if A actually succeeded (or was already
+  amended). If A fails, B is short-circuited untouched — a corpus asserting
+  "corrected" while the stale record still misleads is strictly worse than the
+  status quo, and undetectable to anyone who trusts the warning.
+* **Fail-closed capability preflight** before the first write, so a run that
+  cannot write mem0's history dir refuses up front instead of half-writing.
+* **Attributed writes** (``_source=WRITE_SOURCE``) so the amendment storm alarm
+  reads this sweep rather than a generic ``mcp_tool``.
+
+Usage
+-----
+  # Dry run (default): corroborate both pre-images, print the report, write
+  # nothing. Safe from anywhere, including a sandboxed task worktree.
+  python scripts/amend_stale_resume_cwd_records.py
+
+  # Commit both amendments.
+  python scripts/amend_stale_resume_cwd_records.py --apply
+
+Exit code is 0 for a clean run (dry-run, fully applied, or all-skipped) and 1
+if ANY target was refused, so an operator can gate on it without parsing the
+report.
+
+Status of this correction: NOT YET APPLIED. Like
+``scripts/repair_recon_citation.py`` before it, the authoring task agent could
+not run ``--apply`` — a task agent holds neither the ``update_memory``
+authorization prefix nor (from a sandboxed worktree) write access to mem0's
+history directory. An operator or steward session must run it. Update this line
+to ``DONE — APPLIED <date> by <session>`` once it has been.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Write attribution
+# ---------------------------------------------------------------------------
+
+#: Written to every ``update_memory`` so the write journal attributes each
+#: amendment to this sweep rather than to a generic ``mcp_tool``. The amendment
+#: storm alarm reads this field; an unattributed bulk rewrite of records this
+#: old is exactly the shape that alarm exists to catch. Two writes is far under
+#: the storm threshold, but attributing them correctly costs nothing and keeps
+#: the write journal readable.
+WRITE_SOURCE = 'amend_stale_resume_cwd_records'
+
+#: Recorded on the write journal row beside the amendment.
+WRITE_REASON = (
+    'Version-scope the stale Claude-CLI --resume/cwd claim and retire the '
+    'hygiene warning that says it is uncorrected (task 4610, esc-3578-5)'
+)
+
+#: Distinctive substring present in BOTH replacement texts. This is what
+#: carries idempotency: a record already containing it has been amended, so a
+#: re-run skips it rather than tripping the pre-image mismatch refusal.
+#:
+#: It lives in CONTENT rather than metadata deliberately — content is the field
+#: already read for the pre-image check (no extra fetch), it survives a
+#: metadata wipe or a ``metadata_mode='replace'`` from an unrelated sweep, and
+#: it keeps idempotency independent of whether the optional metadata arm
+#: survives vocabulary validation.
+AMENDED_SENTINEL = 'amended in place by task 4610'
+
+
+# ---------------------------------------------------------------------------
+# Amendment targets
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AmendTarget:
+    """One record to amend, with the pre-image it must still match.
+
+    ``expected_preimage`` is the record's exact content as read live from Mem0
+    on 2026-08-28 while authoring this script. It is the corroboration key, not
+    documentation: :func:`classify_amend_target` refuses to write unless the
+    live content still equals it, so a record that moved underneath us produces
+    a loud refusal instead of a silent clobber.
+
+    ``metadata_patch`` is optional and deliberately NOT load-bearing — the
+    content sentinel carries idempotency on its own, so dropping the metadata
+    arm entirely would lose provenance and nothing else.
+    """
+
+    memory_id: str
+    expected_preimage: str
+    new_content: str
+    metadata_patch: dict[str, Any] | None = field(default=None)
+
+
+#: The stale record's pre-image: one bare sentence asserting an inferred cause
+#: as fact, with no date visible to a reader and nothing marking it historical.
+_STALE_PREIMAGE = (
+    'Broken Claude CLI --resume due to sessions being per-project-directory'
+)
+
+#: Modelled on Graphiti edge fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08's current
+#: text (reworded 2026-08-22 for the same contradiction), adapted to a Mem0
+#: single-claim record. Keeping the two stores telling the same story with the
+#: same caveats is the point — two independently-worded corrections drift.
+_STALE_REPLACEMENT = (
+    'SUPERSEDED AS A GENERAL CLAIM — historical record only; do NOT cite as '
+    'evidence that a moved cwd blocks --resume today. '
+    'WHAT WAS REALLY OBSERVED (2026-04-10, Claude CLI version unrecorded): a '
+    'steward CWD switch to project_root broke --resume with instant "No '
+    'conversation found" failures — 0 cost, 0 turns, 0 duration on all 3 '
+    'retries. That incident was real and was fixed by commit e001dd3746, which '
+    'removed the CWD switch. '
+    'WHAT WAS ONLY INFERRED: the causal explanation recorded alongside it — '
+    '"sessions are stored per-project-directory" — was an inference from that '
+    'symptom, never a measurement, and it is FALSE for the current CLI. '
+    'MEASURED CONTRARY FACT (task 3578, Claude Code CLI 2.1.236, 2026-08-19): '
+    'the CLI is cwd-AGNOSTIC for --resume. It scans every projects/*/ subdir of '
+    'CLAUDE_CONFIG_DIR by session id and ignores BOTH the encoded directory '
+    'name AND the cwd recorded inside the JSONL records; a transcript under a '
+    'completely unrelated projects/<enc>/ still resolves. Arms M1 (re-encoded '
+    'under new cwd), M2 (original encoding, new cwd) and Y (unrelated path) all '
+    'resolved and reached auth. Full method and results: '
+    'plans/session-resume-eligibility-seam-prd.md §14; mem0 '
+    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc. '
+    'UNDETERMINED: whether the CLI changed behaviour between 2026-04 and '
+    '2026-08, or the original 2026-04 diagnosis mis-attributed a real failure '
+    'to the wrong cause. Nobody has measured the April-era CLI, so this is not '
+    'resolvable from the record. '
+    f'(Content {AMENDED_SENTINEL} on the basis of esc-3578-5; the record is '
+    'kept, not deleted, because the April symptom was measured.)'
+)
+
+#: The hygiene warning's pre-image, read live 2026-08-28. Everything up to the
+#: STATUS clause is preserved verbatim in the replacement below.
+_WARNING_PREIMAGE = (
+    'CORPUS-HYGIENE WARNING (2026-08-22, esc-3578-5): the query "claude CLI '
+    '--resume session cwd changed / sessions stored per-project-directory" '
+    'returns STALE records ABOVE the correct ones, so rank is not a truth '
+    'signal here. Measured on that exact query: mem0 '
+    '6403e96b-f1af-403a-9513-59f007ed6d39 ("Broken Claude CLI --resume due to '
+    'sessions being per-project-directory", 2026-04-10) returned at store_score '
+    '0.786 — the TOP hit of the whole result set — while the correct entry '
+    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc returned at 0.692. Graphiti edge '
+    'fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08 returned at graphiti store_rank 1 '
+    'with temporal=null and created_at=null, i.e. NO visible date, so a reader '
+    'cannot tell it is old. THE TRUTH: Claude Code CLI 2.1.236, measured '
+    '2026-08-19 by task 3578, is cwd-AGNOSTIC for --resume — it scans every '
+    'projects/*/ subdir of CLAUDE_CONFIG_DIR by session id and ignores both the '
+    'encoded dir name and the cwd inside the JSONL. See '
+    'plans/session-resume-eligibility-seam-prd.md §14. WHY THE OLD RECORDS '
+    'EXIST AND ARE NOT SIMPLY WRONG: the 2026-04-10 incident was REAL — a '
+    'steward CWD switch to project_root did break --resume (0 cost, 0 turns, '
+    'all 3 retries), fixed by commit e001dd3746. Only the CAUSE attached to it '
+    'was an inference. Whether the CLI changed between April and August or the '
+    'April diagnosis mis-attributed the cause is UNDETERMINED; the April-era '
+    'CLI was never measured. STATUS: edge fb96a8c0 was reworded in place on '
+    '2026-08-22 and now self-dates and carries the correction. Mem0 6403e96b is '
+    'STILL UNCORRECTED — update_memory rejected both its content_amend and '
+    'metadata_patch arms for a steward agent_id (authorized prefixes are '
+    'recon-stage-* and curator-* only), so it needs an authorized agent. Task '
+    '3730 is the consumer at risk, since its acceptance criterion is to obtain '
+    'this exact gate answer.'
+)
+
+#: The prefix of the warning that stays byte-identical: everything before its
+#: STATUS sentence. Split out so the replacement is visibly an edit to ONE
+#: clause rather than a rewrite of a record whose value is its measurements.
+_WARNING_PRESERVED_PREFIX = _WARNING_PREIMAGE.split(' STATUS: ')[0]
+
+_WARNING_REPLACEMENT = (
+    _WARNING_PRESERVED_PREFIX
+    + ' STATUS (updated 2026-08-28, task 4610): BOTH records are now '
+    'corrected. Edge fb96a8c0 was reworded in place on 2026-08-22 and '
+    'self-dates. Mem0 6403e96b was subsequently '
+    f'{AMENDED_SENTINEL} — its bare causal claim is now version-scoped, marked '
+    'SUPERSEDED AS A GENERAL CLAIM, and carries the 2026-08-19 contrary '
+    'measurement. NEITHER was deleted: the April symptom was measured and real, '
+    'only its inferred cause was wrong, so both are kept as dated historical '
+    'records rather than retracted. The correction had to be routed through '
+    'scripts/amend_stale_resume_cwd_records.py because update_memory admits '
+    'only recon-stage-* and curator-* agent ids and no dispatchable role holds '
+    'one. Task 3730 was the consumer at risk.'
+)
+
+
+#: The two amendments, in the order they MUST be applied. d007aa46's new text
+#: asserts that 6403e96b was corrected, so it is written only after that is
+#: true — see the ordering guard in ``run()``.
+AMEND_TARGETS: tuple[AmendTarget, ...] = (
+    AmendTarget(
+        memory_id='6403e96b-f1af-403a-9513-59f007ed6d39',
+        expected_preimage=_STALE_PREIMAGE,
+        new_content=_STALE_REPLACEMENT,
+        # 'correction_basis' — the spelling d007aa46's own metadata already
+        # carries — is NOT in memory_metadata.BLESSED_METADATA_KEYS, so it
+        # would census as an (non-fatal) unknown_key drift violation on every
+        # write. The 'x_' experimental namespace is the sanctioned home for an
+        # unblessed key, so the provenance is recorded there instead.
+        metadata_patch={
+            'x_correction_basis': 'esc-3578-5',
+            'x_corrected_by_task': '4610',
+        },
+    ),
+    AmendTarget(
+        memory_id='d007aa46-5800-455c-af3c-32d8fd8445b2',
+        expected_preimage=_WARNING_PREIMAGE,
+        new_content=_WARNING_REPLACEMENT,
+        metadata_patch={'x_corrected_by_task': '4610'},
+    ),
+)

@@ -6,6 +6,7 @@ test_tag_cgl_eta_rehome_scope.py / test_prune_recon_cycle_summaries.py.
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 import types
@@ -117,5 +118,5 @@ class TestAmendTargetsContract:
 class TestAmendTargetShape:
     def test_target_is_frozen(self):
         target = _mod.AMEND_TARGETS[0]
-        with pytest.raises(Exception):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             target.memory_id = 'mutated'  # type: ignore[misc]
