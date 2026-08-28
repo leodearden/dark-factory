@@ -904,11 +904,29 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # The module tagger's affirmative "no local file predicted" verdict,
         # written unconditionally as a bool in the SAME payload and by the
         # same line of code as the files_tagged_at sentinel above (task 3122).
-        # Tier-A rather than parked in the x_ forward-compat namespace: it is
-        # a first-class, permanently-written signal produced by a funded
-        # orchestrator stage, not an ad-hoc one-off. Unblessed it would emit
-        # an unknown_key drift warning on EVERY tagger batch — noise in the
-        # very census it exists to make readable. Task 3121 is its consumer.
+        # Tier-A rather than parked in the x_ forward-compat namespace for
+        # the same reason as that sibling: it is machine-written by an
+        # orchestrator stage, not an ad-hoc one-off.
+        #
+        # THE WRITE PATH IS INERT ON ARRIVAL. `_MODULE_TAGGER_ENABLED` is
+        # False (task 4523, commit bdcd9f5eff), guarding every production
+        # call site of `Harness._tag_task_modules`, so nothing writes this
+        # key: a fleet-wide census on 2026-08-28 found 0 records carrying it
+        # in any of the 9 project stores, against 325 dark_factory / 269
+        # reify carrying `files_tagged_at`. It is blessed, and lands, because
+        # plans/module-tagger-retirement-prd.md decision 4 (Leo, 2026-08-20)
+        # ratified this ordering -- 3122 lands the persistence, then task
+        # 4523 (pending, blocked on 3122) deletes the write path along with
+        # the tagger and re-annotates this entry historical beside
+        # `files_tagged_at` (PRD decision 5). Blessing it here leaves 4523's
+        # deletion diff unchanged and keeps the key from warning as
+        # `unknown_key` on any record written should the constant be flipped
+        # back before 4523 lands.
+        #
+        # There is no code READER either, and task 3121 is not one: it landed
+        # with deliberately no leg for the soft-signal marker -- see
+        # `orchestrator/src/orchestrator/cross_repo_gate.py::
+        # classify_cross_repo`.
         'files_tagged_empty',
         # Finding-provenance family (esc-3796-1, 2026-08-17). `source_finding_id`
         # is the CANONICAL key naming the finding a task was spawned from;

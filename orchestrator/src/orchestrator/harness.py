@@ -3092,10 +3092,10 @@ class Harness:
         # the tagger ran (files_tagged_at) and never WHAT it concluded. The
         # tagger is prompted with the project's own top-level directory
         # listing and explicitly instructed to "include it with an empty
-        # files list rather than omitting it" (module_tagger_prompt.py:78-79),
-        # so an empty result is an AFFIRMATIVE verdict from a model that
-        # could see the whole layout — and its cost is already sunk (~$0.278
-        # per batch). files_tagged_empty preserves it. It is NOT a gate on
+        # files list rather than omitting it"
+        # (module_tagger_prompt.py::build_tagger_prompt), so an empty result
+        # is an AFFIRMATIVE verdict from a model that could see the whole
+        # layout. files_tagged_empty preserves it. It is NOT a gate on
         # its own — it also fires for genuinely-new-file and vague tasks —
         # but in conjunction with the submit-time soft scope signals it is
         # strong evidence for the FILELESS misfile class.
@@ -3111,6 +3111,20 @@ class Harness:
         # fused-memory's soft_scope_lint.flagged census line and, under
         # FUSED_SOFT_SCOPE_ENFORCE, the operator scope_violation escalation;
         # re-opening 3121 to add a leg is follow-up work.
+        #
+        # INERT ON ARRIVAL, DELIBERATELY. _MODULE_TAGGER_ENABLED is False
+        # (task 4523, commit bdcd9f5eff, already in this branch's base) and
+        # it guards every production call site of _tag_task_modules, so the
+        # files_tagged_empty write below cannot execute in production and
+        # costs nothing -- there is no per-batch spend to weigh, sunk or
+        # otherwise. It lands anyway because
+        # plans/module-tagger-retirement-prd.md decision 4 (Leo, 2026-08-20)
+        # ratified exactly this ordering: 3122 lands the persistence, then
+        # task 4523 (pending, blocked on 3122) "deletes the
+        # files_tagged_empty write path along with the tagger". Deleting it
+        # here instead would break that ratified sequence, not shortcut it.
+        # The code is correct; it is simply waiting for a call site that has
+        # been switched off ahead of its own retirement.
         tagged_at = datetime.now(UTC).isoformat()
 
         tagged_count = 0

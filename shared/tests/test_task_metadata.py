@@ -2381,9 +2381,13 @@ class TestFilesTaggedEmptyBlessed:
 
     Written unconditionally as a bool on every tagged task by
     ``Harness._tag_task_modules``, in the SAME payload and by the same line
-    of code as its already-blessed ``files_tagged_at`` sibling. Unblessed it
-    would emit an ``unknown_key`` drift warning on every tagger batch —
-    noise in exactly the census this signal exists to make readable.
+    of code as its already-blessed ``files_tagged_at`` sibling.
+
+    That write path is INERT today — ``harness._MODULE_TAGGER_ENABLED`` is
+    False (task 4523) — so this pins the blessing, not live traffic. The
+    blessing lands per plans/module-tagger-retirement-prd.md decision 4's
+    ratified ordering (3122 first, then 4523 deletes the write path); see
+    the comment beside the key in ``shared/src/shared/task_metadata.py``.
     """
 
     def _unknown_key_fields(self, blob: dict) -> set[str]:
