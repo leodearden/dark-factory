@@ -484,13 +484,29 @@ class SoftScopeFinding:
 
     @property
     def suggested_project(self) -> str | None:
-        """The single implicated foreign project, or None on disagreement.
+        """The single STRONG-implicated foreign project, or None on disagreement.
 
         Mirrors ``path_scope_guard._aggregate_owner_mismatches``' rule: when
         the evidence names more than one project there is no single target
         to suggest, and silence beats a coin flip.
+
+        Agreement is computed over ``strength='strong'`` signals ONLY, for
+        the same reason :attr:`should_adjudicate` ignores weak ones: the bare
+        project-NAME rule fires on 20.6% of dark_factory tasks, so letting it
+        vote would let one incidental mention of another repo veto a target
+        that unambiguous strong evidence had already established.  Measured
+        over the 4,791-task dark_factory corpus, all-signal agreement lost
+        the suggestion on 10 of 111 strong firings (9.0%) purely to that
+        dilution.  The loss is not cosmetic: this value is passed to
+        ``PathScopeAdjudicator.adjudicate`` (so the classifier loses the
+        target name) and is the only field of the ``possible_scope_mismatch``
+        stamp any landed consumer reads
+        (``orchestrator/src/orchestrator/cross_repo_gate.py::_resolve_owner``).
+
+        Weak signals still travel in :attr:`matched_paths` and in the census
+        line, tagged, so an operator sees every project the text mentioned.
         """
-        owners = {s.project_id for s in self.signals}
+        owners = {s.project_id for s in self.signals if s.strength == 'strong'}
         return next(iter(owners)) if len(owners) == 1 else None
 
     @property

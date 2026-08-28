@@ -523,6 +523,46 @@ class TestCollectSoftScopeSignals:
         assert finding.should_adjudicate is True
         assert finding.suggested_project is None
 
+    def test_weak_disagreement_does_not_dilute_a_strong_suggestion(self, tmp_path):
+        """LOAD-BEARING: agreement is computed over STRONG signals ONLY.
+
+        The module's contract is that weak signals are "context and census
+        detail only" — ``should_adjudicate`` deliberately ignores them. This
+        pins the same rule for ``suggested_project``, which is the ONLY
+        field of the ``possible_scope_mismatch`` stamp any landed consumer
+        reads (``orchestrator/src/orchestrator/cross_repo_gate.py::
+        _resolve_owner``) and is also handed to the paid confirmation step.
+
+        Shape: ONE strong signal names ``dark_factory`` unambiguously, and a
+        bare mention of ``cockpit`` in prose fires the weak name rule. Were
+        agreement computed over ALL signals, that 20.6%-fire-rate rule would
+        null out a suggestion unambiguous strong evidence had established —
+        measured at 10 of 111 strong firings (9.0%) across the dark_factory
+        corpus (tasks 1542, 1543, 1858, 2101, 3168, 3641, 3642, 4264, 4505,
+        4710).
+        """
+        a = _mkproj(tmp_path, 'reify', ['crates'])
+        b = _mkproj(tmp_path, 'dark-factory', ['orchestrator'])
+        c = _mkproj(tmp_path, 'cockpit', ['ui'])
+        registry = ProjectPrefixRegistry.from_roots([str(a), str(b), str(c)])
+        finding = collect_soft_scope_signals(
+            title='dark-factory: wire the timer',
+            description='similar in spirit to what cockpit does for its panes',
+            details='',
+            project_id='reify',
+            registry=registry,
+        )
+
+        strong = [s for s in finding.signals if s.strength == 'strong']
+        weak = [s for s in finding.signals if s.strength == 'weak']
+        # Premise checks: exactly the shape described above, so a green
+        # result cannot come from the weak rule silently failing to fire.
+        assert {s.project_id for s in strong} == {'dark_factory'}
+        assert 'cockpit' in {s.project_id for s in weak}
+
+        assert finding.should_adjudicate is True
+        assert finding.suggested_project == 'dark_factory'
+
     def test_empty_finding(self, tmp_path):
         registry = _two_project_registry(tmp_path)
         finding = collect_soft_scope_signals(
