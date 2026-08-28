@@ -297,6 +297,20 @@ _WHITESPACE_RE = re.compile(r'\s+')
 # NOT, under a Python-engine fallback.
 _RECURRENCE_KEY_RE_STR = r'^[a-z0-9]+(?:-[a-z0-9]+)*\z'
 
+# The length cap that COMPLETES the topic-slug mirror above. The regex
+# alone accepts an arbitrarily long key; every real consumer of
+# TOPIC_SLUG_RE pairs it with TOPIC_SLUG_MAX_LEN instead
+# (fused_memory.topic_slug::is_valid_topic_slug, memory_metadata's `topic`
+# check, config.schema::ProceduralTopicCluster), so mirroring the pattern
+# without the cap would leave `key` a weaker shape than the one its
+# comment — and docs/task-authoring.md §6.1 — advertise it as.
+#
+# Copied as a literal for the same layering reason as the pattern:
+# `shared` is the base package fused-memory depends on. Kept numerically
+# EQUAL to TOPIC_SLUG_MAX_LEN so "safe as a slug" stays true of a chain
+# key, which doubles as a grep anchor and (R-D5) a gauge group key.
+_RECURRENCE_KEY_MAX_LEN = 100
+
 
 class RetryLedger(BaseModel):
     """``metadata.retry_ledger`` — anti-thrash counters (PRD §5).
@@ -418,20 +432,32 @@ class Recurrence(BaseModel):
     run, failure and overdue-ness is visible in the task tree.
 
     ``key`` is the stable chain id shared by every link of one chain —
-    kebab-case so it is safe as a slug and as a grep anchor. The pattern
-    deliberately MIRRORS ``fused_memory.topic_slug::TOPIC_SLUG_RE`` rather
-    than importing it, because ``shared`` is the base package fused-memory
-    depends on and the reverse import would be a layering violation.
+    kebab-case so it is safe as a slug and as a grep anchor. The pattern AND
+    the length cap deliberately MIRROR ``fused_memory.topic_slug``'s
+    ``TOPIC_SLUG_RE``/``TOPIC_SLUG_MAX_LEN`` pair rather than importing them,
+    because ``shared`` is the base package fused-memory depends on and the
+    reverse import would be a layering violation. Both halves are copied
+    because that module's own consumers always apply both — the regex alone
+    would accept an unbounded key.
 
     ``interval_secs`` (> 0) is the cadence, measured from the predecessor's
     TERMINAL time — never from a missed slot, so a late or long-running link
     shifts the chain forward instead of accruing catch-up runs (contract
     C-6).
 
-    ``minted_from`` is the predecessor's task id: ABSENT on the seed link an
-    author writes, and stamped by r2's mint on every successor. It is typed
+    ``minted_from`` is the predecessor's task id: an author omits it on the
+    seed link, and r2's mint stamps it on every successor. It is typed
     ``str`` because task ids are ``str`` codebase-wide (the SQLite task
     backend's signatures, ``ExternalDep.task_id``).
+
+    The seed-vs-successor DISCRIMINATOR is the VALUE — ``minted_from is
+    None`` — never key presence. The field is declared with a ``None``
+    default, so any round-trip through ``parse_metadata`` + ``model_dump``
+    materialises an explicit ``'minted_from': None`` on a seed link an author
+    wrote without one. A consumer that tests ``'minted_from' in rec`` would
+    therefore classify every round-tripped seed as a minted successor;
+    ``rec.get('minted_from') is None`` is the check that holds on both the
+    as-authored and the round-tripped form.
 
     ``extra='allow'`` matches the Milestone/routing/merge_retry_pending
     precedent, so a later writer's field survives round-trip untouched (I1).
@@ -439,8 +465,17 @@ class Recurrence(BaseModel):
 
     model_config = ConfigDict(extra='allow')
 
-    key: str = Field(min_length=1, pattern=_RECURRENCE_KEY_RE_STR)
-    interval_secs: int = Field(gt=0)
+    key: str = Field(
+        min_length=1, max_length=_RECURRENCE_KEY_MAX_LEN, pattern=_RECURRENCE_KEY_RE_STR
+    )
+    # strict=True, not merely gt=0: pydantic's LAX int coercion accepts
+    # `True` (-> 1), `'86400'` and `86400.0`, so a stray boolean would mint a
+    # chain with a ONE-SECOND cadence against a contract scoped to
+    # hours-to-days. That is the same silent-wrong-value class the sibling
+    # guard already defends against with its `always_escalates is True`
+    # identity check. A cadence arrives from JSON, where an int is an int, so
+    # nothing legitimate needs the coercion.
+    interval_secs: int = Field(gt=0, strict=True)
     minted_from: str | None = None
 
 

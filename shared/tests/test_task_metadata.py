@@ -652,6 +652,13 @@ class TestRecurrence:
             pytest.param({'key': 'k', 'interval_secs': 0}, id='interval_secs_zero'),
             pytest.param({'key': 'k', 'interval_secs': -1}, id='interval_secs_negative'),
             pytest.param({'key': 'k', 'interval_secs': '1d'}, id='interval_secs_non_int'),
+            # The three rows pydantic's LAX int coercion would have ACCEPTED
+            # (True -> 1, '86400' -> 86400, 86400.0 -> 86400). strict=True is
+            # what rejects them, and a bool slipping through would mint a
+            # one-second cadence — the silent-wrong-value bug, not a typo.
+            pytest.param({'key': 'k', 'interval_secs': True}, id='interval_secs_bool'),
+            pytest.param({'key': 'k', 'interval_secs': '86400'}, id='interval_secs_numeric_str'),
+            pytest.param({'key': 'k', 'interval_secs': 86400.0}, id='interval_secs_float'),
             pytest.param({'key': 'k'}, id='interval_secs_missing'),
             pytest.param({'interval_secs': 86400}, id='key_missing'),
             pytest.param({'key': '', 'interval_secs': 86400}, id='key_empty'),
@@ -661,11 +668,22 @@ class TestRecurrence:
             pytest.param({'key': '-reify', 'interval_secs': 86400}, id='key_leading_dash'),
             pytest.param({'key': 'reify-', 'interval_secs': 86400}, id='key_trailing_dash'),
             pytest.param({'key': 'reify--closure', 'interval_secs': 86400}, id='key_double_dash'),
+            # The cap half of the topic-slug mirror: the regex alone accepts
+            # any length, so without max_length this row constructs fine.
+            pytest.param({'key': 'a' * 101, 'interval_secs': 86400}, id='key_over_max_len'),
         ],
     )
     def test_invalid_specs_rejected(self, kwargs):
         with pytest.raises(ValidationError):
             Recurrence(**kwargs)  # type: ignore[arg-type]
+
+    def test_key_at_max_length_accepted(self):
+        """The cap is 100 (TOPIC_SLUG_MAX_LEN), inclusive — pin the boundary.
+
+        Paired with the ``key_over_max_len`` row above so a future edit to
+        the literal cannot move the limit in silence.
+        """
+        assert Recurrence(key='a' * 100, interval_secs=86400).key == 'a' * 100
 
     def test_unknown_subfield_retained_and_reemitted(self):
         r = Recurrence(key='k', interval_secs=86400, x_extra='keep')  # type: ignore[call-arg]
@@ -1336,6 +1354,17 @@ class TestRecurrenceRegistration:
             'interval_secs': 86400,
             'minted_from': None,
         }
+        # The seed/successor discriminator r2's mint (and R-D5's gauge) must
+        # use, pinned explicitly because the dict above already shows the
+        # trap: the carrier was authored WITHOUT 'minted_from', yet the
+        # round-trip materialises the key with a None value. Key PRESENCE is
+        # therefore not the discriminator and never was —
+        # ``'minted_from' in rec`` reads True for this seed link. Only the
+        # VALUE separates the two, and it holds on the as-authored form too.
+        assert 'minted_from' not in self._CARRIER['recurrence']
+        assert 'minted_from' in dumped
+        assert dumped['minted_from'] is None
+        assert model.recurrence.minted_from is None  # type: ignore[attr-defined]
 
     def test_malformed_slice_read_warns_and_retains_raw(self):
         model, warnings = parse_metadata({'recurrence': {'key': 'k'}}, direction='read')
