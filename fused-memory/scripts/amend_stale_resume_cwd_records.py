@@ -345,3 +345,78 @@ def classify_amend_target(
         return {**result, 'action': 'amend'}
 
     return {**result, 'action': 'refuse:preimage_mismatch'}
+
+
+# ---------------------------------------------------------------------------
+# Pure core: build_amend_report
+# ---------------------------------------------------------------------------
+
+def build_amend_report(
+    decisions: list[dict[str, Any]],
+    applied_ids: set[str],
+    dry_run: bool,
+    generated_at: str,
+) -> dict[str, Any]:
+    """Assemble the structured JSON-serialisable amendment report.
+
+    Mirrors ``tag_cgl_eta_rehome_scope.build_tag_report``'s shape and
+    determinism -- two runs over identical inputs serialise byte-identically,
+    so an operator can diff two dry-runs and see only what actually moved.
+
+    Two things differ from the sibling sweeps' reports, both deliberately:
+
+    * ``changes`` preserves :data:`AMEND_TARGETS` ORDER rather than sorting by
+      id. Order is semantic here (it encodes the precondition chain), and
+      sorting would put d007aa46 first -- reading as though the dependent write
+      were attempted before the one it depends on.
+    * EVERY decision gets a ``changes`` entry, including skips and refusals.
+      The sibling sweeps list only the records they touched because their pools
+      run to thousands; here there are exactly two records and both are
+      load-bearing, so an operator must be able to see what happened to each
+      without inferring it from a count.
+
+    Args:
+        decisions: :func:`classify_amend_target` results, in AMEND_TARGETS
+            order.
+        applied_ids: memory ids actually written (empty on a dry run).
+        dry_run: True when no writes were made.
+        generated_at: ISO timestamp string.
+
+    Returns:
+        ``{'dry_run', 'generated_at', 'targets', 'totals', 'changes'}``, all
+        JSON-serialisable primitives (no ``default=`` hook needed).
+    """
+    changes: list[dict[str, Any]] = []
+    for decision in decisions:
+        entry = {
+            'id': decision['id'],
+            'action': decision['action'],
+            'applied': decision['id'] in applied_ids,
+        }
+        # Carry any diagnostic the write path attached (error text, the
+        # precondition that failed) so a refusal explains itself in the
+        # artifact rather than only in the logs.
+        for key in ('error', 'error_type', 'detail'):
+            if key in decision:
+                entry[key] = decision[key]
+        changes.append(entry)
+
+    return {
+        'dry_run': dry_run,
+        'generated_at': generated_at,
+        'targets': len(decisions),
+        'totals': {
+            # 'amended' counts what was actually WRITTEN, not what was
+            # amendable -- on a dry run every entry is 'amend' and none is
+            # applied, and the report must not read as though two writes
+            # happened.
+            'amended': sum(1 for c in changes if c['applied']),
+            'skipped': sum(
+                1 for c in changes if c['action'].startswith('skip:')
+            ),
+            'refused': sum(
+                1 for c in changes if c['action'].startswith('refuse:')
+            ),
+        },
+        'changes': changes,
+    }

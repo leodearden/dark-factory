@@ -217,11 +217,7 @@ class TestBuildAmendReport:
             'dry_run', 'generated_at', 'targets', 'totals', 'changes',
         }
 
-    def test_changes_preserve_amend_targets_order_not_id_sort(self):
-        # Order is SEMANTIC here (the precondition chain), so the report must
-        # not sort by id the way the sibling sweeps' reports do. d007aa46
-        # sorts before 6403e96b lexically, so an accidental sort is visible.
-        assert WARNING_ID < STALE_ID
+    def test_changes_follow_the_two_real_targets_in_order(self):
         report = _mod.build_amend_report(
             [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')],
             applied_ids=set(),
@@ -229,6 +225,25 @@ class TestBuildAmendReport:
             generated_at='2026-08-28T00:00:00+00:00',
         )
         assert [c['id'] for c in report['changes']] == [STALE_ID, WARNING_ID]
+
+    def test_changes_preserve_input_order_rather_than_sorting_by_id(self):
+        # Order is SEMANTIC here (it encodes the precondition chain), so the
+        # report must NOT sort by id the way the sibling sweeps' reports do.
+        #
+        # The two REAL ids cannot detect that: 6403e96b sorts BEFORE d007aa46
+        # ('6' < 'd'), so their natural sort order already coincides with the
+        # semantic order and an accidental sorted() would be invisible. Hence
+        # synthetic ids in deliberately reverse-sorted order -- the only shape
+        # in which sorting and order-preservation give different answers.
+        reversed_ids = ['zzz-last-alphabetically', 'aaa-first-alphabetically']
+        assert reversed_ids != sorted(reversed_ids)
+        report = _mod.build_amend_report(
+            [_decision(mid, 'amend') for mid in reversed_ids],
+            applied_ids=set(),
+            dry_run=True,
+            generated_at='2026-08-28T00:00:00+00:00',
+        )
+        assert [c['id'] for c in report['changes']] == reversed_ids
 
     def test_one_change_entry_per_decision_including_skips_and_refusals(self):
         # Unlike the sibling sweeps (whose reports list only the records they
