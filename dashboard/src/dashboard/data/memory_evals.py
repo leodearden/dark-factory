@@ -841,7 +841,7 @@ def _index_escalations(
             _issue(
                 issues, 'unknown_escalation_status', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} has unrecognised status '
+                    f'escalation {_short_repr(record.get("id"))} has unrecognised status '
                     f'{_short_repr(status)}; not joined (only pending escalations are '
                     'treated as open)'
                 ),
@@ -856,7 +856,7 @@ def _index_escalations(
             _issue(
                 issues, 'unfingerprinted_escalation', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} is open but carries no usable '
+                    f'escalation {_short_repr(record.get("id"))} is open but carries no usable '
                     f'dedupe_fingerprint ({_short_repr(fingerprint)}); it can never join '
                     'a metric row'
                 ),
@@ -867,8 +867,8 @@ def _index_escalations(
             _issue(
                 issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} shares dedupe_fingerprint '
-                    f'{_short_repr(fingerprint)} with {index[fingerprint].get("id")!r}; '
+                    f'escalation {_short_repr(record.get("id"))} shares dedupe_fingerprint '
+                    f'{_short_repr(fingerprint)} with {_short_repr(index[fingerprint].get("id"))}; '
                     'the first is used'
                 ),
             )
