@@ -1308,6 +1308,59 @@ class TestGuaranteedMarkerNames:
             f'{sorted(discovered ^ set(_MARKER_SOURCE_FIXTURE_NAMES))}'
         )
 
+    def test_the_real_class_organised_module_in_this_repo_is_handled_soundly(self):
+        """REAL-INPUT COVERAGE for the class tier — deliberately NOT a tripwire.
+
+        The two existing real-config goldens
+        (``TestWarmLaneBashRealConfigRegression``,
+        ``TestTestsScriptsAllIntegrationDecoratedRealConfigRegression``) guard
+        live premises.  This tier has none: ``fused-memory/tests/test_mem0_client.py``
+        is the repo's most class-organised marked suite and it marks only a
+        MINORITY of its top-level classes, so it correctly refuses, and the
+        synthetic goldens above are the honest way to pin the behaviour.  What is
+        worth running on the real file is the part that holds either way — the
+        SUPERSET contract, on input nobody wrote for this test.
+
+        WHY NOT ASSERT THE ABSENCE.  This test reads a file in ANOTHER PACKAGE
+        from inside the orchestrator suite.  An earlier form asserted that the
+        remaining classes are still unmarked, which meant a wholly unrelated task
+        adding a class marker in the fused-memory suite would turn THIS suite RED
+        and block that task's verify, with a failure naming a file its author
+        never touched — a cross-package coupling the synthetic goldens make
+        unnecessary.  The flip is still reported, as a SKIP carrying the
+        "promote it to a real-file golden" instruction, so the signal survives
+        without the blocking.
+        """
+        target = REPO_ROOT / 'fused-memory' / 'tests' / 'test_mem0_client.py'
+        if not target.exists():
+            pytest.skip(
+                f'{target} has been renamed or removed — this is real-input coverage '
+                'for the class tier, not a pin on that path; retarget it at another '
+                'class-organised suite or drop it. The fix is NOT in orchestrator.',
+            )
+        source = target.read_text()
+        top_level_classes = [
+            node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+        ]
+        if len(top_level_classes) <= 1:
+            pytest.skip(f'{target} is no longer class-organised; nothing real-input to assert')
+
+        # Holds on every input, so it can never be flipped by someone else's edit.
+        assert module_level_marker_names(source) <= guaranteed_marker_names(source), (
+            f'the STRICTLY ADDITIVE superset contract is broken on {target} — '
+            'guaranteed_marker_names returned LESS than module_level_marker_names, so '
+            'routing tier 1 through it can now refuse a target the old code accepted. '
+            'THIS one is an orchestrator defect: see pytest_markers.guaranteed_marker_names.'
+        )
+        if guaranteed_marker_names(source) != module_level_marker_names(source):
+            pytest.skip(
+                f'THE TRIPWIRE FLIPPED: every collectable class in {target} is now marked, '
+                'so the class tier has become live on REAL code and no longer has to be '
+                'pinned by synthetic goldens alone. Promote the shape to a real-file '
+                'golden beside TestWarmLaneBashRealConfigRegression. Nothing is broken and '
+                'THE FIX IS NOT IN ORCHESTRATOR — this is a healthy signal, not a failure.',
+            )
+
     # -- cost bound: exactly one parse per call --------------------------------
 
     def test_does_not_re_parse_source_to_derive_the_module_level_union(self, monkeypatch):
@@ -1911,29 +1964,6 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == ('mod/tests/test_d.py',)
         assert run.reason == 'pytest: file-scoped to touched test file(s)'
-
-    def test_no_real_module_in_this_repo_is_all_classes_marked_yet(self):
-        """A REGRESSION GUARD POINTED AT AN ABSENCE, in place of a real-file golden.
-
-        The two existing real-config goldens
-        (``TestWarmLaneBashRealConfigRegression``,
-        ``TestTestsScriptsAllIntegrationDecoratedRealConfigRegression``) guard
-        live premises.  This tier has none: ``fused-memory/tests/test_mem0_client.py``
-        is the repo's most class-organised marked suite and it marks only a
-        MINORITY of its top-level classes, so it correctly refuses and the
-        synthetic goldens above are the honest way to pin the behaviour.
-
-        Asserting the absence keeps that fact checked rather than assumed.  The
-        day someone marks the remaining classes, this pin FLIPS — and that is
-        the signal to promote the shape to a real-file golden, because the
-        widening will have become live on real code.
-        """
-        source = (REPO_ROOT / 'fused-memory' / 'tests' / 'test_mem0_client.py').read_text()
-        top_level_classes = [
-            node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
-        ]
-        assert len(top_level_classes) > 1, 'premise: this file really is class-organised'
-        assert guaranteed_marker_names(source) == module_level_marker_names(source)
 
     def test_module_without_a_marker_expression_is_never_widened(self):
         """CONTROL: an identically-marked target under a module declaring no ``-m``."""
