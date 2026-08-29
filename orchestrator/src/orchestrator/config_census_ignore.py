@@ -208,9 +208,12 @@ SEVERITY_ADVISORY = 'advisory'
 # is pre-existing debt that must not turn every green config red on upgrade.
 HARD_KINDS = frozenset({KIND_SELF_REFUTING, KIND_MISSING_CITE, KIND_ORPHANED})
 
-# The framework itself named as the consumer.  \bDF\b catches the
-# DF_-prefixed env-var convention (e.g. DF_AGENT_CPU_GOVERN) that names
-# dark-factory directly.
+# The framework itself named as the consumer, matched against the entry's
+# REASON prose only — never against `spec.pattern`, so a key NAME is not
+# scanned by this check at all.  `\bDF\b` accordingly catches only a reason
+# that spells DF as a standalone word ("read by DF"); it cannot match inside
+# a DF_-prefixed identifier such as DF_AGENT_CPU_GOVERN, because `_` is a
+# word character and leaves no boundary after the F.
 _SELF_CONSUMER_RE = re.compile(
     r'\b(dark[-\s]?factory|orchestrator|orchestratorconfig|DF)\b', re.IGNORECASE
 )
@@ -504,7 +507,12 @@ def audit_census_ignore_entries(config_path: Path | str) -> list[CensusIgnoreFin
     try:
         with open(config_path) as f:
             tree = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, and it surfaces
+        # lazily from inside safe_load()'s read rather than from open() — the
+        # exact hole task 4124 closed in ``config.census_config_keys``.  Without
+        # it named here a non-UTF-8 config would propagate out of a function
+        # documented to fail open.
         logger.debug('census-ignore audit: cannot read %s (%s)', config_path, exc)
         return []
     if not isinstance(tree, dict):

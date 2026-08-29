@@ -832,8 +832,14 @@ classified `known`, hence never in need of an ignore entry. Membership in
 the ignore list therefore **proves** dark-factory does not read the key —
 an entry claiming otherwise is wrong by construction. The remedy is the
 schema-field route: add the key to the model, don't excuse it. This is the
-one check that would have caught reify's `cpu_governance.DF_AGENT_CPU_GOVERN`
-the moment it was added, weeks before the outage was found by hand.
+check that *could* have caught reify's `cpu_governance.DF_AGENT_CPU_GOVERN`
+weeks before the outage was found by hand — but only under two conditions
+that do not hold today: the reasoned form would have to be **mandatory**
+(that entry is a bare string, so as shipped it grades `unreasoned`, advisory,
+and nothing else), and its author would have to have written a reason that
+names dark-factory as the consumer. The grader reads the `reason:` prose
+only — never the key name — so a `DF_`-prefixed key is never itself the
+evidence.
 
 **Why an orphaned citation is its own diagnostic** (and exit **2**) rather
 than being reclassified as an `unknown` key: reclassifying would wire an

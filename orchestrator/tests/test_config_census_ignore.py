@@ -196,8 +196,13 @@ def test_unreasoned_is_advisory(reason):
     ],
 )
 def test_self_refuting_is_hard(reason):
-    """The one check that would have caught cpu_governance.DF_AGENT_CPU_GOVERN
-    at the moment it was added, ~6 weeks before the outage was found by hand.
+    """The check that COULD have caught cpu_governance.DF_AGENT_CPU_GOVERN ~6
+    weeks before the outage was found by hand — but only under two conditions
+    that do not hold today: the reasoned form would have to be MANDATORY (that
+    entry is a bare string, so as shipped it grades `unreasoned`, advisory, and
+    nothing else), and its author would have to have written a reason that
+    names dark-factory as the consumer.  The grader reads `reason:` prose only,
+    never the key name, so a DF_-prefixed key is never itself the evidence.
     Wrong BY CONSTRUCTION: dark-factory owns the schema, so a key it consumed
     would be a FIELD on the model, hence known, hence never in need of an
     ignore entry.  Certain with no external state — hence hard."""
@@ -278,8 +283,9 @@ def test_no_specs_yields_no_findings():
 
 # --- (c) citation liveness ----------------------------------------------------
 #
-# Policy adopted from reconciliation/stale_status_snapshot_edge_sweep.py:28-32 —
-# invalidate ONLY on a positively-terminal answer, so the audit can under-fire
+# Policy adopted from the module docstring §"Standing invariants" of
+# fused-memory/src/fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py
+# — invalidate ONLY on a positively-terminal answer, so the audit can under-fire
 # but can never invent a violation out of missing data.  check-config is an
 # offline tool routinely pointed at another project's YAML from a machine
 # without that project's .taskmaster/, so absence must mean "cannot know".
