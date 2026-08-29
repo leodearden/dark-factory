@@ -283,10 +283,34 @@ main's current HEAD and never from an eyeballed listing:
 git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
 ```
 
-Non-empty → that sha IS this task's true merge commit. Stamp
-`{"kind": "found_on_main", "commit": "<that sha>", "note": "merge commit located by
-exact-subject marker search"}` and stop here. The `note` is **mandatory**, not decoration —
-`DoneProvenance` rejects `kind='found_on_main'` without one (see the contract restated below).
+**A non-empty result is NOT authoritative on its own here.** On this arm the branch ref still
+exists, and `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in exactly
+that situation — "this prevents finding a stale merge marker from a *previous* run of a
+re-opened task that shared the same branch name". Running the search anyway (as we do, because
+the marker is still the best first candidate) means re-supplying that guard ourselves. Require
+containment before stamping:
+
+```bash
+git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"; echo "containment rc=$?"
+```
+
+The merge that actually brought this branch in must contain the branch's current tip. A stale
+marker from a previous incarnation does not: it predates the recreated ref, so the tip is a
+*descendant* of it, not an ancestor.
+
+- **containment rc=0** → the marker is this incarnation's true merge commit. Stamp
+  `{"kind": "found_on_main", "commit": "<that sha>", "note": "merge commit located by
+  exact-subject marker search; containment-verified against branch tip"}` and stop here. The
+  `note` is **mandatory**, not decoration — `DoneProvenance` rejects `kind='found_on_main'`
+  without one (see the contract restated below).
+- **containment rc=1** → stale marker from a previous incarnation of a re-opened task. Do
+  **not** stamp it. Fall through to step (2)/(3) below and let them decide.
+- **containment rc=128** → the marker sha or the branch ref would not resolve; the check never
+  rendered a verdict. Do not stamp, and do not read it as either outcome — re-derive.
+
+(The escalation server layers a second guard on the same risk — the marker must not predate the
+recorded `branch_base_sha`; see `_found_on_main_response` / the merge_status Tier-3.5 docstring.
+The containment check above is the shell-side equivalent available to an agent.)
 
 **An empty marker search is NOT a not-landed verdict.** Two kinds of genuinely-landed work
 carry no `Merge task/<TASK_ID> into main` marker at all: a **fast-forward / already-contained**

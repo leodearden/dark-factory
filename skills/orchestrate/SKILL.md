@@ -517,7 +517,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    git log main --fixed-strings --grep="Merge task/<task-id> into main" --max-count=1 --format=%H
    ```
 
-   Non-empty → that SHA is this task's true merge commit.
+   Non-empty → **not authoritative on its own here.** On this arm the branch ref still exists, and `GitOps.find_merge_marker`'s **branch-existence gate** returns None in exactly that case — it "prevents finding a stale merge marker from a *previous* run of a re-opened task that shared the same branch name". We run the search anyway (it is still the best first candidate), so re-supply that guard: require `git merge-base --is-ancestor task/<task-id> "<marker sha>"` (echo the rc — never the two-outcome `&&` idiom). **rc=0** → this incarnation's true merge commit; stamp it with note "merge commit located by exact-subject marker search; containment-verified against branch tip". **rc=1** → a stale marker owned by a previous incarnation of a re-opened task; do **not** stamp, fall through to the group-merge search below. **rc=128** → neither sha resolved and no verdict was rendered; do not stamp, re-derive. The merge that truly brought this branch in must *contain* the current tip; a previous incarnation's marker predates the recreated ref, so the tip descends from it instead. (The escalation server layers a second guard on the same risk — the marker must not predate the recorded `branch_base_sha`; see `_found_on_main_response`.)
 
    Empty, but the branch ref still exists → the branch may have been absorbed into a group/train merge under a *tip* branch's subject, which carries no marker of its own. Look for that merge, but **verify it before stamping** — a non-empty result is not authoritative on its own:
 

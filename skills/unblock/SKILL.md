@@ -506,10 +506,29 @@ The merge procedure is iterative — don't assume one pass will be enough:
      #        (1) Exact-subject marker search (the same one the rc=128 arm below runs):
      #              git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
      #                  --max-count=1 --format=%H
-     #            Non-empty → that IS this task's merge commit. Stamp it with
-     #              note="merge commit located by exact-subject marker search"; stop here.
-     #              The note is MANDATORY, not decoration — see the contract at the end
-     #              of this arm.
+     #            NON-EMPTY IS NOT AUTHORITATIVE ON ITS OWN HERE. On this arm the
+     #              branch ref still EXISTS, and GitOps.find_merge_marker's own
+     #              branch-existence gate returns None in exactly that case — it
+     #              "prevents finding a stale merge marker from a PREVIOUS run of a
+     #              re-opened task that shared the same branch name". We run the search
+     #              anyway (it is still the best first candidate), so we must re-supply
+     #              that guard ourselves — require containment before stamping:
+     #                git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"
+     #                echo "containment rc=$?"
+     #              The merge that truly brought this branch in must CONTAIN the current
+     #              tip; a previous incarnation's marker predates the recreated ref, so
+     #              the tip is a DESCENDANT of it, not an ancestor.
+     #              containment rc=0   → this incarnation's true merge commit. Stamp it
+     #                with note="merge commit located by exact-subject marker search;
+     #                containment-verified against branch tip"; stop here. The note is
+     #                MANDATORY — see the contract at the end of this arm.
+     #              containment rc=1   → STALE marker from a previous incarnation of a
+     #                re-opened task. Do NOT stamp; fall through to (2)/(3).
+     #              containment rc=128 → neither sha resolved; no verdict was rendered.
+     #                Do NOT stamp and do NOT read it as either outcome; re-derive.
+     #              (The escalation server layers a second guard on the same risk — the
+     #              marker must not predate the recorded branch_base_sha; see
+     #              _found_on_main_response / the merge_status Tier-3.5 docstring.)
      #        (2) Marker empty is not "no sha": a coalesce-absorbed non-tip member is
      #            merged under the TIP branch's subject and carries no marker of its own,
      #            so look for the group merge — but VERIFY it before stamping:
@@ -651,8 +670,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   landing sha derived by the THREE-STEP ladder in the [canonical ancestry
   #   check](#branch-on-main) above — do not improvise a shorter version of it:
   #     (1) marker search `git log main --fixed-strings
-  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → stamp it
-  #         with note="merge commit located by exact-subject marker search";
+  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → NOT
+  #         authoritative alone on this arm (the ref still exists, so a re-opened task's
+  #         PREVIOUS incarnation can own the marker — the guard find_merge_marker applies
+  #         by refusing to search at all). Require containment first:
+  #         `git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"` — rc=0 → stamp it
+  #         with note="merge commit located by exact-subject marker search;
+  #         containment-verified against branch tip"; rc=1 → stale previous-incarnation
+  #         marker, fall through to (2)/(3); rc=128 → no verdict, re-derive;
   #     (2) marker empty → `c=$(git rev-list --ancestry-path --merges
   #         task/<TASK_ID>..main | tail -1)`, then CONFIRM with
   #         `git merge-base --is-ancestor task/<TASK_ID> "$c^1"` — rc=1 means $c really is
@@ -862,8 +887,11 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 #   and the landing sha derived by the THREE-STEP ladder in the [canonical ancestry
 #   check](#branch-on-main) — run it in full, do not shortcut it:
 #   (1) marker search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
-#       --max-count=1 --format=%H` → stamp it with note="merge commit located by
-#       exact-subject marker search";
+#       --max-count=1 --format=%H` → NOT authoritative alone here: the branch ref still
+#       exists, so a re-opened task's PREVIOUS incarnation can own the marker. Require
+#       `git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"` — rc=0 → stamp with
+#       note="merge commit located by exact-subject marker search; containment-verified
+#       against branch tip"; rc=1 → stale, fall through to (2)/(3); rc=128 → no verdict;
 #   (2) marker empty → `c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main
 #       | tail -1)`, then CONFIRM with `git merge-base --is-ancestor task/<TASK_ID> "$c^1"`:
 #       rc=1 → $c is the merge that brought this branch in, stamp it; rc=0 → $c is an

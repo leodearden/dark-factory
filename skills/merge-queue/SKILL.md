@@ -141,10 +141,28 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
 #          commit=<landing sha from the SAME exact-subject marker search used by the rc=128
 #          arm below: git log main --fixed-strings
-#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>,
-#          note="merge commit located by exact-subject marker search".
+#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>.
+#          A NON-EMPTY MARKER IS NOT AUTHORITATIVE ON ITS OWN HERE. On this arm the branch
+#          ref still EXISTS, and GitOps.find_merge_marker's branch-existence gate returns
+#          None in exactly that case — it "prevents finding a stale merge marker from a
+#          PREVIOUS run of a re-opened task that shared the same branch name". We search
+#          anyway (still the best first candidate), so re-supply the guard ourselves:
+git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"; echo "containment rc=$?"
+#          The merge that truly brought this branch in must CONTAIN the current tip; a
+#          previous incarnation's marker predates the recreated ref, so the tip is a
+#          DESCENDANT of it, not an ancestor.
+#            containment rc=0   → this incarnation's true merge commit. Stamp it with
+#              note="merge commit located by exact-subject marker search;
+#              containment-verified against branch tip".
+#            containment rc=1   → STALE previous-incarnation marker. Do NOT stamp; fall
+#              through to the group-merge search below.
+#            containment rc=128 → neither sha resolved, no verdict rendered. Do NOT stamp
+#              and do NOT read it as either outcome; re-derive.
 #          The NOTE IS MANDATORY, not decoration: DoneProvenance rejects
 #          kind='found_on_main' without one (see the summary at the end of this arm).
+#          (The escalation server layers a second guard on the same risk — the marker must
+#          not predate the recorded branch_base_sha; see _found_on_main_response / the
+#          merge_status Tier-3.5 docstring.)
 #          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT HEAD, which
 #          is this task's merge commit only when this merge happens to be the newest commit
 #          on main — on a live queue it usually is not, so you would stamp an unrelated
