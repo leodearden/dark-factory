@@ -4687,3 +4687,70 @@ class TestVerificationFailureAudit:
         )
         # Containment preserved: the exception does not propagate.
         assert 'task_id' in result
+
+
+# ── task-4903: TargetedReconciler dependent-unblock sweep ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_unblocks_blocked_dependent_when_last_dep_completes(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """Reify 5662/5759 repro: a `blocked` dependent whose sole dep just went
+    `done` must be durably flipped to `pending` through the interceptor, not
+    merely observed.
+
+    Before this fix, targeted.py's step-3 branch gated on
+    ``t.get('status') == 'pending'`` -- exactly the tasks that need no
+    unblocking -- and even on a match only appended an observation dict; no
+    code path anywhere wrote the dependent's status. This is the regression
+    test reproducing that defect verbatim.
+
+    Uses a real tmp_path-derived project_root rather than a shared literal
+    path: the escalation-pin veto (added later in this task) constructs an
+    ``EscalationQueue(Path(project_root)/'data/escalations')``, whose
+    ``__init__`` does ``mkdir(parents=True, exist_ok=True)`` -- this test
+    must not create directories under a path shared with other tests.
+    """
+    project_root = str(tmp_path)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    # (a) the write happened, exactly once, for the right task/status/root.
+    wired_reconciler.task_interceptor.set_task_status.assert_awaited_once()
+    call = wired_reconciler.task_interceptor.set_task_status.await_args
+    assert call.kwargs.get('task_id') == '2', (
+        f'Expected set_task_status to bind task_id="2" by keyword (matching '
+        f"_sweep_cancel_orphan/_sweep_block_orphan's convention in this file); "
+        f'got kwargs={call.kwargs!r}, args={call.args!r}'
+    )
+    assert call.kwargs.get('status') == 'pending', (
+        f'Expected status="pending", got kwargs={call.kwargs!r}'
+    )
+    assert call.kwargs.get('project_root') == project_root, (
+        f'Expected project_root={project_root!r}, got kwargs={call.kwargs!r}'
+    )
+
+    # (b) exactly one dependent_unblock_applied action, naming the dependency
+    #     whose completion satisfied it.
+    applied = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblock_applied']
+    assert len(applied) == 1, (
+        f'Expected exactly one dependent_unblock_applied action, got: {result.get("actions")}'
+    )
+    assert applied[0]['task_id'] == '2'
+    assert applied[0]['satisfied_by'] == '1'
+
+    # (c) the legacy dependent_unblocked observation stays reserved for the
+    #     already-pending case -- it must NOT fire for a blocked dependent.
+    unblocked = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblocked']
+    assert unblocked == [], (
+        f'dependent_unblocked must stay reserved for already-pending dependents, '
+        f'got: {result.get("actions")}'
+    )
