@@ -833,7 +833,18 @@ def refresh_record(
     reaper's own 'corrupt' rule already accounts for.
 
     The upsert body itself lives in ``apply_refresh`` (the pure half); this
-    function is read -> apply_refresh -> write.
+    function is read -> apply_refresh -> write, so there is exactly ONE
+    definition of what a freshly-upserted record looks like.
+    ``session_hooks.py::_run_status_refresh_and_retitle`` is the caller that
+    needs those semantics WITHOUT a second read -- it already holds the
+    record, from the ownership probe's own read -- and composes
+    ``apply_refresh`` with a single ``write_record`` instead of calling this.
+    It still calls this on its unreadable-body fault lane, precisely for the
+    corrupt-propagation guarantee above.
+
+    NON-GOAL, deliberate: this is not a compare-and-swap. ``write_record``
+    is an atomic whole-body replace with no CAS, so registry writes are
+    last-writer-wins here and everywhere else.
     """
     try:
         prior = read_record(slug, root=root)

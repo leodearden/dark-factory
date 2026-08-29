@@ -344,6 +344,11 @@ def _env_slug_ownership(
     performs here is the SAME observation ``_withhold_from_launching`` and
     ``_bind_claude_session_id`` later consult -- see that class's docstring.
     None builds a single-use memo, leaving a direct call unchanged.
+
+    The returned snapshot is the probe's own record read. On the adopt path
+    it is the event's ONLY read of the record it goes on to write: the
+    handlers take it forward through ``_HookSlugResolution.snapshot``
+    instead of reading again (task 4662).
     """
     probes = probes or _EventProbes(env)
     hook_session_id = _hook_session_id(hook_input)
@@ -582,9 +587,12 @@ def hook_session_slug(
     the record instead of forking -- see ``_env_slug_is_owned``.
 
     Thin wrapper over ``_resolve_hook_slug``, which additionally reports
-    WHETHER an inherited env slug was rejected and whether this event may
-    BIND the record it resolved to; callers that enrich or bind a record
-    need those bits, callers that only need an identity do not.
+    WHETHER an inherited env slug was rejected, whether this event may BIND
+    the record it resolved to, and the record SNAPSHOT the ownership probe
+    read; callers that enrich, bind or refresh a record need those bits,
+    callers that only need an identity do not. This wrapper discards them,
+    so calling it re-reads what the probe already read -- the handlers go
+    through ``_resolve_hook_slug`` directly for exactly that reason.
     """
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
 
@@ -788,6 +796,11 @@ def _owning_claude_pid() -> int | None:
     found within ``_MAX_CLAUDE_ANCESTOR_HOPS`` (no ``/proc`` on macOS, a
     mid-read race, a reparented hook). Callers treat None as "cannot prove
     ownership" and take the fail-safe branch.
+
+    Memoized per hook event by ``_EventProbes``, so the adopt/fork decision,
+    the launch-window withhold decision and ``_bind_claude_session_id``'s
+    ``claude_owner_pid`` stamp all read ONE walk of the tree. Call the memo,
+    not this, from anywhere inside an event that already holds one.
     """
     pid: int | None = os.getppid()
     for _ in range(_MAX_CLAUDE_ANCESTOR_HOPS):
@@ -899,6 +912,13 @@ def _owner_ppid_verdict(
     than repeated. Omitting it builds a single-use memo, which resolves
     through the module-level ``_owning_claude_pid`` exactly as before -- so a
     bare ``_owner_ppid_verdict(env)`` call is semantically unchanged.
+
+    Within one hook event this verdict is computed ONCE and reused by the
+    adopt/fork decision (``_env_slug_ownership``) and the launch-window
+    withhold decision (``_withhold_from_launching``). That is a correctness
+    property before it is an efficiency one: two decisions taken from one
+    observation of the process tree cannot disagree because the tree moved
+    in between.
     """
     raw = (env.get('CLAUDE_SPAWN_OWNER_PPID') or '').strip()
     if not raw:
@@ -1167,6 +1187,14 @@ def run_session_start(
     ``CLAUDE_SPAWN_PARENT_ID``, see ``_resolve_parent_session_id``; display
     from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
     ``write_record`` call, which bumps the record's mtime heartbeat.
+
+    The record is read exactly ONCE per event (task 4662): on the adopt path
+    the ownership probe already read it, and that snapshot travels forward
+    on ``_HookSlugResolution.snapshot`` rather than being re-read here, so
+    the ownership/remint decision and the body written derive from the same
+    observation. An UNREADABLE body is the one exception -- it is re-read so
+    the fault propagates rather than being synthesized over; see
+    ``_RecordSnapshot``.
 
     RESOLVED dual-record split for SPAWNED sessions (task 2511): this slug
     used to be keyed on the Claude Code ``session_id`` (module docstring),
