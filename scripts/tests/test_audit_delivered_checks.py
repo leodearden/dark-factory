@@ -293,6 +293,10 @@ class TestAuditProject:
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
     ):
         root = _init_repo(tmp_path / 'proj', {'src/a.py': 'class Landed:\n    pass\n'})
+        # The fixture first: it creates <root>/.taskmaster/tasks/ (and an empty
+        # file there, which make_tasks_db then opens and schemas). Reversed,
+        # make_tasks_db has no directory to write into.
+        project_root_with_tasks_db(root)
         make_tasks_db(
             [
                 # done + matches -> delivered
@@ -314,7 +318,6 @@ class TestAuditProject:
             ],
             directory=root / '.taskmaster' / 'tasks',
         )
-        project_root_with_tasks_db(root)
 
         audit = audit_project(str(root))
         by_task = {f.row.task_id: f.disposition for f in audit.findings}
@@ -335,6 +338,7 @@ class TestAuditProject:
                 'src/a.py': 'pass\n',
                 'plans/x-prd.capability-manifest.yaml': (
                     'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
                     'tasks:\n'
                     '  - label: α\n'
                     '    task_id: 999\n'
@@ -349,9 +353,9 @@ class TestAuditProject:
                 ),
             },
         )
+        project_root_with_tasks_db(root)
         make_tasks_db([{'id': 20, 'status': 'done'}],
                       directory=root / '.taskmaster' / 'tasks')
-        project_root_with_tasks_db(root)
 
         audit = audit_project(str(root))
 
