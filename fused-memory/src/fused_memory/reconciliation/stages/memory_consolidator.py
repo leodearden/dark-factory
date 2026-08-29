@@ -55,9 +55,13 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _render_live_workflow_section,
 )
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
+    PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
+    PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     sweep_stale_priority_override_edges,
 )
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+    STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     sweep_stale_status_snapshot_edges,
 )
 from fused_memory.reconciliation.summary_pool import (
@@ -806,10 +810,10 @@ class MemoryConsolidator(BaseStage):
             report.stats['stale_blocked_edges_supersede_skipped'] = (
                 snapshot_sweep_stats['supersede_skipped']
             )
-            report.stats['stale_status_snapshot_edges_enumeration_complete'] = (
+            report.stats[STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY] = (
                 snapshot_sweep_stats['enumeration_complete']
             )
-            report.stats['stale_status_snapshot_edges_enumeration_incomplete_kind'] = (
+            report.stats[STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY] = (
                 snapshot_sweep_stats['enumeration_incomplete_kind']
             )
 
@@ -849,12 +853,12 @@ class MemoryConsolidator(BaseStage):
             report.stats['stale_priority_override_edges_scanned'] = (
                 priority_override_sweep_stats['scanned']
             )
-            report.stats['stale_priority_override_edges_enumeration_complete'] = (
+            report.stats[PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY] = (
                 priority_override_sweep_stats['enumeration_complete']
             )
-            report.stats[
-                'stale_priority_override_edges_enumeration_incomplete_kind'
-            ] = priority_override_sweep_stats['enumeration_incomplete_kind']
+            report.stats[PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY] = (
+                priority_override_sweep_stats['enumeration_incomplete_kind']
+            )
 
         # ── Deterministic per-cycle summary write (task 2229 W5-λ) ────────────
         # Python writes the authoritative cycle_summary ledger row directly

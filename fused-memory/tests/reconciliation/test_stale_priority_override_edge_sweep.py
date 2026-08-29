@@ -50,6 +50,8 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_STRUCTURAL_KINDS,
 )
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
+    PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
+    PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     extract_priority_override_task_id,
     is_ttl_override_fact,
     read_live_override_state,
@@ -782,6 +784,38 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
 # sweep_stale_priority_override_edges — enumeration completeness signal
 # (task 4386)
 # --------------------------------------------------------------------------- #
+
+
+class TestEnumerationStatKeyValues:
+    """Pin the SHIPPED spelling of this sweep's exported report.stats keys.
+
+    Same argument as the status sweep's identical class: every other
+    reference now goes through the symbol, so the literal needs pinning in
+    exactly one place or a rename of the wire format passes with all the
+    wiring tests green. (amendment, reviewer_comprehensive
+    pattern-consistency finding)
+    """
+
+    def test_priority_override_enumeration_complete_stat_key_value(self):
+        assert PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY == (
+            'stale_priority_override_edges_enumeration_complete'
+        )
+
+    def test_priority_override_enumeration_incomplete_kind_stat_key_value(self):
+        assert PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY == (
+            'stale_priority_override_edges_enumeration_incomplete_kind'
+        )
+
+    def test_the_keys_are_disjoint_from_the_status_sweeps(self):
+        """The two sweeps' key sets are INDEPENDENT by design — a truncated
+        corpus for one never marks the other — so their prefixes must not
+        collide, and this sweep's keys must carry its OWN."""
+        for key in (
+            PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
+            PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
+        ):
+            assert key.startswith('stale_priority_override_edges_'), key
+            assert not key.startswith('stale_status_snapshot_edges_'), key
 
 
 class TestSweepStalePriorityOverrideEdgesEnumerationCompleteness:

@@ -48,6 +48,14 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
+    PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
+    PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
+)
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+    STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
+)
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 
@@ -3037,14 +3045,14 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
             f'got stats={report.stats!r}'
         )
         assert (
-            report.stats.get('stale_status_snapshot_edges_enumeration_complete') is True
+            report.stats.get(STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY) is True
         ), (
             'A proven-complete read must be surfaced as True — the consolidator '
             'extracts sweep stats key by key, so a key it does not name dies at '
             f'that boundary and never reaches the ledger; got stats={report.stats!r}'
         )
         assert (
-            report.stats.get('stale_status_snapshot_edges_enumeration_incomplete_kind')
+            report.stats.get(STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY)
             is None
         ), f'A complete read has no incompleteness kind; got stats={report.stats!r}'
 
@@ -3286,7 +3294,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
             f'got stats={report.stats!r}'
         )
         assert (
-            report.stats.get('stale_priority_override_edges_enumeration_complete')
+            report.stats.get(PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY)
             is True
         ), (
             'A proven-complete read must be surfaced as True; got '
@@ -3294,7 +3302,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         )
         assert (
             report.stats.get(
-                'stale_priority_override_edges_enumeration_incomplete_kind'
+                PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY
             ) is None
         ), f'A complete read has no incompleteness kind; got stats={report.stats!r}'
 
@@ -3353,7 +3361,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         )
         assert 'stale_priority_override_edges_scanned' not in report.stats
         assert (
-            'stale_priority_override_edges_enumeration_complete' not in report.stats
+            PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY not in report.stats
         ), (
             'A raised sweep sets NO stat for this cycle, and the enumeration '
             'keys are no exception: absent is honest, whereas False would claim '
@@ -3361,7 +3369,7 @@ class TestStalePriorityOverrideEdgeSweepWiring:
             f'Got stats={report.stats!r}'
         )
         assert (
-            'stale_priority_override_edges_enumeration_incomplete_kind'
+            PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY
             not in report.stats
         )
         # Proof other post-processing was untouched: the task 2613 sweep (which
@@ -3480,17 +3488,17 @@ class TestSweepEnumerationCompletenessWiring:
         report = await self._run(stage)
 
         assert (
-            report.stats.get('stale_status_snapshot_edges_enumeration_complete') is False
+            report.stats.get(STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY) is False
         ), f'The truncated read belongs to the status sweep; got stats={report.stats!r}'
         assert (
-            report.stats.get('stale_priority_override_edges_enumeration_complete') is True
+            report.stats.get(PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY) is True
         ), (
             "The priority sweep's own read was complete and must not inherit the "
             f'other sweep truncation; got stats={report.stats!r}'
         )
         assert (
             report.stats.get(
-                'stale_priority_override_edges_enumeration_incomplete_kind'
+                PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY
             ) is None
         ), f'A complete read has no kind to report; got stats={report.stats!r}'
 
@@ -3525,19 +3533,19 @@ class TestSweepEnumerationCompletenessWiring:
             )
 
         assert (
-            'stale_status_snapshot_edges_enumeration_complete' not in report.stats
+            STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY not in report.stats
         ), (
             'A raised sweep must leave its enumeration keys absent, not False; '
             f'got stats={report.stats!r}'
         )
         assert (
-            'stale_status_snapshot_edges_enumeration_incomplete_kind'
+            STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY
             not in report.stats
         )
         # Proof the rest of the cycle was untouched: the priority sweep, which
         # runs immediately after, still set its own enumeration key.
         assert (
-            'stale_priority_override_edges_enumeration_complete' in report.stats
+            PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY in report.stats
         ), (
             'The priority sweep must still have run and set its key even though '
             f'the status sweep raised; got stats={report.stats!r}'

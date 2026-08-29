@@ -326,6 +326,38 @@ async def read_live_override_state(project_root: str) -> dict[str, dict]:
 # sweep_stale_priority_override_edges — async orchestrator
 # --------------------------------------------------------------------------- #
 
+# This sweep's completeness pair as MemoryConsolidator spells it onto
+# ``report.stats``.  Same rationale, same shape and same two-layer note as the
+# pair beside the task 2613 sweep (see
+# ``stale_status_snapshot_edge_sweep.STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY``);
+# the KEY SETS are INDEPENDENT, so a truncated corpus for one sweep never
+# marks the other.  (amendment, reviewer_comprehensive pattern-consistency
+# finding, task 4386)
+
+PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY: str = (
+    'stale_priority_override_edges_enumeration_complete'
+)
+"""Key under Stage 1's ``report.stats``: this sweep's TRI-STATE read verdict.
+
+``True`` = the edge enumeration was proven whole, ``False`` = a corpus was
+observed and found incomplete, ``None`` = no corpus was observed. The only
+safe predicate is ``is True``.
+
+Conditional presence: ABSENT when the sweep itself raised — the stage
+swallows that best-effort and sets NONE of its stats. Read via
+``report.stats.get(...)``, never direct indexing.
+"""
+
+PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY: str = (
+    'stale_priority_override_edges_enumeration_incomplete_kind'
+)
+"""Key under Stage 1's ``report.stats``: WHICH WAY the corpus was partial.
+
+Carries the backend's stable ``INCOMPLETE_*`` discriminator (never
+``PagedRead.reason``), or ``None``. Conditional presence exactly as for
+:data:`PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY` above.
+"""
+
 
 async def sweep_stale_priority_override_edges(
     memory_service,

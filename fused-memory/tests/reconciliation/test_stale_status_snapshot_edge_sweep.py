@@ -51,6 +51,8 @@ from fused_memory.reconciliation import task_filter
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
     _MAX_SUPERSEDE_WRITES_PER_CYCLE,
+    STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+    STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     _last_clause_break,
     build_supersede_fact,
     extract_blocked_assertion_task_ids,
@@ -3911,6 +3913,42 @@ class TestSweepStaleStatusSnapshotEdgesBestEffort:
 # sweep_stale_status_snapshot_edges — enumeration completeness signal
 # (task 4386)
 # --------------------------------------------------------------------------- #
+
+
+class TestEnumerationStatKeyValues:
+    """Pin the SHIPPED spelling of the exported report.stats key names.
+
+    The producer (memory_consolidator) and the wiring tests now reference
+    these through the symbol, which is the point — a rename is one edit
+    instead of a grep across five files. But that also means a rename of the
+    STRING would slip past every one of those call sites with all of them
+    still green, silently renaming the wire format the ledger, the journal
+    and the judge read. So the literal is pinned in exactly one place: here.
+
+    Mirrors test_task_count_snapshot_cadence.py's
+    ``test_prune_enumeration_ok_stat_key_value`` for the sibling stat family.
+    (amendment, reviewer_comprehensive pattern-consistency finding)
+    """
+
+    def test_status_snapshot_enumeration_complete_stat_key_value(self):
+        assert STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY == (
+            'stale_status_snapshot_edges_enumeration_complete'
+        )
+
+    def test_status_snapshot_enumeration_incomplete_kind_stat_key_value(self):
+        assert STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY == (
+            'stale_status_snapshot_edges_enumeration_incomplete_kind'
+        )
+
+    def test_the_two_keys_share_the_consolidator_prefix(self):
+        """Both keys carry THIS sweep's prefix, so a reader scanning
+        report.stats can attribute them to the read that produced them —
+        and cannot confuse them with the priority sweep's independent pair."""
+        for key in (
+            STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY,
+            STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
+        ):
+            assert key.startswith('stale_status_snapshot_edges_'), key
 
 
 class TestSweepStaleStatusSnapshotEdgesEnumerationCompleteness:

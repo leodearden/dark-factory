@@ -1793,6 +1793,53 @@ def select_stale_status_snapshot_edges(
 # convention of stamping a stable, identifiable actor.
 _SWEEP_AGENT_ID = 'recon-stage-memory_consolidator'
 
+# The names this sweep's completeness pair carries once MemoryConsolidator has
+# prefixed it onto ``report.stats``.  Exported as symbols rather than left as
+# inline literals at each of producer / consumer / test, matching the
+# :data:`~fused_memory.reconciliation.task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY`
+# precedent for exactly this stat family — otherwise a rename has to be found
+# by grep across five files, which is how a stat key ends up half-renamed and
+# a consumer starts silently reading `None`.  (amendment,
+# reviewer_comprehensive pattern-consistency finding, task 4386)
+#
+# NOTE the two layers: the sweep's own returned dict uses the SHORT keys
+# ``enumeration_complete`` / ``enumeration_incomplete_kind`` (documented on
+# ``sweep_stale_status_snapshot_edges`` below), and the consolidator projects
+# them onto ``report.stats`` under this module's prefix.  These constants name
+# the ``report.stats`` layer — the one that crosses module boundaries and is
+# read by the ledger, the journal and the judge.  Spelled out as whole
+# literals rather than built by concatenating a prefix, so the shipped key
+# name stays greppable from a log line back to here.
+
+STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_complete'
+)
+"""Key under Stage 1's ``report.stats``: this sweep's TRI-STATE read verdict.
+
+``True`` = the edge enumeration was proven whole, ``False`` = a corpus was
+observed and found incomplete, ``None`` = no corpus was observed. The only
+safe predicate is ``is True``; ``is not False`` would admit the UNKNOWN case,
+letting a cycle that never looked pass as one that looked and found
+everything.
+
+Conditional presence: ABSENT when the sweep itself raised (the stage swallows
+that best-effort and sets NONE of its stats), which is honest in a way
+``False`` would not be — ``False`` claims a corpus was observed. Read via
+``report.stats.get(...)``, never direct indexing.
+"""
+
+STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY: str = (
+    'stale_status_snapshot_edges_enumeration_incomplete_kind'
+)
+"""Key under Stage 1's ``report.stats``: WHICH WAY the corpus was partial.
+
+Carries the backend's stable ``INCOMPLETE_*`` discriminator (never
+``PagedRead.reason``, whose wording the backend documents as deliberately
+unstable), or ``None`` when there is nothing to discriminate. Conditional
+presence exactly as for
+:data:`STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY` above.
+"""
+
 
 async def sweep_stale_status_snapshot_edges(
     memory_service,
