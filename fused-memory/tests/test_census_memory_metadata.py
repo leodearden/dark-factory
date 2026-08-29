@@ -2203,7 +2203,7 @@ class TestBuildReportNeverTruncatesTheJson:
 
 
 class TestBuildReportCoverage:
-    """INV-9 no-silent-fail-soft: every enumeration shortfall is named, never swallowed."""
+    """INV-10 no-silent-fail-soft: every enumeration shortfall is named, never swallowed."""
 
     def test_complete_when_every_cell_agrees_and_nothing_uncovered(self):
         cells = {'dark_factory': {OBS: _census([{}, {}]), PROC: _census([{}])}}

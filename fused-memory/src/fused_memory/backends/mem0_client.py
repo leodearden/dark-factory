@@ -47,7 +47,7 @@ class ScrollPageBudgetExhausted(RuntimeError):
 
     The stream is TRUNCATED, so the pager raises rather than ending short —
     a caller that folded a short stream into counters would under-report with
-    no error surface (INV-9 no-silent-fail-soft).
+    no error surface (INV-10 no-silent-fail-soft).
 
     ``scripts/census_memory_metadata.CensusScanIncomplete`` is a module-level
     ALIAS of this class (not a subclass): the census's ``except
@@ -59,7 +59,7 @@ class ScrollPointBudgetExhausted(RuntimeError):
     """A paged scroll consumed a caller-supplied *max_points* cap.
 
     Raised, not returned short, for the same reason as its sibling: the
-    primitive never truncates silently (INV-2 no-silent-fail-soft).  A caller
+    primitive never truncates silently (INV-10 no-silent-fail-soft).  A caller
     that wants a quiet capped read converts this into its own flag; a caller
     that does not pass ``max_points`` can never see it.
 

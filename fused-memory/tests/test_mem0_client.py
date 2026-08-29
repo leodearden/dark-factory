@@ -709,7 +709,7 @@ class TestMem0BackendScrollCollectionPages:
 
     @pytest.mark.asyncio
     async def test_raises_when_page_budget_exhausted_with_live_next_offset(self, backend):
-        """A truncated stream RAISES, never returns short (INV-9 no-silent-fail-soft).
+        """A truncated stream RAISES, never returns short (INV-10 no-silent-fail-soft).
 
         A pager with no budget loops forever if Qdrant keeps handing back a
         live next_offset, so the budget travels with the loop — and exhausting

@@ -213,7 +213,7 @@ _SHORT_HEX_RE = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 #:
 #: Raised rather than returning a short stream: a truncated census is
 #: indistinguishable from a census of a smaller corpus, and its consumer
-#: (leaf beta's grandfather list) cannot tell the difference (INV-9
+#: (leaf beta's grandfather list) cannot tell the difference (INV-10
 #: no-silent-fail-soft).
 #:
 #: An ALIAS of the backend's exception, not a subclass. The paging loop that
@@ -522,7 +522,7 @@ def build_report(
         -- a cell scrolling fewer points than ``count_by_metadata`` expected,
         or per-category counts summing short of the collection's point total
         -- sets ``coverage.complete=false`` and appears as a NAMED entry in
-        ``coverage.deltas`` (INV-9 no-silent-fail-soft). The caller exits
+        ``coverage.deltas`` (INV-10 no-silent-fail-soft). The caller exits
         non-zero on that flag.
     """
     projects: dict[str, Any] = {}

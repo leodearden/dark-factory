@@ -1929,7 +1929,7 @@ def test_every_enumeration_site_is_pinned() -> None:
 # is filed under. Task 3803 measured the failure mode on live data: the phantom
 # `no-silent-fail-soft` was minted independently in dozens of comments, and the
 # numbered ones reached for INV-2 five times and INV-4 once because neither fit.
-# Promotion to INV-9 makes those citations correct in place — but only the ones
+# Promotion to INV-10 makes those citations correct in place — but only the ones
 # that carry the RIGHT number, and nothing was watching the number.
 #
 # THE GUARD IS A NEAR-MISS DETECTOR, NOT A VOCABULARY CHECK. This repo carries
@@ -2309,7 +2309,7 @@ def test_noncanonical_citations_reports_a_phantom_slug() -> None:
 def test_noncanonical_citations_clears_the_phantom_once_it_is_promoted() -> None:
     """Promotion resolves the phantom IN PLACE — the citation never moves.
 
-    This is the whole economic case for promoting `no-silent-fail-soft` to INV-9
+    This is the whole economic case for promoting `no-silent-fail-soft` to INV-10
     rather than rewriting its citations: the same text is a defect against the
     pre-promotion vocabulary and correct against the post-promotion one.
     """
