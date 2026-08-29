@@ -2215,6 +2215,33 @@ def file_unattributed_landing_escalation(
     citation is ever assigned — so that arm carries no identity by
     construction.
 
+    **The CITATION is the identity, deliberately NOT the effect-check anchor**
+    (task 4499, amendment pass — recorded here so the next reader does not have
+    to re-derive it). The two are the same sha in CANDIDATE mode, but they
+    diverge in DISCOVERY mode: when the citation is an in-branch work commit
+    ``validate_landing_evidence`` anchors the survival check on
+    ``branch_tip_sha`` instead, and it is that ``probe['effect_check_sha']``,
+    not the citation, whose survival was actually measured. Stamping the anchor
+    would look like the more precise identity and is the WRONG choice here,
+    because the two shas have opposite stability: the citation is the newest
+    main commit whose SUBJECT cites the task and moves only when the task lands
+    again, while the branch tip moves on every commit added to the branch.
+    Keying suppression on a moving anchor would re-open the ping-pong on each
+    tip advance — the exact storm this guard exists to close — so the frozen
+    design decision is that the sha, not the probe diagnostics, is the identity.
+
+    The accepted residue: a second incarnation under the same task id that
+    re-lands from a re-created branch is measured against a different anchor,
+    yet suppressed against the earlier adjudication if it still resolves to the
+    same citation commit. That is bounded rather than open-ended —
+    ``find_task_citation_commit`` returns the MOST RECENT subject-citing commit
+    on main, so any re-landing that itself cites the task shifts the citation
+    and lifts the suppression automatically. The window is a re-landing that
+    adds no new subject-citing commit, and the trade is taken knowingly: the
+    alternative fails toward a permanent storm rather than a narrow one.
+    ``test_same_citation_under_a_different_effect_anchor_is_still_suppressed``
+    pins this as intended behaviour, not an oversight.
+
     **An identical refile is auto-dismissed** (task 4499). ``has_open_l1``
     above cannot close the close-then-refile ping-pong, and never could: it
     reads PENDING records, so it goes False by design the moment the

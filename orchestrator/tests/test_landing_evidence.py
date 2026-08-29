@@ -606,6 +606,11 @@ class TestValidateLandingEvidenceEffectDivergenceProbe:
         assert 'describe_commit_effect_in_main' in verdict.probe['effect_probe_error']
 
 
+#: "argument not supplied", distinct from an explicitly-passed ``None`` — for
+#: helpers whose default must not collide with a MEANINGFUL None (task 4499).
+_UNSET: object = object()
+
+
 def _verdict(reason: str, **probe_extra) -> LandingEvidenceVerdict:
     """A rejected LandingEvidenceVerdict with a realistic probe (task 3116)."""
     probe = {
@@ -2077,11 +2082,26 @@ class TestResolvedCitationSuppressesIdenticalRefile:
 
         return EscalationQueue(tmp_path / 'queue')
 
-    def _file(self, queue, sha: str | None, *, task_id: str | None = None, reason: str = 'effect_absent'):
+    def _file(
+        self,
+        queue,
+        sha: str | None,
+        *,
+        task_id: str | None = None,
+        reason: str = 'effect_absent',
+        effect_check_sha: str | None = _UNSET,
+    ):
+        """File one L1 for *sha*.
+
+        *effect_check_sha* defaults to the ``_UNSET`` sentinel — not to
+        ``None`` — so it mirrors the citation unless a caller states otherwise,
+        while still letting a caller pass an explicit ``None``.
+        """
         task = self.TASK if task_id is None else task_id
+        anchor = sha if effect_check_sha is _UNSET else effect_check_sha
         file_unattributed_landing_escalation(
             queue, task, f'task/{task}',
-            _verdict(reason, citation=sha, effect_check_sha=sha),
+            _verdict(reason, citation=sha, effect_check_sha=anchor),
             agent_role='harness-reconcile',
         )
 
@@ -2182,6 +2202,40 @@ class TestResolvedCitationSuppressesIdenticalRefile:
 
         assert len(self._pending(queue)) == 1, (
             'a no_citation reject was suppressed against a citation-less resolution'
+        )
+
+    def test_same_citation_under_a_different_effect_anchor_is_still_suppressed(
+        self, tmp_path,
+    ) -> None:
+        """(3b) THE ACCEPTED TRADE-OFF — the citation is the identity, not the anchor.
+
+        In DISCOVERY mode the survival check does not always run against the
+        citation: for an in-branch work commit ``validate_landing_evidence``
+        anchors on ``branch_tip_sha``, so ``probe['effect_check_sha']`` is the
+        sha actually measured.  A refile carrying the SAME citation under a
+        DIFFERENT anchor is therefore a genuinely different measurement, and it
+        is suppressed anyway.  That is intended, not an oversight: the citation
+        moves only when the task lands again, while the branch tip moves on
+        every commit added to the branch, so keying on the anchor would re-open
+        the ping-pong at each tip advance — the storm this guard exists to
+        close.  Pinned so the trade-off is a decision on the record rather than
+        something a future reader silently "fixes"; the reasoning, and the
+        bound on the residue, live in ``file_unattributed_landing_escalation``'s
+        docstring.
+        """
+        queue, first_id = self._arrange_resolved(tmp_path)
+
+        # Same citation, but the branch tip advanced between ticks.
+        self._file(queue, self.SHA_A, effect_check_sha='d' * 40)
+
+        assert self._pending(queue) == [], (
+            'suppression became anchor-sensitive: a same-citation refile under a '
+            'moved branch tip filed again, which re-opens the ping-pong on every '
+            f'tip advance — pending = {[e.id for e in self._pending(queue)]}'
+        )
+        absorbed = queue.get(first_id)
+        assert absorbed is not None and absorbed.refiles_suppressed == 1, (
+            'the suppression must still be counted on the record that absorbed it'
         )
 
     def test_another_tasks_resolution_never_suppresses(self, tmp_path) -> None:
