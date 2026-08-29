@@ -13,8 +13,6 @@ import re
 
 import pytest
 
-_INDEX_URL = '/static/redux/index.html'
-
 # Matches well-formed SRI hashes: sha256/384/512 followed by a base64 payload.
 _SRI_HASH_RE = re.compile(r'^sha(256|384|512)-[A-Za-z0-9+/=]{20,}$')
 
@@ -52,22 +50,12 @@ def _find_script_position(
     return None
 
 
-@pytest.fixture(scope='module')
-def index_html_body():
-    """Fetch /static/redux/index.html once for the whole test module."""
-    from starlette.testclient import TestClient
-
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        return c.get(_INDEX_URL).text
-
-
 def test_static_index_html_serves_200(client):
     """GET /static/redux/index.html via the StaticFiles mount returns 200."""
-    resp = client.get(_INDEX_URL)
+    resp = client.get('/static/redux/index.html')
     assert resp.status_code == 200, (
-        f'expected 200 for {_INDEX_URL}, got {resp.status_code}'
+        f'expected 200 for /static/redux/index.html, '
+        f'got {resp.status_code}'
     )
 
 
