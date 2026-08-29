@@ -1968,6 +1968,38 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         return _add_reuse_item(artifacts, what, where, how)
 
     @mcp.tool()
+    def drop_plan_file(
+        path: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Drop a declared file from the plan, recording WHY it needed no edit.
+
+        Use this when a file you declared was CORRECTLY declared and
+        CORRECTLY needed no change — the branch delivered the work, and this
+        entry simply turned out not to require an edit. The entry leaves the
+        ``files`` list so the pre-merge gate's re-check can pass, while
+        ``reason`` preserves why it was in scope and why no edit was needed,
+        so nothing about the plan's provenance is falsified.
+
+        Call it once per such entry. Dropping NARROWS what the pre-merge
+        verify covers (the MergeRequest ``task_files`` scope), which is why
+        the reason is mandatory rather than optional.
+
+        Args:
+            path: A path currently in the plan's files list.
+            reason: One line: why the file was in scope, and why the branch
+                legitimately needed no edit to it.
+        """
+        # Both parameters are flat ``str`` DELIBERATELY, not a map or a list
+        # of drops. MarkupGuardMiddleware._first_markup_argument skips
+        # non-string values (shared/src/shared/mcp_markup_middleware.py::
+        # _first_markup_argument), so ONLY flat string params get inbound
+        # envelope-markup protection — and ``reason`` is agent-authored free
+        # prose, exactly the leak class that guard exists for. A later
+        # refactor to a batch/map signature would silently drop the guard.
+        return _drop_plan_file(artifacts, path, reason)
+
+    @mcp.tool()
     def mark_step_done(
         step_id: str,
         commit_sha: str,
