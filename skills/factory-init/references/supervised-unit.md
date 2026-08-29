@@ -65,7 +65,7 @@ journalctl --user -u orchestrator-<NAME>.service --since '1 min ago'   # confirm
 The live unit alone is lost if `setup-host.sh` re-provisions the host. Persist it:
 
 1. Copy the unit into the repo: `<DF>/scripts/orchestrator-<NAME>.service` (concrete, verbatim).
-2. In `<DF>/scripts/setup-host.sh`, add a `cp "$REPO_ROOT/scripts/orchestrator-<NAME>.service" "$UNIT_DIR/"` next to the other orchestrator `cp` lines, and a `systemctl --user enable orchestrator-<NAME>.service` next to the other `enable` lines.
+2. In `<DF>/scripts/setup-host.sh` section 5 ("Orchestrator systemd units + watchdog"), add `orchestrator-<NAME>.service` to the `_orch_units` array. No separate enable-line edit is needed: the enable loop derives the obligation at run time from `grep -q '^\[Install\]'` on the committed template.
 3. Commit both to dark-factory.
 
 ## Layer 3 — watchdog port-probe (optional)
