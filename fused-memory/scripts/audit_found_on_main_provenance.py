@@ -14,7 +14,17 @@ two retrospective blind spots this script sweeps for:
       being reopened.
   (b) misattribution — the cited commit is real and on the ref, but its
       message cites a *different* task, so it was never actually this
-      task's deliverable.
+      task's deliverable. For a MERGE commit, the subject alone is not
+      sufficient evidence of this: this repo's merge worker routinely
+      coalesces several tasks' branches under one ``Merge task/<N> into
+      main`` subject naming only one of them, so the classifier also
+      scans the commit messages the merge brought in under its second
+      parent (see :func:`_second_parent_self_citation`) and only declares
+      misattribution when the audited task cites itself NOWHERE in that
+      lineage. Measured at task 4706's filing (main HEAD 72286f53b9): 359
+      of 505 (71%) task-subject merges on main's first-parent chain since
+      2026-07-25 carry commits citing other task ids under their second
+      parent.
 
 For every found_on_main task this script:
   1. Parses ``metadata.done_provenance`` (commit/note) and ``metadata.files``
@@ -279,6 +289,48 @@ def extract_cited_task_ids(message: str) -> set[str]:
     return ids
 
 
+# WHY THIS IS SAFE: the second-parent walk tightens on CONTENT LINEAGE (did
+# this task's own commits ride in under the cited merge?), not on FILE
+# OVERLAP. Both of the PRD's proven fabrications stay flagged after this
+# walk is added: task 2394 / commit b045a72de2 has 12 commits under its
+# cited merge's second parent with 0 citing 2394; task 2531 / commit
+# b929f4441d has 16 commits under ^2 with 0 citing 2531 (re-measured in
+# this worktree at task 4706's filing). Demoting `misattributed` below
+# `deliverable_absent` in the precedence ladder was considered and
+# REJECTED for this reason: the `deliverable_absent` arm below uses
+# `any()`, not `all()`, over declared files, and would have let both
+# fabrications through. This walk leaves the ladder's precedence
+# unchanged.
+#
+# THE MEASURED LIMIT: the walk clears only what extract_cited_task_ids
+# above already accepts as a citation, so of the four found_on_main
+# records task 4706's filing named, it clears exactly ONE — task 3103,
+# commit c7dcc4f9d4, via 20 commits under its cited merge's second parent
+# carrying the `task/3103` slash form. Tasks 2724, 2949 and 3610 are NOT
+# cleared: their cited merges' second parents mention the audited id only
+# as `(task 2724 step-8)` (the `\(task (\d+)\)` alternative in
+# CITATION_PATTERN above needs the closing paren immediately after the
+# digits, so the trailing ` step-8` blocks the match), or as body prose
+# (`Addresses the review pass on task 2949.`, `pre-3610`). Re-measuring
+# with the pre-task-4705 bare-paren pattern restored gives identical
+# counts, so sibling task 4705's citation-pattern narrowing is not the
+# cause and reverting it would not help. Filed as escalation esc-4706-1.
+# Widening CITATION_PATTERN to accept prose is NOT the fix for this limit
+# — it would widen the SUBJECT scan too and reintroduce exactly the
+# misattribution false positives task 4705 removed.
+#
+# WHY NOT task 4647's patch-id primitive:
+# orchestrator/src/orchestrator/landing_evidence.py's patch-id attribution
+# is the stronger tool for this and would clear the SHA-lineage cases
+# prose matching cannot, but a fused-memory -> orchestrator runtime import
+# is architecturally backwards and pulls in the whole GitOps stack — the
+# same reasoning this module's header already records above
+# CITATION_PATTERN for not importing
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN (task 2645
+# design decisions). Not hand-rolled a second time, not imported;
+# recorded here so the next reader sees the choice was made deliberately,
+# not overlooked — patch-id lineage is precisely what WOULD clear the
+# three records message-matching cannot.
 def _second_parent_self_citation(audit: TaskProvenanceAudit) -> str | None:
     """Return the sha of the first commit the cited merge brought in whose
     message cites ``audit.task_id``, or None.
