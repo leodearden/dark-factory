@@ -50,7 +50,7 @@ import pytest
 import startup_completion_fixtures as scf
 import startup_completion_probe as probe
 
-from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX
+from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX, reset_sweep_once_state
 
 #: A long base64url run: 70 chars, no ``/`` neighbours, so it trips
 #: ``GENERIC_CREDENTIAL_PATTERNS`` exactly as a raw pasted token would.
@@ -118,8 +118,10 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
     anything it did not create.  ``sweep_calls`` layers its recording stub on top
     for the tests that assert on call counts.
 
-    The ``_probe_dir_sweep_done`` reset keeps the once-per-process flag from
-    making a test's behaviour depend on which test ran first.
+    The ``reset_sweep_once_state`` calls keep the once-per-process mark from
+    making a test's behaviour depend on which test ran first.  Cleared on the way
+    out as well as in, because the mark lives in ``shared.config_dir`` and would
+    otherwise leak past this module entirely.
     """
     real_sweep = probe.sweep_stale_pid_dirs
 
@@ -131,7 +133,9 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
         return real_sweep(prefix, **kwargs)
 
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _confined_sweep, raising=False)
-    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
+    reset_sweep_once_state()
+    yield
+    reset_sweep_once_state()
 
 
 def _encoded_is_clean(value: Any) -> bool:
@@ -1328,8 +1332,8 @@ class TestConfigDirLifetime:
         for planted in (kept, stale):
             os.utime(planted, (0, 0))
 
-        # run_live_probe already consumed the once-per-process flag above.
-        monkeypatch.setattr(probe, '_probe_dir_sweep_done', False)
+        # run_live_probe already consumed the once-per-process mark above.
+        reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
         assert probe._sweep_stale_probe_dirs_once() == 1, (
             'the control dir was not reclaimed — this sweep did nothing, so it '
             'says nothing about the kept dir'
@@ -1343,9 +1347,9 @@ class TestConfigDirLifetime:
 
 @pytest.fixture
 def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
-    """Record ``sweep_stale_pid_dirs`` calls and reset the once-per-process flag.
+    """Record ``sweep_stale_pid_dirs`` calls and reset the once-per-process mark.
 
-    The reset matters: without it the flag's value would depend on whether an
+    The reset matters: without it the mark's presence would depend on whether an
     earlier test in this process already consumed it, and these tests would pass
     or fail by ordering rather than by behaviour.
     """
@@ -1355,8 +1359,8 @@ def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
         calls.append(prefix)
         return 0
 
-    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep, raising=False)
+    reset_sweep_once_state()
     return calls
 
 
@@ -1510,8 +1514,12 @@ class TestStaleProbeDirSweep:
         with pytest.raises(RuntimeError, match='injected: _build_argv'):
             _run_probe(tmp_path)
         assert sweep_calls == [probe._PROBE_DIR_PREFIX]
-        assert probe._probe_dir_sweep_done is True, (
-            'the flag must be set BEFORE the call, or a raising sweep re-runs on '
+        # The mark is set BEFORE the call, so a sweep that raises every time
+        # still cannot re-run.  Asserted BEHAVIOURALLY now that the flag it used
+        # to read is gone: calling again must not reach the sweep.
+        probe._sweep_stale_probe_dirs_once()
+        assert sweep_calls == [probe._PROBE_DIR_PREFIX], (
+            'the mark must be set BEFORE the call, or a raising sweep re-runs on '
             'every subsequent probe'
         )
 

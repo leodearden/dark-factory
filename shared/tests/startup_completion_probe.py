@@ -102,6 +102,7 @@ from shared.config_dir import (  # noqa: E402
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
     sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
@@ -1012,12 +1013,6 @@ _PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
 #: request, and the name says so out loud on an operator's `ls /tmp`.
 _PROBE_KEEP_SUFFIX = '-keep'
 
-#: Set once the stale-probe-dir sweep has run in this process.  The sweep
-#: reclaims OTHER (dead) processes' leftovers, so it is a process-wide one-shot:
-#: re-running it per probe re-scans /tmp for no benefit.
-_probe_dir_sweep_done: bool = False
-
-
 def _sweep_stale_probe_dirs_once() -> int:
     """Reclaim dead-PID probe config dirs left by earlier processes.
 
@@ -1032,39 +1027,39 @@ def _sweep_stale_probe_dirs_once() -> int:
     on-disk population, which is why ``usage_gate`` pairs the same two
     mechanisms for its own probe dirs.
 
-    Never raises, for ANY exception class: tmp hygiene must not be able to fail
-    a capture that costs real money to retake.  The probe has no logger and
-    prints its warnings to stderr (see :func:`_gate`), so this does too.
+    The once-per-process bookkeeping, the set-before-call ordering and the
+    never-raise contract all live in
+    :func:`shared.config_dir.sweep_stale_pid_dirs_once`, whose docstring carries
+    the rationale for each; this wrapper supplies only what is genuinely local —
+    the prefix and the probe's reporting voice.  Never raises, for ANY exception
+    class: tmp hygiene must not be able to fail a capture that costs real money
+    to retake.  The probe has no logger and prints its warnings to stderr (see
+    :func:`_gate`), so this does too.
     """
-    global _probe_dir_sweep_done
-    if _probe_dir_sweep_done:
-        return 0
-    # Set BEFORE the call, not after, so a raising sweep still cannot re-run on
-    # every subsequent probe.
-    _probe_dir_sweep_done = True
-    try:
-        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
-        if reclaimed:
-            # Silent on the zero case so the steady state stays quiet; loud when
-            # there is something to say, so an operator can see the /tmp
-            # population draining rather than rebuilding.
-            print(
-                f'startup_completion_probe: reclaimed {reclaimed} stale probe config '
-                f'dir(s) under {_PROBE_DIR_PREFIX} (dead-PID sweep).',
-                file=sys.stderr,
-            )
-        return reclaimed
-    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
-        # sweep_stale_pid_dirs already contains OSError internally, so anything
-        # reaching here is UNFORESEEN.  Letting it escape would abort a probe run
-        # over a stale /tmp dir, which is strictly worse than leaving one behind.
-        print(
+    return sweep_stale_pid_dirs_once(
+        _PROBE_DIR_PREFIX,
+        # Passed EXPLICITLY, resolved from this module's globals at call time,
+        # and deliberately not defaulted inside the helper: this name is what
+        # test_startup_completion_probe.py's autouse _confine_stale_dir_sweep
+        # re-binds, and it is the only thing keeping that suite off the real
+        # /tmp (pinned by
+        # test_the_module_level_sweep_name_is_still_the_interception_point).
+        sweep=sweep_stale_pid_dirs,
+        # Silent on the zero case so the steady state stays quiet; loud when
+        # there is something to say, so an operator can see the /tmp population
+        # draining rather than rebuilding.
+        on_reclaimed=lambda reclaimed: print(
+            f'startup_completion_probe: reclaimed {reclaimed} stale probe config '
+            f'dir(s) under {_PROBE_DIR_PREFIX} (dead-PID sweep).',
+            file=sys.stderr,
+        ),
+        on_failure=lambda exc: print(
             f'startup_completion_probe: WARNING — stale probe-dir sweep of '
             f'{_PROBE_DIR_PREFIX} failed ({exc!r}); continuing without it (the next '
             f'process start retries).',
             file=sys.stderr,
-        )
-        return 0
+        ),
+    )
 
 
 def _drain_exit(

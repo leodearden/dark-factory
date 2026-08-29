@@ -96,7 +96,7 @@ def _keep_gates_off_the_real_tmp(request):
     developer's actual /tmp and delete real dead-PID probe dirs — a
     multi-second stall inside a unit test, and a mutation no test asked for.
     Defaulting it off also removes the ordering coupling that the process-wide
-    ``_probe_dir_sweep_done`` guard would otherwise create between test
+    one-shot mark in ``shared.config_dir`` would otherwise create between test
     classes. Tests that want the real thing request ``real_probe_dir_sweep``.
     """
     if 'real_probe_dir_sweep' in request.fixturenames:
