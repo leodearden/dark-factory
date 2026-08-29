@@ -1128,6 +1128,50 @@ class TestProposedResolutionPromotionGate:
         )
 
 
+# ── task-4903: shared helpers for the dependent-unblock sweep ──────────────
+
+
+def _dep_tasks(*dependents: dict) -> dict:
+    """Build a ``get_tasks`` payload: the just-done task '1' plus *dependents*.
+
+    Matches the convention already pinned by
+    ``test_on_task_done_checks_dependents`` (:288-292) and
+    ``test_on_task_done_search_failure_does_not_abort_later_capture_steps``
+    (:2990-2995): the just-done task is always present as the first row,
+    reflecting that the interceptor persists the status write BEFORE
+    scheduling the fire-and-forget ``reconcile_task`` (see
+    ``_fetch_done_provenance``'s docstring in targeted.py) -- so the sweep's
+    own re-read of the live task list always observes its own transition.
+    """
+    return {'tasks': [{'id': '1', 'status': 'done', 'dependencies': []}, *dependents]}
+
+
+@pytest.fixture
+def wired_reconciler(reconciler):
+    """The ``reconciler`` fixture with a mocked ``TaskInterceptor`` attached.
+
+    ``set_task_status`` returns a realistic happy-path ``SetTaskStatusResult``
+    -- note the deliberate absence of a ``success`` key (task_interceptor.py
+    :1453-1455); ``interceptor_write_succeeded`` defaults a missing
+    ``success`` to True. ``update_task`` returns a plain success dict.
+    Mirrors the inline idiom at
+    ``test_blocked_routes_update_through_task_interceptor_when_wired``
+    below (:1150-1152).
+
+    Does NOT touch the ``reconciler`` fixture itself, which deliberately
+    leaves ``task_interceptor = None`` -- the unwired-safety case depends
+    on that default.
+    """
+    interceptor = AsyncMock()
+    interceptor.set_task_status = AsyncMock(return_value={
+        'message': 'status updated',
+        'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
+    })
+    interceptor.update_task = AsyncMock(return_value={'success': True})
+    reconciler.task_interceptor = interceptor
+    return reconciler
+
+
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
 
 
