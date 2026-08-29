@@ -562,7 +562,14 @@ class TestLaneLockRefusalEndToEnd:
         )
         msg = refusals[0]
         assert 'lane-lock contention' in msg, msg
-        assert 'NOT disk pressure' in msg, msg
+        assert 'rc=77' in msg, msg
+        # The structural point, not an editorial phrase: an operator triaging
+        # the esc-5556-1 shape greps the journal for 'disk pressure', so this
+        # line must not come back from that sweep AT ALL — not even carrying
+        # the phrase in order to negate it.
+        assert 'disk pressure' not in msg.lower(), (
+            f'the contention WARNING still matches a disk-pressure grep: {msg!r}'
+        )
         lane_lock = f'{git_ops.worktree_base / "_lane-0"}.lock'
         assert lane_lock in msg, (
             f'the contended lock path must be named so an operator can find '

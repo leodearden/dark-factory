@@ -5274,10 +5274,19 @@ class GitOps:
                 # "script exited 75" and the discriminant rendered it as
                 # warm_lane_disk_pressure, which is what operators had to work
                 # from throughout reify esc-5556-1.
+                #
+                # Deliberately states only the POSITIVE facts — rc, condition,
+                # contended path — and never the words "disk pressure", not
+                # even to negate them (amendment, reviewer_comprehensive
+                # robustness).  Operators triaging the esc-5556-1 shape grep
+                # for that phrase; a line carrying it case-insensitively would
+                # come back from that sweep as a hit even though it is the
+                # NOT-disk-pressure case, re-muddying the exact signal this
+                # task exists to make clean.
                 logger.warning(
                     '_seed_warm_lane: seed refused for %s — lane lock %s is '
                     'held by another live consumer (rc=77, lane-lock '
-                    'contention, NOT disk pressure); requeue (stderr=%r)',
+                    'contention); requeue (stderr=%r)',
                     lane_dir, lane_lock_path(lane_dir), err,
                 )
             elif rc != 0:
