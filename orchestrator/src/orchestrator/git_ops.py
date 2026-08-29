@@ -491,6 +491,15 @@ _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 # :meth:`GitOps._seed_warm_lane` for why this is load-bearing (reify 5556).
 _SEED_ASSUME_LANE_LOCK_HELD_FLAG = '--assume-lane-lock-held'
 
+# The reify seed-warm-lane.sh opt-in flag (reify task 5568) under which BOTH of
+# the script's lane-lock refusal arms — the ``flock -n`` immediate refusal and
+# the ``flock -w`` queue timeout — exit 77 with a ``LANE_LOCK_CONTENDED:``
+# stderr marker instead of the shared 75.  Without it a lock refusal is
+# indistinguishable from disk pressure at :func:`_seed_rc_to_unavailable`; see
+# :meth:`GitOps._seed_warm_lane` for why it is passed UNGATED by
+# ``take_lane_lock`` (task 4211).
+_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG = '--distinct-lock-refusal-rc'
+
 
 # ── warm-lane script resolution (task 3072, PRD leaf α) ───────────────────────
 #
@@ -564,6 +573,38 @@ def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
     except OSError:
         logger.debug(
             '_seed_script_supports_assume_lane_lock_held: unreadable %s — '
+            'assuming unsupported', script, exc_info=True,
+        )
+        return False
+
+
+@functools.lru_cache(maxsize=256)
+def _seed_script_supports_distinct_lock_refusal_rc(script: Path) -> bool:
+    """Does this lane's ``seed-warm-lane.sh`` accept ``--distinct-lock-refusal-rc``?
+
+    Same per-lane-vintage problem as
+    :func:`_seed_script_supports_assume_lane_lock_held`, and solved the same
+    way: the seed script is read from the LANE's own checkout, so a lane
+    sitting on a pre-reify-5568 base predates the flag and would reject it as a
+    usage error (exit 2), converting a working seed into a hard fault.  The
+    flag string appears in the arg parser of every version that supports it and
+    in none that don't, so a text probe is the cheapest reliable check.
+
+    Fails CLOSED (``False``) on any read error.  A false negative simply omits
+    the flag, so a lane-lock refusal exits 75 and surfaces as
+    :attr:`WarmLaneUnavailable.DISK_PRESSURE` — byte-identical to the behaviour
+    before task 4211, i.e. never worse than not having this fix at all.
+
+    Cached per resolved path — lane scripts change only on reseed, and a wrong
+    cached answer degrades to that same safe fallback.
+    """
+    try:
+        return _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG in script.read_text(
+            encoding='utf-8', errors='replace',
+        )
+    except OSError:
+        logger.debug(
+            '_seed_script_supports_distinct_lock_refusal_rc: unreadable %s — '
             'assuming unsupported', script, exc_info=True,
         )
         return False
@@ -5054,6 +5095,16 @@ class GitOps:
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
             75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
+                  On a pre-reify-5568 lane script this ALSO covers a lane-lock
+                  refusal, which is indistinguishable from disk pressure there
+                  — see 77.
+            77  — script exited 77: a lane-lock REFUSAL (task 4211), i.e.
+                  another live consumer holds <lane_dir>.lock.  Emitted by both
+                  of the script's refusal arms (flock -n immediate refusal,
+                  flock -w queue timeout) but ONLY when
+                  _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG was passed, which
+                  _seed_script_supports_distinct_lock_refusal_rc decides per
+                  lane and fails CLOSED.
             124 — outer <lane_dir>.lock wait timed out after
                   _SEED_WARM_LANE_LOCK_WAIT_SECS — a live-but-wedged lock
                   holder; the script itself never ran (task 2599 amendment).
@@ -5062,9 +5113,12 @@ class GitOps:
             127 — any unexpected exception (non-zero sentinel, never raises).
 
         Callers must use ``rc == 0`` for success and may inspect the exact
-        code to discriminate disk-pressure (75) or a lock-wait timeout (124,
-        see ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) from a generic fault (any
-        other non-zero).
+        code to discriminate disk-pressure (75), a lane-lock refusal by the
+        script (77), or a lock-wait timeout on OUR outer lock (124, see
+        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) from a generic fault (any other
+        non-zero).  Note 77 and 124 are both contention but at different
+        locks: 77 is the SCRIPT refusing on ``<lane_dir>.lock``, 124 is THIS
+        method timing out waiting for that same lock.
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
@@ -5112,6 +5166,27 @@ class GitOps:
             seed_flags: list[str] = []
             if take_lane_lock and _seed_script_supports_assume_lane_lock_held(script):
                 seed_flags.append(_SEED_ASSUME_LANE_LOCK_HELD_FLAG)
+            # task 4211: opt in to reify 5568's distinct lane-lock refusal code
+            # so a refusal arrives as 77 (LANE_LOCK_CONTENDED) instead of 75,
+            # which _seed_rc_to_unavailable cannot tell from genuine disk
+            # pressure.  Capability-probed for the same per-lane-vintage reason
+            # as the flag above, and fails CLOSED to today's rc-75 behaviour.
+            #
+            # Deliberately NOT gated on take_lane_lock, unlike the flag above.
+            # That one only matters when WE hold the outer lock; this one is
+            # about what the SCRIPT reports when IT locks, and the refusal arms
+            # are reachable precisely in the take_lane_lock=False shape (the
+            # ephemeral_worktree CM caller, which holds <lane_dir>.lock for the
+            # CM lifetime and so tells seed to lock for itself) as well as in
+            # the take_lane_lock=True + pre-5354-script shape that was the
+            # original reify-5556 self-refusal.  Gating it would make it inert
+            # in exactly the cases it exists for.  Passing it unconditionally is
+            # safe because reify documents the flag as accepted-but-inert
+            # wherever no refusal is reachable (--assume-lane-lock-held,
+            # --record-base, unlimited WAIT) — never a usage error on a
+            # post-5568 script.
+            if _seed_script_supports_distinct_lock_refusal_rc(script):
+                seed_flags.append(_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
