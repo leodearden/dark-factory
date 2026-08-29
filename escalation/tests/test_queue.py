@@ -4332,6 +4332,150 @@ class TestResolveCascade:
         assert result.resolution == 'Fixed; no members'
 
 
+class TestResolveWarnsOnDeclaredPin:
+    """resolve() WARNS when it closes a record carrying a declared pin (task 4377).
+
+    This is the NAMED RESIDUAL for the ~20 orchestrator-internal
+    ``queue.resolve()`` callers the server-side gate deliberately does not cover
+    (harness self-clearing sentinels, workflow.py / steward.py L0 teardown,
+    dismiss_all_pending).  An audit line, NOT a veto: refusal lives at the
+    ``escalation/server.py::resolve_issue`` chokepoint, because resolve()
+    archives an L2 head BEFORE cascading and most in-repo callers wrap it in a
+    best-effort try/except.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _declared_pending(
+        self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        queue.declare_pin(esc_id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    @staticmethod
+    def _pin_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'DECLARED PIN' in r.getMessage()
+        ]
+
+    # --- (a) the warning names the id, every declarer, and the reason ---
+
+    @pytest.mark.parametrize('dismiss', [False, True])
+    def test_warns_naming_id_declarers_and_reason(self, tmp_path: Path, caplog, dismiss: bool):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        warnings = self._pin_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one declared-pin warning, got {warnings}'
+        assert 'esc-pin-1' in warnings[0]
+        assert self.DECLARER in warnings[0]
+        assert self.REASON in warnings[0]
+
+    def test_warning_names_every_declarer(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+        queue.declare_pin('esc-pin-1', declared_by=['esc-3914-1'])
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it')
+
+        (warning,) = self._pin_warnings(caplog)
+        assert self.DECLARER in warning
+        assert 'esc-3914-1' in warning
+
+    # --- (b) it still CLOSES — an audit line, not a veto ---
+
+    @pytest.mark.parametrize(
+        ('dismiss', 'expected_status'), [(False, 'resolved'), (True, 'dismissed')],
+    )
+    def test_record_is_still_closed_and_archived(
+        self, tmp_path: Path, dismiss: bool, expected_status: str,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        result = queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        assert result is not None
+        assert result.status == expected_status
+        assert not (queue.queue_dir / 'esc-pin-1.json').exists(), 'expected it to be archived'
+
+    def test_declaration_survives_into_the_archive(self, tmp_path: Path):
+        """The archived JSON still carries pin_declared_by — the audit trail persists."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        queue.resolve('esc-pin-1', 'closing it')
+
+        (archived,) = list((queue.queue_dir / 'archive').rglob('esc-pin-1.json'))
+        payload = json.loads(archived.read_text())
+        assert payload['pin_declared_by'] == [self.DECLARER]
+        assert payload['pin_declared_reason'] == self.REASON
+
+    # --- (c) cascade members are covered by the same line, via self-recursion ---
+
+    def test_cascade_member_pin_is_warned_about(self, tmp_path: Path, caplog):
+        """The path that actually spent the specimen: a marked MEMBER of an L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-member-pin', level=1)
+        l2 = Escalation(
+            id='esc-l2-head',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster head, itself unmarked',
+            level=2,
+            members=['esc-member-pin'],
+        )
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-l2-head', 'bulk close', dismiss=True)
+
+        (warning,) = self._pin_warnings(caplog)
+        assert 'esc-member-pin' in warning, (
+            'the cascade must warn about the MEMBER that carried the marker'
+        )
+        assert self.DECLARER in warning
+
+    # --- (d) ordinary closes stay silent ---
+
+    def test_unmarked_record_emits_no_declared_pin_warning(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id='esc-plain-1',
+            task_id='task-1',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='an ordinary record',
+            level=1,
+        )
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-plain-1', 'closing it')
+
+        assert self._pin_warnings(caplog) == []
+
+
 class TestResolveResolutionClassExplicit:
     """EscalationQueue.resolve() accepts an explicit resolution_class, validated before any write."""
 
