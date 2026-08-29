@@ -1297,9 +1297,9 @@ class TestMembersImportingScriptsResolveScriptsOnTheirPyrightPath:
     root-scoped verify gate (whose config lists ``scripts``) still reports
     them. That asymmetry IS esc-3805-1/esc-3805-6.
 
-    Presence-tolerant and MEMBERSHIP-only (never list equality — the rule
-    stated at tests/scripts/test_scripts_module_config.py:811), so an unrelated
-    extraPaths addition does not false-red this guard.
+    Presence-tolerant and MEMBERSHIP-only (never list equality — the rule stated at
+    tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports),
+    so an unrelated extraPaths addition does not false-red this guard.
     """
 
     def test_members_importing_scripts_modules_resolve_scripts(self) -> None:
