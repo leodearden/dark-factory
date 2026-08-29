@@ -207,6 +207,40 @@ class TestBuildPlanTighteningPrompt:
         prompt = await self._build(briefing)
         assert 'needed no change' in prompt
 
+    async def test_option_a_no_longer_invites_keeping_flagged_entries(
+        self, briefing: BriefingAssembler,
+    ):
+        """Option (a) used to read "You may keep some flagged entries if you
+        judge them genuinely needed" — an invitation whose consequence is
+        DETERMINISTIC: the gate re-checks and the kept entry re-fires it.
+        Pin the replacement statement of that consequence, positively, rather
+        than asserting the removed sentence is absent."""
+        prompt = await self._build(briefing)
+        assert 'will re-fire' in prompt
+        # The contract the removed sentence carried is load-bearing and must
+        # survive the rewrite as its own statement.
+        assert "the gate's re-check is the source of truth" in prompt
+
+    async def test_option_b_is_scoped_to_genuinely_incomplete_work_and_names_the_alternative(
+        self, briefing: BriefingAssembler,
+    ):
+        """``confirm_plan()`` must stop reading as the only non-falsifying exit
+        for a DELIVERED branch: it stays scoped to genuinely incomplete work,
+        and points at ``drop_plan_file`` for the case that is not that."""
+        prompt = await self._build(briefing)
+        assert 'genuinely incomplete' in prompt
+        confirm_para = prompt.split('b. **')[1].split('c. **')[0]
+        assert 'genuinely incomplete' in confirm_para
+        assert 'drop_plan_file' in confirm_para
+
+    async def test_warns_against_narrowing_to_empty(
+        self, briefing: BriefingAssembler,
+    ):
+        """An empty files list is not a narrowed plan, it is an unchecked one:
+        the gate has nothing left to re-check."""
+        prompt = await self._build(briefing)
+        assert 'never be narrowed to an empty' in prompt
+
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
         prompt = await self._build(
             briefing,
