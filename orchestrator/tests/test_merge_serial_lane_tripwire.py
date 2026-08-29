@@ -11,7 +11,7 @@ cheap DETECTION net for a future request-identity leak of the task/5326 class
 Each test class imports the symbols under test LOCALLY inside its test methods
 (not at module scope) so a not-yet-implemented name never breaks collection of
 the rest of this file during earlier RED steps — mirrors the convention
-documented in test_merge_skew_tripwire.py:11-14.
+documented in test_merge_skew_tripwire.py:10-13.
 """
 
 from __future__ import annotations
@@ -186,7 +186,8 @@ class TestCheckSerialLaneTripwire:
     def test_multi_host_k2_one_local_verify_is_not_breached(self) -> None:
         """K=2 across 2 hosts → per-host bound 1; one local verify is legal.
 
-        Mirrors the harness's ``num_hosts=_k`` wiring (harness.py:10258-10260),
+        Mirrors the harness's ``num_hosts=_k`` wiring
+        (orchestrator/src/orchestrator/harness.py::Harness._start_merge_worker),
         where the per-host bound is always 1.
         """
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
@@ -386,7 +387,9 @@ class TestAlarmSerialLaneBreach:
 # Step 09 — the tripwire wired into the real dispatch chokepoint
 #
 # Real-git fixtures duplicated per-file (PRD D9: no cross-test-module imports
-# of private fixtures) — mirrors test_merge_queue_concurrent_verify.py:59-130.
+# of private fixtures) — mirrors test_merge_queue_concurrent_verify.py's
+# ``_setup_repo`` / ``git_repo`` / ``git_config`` / ``git_ops`` / ``config`` /
+# ``_make_branch_with_file``.
 # ---------------------------------------------------------------------------
 
 
