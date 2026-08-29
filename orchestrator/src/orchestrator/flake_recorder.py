@@ -1,6 +1,6 @@
 """Dispatcher-side RECORDER for merge-gate flake observations (PRD task ε).
 
-`plans/cpu-load-robust-verify-prd.md` §5.8 — the topology rule this module exists
+`plans/flake-ledger-prd.md` §5.8 — the topology rule this module exists
 to encode:
 
   * the DISCRIMINATOR (``verify.confirm_isolated_rerun_verdict``) runs wherever the

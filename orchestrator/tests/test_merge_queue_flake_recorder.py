@@ -1,6 +1,6 @@
 """Boundary row B3, end-to-end on the DISPATCHER (PRD task ε).
 
-`plans/cpu-load-robust-verify-prd.md` §5.8.  The discriminator runs wherever the
+`plans/flake-ledger-prd.md` §5.8.  The discriminator runs wherever the
 worktree is; the recorder runs in ``merge_queue._run_post_merge_verify``, the one
 scope where a local OR remote ``VerifyResult`` sits alongside ``event_store``,
 ``escalation_queue``, ``project_root``, ``merge_sha`` and ``task_id`` at once.

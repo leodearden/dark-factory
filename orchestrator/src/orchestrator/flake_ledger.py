@@ -210,7 +210,8 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
 
     The READ half of the ``VerifyResult.flake_suppression`` carrier.  ``result_to_dict``
     is ``dataclasses.asdict`` and ``result_from_dict`` is a bare ``VerifyResult(**d)``
-    (verify_runner.py:362-373), so the WRITE half needs nothing — ``json.dumps``
+    (``orchestrator/src/orchestrator/verify_runner.py::result_to_dict`` /
+    ``::result_from_dict``), so the WRITE half needs nothing — ``json.dumps``
     flattens a ``StrEnum`` to its value and a tuple to an array losslessly — but the read
     half hands ``verdict``/``call_site`` back as plain ``str`` and ``test_ids`` as a
     ``list``.  Coercing here is what makes the field's annotation true on the
@@ -218,9 +219,11 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
 
     It NEVER raises, and that is the load-bearing property, not politeness:
     ``RemoteRunner.run_merge_verify`` converts any ``TypeError``/``ValueError`` escaping
-    ``result_from_json`` into a ``RunnerUnavailable`` (verify_runner.py:1447), which the
-    pool pays for with a whole local re-verify.  Letting one malformed sub-payload cost a
-    re-verify would be strictly worse than dropping the one observation it carried, so a
+    ``result_from_json`` into a ``RunnerUnavailable``
+    (``orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify``),
+    which the pool pays for with a whole local re-verify.  Letting one malformed
+    sub-payload cost a re-verify would be strictly worse than dropping the one
+    observation it carried, so a
     bad payload degrades to ``None`` plus a LOUD warning (B12's discipline, applied to
     the wire).
 

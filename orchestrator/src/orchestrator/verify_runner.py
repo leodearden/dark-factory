@@ -382,12 +382,15 @@ def result_from_dict(d: dict) -> VerifyResult:
     straight through would leave the field's TYPED annotation a lie on exactly the
     deserialized path it exists to serve.  Rebuild it first, in the same
     ``d.get(key)`` / ``X(v) if v is not None else None`` shape
-    ``MergeVerifySpec.from_dict`` uses for its optional nested ``global_verify_command``
-    (:339, :351-353) — this file's established idiom for a newly-added optional field.
+    ``orchestrator/src/orchestrator/verify_runner.py::MergeVerifySpec.from_dict`` uses for
+    its optional nested ``global_verify_command`` — this file's established idiom for a
+    newly-added optional field.
 
     ``flake_suppression_from_wire`` NEVER raises: a malformed sub-payload degrades to
     ``None`` with a loud warning, because anything raising out of here becomes a
-    ``RunnerUnavailable`` at :1447 and costs a whole local re-verify.
+    ``RunnerUnavailable`` in
+    ``orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`` and
+    costs a whole local re-verify.
 
     The codec's strictness is otherwise UNCHANGED — an unknown top-level key is still a
     ``TypeError`` (pinned by test_verify_runner's characterization tests), the
@@ -395,7 +398,9 @@ def result_from_dict(d: dict) -> VerifyResult:
     """
     # `isinstance` guard, not a bare `d.get`: a buggy remote can send a valid JSON
     # LIST, and that must keep failing exactly as it does today — `VerifyResult(**d)`
-    # raising TypeError, which RemoteRunner catches at :1447 — instead of a fresh
+    # raising TypeError, which
+    # `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`
+    # catches — instead of a fresh
     # AttributeError that no handler on the merge path expects.
     if isinstance(d, dict):
         raw = d.get('flake_suppression')

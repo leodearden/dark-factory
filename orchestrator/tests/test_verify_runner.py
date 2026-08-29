@@ -603,8 +603,9 @@ class TestVerifyResultFlakeSuppressionWire:
     )
     def test_b13_malformed_payload_degrades_to_none_without_raising(self, malformed):
         """A malformed sub-payload must cost ONE observation, not a whole re-verify:
-        anything raising out of result_from_json becomes a RunnerUnavailable at
-        verify_runner.py:1447, which the pool pays for with a local re-run."""
+        anything raising out of result_from_json becomes a RunnerUnavailable in
+        orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify,
+        which the pool pays for with a local re-run."""
         payload = json.dumps(
             {
                 'passed': False,
@@ -698,8 +699,9 @@ class TestVerifyResultFlakeSuppressionWire:
     @pytest.mark.asyncio
     async def test_characterization_remote_typeerror_becomes_runner_unavailable(self):
         """The twin of the above, at the boundary that matters: RemoteRunner converts
-        that TypeError into RunnerUnavailable (verify_runner.py:1447), which
-        VerifyRunnerPool.dispatch turns into a LOCAL re-verify.  Degraded, never
+        that TypeError into RunnerUnavailable
+        (orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify),
+        which VerifyRunnerPool.dispatch turns into a LOCAL re-verify.  Degraded, never
         wrong — and never an unhandled crash in the merge path."""
         from orchestrator.verify_runner import RunnerUnavailable
 

@@ -1,4 +1,4 @@
-"""Tests for the dispatcher-side flake RECORDER (PRD task ε, `plans/cpu-load-robust-verify-prd.md`).
+"""Tests for the dispatcher-side flake RECORDER (PRD task ε, `plans/flake-ledger-prd.md`).
 
 `flake_recorder.record_merge_flake_suppression` is the one place the three
 side-effects of a merge-gate flake observation happen: the durable
