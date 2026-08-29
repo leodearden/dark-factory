@@ -28,10 +28,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 from shared.capability_manifest import DeliveredCheckMeta
+from shared.delivered_check_polarity import CheckOutcome, build_grep_argv, interpret_grep_rc
 
 from orchestrator import git_ops
 
@@ -70,6 +71,21 @@ class DeliveredCheckResult(Enum):
     #: descriptor, script timeout/spawn failure) — fail-safe: never treated
     #: as a definitive DELIVERED or FAILED result by callers.
     ERRORED = 'errored'
+
+
+#: ``shared.delivered_check_polarity.CheckOutcome`` → :class:`DeliveredCheckResult`
+#: (task 3500). The two enums are deliberately distinct vocabularies — one says
+#: whether a PREDICATE held against some tree, the other whether a CAPABILITY is
+#: delivered — and this table is the single place they are joined. Exhaustive
+#: over ``CheckOutcome`` by construction: a new member would raise ``KeyError``
+#: at the delegation site (caught by :func:`run_delivered_check` and reported as
+#: ERRORED) rather than silently returning the wrong verdict for a whole class
+#: of checks.
+_OUTCOME_TO_RESULT: dict[CheckOutcome, DeliveredCheckResult] = {
+    CheckOutcome.PASS: DeliveredCheckResult.DELIVERED,
+    CheckOutcome.FAIL: DeliveredCheckResult.FAILED,
+    CheckOutcome.ERRORED: DeliveredCheckResult.ERRORED,
+}
 
 
 @dataclass(frozen=True)
@@ -143,22 +159,30 @@ async def _run_grep_check(
     ``meta.expect``: ``'present'`` wants a match, ``'absent'`` wants no
     match.
 
-    The explicit ``-e`` separator (reviewer_comprehensive amendment) keeps
-    a pattern beginning with ``'-'`` from being parsed as a ``git grep``
-    option instead of the search pattern — without it, such a pattern
-    would fail with a git error (rc>=2, ERRORED) rather than being used
-    literally.
+    Both halves of that — the argv and the rc mapping, including the
+    ``-e``-separator rationale that used to be spelled out here — now live
+    in ``shared.delivered_check_polarity``; see the delegation comment
+    below and that module's PARITY CONTRACT.
     """
-    argv = ['git', '-C', str(project_root), 'grep', '-E', '-e', meta.pattern, ref]
-    if meta.paths:
-        argv.append('--')
-        argv.extend(meta.paths)
+    # Task 3500: AUTHORING-TIME validation evaluates these same grep checks
+    # (in shared.delivered_check_polarity) before they are ever committed to
+    # a task's metadata, and it MUST reach the identical verdict this runner
+    # will later reach. Rather than trust two implementations to agree on
+    # POSIX-ERE-via-`git grep -E`, the `-e` separator, `--` pathspec
+    # placement and the rc>=2 boundary, both call the same builder and the
+    # same interpreter — so divergence is structurally impossible rather
+    # than merely absent today. A drift here would make the authoring gate a
+    # new source of the wedge it exists to prevent: a check the lint judges
+    # healthy that this runner then fails still blocks its dependent forever.
+    #
+    # `cast` (a runtime no-op): DeliveredCheckMeta's validator guarantees a
+    # non-empty `pattern` whenever kind == 'grep', which is the only way
+    # into this function — pyright just cannot see the cross-field rule.
+    argv = build_grep_argv(
+        cast(str, meta.pattern), meta.paths, project_root=project_root, ref=ref
+    )
     rc, _out, _err = await runner(argv)
-    if rc >= 2:
-        return DeliveredCheckResult.ERRORED
-    matched = rc == 0
-    delivered = matched if meta.expect == 'present' else not matched
-    return DeliveredCheckResult.DELIVERED if delivered else DeliveredCheckResult.FAILED
+    return _OUTCOME_TO_RESULT[interpret_grep_rc(rc, meta.expect)]
 
 
 async def _run_script_check(
