@@ -516,6 +516,39 @@ class TestLaneLockRefusalEndToEnd:
             'lane must be FREE after a lock-contention failure'
         )
 
+    async def test_the_lane_worktree_is_retained_not_torn_down(
+        self, seed_repo: Path,
+    ):
+        """Contention must NOT trigger `git worktree remove --force`.
+
+        A lane-lock refusal is the one seed failure whose entire meaning is
+        that ANOTHER LIVE CONSUMER holds <lane_dir>.lock right now, so the
+        generic seed-failure teardown would be a destructive rm racing that
+        holder (a reify GC reclaim, a thin rm -rf, another seed).  It is also
+        unnecessary — seed refused before touching the lane.  Pins the retain
+        policy explicitly, since the pool slot being FREE (asserted by
+        test_lane_is_released_back_to_free_after_a_refusal) holds under EITHER
+        policy and so cannot distinguish them.
+        """
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        lane = git_ops.worktree_base / '_lane-0'
+        assert lane.is_dir(), (
+            f'{lane} was torn down on a lane-lock refusal — that is a '
+            'destructive teardown racing the live lock holder'
+        )
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=seed_repo,
+        )
+        assert rc == 0
+        assert str(lane) in out, (
+            f'the lane worktree was unregistered on a lane-lock refusal; '
+            f'`git worktree list` was:\n{out}'
+        )
+
     async def test_create_worktree_disposition_names_lock_contention(
         self, seed_repo: Path,
     ):
@@ -553,12 +586,18 @@ class TestLaneLockRefusalEndToEnd:
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
             await git_ops.acquire_warm_lane('task/lock', 'HEAD')
 
+        # Scoped to the _seed_warm_lane line specifically: the acquire_warm_lane
+        # abort path emits its OWN refusal WARNING (naming the retain-the-
+        # worktree decision), and both are wanted.  This test pins the one that
+        # carries the contended lock path.
         refusals = [
             r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING and 'seed refused' in r.getMessage()
+            if r.levelno == logging.WARNING
+            and '_seed_warm_lane: seed refused' in r.getMessage()
         ]
         assert len(refusals) == 1, (
-            f'expected exactly one refusal WARNING, got {caplog.messages}'
+            f'expected exactly one _seed_warm_lane refusal WARNING, '
+            f'got {caplog.messages}'
         )
         msg = refusals[0]
         assert 'lane-lock contention' in msg, msg

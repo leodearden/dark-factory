@@ -7277,10 +7277,22 @@ class GitOps:
                     # NOT the shared create tail at the bottom of this method.
                     _co_seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
                     if _co_seed_rc != 0:
+                        _co_unavail = _seed_rc_to_unavailable(_co_seed_rc)
+                        _co_contended = (
+                            _co_unavail is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                        )
                         if _co_seed_rc == 127:
                             logger.warning(
                                 'acquire_warm_lane: create-once reattach seed script '
                                 'absent for lane %s (rc=127)', lane,
+                            )
+                        elif _co_contended:
+                            logger.warning(
+                                'acquire_warm_lane: create-once reattach seed refused '
+                                'for lane %s (rc=%d, lane-lock contention) — '
+                                'RETAINING the worktree; removing it would race the '
+                                'live lock holder',
+                                lane, _co_seed_rc,
                             )
                         else:
                             logger.warning(
@@ -7289,9 +7301,9 @@ class GitOps:
                                 _co_seed_rc, lane,
                             )
                         await self._abort_lane_acquisition(
-                            lane, branch_name, remove_worktree=True,
+                            lane, branch_name, remove_worktree=not _co_contended,
                         )
-                        return _seed_rc_to_unavailable(_co_seed_rc)
+                        return _co_unavail
                     info = await self._reuse_warm_lane(lane, full_branch)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
@@ -7320,6 +7332,29 @@ class GitOps:
                     # producing one BLOCKED+L1 escalation per dispatched task.
                     # Operators should check that seed-warm-lane.sh is present
                     # and executable in the lane's checked-out scripts/ directory.
+                    #
+                    # ONE exception to "remove the worktree" (amendment,
+                    # reviewer_comprehensive robustness): a lane-lock refusal is
+                    # the single seed failure whose whole meaning is that
+                    # ANOTHER LIVE CONSUMER holds <lane_dir>.lock right now, so
+                    # `git worktree remove --force` here is a destructive
+                    # teardown racing that holder (a reify GC reclaim, a thin
+                    # rm -rf, another seed).  It is also unnecessary: seed
+                    # refused BEFORE touching the lane, so there is no partial
+                    # seed residue to clear.  Retain the worktree and let
+                    # _abort_lane_acquisition do the rest (detach HEAD, drop the
+                    # degenerate branch, free the slot) — which leaves the lane
+                    # in EXACTLY the state the recycle and reset-in-place abort
+                    # routes already leave, both of which pass
+                    # remove_worktree=False; the next acquire then takes the
+                    # already-registered reset-in-place path.  Every other rc
+                    # keeps today's teardown unchanged.  Before task 4211 this
+                    # race was not even identifiable: the refusal arrived as 75
+                    # and was indistinguishable from genuine disk pressure.
+                    _seed_unavail = _seed_rc_to_unavailable(seed_rc)
+                    _seed_contended = (
+                        _seed_unavail is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                    )
                     if seed_rc == 127:
                         logger.warning(
                             'acquire_warm_lane: seed script absent for lane %s '
@@ -7327,6 +7362,14 @@ class GitOps:
                             'EVERY task on this host will fault while pool is '
                             'enabled and the script is missing',
                             lane,
+                        )
+                    elif _seed_contended:
+                        logger.warning(
+                            'acquire_warm_lane: seed refused for lane %s '
+                            '(rc=%d, lane-lock contention) — RETAINING the '
+                            'worktree and releasing the lane; removing it '
+                            'would race the live holder of the lane lock',
+                            lane, seed_rc,
                         )
                     else:
                         logger.warning(
@@ -7348,9 +7391,9 @@ class GitOps:
                     # _delete_branch_if_on_main, so a commit-bearing branch
                     # is never destroyed.
                     await self._abort_lane_acquisition(
-                        lane, branch_name, remove_worktree=True,
+                        lane, branch_name, remove_worktree=not _seed_contended,
                     )
-                    return _seed_rc_to_unavailable(seed_rc)
+                    return _seed_unavail
                 route = AcquireRoute.CREATE_ONCE_FRESH
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
