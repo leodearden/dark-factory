@@ -1677,6 +1677,29 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
         for store in observation.stores_served:
             key = f'observations_served_by_{store}_at_k{observation.k}'
             counts[key] = counts.get(key, 0) + 1
+    # The inversion family's own depth-named disclosure. `superseded-above-
+    # successor` carries no depth suffix in its metric_id and leaf alpha joins
+    # by metric_id alone, so without a row naming the depth a --k change reads
+    # to the evaluator as a rate move rather than a re-parameterisation.
+    # `pairs_registered` is published because it is the un-narrowed population
+    # `pairs_comparable` is a subset of; the two together separate "fewer
+    # pairs are coming back" from "the registry recorded fewer pairs". There
+    # is deliberately NO `inversion_pairs_comparable` row: leaf beta settled
+    # this exact question for the identically-shaped `surfacing` family
+    # (memory_eval_staleness_sweep.py:1000-1017, refusing a
+    # `surfacing_pairs_observed` row) — it would be a second name for the
+    # number already published as the metric's `n`, and when exposure is zero
+    # the metric is absent and `metric_families_not_measured` names the gap,
+    # which a bare 0 here would have disguised as a measurement.
+    for observation in observations.inversions:
+        if observation.degraded:
+            key = f'degraded_inversion_observations_at_k{observation.k}'
+            counts[key] = counts.get(key, 0) + 1
+            continue
+        key = f'inversion_observations_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + 1
+        key = f'inversion_pairs_registered_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + observation.pairs_registered
     return counts
 
 
