@@ -8657,6 +8657,22 @@ def create_mcp_server(
         the descriptor and re-commit; ``shared.delivered_check_polarity`` holds
         the rules and ``docs/task-authoring.md`` §3.3 the author-facing guide.
 
+        The gate runs ONLY for ``target_status='pending'`` — the one status
+        that releases a task for scheduling, and so the one at which its
+        checks begin gating dependents. A ``cancelled``/``deferred`` commit
+        releases nothing, so gating it would only block cleanup of exactly the
+        mis-authored batch the author is discarding.
+
+        It fails CLOSED on a verdict and OPEN on infrastructure. A check that
+        could not be evaluated at all (no git, root not a repo, unresolvable
+        ref) is neither rejected nor silently passed: it is reported under the
+        ``delivered_check_warnings`` response key, alongside the non-blocking
+        ``absent_overbroad`` warning (an over-broad ``expect=absent`` pattern
+        is genuinely undecidable at authoring time, so it is advisory by
+        design). Each entry is ``{task_id, name, code, severity, message}``.
+        Like ``manifest_stamping``, the key is attached ONLY when non-empty,
+        so a clean batch's response is byte-identical to the pre-gate one.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -8742,6 +8758,14 @@ def create_mcp_server(
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
 
+            # Scoped to `pending`: it is the only target status that releases
+            # a task for scheduling, and so the only one at which its
+            # delivered_checks begin gating dependents. A `cancelled` or
+            # `deferred` commit releases nothing, so gating it would only
+            # block cleanup of exactly the mis-authored batch the author is
+            # discarding.
+            if target_status != 'pending':
+                continue
             checks = extract_delivered_checks(meta)
             if not checks:
                 continue
@@ -8810,6 +8834,21 @@ def create_mcp_server(
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
+        # Non-blocking half of the polarity gate (task 3500), attached in the
+        # same CONDITIONAL shape as `manifest_stamping` directly above: only
+        # when non-empty, so a clean batch's response is byte-identical to the
+        # pre-gate one (several tests in test_task_tools.py assert
+        # `result == {'success': True}` exactly).
+        #
+        # Everything reaching this list has ALREADY been decided not to block:
+        # a 'warn' is undecidable at authoring time, and an 'errored' is an
+        # availability failure — git missing, root not a repo, ref
+        # unresolvable. An unevaluable check degrades toward the PRE-GATE
+        # status quo (the task commits; its dependent dispatches ungated),
+        # never toward the wedge this gate exists to prevent — but it is
+        # reported here rather than dropped, so it is never a silent pass.
+        if polarity_warnings and isinstance(result, dict):
+            result['delivered_check_warnings'] = polarity_warnings
         return result
 
     @mcp.tool()
