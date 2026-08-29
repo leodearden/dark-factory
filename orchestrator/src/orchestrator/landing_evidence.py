@@ -2,25 +2,28 @@
 
 SEVEN always-on call sites re-derive "has this task's work already landed on
 main?" from live git state before stamping a task ``done`` (re-measured
-2026-08-25; this list said "five" until task 4647 recounted it, and the two it
-omitted were the pair that never had a ``Harness`` or worker method to be
-named after):
+2026-08-25 and re-verified 2026-08-29; this list said "five" until task 4647
+recounted it, and the two it omitted were the pair that never had a
+``Harness`` or worker method to be named after).  Each is cited by ENCLOSING
+SYMBOL rather than by line, because a line pin into these two files rots
+within days:
 
-  1. ``Harness._already_landed_dispatch_gate``'s ancestry path
-     (``harness.py:11710``)
-  2. ``Harness._already_landed_dispatch_gate``'s branch-deleted merge-marker
-     path (``harness.py:11752``)
-  3. ``Harness._already_landed_dispatch_gate``'s content-equivalence fallback
-     (``harness.py:11780``)
-  4. the stranded-in-progress sweep (``Harness._reconcile_one_stranded``,
-     ``harness.py:5715``)
-  5. ``SpeculativeMergeWorker._redrive_coalesce_members`` (coalesce re-drive,
-     ``merge_queue.py:14805``)
-  6. and 7. the escalation server's ``merge_status`` query
-     (``escalation/server.py:3870`` and ``:3916``) — a read-only report rather
-     than a recovery action, which is why it is easy to miss when counting
-     "sites that stamp a task done", and why it is nonetheless a site: it
-     shows a human the same verdict the other five act on.
+  1. ``orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate``'s
+     ancestry path
+  2. the same function's branch-deleted merge-marker path
+  3. the same function's content-equivalence fallback — the third and last of
+     its three ``validate_landing_evidence`` calls, the one gated by
+     ``branch_content_in_main``
+  4. the stranded-in-progress sweep
+     (``orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded``)
+  5. ``orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members``
+     (coalesce re-drive)
+  6. and 7. the escalation server's
+     ``escalation/src/escalation/server.py::merge_status`` query, both
+     git-authority arms — a read-only report rather than a recovery action,
+     which is why it is easy to miss when counting "sites that stamp a task
+     done", and why it is nonetheless a site: it shows a human the same
+     verdict the other five act on.
 
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,

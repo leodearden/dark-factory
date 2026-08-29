@@ -1065,14 +1065,33 @@ class TestDegenerateArmBackwardCompatibility:
 
         So the verdict comes from attribution: the parked tip IS patch-id
         contained in main, and no main-reachable commit can be attributed to
-        the task, giving ``no_attribution``.  The fall-through therefore costs
-        LEGIBILITY — the operator is told "nothing on main could be attributed
-        to this task" rather than the sharper "this branch never advanced past
-        its base" — and never SAFETY: the verdict is still a refusal carrying
-        no provenance anchor, never the confident accept that patch-id
-        containment alone would have produced for a parked branch.  Supplying
-        ``branch_base_sha`` restores the sharp answer, which is why every
-        orchestrator-dispatched caller has one.
+        the task, giving ``no_attribution``.  In THIS shape the fall-through
+        therefore costs only LEGIBILITY — the operator is told "nothing on main
+        could be attributed to this task" rather than the sharper "this branch
+        never advanced past its base" — and not SAFETY: the verdict is still a
+        refusal carrying no provenance anchor, never the confident accept that
+        patch-id containment alone would have produced for a parked branch.
+
+        **The residual, named rather than implied.**  That "not SAFETY" is
+        conditional on attribution ALSO failing, and it is not guaranteed to.
+        :func:`~orchestrator.landing_evidence._resolve_main_reachable_evidence`
+        tier 1 accepts ANY main-reachable commit whose subject cites the task,
+        including one from an EARLIER partial landing that this branch played
+        no part in.  For a parked branch with no recorded base, a task with
+        such a commit already on main therefore reaches
+        ``_accept(citation)``: degenerate is skipped for want of a baseline,
+        the no-op guard declines for the same reason, patch-id containment is
+        trivially true because the tip contributes nothing, and tier 1
+        resolves.  That IS a safety cost — a confident accept for a branch that
+        delivered nothing this dispatch — and it is exactly the "landed a
+        partial earlier increment, was re-dispatched for the rest, delivered
+        nothing this time" shape that
+        ``orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch``
+        covers with its signal-3 COVERAGE check against declared plan files.  Supplying
+        ``branch_base_sha`` closes it here too, by restoring the sharp
+        degenerate answer ahead of attribution — which is why every
+        orchestrator-dispatched caller has one, and why the missing-metadata
+        posture is backward compatibility rather than a supported mode.
         """
         sc = build_degenerate_branch(repo)
         verdict = await branch_work_landed(

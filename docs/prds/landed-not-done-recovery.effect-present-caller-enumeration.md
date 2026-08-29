@@ -1,74 +1,116 @@
 # Effect-present caller enumeration — the record leaf ε must cite
 
 **Owner:** task 4647 (leaf δ) · **Consumer:** leaf ε
-**Measured:** 2026-08-25, against this branch's tree.
+**Measured:** 2026-08-25; re-measured 2026-08-29 against this branch's tree
+(rebased onto main after task 3539 landed — see the callout below).
 **Parent PRD:** `docs/prds/landed-not-done-recovery.md`
 
 D1's scope limit reads: *"effect-present is retired at the landing-detection
 sites only (dispatch gate, Tier-3.5); its other callers are out of scope and
 must be enumerated by leaf δ before removal."* This file is that enumeration.
 
-> **Cite these anchors, not the PRD's.** The parent PRD's own enumeration
-> (`landed-not-done-recovery.md:632-637`) states the right COUNTS — two + one
-> = three production sites — but every line number in it is stale, and so is
-> the one it gives for the eighth site. It says `harness.py:11733`,
-> `git_ops.py:9155` and `git_ops.py:10005`; the real anchors are
-> `harness.py:11772`, `git_ops.py:9207` and `git_ops.py:10201`. Its
-> `merge_queue.py:14241` is really `merge_queue.py:14805`. The counts were
-> re-measured independently here and confirmed; only the anchors moved.
+> **Cite these anchors, not the PRD's — and cite SYMBOLS, not line numbers.**
+> The parent PRD's own enumeration (`docs/prds/landed-not-done-recovery.md`
+> §"Decomposition plan", the leaf-δ bullet "The enumeration deliverable is
+> smaller than D1 implies") is wrong in both halves.
+>
+> Its COUNT is wrong. It says `commit_effect_present_in_main` "has exactly two
+> production callers, both inside `validate_landing_evidence`". That was true
+> when this file was first measured (2026-08-25) and stopped being true the
+> next day: task 3539 landed on main on 2026-08-26 (`9b18d7efa3` /
+> `12aca23a58` / `7a6245b493`) and added a third — signal 4 of
+> `orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch`.
+> Re-measured on this branch's own tree (which is based on main *after* 3539),
+> there are **three**, so the PRD's "two + one = three production sites" is
+> really four. §1 and §4 below carry the corrected table and the ruling.
+>
+> Its ANCHORS are wrong. It names `harness.py:11733`, `git_ops.py:9155`,
+> `git_ops.py:10005` and `merge_queue.py:14241`; not one of them resolves to
+> the code it describes. That is the ordinary fate of a line pin, which is why
+> every anchor in this file is now `path/to/module.py::symbol` in the house
+> form (`CLAUDE.md`, `CONTRIBUTING.md` §2). ε should cite them the same way:
+> a symbol anchor survives the edits above it that rot a line number within
+> days.
 
 ---
 
-## 1. `commit_effect_present_in_main` — exactly TWO production callers
+## 1. `commit_effect_present_in_main` — exactly THREE production callers
 
-Definition: `git_ops.py:10201`. Since task 3116 (`40c39cd8ee`) it is a
-**one-line wrapper** — `git_ops.py:10366` returns
-`(await self.describe_commit_effect_in_main(commit_sha)).present`, over
-`describe_commit_effect_in_main` (`:9422`) → `_probe_commit_effect` (`:9570`).
+Definition:
+`orchestrator/src/orchestrator/git_ops.py::GitOps.commit_effect_present_in_main`.
+Since task 3116 (`40c39cd8ee`) its whole body is
+`return (await self.describe_commit_effect_in_main(commit_sha)).present` — a
+**one-line wrapper** over
+`orchestrator/src/orchestrator/git_ops.py::GitOps.describe_commit_effect_in_main`
+→ `orchestrator/src/orchestrator/git_ops.py::GitOps._probe_commit_effect`.
 ε must retire the *call sites*, not the primitive (see §4).
 
-| # | Call site | Enclosing symbol | Role | ε scope |
+| # | Anchor (`path::symbol`) | Call expression | Role | ε scope |
 |---|---|---|---|---|
-| 1 | `landing_evidence.py:1635` | `validate_landing_evidence` — CANDIDATE arm | The FIX 1' guard applied to a caller-supplied `candidate_sha` | **IN** |
-| 2 | `landing_evidence.py:1695` | `validate_landing_evidence` — DISCOVERY arm | The FIX 1' guard applied to the branch-tip-or-citation anchor | **IN** |
+| 1 | `orchestrator/src/orchestrator/landing_evidence.py::validate_landing_evidence` | CANDIDATE arm (`if not await git_ops.commit_effect_present_in_main(candidate_sha)`) | The FIX 1' guard applied to a caller-supplied `candidate_sha` | **IN** |
+| 2 | `orchestrator/src/orchestrator/landing_evidence.py::validate_landing_evidence` | DISCOVERY arm (`… (effect_check_sha)`) | The FIX 1' guard applied to the branch-tip-or-citation anchor | **IN** |
+| 3 | `orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch` | **signal 4 (SURVIVAL)** — `if not await git_ops.commit_effect_present_in_main(landed_sha)` | The merge-lane already-landed recognizer's only non-historical signal | **OUT — see §4** |
 
-Both are inside the one function, which is why ε's edit is local. Every other
-occurrence in the tree is prose or a test stub:
+Sites 1 and 2 are inside the one function, which is why ε's edit there is
+local. Site 3 is a different subsystem entirely and is ruled OUT in §4; it is
+listed here because §1's job is the CENSUS, and a census that silently omits a
+caller cannot be told from one that missed it. Every other occurrence in the
+tree is prose or a test stub:
 
-- `landing_evidence.py:14, :36, :113, :624, :748, :1261, :1538, :1685` — module
-  and function docstrings, and one inline comment.
-- `git_ops.py:1216, :1233, :9230, :9238, :9428, :9735` — docstrings.
-- `harness.py:11527` — a comment explaining why the dispatch gate
-  short-circuits *before* the git work.
+- `orchestrator/src/orchestrator/landing_evidence.py` — the module docstring
+  (×3), and the docstrings of `::_record_effect_divergence`,
+  `::_delivered_checks_differential`, `::branch_work_landed` and
+  `::validate_landing_evidence`, plus one inline comment inside
+  `::validate_landing_evidence` (8 mentions).
+- `orchestrator/src/orchestrator/git_ops.py` — docstrings on
+  `::CommitEffectProbe` (×2), `::GitOps.branch_content_in_main` (×2),
+  `::GitOps.describe_commit_effect_in_main`, and one comment in
+  `::GitOps._anchor_diff_lines` (6 mentions).
+- `orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate`
+  — a comment explaining why the gate short-circuits *before* the git work.
+- `orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch`
+  — its own docstring, describing site 3 above.
 - `docs/prds/*.md` — prose.
 
-Note `landing_evidence.py:1261`: `branch_work_landed`'s docstring names this
-predicate as one of the two things it may never await, pinned at a zero call
-count by `test_branch_work_landed.py::TestB2SyncMergeTip`. That pin is a
-*constraint on the new producer*, not a call site.
+Note the mention inside
+`orchestrator/src/orchestrator/landing_evidence.py::branch_work_landed`'s
+docstring: it names this predicate as one of the two things the new producer
+may never await, pinned at a zero call count by
+`orchestrator/tests/test_branch_work_landed.py::TestB2SyncMergeTip`. That pin
+is a *constraint on the new producer*, not a call site.
 
 ## 2. `branch_content_in_main` — exactly ONE production caller
 
-Definition: `git_ops.py:9207`. Unchanged by 3116 and still byte-identity —
-it ends in `git diff --quiet`.
+Definition:
+`orchestrator/src/orchestrator/git_ops.py::GitOps.branch_content_in_main`.
+Unchanged by 3116 and still byte-identity — it ends in `git diff --quiet`.
 
-| # | Call site | Enclosing symbol | Role | ε scope |
+| # | Anchor (`path::symbol`) | Call expression | Role | ε scope |
 |---|---|---|---|---|
-| 3 | `harness.py:11772` | `Harness._already_landed_dispatch_gate` (def `:11337`), third arm | **The arm's ENTRY CONDITION**, not an inner guard | **IN** |
+| 4 | `orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate`, third arm | `if await self.git_ops.branch_content_in_main(branch):` | **The arm's ENTRY CONDITION**, not an inner guard | **IN** |
 
 The distinction matters to ε and is easy to misread from the PRD's one-line
 summary. This is not a check applied *after* the arm decides to look; it is
 `if await self.git_ops.branch_content_in_main(branch):`, the predicate that
 decides whether the arm runs at all. The DISCOVERY-mode
-`validate_landing_evidence` call it gates sits at `harness.py:11780`. So a
-False here does not weaken the verdict — it means **no verdict is produced**,
+`validate_landing_evidence` call it gates is the third and last of that
+function's three `validate_landing_evidence` calls, in the body of that same
+`if`. So a False here does not weaken the verdict — it means **no verdict is produced**,
 and the gate falls through as if no landing evidence existed. Replacing this
 predicate changes *which tasks are examined*, not merely how they are judged.
 
-Everything else is prose: `landing_evidence.py:1260` (the same zero-call-count
-constraint), `scheduler.py:5708` and `workflow.py:8650` (docstrings naming the
-method as an example), `git_ops.py:9311, :9316, :9499, :10258`,
-`harness.py:11351, :11435, :11448`.
+Everything else is prose:
+`orchestrator/src/orchestrator/landing_evidence.py::branch_work_landed`'s
+docstring (the same zero-call-count constraint),
+`orchestrator/src/orchestrator/scheduler.py::Scheduler._consult_already_landed`
+and
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_done_step_commits`
+(docstrings naming the method as an example),
+`orchestrator/src/orchestrator/git_ops.py::GitOps.net_diff_is_empty` (×2),
+`::GitOps.describe_commit_effect_in_main`,
+`::GitOps.commit_effect_present_in_main`, and three mentions in
+`orchestrator/src/orchestrator/harness.py::Harness._already_landed_dispatch_gate`'s
+own docstring.
 
 ## 3. The hardening asymmetry — and it points the wrong way
 
@@ -77,8 +119,8 @@ matters:
 
 | | `-z` / `core.quotePath=false` | Anchor |
 |---|---|---|
-| `commit_effect_present_in_main` | **hardened** (task 2500 amendment) | `git_ops.py:9463-9496` documents it; applied at `:9620-9621`, `:9659-9660`, `:9826-9827` |
-| `branch_content_in_main` | **NOT hardened** | `git_ops.py:9230-9241` documents the hole explicitly |
+| `commit_effect_present_in_main` | **hardened** (task 2500 amendment) | Documented in `git_ops.py::GitOps.commit_effect_present_in_main`'s and `::GitOps.describe_commit_effect_in_main`'s docstrings; applied in `::GitOps._probe_commit_effect` (×2), `::GitOps._anchor_diff_lines`, `::GitOps._batch_added_line_counts` and `::GitOps._compare_touched_paths_to_main` |
+| `branch_content_in_main` | **NOT hardened** | `git_ops.py::GitOps.branch_content_in_main`'s **Path-quoting caveat** paragraph documents the hole explicitly |
 
 `branch_content_in_main`'s own docstring spells out the consequence: a changed
 path with non-ASCII bytes comes back quoted from `--name-only`, then fails to
@@ -88,25 +130,60 @@ POSITIVE for "content already landed" — the one direction this primitive is
 otherwise fail-safe against.
 
 The asymmetry is the wrong way round for the system as built: the UNHARDENED
-predicate is the one at site 3, gating the dispatch gate's third arm, while
+predicate is the one at site 4, gating the dispatch gate's third arm, while
 the hardened one only ever narrows an already-selected candidate. ε should
-treat site 3 as the higher-value replacement of the three, not the lesser one
-because it is only a single call.
+treat site 4 as the higher-value replacement of the three in scope, not the
+lesser one because it is only a single call.
 
 ## 4. Explicitly OUT of scope for ε
 
 | Item | Ruling | Why |
 |---|---|---|
-| The primitives themselves (`git_ops.py:9207`, `:10201`, `:9422`, `:9570`) | **OUT** | D1 retires *landing-detection call sites*, not the primitives. `docs/prds/landed-not-done-recovery.md:775-776` says so in as many words. Both remain live for diagnostics: `_record_effect_divergence` (`landing_evidence.py:624`) calls `describe_commit_effect_in_main` to explain a rejection, which survives the retirement of the decision it explains. |
-| **Site 8 — `merge_queue.py:14805`**, inside `SpeculativeMergeWorker._redrive_coalesce_members` (def `:14710`) | **OUT** | Ruled explicitly; see below. |
-| `harness.py:5715`, in `Harness._reconcile_one_stranded` (def `:5479`) | **OUT** | The stranded-in-progress sweep, not a dispatch gate or a Tier-3.5 arm. It reaches effect-present only transitively, through `validate_landing_evidence`. |
-| `escalation/server.py:3870`, `:3916`, in `merge_status` (def `:3651`) | **OUT** | A read-only status *query*. It reports what the evidence says; it never dispatches, stamps or reverts, so a decaying answer costs a wrong display, not a stranded task. |
+| The primitives themselves (`git_ops.py::GitOps.branch_content_in_main`, `::GitOps.commit_effect_present_in_main`, `::GitOps.describe_commit_effect_in_main`, `::GitOps._probe_commit_effect`) | **OUT** | D1 retires *landing-detection call sites*, not the primitives. `docs/prds/landed-not-done-recovery.md` §"Out of scope" ("Retiring `commit_effect_present_in_main` entirely") says so in as many words. Both remain live for diagnostics: `orchestrator/src/orchestrator/landing_evidence.py::_record_effect_divergence` calls `describe_commit_effect_in_main` to explain a rejection, which survives the retirement of the decision it explains. |
+| **Site 3 — `orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch`**, signal 4 | **OUT, owned by task 3539** | Ruled explicitly; see below. |
+| **Site 8 — `orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members`** | **OUT** | Ruled explicitly; see below. |
+| `orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded` | **OUT** | The stranded-in-progress sweep, not a dispatch gate or a Tier-3.5 arm. It reaches effect-present only transitively, through `validate_landing_evidence`. |
+| `escalation/src/escalation/server.py::merge_status` (both git-authority arms) | **OUT** | A read-only status *query*. It reports what the evidence says; it never dispatches, stamps or reverts, so a decaying answer costs a wrong display, not a stranded task. |
+
+### The ruling on site 3, stated rather than omitted
+
+**`orchestrator/src/orchestrator/merge_gates.py::_resolve_already_landed_branch`
+signal 4 is OUT of ε's scope**, for three independent reasons, any one of
+which suffices — the same three-reason shape as the site-8 ruling below:
+
+1. **It is task 3539's declared site.** 3539 landed it on 2026-08-26
+   (`7a6245b493`, the amendment pass that added signal 4) as one of four
+   signals in a single fail-closed ladder, and owns it. Two leaves editing the
+   same call in the same window is the lock contention this decomposition
+   exists to avoid.
+2. **It is not the shape D1 describes.** D1's scope limit enumerates "dispatch
+   gate, Tier-3.5". This is neither: it is the MERGE LANE's already-landed
+   recognizer, reached from
+   `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._submit_to_merge_queue`
+   through the never-raises guard
+   `merge_gates.py::resolve_already_landed_branch`. Its outcome is
+   `OutcomeKind.plan_files_already_landed` — an advisory carve-out from the
+   `plan_files_not_touched` failure — not a dispatch, a stamp or a revert.
+3. **The decay argument does not transfer unaltered.** Signal 4 exists
+   precisely BECAUSE signals 1–3 are claims about immutable history and cannot
+   see a post-hoc revert; effect-present is deliberately the one non-historical
+   leg of that ladder, and it fails CLOSED (`None` = "carve nothing out" =
+   today's behaviour). Replacing it there is a different design question from
+   retiring a *landing-detection* guard whose failure strands a task, and
+   widening D1 by interpretation is how a bounded change becomes an unbounded
+   one.
+
+Recorded for the same reason as site 8: §4 says in its own words that a reader
+who finds a caller with no ruling on it cannot tell whether it was considered
+and excluded or simply missed. This one was considered.
 
 ### The ruling on site 8, stated rather than omitted
 
 The parent PRD requires δ to rule on the eighth landing-detection site it never
-names. **`merge_queue.py:14805` is OUT of ε's scope**, for three independent
-reasons, any one of which suffices:
+names.
+**`orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members`
+is OUT of ε's scope**, for three independent reasons, any one of which
+suffices:
 
 1. **It is task 4497's declared site.** Two leaves editing the same call in the
    same window is the lock contention this decomposition exists to avoid.
@@ -124,14 +201,17 @@ it was considered and excluded or simply missed.
 ## 5. D1's precision arithmetic, RE-DERIVED
 
 **ε must cite these figures, not the PRD's.** The parent's 95.5% / 0.04%
-arithmetic (`landed-not-done-recovery.md:314-330`) predates `40c39cd8ee` and
-is measured against a predicate that no longer exists.
+arithmetic (`docs/prds/landed-not-done-recovery.md` §"The revert measurement
+(why effect-present goes, and what replaces it)") predates `40c39cd8ee` and is
+measured against a predicate that no longer exists.
 
 **What changed.** Task 3116 replaced byte-identity with threshold added-line
-survival — `_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD = 0.98` (`git_ops.py:1165`),
-`_EFFECT_SURVIVAL_PER_FILE_THRESHOLD = 0.90` (`:1173`),
-`_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES = 25` (`:1180`). (These are the real
-symbol names; the task text abbreviates the latter two.) On its own full-corpus
+survival —
+`orchestrator/src/orchestrator/git_ops.py::_EFFECT_SURVIVAL_AGGREGATE_THRESHOLD`
+`= 0.98`, `::_EFFECT_SURVIVAL_PER_FILE_THRESHOLD` `= 0.90`,
+`::_EFFECT_SURVIVAL_PER_FILE_MIN_ADDED_LINES` `= 25` (all module-level
+constants). (These are the real symbol names; the task text abbreviates the
+latter two.) On its own full-corpus
 measurement of 2,827 merges (2,822 usable), it accepts **1,050 of 2,680**
 previously-rejected merges — **39.2%** — leaving a **60.8% residual**.
 
