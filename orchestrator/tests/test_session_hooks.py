@@ -4124,3 +4124,134 @@ def test_refresh_never_overwrites_a_corrupt_body(tmp_path: Path) -> None:
         sh.run_stop(hook_input, env, root=tmp_path)
 
     assert record_path.read_text() == 'not-json{{{'
+
+
+# ---------------------------------------------------------------------------
+# The same one-read pin for SessionStart, which shares the resolution path
+# (task 4662). Today the adopted path reads twice: _env_slug_ownership's
+# probe read, then run_session_start's own read_record.
+# ---------------------------------------------------------------------------
+
+
+def test_session_start_reads_the_written_record_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slug = 'session-cockpit-4662040'
+    hook_input = _adopted_bound_record(slug, tmp_path)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_session_start({**hook_input, 'source': 'startup'}, env, root=tmp_path)
+
+    assert io.reads_of(slug) == 1
+    assert sr.read_record(slug, root=tmp_path).status is sr.Status.RUNNING
+
+
+def test_session_start_writes_the_body_it_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SAME-SNAPSHOT DERIVATION: the record the ownership/remint decision was
+    made on is the record that gets written."""
+    slug = 'session-cockpit-4662041'
+    hook_input = _adopted_bound_record(slug, tmp_path)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_session_start({**hook_input, 'source': 'startup'}, env, root=tmp_path)
+
+    assert len(io.writes) == 1
+    assert io.writes[0].cwd == 'read-1'
+
+
+def test_session_start_fork_path_reads_each_slug_at_most_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawner = 'session-cockpit-4662042'
+    _write_bound_parent(spawner, tmp_path, 4662042)
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': spawner}
+    forked = sh.hook_session_slug(nested, env, root=tmp_path)
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_session_start({**nested, 'source': 'startup'}, env, root=tmp_path)
+
+    assert io.reads_of(spawner) <= 1
+    assert io.reads_of(forked) <= 1
+    assert sr.read_record(spawner, root=tmp_path).status is sr.Status.RUNNING
+    assert sr.read_record(forked, root=tmp_path).parent_session_id == spawner
+
+
+def test_session_start_hand_launched_reads_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
+    slug = sh.hook_session_slug(hook_input, {}, root=tmp_path)
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_session_start(hook_input, {}, root=tmp_path)
+
+    assert io.reads_of(slug) == 1
+    assert sr.read_record(slug, root=tmp_path).status is sr.Status.RUNNING
+
+
+def test_session_start_fault_lane_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CHARACTERIZATION of test_main_session_start_fail_soft_when_probe_read_
+    raises' scenario, asserted here so the single-snapshot rewrite cannot
+    quietly narrow it: a probe read that raises still completes the write,
+    without CLAIMING the record (adopting is fail-soft, binding is permanent).
+    """
+    slug = 'session-cockpit-4662043'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    real_read = sr.read_record
+    calls: list[int] = []
+
+    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk on fire')
+        return real_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sr, 'read_record', _boom_once)
+
+    sh.run_session_start(
+        {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+    )
+
+    assert len(calls) >= 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.RUNNING
+    assert record.claude_session_id is None
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_session_start_first_sight_still_captures_richly(tmp_path: Path) -> None:
+    """OUTCOME PARITY for the rich-capture path (no prior record)."""
+    hook_input = {
+        'session_id': 'sess-rich',
+        'cwd': '/home/leo/src/dark-factory',
+        'transcript_path': '/tmp/ignored.jsonl',
+    }
+    env = {
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '4662',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-4662-1',
+        'CLAUDE_SPAWN_LAUNCHER_PID': '4662044',
+    }
+
+    record = sh.run_session_start(hook_input, env, root=tmp_path)
+
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '4662'
+    assert record.escalation_id == 'esc-4662-1'
+    assert record.cwd == '/home/leo/src/dark-factory'
+    assert record.launcher_pid == 4662044
+    assert record.start_ts
+    assert record.transcript_path == sr.transcript_path_for_cwd(
+        '/home/leo/src/dark-factory'
+    )
