@@ -13,9 +13,11 @@ follow-up commit ``ca71e0e12a``, whose message states the hazard outright: "The
 listing in docs/task-authoring.md is hand-maintained prose with no sync test, so
 it drifts silently if not mirrored by hand." The follow-up landed; the next one
 might not, and nothing would have failed. The same file already demonstrates
-where that ends — the frozenset's own header comment said "the 39 load-bearing
-...keys" while the frozenset held 42, having gone silently stale across two
-independent blessings (tasks 3697 and 4372) before task 3780 dropped the numeral.
+where that ends — at the ORIGINAL base (2026-08-18) the frozenset's own header
+comment said "the 39 load-bearing ...keys" while the frozenset held 42, having
+gone silently stale across two independent blessings (tasks 3697 and 4372)
+before task 3780 dropped the numeral. The stale numeral outlived that base too:
+it still read 39 on the pre-branch main this work rebased onto, against 43 keys.
 
 The drift is not cosmetic. UNDER-listing is the dangerous direction: an author
 consulting the doc sees a key absent, concludes it is unblessed, and either

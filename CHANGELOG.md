@@ -149,7 +149,7 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 **Two changes, and the second matters more than the first.**
 
 **`execution_class` is now a Tier-A blessed metadata key.** It had eight
-production read sites across six modules — `execution_class_guard`,
+production read sites across seven modules — `execution_class_guard`,
 `operational_routing_guard` (which coerces `operational`/`decision` to
 `task_kind='deterministic'` + `always_escalates`, a real dispatch consequence),
 `routing_intent_guard`, `operational_suggestion_guard`,

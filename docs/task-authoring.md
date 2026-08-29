@@ -1278,7 +1278,7 @@ first written), not an invariant.
 **`execution_class` was the third row here and is now CLOSED** — task 3780
 blessed it into Tier-A rather than typing or retiring it. Recorded so a
 reader arriving from an older revision does not re-open it: the fork was
-decided, not deferred. Retiring was ruled out because `routing_intent` is
+decided, not deferred. Retiring was ruled out because `operational_mode` is
 documented as *orthogonal*, not a substitute, so there was nothing to
 migrate to; typing was ruled out for the reasons under "Promoting a
 convention" above. See the frozenset entry in
