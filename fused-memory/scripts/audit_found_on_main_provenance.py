@@ -333,7 +333,7 @@ def extract_cited_task_ids(message: str) -> set[str]:
 # three records message-matching cannot.
 def _second_parent_self_citation(audit: TaskProvenanceAudit) -> str | None:
     """Return the sha of the first commit the cited merge brought in whose
-    message cites ``audit.task_id``, or None.
+    SUBJECT LINE cites ``audit.task_id``, or None.
 
     Deliberately reuses :func:`extract_cited_task_ids` — the same pattern
     the subject scan uses — rather than a second, independent pattern, so
@@ -341,13 +341,29 @@ def _second_parent_self_citation(audit: TaskProvenanceAudit) -> str | None:
     citation-pattern change, e.g. task 4705's bare-paren narrowing, moves
     both together automatically).
 
+    Scans ``message.splitlines()[0]`` only, never the full body. The
+    module header above (the "Residual, un-addressed false-positive
+    source" paragraph before ``CITATION_PATTERN``) already documents that
+    the ``task/{id}`` alternative matches anywhere in a message — scanning
+    full second-parent commit bodies would let body prose like "rebased on
+    top of task/50" manufacture a false CLEARANCE, which is fail-open in a
+    way the subject scan's false positives are not (those are surfaced for
+    a human to filter; a clearance is silent — see
+    ``check_found_on_main_spurious_rate.py`` and
+    ``correct_found_on_main_backlog.py::plan_corrections``, both of which
+    treat a cleared verdict as final). Restricting to the subject line
+    still clears the load-bearing real case: task 3103 / c7dcc4f9d4's
+    `task/3103` citations are themselves subject-line forms (see "THE
+    MEASURED LIMIT" above).
+
     Walk order is ``audit.second_parent_commits``' own order, which is
     ``git log``'s default newest-first (see :func:`_git_second_parent_commits`);
     this returns the FIRST match in that order — first-match-wins, mirroring
     the rest of the module's deterministic-first-match conventions.
     """
     for sha, message in audit.second_parent_commits:
-        if audit.task_id in extract_cited_task_ids(message):
+        subject = message.splitlines()[0] if message else ''
+        if audit.task_id in extract_cited_task_ids(subject):
             return sha
     return None
 
@@ -406,12 +422,19 @@ def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
     coalesced_sha = None if self_cited else _second_parent_self_citation(audit)
     extra: list[str] = []
     if coalesced_sha is not None:
-        extra.append(
-            f"cited merge's second parent carries commit {coalesced_sha} citing "
-            f'task {audit.task_id} — this task\'s work was coalesced into a merge '
-            f'whose own subject names another task, so the subject citation is '
-            f'not proof of misattribution'
-        )
+        if cited:
+            extra.append(
+                f"cited merge's second parent carries commit {coalesced_sha} citing "
+                f'task {audit.task_id} — this task\'s work was coalesced into a merge '
+                f'whose own subject names another task, so the subject citation is '
+                f'not proof of misattribution'
+            )
+        else:
+            extra.append(
+                f"cited merge's second parent carries commit {coalesced_sha} citing "
+                f"task {audit.task_id} — this task's work rode in under the merge's "
+                f"second parent (the cited merge's own subject names no task at all)"
+            )
 
     if cited and not self_cited and coalesced_sha is None:
         others = ', '.join(sorted(cited))
@@ -702,6 +725,19 @@ class GitFacts:
         :func:`_git_second_parent_commits`), so gating it would cost a
         separate parent-count probe just to save a call that is already
         cheap to fail.
+
+        That "cheap to fail" framing covers non-merges only. For a genuine
+        merge — even one whose subject already self-cites, so
+        ``_classify_core`` never ends up consulting the fact at all (it
+        only calls :func:`_second_parent_self_citation` when ``not
+        self_cited``) — this runs a full ``git log`` over up to
+        :data:`_SECOND_PARENT_WALK_CAP` commits (measured up to ~104 on
+        this repo) whose result is then discarded. Accepted as-is because
+        the found_on_main corpus this audit runs over is small; revisit
+        (thread ``task_id`` into this contract so the walk can be skipped
+        when the subject already self-cites, or make
+        ``second_parent_commits`` lazily populated) if that stops being
+        true.
         """
         is_ancestor = await _git_is_ancestor(self.project_root, commit, ref)
         if not is_ancestor:
