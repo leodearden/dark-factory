@@ -767,6 +767,13 @@ class _Other:
 #: below parametrizes over names rather than values because this class is
 #: created at import time, BEFORE the fixtures defined further down the module
 #: exist; ``globals()`` resolves them at call time instead.
+#:
+#: DRIFT IS CHECKED, NOT TRUSTED: this list is spelled out (so a parametrize id
+#: names a real fixture and a deliberate exclusion would be visible) and
+#: ``test_the_fixture_sweep_names_every_marker_source_in_this_module`` asserts it
+#: against the module's own globals.  It had already drifted once — every
+#: class-marked fixture the class tier was written for was missing, so the family
+#: invariant swept only the shapes that predate it.
 _MARKER_SOURCE_FIXTURE_NAMES = (
     '_REAL_PYTESTMARK_SOURCE',
     '_ALL_DECORATED_SOURCE',
@@ -777,8 +784,13 @@ _MARKER_SOURCE_FIXTURE_NAMES = (
     '_MARKED_SOURCE',
     '_UNMARKED_SOURCE',
     '_ALL_DECORATED_SOURCE_WITH_CLASS',
+    '_CLASS_MARKED_SOURCE',
+    '_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE',
+    '_CLASS_MARKED_MODULE_SOURCE',
+    '_CLASS_PARTLY_MARKED_MODULE_SOURCE',
     '_SLOW_MARKED_SOURCE',
     '_UNMARKED_PLAIN_SOURCE',
+    '_CLASS_MARKED_SLOW_SOURCE',
     '_SMOKE_MARKED_SOURCE',
 )
 
@@ -1267,6 +1279,34 @@ class TestGuaranteedMarkerNames:
         """
         source = globals()[fixture_name]
         assert module_level_marker_names(source) <= guaranteed_marker_names(source)
+
+    def test_the_fixture_sweep_names_every_marker_source_in_this_module(self):
+        """THE DRIFT GUARD for the sweep above — the invariant is only as wide as its list.
+
+        ``_MARKER_SOURCE_FIXTURE_NAMES`` is hand-maintained, and it had already
+        silently drifted: every CLASS-marked fixture added for this tier was
+        missing from it, so the one test whose whole purpose is the superset
+        guarantee was asserting it on the legacy shapes and none of the shapes
+        the tier was written for.  A regression making
+        ``guaranteed_marker_names`` return LESS than ``module_level_marker_names``
+        on a class-marked module would have gone straight through.
+
+        Deriving the list at call time instead would fix the drift and lose the
+        readable parametrize ids -- and would need a naming rule loose enough to
+        catch ``_ALL_DECORATED_SOURCE_WITH_CLASS``, which does not even end in
+        ``_SOURCE``. Checking the hand-written list against that rule keeps both.
+        """
+        discovered = {
+            name
+            for name, value in globals().items()
+            if name.startswith('_') and 'SOURCE' in name and isinstance(value, str)
+        }
+        assert discovered, 'premise: the naming rule still finds the fixtures'
+        assert discovered == set(_MARKER_SOURCE_FIXTURE_NAMES), (
+            'a marker-source fixture is missing from _MARKER_SOURCE_FIXTURE_NAMES (or vice '
+            'versa), so the family invariant no longer sweeps it: '
+            f'{sorted(discovered ^ set(_MARKER_SOURCE_FIXTURE_NAMES))}'
+        )
 
     # -- cost bound: exactly one parse per call --------------------------------
 
