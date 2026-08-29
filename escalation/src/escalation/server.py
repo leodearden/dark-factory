@@ -1639,6 +1639,7 @@ def create_server(
         resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        acknowledge_declared_pins: list[str] | None = None,
         escalate_model: bool = False,
         terminate: Any = None,
     ) -> dict[str, Any]:
@@ -1769,6 +1770,29 @@ def create_server(
         ``queue.get`` cannot return is treated as unmarked and skipped, matching
         the cascade's existing best-effort contract (see the in-code note for
         the named limitation).
+
+        ``acknowledge_declared_pins`` is the deliberate override.  It must NAME
+        each escalation id whose declared pin is being spent — a list, not a
+        boolean, because a boolean is one keystroke and is exactly what a
+        rotation working through a homogeneous cluster would set reflexively to
+        make an unexpected error go away, reproducing the incident with an extra
+        parameter.  A PARTIAL acknowledgement still refuses and reports only the
+        remainder, which is the property that stops a bulk closer from waving a
+        whole cluster through on the one id the error happened to mention first.
+        Naming an id that is not blocked is a harmless no-op.
+
+        This acknowledgement is the ONLY release valve: this task ships no
+        un-declare verb, deliberately — withdrawal then happens at the moment of
+        the close, named in the resolution, by the party actually spending the
+        pin, rather than as a separate untraceable write that leaves the record
+        looking as though it was never protected.  A caller reaching for it
+        should first go READ what ``pin_declared_by`` names and consult it, not
+        silence it.
+
+        No extra logging is needed here: ``queue.resolve`` emits one WARNING per
+        pin actually spent — for the head and, via its cascade recursion, for
+        every marked member — so an acknowledged close is loud in the log even
+        though it is permitted.
 
         COVERS every action EXCEPT ``park``: ``resume``, ``restart``,
         ``abandon`` and ``close_only`` all run ``queue.resolve()`` and archive
@@ -1970,7 +1994,9 @@ def create_server(
             member = queue.get(member_id)
             if member is not None:
                 candidates.append(member)
-        blocked = blocking_pin_declarations(candidates)
+        blocked = blocking_pin_declarations(
+            candidates, acknowledged=acknowledge_declared_pins or (),
+        )
         if blocked:
             return {
                 'error': format_refusal(blocked),
