@@ -1224,9 +1224,23 @@ def run_session_start(
         resolution.rejected_env_slug,
         resolution.may_bind,
     )
-    try:
-        record = session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
+    # THE event's only read of the slug it writes: on the adopt path the
+    # ownership probe already read this very record, so its snapshot is
+    # handed forward rather than re-read (task 4662).
+    snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
+    record = snapshot.record
+    if record is None and snapshot.unreadable:
+        # UNREADABLE, not ABSENT: a record EXISTS but could not be parsed or
+        # read, and synthesizing over it would destroy the body holding
+        # role/prompt/result_file. Re-read so a CorruptSessionRecord/OSError
+        # propagates to main()'s blanket except exactly as it does today --
+        # deliberately neither swallowed here nor written past. A
+        # FileNotFoundError here instead means the fault was transient over
+        # a record that is simply absent, which falls through to the capture
+        # below, again exactly as today.
+        with contextlib.suppress(FileNotFoundError):
+            record = session_registry.read_record(slug, root=root)
+    if record is None:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
         if forked_from is not None:
