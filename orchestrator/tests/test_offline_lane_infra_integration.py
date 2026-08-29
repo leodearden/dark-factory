@@ -160,6 +160,18 @@ _SPAWNS_PER_REPO_FIXTURE = 5
 # subprocess at all here.
 _SPAWNS_PER_DRIVE_ADVANCE = 4
 
+# Task 4203 (reviewer amendment) — this module's own copy of the sibling's
+# constant of the same name (see that module for the full rationale), needed
+# only by `test_ib2_infra_run_in_flight_never_gates_merge`'s
+# `out_of_bound_spawns` row. MEASURED, not hand-counted (see
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_assert_infra_never_a_gate` performs one `git_ops.get_main_sha()` (1) plus
+# TWO `_advance_main` rounds (3 each) = 7. Both `_note_merge_all` calls inside
+# it contribute zero spawns here, same stub as `_SPAWNS_PER_DRIVE_ADVANCE`'s.
+# An earlier hand approximation priced this whole function as "one
+# _drive_advance-equivalent round" (4), undercounting the true value by 3.
+_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE = 7
+
 
 def _required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
     """Task 4203 — this module's own copy of the sibling numeric module's
@@ -745,16 +757,18 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     # table (see that module for the full rationale). ib4 drives exactly n x
     # _drive_advance via _drive_infra_reds (`for _ in range(n)`); ib2 drives
     # one direct _drive_advance plus _assert_infra_never_a_gate's own
-    # unbounded advance-and-notify work, approximated at one
-    # _drive_advance-equivalent round (matching this module's landed
-    # @pytest.mark.timeout comment on ib2, "two _drive_advance/_advance_main
-    # rounds").
+    # unbounded advance-and-notify work — MEASURED (reviewer amendment, task
+    # 4203) at _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE = 7, not the earlier hand
+    # approximation of one _drive_advance-equivalent round (4), which
+    # undercounted by 3 (see that constant's comment for the breakdown).
     out_of_bound_spawns = {
         test_ib4_same_infra_set_recurrence_updates_not_duplicates: (
             _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
         ),
         test_ib2_infra_run_in_flight_never_gates_merge: (
-            _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
+            _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE
         ),
     }
     assert set(worst_case_secs) == set(out_of_bound_spawns), (
@@ -969,7 +983,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
-    harness: Harness, repo: Path, tmp_path: Path,
+    harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
 ) -> None:
     """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_REPO_FIXTURE` are the
     multiplicands `_required_timeout_secs` (task 4203) prices at
@@ -982,6 +996,23 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     fixture stubs `get_merge_diff_files` the same way, but the count itself
     is MEASURED here, independently, per this task's own "measure, don't
     trust" rule — not copied from the sibling's result.
+
+    REVIEWER AMENDMENT (task 4203) also measures
+    `_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE` — this module's own copy of the
+    sibling's third multiplicand, needed only by
+    `test_ib2_infra_run_in_flight_never_gates_merge`'s `out_of_bound_spawns`
+    row. Measured under the SAME counting wrapper.
+
+    Deliberately calls `_assert_infra_never_a_gate` WITHOUT first driving it
+    through `test_ib2_infra_run_in_flight_never_gates_merge`'s full
+    held-in-flight `_run_lane` scaffolding — this module's own copy accepts
+    no `runner` argument at all (unlike the sibling's `_assert_never_a_gate`),
+    so there is nothing to hold in flight for the measurement to skip.
+    Composing an actual `_run_lane` pass here would also wrongly register
+    THIS test in `_lane_pass_composing_callers`' AST net (it scans for
+    literal calls to `_run_lane` / `_run_one_lane_pass` / `_drive_infra_reds`
+    by name), forcing it into `worst_case_secs` and a `@pytest.mark.timeout`
+    override it does not need.
 
     SEAM VERIFICATION: identical to the sibling module's — this module also
     does ``from orchestrator.git_ops import GitOps, _run`` at module scope,
@@ -1039,6 +1070,28 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'_required_timeout_secs — every test in this module transitively '
         f'pulls the repo fixture, so a drift here mis-prices every '
         f'composing test, not just one.'
+    )
+
+    # Reviewer amendment (task 4203) — measure `_assert_infra_never_a_gate`
+    # itself. No held-in-flight `_run_lane` pass is composed here (see this
+    # test's docstring), so `_build_infra_worker` is left on its default
+    # `infra_runner` — this measurement never triggers a run, so which seam
+    # it would have used is immaterial.
+    calls.clear()
+    worker = _build_infra_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _assert_infra_never_a_gate(harness, worker, repo, git_ops)
+
+    assert len(calls) == _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE, (
+        f'_assert_infra_never_a_gate spawned {len(calls)} real git '
+        f'subprocess(es) ({calls}), not the pinned '
+        f'_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE = '
+        f'{_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE}. This count is the second '
+        f'out_of_bound_spawns multiplicand '
+        f'test_ib2_infra_run_in_flight_never_gates_merge needs beyond its '
+        f'own _drive_advance call.'
     )
 
 
@@ -1220,10 +1273,13 @@ async def _assert_infra_never_a_gate(
 @pytest.mark.timeout(150)  # task 4030: NOT a _drive_infra_reds chainer, which is why the
 # task-3832 review's marker sweep missed it -- but it composes anyway: a 30s _run_lane bound
 # raced concurrently by wait_entered (max, not sum), then _assert_infra_never_a_gate's 0.5 +
-# 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns (repo init,
-# _setup_repo, two _drive_advance/_advance_main rounds; task 3451 measured 4.71s worst case
-# per spawn). Clear the 60s pyproject default with margin so a genuinely wedged pass fails via
-# _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
+# 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns: repo init
+# (_SPAWNS_PER_REPO_FIXTURE=5), one _drive_advance (4), and _assert_infra_never_a_gate's own
+# get_main_sha + two _advance_main rounds (_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE=7, task 4203
+# reviewer amendment -- MEASURED, supersedes an earlier "two _drive_advance/_advance_main
+# rounds" approximation) = 16 spawns x 4.71s = 75.36s, required = 120.86s, comfortably under
+# this marker. Clear the 60s pyproject default with margin so a genuinely wedged pass fails
+# via _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
 @pytest.mark.asyncio
 async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo, tmp_path):
     """IB2 (C7/§6, load-bearing) — a merge-landed notification while the

@@ -134,6 +134,22 @@ _SPAWNS_PER_REPO_FIXTURE = 5
 # which it is here (the `git_config` fixture never sets it).
 _SPAWNS_PER_DRIVE_ADVANCE = 4
 
+# Task 4203 (reviewer amendment) — the THIRD multiplicand, needed only by
+# `test_b3_never_a_gate`'s `out_of_bound_spawns` row. MEASURED, not
+# hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
+# `_assert_never_a_gate` performs one `git_ops.get_main_sha()` (1) plus TWO
+# `_advance_main` rounds (3 each: `add` / `commit` / `rev-parse`) = 7 — NOT
+# `_SPAWNS_PER_DRIVE_ADVANCE` (4), because it drives an extra `_advance_main`
+# beyond a single `_drive_advance`'s shape, and NOT 8 (2x
+# `_SPAWNS_PER_DRIVE_ADVANCE`) either, since only ONE `get_main_sha` is
+# fetched up front (the second round reuses its own returned head as the new
+# base). Both `_note_merge_all` calls inside it contribute zero spawns here,
+# same stub as `_SPAWNS_PER_DRIVE_ADVANCE`'s. An earlier hand approximation
+# priced this whole function as "one _drive_advance-equivalent round" (4),
+# undercounting the true value by 3 — exactly the drift a measuring test
+# exists to catch.
+_SPAWNS_PER_ASSERT_NEVER_A_GATE = 7
+
 
 def _required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
     """Task 4203 — THE canonical sizing model for `@pytest.mark.timeout`
@@ -832,10 +848,10 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     # drive exactly n x `_drive_advance` via `_drive_reds` (`for _ in
     # range(n)`) — b7's four `_drive_reds` calls sum n = 2+1+2+1 = 6. b3
     # drives one direct `_drive_advance` plus `_assert_never_a_gate`'s own
-    # unbounded advance-and-notify work, approximated here at one
-    # `_drive_advance`-equivalent round (the landed `@pytest.mark.timeout`
-    # comment on b3 itself already characterizes this as "two
-    # _drive_advance/_advance_main rounds").
+    # unbounded advance-and-notify work — MEASURED (reviewer amendment,
+    # task 4203) at `_SPAWNS_PER_ASSERT_NEVER_A_GATE` = 7, not the earlier
+    # hand approximation of one `_drive_advance`-equivalent round (4), which
+    # undercounted by 3 (see that constant's comment for the breakdown).
     out_of_bound_spawns = {
         test_b5_same_set_recurrence_updates_not_duplicates: (
             _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
@@ -844,7 +860,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             _SPAWNS_PER_REPO_FIXTURE + 6 * _SPAWNS_PER_DRIVE_ADVANCE
         ),
         test_b3_never_a_gate: (
-            _SPAWNS_PER_REPO_FIXTURE + 2 * _SPAWNS_PER_DRIVE_ADVANCE
+            _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_NEVER_A_GATE
         ),
     }
     assert set(worst_case_secs) == set(out_of_bound_spawns), (
@@ -1001,6 +1019,9 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         _LANE_PASS_BOUND_SECS as _infra_lane_pass_bound_secs,
     )
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
+        _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE as _infra_spawns_per_assert_never_a_gate,
+    )
+    from test_offline_lane_infra_integration import (  # noqa: PLC0415
         _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
     )
     from test_offline_lane_infra_integration import (  # noqa: PLC0415
@@ -1033,6 +1054,17 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'({_infra_spawns_per_drive_advance}) — both modules share byte-identical '
         f'_drive_advance bodies and harness fixture stubs, so a real divergence here '
         f"means one module's measurement (or fixture) has silently changed."
+    )
+    # Reviewer amendment (task 4203) — same anti-drift rationale, for the third
+    # multiplicand test_b3_never_a_gate / test_ib2_infra_run_in_flight_never_gates_merge
+    # each need beyond their own _drive_advance call.
+    assert _infra_spawns_per_assert_never_a_gate == _SPAWNS_PER_ASSERT_NEVER_A_GATE, (
+        f"this module's _SPAWNS_PER_ASSERT_NEVER_A_GATE ({_SPAWNS_PER_ASSERT_NEVER_A_GATE}) "
+        f"has drifted from test_offline_lane_infra_integration.py's copy, "
+        f'_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE ({_infra_spawns_per_assert_never_a_gate}) — '
+        f'both modules share byte-identical _assert_never_a_gate / _assert_infra_never_a_gate '
+        f"bodies and harness fixture stubs, so a real divergence here means one module's "
+        f'measurement (or fixture) has silently changed.'
     )
 
     global_timeout = _effective_per_test_timeout(pytestconfig)
@@ -1117,7 +1149,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
-    harness: Harness, repo: Path, tmp_path: Path,
+    harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
 ) -> None:
     """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_REPO_FIXTURE` are the
     multiplicands `_required_timeout_secs` (task 4203) prices at
@@ -1128,6 +1160,26 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     `_run_lane`'s) had already drifted from each other AND from the truth,
     which is exactly the failure mode a measuring test — instead of a third
     hand count — closes off.
+
+    REVIEWER AMENDMENT (task 4203) also measures `_SPAWNS_PER_ASSERT_NEVER_A_GATE`
+    — the third multiplicand `test_b3_never_a_gate`'s `out_of_bound_spawns` row
+    needs beyond its own single `_drive_advance` call. An earlier hand
+    approximation treated the whole of `_assert_never_a_gate` as "one
+    `_drive_advance`-equivalent round" (4 spawns); measured under the SAME
+    counting wrapper, it is actually 7.
+
+    Deliberately calls `_assert_never_a_gate` WITHOUT first driving it through
+    `test_b3_never_a_gate`'s full held-in-flight `_run_lane` scaffolding:
+    `_assert_never_a_gate` accepts a `runner` argument but never reads it in
+    its own body (the parameter only documents an already-satisfied
+    precondition of its real caller) — its git-spawn count is therefore
+    unaffected by whether a pass is actually held in flight. Composing an
+    actual `_run_lane` pass here would also wrongly register THIS test in
+    `_lane_pass_composing_callers`' AST net (it scans for literal calls to
+    `_run_lane` / `_run_one_lane_pass` / `_drive_reds` by name), forcing it
+    into `worst_case_secs` and a `@pytest.mark.timeout` override it does not
+    need — this test's own real-git footprint stays the marker-less shape
+    the docstring below describes.
 
     SEAM VERIFICATION (must hold before a single monkeypatch target can be
     trusted to observe every spawn): this module does ``from
@@ -1216,6 +1268,28 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'composing test, not just one.'
     )
 
+    # Reviewer amendment (task 4203) — measure `_assert_never_a_gate` itself.
+    # `runner` is required by its signature but never read in its body (see
+    # this test's docstring), so a bare, never-driven instance is enough —
+    # no held-in-flight `_run_lane` pass is composed here.
+    calls.clear()
+    runner = _ControllableSuiteRunner()
+    worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
+    _wire_lane(harness, worker)
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        await _assert_never_a_gate(harness, worker, runner, repo, git_ops)
+
+    assert len(calls) == _SPAWNS_PER_ASSERT_NEVER_A_GATE, (
+        f'_assert_never_a_gate spawned {len(calls)} real git subprocess(es) '
+        f'({calls}), not the pinned _SPAWNS_PER_ASSERT_NEVER_A_GATE = '
+        f'{_SPAWNS_PER_ASSERT_NEVER_A_GATE}. This count is the second '
+        f'out_of_bound_spawns multiplicand test_b3_never_a_gate needs beyond '
+        f'its own _drive_advance call — a drift here mis-prices that test '
+        f"(and the infra module's mirror, "
+        f'test_ib2_infra_run_in_flight_never_gates_merge).'
+    )
+
 
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
@@ -1290,10 +1364,13 @@ async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, rep
 @pytest.mark.timeout(150)  # task 4030: NOT a _drive_reds chainer, which is why the task-3832
 # review's marker sweep missed it -- but it composes anyway: a 30s _run_lane bound raced
 # concurrently by wait_entered (max, not sum), then _assert_never_a_gate's 0.5 + 15.0
-# SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns (repo init,
-# _setup_repo, two _drive_advance/_advance_main rounds; task 3451 measured 4.71s worst case
-# per spawn). Clear the 60s pyproject default with margin so a genuinely wedged pass fails via
-# _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
+# SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns: repo init
+# (_SPAWNS_PER_REPO_FIXTURE=5), one _drive_advance (4), and _assert_never_a_gate's own
+# get_main_sha + two _advance_main rounds (_SPAWNS_PER_ASSERT_NEVER_A_GATE=7, task 4203
+# reviewer amendment -- MEASURED, supersedes an earlier "two _drive_advance/_advance_main
+# rounds" approximation) = 16 spawns x 4.71s = 75.36s, required = 120.86s, comfortably under
+# this marker. Clear the 60s pyproject default with margin so a genuinely wedged pass fails
+# via _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
 @pytest.mark.asyncio
 async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
     """B3 (PRD §8, C7) — a merge-landed notification while the lane is
