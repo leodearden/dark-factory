@@ -7229,6 +7229,27 @@ class TestTimeoutMarkOffenders:
 # ---------------------------------------------------------------------------
 # task 3492 step-3: enforced coverage invariant over THIS module's own source
 # ---------------------------------------------------------------------------
+#
+# RELATED, BUT ENFORCED ELSEWHERE (task 4246): the SHAPE of a load-bearing wait
+# — a `MergeRequest.result` future or a `gate*.wait()` barrier reached through a
+# bare `asyncio.wait_for(...)`, or carrying a raw numeric `timeout=` literal —
+# is now checked repo-wide by rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py, run by the seven package
+# lint_commands, dark-factory-orchestrator.yaml and hooks/project-checks. That
+# rule and this class are complements, not overlaps: the rule says a wait must
+# be loop-responsive (`wait_responsive(...)` with a descriptive `label=`, bound
+# derived from MERGE_RESULT_TIMEOUT rather than a written number); this class
+# says whatever budget the resulting waits add up to must be covered by an
+# adequate `@pytest.mark.timeout`. It stays here because it needs runtime marks
+# and imported helper constants, which the stdlib-only checker cannot have —
+# see the policy note above test_merge_speculation.py::TestTimeoutMarkCoverage.
+#
+# THIS FILE CARRIES DEBT under that rule: it is on the shrink-only, opt-out
+# `_WALL_CLOCK_DEADLINE_DEBT` baseline at its measured day-one count (90
+# violations), so its pre-existing sites are grandfathered but the budget is
+# CHECKED — add one more offending wait and the gate reports the overrun. New
+# load-bearing waits added here must therefore use `wait_responsive(...)`, and
+# the recorded number may only be lowered as sites are migrated, never raised.
 
 
 class TestTimeoutMarkCoverage:

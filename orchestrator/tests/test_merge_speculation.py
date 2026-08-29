@@ -3764,6 +3764,35 @@ class TestFinalizeInflightJournalsLandedRow:
 # ---------------------------------------------------------------------------
 # task 3980: enforced timeout-mark coverage over THIS module's own source
 # ---------------------------------------------------------------------------
+#
+# POLICY (task 4246): this guard deliberately STAYS file-local, and is the one
+# guard in this module that did NOT move into
+# fused-memory/scripts/check_bare_magicmock_config.py alongside
+# `wall-clock-deadline` and `bare-dataclass-double`. Two independent reasons,
+# both hard:
+#
+#   1. It is not an AST-only guard. `_timeout_mark_offenders` resolves each
+#      class through a RUNTIME resolver (`globals().get` below) and reads the
+#      live `cls.pytestmark` marks, and the mark's argument is a Name
+#      (`@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`), not a literal a
+#      static pass could evaluate. Its budget engine likewise depends on
+#      RESPONSIVE_WAIT_STRETCH / RESPONSIVE_WAIT_WALL_CAP imported from
+#      orchestrator's test helpers. The checker script holds a hard
+#      stdlib-only contract — hooks/project-checks runs it under a bare
+#      `python3` with no uv env resolution — so importing this module's
+#      dependencies there is not an option, and re-deriving the constants
+#      would recreate exactly the drift the imports exist to prevent.
+#
+#   2. It is ALREADY shared, by cross-module import rather than by copy: the
+#      helpers come from test_merge_queue_concurrent_verify (see the imports
+#      at the head of this file), which is why moving it would not remove a
+#      duplicate. It is not the one-copy-per-test-module multiplication that
+#      motivated task 4246; the two guards that WERE that multiplication are
+#      the ones that moved.
+#
+# So the (a)/(b)/(c) choice this task weighed resolved to option (c) — leave it
+# file-local — for this guard alone, and to option (a) — widen the shared
+# checker — for the other two. Do not "finish the job" by moving this one too.
 
 
 class TestTimeoutMarkCoverage:
