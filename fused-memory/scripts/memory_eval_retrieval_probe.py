@@ -1527,10 +1527,17 @@ class InversionObservation:
     itself the signal: comparable ≪ registered means most pairs are not being
     returned at all, which is a findability fact ``canonical-in-top-k``
     measures and this metric must not be read as if it had.
+
+    ``k`` is the depth this observation was SCORED at, not the depth fetched
+    — mirroring :class:`ContaminationObservation` and :class:`ClaimObservation`.
+    It is required rather than defaulted so no construction site can silently
+    claim the tripwire's depth for an observation actually built at another
+    one; every existing construction site passes it explicitly.
     """
 
     topic: str
     phrasing: str
+    k: int
     pairs_registered: int
     pairs_comparable: int
     inversions: tuple[InversionRecord, ...] = ()
@@ -1978,6 +1985,7 @@ async def probe_topic(
         observations.inversions.append(InversionObservation(
             topic=entry.topic,
             phrasing=phrasing.text,
+            k=scored_k,
             pairs_registered=len(entry.supersedes_pairs),
             pairs_comparable=comparable_pairs(entry, ranks),
             inversions=tuple(

@@ -1717,11 +1717,12 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
     )
 
 
-def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False):
+def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5):
     m = _mod()
     return m.InversionObservation(
         topic=topic,
         phrasing='q',
+        k=k,
         pairs_registered=pairs,
         # Default: every registered pair came back both-present. Tests that
         # care about the exposure gap set it explicitly.
@@ -2421,7 +2422,7 @@ def _report_observations():
         claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
         inversions=[m.InversionObservation(
-            topic='alpha-topic', phrasing='tuned',
+            topic='alpha-topic', phrasing='tuned', k=5,
             pairs_registered=1, pairs_comparable=1,
             inversions=(m.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
