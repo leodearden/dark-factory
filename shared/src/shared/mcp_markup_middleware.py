@@ -394,6 +394,47 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 #: A rate alarm about the window, carrying no payload of its own.
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
+
+def _caller_label(
+    agent_id: str | None,
+    subject_task_id: str | None,
+    subject_agent_role: str | None,
+) -> str | None:
+    """One human-legible string naming a leaking caller, or ``None``.
+
+    The ATTRIBUTION dimension ``StormCounter`` documents — "the label
+    dimension is load-bearing, not decoration" — rendered from the two
+    disjoint axes ``_identity`` and ``_subject`` resolve. Both are folded into
+    one string because ``StormCounter`` takes a single opaque label; keeping
+    the axis names in it is what stops a bare ``'4805'`` reading as an
+    ``agent_id`` on a boundary where only the subject axis resolved.
+
+    Axes that came back ``None`` are OMITTED rather than rendered as nulls, so
+    a label carries only what a caller actually declared. All three ``None``
+    yields ``None``: ``StormCounter``'s contract is that an unlabelled event
+    still counts toward the burst and is simply not named, which is what makes
+    an empty ``callers`` beside a non-zero ``count`` correct rather than a bug.
+
+    Values are ``!r``-rendered, and that is not cosmetic. The label lands
+    verbatim in an operator-facing escalation ``detail``, and the axes are
+    caller-supplied strings — a raw newline would inject a line into a body
+    ``markup_tripwire._recorded_outcome`` parses back for its ``outcome=``
+    key, silently disabling the outcome-mismatch warning that is an operator's
+    only sign a burst folded into a record naming a different outcome. ``!r``
+    escapes newlines and is what every existing diagnostic line in both sinks
+    already uses.
+    """
+    parts = [
+        f'{key}={value!r}'
+        for key, value in (
+            ('agent_id', agent_id),
+            ('task_id', subject_task_id),
+            ('agent_role', subject_agent_role),
+        )
+        if value is not None
+    ]
+    return ' '.join(parts) if parts else None
+
 #: The queue CATEGORY a boundary guard's burst alarm is filed under — one
 #: spelling for every ``MarkupGuardMiddleware`` registration site, because a
 #: burst on the escalation server and a burst on verdict-tools are the same
@@ -1070,10 +1111,22 @@ class MarkupGuardMiddleware(Middleware):
             counter = StormCounter(time_provider=self._storm_time_provider)
             self._storms[key] = counter
 
+        # The label was ``key`` — the very string this counter is keyed by —
+        # so the distinct-label set ``StormCounter.record`` returns was
+        # DEGENERATE by construction: one element, always, however many
+        # callers leaked. Not a tally being ignored, an attribution slot wired
+        # to a constant; no consumer read it. ``StormCounter``'s own docstring
+        # states "the label dimension is load-bearing, not decoration", which
+        # is exactly the slot reclaimed here — so do not "simplify" this back
+        # to ``label=key``.
+        #
+        # This buys per-key ATTRIBUTION and never a per-key THRESHOLD (that
+        # contract is stated in ``record``'s docstring), so nothing about WHEN
+        # a burst fires changes: the key above is untouched.
         summary = counter.record(
             threshold=self._storm_threshold,
             window_seconds=self._storm_window_seconds,
-            label=key,
+            label=_caller_label(agent_id, subject_task_id, subject_agent_role),
         )
 
         # One counter per key means one object per key ever seen, and `project`
@@ -1110,6 +1163,16 @@ class MarkupGuardMiddleware(Middleware):
             'crossing_agent_id': agent_id,
             'crossing_subject_task_id': subject_task_id,
             'crossing_subject_agent_role': subject_agent_role,
+            # The WINDOW-wide answer, under its own key so the two questions
+            # are never conflated: already sorted, already de-duplicated and
+            # already excluding ``None`` by ``StormCounter.record``.
+            #
+            # A distinct SET, deliberately not per-identity COUNTS. A tally
+            # would need new state inside ``StormCounter`` and a fourth
+            # consumer contract; this set is already computed on every fire
+            # and was simply discarded. Recorded here so the difference is not
+            # re-litigated as an oversight.
+            'callers': summary['labels'],
         }
         # ERROR, and greppable: markup_tripwire's split again — the summary
         # folded into the response reaches ONLY the leaking caller, which is
