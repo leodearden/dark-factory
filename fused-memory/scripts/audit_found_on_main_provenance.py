@@ -186,8 +186,11 @@ class TaskProvenanceAudit:
     Task facts (``task_id``/``title``/``commit``/``note``/``declared_files``)
     are populated by :func:`select_found_on_main_tasks`. The git-fact fields
     default to benign placeholders until :func:`build_audit_report` fills
-    them in from an injected git-facts dependency. ``verdict``/``reasons``
-    are set by :func:`classify`.
+    them in from an injected git-facts dependency — including
+    ``second_parent_commits``: ``(sha, message)`` pairs for the commits a
+    CITED MERGE brought in under its second parent; empty for a non-merge, a
+    git failure, or a commit whose facts were never gathered. ``verdict``/
+    ``reasons`` are set by :func:`classify`.
     """
 
     task_id: str
@@ -199,6 +202,7 @@ class TaskProvenanceAudit:
     commit_subject: str = ''
     commit_message: str = ''
     commit_files: list[str] = field(default_factory=list)
+    second_parent_commits: list[tuple[str, str]] = field(default_factory=list)
     revert_commit: str | None = None
     declared_files_missing_on_main: list[str] = field(default_factory=list)
     declared_files_inconclusive: list[str] = field(default_factory=list)
@@ -275,6 +279,27 @@ def extract_cited_task_ids(message: str) -> set[str]:
     return ids
 
 
+def _second_parent_self_citation(audit: TaskProvenanceAudit) -> str | None:
+    """Return the sha of the first commit the cited merge brought in whose
+    message cites ``audit.task_id``, or None.
+
+    Deliberately reuses :func:`extract_cited_task_ids` — the same pattern
+    the subject scan uses — rather than a second, independent pattern, so
+    the subject scan and this lineage scan can never drift apart (a future
+    citation-pattern change, e.g. task 4705's bare-paren narrowing, moves
+    both together automatically).
+
+    Walk order is ``audit.second_parent_commits``' own order, which is
+    ``git log``'s default newest-first (see :func:`_git_second_parent_commits`);
+    this returns the FIRST match in that order — first-match-wins, mirroring
+    the rest of the module's deterministic-first-match conventions.
+    """
+    for sha, message in audit.second_parent_commits:
+        if audit.task_id in extract_cited_task_ids(message):
+            return sha
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Classifier (pure)
 # ---------------------------------------------------------------------------
@@ -291,6 +316,13 @@ def classify(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
     reviewer can tell "some declared file's presence on the ref couldn't be
     confirmed (transient git failure)" apart from a verdict actually earned
     by confirmed facts.
+
+    A coalesce clearance (see :func:`_second_parent_self_citation`) never
+    changes which verdict wins the ladder either — it only ever suppresses
+    ``misattributed``/``unverifiable`` on positive evidence that this
+    task's own work rode in under a cited merge's second parent, and
+    contributes an extra leading reason (the clearing commit's sha) so a
+    human can see why, whichever verdict finally wins.
     """
     verdict, reasons = _classify_core(audit)
     if audit.declared_files_inconclusive:
@@ -311,7 +343,25 @@ def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
         ]
 
     cited = extract_cited_task_ids(audit.commit_message)
-    if cited and audit.task_id not in cited:
+    self_cited = audit.task_id in cited
+    # A cited MERGE's subject can name only the task that "owns" it while
+    # this task's own work rode in under the second parent — this repo's
+    # merge worker routinely coalesces several tasks' branches under one
+    # subject (see plan.json's "THE DEFECT" for task 4706). So before
+    # declaring misattribution, look for a self-citation in what the merge
+    # actually brought in, using the same citation semantics as the
+    # subject scan.
+    coalesced_sha = None if self_cited else _second_parent_self_citation(audit)
+    extra: list[str] = []
+    if coalesced_sha is not None:
+        extra.append(
+            f"cited merge's second parent carries commit {coalesced_sha} citing "
+            f'task {audit.task_id} — this task\'s work was coalesced into a merge '
+            f'whose own subject names another task, so the subject citation is '
+            f'not proof of misattribution'
+        )
+
+    if cited and not self_cited and coalesced_sha is None:
         others = ', '.join(sorted(cited))
         return 'misattributed', [
             f'commit message cites task(s) {others}, not task {audit.task_id} — '
@@ -328,21 +378,23 @@ def _classify_core(audit: TaskProvenanceAudit) -> tuple[str, list[str]]:
         if audit.declared_files_missing_on_main:
             missing = ', '.join(audit.declared_files_missing_on_main)
             reasons.append(f'declared file(s) missing from the ref HEAD: {missing}')
-        return 'reverted', reasons
+        return 'reverted', [*extra, *reasons]
 
     if audit.declared_files and not any(f in audit.commit_files for f in audit.declared_files):
         return 'deliverable_absent', [
+            *extra,
             f'none of the declared file(s) {sorted(audit.declared_files)} appear in the '
             f'cited commit\'s diff',
         ]
 
-    if not audit.declared_files and audit.task_id not in cited:
+    if not audit.declared_files and not self_cited and coalesced_sha is None:
         return 'unverifiable', [
+            *extra,
             'no declared files and the commit message does not cite this task — '
             'nothing to verify the found_on_main claim against',
         ]
 
-    return 'ok', []
+    return 'ok', extra
 
 
 # ---------------------------------------------------------------------------
