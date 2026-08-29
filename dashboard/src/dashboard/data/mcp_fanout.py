@@ -85,6 +85,28 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # 4.2s, and tasks.fetch_tasks documents a cold-session worst case of
 # roughly 3 * DEFAULT_PER_CALL_TIMEOUT (~6s) per URL — while converting an
 # UNBOUNDED wedge (19.8h measured) into a bounded one.
+#
+# This bound is UNREACHABLE from active_tasks.collect_tasks_with_counts's
+# per-project path (the Tasks tab): _shape_one_project — which calls
+# fetch_tasks/fetch_statuses, i.e. THIS bound's own _fetch_tasks_cache /
+# _fetch_statuses_cache — runs under
+# ``asyncio.wait_for(..., timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET))``
+# with active_tasks._TASKS_PER_PROJECT_BUDGET == 7.0, itself inside
+# active_tasks._TASKS_TOTAL_BUDGET == 20.0. A caller on THAT path is
+# cancelled at <= 7s, well before this 15s bound could ever fire, so a wedge
+# there still surfaces exactly as it did before this module's fix: as a
+# per-project "degraded" WARNING (rows/done-count UNKNOWN), never as a
+# bypass. That is acceptable — collect_tasks_with_counts already has its own
+# adequate degradation story for exactly this case, and this fix does not
+# need to duplicate it; the fix is chosen for the callers below instead.
+#
+# The bound IS reachable from every OTHER live call site, because none of
+# them has an enclosing deadline: app._task_cards_cache (which also reaches
+# _fetch_tasks_cache, but via fetch_tasks called from _load_task_cards — a
+# path with no _TASKS_PER_PROJECT_BUDGET-style wrapper, so the SAME cache
+# can be bound-reachable or not depending on which caller reached it),
+# app._analytics_cache, app._memory_evals_cache, scheduler._scheduler_cache,
+# and merge_queue._task_titles_cache.
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 # A bypass must leave its own journal trace — reusing the SAME
@@ -439,12 +461,24 @@ class TTLCache(Generic[V]):
           has taken a lock object from ``_locks`` reaches ``lock.acquire()``
           with no intervening await (see ``get_or_refresh``), so it cannot be
           suspended between ``setdefault`` and entering ``acquire()``. This
-          invariant survives the bounded acquisition (task 4789):
+          invariant survives the bounded acquisition (task 4789) ON CPYTHON
+          >= 3.12: there, ``asyncio.wait_for`` is implemented as ``async with
+          timeouts.timeout(...): return await fut``, so
           ``await asyncio.wait_for(lock.acquire(), ...)`` delegates into
-          ``lock.acquire()`` as a coroutine, and neither ``wait_for``'s
-          preamble nor ``Timeout.__aenter__`` contains an await, so control
-          still never returns to the event loop before ``acquire()``'s body
-          runs.
+          ``lock.acquire()`` as a coroutine, and neither that preamble nor
+          ``Timeout.__aenter__`` contains an await — control never returns to
+          the event loop before ``acquire()``'s body runs. This package's
+          declared floor is lower (``requires-python = '>=3.11,<4'``), and on
+          3.11 ``wait_for`` instead unconditionally wraps its argument in a
+          ``Task`` via ``ensure_future`` and awaits a *separate* waiter
+          future — control CAN return to the loop first, so a concurrent
+          sweep could reclaim the still-idle, unwaited lock in that window,
+          leaving two callers holding different ``Lock`` objects for one
+          key. The blast radius matches the ``getattr``-fallback case just
+          below — one duplicate refresh, never corruption — and the
+          deployed interpreter is 3.13, where the invariant holds without
+          qualification; this note exists so a reader on 3.11 knows the
+          degradation is bounded, not silent.
 
           ``locked()`` alone would NOT be enough, which is why the predicate
           below also checks for waiters. ``asyncio.Lock.release()`` clears
