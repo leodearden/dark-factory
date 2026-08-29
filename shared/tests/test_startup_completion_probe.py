@@ -390,11 +390,13 @@ _POISONED_KEYS = frozenset(
         'redaction_failed',
         'redaction_failure_pattern',
         'mode',
+        'wedge_shape',
         'sample_kind',
         'sample_index',
         'sample_offset_secs',
         'captured_at',
         'session_id',
+        'probe_run_id',
         'substrate_returns',
     }
 )
@@ -474,6 +476,59 @@ class TestGateNeverRaisesOnGenericHit:
                 f'nulled it out'
             )
 
+    @pytest.mark.parametrize('wedge_shape', sorted(set(probe.MODE_WEDGE_SHAPE.values()), key=str))
+    def test_every_declared_wedge_shape_survives(self, monkeypatch, wedge_shape):
+        """A member of the probe's own closed wedge-shape set is carried through.
+
+        Parametrized off ``MODE_WEDGE_SHAPE`` rather than a hand-written list, so
+        adding a mode cannot leave this test agreeing with the old constant.
+        ``None`` is a LEGITIMATE member (the healthy and replay regimes), which is
+        why the filter has to be a membership test and not a truthiness one.
+        """
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(wedge_shape=wedge_shape))
+        assert result['wedge_shape'] == wedge_shape, (
+            f'{wedge_shape!r} is a declared MODE_WEDGE_SHAPE value but the degraded '
+            f'row nulled it out'
+        )
+
+    @pytest.mark.parametrize('wedge_shape', [_LONG_RUN, 'not-a-wedge-shape', 7])
+    def test_a_non_member_wedge_shape_degrades_to_none(self, monkeypatch, wedge_shape):
+        # Same reasoning as `mode`: an arbitrary string in a closed-set field is
+        # the route by which credential material would ride back into a row whose
+        # whole claim is that it is clean BY CONSTRUCTION.
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(wedge_shape=wedge_shape))
+        assert result['wedge_shape'] is None
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:poisoned-row-wedge-shape'
+        )
+
+    @pytest.mark.parametrize(
+        'probe_run_id',
+        # The REAL corpus values, read off the fixtures README's Provenance table
+        # (:129-135), so the validator is pinned against what the probe has
+        # actually written rather than against the regex's own assumptions.
+        [
+            'healthy-171d92bec337',
+            'healthy-e52685462d20',
+            'build_wedge-721c2ab8ebb1',
+            'uv_wedge-d178e0084890',
+            'mcp_wedge-7182760110c3',
+        ],
+    )
+    def test_a_probe_authored_run_id_survives(self, monkeypatch, probe_run_id):
+        """``probe_run_id`` is the key the curated corpus JOINS on.
+
+        ``test_every_row_is_linked_to_a_raw_probe_run`` fails any curated row
+        whose ``probe_run_id`` is absent from the raw capture, and ``session_id``
+        does not stand in for it — so a degraded row without one is unjoinable
+        even though it is attributable.
+        """
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(probe_run_id=probe_run_id))
+        assert result['probe_run_id'] == probe_run_id
+
     def test_substrate_returns_is_carried_and_scalar_filtered(self, monkeypatch):
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         # run_live_probe subscripts candidate['substrate_returns']
@@ -525,10 +580,12 @@ class TestGateNeverRaisesOnGenericHit:
         )
         for leaked in (
             'transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv',
-            # Neither is probe-authored: cli_version is `claude --version` output
-            # and probe_run_id can come straight from --probe-run-id, so neither
-            # has a shape that could be validated the way captured_at/session_id are.
-            'cli_version', 'probe_run_id',
+            # cli_version is `claude --version` output: not probe-authored, and
+            # with no probe-owned shape it could be validated against.
+            # (probe_run_id is NOT here — its default IS probe-authored and
+            # anchored-validatable, and it is the corpus join key; see
+            # test_a_probe_authored_run_id_survives.)
+            'cli_version',
         ):
             assert leaked not in result
 
@@ -584,6 +641,14 @@ class TestGateNeverRaisesOnGenericHit:
             ('session_id', f'3f1c9a6e-2b4d-4c8a-9f77-0a1b2c3d4e5f{_LONG_RUN}'),
             ('session_id', 'abc'),
             ('session_id', None),
+            # The DEFAULT probe_run_id is probe-authored — main() builds
+            # f'{mode}-{uuid4().hex[:12]}' — so it has an anchored shape.  An
+            # operator-supplied --probe-run-id simply will not fullmatch and
+            # degrades here, which is exactly the behaviour before it was carried.
+            ('probe_run_id', f'healthy-171d92bec337{_LONG_RUN}'),
+            ('probe_run_id', 'operator-supplied-label'),
+            ('probe_run_id', 'healthy-deadbeef'),  # 8 hex, not 12
+            ('probe_run_id', None),
         ],
     )
     def test_unshaped_attribution_fields_degrade_to_none(self, monkeypatch, field, value):
@@ -597,21 +662,27 @@ class TestGateNeverRaisesOnGenericHit:
             json.dumps(result), source='synthetic:poisoned-row-attribution'
         )
 
-    def test_a_real_observation_survives_both_shape_validators(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize('mode', probe.MODES)
+    def test_a_real_observation_survives_all_shape_validators(
+        self, monkeypatch, tmp_path, mode
+    ):
         """The validators must accept what :func:`probe.observe` actually stamps.
 
-        Pinned against a REAL assembled observation, not against a hand-written
-        literal: a validator too strict for the probe's own output would null both
-        fields on every degraded row, and no test written from the same
-        assumptions as the regex would ever notice.
+        Pinned against a REAL assembled observation, not against hand-written
+        literals: a validator too strict for the probe's own output would null the
+        field on every degraded row, and no test written from the same assumptions
+        as the regex would ever notice.  Parametrized over every mode so each
+        ``MODE_WEDGE_SHAPE`` value the probe can actually stamp is covered, and
+        ``probe_run_id`` is built exactly the way ``main()`` builds its default.
         """
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         session_id = str(probe.uuid.uuid4())
+        probe_run_id = f'{mode}-{probe.uuid.uuid4().hex[:12]}'
         observation = probe.observe(
             config_dir=tmp_path,
             session_id=session_id,
-            probe_run_id='healthy-deadbeef',
-            mode='healthy',
+            probe_run_id=probe_run_id,
+            mode=mode,
             sample_index=0,
             sample_kind='scheduled',
             sample_offset_secs=0.25,
@@ -627,6 +698,8 @@ class TestGateNeverRaisesOnGenericHit:
         assert result['redaction_failed'] is True, 'the degradation path never ran'
         assert result['captured_at'] == observation['captured_at']
         assert result['session_id'] == session_id
+        assert result['probe_run_id'] == probe_run_id
+        assert result['wedge_shape'] == observation['wedge_shape']
 
 
 def _sample_kind_literals_in_probe_source() -> set[str]:
