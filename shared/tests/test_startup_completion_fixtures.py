@@ -964,6 +964,19 @@ class TestLiveReprobe:
             if line.strip()
         ]
         assert observations, 'probe emitted no observations'
+        degraded = [o for o in observations if o.get('redaction_failed')]
+        assert not degraded, (
+            'DRIFT: the live re-probe emitted '
+            f'{len(degraded)} redaction_failed row(s) '
+            f'(sample_kind={[o.get("sample_kind") for o in degraded]!r}, '
+            f'pattern={[o.get("redaction_failure_pattern") for o in degraded]!r}). '
+            "A degraded row drops cli_version, transcript_relpath and "
+            "transcript_records by construction (see "
+            "startup_completion_probe.py::_poisoned_observation), so letting one "
+            "reach test_a/test_b/test_c would trade this DRIFT diagnostic for a "
+            "bare KeyError at exactly the moment it matters. Widen _scrub_value "
+            "to stop redacting this observation, then re-run the probe."
+        )
         return observations
 
     @pytest.fixture(scope='class')
