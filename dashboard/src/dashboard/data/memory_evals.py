@@ -226,12 +226,33 @@ _LIMITS_PROVENANCE_KEYS = (
     'generator',
 )
 
-# A discarded queue record — or any single field read out of one before its
-# shape is known, such as a status or a fingerprint — is arbitrary JSON off
-# disk and may be arbitrarily large.  An issue detail names WHAT was read, so
-# the value is capped: an unbounded repr would put a multi-megabyte artifact
-# into every poll's payload, making the naming of the discard its own
-# degradation.
+# Every value this module interpolates into an `_issue` detail is read out
+# of unvalidated JSON off disk — an escalation queue record, a metrics run,
+# a per-eval limits artifact, or the root verdicts artifact — and may be
+# arbitrarily large.  Two shapes reach here, and the second is the
+# non-obvious one a future reader would otherwise re-litigate: a value with
+# no type guard at all (`record.get("id")`, `run_kind`, `verdict`,
+# `status`) is arbitrary JSON and may be a dict, a list, or a
+# multi-megabyte string; a value already `isinstance`-guarded to a
+# non-empty `str` (`metric_id`, `eval_id`, `latest_run_stamp`) is
+# type-safe but never length-guarded, because the guard proves the value
+# is a string, never that it is a short one — this second shape is exactly
+# the gap that let the sweep stay incomplete after task 4168.  A detail
+# names WHAT was read, so every one of these is capped: an unbounded repr
+# would put a multi-megabyte artifact into every poll's payload, making
+# the naming of the discard its own degradation.
+#
+# The invariant this enforces: no raw `!r` on an artifact-derived value in
+# an `_issue` detail anywhere in this module — held by the closure test
+# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` rather
+# than by convention alone, so a future `_issue` call that reintroduces a
+# raw `!r` fails loudly instead of silently reopening this exposure.  Two
+# deliberate exceptions stay uncapped: the `seen_kinds` dedup key below
+# (an internal `repr`, never emitted — capping it would collide two
+# distinct oversized kinds on their shared prefix and silently swallow a
+# real second issue), and `_issue`'s structured `eval_id=` / `path=`
+# kwargs (identity/locator fields the UI groups and links on, where
+# truncation would corrupt identity rather than trim prose).
 _MAX_DISCARDED_VALUE_REPR = 120
 
 
