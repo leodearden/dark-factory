@@ -27,7 +27,9 @@ from dashboard.data.active_tasks import (
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
     one_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
-    assert 59 <= _minutes_since(one_hour_ago) <= 61
+    minutes = _minutes_since(one_hour_ago)
+    assert minutes is not None  # a parseable start time is never the unknown-start None
+    assert 59 <= minutes <= 61
 
 
 def test_minutes_since_returns_none_on_missing_and_zero_on_bad():
@@ -68,6 +70,7 @@ def test_minutes_since_no_now_resolves_via_clock():
 
     lower = int((before - ts).total_seconds() // 60)
     upper = int((after - ts).total_seconds() // 60)
+    assert result is not None  # a parseable start time is never the unknown-start None
     assert lower <= result <= upper
 
 
