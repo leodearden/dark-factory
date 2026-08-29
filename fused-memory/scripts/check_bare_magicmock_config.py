@@ -512,6 +512,48 @@ def _dataclass_double_violation(
     )
 
 
+# ---------------------------------------------------------------------------
+# Rule C — wall-clock-deadline
+# ---------------------------------------------------------------------------
+
+
+def _load_bearing_wait_target(node: ast.expr) -> str | None:
+    """Describe *node* if it is a load-bearing synchronisation point, else None.
+
+    Exactly two shapes are load-bearing, and both gate a hard assertion
+    downstream:
+
+      * ``req_a.result`` — a ``MergeRequest.result`` future.  Its resolution IS
+        the event the test is waiting for; a deadline here fails a test whose
+        merge pipeline completed correctly.
+      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier.  Already
+        event-driven; only its deadline is wall-clock.
+
+    Deliberately NOT load-bearing, and therefore excluded: the
+    ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
+    ``_stop_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
+    ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
+    TimeoutError — so it cannot manufacture the flake task 3980 fixed, and
+    stretching it would only slow teardown down.  The Name-vs-Attribute/Call
+    distinction is what makes that exclusion STRUCTURAL rather than a
+    hand-maintained name list, which is what lets this rule scan every scope of
+    every file the nine call sites reach.
+
+    Ported unchanged in behaviour from the file-local guard this rule replaced
+    (task 3980, orchestrator/tests/test_merge_speculation.py).
+    """
+    if isinstance(node, ast.Attribute) and node.attr == 'result':
+        return f'{ast.unparse(node)} (MergeRequest.result future)'
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'wait'
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id.startswith('gate')
+    ):
+        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
+    return None
+
 def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
     """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
 
