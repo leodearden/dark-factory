@@ -64,9 +64,11 @@ Filing-identity field (default-None; task 3533, populated by task 3550):
               None = unknown.  STAMPED BY: `orchestrator.workflow.TaskWorkflow`,
               `orchestrator.harness.Harness`, and the
               `escalate_blocker`/`escalate_info` chokepoint in
-              `escalation.server`.  NOT stamped by `escalation.submit`'s
-              detached CLI or the other level-1/2-only filers, where link 3
-              makes the identity moot.  Semantics and the fail-safe rule are stated
+              `escalation.server`.  For the producers that do NOT stamp it —
+              and why each one's records are (or are not) moot — see the
+              inventory on `escalation.pins.classify_pins`; do not restate or
+              summarise it here, and in particular do not assume the
+              non-stamping set is level-1/2-only.  Semantics and the fail-safe rule are stated
               once on `escalation.pins.classify_pins` (normative source:
               spec docs/task-escalation-state-spec.md S6) — do not restate
               them here.

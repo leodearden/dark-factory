@@ -339,9 +339,27 @@ def classify_pins(
     ``escalation.server`` (via its injected ``task_claimant_lookup``).  Still
     NOT stamping: ``escalation.submit``'s detached CLI (a systemd OnFailure
     entry point with no orchestrator run_id and no session, so it structurally
-    cannot), ``orchestrator.deterministic_runner``, ``orchestrator.merge_queue``
-    and the other level-1/2-only filers — where link 3 makes the identity moot
-    anyway.
+    cannot, and which hardcodes ``level=2``),
+    ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
+    ``severity='critical'``) and the other level-1/2-only filers — where link
+    3 makes the identity moot.  The L0 ``severity='info'`` filers (e.g.
+    ``orchestrator.merge_skew_tripwire``, ``orchestrator.offline_lane``'s
+    risk notice, the ``_AMENDMENT_TRUNCATION``/``_ROOT_CAUSE_OVERFOLD``
+    anchors in ``escalation.server``) do not stamp either, but they are moot
+    via link 1, not link 3.
+
+    One residual L0 gap is NOT closed by the stamping above:
+    ``orchestrator/src/orchestrator/merge_queue.py::_file_main_health_escalation``
+    builds at the DEFAULT level 0 with ``severity='blocking'`` (category
+    ``preexisting_main_break``) against a real ``req.task_id``, so links
+    1/2/3/3b all fall through and its records still read as UNKNOWN at link 4
+    — failing safe to pinning.  It is a module-level function with no
+    per-task incarnation, so ``None`` is the honest value there; closing the
+    gap needs a caller-supplied identity, not a stamp.  A second non-stamping
+    L0 ``'blocking'`` producer,
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._escalate``,
+    files against synthetic ``recon-<run_id>`` task ids on the reconciliation
+    queue, which no task-scoped pin read binds to.
 
     See the precedence chain above :func:`_classify_record` for the rules, and
     :class:`PinReport` for the buckets and the two derived predicates.

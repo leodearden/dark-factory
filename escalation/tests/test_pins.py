@@ -352,8 +352,11 @@ class TestDeadL0FilingIncarnationRule:
         incarnation is dead. It cannot here, so it pins.
 
         Governs every record whose filing identity is unknown: legacy rows
-        written before task 3550, and producers that still do not stamp
-        (submit.py's detached CLI and the other level-1/2-only filers)."""
+        written before task 3550, and producers that still do not stamp (see
+        the inventory on ``pins.classify_pins`` — most are moot above link 4,
+        but ``merge_queue._file_main_health_escalation`` reaches THIS branch
+        with a real task_id, which is exactly the residual gap the inventory
+        names)."""
         bucket = _bucket_of(
             _rec(level=0, severity='blocking', filing=filing),
             live_claimant=True,
