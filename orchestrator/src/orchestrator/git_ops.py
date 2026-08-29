@@ -951,6 +951,19 @@ class WarmLaneUnavailable(Enum):
       reseed-consistency defect — :meth:`create_worktree` maps it to
       :class:`WarmLaneReseedContaminated` so the task requeues to re-acquire a
       DIFFERENT lane rather than dispatch onto the stale tree (task 2854).
+    * ``LANE_LOCK_CONTENDED`` — seed exited 77 under reify's OPT-IN
+      ``--distinct-lock-refusal-rc`` flag (reify task 5568): another live
+      consumer holds ``<lane_dir>.lock``, so seed refused rather than seeding.
+      Emitted from BOTH of seed's refusal arms — the ``flock -n`` immediate
+      refusal and the ``flock -w`` queue timeout — with a ``LANE_LOCK_CONTENDED:``
+      stderr marker.  Explicitly NOT disk pressure: ``reify/scripts/seed-warm-lane.sh``
+      has no disk-pressure exit-75 path at all, so before this discriminant
+      every lock refusal arrived as 75 and was rendered to operators as
+      ``warm_lane_disk_pressure`` (the misleading signal throughout reify
+      esc-5556-1).  Transient shared-resource contention — requeue
+      (:class:`WarmLaneLockContention`), never a per-task fault.  Reachable only
+      when DF passes the opt-in flag; see
+      :func:`_seed_script_supports_distinct_lock_refusal_rc`.
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -969,6 +982,7 @@ class WarmLaneUnavailable(Enum):
     SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
     RESEED_CONTAMINATED = 'reseed_contaminated'
+    LANE_LOCK_CONTENDED = 'lane_lock_contended'
     DISABLED = 'disabled'
 
 
@@ -976,20 +990,40 @@ def _seed_rc_to_unavailable(rc: int) -> WarmLaneUnavailable:
     """Discriminate a seed-warm-lane.sh exit code into a WarmLaneUnavailable.
 
     Shared by every seed-rc call site in :meth:`GitOps.acquire_warm_lane` so
-    the 75/76/other mapping lives in exactly one place.
+    the 75/76/77/other mapping lives in exactly one place.
 
     * ``75`` (EX_TEMPFAIL) → ``DISK_PRESSURE`` — transient disk pressure.
     * ``76`` → ``BASE_ABSENT`` — reify contract for "CoW base missing".
       **DORMANT**: no shipped seed-warm-lane.sh emits 76 today: this branch
       is inert until a future reify version adopts the exit-76 convention. It
       is harmless meanwhile (no script exits 76, so it is simply never hit).
+    * ``77`` → ``LANE_LOCK_CONTENDED`` — a lane-lock REFUSAL (task 4211):
+      another live consumer holds ``<lane_dir>.lock``.  Emitted by both of
+      ``reify/scripts/seed-warm-lane.sh``'s refusal arms (``flock -n``
+      immediate refusal, ``flock -w`` queue timeout) but ONLY when DF passes
+      the opt-in ``--distinct-lock-refusal-rc`` flag (reify task 5568); the
+      per-lane capability probe
+      :func:`_seed_script_supports_distinct_lock_refusal_rc` decides whether
+      to pass it, and fails CLOSED.
     * anything else (including ``127``, the absent-script / unexpected-
       exception sentinel) → ``FAULT`` — generic infra fault.
+
+    75 deliberately KEEPS its DISK_PRESSURE meaning rather than being
+    reinterpreted as contention, for two independent reasons.  (1) A lane whose
+    checked-out seed script predates reify 5568 still exits 75 for a lock
+    refusal and the probe omits the flag for it, so narrowing 75 would change
+    behaviour for exactly the lanes that cannot signal 77.  (2) DF has its own
+    genuine exit-75 producer that is not seed at all — the ε pre-acquire
+    disk-guard path in :meth:`GitOps.acquire_warm_lane` — where 75 really does
+    mean disk pressure.  Disambiguation is therefore purely additive: it comes
+    only from the opt-in 77, never from re-reading 75.
     """
     if rc == 75:
         return WarmLaneUnavailable.DISK_PRESSURE
     if rc == 76:
         return WarmLaneUnavailable.BASE_ABSENT
+    if rc == 77:
+        return WarmLaneUnavailable.LANE_LOCK_CONTENDED
     return WarmLaneUnavailable.FAULT
 
 
