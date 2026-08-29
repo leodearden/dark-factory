@@ -681,6 +681,14 @@ def _only(rows: list[dict], metric_id: str) -> dict:
     return matches[0]
 
 
+# An oversized metric_id, shared by the three duplicate-index tests below
+# (`duplicate_limits_verdict`, `duplicate_metric_id`, `duplicate_verdict_entry`):
+# each is `isinstance(metric_id, str)`-guarded but never length-guarded, so a
+# huge one must still be capped in the issue detail without becoming a defect
+# in what value survives as the row's own identity.
+_HUGE_METRIC_ID = 'm' * 5000
+
+
 class TestLimitsProvenance:
     """The limits artifact contributes provenance + ``rule_kind``. Nothing else.
 
@@ -771,6 +779,33 @@ class TestLimitsProvenance:
         assert issue['kind'] == 'missing_limits'
         assert issue['eval_id'] == 'eval-a'
         assert issue['path'] == str(root / 'eval-a' / 'limits-current.json')
+
+    def test_duplicate_limits_verdict_metric_id_is_capped(self, tmp_path: Path) -> None:
+        """``metric_id`` is str-guarded (:391) but never length-guarded.
+
+        A duplicate limits verdict names the metric_id in its detail — an
+        oversized one must not blow up the payload the way an oversized
+        discarded record already cannot (task 4168).
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric(_HUGE_METRIC_ID, 'count', 4.0)])
+        _write_limits(
+            root, 'eval-a', run_stamp=_AGE_RUN,
+            verdicts=[
+                _limits_verdict(_HUGE_METRIC_ID, 'shift'),
+                _limits_verdict(_HUGE_METRIC_ID, 'ratio'),
+            ],
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'duplicate_limits_verdict'
+        assert '…' in issue['detail']
+        assert len(issue['detail']) < 500
+        assert 'has more than one limits verdict' in issue['detail']
 
 
 # ---------------------------------------------------------------------------
@@ -2741,6 +2776,28 @@ class TestStalenessAndDegradedStates:
         assert row['metric_id'] == 'dup'
         assert row['current_value'] == 1.0
 
+    def test_duplicate_metric_id_metric_id_is_capped(self, tmp_path: Path) -> None:
+        """Same size exposure as ``duplicate_limits_verdict``, one reader over.
+
+        The huge id legitimately still appears as the surviving row's own
+        ``metric_id`` -- only the issue detail is bounded.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[
+            _metric(_HUGE_METRIC_ID, 'count', 1.0),
+            _metric(_HUGE_METRIC_ID, 'count', 99.0),
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'duplicate_metric_id'
+        assert '…' in issue['detail']
+        assert len(issue['detail']) < 500
+        assert 'appears more than once in this run' in issue['detail']
+
     def test_metric_record_with_no_metric_id_is_counted_not_dropped(self, tmp_path: Path) -> None:
         """An unidentifiable record cannot be charted — but its loss is reported.
 
@@ -2785,6 +2842,29 @@ class TestStalenessAndDegradedStates:
         row = _only(payload['evals'][0]['metrics'], 'dangling-pointers')
         assert row['verdict'] == 'alarm'
         assert row['fingerprint'] == 'a' * 32
+
+    def test_duplicate_verdict_entry_metric_id_is_capped(self, tmp_path: Path) -> None:
+        """Same size exposure as the other two duplicate-index details.
+
+        The huge id legitimately still appears as the surviving row's own
+        ``metric_id`` -- only the issue detail is bounded.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric(_HUGE_METRIC_ID, 'count', 4.0)])
+        _write_verdicts(root, [
+            _verdict('eval-a', _HUGE_METRIC_ID, 'alarm', fingerprint='a' * 32, run_stamp=_AGE_RUN),
+            _verdict('eval-a', _HUGE_METRIC_ID, 'no_alarm', fingerprint='b' * 32, run_stamp=_AGE_RUN),
+        ], run_stamp=_AGE_RUN)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'duplicate_verdict_entry'
+        assert '…' in issue['detail']
+        assert len(issue['detail']) < 500
+        assert 'has more than one verdict entry' in issue['detail']
 
     def test_two_escalations_sharing_a_fingerprint_are_named(self, tmp_path: Path) -> None:
         """A dropped escalation is exactly what the parity view exists to catch.
