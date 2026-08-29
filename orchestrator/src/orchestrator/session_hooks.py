@@ -672,7 +672,64 @@ def _owning_claude_pid() -> int | None:
     return None
 
 
-def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
+#: Sentinel for "this probe has not been resolved yet", distinct from None --
+#: which is a legitimate RESOLVED answer for both memoized probes (no
+#: ``claude`` ancestor found; no ownership verdict available).
+_UNRESOLVED: Any = object()
+
+
+class _EventProbes:
+    """Per-event memo for this module's two ``/proc`` ownership probes.
+
+    ONE hook event consults ``_owner_ppid_verdict`` TWICE -- once to decide
+    whether to adopt the inherited ``CLAUDE_SPAWN_SESSION_ID`` slug
+    (``_env_slug_ownership``) and again to decide whether to withhold a
+    status from a still-LAUNCHING record (``_withhold_from_launching``) --
+    and reads ``_owning_claude_pid`` a third time to stamp
+    ``claude_owner_pid`` at bind time (``_bind_claude_session_id``). All
+    three fire together on exactly the case that matters most: the owner's
+    own pre-SessionStart Notification against an unbound LAUNCHING record
+    (task 4193 L2 ruling item 4-iii).
+
+    Each walk costs up to ``_MAX_CLAUDE_ANCESTOR_HOPS`` (6) hops x 2
+    ``/proc`` reads, charged against the hard ``_HOOK_TIMEOUT_SECS`` = 10s
+    budget this module's own ``_resolve_wm_window_id`` already prices at
+    ~10.8s in the pathological case. Memoizing pays that once.
+
+    Efficiency is not the only reason. Memoizing also closes a TOCTOU gap on
+    the verdict itself: the adopt/fork decision and the withhold decision
+    are now made from ONE observation of the process tree, so they can no
+    longer disagree because the tree changed between two walks. One
+    decision from one observation is a correctness property.
+
+    Scope is exactly one hook event -- construct it at the top of a handler
+    and thread it down. It deliberately does NOT cache across events; the
+    process tree is live state, and the memo's whole safety argument is that
+    its lifetime is shorter than any interval over which that state can
+    meaningfully change.
+    """
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        self._env = env
+        self._pid: Any = _UNRESOLVED
+        self._verdict: Any = _UNRESOLVED
+
+    def owning_claude_pid(self) -> int | None:
+        """``_owning_claude_pid()``, walked at most once per event."""
+        if self._pid is _UNRESOLVED:
+            self._pid = _owning_claude_pid()
+        return self._pid
+
+    def owner_ppid_verdict(self) -> bool | None:
+        """``_owner_ppid_verdict(env)``, computed at most once per event."""
+        if self._verdict is _UNRESOLVED:
+            self._verdict = _owner_ppid_verdict(self._env, probes=self)
+        return self._verdict
+
+
+def _owner_ppid_verdict(
+    env: Mapping[str, str], *, probes: _EventProbes | None = None
+) -> bool | None:
     """Does this event come from the claude spawn-claude.sh actually launched?
 
     Returns True (positively the owner), False (positively an inheritor), or
@@ -709,6 +766,12 @@ def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
     pre-task-4193 spawn-claude.sh), an unresolvable owning pid, or a platform
     with no ``/proc`` (macOS -- a first-class lane, cf. task 4058). Callers
     treat None as "adopt", the fail-soft direction this module documents.
+
+    *probes* is this event's ``_EventProbes`` memo when the caller holds one,
+    so the owning-pid walk is shared with the event's other consumers rather
+    than repeated. Omitting it builds a single-use memo, which resolves
+    through the module-level ``_owning_claude_pid`` exactly as before -- so a
+    bare ``_owner_ppid_verdict(env)`` call is semantically unchanged.
     """
     raw = (env.get('CLAUDE_SPAWN_OWNER_PPID') or '').strip()
     if not raw:
@@ -720,7 +783,7 @@ def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
         return None
     if expected <= 1:
         return None
-    owner_pid = _owning_claude_pid()
+    owner_pid = (probes or _EventProbes(env)).owning_claude_pid()
     if owner_pid is None:
         return None
     actual = _parent_pid_of(owner_pid)
