@@ -225,8 +225,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        If the search comes back empty, do **not** abort on that alone — you are holding a
        server-issued `already_merged` verdict, and a fast-forward or coalesce-absorbed
        landing carries no marker. Run the ancestry disposition in [Deriving the landed
-       sha](#deriving-the-landed-sha) and follow its arms; only its rc=1 / rc=128 arms are
-       NOT landed and ABORT.
+       sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm that terminates
+       without a sha — its rc=1 / rc=128 not-landed outcomes, and rc=0's **phantom-branch** (no
+       subject-matching citation on main) and **gate-un-evaluable**
+       (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be stamped:
+       report them rather than proceeding to sub-steps a–d.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance=<shape>)`. Choose by HOW `done` was observed:
@@ -244,8 +247,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           the task-scoped merge-marker search; it is never present in the merge_status
           response. An empty search is **not** by itself a not-landed verdict — you are
           holding a server-issued polled `done`. Run the ancestry disposition in [Deriving
-          the landed sha](#deriving-the-landed-sha) and follow its arms; ABORT only on its
-          rc=1 / rc=128 arms.
+          the landed sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm
+          that terminates without a sha — its rc=1 / rc=128 not-landed outcomes, and rc=0's
+          **phantom-branch** (no subject-matching citation on main) and **gate-un-evaluable**
+          (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be
+          stamped.
         - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
           above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
@@ -270,9 +276,14 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        "note": "confirmed on main after unknown merge_status; sha from merge-marker search"}`
        and proceed with sub-steps a–d above.
      - Search empty → not yet a verdict: run the ancestry disposition in [Deriving the
-       landed sha](#deriving-the-landed-sha). Its rc=0 arm yields a sha — proceed with
-       sub-steps a–d. Only its rc=1 / rc=128 arms are not-landed →
-       `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+       landed sha](#deriving-the-landed-sha) and follow its arms. Its rc=0 arm yields a sha
+       **only** on the verified-group-merge and positive-citation outcomes — proceed with
+       sub-steps a–d there. Its rc=1 / rc=128 not-landed outcomes and rc=0's
+       **phantom-branch** exit are genuine not-landed verdicts →
+       `mcp__escalation__merge_cancel(request_id)` then **ABORT**. rc=0 with the citation gate
+       **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, so it is
+       **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
+       calling `merge_cancel` — this section scopes that call to genuine not-landed outcomes.
 
 ### Deriving the landed sha
 
