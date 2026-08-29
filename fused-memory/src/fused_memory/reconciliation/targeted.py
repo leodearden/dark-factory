@@ -1561,6 +1561,12 @@ class TargetedReconciler:
         used by ``_sweep_cancelled_descendants``: a direct
         ``self.taskmaster`` write would bypass the per-project write_lock and
         the status-FSM gates.
+
+        Everything past that guard — the metadata veto check, the write, and
+        classifying its response — runs inside one try/except so a single
+        dependent's I/O failure (a raised exception, not just a rejection
+        response) can never abandon the rest of the sweep; the caller loops
+        over every dependent unconditionally.
         """
         dep_id = str(dependent.get('id') or '')
         if self.task_interceptor is None:
@@ -1576,28 +1582,74 @@ class TargetedReconciler:
                 'satisfied_by': satisfied_by,
             }
 
-        veto_reason = _unblock_veto_reason(dependent)
-        if veto_reason is not None:
-            return {
-                'type': 'dependent_unblock_vetoed',
+        try:
+            veto_reason = _unblock_veto_reason(dependent)
+            if veto_reason is not None:
+                return {
+                    'type': 'dependent_unblock_vetoed',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': veto_reason,
+                }
+
+            resp = await self.task_interceptor.set_task_status(
+                task_id=dep_id,
+                status='pending',
+                project_root=project_root,
+                reopen_reason=f'dependency_satisfied:{satisfied_by}',
+            )
+
+            # interceptor_write_succeeded is the single sanctioned classifier
+            # (task 1184): a happy-path SetTaskStatusResult carries no
+            # 'success' key at all (defaults to True), while a
+            # StatusWriteNotPersistedResult or a gate rejection (e.g.
+            # BacklogVerdict, which carries 'error'/'error_type' but no
+            # 'success' key either) must not be reported as applied.
+            if not interceptor_write_succeeded(resp):
+                error_code = (
+                    (resp.get('error_type') or resp.get('error'))
+                    if isinstance(resp, dict) else 'unknown'
+                )
+                actual_status = resp.get('actual_status') if isinstance(resp, dict) else None
+                logger.warning(
+                    'sweep: unblock rejected for dependent %s (satisfied by %s): '
+                    'error=%r',
+                    dep_id, satisfied_by, error_code,
+                )
+                return {
+                    'type': 'dependent_unblock_failed',
+                    'task_id': dep_id,
+                    'satisfied_by': satisfied_by,
+                    'error': error_code,
+                    'actual_status': actual_status,
+                }
+
+            action: dict[str, Any] = {
+                'type': 'dependent_unblock_applied',
                 'task_id': dep_id,
                 'title': dependent.get('title'),
                 'satisfied_by': satisfied_by,
-                'reason': veto_reason,
             }
-
-        await self.task_interceptor.set_task_status(
-            task_id=dep_id,
-            status='pending',
-            project_root=project_root,
-            reopen_reason=f'dependency_satisfied:{satisfied_by}',
-        )
-        return {
-            'type': 'dependent_unblock_applied',
-            'task_id': dep_id,
-            'title': dependent.get('title'),
-            'satisfied_by': satisfied_by,
-        }
+            # A same-status race (something else already re-pended this task
+            # between the snapshot and this write) lands here too -- the
+            # desired end state was reached, but no flip actually happened.
+            # Surface it rather than silently treating a no-op identically
+            # to a real write.
+            if isinstance(resp, dict) and resp.get('no_op'):
+                action['no_op'] = True
+            return action
+        except Exception as e:
+            logger.warning(
+                'sweep: unblock failed for dependent %s (satisfied by %s): %s',
+                dep_id, satisfied_by, e,
+            )
+            return {
+                'type': 'dependent_unblock_failed',
+                'task_id': dep_id,
+                'satisfied_by': satisfied_by,
+                'error': str(e)[:200],
+            }
 
     async def _on_task_deferred(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
