@@ -213,6 +213,42 @@ def _marker_name(element: ast.expr) -> str | None:
     return None
 
 
+def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
+    """Marker names the ``pytestmark`` binding in *body* names, else an empty set.
+
+    THE ONE SHARED FOLD, covering both scopes at which pytest honours
+    ``pytestmark``: a MODULE body (:func:`module_level_marker_names` and its
+    tree-consuming twin :func:`_module_level_marker_names_from_tree`) and a
+    CLASS body (:func:`_class_marker_names`).  Those three held
+    character-for-character copies of this fold, differing only in the
+    statement container, until they were collapsed here.  ONE copy is what
+    stops the two readings of ``pytestmark`` syntax drifting apart — a drift
+    would silently let the class tier accept a value shape the module tier
+    rejects, breaking the "same shapes at both scopes" promise
+    :func:`_class_marker_names` makes.
+
+    Only DIRECT children of *body* are considered — never ``ast.walk`` — so a
+    ``pytestmark`` bound inside an ``if`` is not the enclosing scope's marker.
+    Accepted value shapes: a bare ``pytest.mark.NAME``, a
+    ``pytest.mark.NAME(...)`` call, or a list/tuple of either.  A non-marker
+    element yields None from :func:`_marker_name` and is skipped silently,
+    without suppressing its siblings.  If the scope rebinds ``pytestmark`` more
+    than once, the LAST binding wins, mirroring Python's own semantics.
+    """
+    value: ast.expr | None = None
+    for statement in body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is None:
+        return frozenset()
+
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
+    )
+
+
 def module_level_marker_names(source: str | None) -> frozenset[str]:
     """Marker names a module-level ``pytestmark`` applies to EVERY item in *source*.
 
@@ -240,11 +276,13 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     each of those tiers is defined as a superset OF — so widening it in place
     would move the baseline every one of them is stated against.
 
-    Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
-    call, or a list/tuple of either.  Only ``tree.body`` is walked (never
-    ``ast.walk``), so a ``pytestmark`` bound inside a class or function body does
-    not count.  If the module rebinds ``pytestmark`` more than once, the LAST
-    assignment wins, mirroring Python's own semantics.
+    The ``pytestmark`` read itself is :func:`_pytestmark_marker_names`, the ONE
+    shared fold this module uses at every scope: accepted value shapes are a bare
+    ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)`` call, or a list/tuple of
+    either; only ``tree.body`` is walked (never ``ast.walk``), so a ``pytestmark``
+    bound inside a class or function body does not count; and if the module
+    rebinds ``pytestmark`` more than once the LAST assignment wins, mirroring
+    Python's own semantics.
 
     ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields an empty
     set.  Never raises.
@@ -256,18 +294,7 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     except (SyntaxError, ValueError):
         return frozenset()
 
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return frozenset()
-
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
+    return _pytestmark_marker_names(tree.body)
 
 
 def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
@@ -275,14 +302,14 @@ def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
 
     Reads BOTH spellings pytest honours on a class, and unions them: the
     ``@pytest.mark.NAME`` DECORATORS on the class itself, and a ``pytestmark``
-    bound in the class BODY.  The body form accepts exactly the value shapes
-    :func:`module_level_marker_names` accepts at module scope — a bare
-    ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)`` call, or a list/tuple of
-    either — and applies the same LAST-binding-wins rule, so the two readings
-    of ``pytestmark`` syntax cannot drift apart.  Only DIRECT children of
-    ``node.body`` are considered, mirroring that function's ``tree.body``-only
-    rule: a ``pytestmark`` bound inside an ``if`` in the class body is not the
-    class's marker.
+    bound in the class BODY.  The body form is read by the SAME
+    :func:`_pytestmark_marker_names` fold :func:`module_level_marker_names` uses
+    at module scope, so the two readings of ``pytestmark`` syntax cannot drift
+    apart — that is now structural rather than a claim maintained by hand.  It
+    inherits that fold's rules verbatim: the same accepted value shapes, the
+    same LAST-binding-wins rule, and DIRECT children of ``node.body`` only, so a
+    ``pytestmark`` bound inside an ``if`` in the class body is not the class's
+    marker.
 
     A non-marker element (e.g. the ``qdrant_skipif()`` call heading the real
     shape at ``fused-memory/tests/test_mem0_client.py``) yields None from
@@ -295,17 +322,7 @@ def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
         if name is not None
     }
 
-    value: ast.expr | None = None
-    for statement in node.body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is not None:
-        elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-        markers.update(
-            name for name in (_marker_name(element) for element in elements) if name is not None
-        )
-    return frozenset(markers)
+    return frozenset(markers) | _pytestmark_marker_names(node.body)
 
 
 def _is_collectable_class(node: ast.ClassDef) -> bool:
@@ -527,25 +544,18 @@ def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
     sequencing note asking whichever task landed second to fold its walk into
     the tier the other had added rather than adding a THIRD copy.  4561 has
     since landed and did NOT edit ``module_level_marker_names``: esc-3513-2
-    re-specced Gap 2 as a SIBLING, :func:`guaranteed_marker_names`, which
-    consumes this helper.  The note's instruction was therefore honoured —
-    there are two copies of this walk, not three, and the remaining
-    duplication is exactly the source-consuming/tree-consuming pair.
-    Collapsing that last pair would mean giving ``module_level_marker_names``
-    a body that delegates here; nothing blocks it, and nothing requires it.
-    """
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return frozenset()
+    re-specced Gap 2 as a SIBLING, :func:`guaranteed_marker_names`.
 
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
+    The note's instruction is honoured in the strongest available form: there
+    is now exactly ONE copy of the fold, :func:`_pytestmark_marker_names`, and
+    every scope that reads ``pytestmark`` — this helper,
+    ``module_level_marker_names`` and :func:`_class_marker_names` — calls it.
+    What survives here is only the tree-consuming ENTRY POINT, kept because
+    ``per_item_marker_names`` and ``guaranteed_marker_names`` hold a tree
+    rather than a body and because this docstring is the record of the
+    3513/4561 sequencing agreement.
+    """
+    return _pytestmark_marker_names(tree.body)
 
 
 def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | None:
