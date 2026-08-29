@@ -31,6 +31,14 @@ from escalation.queue import (
 )
 
 
+#: "argument not supplied", distinct from an explicitly-passed ``None``.
+#: Needed wherever a helper's default must not collide with a MEANINGFUL
+#: ``None`` value — e.g. seeding a record whose ``citation_sha`` is genuinely
+#: absent, which ``citation_sha=None`` would otherwise read as "use the
+#: default sha" (amendment pass, task 4499).
+_UNSET: Any = object()
+
+
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
     esc = Escalation(
         id=esc_id,
@@ -5962,13 +5970,20 @@ class TestFindTerminalByCitation:
         esc_id: str,
         *,
         task_id: str = '1',
-        citation_sha: str | None = None,
+        citation_sha: str | None = _UNSET,
         category: str | None = None,
     ) -> Escalation:
-        """Submit a provenance-shaped L1 carrying *citation_sha*."""
+        """Submit a provenance-shaped L1 carrying *citation_sha*.
+
+        *citation_sha* defaults to the ``_UNSET`` sentinel rather than to
+        ``None`` so that ``citation_sha=None`` seeds a record whose identity is
+        genuinely ABSENT — the state a ``no_citation`` reject files.  Defaulting
+        on ``None`` would silently substitute ``CITATION`` there and make the
+        "stored without a citation" cell unreachable (amendment pass).
+        """
         esc = _make_escalation(esc_id, task_id=task_id, level=1)
         esc.category = category if category is not None else self.CATEGORY
-        esc.citation_sha = self.CITATION if citation_sha is None else citation_sha
+        esc.citation_sha = self.CITATION if citation_sha is _UNSET else citation_sha
         _submit_escalation(queue, esc)
         return esc
 
@@ -6032,14 +6047,47 @@ class TestFindTerminalByCitation:
         )
 
     @pytest.mark.parametrize('falsy', [None, ''])
-    def test_falsy_citation_never_matches(self, tmp_path: Path, falsy: str | None):
-        """(6) A no_citation verdict has no evidence identity and can never be suppressed."""
+    def test_falsy_lookup_key_short_circuits(self, tmp_path: Path, falsy: str | None):
+        """(6a) LOOKUP-KEY half — a no_citation verdict carries no identity to match on.
+
+        The record here deliberately carries a FULL identity (``CITATION``): the
+        point is that the incoming filing has none, so the ``find_dedupe_parent``
+        falsy-key short-circuit answers None before any record is compared.  A
+        no_citation reject can therefore never be suppressed — not even against
+        a resolution on the very same task and category.
+        """
         queue = EscalationQueue(tmp_path / 'queue')
-        self._filed(queue, 'esc-1-1', citation_sha=falsy)
+        self._filed(queue, 'esc-1-1')
         queue.resolve('esc-1-1', 'confirmed benign')
 
         assert queue.find_terminal_by_citation('1', self.CATEGORY, falsy) is None, (
-            f'falsy citation {falsy!r} must short-circuit to None, never match'
+            f'falsy lookup key {falsy!r} must short-circuit to None, never match'
+        )
+
+    @pytest.mark.parametrize('stored', [None, ''])
+    def test_record_stored_without_a_citation_never_matches_a_real_sha(
+        self, tmp_path: Path, stored: str | None,
+    ):
+        """(6b) STORED-IDENTITY half — the other direction, and the one the short-circuit misses.
+
+        A resolution filed with no evidence identity (the ``no_citation`` arm)
+        must never be returned for a filing that DOES carry a sha: that would be
+        a cross-finding collapse, suppressing real evidence against an
+        adjudication of something else entirely.  Pinned separately from (6a)
+        because it survives the falsy-key short-circuit being moved or removed —
+        the per-record ``esc.citation_sha != citation_sha`` comparison is what
+        has to reject it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', citation_sha=stored)
+        queue.resolve('esc-1-1', 'confirmed benign')
+        assert queue.get('esc-1-1').citation_sha == stored, (
+            'Pre-condition: the record must really be stored WITHOUT an identity'
+        )
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            f'a record stored with citation_sha={stored!r} matched a real sha — '
+            'unrelated findings would collapse into one another'
         )
 
     def test_no_record_at_all_returns_none(self, tmp_path: Path):
