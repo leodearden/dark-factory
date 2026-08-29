@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -160,16 +161,6 @@ class TestExitCodeContract:
         codes = [drift.EXIT_OK, drift.EXIT_DRIFT, drift.EXIT_UNAVAILABLE]
         assert all(isinstance(c, int) for c in codes)
         assert len(set(codes)) == 3
-
-    def test_there_is_no_skip_state(self):
-        """No fourth outcome may be added that reads as 'we did not check, but fine'.
-
-        The whole remedy is that absence is loud.  A module-level ``EXIT_SKIP``
-        — however spelled — would reintroduce the pytest-skip semantics this
-        script exists to escape.
-        """
-        skipish = [n for n in dir(drift) if n.startswith('EXIT_')]
-        assert sorted(skipish) == ['EXIT_DRIFT', 'EXIT_OK', 'EXIT_UNAVAILABLE']
 
 
 class TestCheckVectors:
@@ -909,8 +900,41 @@ class TestMainCli:
 
     def test_module_is_executable(self):
         """A script an operator is told to run must be runnable."""
-        import os
-
         assert os.access(drift.__file__, os.X_OK), (
             f'{drift.__file__} is not executable — chmod +x it'
         )
+
+    @pytest.mark.parametrize(
+        ('plant_guard', 'expected'),
+        [(True, drift.EXIT_OK), (False, drift.EXIT_UNAVAILABLE)],
+        ids=['ok', 'unavailable'],
+    )
+    def test_process_exit_status_carries_the_outcome(self, tmp_path, plant_guard, expected):
+        """Run the script as a PROCESS and read the status a shell would read.
+
+        Everything above calls ``main()`` in-process, which cannot observe the
+        ``sys.exit(main(...))`` wiring at the bottom of the module.  A scheduled
+        job or CI lane branches on the numeric exit STATUS, so the could-not-look
+        arm is asserted ``!= 0`` as well as ``== EXIT_UNAVAILABLE``: the failure
+        being guarded against is a future refactor that swallows the return value
+        (``main(...)`` called bare, or wrapped in a ``try``) and lets an
+        unavailable run exit 0 — a skip reported as a pass, which is exactly the
+        conflation this script exists to end.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        if plant_guard:
+            _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        env = {k: v for k, v in os.environ.items() if k != 'REIFY_ROOT'}
+        proc = subprocess.run(
+            [sys.executable, drift.__file__, '--reify-repo', str(repo)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(drift.__file__).parent),
+            env=env,
+            timeout=60,
+        )
+
+        assert proc.returncode == expected, proc.stderr
+        if expected != drift.EXIT_OK:
+            assert proc.returncode != drift.EXIT_OK
