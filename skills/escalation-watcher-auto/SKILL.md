@@ -217,6 +217,25 @@ Pass the same `root_cause` string for escalations that share a hypothesis. The s
 
 Re-calling `promote_to_l2` with the same `root_cause` and new member ids (found in a later drain cycle) is correct and idempotent. However, the **drain-side dedup** (see [Draining pending escalations](#draining-pending-escalations)) filters out ids already present in a pending L2's `members` list _before_ RCA runs — so the server-side dedup is the safety net, not the primary guard against redundant RCA work and counter inflation.
 
+### Declared pins: a close can be REFUSED (`declared_pin_refused`)
+
+Some pending records are **load-bearing**: something outside the escalation store relies on the record staying OPEN, because an open escalation preserves its subject task (`orchestrator/task_ground_truth.py::_RECOVERY` has no row for that shape, so the task row falls through to `LEAVE`; closing the record flips `has_open_escalation` and the task reverts). Closing one is therefore a **state-changing act on the subject task even under `action='close_only'`**.
+
+Such a record now carries `pin_declared_by` (task 4377). `resolve_issue` refuses **every non-`park` action** — `close_only` included — when the target **or ANY CASCADE MEMBER** carries it, returning:
+
+```json
+{"error": "...", "code": "declared_pin_refused",
+ "declared_pins": [{"escalation_id": "esc-...", "declared_by": ["..."], "reason": "..."}]}
+```
+
+Nothing is mutated on a refusal: the head and every member stay pending and un-archived. Read the structured `declared_pins` payload — don't parse the message.
+
+- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to pull the full record with `get_escalation`.
+- **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
+- **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
+
+Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member cluster esc-3237-5 dismissed esc-3371-2 — the only pin preserving mu-gate validation specimen task 3371, which is permanently gone. Every member was indistinguishable by id, level, category, severity, agent_role and summary, and the sole marker lived in prose nothing linked from. The surviving sibling pin is **esc-3105-3** (a 15-member L2 head — exactly the shape a rotation bulk-closes).
+
 ### Auto-closing a rubber-stamp L2 (narrow close_only carve-out)
 
 The server carves out one narrow exception to the level-2 authority boundary described in [Hard Constraints](#hard-constraints--never-violate) (task 2630, `escalation.authority.l2_auto_close_class`): `resolve_issue(action='close_only')` on an L2 record succeeds when the record matches one of three allowlisted classes **and** your `resolution` text quotes that class's required evidence. This exists to stop the human from rubber-stamping closes you already pre-triaged — trace analysis found roughly 45% of human `resolve_issue` clicks were exactly that, and recommendations were rotting while pending (one RCA was 21h stale by the time it was closed). It changes **nothing** else: `resume` / `restart` / `park` / `abandon` at L2 are still always `level_forbidden`, and `design_concern` / `milestone_gate` categories and any record filed by `orchestrator-deterministic` (the born-at-L2 human-gate sentinel — deterministic `always_escalates`, operator/acceptance gates, milestone-predicate gates) are **NEVER** auto-closable no matter how good the evidence looks — the server checks this denylist before the allowlist.

@@ -24,9 +24,16 @@ reports members in a terminal status, classified by their resolution TEXT
 REPORT-ONLY, strictly read-only. Never close anything off this output:
 a record can be a deliberately-preserved PIN whose value is its existence
 (esc-3105-3 scores 15/15 ruled members and must NOT be closed -- see
-skills/escalation-watcher/SKILL.md "Ruled-elsewhere check"). Until task
-4377 lands `pin_declared_by`, pins and answered questions are
-indistinguishable from the member chain alone.
+skills/escalation-watcher/SKILL.md "Ruled-elsewhere check"). From the
+member chain alone, pins and answered questions are indistinguishable.
+The machine-readable marker is the record's own `pin_declared_by` (task
+4377): non-empty means something outside the escalation store relies on
+this record staying OPEN, and `resolve_issue` refuses every non-`park`
+action on it -- and on any L2 whose cascade would close it -- with
+`declared_pin_refused`. Check that field before proposing any
+disposition. It does NOT make this output actionable: the marker is
+opt-in, so an EMPTY `pin_declared_by` means "not declared", not "safe" --
+esc-3105-3 is exactly the shape that would be lost to that assumption.
 
 Usage:
     member-chain-sweep.py                 # sweep the default fleet queues

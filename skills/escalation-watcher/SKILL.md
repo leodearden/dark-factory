@@ -1025,9 +1025,16 @@ deliberately-preserved PIN whose value is its *existence*, not its question: esc
 15/15 ruled members on this probe and must NOT be closed (it is the last hold on task 3105 /
 task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk close cascade on
 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag). From the member chain alone, a
-pin and an answered question are indistinguishable. Until task 4377 lands `pin_declared_by` as the
-machine-readable opt-out, the only protection is reading the record and its companions before
-proposing any disposition.
+pin and an answered question are indistinguishable. The machine-readable marker now exists (task
+4377): a record whose **`pin_declared_by`** is non-empty has been declared load-bearing, and
+`resolve_issue` refuses every non-`park` action on it — and on any L2 whose cascade would close it
+— with `{'code': 'declared_pin_refused', 'declared_pins': [...]}`. It rides every compact row, so
+read it on the drain; `pin_declared_reason` (the free-text why) is only on the full record via
+`get_escalation`. Read what `pin_declared_by` NAMES and consult it — `acknowledge_declared_pins`
+exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
+check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
+it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
+companions before proposing any disposition remains the protection.
 
 **If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
 done by hand): before designating any survivor, run this check on the shared members. Never keep
