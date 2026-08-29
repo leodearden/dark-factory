@@ -2097,7 +2097,7 @@ class TestPytestXdistSerialOverrideCluster:
         outcomes applies -- distinct, duplicate, or contradicts. It must
         never again be re-attached to an amend instruction this audience
         cannot execute; that regression is what
-        ``test_hint_does_not_route_a_non_curator_to_a_refused_amend`` pins.
+        ``test_rendered_hint_does_not_route_to_a_refused_amend`` pins.
         Supersedes the former
         ``test_pytest_xdist_cluster_hint_points_at_canonical_memory`` in
         ``TestProceduralTopicGuardClustersDefault``, folded in here so this
