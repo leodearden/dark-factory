@@ -1236,20 +1236,17 @@ def test_two_projects_claiming_the_same_port_still_allocate_past_it(
 ) -> None:
     """An ALREADY-COLLIDED fleet: two configs claiming 8100 at once.
 
-    ``main`` accumulates claims as ``used[port] = f"{root.name} ({...})"`` — a plain
-    dict assignment — so the second project discovered on a port OVERWRITES the first
-    and the evidence table under-reports. PINNED AS OBSERVED, NOT ENDORSED: a human
-    reading the survey sees one project holding 8100 when two do, which is exactly the
-    broken state a port-allocation tool exists to surface. Filed as follow-up ticket
-    ``tkt_0RSH4GD31ZE7FQSP1844TQY6VY`` (reporting only — allocation is unaffected, since the port is
-    blocked either way, which is what the stdout assertion below pins).
+    ``main`` accumulates claims as ``used.setdefault(port, []).append(...)``, so every
+    claimant on a port survives and the evidence table under "Claimed by existing
+    project configs:" lists ALL of them on that port's row, comma-joined. Fixed per
+    follow-up ticket ``tkt_0RSH4GD31ZE7FQSP1844TQY6VY``: before this, a plain dict
+    assignment let the second project discovered on a port OVERWRITE the first, so a
+    human reading the survey saw one project holding 8100 when two actually did — which
+    is exactly the broken state a port-allocation tool exists to surface.
 
-    WHICH of the two survives is deliberately NOT asserted: ``known_project_roots``'
-    fallback uses ``glob.glob``, which returns ``os.scandir`` order, so the winner is
-    filesystem-dependent. The falsifiable claim is that exactly ONE of the two names
-    reaches the table — if the reporting is ever fixed to list both, this test
-    reddens and the docstring above is what tells the next reader that greening it by
-    asserting both is a fix and not a regression.
+    Both names are asserted, not just their count: ordering between them is
+    filesystem-dependent (``known_project_roots``' fallback uses ``glob.glob``, which
+    returns ``os.scandir`` order), so this test does not pin which comes first.
     """
     parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8100})
 
@@ -1257,15 +1254,15 @@ def test_two_projects_claiming_the_same_port_still_allocate_past_it(
 
     # Allocation is CORRECT regardless: 8100 is blocked, so the next free port wins.
     assert (rc, out) == (0, "8101\n")
-    # Both configs really do claim 8100 — otherwise the collapse below is vacuous.
+    # Both configs really do claim 8100 — otherwise the assertion below is vacuous.
     for name in ("proj-a", "target"):
         cfg = parent / name / "dark-factory-orchestrator.yaml"
         assert fep.escalation_port(cfg) == 8100
 
     reported = [name for name in ("proj-a", "target") if name in err]
-    assert len(reported) == 1, (
-        "the duplicate claim on 8100 is expected to COLLAPSE to a single reported "
-        f"project (see tkt_0RSH4GD31ZE7FQSP1844TQY6VY), got {reported}"
+    assert reported == ["proj-a", "target"], (
+        "both claimants on the collided port 8100 must be reported "
+        f"(see tkt_0RSH4GD31ZE7FQSP1844TQY6VY), got {reported}"
     )
 
 
