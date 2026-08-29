@@ -30,7 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -328,8 +328,10 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
           this module's "stay green in sandboxes and CI" contract.
       (d) all three satisfied -- the guarded tests must actually RUN.
 
-    Assertions are on `is None` / `is not None` plus a substring, never on
-    exact prose, so the reason strings stay free to explain themselves.
+    Assertions are on `is None` / `is not None` plus a substring UNIQUE to
+    the branch under test, never on exact prose, so the reason strings stay
+    free to explain themselves while still identifying WHICH precondition
+    fired.
     """
     writable_cfg = tmp_path / "cfg"
     writable_cfg.mkdir()
@@ -346,7 +348,13 @@ def test_skip_reason_gates_on_binary_manager_and_writable_unit_dir(
     monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
     reason = _systemd_user_manager_skip_reason()
     assert reason is not None
-    assert "systemctl" in reason
+    # "on this PATH", NOT the bare word "systemctl".  Branch 2's
+    # manager-unreachable string also contains "systemctl" -- it quotes
+    # `systemctl --user show` -- so a bare-word assertion would still pass if
+    # this branch were deleted or reordered and control fell through to the
+    # manager probe, i.e. it could not tell the two apart.  Cases (b) and (c)
+    # below are discriminating for the same reason.
+    assert "on this PATH" in reason
 
     # (b) Binary present, manager unreachable -- three distinct failure
     # modes, because a container with no DBUS_SESSION_BUS_ADDRESS /
@@ -633,6 +641,15 @@ def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
     are aged FAR beyond max_age_s -- age must be irrelevant for anything
     lacking the selftest prefix, or this module becomes the outage it was
     written to prevent.
+
+    Second half: the SUFFIX filter, which neither the prefix case above nor
+    the age case in the previous test can reach.  The prune requires BOTH
+    _SELFTEST_PREFIX and a .service/.service.d suffix, and the suffix half is
+    load-bearing on its own -- see the rationale in
+    _systemd_user_manager_skip_reason, which declines to widen it precisely
+    because it is what keeps this sweep away from _LOCK_NAME.  Without a test,
+    widening the filter to the prefix alone would delete a live lock file with
+    every other prune assertion still green.
     """
     now = 1_000_000.0
     unit_dir = tmp_path / "systemd" / "user"
@@ -642,11 +659,37 @@ def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
         _write_unit(unit_dir, "dark-factory-dashboard", age_s=86_400.0 * 90, now=now),
     ]
 
+    # Aged FAR past max_age_s, so ONLY the suffix filter stands between each
+    # of these and deletion -- the second one carries _SELFTEST_PREFIX too, so
+    # for it the suffix is the only surviving guard of the three.
+    #
+    #   * _LOCK_NAME is the host-wide serialization lock.  `fcntl.flock` lives
+    #     on an open file DESCRIPTION, not on the path, so unlinking it does
+    #     not release anything: it makes the next session create a fresh inode
+    #     and take a second "exclusive" slot on it, silently unserializing the
+    #     one real-systemd leg while every other assertion here stayed green.
+    #   * A selftest-prefixed .conf stands in for any future non-unit
+    #     bookkeeping file a widened prefix-only filter would sweep up.
+    non_units: list[Path] = []
+    for name in (_LOCK_NAME, f"{_SELFTEST_PREFIX}x@.conf"):
+        path = unit_dir / name
+        path.write_text("")
+        os.utime(path, (now - 86_400.0, now - 86_400.0))
+        non_units.append(path)
+
     _prune_stale_selftest_units(unit_dir, now=now, max_age_s=3600.0)
 
     for unit, dropin_dir in reals:
         assert unit.exists(), f"{unit.name} is a REAL unit and must never be pruned"
         assert dropin_dir.exists(), f"{dropin_dir.name}/ is REAL and must never be pruned"
+
+    for path in non_units:
+        assert path.exists(), (
+            f"{path.name} carries no .service/.service.d suffix and must never be "
+            "pruned.  That suffix filter is what keeps this sweep away from the "
+            "host-wide serialization lock; a prune that can unlink a held lock file "
+            "silently destroys the serialization seam."
+        )
 
 
 def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> None:
@@ -702,16 +745,38 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
 _LOCK_NAME = ".lms-dropin-selftest.lock"
 
 # Budget, sized against the suite's per-test --timeout=300
-# (scripts/orchestrator.yaml): _LOCK_WAIT_S + _SELFTEST_TIMEOUT_S = 270 < 300,
-# so a wedged run always surfaces as this module's own diagnosable skip or
-# failure -- naming the lock or naming the .sh -- rather than as an opaque
-# suite-level timeout that names no cause.
+# (scripts/orchestrator.yaml).  The worst case for test_shell_selftest_passes,
+# which is the one test that can pay ALL of these on a single invocation, is a
+# sum of FOUR terms -- an earlier version of this comment counted only the
+# middle two, put the total at 270, and thereby claimed a 30s margin the
+# arithmetic did not support:
 #
-# _LOCK_WAIT_S = 120 covers ~20 fully-serialized predecessors at the measured
-# 5.2s each.  _SELFTEST_TIMEOUT_S = 150 is ~29x the measured solo cost, and
-# under the lock the run is EXCLUSIVE, so the only load it now has to absorb is
-# unrelated daemon-reload traffic rather than 47 copies of itself.
-_LOCK_WAIT_S = 120.0
+#     15  _require_systemd_user_manager -> _skip_reason: the
+#         `systemctl --user show` probe, which runs BEFORE the lock is taken
+#         and can burn its full timeout= against a wedged manager
+#     90  _LOCK_WAIT_S -- the bounded wait for the host-wide slot
+#    150  _SELFTEST_TIMEOUT_S -- the .sh subprocess itself
+#     10  run_in_new_session's bounded post-kill drain
+#         (df_pytest_isolation.py::_POST_KILL_DRAIN_SECS), charged ON TOP of
+#         the timeout above whenever a grandchild still holds the stdout pipe
+#    ---
+#    265 < 300
+#
+# leaving ~35s for the prune, the residue sweep and filesystem overhead.  With
+# that margin a wedged run always surfaces as this module's own diagnosable
+# skip or failure -- naming the probe, the lock or the .sh -- rather than as an
+# opaque suite-level timeout that names no cause.
+#
+# _LOCK_WAIT_S = 90 is ~17x the measured 5.2s solo run, i.e. ~17 fully
+# serialized predecessors.  Sizing it for ~20 was conservative to begin with:
+# `verify_admission_pytest_n: 8` already caps the fleet at 8 concurrent pytest
+# verifies, so fewer than 8 real predecessors can ever be queued ahead of this
+# leg and the wait was never the binding constraint -- trimming it to buy the
+# margin above costs nothing.  _SELFTEST_TIMEOUT_S = 150 is ~29x the measured
+# solo cost, and under the lock the run is EXCLUSIVE, so the only load it now
+# has to absorb is unrelated daemon-reload traffic rather than 47 copies of
+# itself.
+_LOCK_WAIT_S = 90.0
 _SELFTEST_TIMEOUT_S = 150
 _LOCK_POLL_S = 0.25
 
@@ -839,7 +904,19 @@ def test_serialized_slot_skips_rather_than_fails_when_contended(
         os.close(holder)
 
 
-def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
+# The .sh's side of the seam reads `${LMS_SELFTEST_TEMPLATE:-...}`.  Named
+# once here so the single writer below and the guard that protects it bind the
+# same string; the .sh's own literal is deliberately NOT derived from this --
+# a test that generated the name it then asserts on would assert nothing.
+_TEMPLATE_ENV_VAR = "LMS_SELFTEST_TEMPLATE"
+
+
+def _run_selftest(
+    template: str,
+    *,
+    extra_env: Mapping[str, str] | None = None,
+    timeout: float = _SELFTEST_TIMEOUT_S,
+) -> subprocess.CompletedProcess[str]:
     """Drive scripts/tests/test_remove_lms_dropin.sh against ONE template name.
 
     The template is threaded in through the LMS_SELFTEST_TEMPLATE seam, which
@@ -847,6 +924,20 @@ def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
     LMS_UNIT_TEMPLATE seam -- so this single variable propagates through both
     halves and gives the invocation an absolute unit path no concurrent run
     shares.
+
+    EVERY caller goes through here, including
+    test_selftest_template_seam_propagates, which is what makes that test
+    cover the WRAPPER half of the seam and not just the .sh half.  When it
+    built its own env dict inline, a misspelled or dropped key on the
+    ``env[...] =`` line below broke nothing visible: the seam test still
+    passed (it set the variable itself), test_shell_selftest_passes still
+    passed solo (the .sh fell back to the shared default template), and the
+    measured concurrency collision quietly re-opened.  ``extra_env`` exists so
+    a test can vary the ENVIRONMENT AROUND the seam without owning the seam.
+
+    ``extra_env`` is applied BEFORE the seam and may not contain it: this
+    function is the single writer of LMS_SELFTEST_TEMPLATE, and a caller that
+    could supply its own would silently restore exactly the blind spot above.
 
     ``run_in_new_session`` rather than a bare ``subprocess.run(timeout=...)``,
     which is this repo's documented convention (task 3798) and is load-bearing
@@ -862,12 +953,21 @@ def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
     which matters doubly here, because this call runs while holding the
     host-wide slot every other session is waiting on.
     """
+    if extra_env is not None and _TEMPLATE_ENV_VAR in extra_env:
+        raise ValueError(
+            f"{_TEMPLATE_ENV_VAR} must not be supplied via extra_env -- "
+            "_run_selftest is its single writer, and a caller that sets it "
+            "itself makes test_selftest_template_seam_propagates blind to a "
+            "dropped seam.  Pass the name as the `template` argument."
+        )
     env = os.environ.copy()
-    env["LMS_SELFTEST_TEMPLATE"] = template
+    if extra_env is not None:
+        env.update(extra_env)
+    env[_TEMPLATE_ENV_VAR] = template
     return run_in_new_session(
         ["bash", str(SELFTEST_SH)],
         env=env,
-        timeout=_SELFTEST_TIMEOUT_S,
+        timeout=timeout,
     )
 
 
@@ -939,6 +1039,16 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     _remove_template_residue and _prune_stale_selftest_units key on the
     unique, hyphenated name.
 
+    Driven through ``_run_selftest``, the SAME helper the real gate uses, so
+    both halves of the seam are covered by one assertion.  An earlier version
+    built its env dict inline and set LMS_SELFTEST_TEMPLATE itself, which
+    covered only the .sh half: a misspelled or deleted key in _run_selftest
+    left this test green, left test_shell_selftest_passes green solo (the .sh
+    would just fall back to the shared default), and re-opened the measured
+    collision in the fleet.  ``extra_env`` therefore varies only the
+    environment AROUND the seam -- the unit dir and PATH -- and _run_selftest
+    rejects any attempt to pass the seam variable itself.
+
     HOW, without systemd and without touching the real unit dir.  The seam is
     observable by making the .sh's very first write FAIL at a path only a
     propagated template can name: XDG_CONFIG_HOME is redirected at tmp_path
@@ -972,11 +1082,17 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     blocker = unit_dir / f"{template}.service.d"
     blocker.write_text("")
 
-    env = os.environ.copy()
-    env["LMS_SELFTEST_TEMPLATE"] = template
-    env["XDG_CONFIG_HOME"] = str(tmp_path)
-    env["PATH"] = os.pathsep.join([str(fake_bin), env.get("PATH", "")])
-    result = run_in_new_session(["bash", str(SELFTEST_SH)], env=env, timeout=60)
+    result = _run_selftest(
+        template,
+        extra_env={
+            "XDG_CONFIG_HOME": str(tmp_path),
+            "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+        },
+        # This run aborts at its first mkdir, so it needs none of
+        # _SELFTEST_TIMEOUT_S's budget -- and it holds no serialization slot,
+        # so a wedge here must not sit on the suite's --timeout=300.
+        timeout=60,
+    )
 
     detail = (
         f"\n--- template: {template}\n"
