@@ -1086,6 +1086,12 @@ def _build_eval(
         # One issue per distinct (metric, kind): a kind that is wrong in every
         # run of a 90-run window is one problem, not ninety.  Deduped on the
         # repr so an unhashable value out of a malformed artifact cannot raise.
+        # This repr is an internal dedup key, never emitted into a detail, and
+        # deliberately NOT routed through `_short_repr`: capping it would make
+        # two distinct oversized kinds that differ only past the cap collide
+        # on their shared prefix, silently swallowing the second metric's
+        # `unknown_kind` issue (DD6/INV-2 forbids exactly that silent drop).
+        # The `unknown_kind` detail below IS capped — only the key stays raw.
         kind = current.get('kind')
         seen_kinds: set[str] = set()
         for _stamp, by_id, run_path in runs:
@@ -1110,14 +1116,17 @@ def _build_eval(
                 _issue(
                     issues, 'missing_kind', eval_id=eval_id, path=run_path,
                     detail=(
-                        f'metric {metric_id!r} carries no "kind" (a required M1 field), '
+                        f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
                         'so it has no chart primitive'
                     ),
                 )
             else:
                 _issue(
                     issues, 'unknown_kind', eval_id=eval_id, path=run_path,
-                    detail=f'metric {metric_id!r} has kind {run_kind!r}, which has no chart primitive',
+                    detail=(
+                        f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
+                        'which has no chart primitive'
+                    ),
                 )
 
         # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
@@ -1177,8 +1186,8 @@ def _build_eval(
                 issues, 'unknown_verdict', eval_id=eval_id,
                 path=eval_dir.parent / 'verdicts-current.json',
                 detail=(
-                    f'metric {metric_id!r} has verdict {verdict!r}, which is outside the '
-                    'M2 vocabulary and has no parity badge'
+                    f'metric {_short_repr(metric_id)} has verdict {_short_repr(verdict)}, '
+                    'which is outside the M2 vocabulary and has no parity badge'
                 ),
             )
 
