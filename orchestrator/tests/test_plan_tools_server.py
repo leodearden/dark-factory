@@ -464,6 +464,65 @@ class TestDropPlanFile:
             {'path': 'mod_a/bar.py', 'reason': reason}
         ]
 
+    def _assert_record_untouched(self, artifacts, files):
+        """A refusal must leave the durable record exactly as it was."""
+        plan = artifacts.read_plan()
+        assert plan['files'] == files
+        assert plan.get('dropped_files', []) == []
+
+    def test_unknown_path_is_refused(self, artifacts):
+        """A hallucinated or already-dropped entry must not silently no-op.
+
+        Appending a note explaining an absence that was never a declaration
+        would manufacture provenance rather than preserve it.
+        """
+        self._three_file_plan(artifacts)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/nope.py', reason='Never needed'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(
+            artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        )
+
+    def test_blank_reason_is_refused(self, artifacts):
+        """An unrecorded reason is exactly the falsified provenance
+        ``merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX`` objects to,
+        so an empty (or whitespace-only) one must not be accepted."""
+        self._three_file_plan(artifacts)
+
+        for reason in ('', '   '):
+            result = _drop_plan_file(
+                artifacts, path='mod_a/bar.py', reason=reason
+            )
+
+            assert result['status'] == 'error', f'reason={reason!r} was accepted'
+            assert result['message']
+            self._assert_record_untouched(
+                artifacts, ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+            )
+
+    def test_refuses_to_drop_the_last_remaining_file(self, artifacts):
+        """Narrowing to empty silences the gate wholesale.
+
+        ``_task_files`` returns None for an empty list, so
+        ``workflow._check_plan_files_touched_in_branch`` is handed ``[]`` and
+        flags nothing — a plan with no files is not a narrowed plan, it is an
+        unchecked one.
+        """
+        _create_plan(artifacts, 'test-1', 'Test task', 'Analysis', ['mod_a/only.py'])
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert result['message']
+        self._assert_record_untouched(artifacts, ['mod_a/only.py'])
+
 
 class TestRemovePlanStep:
     def test_removes_pending_step(self, artifacts):
