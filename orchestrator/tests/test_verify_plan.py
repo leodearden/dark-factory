@@ -2672,6 +2672,12 @@ class TestEffectiveMergeModuleConfigs:
 # Version pin survival through the VerifyCmd-layer scoper (task 3931)
 # ---------------------------------------------------------------------------
 
+# The committed fleet chain is deliberately BARE — task 4538 pins the pyright
+# version out-of-band, in the repo-root package.json that
+# verify_cold_preprovision_command's `npm ci` materialises — so the pinned
+# fixture is DERIVED from it here. The non-vacuity assert in
+# ``test_unpinned_chain_scopes_exactly_as_today`` below is what keeps the two
+# fixtures from collapsing into one string if that ever changes.
 _PINNED_TYPE_CHAIN_3931 = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', 'npx pyright@1.1.408')
 _ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
 
@@ -2713,6 +2719,11 @@ class TestVersionPinSurvivesPrefixScoping:
 
     def test_unpinned_chain_scopes_exactly_as_today(self):
         """Regression floor: the bare spelling is unchanged."""
+        assert _PINNED_TYPE_CHAIN_3931 != ROOT_TYPE_CHECK_COMMAND, (
+            'the committed fleet chain already carries an inline `@<version>` '
+            '(task 3931 / 4538) — the pinned fixture above would then be the '
+            'same string as this one and neither guard would mean anything'
+        )
         cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
         assert cmd.tool is ToolKind.PYRIGHT
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
