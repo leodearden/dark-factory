@@ -1214,8 +1214,10 @@ def _withhold_from_launching(
       question belong on this record whether or not its SessionStart has
       landed yet, and withholding them was the regression this repairs.
     * The record has been stuck in the window past
-      ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS``, i.e. the owner's SessionStart is
-      not merely slow, it is never coming.
+      ``_LAUNCH_WINDOW_WITHHOLD_MAX_SECS`` -- i.e. the owner's SessionStart
+      is not merely slow, it is never coming -- or it carries no readable
+      ``start_ts`` at all, which cannot be shown to be inside the window and
+      so is treated the same way (see ``_launch_window_withholding_expired``).
 
     Otherwise the event's provenance is genuinely unknowable and nothing it
     carries may land on the spawn-created record.
