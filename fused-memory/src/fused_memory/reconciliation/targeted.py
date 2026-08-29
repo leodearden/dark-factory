@@ -1576,6 +1576,16 @@ class TargetedReconciler:
                 'satisfied_by': satisfied_by,
             }
 
+        veto_reason = _unblock_veto_reason(dependent)
+        if veto_reason is not None:
+            return {
+                'type': 'dependent_unblock_vetoed',
+                'task_id': dep_id,
+                'title': dependent.get('title'),
+                'satisfied_by': satisfied_by,
+                'reason': veto_reason,
+            }
+
         await self.task_interceptor.set_task_status(
             task_id=dep_id,
             status='pending',
@@ -1599,6 +1609,48 @@ class TargetedReconciler:
         test_on_task_deferred_reopen_deletes_stale_completion_echo.
         """
         return await self._on_task_blocked(task_id, scope, task_before, run_id)
+
+
+def _unblock_veto_reason(dependent: dict) -> str | None:
+    """Pure, no-I/O check for whether *dependent*'s own metadata forbids
+    unblocking it, even though all its dependencies are now done.
+
+    Returns a reason string to veto, or ``None`` when this metadata check
+    raises no objection (the caller separately checks for an open
+    escalation pin before writing).
+
+    * ``'parent_cancelled'`` — ``metadata.parent_cancelled`` or
+      ``metadata.needs_recheck_against_main`` is truthy: exactly the shape
+      ``_sweep_block_orphan`` stamps when it deliberately blocks an
+      ambiguous descendant of a cancelled parent. Unblocking it here would
+      silently undo that sweep's decision.
+    * ``'external_deps'`` — ``metadata.external_deps`` is a non-empty
+      dict/list: only ``Scheduler._apply_external_dep_policy`` can evaluate
+      live cross-project statuses, so this reconciler must abstain rather
+      than guess.
+
+    Reads metadata defensively: a JSON-string metadata value (as stored by
+    some callers) is tolerated the same way the rest of this module treats
+    task metadata, and anything else unparseable is treated as empty.
+    """
+    metadata = dependent.get('metadata')
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    if metadata.get('parent_cancelled') or metadata.get('needs_recheck_against_main'):
+        return 'parent_cancelled'
+
+    external_deps = metadata.get('external_deps')
+    if isinstance(external_deps, (dict, list)) and external_deps:
+        return 'external_deps'
+
+    return None
+
 
 def _extract_task(task_data: dict) -> dict:
     """Normalize Taskmaster response to get the task dict."""
