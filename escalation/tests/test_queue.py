@@ -3986,6 +3986,216 @@ class TestUpdatedAtStamp:
         )
 
 
+class TestDeclarePin:
+    """EscalationQueue.declare_pin() stamps the declared-dependency marker (task 4377).
+
+    ``stamp_triage``'s structural twin — an annotation writer on a PENDING
+    record — but with a different consequence: the marker changes what a
+    resolver may do to the record (``escalation/server.py::resolve_issue``
+    refuses every non-``park`` action on a marked record), so a silent no-op
+    stamp would leave the declarer believing a record is protected when it is
+    not.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _make_pending(
+        self, queue: EscalationQueue, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='pending record for the declared-pin marker',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) stamps a pending record and persists to disk ---
+
+    def test_stamps_pending_record_and_returns_it(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.pin_declared_by == [self.DECLARER]
+        assert result.pin_declared_reason == self.REASON
+
+    def test_stamp_is_persisted_to_disk(self, tmp_path: Path):
+        """It went through _rewrite, not just an in-memory mutation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER]
+        assert reread.pin_declared_reason == self.REASON
+
+    def test_stamp_does_not_archive(self, tmp_path: Path):
+        """The file stays in the queue root — a declaration is not a resolution."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert (queue.queue_dir / f'{esc.id}.json').exists()
+
+    # --- (b)/(c) append semantics ---
+
+    def test_second_distinct_declarer_appends_in_declaration_order(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    def test_redeclaring_an_existing_declarer_is_idempotent(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None, (
+            'a wholly-redundant re-declaration adds nothing and must not report success'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER], 'no duplicate entry'
+
+    def test_partially_redundant_declaration_appends_only_the_new_entry(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+
+        result = queue.declare_pin(esc.id, declared_by=['first-gate', 'second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    # --- (d) asymmetric reason overwrite ---
+
+    def test_reason_is_overwritten_only_when_non_empty(self, tmp_path: Path):
+        """The asymmetric-overwrite contract stamp_triage establishes for triage_note."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason=self.REASON)
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='')
+
+        assert result is not None
+        assert result.pin_declared_reason == self.REASON, (
+            'an empty reason must not silently wipe a previously-recorded one'
+        )
+
+    def test_a_non_empty_reason_replaces_the_previous_one(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason='old reason')
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='new reason')
+
+        assert result is not None
+        assert result.pin_declared_reason == 'new reason'
+
+    # --- (e) blank normalisation; a no-op stamp must not report success ---
+
+    def test_blank_entries_are_dropped_from_declared_by(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=['', '  real-gate  ', '\t'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['real-gate']
+
+    def test_empty_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=[])
+
+        assert result is None, 'loud over silent: a no-op stamp must not report success'
+        assert path.read_bytes() == before, 'the record must be byte-identical on disk'
+
+    def test_all_blank_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=['', '   ', '\t\n'], reason='r')
+
+        assert result is None
+        assert path.read_bytes() == before
+
+    # --- (f)/(g) unknown and archived ids ---
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        assert queue.declare_pin('esc-does-not-exist', declared_by=[self.DECLARER]) is None
+
+    def test_resolved_record_returns_none_and_is_not_resurrected(self, tmp_path: Path):
+        """Root-only load: the Defect-2 class of bug stamp_triage's contract prevents.
+
+        ``self.get()`` falls back to the archive, and ``_rewrite`` always targets
+        the queue root — so loading via ``get()`` here would write an archived
+        record back into the pending pile.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'done')
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'precondition: archived'
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'declare_pin must not resurrect an archived record into the queue root'
+        )
+
+    def test_dismissed_record_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'not a real problem', dismiss=True)
+
+        assert queue.declare_pin(esc.id, declared_by=[self.DECLARER]) is None
+
+    # --- (h) neighbouring fields are untouched ---
+
+    def test_does_not_bump_updated_at_or_touch_status_level_triage(self, tmp_path: Path):
+        """add_members_to_l2 stays the sole updated_at writer (see the design decision)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue, level=2)
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+        triaged_at_before = queue.get(esc.id).triaged_at  # type: ignore[union-attr]
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.updated_at is None, (
+            f'declare_pin must not bump updated_at, got {result.updated_at!r}'
+        )
+        assert result.status == 'pending'
+        assert result.level == 2
+        assert result.triaged_at == triaged_at_before
+        assert result.triaged_by == 'watcher'
+
+
 class TestResolveCascade:
     """EscalationQueue.resolve() cascades resolution to member L1s when L2 has members."""
 
