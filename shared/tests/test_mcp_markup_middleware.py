@@ -2585,7 +2585,16 @@ class TestB10StormEscape:
             )
         return excinfo
 
-    async def _unrepairable(self, h, project='/srv/alpha'):
+    @staticmethod
+    async def _unrepairable(h, project='/srv/alpha'):
+        """One unrepairable refusal attributed to *project*, by *agent_id*.
+
+        STATIC, like ``_storms`` below and for the same reason: it touches no
+        instance state, and the sibling class beside this one drives the
+        IDENTITY axis through it — ``add_memory`` is the toy that declares
+        ``agent_id``, so a bound-method-only helper would have to be copied to
+        be reused.
+        """
         with pytest.raises(ToolError):
             await h.call(
                 'add_memory',
@@ -2965,7 +2974,7 @@ class TestTheStormNamesItsCrossingCaller:
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
 
         for _ in range(3):
-            await TestB10StormEscape._unrepairable(self, h)
+            await TestB10StormEscape._unrepairable(h)
             clock.advance(60)
 
         assert self._storms(h)[0]['crossing_agent_id'] == 'claude-caller'
@@ -2982,7 +2991,7 @@ class TestTheStormNamesItsCrossingCaller:
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
 
         for _ in range(3):
-            await TestB10StormEscape._unrepairable(self, h)
+            await TestB10StormEscape._unrepairable(h)
             clock.advance(60)
 
         storm = self._storms(h)[0]
