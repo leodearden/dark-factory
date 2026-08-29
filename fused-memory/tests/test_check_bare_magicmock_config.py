@@ -2149,3 +2149,83 @@ class TestWallClockDeadlineBaselineIntegrity:
         assert sum(debt.values()) == 618, (
             f'expected the measured 618 violations; got {sum(debt.values())}'
         )
+
+
+_MERGE_SPECULATION = 'orchestrator/tests/test_merge_speculation.py'
+
+# The reviewer's own counter-example (task 3980): a sixth late-arrival class added
+# tomorrow, outside any hand-maintained list, carrying the exact bare mid-range
+# deadline that produced one of the three measured failures.
+_COUNTER_EXAMPLE_CLASS = (
+    '\n\n'
+    'class TestSomeBrandNewLateArrivalCase:\n'
+    '    async def test_new_case(self):\n'
+    '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
+)
+
+
+def _merge_speculation_source() -> str:
+    """Return the real test_merge_speculation.py source, or skip if absent.
+
+    Reached through the existing _REPO_ROOT, matching TestAllScannedTestDirsClean's
+    tolerance for a checkout without orchestrator/.
+    """
+    path = _REPO_ROOT / _MERGE_SPECULATION
+    if not path.is_file():
+        pytest.skip(f'{_MERGE_SPECULATION} not present under {_REPO_ROOT}')
+    return path.read_text(encoding='utf-8')
+
+
+class TestRuleCCoversMergeSpeculation:
+    """Two-sided proof that Rule C genuinely covers test_merge_speculation.py.
+
+    This is the PRECONDITION for deleting that module's file-local wall-clock
+    guard (_load_bearing_wait_target / _late_arrival_wait_offenders /
+    TestLateArrivalWaitsAreLoadIndependent, task 3980). Deleting a guard is only
+    honest if the replacement provably reaches the same code.
+
+    Leg (b) is the load-bearing one. Leg (a) alone — "the module is clean" — is
+    equally satisfied by a rule that never fires at all, or by one that quietly
+    grandfathered the module. Injecting the counter-example under that exact
+    filename and requiring it to flag is what distinguishes real coverage from
+    vacuous silence.
+    """
+
+    def test_the_module_is_clean_today(self):
+        """(a) Zero Rule C violations: task 3980 already migrated every site."""
+        violations = _rule_c(_merge_speculation_source(), _MERGE_SPECULATION)
+        assert violations == [], (
+            'test_merge_speculation.py must be Rule-C clean — task 3980 migrated its '
+            'load-bearing waits onto wait_responsive. Offenders:\n  '
+            + '\n  '.join(f'{v.lineno}: {v.message}' for v in violations)
+        )
+
+    def test_the_counter_example_flags_under_that_exact_filename(self):
+        """(b) The module is IN SCOPE, not grandfathered.
+
+        A sixth late-arrival class added tomorrow must trip BOTH offence kinds —
+        the wrong routing and the written number — under the module's own filename.
+        """
+        source = _merge_speculation_source() + _COUNTER_EXAMPLE_CLASS
+        violations = _rule_c(source, _MERGE_SPECULATION)
+        assert len(violations) == 2, (
+            'the counter-example must flag BOTH offence kinds under '
+            f'{_MERGE_SPECULATION}; got {violations!r}. If this is empty, the module '
+            'has been grandfathered onto _WALL_CLOCK_DEADLINE_DEBT and its file-local '
+            'guard must NOT be deleted.'
+        )
+        remedies = ' '.join(v.message for v in violations)
+        assert 'wait_responsive' in remedies
+        assert 'MERGE_RESULT_TIMEOUT' in remedies
+
+    def test_coverage_does_not_depend_on_the_file_local_guard_existing(self):
+        """The shared rule reads the module as plain source, not through its helpers.
+
+        Pinned explicitly because steps 12/14 delete those helpers: nothing about
+        this coverage may be an artefact of the guard being present when measured.
+        """
+        source = _merge_speculation_source()
+        assert '_late_arrival_wait_offenders' not in _COUNTER_EXAMPLE_CLASS
+        # The same verdict holds for a synthetic module carrying only the counter-example.
+        assert len(_rule_c(_COUNTER_EXAMPLE_CLASS, _MERGE_SPECULATION)) == 2
+        assert _rule_c(source, _MERGE_SPECULATION) == []
