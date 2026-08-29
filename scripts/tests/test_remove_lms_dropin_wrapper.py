@@ -23,16 +23,27 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+
+# The repo's session-isolated subprocess runner (task 3798, THIRD DEFENCE), a
+# documented drop-in for `subprocess.run(cmd, env=..., capture_output=True,
+# text=True, timeout=...)` whose timeout path signals the whole process GROUP.
+# Load-bearing here, not stylistic: see _run_selftest for why the direct-child
+# kill that stock subprocess.run performs is the wrong one for this .sh.
+# Importable because conftest.py appends REPO_ROOT to sys.path for this
+# directory.
+from df_pytest_isolation import run_in_new_session
 
 SELFTEST_SH = Path(__file__).parent / "test_remove_lms_dropin.sh"
 
@@ -113,7 +124,23 @@ def _systemd_user_manager_skip_reason() -> str | None:
     unit_dir = _unit_dir()
     try:
         unit_dir.mkdir(parents=True, exist_ok=True)
-        write_probe = unit_dir / f".lms-selftest-writeprobe-{os.getpid()}-{uuid4().hex[:8]}"
+        # The probe name carries _SELFTEST_PREFIX and a `.service` suffix on
+        # purpose: those are the two things _prune_stale_selftest_units keys
+        # on, so a run SIGKILLed in the microseconds between the write and the
+        # unlink strands a file the existing sweep can still reap.  An
+        # unprefixed name (or a bare tempfile) would strand residue nothing
+        # could ever collect -- the exact accumulation the prune was written
+        # to solve.  Deliberately NOT widening the prune's suffix filter to
+        # cover a dot-file instead: that filter is what keeps the sweep away
+        # from _LOCK_NAME, and a prune that can delete a held lock file would
+        # silently destroy the serialization seam below.
+        #
+        # The forward reference to _SELFTEST_PREFIX (defined below) is safe:
+        # globals resolve at CALL time, and this function is now called
+        # lazily -- see _skip_reason.
+        write_probe = unit_dir / (
+            f"{_SELFTEST_PREFIX}writeprobe-{os.getpid()}-{uuid4().hex[:8]}@.service"
+        )
         write_probe.write_text("")
         write_probe.unlink()
     except OSError as exc:
@@ -128,7 +155,46 @@ def _systemd_user_manager_skip_reason() -> str | None:
     return None
 
 
-_SKIP_REASON = _systemd_user_manager_skip_reason()
+@functools.cache
+def _skip_reason() -> str | None:
+    """The skip reason, computed AT MOST ONCE and never at import time.
+
+    Deliberately a cached function rather than the module constant
+    ``_SKIP_REASON = _systemd_user_manager_skip_reason()`` this file used to
+    carry.  The evaluate-ONCE property that constant existed for is preserved
+    exactly by ``functools.cache`` -- what changes is WHEN.
+
+    A module-scope call runs at COLLECTION: merely collecting
+    ``scripts/tests/`` -- including ``--collect-only``, and including a ``-k``
+    run that deselects every test in this file -- would spawn
+    ``systemctl --user show`` with a 15s timeout AND mutate the operator's
+    real home, because precondition 3 above ``mkdir -p``s
+    ~/.config/systemd/user and writes a probe file inside it.  This repo's
+    suite-wide isolation doctrine (df_pytest_isolation.py, whose four defences
+    all exist to stop test runs touching live operator state) is squarely
+    against that, and collection-time side effects are the worst version of it
+    -- they are paid by runs that never intended to touch systemd at all.
+
+    Lazily, the probe runs only when the one systemd-backed test actually
+    runs, which is also the only moment its answer is load-bearing.
+    """
+    return _systemd_user_manager_skip_reason()
+
+
+def _require_systemd_user_manager() -> None:
+    """Skip the calling test unless a usable systemd --user manager is here.
+
+    The in-test spelling of what used to be
+    ``@pytest.mark.skipif(_SKIP_REASON is not None, ...)``.  A ``skipif``
+    marker must have its condition evaluated at import to build the decorator,
+    which is precisely the collection-time side effect ``_skip_reason``
+    exists to avoid; calling this on the test's first line reports the same
+    skip, with the same reason string, at the same granularity.
+    """
+    __tracebackhide__ = True  # report the skip against the TEST, not this helper
+    reason = _skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +439,68 @@ def test_skip_reason_falls_back_to_home_config_like_the_shell(
     # And an UNSET XDG_CONFIG_HOME resolves the same way.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert _systemd_user_manager_skip_reason() is None
+
+
+def test_importing_this_module_touches_no_unit_directory(tmp_path: Path) -> None:
+    """COLLECTION must be inert.  The guard is armed, not merely defined.
+
+    Every other assertion in this file would stay green if the skip reason
+    were computed at module scope again -- that spelling works, it is just
+    impure.  This is the only test that can tell the difference, and it is the
+    difference that matters to every OTHER suite: `pytest scripts/tests/`
+    imports this module during collection, so a module-scope probe would spawn
+    `systemctl --user show` with a 15s timeout and `mkdir -p` the operator's
+    real ~/.config/systemd/user on every run that merely COLLECTS this
+    directory -- `--collect-only`, or a `-k` run that deselects everything
+    here.  The repo's isolation doctrine (df_pytest_isolation.py) exists to
+    stop exactly that.
+
+    Imported in a SUBPROCESS because this module is already imported in the
+    running interpreter: by the time any test executes, an import-time side
+    effect has long since happened and is unobservable from here.  A fresh
+    interpreter with XDG_CONFIG_HOME and HOME redirected at tmp_path is the
+    only place the question can still be asked.
+
+    Host-independent -- no systemd, no real unit dir, so this runs everywhere,
+    including the sandboxes where test_shell_selftest_passes skips.
+    """
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    # Both, deliberately: XDG_CONFIG_HOME is what _unit_dir reads, and HOME is
+    # its `:-` fallback -- so a regression that ignored the first still lands
+    # in tmp_path rather than in the operator's real home.
+    env["XDG_CONFIG_HOME"] = str(cfg)
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+    )
+
+    program = (
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('_wrapper_import_probe', {str(Path(__file__).resolve())!r})\n"  # noqa: E501
+        "assert spec is not None and spec.loader is not None\n"
+        "spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
+    )
+    result = run_in_new_session([sys.executable, "-c", program], env=env, timeout=120)
+
+    assert result.returncode == 0, (
+        "importing this module in a fresh interpreter failed.\n"
+        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    )
+    assert not (cfg / "systemd").exists(), (
+        f"importing this module created {cfg / 'systemd'} -- the skip probe ran at "
+        "IMPORT time.  Compute it lazily (see _skip_reason): collection must not "
+        "mkdir or write into the operator's real systemd unit directory."
+    )
+    assert not (home / ".config").exists(), (
+        f"importing this module created {home / '.config'} -- the skip probe ran at "
+        "IMPORT time via the $HOME fallback.  See _skip_reason."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -719,16 +847,27 @@ def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
     LMS_UNIT_TEMPLATE seam -- so this single variable propagates through both
     halves and gives the invocation an absolute unit path no concurrent run
     shares.
+
+    ``run_in_new_session`` rather than a bare ``subprocess.run(timeout=...)``,
+    which is this repo's documented convention (task 3798) and is load-bearing
+    on exactly the path _SELFTEST_TIMEOUT_S makes reachable.  stock
+    ``subprocess.run``'s POSIX timeout branch calls ``Popen.kill()``, which
+    signals the DIRECT CHILD only: the ``bash`` dies without running its
+    ``trap cleanup EXIT`` (stranding the template in the live unit dir for
+    _prune_stale_selftest_units to reap an hour later), while any in-flight
+    ``systemctl``/``python3`` grandchild is reparented to ``systemd --user``
+    still holding the stdout/stderr pipe write ends.  Signalling the process
+    GROUP reaches them, and the helper's bounded post-kill drain means a
+    surviving pipe-holder cannot turn ``timeout=`` into an unbounded block --
+    which matters doubly here, because this call runs while holding the
+    host-wide slot every other session is waiting on.
     """
     env = os.environ.copy()
     env["LMS_SELFTEST_TEMPLATE"] = template
-    return subprocess.run(
+    return run_in_new_session(
         ["bash", str(SELFTEST_SH)],
-        capture_output=True,
-        text=True,
-        timeout=_SELFTEST_TIMEOUT_S,
         env=env,
-        check=False,
+        timeout=_SELFTEST_TIMEOUT_S,
     )
 
 
@@ -788,7 +927,76 @@ def test_shell_selftest_is_executable() -> None:
     )
 
 
-@pytest.mark.skipif(_SKIP_REASON is not None, reason=str(_SKIP_REASON))
+def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
+    """The LMS_SELFTEST_TEMPLATE seam must actually REACH the .sh's paths.
+
+    Nothing else asserts this any more.  Until esc-4200-2 a broken seam would
+    have surfaced INDIRECTLY, as test_concurrent_selftests_do_not_collide
+    failing because all three runs silently fell back to the shared default;
+    that test is gone, so without this one a dropped seam degrades SILENTLY to
+    `lms-dropin-selftest@` -- re-opening the measured collision defect, and
+    stranding that default unit in the live dir permanently, since both
+    _remove_template_residue and _prune_stale_selftest_units key on the
+    unique, hyphenated name.
+
+    HOW, without systemd and without touching the real unit dir.  The seam is
+    observable by making the .sh's very first write FAIL at a path only a
+    propagated template can name: XDG_CONFIG_HOME is redirected at tmp_path
+    and a regular FILE is planted where install_fixture will `mkdir -p` its
+    drop-in dir.  If the seam propagates, mkdir refuses and bash prints the
+    blocked path -- which contains our unique template -- to stderr.  If the
+    seam were dropped, the .sh would build that path from the default template
+    instead, find nothing in its way, and never mention our name at all.
+
+    Asserted on the template NAME in stderr, not on the exit code: BOTH cases
+    exit non-zero (a dropped seam would proceed and then fail its
+    WorkingDirectory checks under the redirect, per design decision 2), so rc
+    cannot discriminate and the name is the only signal that can.
+
+    `systemctl` is shimmed to a no-op on PATH so the cleanup trap's
+    `daemon-reload` costs nothing and contends with nothing -- this test must
+    not add unserialized load to the one shared user manager the slot above
+    exists to protect.  Same fake-systemctl-on-PATH idiom as
+    scripts/tests/test_lms_ctl.py.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    shim = fake_bin / "systemctl"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+
+    unit_dir = tmp_path / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    template = _unique_template()
+    # A regular file exactly where `mkdir -p "$DROPIN_DIR"` wants a directory.
+    blocker = unit_dir / f"{template}.service.d"
+    blocker.write_text("")
+
+    env = os.environ.copy()
+    env["LMS_SELFTEST_TEMPLATE"] = template
+    env["XDG_CONFIG_HOME"] = str(tmp_path)
+    env["PATH"] = os.pathsep.join([str(fake_bin), env.get("PATH", "")])
+    result = run_in_new_session(["bash", str(SELFTEST_SH)], env=env, timeout=60)
+
+    detail = (
+        f"\n--- template: {template}\n"
+        f"--- exit code: {result.returncode}\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+    assert template in result.stderr, (
+        f"{SELFTEST_SH.name} never named the template it was handed, so "
+        "LMS_SELFTEST_TEMPLATE did not reach its UNIT/DROPIN_DIR paths.  The .sh "
+        "has silently fallen back to the shared default 'lms-dropin-selftest@', "
+        "which is NOT safe to run concurrently.  Check that line still reads "
+        'TEMPLATE="${LMS_SELFTEST_TEMPLATE:-lms-dropin-selftest@}".' + detail
+    )
+    # The blocker is still a regular file: the run aborted AT the mkdir rather
+    # than somehow proceeding past it, so the stderr above is the mkdir refusal
+    # and not an unrelated message that happened to quote the template.
+    assert blocker.is_file(), f"expected the planted blocker to survive.{detail}"
+
+
 def test_shell_selftest_passes() -> None:
     """THE assertion this task exists to create.  Expected GREEN on arrival.
 
@@ -823,6 +1031,7 @@ def test_shell_selftest_passes() -> None:
     host at one run at a time, so this stays 5.2s of exclusive work plus a
     bounded, skip-terminated wait instead.
     """
+    _require_systemd_user_manager()
     _prune_stale_selftest_units(_unit_dir(), now=time.time())
 
     # The slot is acquired BEFORE the template is generated and released only
