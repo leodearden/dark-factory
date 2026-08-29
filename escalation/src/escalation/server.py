@@ -2367,6 +2367,77 @@ def create_server(
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
+    @mcp.tool()
+    def declare_pin(
+        escalation_id: str,
+        declared_by: list[str],
+        reason: str = '',
+    ) -> dict[str, Any]:
+        """Declare that something outside the escalation store RELIES on this
+        pending record staying OPEN (task 4377).
+
+        An open escalation is a PRESERVATION MECHANISM for its subject task:
+        ``orchestrator/task_ground_truth.py::_RECOVERY`` has no row for the
+        pinned shape, so the row falls through to ``RecoveryAction.LEAVE``.
+        Closing the record flips ``has_open_escalation`` and the task reverts —
+        which makes a close a state-changing act on the subject task even under
+        ``action='close_only'``.  This tool is what makes that dependency
+        DECLARABLE on the record itself, instead of living in prose (a deviation
+        notice, an operator gate) that a bulk closer never reads.
+
+        Once marked, ``resolve_issue`` REFUSES every action except ``park``
+        (``resume`` / ``restart`` / ``abandon`` / ``close_only`` all archive the
+        record) for this record AND for any L2 whose cascade would close it,
+        unless the caller names its id in ``acknowledge_declared_pins``.  That
+        acknowledgement is the ONLY release valve — this ships no un-declare
+        verb, deliberately: withdrawal then happens at the moment of the close,
+        named in the resolution, by the party actually spending the pin.
+
+        *declared_by* names WHAT relies on the record staying open
+        (``'task-3546-second-deviation-notice'``), NOT who stamped it.  Entries
+        are stripped, blanks dropped, already-present entries dropped, then
+        APPENDED in declaration order.  *reason* is the free-text why,
+        overwritten only when non-empty.
+
+        Two deliberate departures from ``stamp_triage``, its structural twin:
+
+        - **NOT level-gated**, for ``stamp_triage``'s stated reason: a
+          declaration is restrictive-only — it can never widen what a
+          connection may do, only narrow it — so gating it would let a
+          level-capped connection OBSERVE a pin it is forbidden to declare.
+        - **The ``X-Escalation-Identity`` header is NOT read** to override
+          *declared_by*.  ``resolved_by`` / ``triaged_by`` are WHO-acted
+          attributions and the non-spoofable server override is right for
+          those; ``pin_declared_by`` answers a different question — WHAT
+          outside the store relies on this record — and overwriting it with a
+          connection identity would destroy the single fact the field exists to
+          carry, silently converting every declaration into "the watcher
+          connection declared this", which names nothing a closer could go
+          consult.  The asymmetry is deliberate; please do not "fix" it.
+
+        Returns the updated record as a full dict on success.  The two failure
+        modes are distinguished so a caller is not left guessing:
+        ``{'error': ..., 'code': 'empty_declared_by'}`` when *declared_by*
+        normalises to nothing (checked here, before the queue is touched — a
+        silent no-op would leave the declarer believing the record is protected
+        when it is not), and ``{'error': ...}`` when the record is not found in
+        the queue root or is not pending.
+        """
+        if not [entry for entry in declared_by if entry.strip()]:
+            return {
+                'error': (
+                    f'declare_pin on {escalation_id} names no declarer: declared_by must '
+                    'carry at least one non-blank entry naming WHAT relies on this record '
+                    'staying open (e.g. "task-3546-second-deviation-notice"). '
+                    'Nothing was stamped — the record is NOT protected.'
+                ),
+                'code': 'empty_declared_by',
+            }
+        esc = queue.declare_pin(escalation_id, declared_by=declared_by, reason=reason)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found or not pending'}
+        return esc.to_dict()
+
     # --- L2 promotion tool ---
 
     @mcp.tool()
