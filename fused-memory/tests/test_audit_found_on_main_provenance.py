@@ -1025,6 +1025,7 @@ def _facts(
     commit_subject: str = '',
     commit_message: str = '',
     commit_files: list[str] | None = None,
+    second_parent_commits: list | None = None,
     revert_commit: str | None = None,
     declared_files_missing_on_main: list[str] | None = None,
 ) -> dict:
@@ -1034,6 +1035,7 @@ def _facts(
         'commit_subject': commit_subject,
         'commit_message': commit_message,
         'commit_files': commit_files or [],
+        'second_parent_commits': second_parent_commits or [],
         'revert_commit': revert_commit,
         'declared_files_missing_on_main': declared_files_missing_on_main or [],
     }
@@ -1193,6 +1195,26 @@ class TestBuildAuditReportShape:
         }
         assert report['total'] == 3
 
+    async def test_second_parent_commits_fact_is_copied_onto_the_audit(self):
+        """A canned second_parent_commits carrying a self-citation clears a
+        task whose merge subject cites a different task — proves the fact
+        reaches classify() through build_audit_report's orchestration, not
+        just through GitFacts.gather() directly."""
+        clearing_sha = 'e' * 40
+        tasks = [_fom_task('50', 'a' * 40, files=['src/f.py'])]
+        git = FakeGitFacts({
+            'a' * 40: _facts(
+                commit_message='Merge task/77 into main',
+                commit_files=['src/f.py'],
+                second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            ),
+        })
+        report = await build_audit_report(tasks, git, ref='main')
+        detail = report['tasks'][0]
+        assert detail['verdict'] == 'ok'
+        assert detail['verdict'] != 'misattributed'
+        assert clearing_sha in ' '.join(detail['reasons'])
+
 
 @pytest.mark.asyncio
 class TestBuildAuditReportMissingFactsDefaultSafe:
@@ -1206,6 +1228,20 @@ class TestBuildAuditReportMissingFactsDefaultSafe:
         report = await build_audit_report(tasks, git, ref='main')
         assert report['tasks'][0]['verdict'] == 'commit_not_on_main'
         assert report['verdict_counts']['commit_not_on_main'] == 1
+
+    async def test_missing_second_parent_commits_key_defaults_to_empty(self):
+        """An alternate facts provider that omits second_parent_commits
+        entirely must reproduce the pre-change verdict (misattributed),
+        never silently clear a task — mirrors the conservative-default
+        policy this class already pins for is_ancestor."""
+        tasks = [_fom_task('50', 'a' * 40)]
+        git = FakeGitFacts({'a' * 40: {
+            'is_ancestor': True,
+            'commit_message': 'Merge task/77 into main',
+            # second_parent_commits omitted entirely.
+        }})
+        report = await build_audit_report(tasks, git, ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
 
 
 # ===========================================================================
@@ -1634,8 +1670,26 @@ class TestGitFactsGather:
         assert facts['is_ancestor'] is True
         assert facts['commit_files'] == ['src/feature.py']
 
+    async def test_merge_commit_gathers_second_parent_commits(self, repo_facts):
+        """The new git fact task 4706 adds: gather() surfaces what a cited
+        merge's second parent brought in, end to end through the real
+        GitFacts facade."""
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_coalesce_merge'], 'main', [])
+        result_shas = {sha for sha, _message in facts['second_parent_commits']}
+        assert result_shas == {
+            shas['c_coalesced_other'], shas['c_coalesced_self'], shas['c_coalesced_slash'],
+        }
+
+    async def test_non_merge_gathers_empty_second_parent_commits(self, repo_facts):
+        root, shas = repo_facts
+        git = GitFacts(str(root))
+        facts = await git.gather(shas['c_keep_drop'], 'main', [])
+        assert facts['second_parent_commits'] == []
+
     async def test_non_ancestor_short_circuits_remaining_git_calls(self, repo_facts, monkeypatch):
-        """When is_ancestor is False, none of the other four subprocesses run
+        """When is_ancestor is False, none of the other five subprocesses run
         — classify() would ignore their facts anyway (commit_not_on_main wins
         at the very first precedence check), so gathering them is pure waste.
         """
@@ -1658,10 +1712,15 @@ class TestGitFactsGather:
             calls.append('files_missing')
             return list(files), []
 
+        async def _spy_second_parent(project_root, commit):
+            calls.append('second_parent')
+            return [('should-not-be-called' * 3, 'should not be called')]
+
         monkeypatch.setattr(_mod, '_git_commit_message', _spy_commit_message)
         monkeypatch.setattr(_mod, '_git_show_files', _spy_show_files)
         monkeypatch.setattr(_mod, '_git_find_revert', _spy_find_revert)
         monkeypatch.setattr(_mod, '_git_files_missing_on_ref', _spy_files_missing)
+        monkeypatch.setattr(_mod, '_git_second_parent_commits', _spy_second_parent)
 
         git = GitFacts(str(root))
         facts = await git.gather(shas['c_side'], 'main', ['src/keep.py'])
@@ -1671,11 +1730,50 @@ class TestGitFactsGather:
             'commit_subject': '',
             'commit_message': '',
             'commit_files': [],
+            'second_parent_commits': [],
             'revert_commit': None,
             'declared_files_missing_on_main': [],
             'declared_files_inconclusive': [],
         }
-        assert calls == []  # none of the other four wrappers ran
+        assert calls == []  # none of the other five wrappers ran
+
+
+@pytest.mark.asyncio
+class TestCoalescedMergeEndToEnd:
+    """End-to-end pins through the REAL git wrappers (no canned facts) — the
+    pin that would have caught the original defect, since mocking
+    subprocess hides it entirely."""
+
+    async def test_coalesced_merge_task_is_ok_end_to_end(self, repo_facts):
+        """task 50's merge subject cites only task 77, but its own step
+        commit rode in under the merge's second parent — must clear to ok,
+        not misattributed."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_coalesce_merge'], files=['src/coalesced_self.py'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'ok'
+        assert report['verdict_counts']['misattributed'] == 0
+
+    async def test_fabricated_merge_task_is_still_misattributed_end_to_end(self, repo_facts):
+        """THE critical negative control, run through real git rather than
+        canned facts: nothing under the fabricated branch cites task 50 at
+        all, synthesizing the PRD's proven fabrications (tasks 2394/2531) —
+        must stay misattributed."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_fabrication_merge'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
+
+    async def test_prose_only_merge_is_still_misattributed_end_to_end(self, repo_facts):
+        """Documents the measured real-world outcome for tasks 2724, 2949
+        and 3610 (see esc-4706-1): task 50 appears only as a raw substring
+        under the second parent, never in a form extract_cited_task_ids
+        accepts, so this stays misattributed too. NOT a defect in this
+        change — a measured, accepted limit."""
+        root, shas = repo_facts
+        task = _fom_task('50', shas['c_prose_merge'])
+        report = await build_audit_report([task], GitFacts(str(root)), ref='main')
+        assert report['tasks'][0]['verdict'] == 'misattributed'
 
 
 # ===========================================================================
