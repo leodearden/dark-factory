@@ -327,9 +327,10 @@ class CategoryCensus:
     # partition -- topics with exactly one canonical / zero / more than one --
     # is not derivable from either.  Keyed by topic, this mirrors 3198's
     # write-time uniqueness probe ``count_memories_by_metadata(project_id,
-    # {'topic': T, 'canonical': True})`` (memory_service.py:594), which is
-    # scope-wide and NOT category-filtered -- so the partition must be read
-    # off the per-project ``merge()`` rollup, never off a single cell.
+    # {'topic': T, 'canonical': True})``
+    # (fused-memory/src/fused_memory/services/memory_service.py::_check_canonical_uniqueness),
+    # which is scope-wide and NOT category-filtered -- so the partition must
+    # be read off the per-project ``merge()`` rollup, never off a single cell.
     canonical_true_by_topic: Counter[str] = field(default_factory=Counter)
     # A ``canonical: true`` carrying no topic cannot be keyed into the
     # cross-tab, and dropping it would break the identity
@@ -704,11 +705,13 @@ def _load_probe_module() -> Any:
     """Load ``memory_eval_retrieval_probe`` by path.
 
     ``scripts/`` is not a package, so a plain import cannot reach it. This is
-    the same importlib idiom ``retro_stamp_topics.py:149`` already established
-    for exactly this cross-script reuse, including the ``sys.modules``-first
-    lookup: that slot may already hold a module another by-path loader
-    executed, and re-executing would hand back a DIFFERENT class object for
-    ``RegistryEntry``, silently breaking identity across the seam.
+    the same importlib idiom
+    ``fused-memory/scripts/retro_stamp_topics.py::_load_probe_module`` already
+    established for exactly this cross-script reuse, including the
+    ``sys.modules``-first lookup: that slot may already hold a module another
+    by-path loader executed, and re-executing would hand back a DIFFERENT
+    class object for ``RegistryEntry``, silently breaking identity across the
+    seam.
     """
     import importlib.util  # noqa: PLC0415
 
@@ -740,8 +743,10 @@ def topic_registry_loader() -> Any:
 
     REUSED, never re-parsed: the registry's schema-version check, its
     zero-entry rejection and its ``RegistryError`` type all stay single-homed
-    in the probe, exactly as ``retro_stamp_topics.py:189`` establishes -- and
-    the reuse stays pinnable by ``is``, through this accessor.
+    in the probe, exactly as
+    ``fused-memory/scripts/retro_stamp_topics.py::load_topic_registry``
+    establishes -- and the reuse stays pinnable by ``is``, through this
+    accessor.
 
     LAZY and memoized, not an import-time module alias. As an alias the load
     ran at ``import census_memory_metadata`` time, which made the most likely
@@ -886,7 +891,8 @@ def _build_topic_coverage(
     :meth:`CategoryCensus.merge`, never a single cell.  That is load-bearing,
     not incidental: 3198's write-time uniqueness probe is
     ``count_memories_by_metadata(project_id, {'topic': T, 'canonical': True})``
-    (memory_service.py:594) -- scope-wide, NOT category-filtered.  Measuring
+    (fused-memory/src/fused_memory/services/memory_service.py::_check_canonical_uniqueness)
+    -- scope-wide, NOT category-filtered.  Measuring
     the partition at a finer grain than the invariant is stated at would
     score a topic whose canonical sits in a different category from its
     peers as "zero canonical" and split a genuine cross-category duplicate

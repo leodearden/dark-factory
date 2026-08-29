@@ -1327,6 +1327,16 @@ a semantic search: a coverage number derived from ranked retrieval could not
 distinguish "the record is absent" from "the record ranks below *k*", which
 is the exact ambiguity this instrument exists to resolve.
 
+**Why its own timer, and not task 3136's report.** The charter strongly
+preferred emitting these columns from task 3136's duplicate-audit report over
+standing up a second timer, and made that conditional on 3136's state. 3136 is
+still `pending` — neither its report script
+(`fused-memory/scripts/duplicate_cluster_report.py`) nor its timer
+(`scripts/fused-memory-duplicate-audit.timer`) exists — so there is no report
+to add columns to and no cadence to borrow, and a dedicated timer is what ships
+a measurement now. Should 3136 land later, folding this census into its report
+and retiring this timer is the cheaper shape and is the preferred follow-up.
+
 | File | Role |
 |---|---|
 | `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then commit |
@@ -1348,7 +1358,7 @@ The history file carries scalars and no per-topic tables on purpose: a
 nightly timer appending a full topic breakdown would grow a committed file
 without bound. Retention is capped at 90 runs and any drop is **disclosed in
 the file** rather than silently truncated. Measured on the committed file
-(10,736 bytes for 2 runs at the current two-project shape): **~5.2 KiB per
+(16,022 bytes for 3 runs at the current two-project shape): **~5.2 KiB per
 run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
@@ -1363,9 +1373,9 @@ at one row's worth. Counts shift nightly on a live corpus, so a quiet night
 is rare and the job writes roughly **140 KiB of new loose object content per
 night, ~50 MiB per year** before `git gc` delta-compresses the
 near-identical successive versions. That is deliberate,
-not an oversight: the JSON is a **cited, read** artifact — leaf beta's
-grandfather list and `fused-memory/scripts/memory_eval_retrieval_probe.py`
-(`DEFAULT_CENSUS_PATH`) both read it from the repo, so a snapshot that is
+not an oversight: the JSON is a **cited, read** artifact —
+`fused-memory/scripts/memory_eval_retrieval_probe.py`
+(`DEFAULT_CENSUS_PATH`) reads it from the repo, so a snapshot that is
 only regenerated on demand would be silently stale for whoever reads it
 next. Not committing them is worse still: the wrapper regenerates them in
 the machine-operated `project_root` checkout regardless, so skipping the

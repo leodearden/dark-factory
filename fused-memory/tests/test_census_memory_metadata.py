@@ -297,7 +297,8 @@ class TestCategoryCensusCanonicalByTopic:
     with zero, with more than one -- cannot be derived from either.  This
     accumulator joins them at fold time, keyed by topic, mirroring 3198's
     write-time probe ``count_memories_by_metadata(project_id,
-    {'topic': T, 'canonical': True})`` (memory_service.py:594).
+    {'topic': T, 'canonical': True})``
+    (fused-memory/src/fused_memory/services/memory_service.py::_check_canonical_uniqueness).
     """
 
     def test_canonical_true_keyed_by_its_topic(self):
@@ -790,9 +791,10 @@ class TestUniquenessViolationsAreNamedAndReadable:
 
     An operator cannot act on an integer, and a bare count is also
     MISREADABLE: 3198 ships warn-mode-first behind ``memory_metadata.enforce``
-    (default False, config/schema.py:458), so a duplicate can land by an
-    ordinary write and a non-zero count is partly backlog, not proof the
-    guard broke.  The block therefore carries the violators, the live flag,
+    (default False,
+    ``fused-memory/src/fused_memory/config/schema.py::MemoryMetadataConfig.enforce``),
+    so a duplicate can land by an ordinary write and a non-zero count is
+    partly backlog, not proof the guard broke.  The block therefore carries the violators, the live flag,
     and -- per Leo's 2026-08-12 ruling (Option B on esc-4006-3) -- what still
     stands between here and flipping that flag.
     """
@@ -1370,7 +1372,8 @@ class TestRegistryCoverageGauge:
 
     def test_loader_is_the_probes_pinned_by_identity(self):
         # Imported through the same _load_probe_module importlib idiom
-        # retro_stamp_topics.py:149,189 already established, so the schema
+        # fused-memory/scripts/retro_stamp_topics.py::_load_probe_module and
+        # ::load_topic_registry already established, so the schema
         # check, the zero-entry rejection and the RegistryError type stay
         # single-homed rather than re-parsed here.
         import importlib.util as _ilu
