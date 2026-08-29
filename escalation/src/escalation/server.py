@@ -438,6 +438,31 @@ _COMPACT_ESCALATION_FIELDS = (
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
     'root_cause', 'member_ids',
+    # pin_declared_by (task 4377) — the declared-dependency marker.
+    #
+    # WHY IT IS PROJECTED: a bulk closer that drains COMPACT rows must be able
+    # to tell a declared pin from an ordinary homogeneous cluster member BEFORE
+    # it acts.  On 2026-08-08 all eleven members of esc-3237-5 were
+    # indistinguishable by id, level, category, severity, agent_role and
+    # summary, and the sole marker on esc-3371-2 lived in prose nothing linked
+    # from; the cascade close spent it and mu-gate specimen task 3371 is gone.
+    # Same class of finding as task 3997's dedup-critical fields.
+    #
+    # ITS COST, named: it rides EVERY compact row as `[]` for the overwhelming
+    # majority of records (~22 bytes), including the dashboard's
+    # fetch_pins_recovery poll.  In practice the populated form is short too — a
+    # handful of short declarer strings — which is the actual basis for
+    # including it rather than an assertion that it is free.
+    #
+    # WHY pin_declared_reason IS NOT PROJECTED: unbounded free text, the same
+    # property that keeps `detail` out.  The projected declarer list is the
+    # signal to pull the full record via get_escalation.
+    #
+    # WHY IT IS ALWAYS PROJECTED, never conditionally omitted: `pins_recovery`
+    # already gives ABSENCE a specific meaning here ("could not be computed"),
+    # and giving absence a second, different meaning on a neighbouring key would
+    # be exactly the legibility trap that contract exists to prevent.
+    'pin_declared_by',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
