@@ -1756,6 +1756,20 @@ def create_server(
         a fact the emitter held in a variable.  The predicate is
         ``escalation/declared_pins.py::blocking_pin_declarations``.
 
+        The check covers the TARGET **and EVERY MEMBER** of an L2 cluster.
+        Both halves are load-bearing.  ``queue.resolve`` archives the head
+        BEFORE it cascades, so a per-member check inside the cascade could only
+        ever half-close a cluster — head archived, members still pending —
+        which is why this is a PRE-FLIGHT here rather than a refusal down
+        there.  And the bulk close of a homogeneous cluster is precisely the
+        operation that hides a member serving double duty as a pin: on
+        2026-08-08 all eleven members of esc-3237-5 were indistinguishable by
+        id, level, category, severity, agent_role and summary, and the sole
+        marker on esc-3371-2 lived in prose nothing linked from.  A member
+        ``queue.get`` cannot return is treated as unmarked and skipped, matching
+        the cascade's existing best-effort contract (see the in-code note for
+        the named limitation).
+
         COVERS every action EXCEPT ``park``: ``resume``, ``restart``,
         ``abandon`` and ``close_only`` all run ``queue.resolve()`` and archive
         the record, flipping the boolean identically — a ``resume`` would spend
@@ -1933,7 +1947,30 @@ def create_server(
         # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
         # refusal persists nothing (INV-1), exactly as the capability and Table B
         # gates do.
-        blocked = blocking_pin_declarations([rec])
+        #
+        # Classifies the TARGET plus EVERY member of an L2 cluster, because the
+        # BULK CLOSE of a homogeneous cluster is precisely the operation that
+        # hides a member serving double duty as a pin.  A member `queue.get`
+        # cannot return is treated as UNMARKED and skipped, deliberately
+        # matching queue.resolve's best-effort cascade contract (pinned by
+        # test_queue.py::TestResolveCascade::test_cascade_to_nonexistent_member_
+        # is_best_effort): a record that does not exist cannot carry a marker,
+        # and refusing a whole resolve on a dangling member id would break
+        # behaviour the cascade tests already pin.  NAMED LIMITATION: queue.get
+        # collapses "absent" and "unparseable" into None, so a CORRUPT member
+        # file reads as unmarked — the opposite fail-direction from
+        # escalation/pins.py (records=None => store_unavailable).  Distinguishing
+        # them would require changing queue.get's return contract; out of scope.
+        #
+        # COST, considered: one queue.get per member on a resolve.  A resolve is
+        # a rare, human/watcher-driven operation and `get` memoises its archive
+        # listing, so this is not an unconsidered N+1.
+        candidates = [rec]
+        for member_id in rec.members:
+            member = queue.get(member_id)
+            if member is not None:
+                candidates.append(member)
+        blocked = blocking_pin_declarations(candidates)
         if blocked:
             return {
                 'error': format_refusal(blocked),
