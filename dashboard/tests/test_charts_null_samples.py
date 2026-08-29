@@ -237,8 +237,8 @@ _HBAR_CHART_BANNED = (
     (
         'formatVal(r[valueKey])',
         "hands the RAW primary value to the caller's formatter — BOTH live "
-        'call sites pass ``v => `$${v.toFixed(2)}``` (tabs.jsx:1145, '
-        'tabs.jsx:1156), so a row lacking the key throws a TypeError DURING '
+        'call sites pass ``v => `$${v.toFixed(2)}``` (both <HBC> tags in '
+        'tabs.jsx::CostsTab), so a row lacking the key throws a TypeError DURING '
         'RENDER and takes out the whole Costs tab, not just one row. Rows '
         'lacking the key are what this component\'s contract permits (it '
         'reads them through a caller-supplied valueKey), not what the API '
@@ -676,7 +676,7 @@ def _hbar_hole_contract_violations(body: str) -> list[str]:
 
 
 def test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_throwing(
-    charts_jsx: str,
+    charts_jsx_body: str,
 ) -> None:
     """A row with no measurement must degrade, not throw.
 
@@ -694,7 +694,7 @@ def test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_throwing(
     ``barFractions`` null the bar already uses — one hole decision per row means
     the row's text and its bar can never disagree about whether it was measured.
     """
-    body = _component_body(charts_jsx, 'HBarChart')
+    body = _component_body(charts_jsx_body, 'HBarChart')
     violations = _hbar_hole_contract_violations(body)
 
     assert not violations, 'HBarChart still mishandles a row with no measurement:\n' + '\n'.join(
@@ -710,7 +710,7 @@ def test_hbar_chart_hole_contract_fails_on_pre_fix_source() -> None:
     itself and would be a permanent false GREEN — the same failure mode
     test_hist_bar_branch_contract_fails_on_pre_fix_source guards for HistBar.
     """
-    violations = _hbar_hole_contract_violations(_strip_comments(_PRE_FIX_HBAR_CHART))
+    violations = _hbar_hole_contract_violations(strip_js_comments(_PRE_FIX_HBAR_CHART))
     kinds = {v.split(':', 1)[0] for v in violations}
 
     assert kinds == {'em-dash', 'width', 'branch'}, (

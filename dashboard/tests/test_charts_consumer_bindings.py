@@ -36,7 +36,9 @@ import re
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
-# Copied verbatim from test_tab_burndown.py:68.  Matches ONLY the destructure
+# Copied verbatim from
+# dashboard/tests/test_tab_burndown.py::_DF_CHARTS_DESTRUCTURE_RE.
+# Matches ONLY the destructure
 # shape (see the module docstring for the three shapes it deliberately skips).
 _DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
 
