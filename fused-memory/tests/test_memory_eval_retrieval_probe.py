@@ -1208,6 +1208,48 @@ class TestRankIndex:
         assert _mod().rank_index([]) == {}
 
 
+class TestRanksAtDepth:
+    """`ranks_at_depth(ranks, k)` — the depth-scoped view of a full-depth index.
+
+    Provably identical to `rank_index(results[:k])`: `rank_index` keeps the
+    FIRST rank, so a hash whose first rank is <= k has that same rank in the
+    truncated list, and one whose first rank is > k does not appear in the
+    truncated list at all. Pinning that identity is what justifies deriving
+    the view instead of re-hashing a truncated copy.
+    """
+
+    def test_matches_rehashing_the_truncated_list_at_every_depth(self):
+        m = _mod()
+        results = _filler(9)
+        ranks = m.rank_index(results)
+
+        for k in (0, 1, 4, len(results), len(results) + 5):
+            assert m.ranks_at_depth(ranks, k) == m.rank_index(results[:k])
+
+    def test_a_repeated_hash_keeps_its_first_rank_across_the_cut(self):
+        """Same content at rank 1 (<= k) and rank 7 (> k): the derived view
+        must map it to its first rank, not drop it because a later
+        occurrence of the same content fell outside the depth."""
+        m = _mod()
+        results = [_R(content='dup', id='D1'), *_filler(5), _R(content='dup', id='D2')]
+        ranks = m.rank_index(results)
+        k = 3
+
+        depth_view = m.ranks_at_depth(ranks, k)
+
+        assert depth_view[m.content_key('dup')] == 1
+        assert depth_view == m.rank_index(results[:k])
+
+    def test_it_does_not_mutate_the_input_mapping(self):
+        m = _mod()
+        ranks = m.rank_index(_filler(5))
+        before = dict(ranks)
+
+        m.ranks_at_depth(ranks, 2)
+
+        assert ranks == before
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
