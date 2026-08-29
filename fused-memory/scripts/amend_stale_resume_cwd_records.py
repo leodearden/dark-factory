@@ -69,11 +69,17 @@ Safety properties
 -----------------
 * **Dry-run is the DEFAULT.** ``--apply`` is opt-in.
 * **Corroborate before acting.** Each target's exact pre-image is pinned here
-  and re-read live before any write; a mismatch REFUSES rather than clobbers.
-  An in-place amend is invisible to every downstream reader, so blindly
-  overwriting a record that changed underneath us (a curator sitting, a recon
-  Stage-1/2 consolidation) would destroy someone else's correction with no
-  trace.
+  and re-read live IMMEDIATELY BEFORE THAT TARGET'S OWN WRITE; a mismatch
+  REFUSES rather than clobbers. An in-place amend is invisible to every
+  downstream reader, so blindly overwriting a record that changed underneath us
+  (a curator sitting, a recon Stage-1/2 consolidation) would destroy someone
+  else's correction with no trace. The per-target re-read matters because the
+  batch read happens before ANY write: without it, the second target's
+  corroboration would predate the first target's write by a Qdrant round-trip
+  plus a re-embed, and a race landing in that window would be clobbered by the
+  very guard meant to catch it. ``MemoryService.update_memory`` offers no
+  compare-and-swap, so the residual read-to-write window is narrowed to a
+  single await rather than eliminated.
 * **Idempotent.** Re-running after a successful apply finds the sentinel in
   both records and writes nothing. Safe to re-run after a partial failure.
 * **Ordered.** B is written only if A actually succeeded (or was already
@@ -82,8 +88,9 @@ Safety properties
   status quo, and undetectable to anyone who trusts the warning.
 * **Fail-closed capability preflight** before the first write, so a run that
   cannot write mem0's history dir refuses up front instead of half-writing.
-* **Attributed writes** (``_source=WRITE_SOURCE``) so the amendment storm alarm
-  reads this sweep rather than a generic ``mcp_tool``.
+* **Attributed writes** (``_source=WRITE_SOURCE``, and ``agent_id`` set to the
+  same value) so the amendment storm alarm and the metadata-vocabulary census
+  both read this sweep rather than a generic ``mcp_tool`` and a null agent.
 
 Usage
 -----
@@ -134,12 +141,15 @@ logger = logging.getLogger('amend_stale_resume_cwd_records')
 # Write attribution
 # ---------------------------------------------------------------------------
 
-#: Written to every ``update_memory`` so the write journal attributes each
-#: amendment to this sweep rather than to a generic ``mcp_tool``. The amendment
-#: storm alarm reads this field; an unattributed bulk rewrite of records this
-#: old is exactly the shape that alarm exists to catch. Two writes is far under
-#: the storm threshold, but attributing them correctly costs nothing and keeps
-#: the write journal readable.
+#: Written to every ``update_memory`` -- as ``_source`` AND as ``agent_id`` --
+#: so the write journal attributes each amendment to this sweep rather than to
+#: a generic ``mcp_tool``. The amendment storm alarm reads ``_source``; an
+#: unattributed bulk rewrite of records this old is exactly the shape that
+#: alarm exists to catch. The metadata-vocabulary census and the unknown-key
+#: storm detector, which a ``metadata_patch`` triggers at the service seam,
+#: read ``agent_id`` instead -- so the same value goes to both and neither view
+#: reads this run as anonymous. Two writes is far under either threshold, but
+#: attributing them correctly costs nothing and keeps both journals readable.
 WRITE_SOURCE = 'amend_stale_resume_cwd_records'
 
 #: Recorded on the write journal row beside the amendment.
@@ -487,6 +497,12 @@ async def run(
     :func:`classify_amend_target`, and assembles the report. See the module
     docstring for the two-phase (dry-run default / ``--apply``) model.
 
+    This batch read decides WHAT to write; it is not the corroboration a write
+    acts on. Under *apply*, :func:`_apply_amendments` re-reads and re-classifies
+    each target immediately before that target's own write, because this pass
+    completes before any write and so cannot see a concurrent edit landing
+    mid-batch.
+
     A read that RAISES is caught and classified ``'refuse:read_error'`` rather
     than aborting the run: with two targets, one unreadable record must still
     leave the operator with a report about the other.
@@ -574,6 +590,15 @@ async def _apply_amendments(
     A refusal converts every pending target to ``'refuse:store_unavailable'``
     rather than raising, so a sandboxed operator still gets the report and can
     see why nothing happened.
+
+    Each write is preceded by a re-read of ITS OWN record, re-classified
+    through :func:`classify_amend_target`. The batch corroboration in
+    :func:`run` happens before any write, so it cannot see a concurrent edit
+    that lands while an earlier target is being written; without the re-read
+    the pre-image guard would silently clobber exactly the race it exists to
+    refuse. A record that moved in that window is reported with its NEW
+    classification (a mismatch refuses and breaks the chain; a sentinel means
+    somebody else already landed the correction, which keeps it intact).
     """
     amendable = [d for d in decisions if d['action'] == 'amend']
     if not amendable:
@@ -628,6 +653,62 @@ async def _apply_amendments(
             continue
 
         target = targets_by_id[decision['id']]
+
+        # RE-CORROBORATE, immediately before THIS record's own write. The
+        # batch read in run() happens before ANY write, so every target after
+        # the first was corroborated at least one Qdrant round-trip plus one
+        # full re-embed of a ~2KB replacement ago. A curator sitting or a recon
+        # Stage-1/2 consolidation landing inside that window is precisely the
+        # race the pre-image guard exists to catch, and the batch read cannot
+        # see it. Two records, so the extra reads cost nothing.
+        #
+        # This NARROWS the window to a single await; it does not close it.
+        # ``MemoryService.update_memory`` offers no compare-and-swap, so there
+        # is no seam at which read-then-write could be made atomic -- which is
+        # why the safety property is stated as a narrowed race, not none.
+        try:
+            fresh = await memory_service.get_memory_by_id(
+                project_id=project_id, memory_id=target.memory_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- unknown is not absent
+            logger.warning(
+                'amend_stale_resume_cwd_records: pre-write re-read FAILED '
+                'for %s: %r -- NOT writing',
+                target.memory_id, exc,
+            )
+            chain_intact = False
+            updated.append({
+                **decision,
+                'action': 'refuse:read_error',
+                'error': f'{type(exc).__name__}: {exc}',
+                'detail': (
+                    'the pre-write re-read failed, so the pre-image could not '
+                    'be re-corroborated and the write was not attempted'
+                ),
+            })
+            continue
+
+        recheck = classify_amend_target(target, _normalise_fetched(fresh))
+        if recheck['action'] != 'amend':
+            logger.warning(
+                'amend_stale_resume_cwd_records: %s MOVED between '
+                'corroboration and write (now %s) -- NOT writing',
+                target.memory_id, recheck['action'],
+            )
+            # A skip keeps the chain intact (the record already carries the
+            # correction, whoever landed it); any refusal breaks it.
+            chain_intact = _precondition_satisfied(recheck)
+            updated.append({
+                **decision,
+                **recheck,
+                'detail': (
+                    'this record changed between the corroborating read and '
+                    'its write; the pre-write re-read reclassified it, so '
+                    'nothing was overwritten'
+                ),
+            })
+            continue
+
         try:
             response = await memory_service.update_memory(
                 memory_id=target.memory_id,
@@ -635,6 +716,15 @@ async def _apply_amendments(
                 content=target.new_content,
                 metadata_patch=target.metadata_patch or None,
                 reason=WRITE_REASON,
+                # Attribution has TWO consumers and they read different
+                # fields: the write journal / storm alarm read ``_source``,
+                # while the metadata-vocabulary check this patch triggers
+                # (emit_schema_warnings, UnknownKeyStormDetector.record,
+                # file_unknown_key_storm_escalation) is keyed by ``agent_id``.
+                # Omitting the latter leaves every census line and storm
+                # bucket from this run attributed to a null agent, so both are
+                # set to the same value and the two views agree.
+                agent_id=WRITE_SOURCE,
                 _source=WRITE_SOURCE,
             )
         except Exception as exc:  # noqa: BLE001 -- report, never propagate

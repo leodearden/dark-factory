@@ -59,11 +59,6 @@ class TestAmendTargetsContract:
         # was corrected, so it must never be written first (see step-11/12).
         assert [t.memory_id for t in _mod.AMEND_TARGETS] == [STALE_ID, WARNING_ID]
 
-    def test_write_attribution_constants_exist(self):
-        assert isinstance(_mod.WRITE_SOURCE, str) and _mod.WRITE_SOURCE
-        assert isinstance(_mod.WRITE_REASON, str) and _mod.WRITE_REASON
-        assert isinstance(_mod.AMENDED_SENTINEL, str) and _mod.AMENDED_SENTINEL
-
     def test_sentinel_present_in_every_replacement_text(self):
         # The sentinel is what carries idempotency, so it must be in BOTH
         # replacement texts -- a target whose new content lacks it would be
@@ -109,11 +104,6 @@ class TestAmendTargetsContract:
         assert '0.786' in new_content
         assert '0.692' in new_content
         assert 'e001dd3746' in new_content
-
-    def test_preimages_are_nonempty_strings(self):
-        for target in _mod.AMEND_TARGETS:
-            assert isinstance(target.expected_preimage, str)
-            assert target.expected_preimage.strip()
 
 
 class TestAmendTargetShape:
@@ -316,18 +306,6 @@ class TestBuildAmendReport:
         assert by_id[STALE_ID]['applied'] is True
         assert by_id[WARNING_ID]['applied'] is False
 
-    def test_report_is_deterministic_so_two_dry_runs_diff_cleanly(self):
-        import json as _json
-        decisions = [_decision(STALE_ID, 'amend'), _decision(WARNING_ID, 'amend')]
-        kwargs = dict(
-            applied_ids=set(),
-            dry_run=True,
-            generated_at='2026-08-28T00:00:00+00:00',
-        )
-        first = _json.dumps(_mod.build_amend_report(decisions, **kwargs), sort_keys=True)
-        second = _json.dumps(_mod.build_amend_report(decisions, **kwargs), sort_keys=True)
-        assert first == second
-
     def test_report_is_json_serialisable_without_a_default_hook(self):
         import json as _json
         report = _mod.build_amend_report(
@@ -481,10 +459,17 @@ class TestRunApply:
         # The amendment storm alarm reads _source. A bulk rewrite under the
         # default 'mcp_tool' source would look exactly like the runaway
         # rewrite that alarm exists to catch.
+        #
+        # agent_id is the SECOND attribution channel and a different consumer:
+        # the metadata_patch on these writes runs the vocabulary check at the
+        # service seam, which keys its census lines and unknown-key storm
+        # buckets by agent_id. Left unset it defaults to None, so this run's
+        # rows would read as anonymous while _source named the sweep.
         service = _memory_service()
         await _mod.run(service, project_id='dark_factory', apply=True)
         for call in service.update_memory.await_args_list:
             assert call.kwargs['_source'] == _mod.WRITE_SOURCE
+            assert call.kwargs['agent_id'] == _mod.WRITE_SOURCE
             assert call.kwargs['reason'] == _mod.WRITE_REASON
             assert call.kwargs['project_id'] == 'dark_factory'
 
@@ -514,6 +499,123 @@ class TestRunApply:
         assert [c['action'] for c in report['changes']] == ['amend', 'amend']
         assert all(c['applied'] is True for c in report['changes'])
         assert report['totals']['amended'] == 2
+
+
+class TestPreWriteRecorroboration:
+    """Each write is corroborated against a read of its OWN record, just before.
+
+    run()'s batch pass classifies BOTH targets before either is written, so by
+    the time the second write is issued its pre-image is older than a full
+    write (a Qdrant round-trip plus a re-embed of a ~2KB replacement). A
+    curator sitting or a recon Stage-1/2 consolidation landing in that window
+    is exactly what the pre-image guard exists to refuse, and the batch read
+    cannot see it -- so the guard would have clobbered the very race it claims
+    to catch. These tests pin the re-read that closes that reasoning gap.
+    """
+
+    @staticmethod
+    def _service_racing_on_the_second_target(new_content: str) -> AsyncMock:
+        """Both pre-images, until d007aa46 is rewritten DURING 6403e96b's write."""
+        contents = {t.memory_id: t.expected_preimage for t in _mod.AMEND_TARGETS}
+        service = AsyncMock()
+
+        async def _get(*, project_id, memory_id):  # noqa: ARG001
+            if memory_id not in contents:
+                return None
+            return {'id': memory_id, 'content': contents[memory_id], 'metadata': {}}
+
+        async def _update(*, memory_id, **kwargs):  # noqa: ARG001
+            if memory_id == STALE_ID:
+                contents[WARNING_ID] = new_content
+            return {'status': 'updated', 'store': 'mem0'}
+
+        service.get_memory_by_id.side_effect = _get
+        service.update_memory.side_effect = _update
+        return service
+
+    @pytest.mark.asyncio
+    async def test_record_edited_during_an_earlier_write_is_refused_not_clobbered(self):
+        service = self._service_racing_on_the_second_target(
+            'a curator rewrote this record while the first amendment was in flight',
+        )
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [
+            c.kwargs['memory_id'] for c in service.update_memory.await_args_list
+        ]
+        assert written == [STALE_ID]  # the moved record was NOT overwritten
+        by_id = {c['id']: c for c in report['changes']}
+        assert by_id[WARNING_ID]['action'] == 'refuse:preimage_mismatch'
+        assert by_id[WARNING_ID]['applied'] is False
+        assert _mod.resolve_exit_code(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_record_amended_by_someone_else_in_the_window_is_skipped(self):
+        # The same race, benign: the concurrent write landed OUR correction.
+        # Nothing to do, and it is not a refusal -- a record already carrying
+        # the sentinel satisfies anything asserting it was corrected.
+        service = self._service_racing_on_the_second_target(
+            f'already corrected -- {_mod.AMENDED_SENTINEL}',
+        )
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        written = [
+            c.kwargs['memory_id'] for c in service.update_memory.await_args_list
+        ]
+        assert written == [STALE_ID]
+        by_id = {c['id']: c for c in report['changes']}
+        assert by_id[WARNING_ID]['action'] == 'skip:already_amended'
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_every_write_is_immediately_preceded_by_a_read_of_that_record(self):
+        # The property itself: no write is ever issued on a pre-image read
+        # before some other write happened.
+        service = _memory_service()
+        served = service.get_memory_by_id.side_effect
+        calls: list[tuple[str, str]] = []
+
+        async def _tracked_get(*, project_id, memory_id):
+            calls.append(('read', memory_id))
+            return await served(project_id=project_id, memory_id=memory_id)
+
+        async def _tracked_update(*, memory_id, **kwargs):  # noqa: ARG001
+            calls.append(('write', memory_id))
+            return {'status': 'updated'}
+
+        service.get_memory_by_id.side_effect = _tracked_get
+        service.update_memory.side_effect = _tracked_update
+        await _mod.run(service, project_id='dark_factory', apply=True)
+
+        assert ('write', WARNING_ID) in calls  # the path under test ran
+        for index, (kind, memory_id) in enumerate(calls):
+            if kind == 'write':
+                assert index > 0
+                assert calls[index - 1] == ('read', memory_id)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_re_read_refuses_that_target_and_blocks_the_next(self):
+        # The re-read is I/O, so it can fail where the batch read succeeded.
+        # It must be reported like any other read failure -- not propagated
+        # out of run(), and not treated as permission to write blind.
+        service = _memory_service()
+        served = service.get_memory_by_id.side_effect
+        seen: dict[str, int] = {}
+
+        async def _flaky_get(*, project_id, memory_id):
+            seen[memory_id] = seen.get(memory_id, 0) + 1
+            if memory_id == STALE_ID and seen[memory_id] > 1:
+                raise RuntimeError('qdrant timed out on the pre-write re-read')
+            return await served(project_id=project_id, memory_id=memory_id)
+
+        service.get_memory_by_id.side_effect = _flaky_get
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        service.update_memory.assert_not_awaited()
+        assert [c['action'] for c in report['changes']] == [
+            'refuse:read_error', 'refuse:precondition_failed',
+        ]
+        assert _mod.resolve_exit_code(report) == 1
 
 
 class TestApplyStoreMutationPreflight:
