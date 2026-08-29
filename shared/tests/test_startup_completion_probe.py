@@ -44,6 +44,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
+from unittest.mock import patch
 
 import pytest
 import startup_completion_fixtures as scf
@@ -1373,6 +1374,57 @@ class TestStaleProbeDirSweep:
     inventing one: same constant pair, same once-per-process flag set BEFORE the
     call, same never-raise contract.
     """
+
+    def test_the_probe_delegates_to_the_shared_once_helper(self):
+        """The once-per-process bookkeeping lives in shared.config_dir now.
+
+        Its twin used to live here in ~45 near-verbatim lines alongside
+        ``usage_gate``'s — same one-shot flag, same set-before-call ordering,
+        same broad except, same silent-on-zero rule — and the two could drift
+        apart with nothing to notice.
+        """
+        with patch.object(probe, 'sweep_stale_pid_dirs_once', return_value=0) as once:
+            probe._sweep_stale_probe_dirs_once()
+
+        once.assert_called_once()
+        assert once.call_args.args[0] == probe._PROBE_DIR_PREFIX
+
+    def test_the_module_level_sweep_name_is_still_the_interception_point(
+        self, monkeypatch
+    ):
+        """`probe.sweep_stale_pid_dirs` must stay what actually runs.
+
+        The stakes here are higher than in ``usage_gate``. The AUTOUSE,
+        module-wide ``_confine_stale_dir_sweep`` fixture is the ONLY thing
+        keeping every test in this file from rmtree-ing real
+        ``/tmp/claude-config-startup-probe-*`` dirs — its docstring records that
+        this was MEASURED, not theorised (a planted
+        ``/tmp/claude-config-startup-probe-healthy-999999`` was gone after one
+        pytest run), and names the plausible victim: a dir an operator
+        deliberately kept with ``--keep-config-dir``, which costs a real-money
+        live run to retake.
+
+        That confinement works by monkeypatching THIS module-level name. If the
+        hoisted helper ever resolved the sweep out of ``shared.config_dir``'s own
+        globals instead — which is exactly what giving it a def-time default
+        parameter would do — the fixture would silently stop intercepting: green
+        tests, real deletions.
+        """
+        calls: list[str] = []
+
+        def _recording_sweep(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            return 0
+
+        monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep)
+        probe._sweep_stale_probe_dirs_once()
+
+        assert calls == [probe._PROBE_DIR_PREFIX], (
+            'the sweep patched onto probe.sweep_stale_pid_dirs was not what ran — '
+            '_confine_stale_dir_sweep has stopped intercepting, and this module '
+            'is now deleting real /tmp/claude-config-startup-probe-* dirs, '
+            'including any an operator kept with --keep-config-dir'
+        )
 
     def test_swept_prefix_and_created_names_are_the_same_string(self):
         # Not a tautology: it pins that the sweep key is DERIVED from the task-id
