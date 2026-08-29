@@ -71,6 +71,13 @@ NODE_PAGE_CYPHER = _mod.NODE_PAGE_CYPHER
 NODE_CENSUS_CYPHER = _mod.NODE_CENSUS_CYPHER
 build_report = _mod.build_report
 PROXIMITY_BUCKETS = _mod.PROXIMITY_BUCKETS
+NOT_COMPUTED = _mod.NOT_COMPUTED
+COMMAND_BY_PRIMITIVE = _mod.COMMAND_BY_PRIMITIVE
+_ReadOnlyGraphProxy = _mod._ReadOnlyGraphProxy
+EdgeParse = _mod.EdgeParse
+parse_edge = _mod.parse_edge
+_sweep_graph = _mod._sweep_graph
+_run = _mod._run
 _build_parser = _mod._build_parser
 
 GRAPH = 'reify'
@@ -558,6 +565,56 @@ class TestBareIdPresent:
         assert not bare_id_present(_task('6165'), '')
         assert not bare_id_present(_task('6165'), None)
 
+    #: The report's own Mode-2 worked example. Every digit run inside the
+    #: timestamp is a word-boundary match, so before the compound-number
+    #: narrowing this ONE fact suppressed endpoints Task 2026 / 5 / 9 / 17.
+    DATED_FACT = (
+        'Task 1137 completed at 2026-05-09T17:09 UTC via commit b4b4614.'
+    )
+
+    @pytest.mark.parametrize('number', ['2026', '5', '9', '17'])
+    def test_a_date_or_time_component_does_not_suppress(self, number: str) -> None:
+        """THE HAZARD THIS NARROWING CLOSES, on the artifact's own example.
+
+        ``\b`` treats '-' and ':' as boundaries, so '2026', '05', '09' and
+        '17' inside an ISO timestamp each read as a standalone digit run. A
+        genuinely mis-bound edge hanging off node 'Task 2026' or 'Task 17'
+        was therefore dropped from the findings — and because suppression
+        happens BEFORE a finding is minted, the loss was invisible in every
+        count the artifact publishes.
+        """
+        assert not bare_id_present(_task(number), self.DATED_FACT)
+
+    def test_the_id_the_fact_really_names_still_suppresses(self) -> None:
+        """The other half: narrowing must not break the check's whole purpose."""
+        assert bare_id_present(_task('1137'), self.DATED_FACT)
+
+    def test_a_ratio_is_one_number_not_two(self) -> None:
+        """'192/7131' — the artifact's own rate spelling — names no task."""
+        assert not bare_id_present(_task('192'), 'flagged 192/7131 rows')
+        assert not bare_id_present(_task('7131'), 'flagged 192/7131 rows')
+
+    def test_a_version_string_is_one_number(self) -> None:
+        assert not bare_id_present(_task('28'), 'graphiti_core 0.28.2 resolves it')
+
+    def test_a_trailing_period_still_ends_a_reference(self) -> None:
+        """The separator only joins when a DIGIT follows it, so ordinary
+        sentence punctuation after an id is not mistaken for a compound
+        number."""
+        assert bare_id_present(_task('4043'), 'BOOKMARK task 4043.')
+        assert bare_id_present(_task('4043'), 'see #4043, then stop')
+
+    def test_the_bare_count_bound_is_acknowledged_not_fixed(self) -> None:
+        """A KNOWN, DELIBERATE residue — pinned so it stays visible.
+
+        Narrowing further would mean requiring a preceding 'task'/'#', i.e.
+        compiling a second task-label vocabulary, which INV-5 forbids here.
+        So a bare COUNT still suppresses, the script COUNTS every suppression
+        into ``summary.suppressed_by_bare_id``, and the caveats say so. This
+        test asserts the residue exists rather than pretending it does not.
+        """
+        assert bare_id_present(_task('192'), 'The sweep flagged 192 candidates.')
+
     def test_a_foreign_referent_is_matched_on_its_number(self) -> None:
         """Deliberate and documented: containment sees DIGITS, not projects.
 
@@ -747,6 +804,114 @@ class TestClassifyEdge:
         fields = vars_of(finding)
         assert fields['edge_uuid'] == '63fa5c78'
         assert set(fields) == set(Finding.__dataclass_fields__)
+
+
+class TestOneSharedParse:
+    """The population predicate and the detector read ONE parse.
+
+    Each row used to be parsed twice — once by the sweep loop to decide
+    whether it was in the population, once again inside ``classify_edge`` to
+    judge it. That was ~2x the shared scanner's regex work in the only hot
+    loop this script has, and, more importantly, two evaluations that could
+    disagree after an edit about what the very same row IS.
+    """
+
+    def test_parse_edge_answers_all_three_questions_at_once(self) -> None:
+        parse = parse_edge(*SPEC_63FA5C78[1:4], GRAPH)
+        assert parse.subject_referent == _task('6165')
+        assert parse.object_referent is None  # 'ElasticResult.rotation'
+        assert parse.named == frozenset({_task('6164')})
+        assert parse.has_task_endpoint is True
+        assert parse.verifiable is True
+
+    def test_no_task_shaped_endpoint_is_neither_population_nor_unverifiable(
+        self
+    ) -> None:
+        """The third state: the edge asks no question this sweep can answer."""
+        parse = parse_edge(
+            'ElasticResult.rotation', 'commit e6a7e971ed', 'Task 6164 landed.', GRAPH
+        )
+        assert parse.has_task_endpoint is False
+        assert parse.verifiable is True  # the FACT is scannable; the ends are not
+
+    def test_a_fact_naming_nothing_is_unverifiable_not_clean(self) -> None:
+        parse = parse_edge('Task 6165', None, 'The rotation was retired.', GRAPH)
+        assert parse.has_task_endpoint is True
+        assert parse.verifiable is False
+
+    def test_an_injected_parse_is_the_one_the_detector_uses(self) -> None:
+        """Not merely accepted — AUTHORITATIVE.
+
+        Fed a parse whose ``named`` set disagrees with the fact text, the
+        detector must follow the parse. That is what proves the sweep loop's
+        admission test and the verdict are one evaluation rather than two
+        that happen to agree.
+        """
+        edge_uuid, subject, obj, fact = SPEC_63FA5C78
+        assert _classify(SPEC_63FA5C78)  # the honest parse flags it
+        lying = EdgeParse(
+            subject_referent=_task('6165'),
+            object_referent=None,
+            named=frozenset({_task('6165')}),
+        )
+        assert classify_edge(
+            subject, obj, fact, edge_uuid, GRAPH, parse=lying
+        ) == []
+
+    def test_the_default_parse_is_computed_when_none_is_passed(self) -> None:
+        """Standalone callability is the property every unit test relies on."""
+        assert len(_classify(SPEC_63FA5C78)) == 1
+
+
+class TestSuppressionSink:
+    """Every ``bare_id_present`` drop is RECORDED, so it can be counted.
+
+    A suppression happens before a finding is minted, so it is invisible in
+    every number the artifact otherwise publishes. The sink is what turns
+    "this check is context-free and can drop a real finding" from an
+    unmeasured hazard into a published tally.
+    """
+
+    def test_a_suppressed_endpoint_is_recorded(self) -> None:
+        sink: list[dict] = []
+        findings = classify_edge(
+            'Task 4262',
+            None,
+            "#4262's cache is separated from the engine-level tables in Task 4351.",
+            'edge-x',
+            GRAPH,
+            suppressed=sink,
+        )
+        assert findings == []
+        assert [(r['edge_uuid'], r['end'], r['node_task_id']) for r in sink] == [
+            ('edge-x', 'subject', '4262')
+        ]
+
+    def test_a_precise_set_membership_hit_is_not_a_suppression(self) -> None:
+        """Only the BACKSTOP's drops are counted.
+
+        An endpoint the fact names outright was never a candidate, so
+        counting it would inflate the published bound into meaninglessness.
+        """
+        sink: list[dict] = []
+        classify_edge(
+            'Task 6164', None, 'Task 6164 described landing the same artefact.',
+            'edge-y', GRAPH, suppressed=sink,
+        )
+        assert sink == []
+
+    def test_a_real_finding_is_not_recorded_as_suppressed(self) -> None:
+        sink: list[dict] = []
+        findings = classify_edge(*SPEC_63FA5C78[1:4], SPEC_63FA5C78[0], GRAPH,
+                                 suppressed=sink)
+        assert len(findings) == 1
+        assert sink == []
+
+    def test_the_sink_is_optional(self) -> None:
+        """Omitting it changes no verdict — every other test calls it that way."""
+        assert classify_edge(
+            'Task 4262', None, "#4262's cache is in Task 4351.", 'e', GRAPH
+        ) == []
 
 
 class TestOutOfReachByConstruction:
@@ -1195,7 +1360,16 @@ class TestEdgeReader:
 
     @pytest.mark.asyncio
     async def test_only_the_read_only_command_is_ever_issued(self) -> None:
-        """Behavioural, not just structural: the double's query() raises."""
+        """Behavioural, not just structural: the double's query() raises.
+
+        The direct ``assert_read_only_command`` call below proves the helper
+        RAISES; what proves anything ROUTES through it is
+        ``TestReadOnlyByConstruction::test_the_command_guard_is_reachable_on_a_real_read``,
+        which exercises the ``_ReadOnlyGraphProxy`` seam ``_read`` actually
+        hands to the shared paged primitive. Before that seam existed this
+        pair was the whole guard, and the reachable half of it was a module
+        constant compared against itself.
+        """
         graph = _FakeGraph(_edge_rows(3), resultset_cap=10)
         reader = EdgeReader(graph=graph, graph_name=GRAPH, page_size=5, resultset_size=10)
         await reader.fetch_edges()
@@ -1365,14 +1539,69 @@ class TestBuildReport:
     def test_every_proximity_bucket_is_present_even_when_zero(self) -> None:
         """Absent reads as 'not measured'; 0 reads as 'measured, none'."""
         summary = self._build([_finding()])['summary']
-        assert set(summary['by_proximity']) == set(PROXIMITY_BUCKETS)
+        assert set(summary['by_proximity']) == {*PROXIMITY_BUCKETS, NOT_COMPUTED}
         assert summary['by_proximity']['one_digit_diff'] == 1
         assert summary['by_proximity']['unrelated'] == 0
+        assert summary['by_proximity'][NOT_COMPUTED] == 0
 
     def test_both_ends_and_both_node_presence_values_are_always_present(self) -> None:
         summary = self._build([_finding()])['summary']
         assert summary['by_end'] == {'subject': 1, 'object': 0}
-        assert summary['correct_node_present'] == {'true': 0, 'false': 1}
+        assert summary['correct_node_present'] == {
+            'true': 0, 'false': 1, NOT_COMPUTED: 0
+        }
+
+    def test_an_uncomputed_cause_column_is_named_not_folded(self) -> None:
+        """None means NOT MEASURED, and must never tally as a measured result.
+
+        ``Finding``'s cause columns default to None precisely because the
+        pure layer cannot compute them, and ``build_report`` accepts that
+        layer's output directly. Folding None into 'unrelated' /
+        'false' would publish a measured cause-attribution RESULT for a
+        column nobody measured — and investigation.md's cause argument rests
+        entirely on those two distributions, so the fold is the wrong
+        direction to fail in.
+        """
+        summary = self._build([
+            _finding(proximity=None, nearest_id=None, correct_node_present=None)
+        ])['summary']
+        assert summary['by_proximity'][NOT_COMPUTED] == 1
+        assert summary['by_proximity']['unrelated'] == 0
+        assert summary['correct_node_present'][NOT_COMPUTED] == 1
+        assert summary['correct_node_present']['false'] == 0
+
+    def test_a_computed_negative_is_still_a_computed_negative(self) -> None:
+        """The other half: 'measured and unrelated/absent' must not drift into
+        NOT_COMPUTED either, or the fix would have traded one confusion for
+        its mirror image."""
+        summary = self._build([
+            _finding(proximity='unrelated', nearest_id='9', correct_node_present=False)
+        ])['summary']
+        assert summary['by_proximity']['unrelated'] == 1
+        assert summary['by_proximity'][NOT_COMPUTED] == 0
+        assert summary['correct_node_present']['false'] == 1
+        assert summary['correct_node_present'][NOT_COMPUTED] == 0
+
+    def test_the_suppression_tally_is_published(self) -> None:
+        """The size of the bare-id bound is MEASURED, not implied.
+
+        A suppression happens before a finding is minted, so it is invisible
+        in every other number the artifact carries. Publishing the count is
+        what lets the LOWER BOUND caveat name its second cause.
+        """
+        summary = self._build([_finding()], suppressed_by_bare_id=7)['summary']
+        assert summary['suppressed_by_bare_id'] == 7
+        assert self._build([])['summary']['suppressed_by_bare_id'] == 0
+
+    def test_the_caveats_name_the_suppression_bound(self) -> None:
+        """Not a prose pin: the CONTRACT that the artifact states the bound.
+
+        Asserted on the measurable key name plus the worked hazard, so
+        re-wording the caveat is free and deleting the disclosure is not.
+        """
+        blob = ' '.join(self._build([])['caveats'])
+        assert 'suppressed_by_bare_id' in blob
+        assert 'LOWER BOUND' in blob
 
     def test_by_graph_tallies_every_swept_graph(self) -> None:
         summary = self._build([_finding(), _finding(edge_uuid='e2')])['summary']
@@ -1465,6 +1694,404 @@ class TestBuildReport:
         report = self._build([_finding()])
         assert report['unverifiable'] == 1200
         assert report['summary']['rate'] == pytest.approx(1 / 7131)
+
+
+# --------------------------------------------------------------------------- #
+# The orchestration layer — _sweep_graph, _run, and the exit-code contract
+# --------------------------------------------------------------------------- #
+
+
+class _FakeReader:
+    """An EdgeReader stand-in, driven through ``_run``'s ``reader_factory``.
+
+    That injection hook exists for exactly this and was carried over from
+    ``scripts/audit_unverified_completion_claims.py``, whose suite DOES drive
+    ``_run`` through it. Returning ``(rows, PagedRead)`` and
+    ``(ids, PagedRead)`` mirrors the real reader's contract: completeness
+    travels ALONGSIDE the rows, never inferred from a row count.
+    """
+
+    def __init__(
+        self,
+        rows: list[list],
+        node_ids: set[str] | None = None,
+        *,
+        edge_read: object | None = None,
+        node_read: object | None = None,
+    ):
+        self.rows = rows
+        self.node_ids = set(node_ids or ())
+        self.edge_read = edge_read or PagedRead(
+            rows=list(rows), complete=True, rows_seen=len(rows),
+            expected_rows=len(rows), reason=None,
+        )
+        self.node_read = node_read or PagedRead(
+            rows=[], complete=True, rows_seen=len(self.node_ids),
+            expected_rows=len(self.node_ids), reason=None,
+        )
+
+    async def fetch_edges(self) -> tuple[list[list], object]:
+        return list(self.rows), self.edge_read
+
+    async def read_task_node_ids(self) -> tuple[set[str], object]:
+        return set(self.node_ids), self.node_read
+
+
+def _args(**over) -> object:
+    """Parsed CLI defaults with the named options overridden.
+
+    Built through the real parser rather than a hand-made Namespace, so a
+    renamed dest fails these tests instead of silently reading as its
+    default.
+    """
+    args = _build_parser().parse_args([])
+    args.graph = [GRAPH]
+    for key, value in over.items():
+        setattr(args, key, value)
+    return args
+
+
+#: One row per shape the sweep loop must classify, in the tuple order
+#: EDGE_PAGE_CYPHER projects: (a.name, b.name, r.uuid, r.fact, r.episodes).
+ROW_FINDING = [
+    'Task 6165', 'ElasticResult.rotation', 'e-finding',
+    'Task 6164 described landing the same artefact.', ['779b7b7d'],
+]
+ROW_CLEAN = [
+    'Task 6164', 'ElasticResult.rotation', 'e-clean',
+    'Task 6164 described landing the same artefact.', [],
+]
+ROW_UNVERIFIABLE = [
+    'Task 6165', 'ElasticResult.rotation', 'e-unverifiable',
+    'The rotation was retired outright.', [],
+]
+ROW_NOT_ABOUT_TASKS = [
+    'ElasticResult.rotation', 'commit e6a7e971ed', 'e-nontask',
+    'Task 6164 described landing the same artefact.', [],
+]
+ROW_SUPPRESSED = [
+    'Task 4262', 'ElasticResult.rotation', 'e-suppressed',
+    "#4262's cache is separated from the engine-level tables in Task 4351.", [],
+]
+
+
+@pytest.mark.asyncio
+class TestSweepGraph:
+    """The three-way accounting that produces every published denominator."""
+
+    async def _sweep(self, rows, node_ids=()) -> object:
+        return await _sweep_graph(_FakeReader(rows, set(node_ids)), GRAPH)
+
+    async def test_each_row_shape_lands_in_exactly_one_bucket(self) -> None:
+        """population + unverifiable + not-about-tasks == scanned, once each.
+
+        The load-bearing assertion of the whole loop: an edge counted twice,
+        or counted into ``population`` when it was unverifiable, moves the
+        rate directly.
+        """
+        swept = await self._sweep(
+            [ROW_FINDING, ROW_CLEAN, ROW_UNVERIFIABLE, ROW_NOT_ABOUT_TASKS]
+        )
+        assert swept.scanned == 4
+        assert swept.population == 2  # finding + clean
+        assert swept.unverifiable == 1
+        assert [f.edge_uuid for f in swept.findings] == ['e-finding']
+
+    async def test_an_unverifiable_edge_is_never_counted_into_population(
+        self
+    ) -> None:
+        """Folding it in would understate the rate by the ratio of the two."""
+        swept = await self._sweep([ROW_UNVERIFIABLE] * 5)
+        assert (swept.population, swept.unverifiable, swept.scanned) == (0, 5, 5)
+        assert [r['edge_uuid'] for r in swept.unverifiable_rows] == [
+            'e-unverifiable'
+        ] * 5
+
+    async def test_an_edge_with_no_task_endpoint_is_counted_nowhere_but_scanned(
+        self
+    ) -> None:
+        """Not clean, not unverifiable — simply not about tasks."""
+        swept = await self._sweep([ROW_NOT_ABOUT_TASKS] * 3)
+        assert (swept.scanned, swept.population, swept.unverifiable) == (3, 0, 0)
+        assert swept.unverifiable_rows == []
+
+    async def test_a_short_row_is_padded_rather_than_aborting_the_sweep(self) -> None:
+        """A projection that lost a column must not kill a whole-corpus read."""
+        swept = await self._sweep([['Task 6165', 'X', 'e-short']])
+        assert swept.scanned == 1
+        assert swept.unverifiable == 1  # fact is None -> nothing to compare
+
+    async def test_cause_attribution_lands_on_every_finding(self) -> None:
+        """The enrichment pass is where ``proximity`` and
+        ``correct_node_present`` stop being None. A finding that reached the
+        report un-enriched would publish NOT_COMPUTED."""
+        swept = await self._sweep([ROW_FINDING], node_ids={'6164'})
+        (finding,) = swept.findings
+        assert finding.proximity == 'one_digit_diff'
+        assert finding.nearest_id == '6164'
+        assert finding.correct_node_present is True
+
+    async def test_a_missing_correct_node_is_measured_as_false_not_unknown(
+        self
+    ) -> None:
+        """The canonical specimen: reify has no 'Task 6164'."""
+        swept = await self._sweep([ROW_FINDING], node_ids=set())
+        assert swept.findings[0].correct_node_present is False
+
+    async def test_a_foreign_referent_is_dropped_before_proximity(self) -> None:
+        """``named`` keeps only own-project ids, so a foreign 'dark_factory:2'
+        can never become the ``nearest_id`` of a local endpoint."""
+        row = [
+            'Task 6165', None, 'e-foreign',
+            'Ported from dark_factory:2 into task 6164.', [],
+        ]
+        swept = await self._sweep([row], node_ids={'6164'})
+        assert swept.findings[0].nearest_id == '6164'
+
+    async def test_suppressions_are_collected_for_the_tally(self) -> None:
+        swept = await self._sweep([ROW_SUPPRESSED])
+        assert swept.findings == []
+        assert swept.population == 1  # it WAS adjudicated, and came back clean
+        assert [r['edge_uuid'] for r in swept.suppressed_rows] == ['e-suppressed']
+
+    async def test_both_reads_are_reported_for_the_completeness_proof(self) -> None:
+        swept = await self._sweep([ROW_FINDING])
+        assert [(g, kind) for g, kind, _ in swept.reads] == [
+            (GRAPH, 'nodes'), (GRAPH, 'edges')
+        ]
+
+
+@pytest.mark.asyncio
+class TestRunEndToEnd:
+    """``_run`` wired against fakes, including the documented exit codes.
+
+    Mirrors ``tests/test_audit_unverified_completion_claims.py::TestRunEndToEnd``,
+    the precedent this script's ``reader_factory`` hook was copied from.
+    """
+
+    async def _run_capture(self, capsys, readers, **over):
+        """Run and return (exit code, parsed report or None, raw stdout).
+
+        *readers* is a graph -> _FakeReader mapping, so a multi-graph sweep
+        can be driven with different corpora per graph.
+        """
+        code = await _run(_args(**over), reader_factory=lambda g: readers[g])
+        out = capsys.readouterr().out
+        report = json.loads(out) if out.strip() and over.get('json') else None
+        return code, report, out
+
+    async def test_a_clean_corpus_returns_zero_with_no_findings(self, capsys) -> None:
+        code, report, _ = await self._run_capture(
+            capsys, {GRAPH: _FakeReader([ROW_CLEAN])}, json=True
+        )
+        assert code == 0
+        assert report['findings'] == []
+        assert report['summary']['findings'] == 0
+        assert report['population'] == 1
+
+    async def test_the_published_denominators_come_from_the_sweep(
+        self, capsys
+    ) -> None:
+        """The accounting the artifact's every rate depends on, end to end."""
+        rows = [ROW_FINDING, ROW_CLEAN, ROW_UNVERIFIABLE, ROW_NOT_ABOUT_TASKS]
+        _code, report, _ = await self._run_capture(
+            capsys, {GRAPH: _FakeReader(rows, {'6164'})}, json=True
+        )
+        assert report['scanned'] == 4
+        assert report['population'] == 2
+        assert report['unverifiable'] == 1
+        assert report['summary']['rate'] == pytest.approx(1 / 2)
+
+    async def test_enrichment_reaches_the_report_rows(self, capsys) -> None:
+        """If it did not, the artifact would publish NOT_COMPUTED for the two
+        columns investigation.md's cause argument rests on."""
+        _code, report, _ = await self._run_capture(
+            capsys, {GRAPH: _FakeReader([ROW_FINDING], {'6164'})}, json=True
+        )
+        (row,) = report['findings']
+        assert row['proximity'] == 'one_digit_diff'
+        assert row['nearest_id'] == '6164'
+        assert row['correct_node_present'] is True
+        assert report['summary']['by_proximity'][NOT_COMPUTED] == 0
+        assert report['summary']['correct_node_present'][NOT_COMPUTED] == 0
+
+    async def test_every_requested_graph_is_swept_and_tallied(self, capsys) -> None:
+        readers = {
+            GRAPH: _FakeReader([ROW_FINDING]),
+            'dark_factory': _FakeReader([ROW_FINDING, ROW_CLEAN]),
+        }
+        _code, report, _ = await self._run_capture(
+            capsys, readers, graph=[GRAPH, 'dark_factory'], json=True
+        )
+        assert report['scanned'] == 3
+        assert report['summary']['by_graph'] == {GRAPH: 1, 'dark_factory': 1}
+
+    async def test_the_gate_flag_is_the_only_thing_that_changes_the_exit_code(
+        self, capsys
+    ) -> None:
+        """THE DOCUMENTED CONTRACT: findings alone never fail a run."""
+        readers = {GRAPH: _FakeReader([ROW_FINDING])}
+        code, _r, _o = await self._run_capture(capsys, readers)
+        assert code == 0
+        code, _r, _o = await self._run_capture(capsys, readers, fail_on_finding=True)
+        assert code == 2
+
+    async def test_the_gate_stays_quiet_on_a_clean_corpus(self, capsys) -> None:
+        code, _r, _o = await self._run_capture(
+            capsys, {GRAPH: _FakeReader([ROW_CLEAN])}, fail_on_finding=True
+        )
+        assert code == 0
+
+    async def test_an_infra_failure_returns_one_and_emits_nothing(
+        self, capsys, tmp_path
+    ) -> None:
+        """A truncated report that LOOKS complete is worse than none.
+
+        So the failure path must print nothing AND write nothing — asserted
+        on both, since --out-dir is the half a stdout-only check would miss.
+        """
+        def exploding_factory(graph: str) -> object:
+            raise RuntimeError('FalkorDB unreachable')
+
+        out_dir = tmp_path / 'sweep'
+        code = await _run(
+            _args(out_dir=str(out_dir), json=True), reader_factory=exploding_factory
+        )
+        assert code == 1
+        assert capsys.readouterr().out == ''
+        assert not out_dir.exists()
+
+    async def test_a_reader_that_fails_mid_sweep_emits_nothing_either(
+        self, capsys
+    ) -> None:
+        """The partial-report hazard is worst HERE — graph one succeeded."""
+        class _ExplodingReader:
+            async def read_task_node_ids(self):
+                raise RuntimeError('connection reset')
+
+            async def fetch_edges(self):  # pragma: no cover - never reached
+                raise AssertionError('unreachable')
+
+        readers = {GRAPH: _FakeReader([ROW_FINDING]), 'dark_factory': _ExplodingReader()}
+        code = await _run(
+            _args(graph=[GRAPH, 'dark_factory'], json=True),
+            reader_factory=lambda g: readers[g],
+        )
+        assert code == 1
+        assert capsys.readouterr().out == ''
+
+    async def test_out_dir_receives_exactly_the_json_stdout(
+        self, capsys, tmp_path
+    ) -> None:
+        """The committed artifact IS the stdout blob, so any drift here makes
+        report.json something no re-run reproduces."""
+        out_dir = tmp_path / 'sweep'
+        _code, _report, out = await self._run_capture(
+            capsys, {GRAPH: _FakeReader([ROW_FINDING], {'6164'})},
+            json=True, out_dir=str(out_dir),
+        )
+        written = (out_dir / 'report.json').read_text()
+        assert written == out
+        assert written.endswith('\n')
+
+    async def test_out_dir_is_written_even_without_json_on_stdout(
+        self, capsys, tmp_path
+    ) -> None:
+        """The two flags are independent; the artifact run passes both, but a
+        cron gate that only wants the file must still get it."""
+        out_dir = tmp_path / 'sweep'
+        code, _report, out = await self._run_capture(
+            capsys, {GRAPH: _FakeReader([ROW_FINDING])}, out_dir=str(out_dir)
+        )
+        assert code == 0
+        assert json.loads((out_dir / 'report.json').read_text())['scanned'] == 1
+        assert out.startswith('scanned=1 ')  # the short summary, not the blob
+
+    async def test_the_short_summary_names_every_headline_number(
+        self, capsys
+    ) -> None:
+        rows = [ROW_FINDING, ROW_CLEAN, ROW_UNVERIFIABLE, ROW_SUPPRESSED]
+        _code, _report, out = await self._run_capture(
+            capsys, {GRAPH: _FakeReader(rows, {'6164'})}
+        )
+        assert 'scanned=4' in out
+        assert 'population=3' in out
+        assert 'unverifiable=1' in out
+        assert 'suppressed=1' in out
+        assert 'findings=1' in out
+        assert 'truncated_by=no' in out
+
+    async def test_include_unverifiable_adds_the_listings_it_always_counted(
+        self, capsys
+    ) -> None:
+        rows = [ROW_UNVERIFIABLE, ROW_SUPPRESSED]
+        readers = {GRAPH: _FakeReader(rows)}
+        _code, without, _o = await self._run_capture(capsys, readers, json=True)
+        assert without['unverifiable'] == 1
+        assert without['summary']['suppressed_by_bare_id'] == 1
+        assert 'unverifiable_edges' not in without
+        assert 'suppressed_edges' not in without
+
+        _code, with_it, _o = await self._run_capture(
+            capsys, readers, json=True, include_unverifiable=True
+        )
+        assert [r['edge_uuid'] for r in with_it['unverifiable_edges']] == [
+            'e-unverifiable'
+        ]
+        assert [r['edge_uuid'] for r in with_it['suppressed_edges']] == [
+            'e-suppressed'
+        ]
+
+    async def test_limit_listing_bounds_the_listing_but_not_the_count(
+        self, capsys
+    ) -> None:
+        rows = [
+            ['Task 6165', None, f'e-{i}',
+             'Task 6164 described landing the same artefact.', []]
+            for i in range(5)
+        ]
+        _code, report, _o = await self._run_capture(
+            capsys, {GRAPH: _FakeReader(rows)}, json=True, limit_listing=2
+        )
+        assert report['summary']['findings'] == 5
+        assert len(report['findings']) == 2
+        assert report['truncated_by']['listing']['withheld'] == 3
+
+    async def test_an_incomplete_read_reaches_the_report(self, capsys) -> None:
+        """The reader's completeness proof must survive the whole pipeline —
+        every denominator depends on it."""
+        reader = _FakeReader(
+            [ROW_FINDING],
+            edge_read=PagedRead(
+                rows=[ROW_FINDING], complete=False, rows_seen=10000,
+                expected_rows=15256, reason='SHORT: fetched 10000 of 15256',
+                incomplete_kind='short_read',
+            ),
+        )
+        code, report, _o = await self._run_capture(
+            capsys, {GRAPH: reader}, json=True
+        )
+        assert code == 0  # incomplete is a FACT to publish, not a crash
+        entry = report['truncated_by']['incomplete_reads'][0]
+        assert entry['kind'] == 'edges'
+        assert entry['reason'] == 'SHORT: fetched 10000 of 15256'
+        assert 'SHORT: fetched 10000 of 15256' in ' '.join(report['caveats'])
+
+    async def test_the_default_graph_is_swept_when_none_is_requested(
+        self, capsys
+    ) -> None:
+        seen: list[str] = []
+
+        def factory(graph: str) -> object:
+            seen.append(graph)
+            return _FakeReader([ROW_CLEAN])
+
+        args = _args()
+        args.graph = None
+        code = await _run(args, reader_factory=factory)
+        capsys.readouterr()
+        assert code == 0
+        assert seen == [_mod.DEFAULT_GRAPH]
 
 
 class TestReadOnlyByConstruction:
@@ -1566,6 +2193,44 @@ class TestReadOnlyByConstruction:
         await reader.fetch_edges()
         await reader.read_task_node_ids()
         assert graph.queries
+
+    def test_the_command_guard_is_reachable_on_a_real_read(self) -> None:
+        """THE GUARD IS LOAD-BEARING, not a constant compared with itself.
+
+        ``_read`` used to call ``assert_read_only_command(RO_COMMAND)`` —
+        both sides the same module constant, so the branch was unreachable by
+        construction and the guard could never fire on a real run. It now
+        asserts on the command resolved from the primitive the read is about
+        to reach for, via ``_ReadOnlyGraphProxy``. Asserted here as the
+        wiring: the handle the shared paged primitive is handed is the
+        guarded one, not the raw graph.
+        """
+        graph = _FakeGraph(_edge_rows(1), resultset_cap=10)
+        proxy = _ReadOnlyGraphProxy(graph, EdgeReader.assert_read_only_command)
+        # The read primitive resolves and forwards...
+        assert proxy.ro_query.__self__ is graph
+        # ...and the WRITE primitive is refused before any byte reaches the
+        # store, naming the command rather than the method.
+        with pytest.raises(RuntimeError, match='GRAPH.QUERY'):
+            _ = proxy.query
+
+    def test_every_falkordb_primitive_the_proxy_knows_is_mapped(self) -> None:
+        """A primitive absent from the map is forwarded UNGUARDED.
+
+        So the map, not the guard, is the thing that can go quietly wrong —
+        pinned here rather than left to inspection.
+        """
+        assert COMMAND_BY_PRIMITIVE['ro_query'] == RO_COMMAND
+        assert COMMAND_BY_PRIMITIVE['query'] == 'GRAPH.QUERY'
+
+    def test_unmapped_attributes_are_forwarded_untouched(self) -> None:
+        """A handle legitimately carries bookkeeping; guarding it would only
+        make the proxy brittle without making it safer."""
+        graph = _FakeGraph(_edge_rows(1), resultset_cap=10)
+        proxy = _ReadOnlyGraphProxy(graph, EdgeReader.assert_read_only_command)
+        assert proxy.queries is graph.queries
+        assert proxy.resultset_cap == 10
+
 
     def test_graph_is_repeatable_and_the_gate_flag_exists(self) -> None:
         args = _build_parser().parse_args(

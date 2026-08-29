@@ -23,12 +23,13 @@ task 6164's ruling.
 
 Detection, and its exact relationship to the LIVE write-time guard
 ------------------------------------------------------------------
-``MemoryService._verify_episode_referents`` already performs this check
-post-write, as a ``set-membership`` test (memory_service.py:3524-3529): an
+``fused_memory/services/memory_service.py::MemoryService._verify_episode_referents``
+already performs this check post-write, as a ``set-membership`` test: an
 endpoint whose name is a task label must be among the referents its fact
 names. It computes the correction and logs a warning; leaf ETA
-(``ensure_entity_node`` -> ``reassign_edge`` -> ``refresh_entity_summary``)
-that would ACT on it has no production wiring.
+(``fused_memory/backends/graphiti_client.py::GraphitiBackend.ensure_entity_node``
+-> ``reassign_edge`` -> ``refresh_entity_summary``) that would ACT on it has
+no production wiring.
 
 This sweep is the RETROSPECTIVE counterpart of that check, and it IMPORTS the
 same detection vocabulary rather than re-deriving it — see
@@ -188,6 +189,17 @@ def endpoint_referent(node_name: str | None) -> Referent | None:
     return parse_node_name(node_name)
 
 
+_COMPOUND_SEPARATORS = r'\-:./'
+"""Characters that, sitting between two digit runs, make them ONE number.
+
+Read as a character class by :func:`bare_id_present`. An ISO timestamp
+('2026-05-09T17:09'), a version ('1.2.3') and a ratio ('192/7131') are all
+single numbers whose PARTS would otherwise satisfy a word-boundary
+containment check — see that function for the false suppression this
+prevents.
+"""
+
+
 def bare_id_present(referent: Referent, fact: str | None) -> bool:
     """Does *referent*'s already-parsed id appear as a standalone digit run?
 
@@ -229,6 +241,29 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     6165. Without that, the suppression would silently swallow real findings
     in exactly the near-miss population this sweep exists to measure.
 
+    COMPOUND NUMBERS ARE EXCLUDED, and that narrowing is load-bearing rather
+    than tidy. ``\b`` treats '-', ':', '.' and '/' as boundaries, so a plain
+    containment check reads the parts of an ISO timestamp as standalone ids:
+    the report's own worked example, "Task 1137 completed at
+    2026-05-09T17:09 UTC via commit b4b4614...", would suppress a genuinely
+    mis-bound endpoint ``Task 2026``, ``Task 17`` or ``Task 9`` — and because
+    suppression happens BEFORE a finding is minted, the loss would be
+    invisible in every count the artifact publishes. A digit run joined to
+    ANOTHER digit run by one of :data:`_COMPOUND_SEPARATORS` is therefore
+    part of a larger number, not a reference, and does not suppress. The
+    spellings this function exists for survive it: '#4262' and 'task-1836'
+    are each preceded by a NON-digit, so neither lookaround fires.
+
+    WHAT IT STILL CANNOT SEE, stated because the report has to publish the
+    bound rather than imply it does not exist: the check is CONTEXT-FREE, by
+    INV-5 construction — requiring a preceding 'task'/'#' would be exactly
+    the second vocabulary this module refuses to compile. So a fact carrying
+    a bare COUNT ('192 flags', '5 findings') still suppresses an endpoint
+    ``Task 192`` or ``Task 5``. Callers pass a *suppressed* sink into
+    :func:`classify_edge` so every such suppression is COUNTED and published
+    under ``summary.suppressed_by_bare_id``; the size of this bound is
+    measured, not assumed.
+
     A FOREIGN referent is matched on its NUMBER alone, since containment
     cannot see projects. That makes 'reify:132' look named by a fact saying
     'task 132' — a suppression, never an invented flag, and the precise
@@ -236,7 +271,15 @@ def bare_id_present(referent: Referent, fact: str | None) -> bool:
     """
     if not fact:
         return False
-    return re.search(rf'\b{re.escape(referent.number)}\b', fact) is not None
+    return (
+        re.search(
+            rf'(?<!\d[{_COMPOUND_SEPARATORS}])'
+            rf'\b{re.escape(referent.number)}\b'
+            rf'(?![{_COMPOUND_SEPARATORS}]\d)',
+            fact,
+        )
+        is not None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -328,12 +371,75 @@ def vars_of(finding: Finding) -> dict[str, Any]:
 def _sorted_referents(referents: frozenset[Referent]) -> tuple[Referent, ...]:
     """Referents in a deterministic order, so the report diffs cleanly.
 
-    Sorted on (project_id, number-as-int-when-numeric, number) rather than on
-    the rendered name: 'Task 132' and 'Task 6165' sort the wrong way as
-    strings, and a report a human diffs run to run should read in id order.
+    Sorted on ``(project_id, _id_sort_key(number))`` rather than on the
+    rendered name: 'Task 132' and 'Task 6165' sort the wrong way as strings,
+    and a report a human diffs run to run should read in id order.
+
+    The id half REUSES :func:`_id_sort_key` — the module's single description
+    of "the order a human means by the lowest id" — rather than restating it.
+    This used to carry its own ``(len(number), number)`` key, which is
+    equivalent for every id the shared parser can produce (digit strings with
+    no leading zeros) but sat three functions away from the real key with a
+    docstring describing the OTHER one, so a reader comparing the two could
+    not tell which was authoritative. Forward-referencing :func:`_id_sort_key`
+    is deliberate: it belongs next to the proximity buckets that are its main
+    consumer, and module-level names resolve at call time.
     """
     return tuple(
-        sorted(referents, key=lambda r: (r.project_id, len(r.number), r.number))
+        sorted(referents, key=lambda r: (r.project_id, _id_sort_key(r.number)))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeParse:
+    """The three parses of one edge that BOTH the population test and the
+    detector read.
+
+    It exists so those two can never be two different evaluations. The sweep
+    loop needs the endpoint parses to answer "is this edge about tasks at
+    all?" and the fact scan to answer "is it verifiable?"; :func:`classify_edge`
+    needs all three again to reach a verdict. Recomputing them was ~2x the
+    shared scanner's regex work — the expensive part of the only hot loop this
+    script has — over a 26674-row sweep, and, more importantly, it meant the
+    predicate that admitted a row into ``population`` and the predicate that
+    judged it were two evaluations that could drift apart under an edit.
+    """
+
+    subject_referent: Referent | None
+    object_referent: Referent | None
+    named: frozenset[Referent]
+
+    @property
+    def has_task_endpoint(self) -> bool:
+        """Does either end parse as a task label?
+
+        False means the edge asks no question this sweep can answer: it is
+        outside BOTH the population and the unverifiable count — not clean,
+        simply not about tasks.
+        """
+        return self.subject_referent is not None or self.object_referent is not None
+
+    @property
+    def verifiable(self) -> bool:
+        """Does the fact name at least one task referent?
+
+        False is UNVERIFIABLE, not clean — there is nothing to compare an
+        endpoint against, so no verdict is possible in either direction.
+        """
+        return bool(self.named)
+
+
+def parse_edge(
+    subject_name: str | None,
+    object_name: str | None,
+    fact: str | None,
+    graph: str,
+) -> EdgeParse:
+    """Parse one edge's endpoints and fact, once."""
+    return EdgeParse(
+        subject_referent=endpoint_referent(subject_name),
+        object_referent=endpoint_referent(object_name),
+        named=fact_referents(fact, graph),
     )
 
 
@@ -345,12 +451,15 @@ def classify_edge(
     graph: str,
     *,
     episodes: list[str] | tuple[str, ...] | None = None,
+    parse: EdgeParse | None = None,
+    suppressed: list[dict[str, Any]] | None = None,
 ) -> list[Finding]:
     """Every endpoint of one edge that the *fact* fails to name.
 
-    THE RULE, mirroring the write-time guard's ``set-membership`` check at
-    ``memory_service.py:3524-3529`` deliberately, so the retrospective and
-    live views of one defect cannot drift into two different verdicts: for
+    THE RULE, mirroring the write-time guard's ``set-membership`` check in
+    ``memory_service.py::MemoryService._verify_episode_referents``
+    deliberately, so the retrospective and live views of one defect cannot
+    drift into two different verdicts: for
     EACH endpoint whose name parses as a task label, if the fact names at
     least one referent and that endpoint's referent is NOT among them (and
     its bare id does not appear in the fact either), emit a Finding for that
@@ -378,21 +487,48 @@ def classify_edge(
 
     Subject is examined before object so a two-finding edge lists its ends in
     graph order rather than in whatever order a set iterated.
+
+    Args:
+        parse: A pre-computed :class:`EdgeParse` of the SAME four inputs,
+            supplied by :func:`_sweep_graph` so the population predicate and
+            this detector provably read one parse rather than two. Defaulting
+            to computing it keeps this function callable standalone, which is
+            how every unit test drives it.
+        suppressed: Optional sink. Each endpoint dropped by
+            :func:`bare_id_present` — rather than by the precise
+            set-membership test — is appended here as a row. That check is
+            context-free by INV-5 construction and can therefore drop a real
+            finding on a bare count; recording each one is what lets
+            ``summary.suppressed_by_bare_id`` publish the size of that bound
+            instead of leaving it an unmeasured hazard.
     """
-    named = fact_referents(fact, graph)
+    if parse is None:
+        parse = parse_edge(subject_name, object_name, fact, graph)
+    named = parse.named
     if not named:
         return []
 
     sorted_named = _sorted_referents(named)
     episode_uuids = tuple(episodes or ())
     findings: list[Finding] = []
-    for end, name in (('subject', subject_name), ('object', object_name)):
-        referent = endpoint_referent(name)
+    for end, name, referent in (
+        ('subject', subject_name, parse.subject_referent),
+        ('object', object_name, parse.object_referent),
+    ):
         if referent is None:
             continue
         if referent in named:
             continue
         if bare_id_present(referent, fact):
+            if suppressed is not None:
+                suppressed.append({
+                    'edge_uuid': edge_uuid,
+                    'graph': graph,
+                    'end': end,
+                    'node_name': str(name),
+                    'node_task_id': referent.number,
+                    'fact': fact or '',
+                })
             continue
         findings.append(
             Finding(
@@ -424,6 +560,18 @@ PROXIMITY_BUCKETS: tuple[str, ...] = (
 Load-bearing rather than documentation: :func:`id_proximity` ranks candidates
 by index into this tuple, and :func:`build_report` seeds ``by_proximity`` from
 it so every bucket is present with a 0 rather than absent when empty.
+"""
+
+NOT_COMPUTED = 'not_computed'
+"""The tally bucket for a cause column that was never MEASURED.
+
+:class:`Finding`'s cause columns default to None precisely because the pure
+layer cannot compute them, and None means NOT COMPUTED — distinct from a
+computed 'unrelated'/False. :func:`build_report` therefore tallies None into
+this bucket of its own rather than folding it into either, because the cause
+argument the artifact makes rests entirely on those two distributions and
+"not measured" silently read as "measured negative" is the wrong direction to
+fail in.
 """
 
 _SIMILAR_RATIO = 0.75
@@ -631,6 +779,58 @@ removes the loss rather than continuing to rely on that immunity.
 
 NODE_CENSUS_CYPHER = _NODE_MATCH + 'RETURN count(*)'
 
+COMMAND_BY_PRIMITIVE: dict[str, str] = {
+    'ro_query': 'GRAPH.RO_QUERY',
+    'query': 'GRAPH.QUERY',
+}
+"""Which FalkorDB command each graph-handle method issues.
+
+The whole point of naming both: it is what lets
+:meth:`EdgeReader.assert_read_only_command` be asked a question whose answer
+is not already fixed. A guard that can only ever be handed
+:data:`RO_COMMAND` proves nothing.
+"""
+
+
+class _ReadOnlyGraphProxy:
+    """The graph handle as :func:`_paged_ro_query` sees it, guarded.
+
+    WHY THIS EXISTS. ``EdgeReader._read`` used to call
+    ``assert_read_only_command(RO_COMMAND)`` — a module constant compared
+    against itself, so the branch was unreachable by construction and the
+    guard could never fire on a real run. It read as a safety net in the file
+    whose central claim is that reads are read-only by construction, and it
+    was not one: the actual guarantee came entirely from ``_paged_ro_query``
+    choosing ``ro_query``, with nothing checking that choice.
+
+    This proxy makes the same guard load-bearing by moving it to the seam
+    where the choice is OBSERVABLE. ``_paged_ro_query`` reaches the store
+    through exactly one attribute of the handle it is given, so every
+    primitive it resolves passes through :meth:`__getattr__` here; a
+    primitive that maps to a write command raises a typed error naming it
+    BEFORE any bytes reach the store. If a future edit to the shared
+    primitive — or a caller passing the wrong page template — reached for
+    ``query``, this fires. The behavioural double in the tests raises too;
+    the two are independent, and this one is the layer that names the
+    COMMAND rather than the method.
+
+    Attributes the map does not name are forwarded untouched: a handle
+    legitimately carries a name, a connection and other bookkeeping, and
+    guarding those would only make the proxy brittle without making it safer.
+    """
+
+    __slots__ = ('_graph', '_assert_command')
+
+    def __init__(self, graph: Any, assert_command: Any) -> None:
+        self._graph = graph
+        self._assert_command = assert_command
+
+    def __getattr__(self, name: str) -> Any:
+        command = COMMAND_BY_PRIMITIVE.get(name)
+        if command is not None:
+            self._assert_command(command)
+        return getattr(self._graph, name)
+
 
 class EdgeReader:
     """Reads one graph's live ``RELATES_TO`` edges and task-node ids.
@@ -680,6 +880,11 @@ class EdgeReader:
         A client-side guard layered on the server-side one, so a violation is
         a typed error at the seam that owns the guarantee rather than a redis
         error surfacing three layers down.
+
+        It is reached from :class:`_ReadOnlyGraphProxy`, with the command
+        looked up from the primitive the reader is ACTUALLY about to call —
+        never with :data:`RO_COMMAND` handed back to itself. See that class
+        for why the difference is the whole guard.
         """
         if command != RO_COMMAND:
             raise RuntimeError(
@@ -702,9 +907,14 @@ class EdgeReader:
         return self._graph
 
     async def _read(self, page: str, census: str) -> PagedRead:
-        self.assert_read_only_command(RO_COMMAND)
+        """One paged read, with the handle wrapped so the guard can fire.
+
+        The proxy — not a constant compared against itself — is what makes
+        ``assert_read_only_command`` load-bearing: the command asserted on is
+        resolved from whichever primitive ``_paged_ro_query`` reaches for.
+        """
         return await _paged_ro_query(
-            self._resolve_graph(),
+            _ReadOnlyGraphProxy(self._resolve_graph(), self.assert_read_only_command),
             page,
             census,
             page_size=self.page_size,
@@ -830,6 +1040,17 @@ CAVEATS: tuple[str, ...] = (
     'by task TITLE, an alias/codename, and a hard-wrapped qualified ref are '
     'all invisible by design. The rate reported here is therefore a LOWER '
     'BOUND on Class A.',
+    'DETECTION BOUND, SUPPRESSION: an endpoint whose bare digits appear as a '
+    'standalone run in the fact is treated as NAMED and never flagged — the '
+    'backstop absorbing the shared scanner\'s "#4262" and "task-1836" blind '
+    'spots. Digit runs joined to another digit run by -:./ are excluded, so '
+    'an ISO timestamp ("2026-05-09T17:09") no longer suppresses an endpoint '
+    '"Task 2026" or "Task 17". The check is still CONTEXT-FREE by design '
+    '(requiring a preceding "task"/"#" would be a second vocabulary), so a '
+    'bare COUNT in a fact — "192 flags" — does suppress an endpoint "Task '
+    '192". summary.suppressed_by_bare_id counts every suppression, so the '
+    'size of this bound is measured rather than assumed. It is the SECOND '
+    'reason the rate here is a LOWER BOUND.',
     'DENOMINATOR: "rate" divides by "population" — edges with at least one '
     'task-shaped endpoint AND at least one task id named in the fact. Edges '
     'whose fact names no task id are UNVERIFIABLE, not clean, and are '
@@ -867,6 +1088,7 @@ def build_report(
     scanned: int,
     population: int,
     unverifiable: int = 0,
+    suppressed_by_bare_id: int = 0,
     reads: object = (),
     limit_listing: int | None = None,
 ) -> dict[str, Any]:
@@ -893,10 +1115,24 @@ def build_report(
     findings on five nodes is not, and a reader must not have to recompute
     that distinction by hand.
 
+    A CAUSE COLUMN THAT WAS NEVER COMPUTED IS NAMED, NOT FOLDED. A Finding's
+    ``proximity`` and ``correct_node_present`` default to None, meaning NOT
+    MEASURED, and this function accepts un-enriched findings (the pure
+    layer's own output). Tallying None as 'unrelated' / 'false' would publish
+    a measured cause-attribution RESULT for a column nobody measured — and
+    the artifact's whole cause argument rests on those two distributions, so
+    that fold is the wrong direction to fail in. Both land in
+    :data:`NOT_COMPUTED`, seeded at 0 like every other bucket.
+
     Pure: *swept_at* is an argument rather than a ``datetime.now()`` call,
     which is what makes the output byte-stable across two runs on one input.
 
     Args:
+        suppressed_by_bare_id: How many endpoints :func:`bare_id_present`
+            dropped before a finding was minted. Published because that
+            check is context-free and can therefore drop a real finding on a
+            bare count — a second reason the rate is a LOWER BOUND, and one
+            that is invisible in every other number here.
         reads: ``(graph, kind, PagedRead)`` triples — one per read performed.
     """
     findings = sorted(
@@ -961,13 +1197,19 @@ def build_report(
             'by_graph': _tally(findings, lambda f: f.graph, tuple(graphs)),
             'by_end': _tally(findings, lambda f: f.end, ('subject', 'object')),
             'by_proximity': _tally(
-                findings, lambda f: f.proximity or 'unrelated', PROXIMITY_BUCKETS
+                findings,
+                lambda f: f.proximity or NOT_COMPUTED,
+                (*PROXIMITY_BUCKETS, NOT_COMPUTED),
             ),
             'correct_node_present': _tally(
                 findings,
-                lambda f: 'true' if f.correct_node_present else 'false',
-                ('true', 'false'),
+                lambda f: (
+                    NOT_COMPUTED if f.correct_node_present is None
+                    else ('true' if f.correct_node_present else 'false')
+                ),
+                ('true', 'false', NOT_COMPUTED),
             ),
+            'suppressed_by_bare_id': suppressed_by_bare_id,
             'families': families,
         },
         'truncated_by': truncated_by,
@@ -1024,9 +1266,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--include-unverifiable', action='store_true',
         help=(
-            'List the edges whose fact names NO task id. They are always '
-            'COUNTED under the top-level "unverifiable" key; this adds the '
-            'listing.'
+            'List the edges whose fact names NO task id, and the endpoints '
+            'bare_id_present suppressed. Both are always COUNTED (top-level '
+            '"unverifiable", summary.suppressed_by_bare_id); this adds the '
+            'listings.'
         ),
     )
     parser.add_argument(
@@ -1063,11 +1306,43 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
         return None
 
 
-async def _sweep_graph(
-    reader: Any, graph: str
-) -> tuple[list[Finding], int, int, int, list[dict[str, Any]], list[tuple]]:
-    """Sweep one graph. Returns findings, scanned, population, unverifiable,
-    unverifiable rows, and the (graph, kind, PagedRead) triples."""
+@dataclass(frozen=True, slots=True)
+class GraphSweep:
+    """One graph's swept result — every accounting column, named.
+
+    A dataclass rather than the 6-tuple this used to return: the caller
+    unpacked it positionally, so an added column silently shifted every
+    downstream name by one, and the three-way population / unverifiable /
+    not-about-tasks accounting that produces every published denominator was
+    the thing being shifted.
+    """
+
+    findings: list[Finding]
+    scanned: int
+    population: int
+    unverifiable: int
+    unverifiable_rows: list[dict[str, Any]]
+    suppressed_rows: list[dict[str, Any]]
+    reads: list[tuple]
+
+
+async def _sweep_graph(reader: Any, graph: str) -> GraphSweep:
+    """Sweep one graph.
+
+    THE THREE-WAY ACCOUNTING, since every denominator the artifact publishes
+    comes out of this loop:
+
+    * an edge with NO task-shaped endpoint is counted in ``scanned`` and
+      NOWHERE else — it asks no question this sweep can answer;
+    * an edge with a task-shaped endpoint whose fact names no task id is
+      UNVERIFIABLE — counted separately, never in ``population``;
+    * everything else is ``population``, the denominator of ``rate``.
+
+    Each row is parsed EXACTLY ONCE, by :func:`parse_edge`, and that one
+    parse is handed to :func:`classify_edge`. So the predicate admitting a
+    row into the population and the predicate judging it are the same
+    evaluation by construction, not by two functions agreeing.
+    """
     node_ids, node_read = await reader.read_task_node_ids()
     rows, edge_read = await reader.fetch_edges()
     logger.info(
@@ -1079,14 +1354,15 @@ async def _sweep_graph(
     population = 0
     unverifiable = 0
     unverifiable_rows: list[dict[str, Any]] = []
+    suppressed_rows: list[dict[str, Any]] = []
     for row in rows:
+        # Short rows are padded rather than unpacked strictly: a projection
+        # that lost a column must not abort a whole-corpus read.
         subject, obj, uuid, fact, episodes = (list(row) + [None] * 5)[:5]
-        # An edge with no task-shaped endpoint asks no question this sweep can
-        # answer, so it is outside BOTH the population and the unverifiable
-        # count — it is simply not about tasks.
-        if endpoint_referent(subject) is None and endpoint_referent(obj) is None:
+        parse = parse_edge(subject, obj, fact, graph)
+        if not parse.has_task_endpoint:
             continue
-        if not fact_referents(fact, graph):
+        if not parse.verifiable:
             unverifiable += 1
             unverifiable_rows.append(
                 {'edge_uuid': uuid, 'graph': graph, 'subject': subject,
@@ -1095,7 +1371,10 @@ async def _sweep_graph(
             continue
         population += 1
         findings.extend(
-            classify_edge(subject, obj, fact, uuid, graph, episodes=episodes)
+            classify_edge(
+                subject, obj, fact, uuid, graph,
+                episodes=episodes, parse=parse, suppressed=suppressed_rows,
+            )
         )
 
     # Cause attribution, once the graph's whole task-node census is in hand.
@@ -1111,8 +1390,15 @@ async def _sweep_graph(
                 'correct_node_present': correct_node_present(nearest, node_ids),
             })
         )
-    reads = [(graph, 'nodes', node_read), (graph, 'edges', edge_read)]
-    return enriched, len(rows), population, unverifiable, unverifiable_rows, reads
+    return GraphSweep(
+        findings=enriched,
+        scanned=len(rows),
+        population=population,
+        unverifiable=unverifiable,
+        unverifiable_rows=unverifiable_rows,
+        suppressed_rows=suppressed_rows,
+        reads=[(graph, 'nodes', node_read), (graph, 'edges', edge_read)],
+    )
 
 
 async def _run(
@@ -1143,17 +1429,17 @@ async def _run(
         findings: list[Finding] = []
         scanned = population = unverifiable = 0
         unverifiable_rows: list[dict[str, Any]] = []
+        suppressed_rows: list[dict[str, Any]] = []
         reads: list[tuple] = []
         for graph in graphs:
-            found, n, pop, unv, unv_rows, gr = await _sweep_graph(
-                make_reader(graph), graph
-            )
-            findings.extend(found)
-            scanned += n
-            population += pop
-            unverifiable += unv
-            unverifiable_rows.extend(unv_rows)
-            reads.extend(gr)
+            swept = await _sweep_graph(make_reader(graph), graph)
+            findings.extend(swept.findings)
+            scanned += swept.scanned
+            population += swept.population
+            unverifiable += swept.unverifiable
+            unverifiable_rows.extend(swept.unverifiable_rows)
+            suppressed_rows.extend(swept.suppressed_rows)
+            reads.extend(swept.reads)
     except Exception:
         logger.error(
             'could not read the edge population — no report is emitted rather '
@@ -1168,11 +1454,13 @@ async def _run(
         scanned=scanned,
         population=population,
         unverifiable=unverifiable,
+        suppressed_by_bare_id=len(suppressed_rows),
         reads=reads,
         limit_listing=args.limit_listing,
     )
     if args.include_unverifiable:
         report['unverifiable_edges'] = unverifiable_rows
+        report['suppressed_edges'] = suppressed_rows
 
     blob = json.dumps(report, indent=2, sort_keys=False, default=str)
     if args.out_dir:
@@ -1188,6 +1476,7 @@ async def _run(
         print(
             f"scanned={report['scanned']} population={report['population']} "
             f"unverifiable={report['unverifiable']} "
+            f"suppressed={summary['suppressed_by_bare_id']} "
             f"findings={summary['findings']} rate={summary['rate']:.4f} "
             f"truncated_by={'yes' if report['truncated_by'] else 'no'}"
         )
