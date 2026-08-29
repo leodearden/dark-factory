@@ -568,6 +568,17 @@ class CockpitApp(App):
         sensitive to manual_boost would spuriously expire a live overlay on
         the operator's own keypress. OPEN-ness is already the liveness
         gate, so state is not part of the identity either.
+
+        KEEP IN LOCKSTEP WITH THE SNAPSHOTS. This identity is only ever
+        consulted from a rebuild, and a rebuild only happens when the tick
+        diff sees a change (_apply_scan short-circuits otherwise), so each
+        snapshot must be at least as strong as the identity above or a real
+        identity change never wakes the prune at all:
+          - session -> registry_reader.build_snapshot, which appends
+            question.text AND question.asked_at for precisely this reason.
+          - decision -> _DECISION_SNAPSHOT_FIELDS, which already carries
+            text, filed_at and state -- a strict superset of (text,
+            filed_at) plus its OPEN gate, so there is no hole on that side.
         """
         kind, _, ident = key.partition(':')
         if kind == 'session':

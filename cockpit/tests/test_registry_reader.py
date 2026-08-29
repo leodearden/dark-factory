@@ -6,8 +6,13 @@ contract, never re-derive it). Fail-soft is a hard constraint (PRD §2): a
 corrupt record must never abort the whole scan.
 
 build_snapshot/snapshot_changed drive the app's rebuild-only-on-change poll:
-a snapshot is keyed on substantive display fields only (never start_ts/age),
-so a purely-time-passing tick is a no-op diff.
+a snapshot is keyed on substantive display fields only -- never on values
+that move on their own (start_ts/age) -- so a purely-time-passing tick is a
+no-op diff. That is a rule about self-moving values, not about timestamps as
+such: the ask's own question.asked_at IS part of the key, because this
+snapshot is the wake-up trigger for CockpitApp._prune_overlays and must be
+at least as strong as the `(question.text, question.asked_at)` identity that
+prune keys a session overlay on.
 """
 
 from __future__ import annotations
