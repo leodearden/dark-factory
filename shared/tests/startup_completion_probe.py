@@ -133,6 +133,13 @@ MODE_WEDGE_SHAPE: dict[str, str | None] = {
     'replay': None,
 }
 
+#: The closed set :func:`_poisoned_observation` filters ``wedge_shape`` against,
+#: derived from the dict above rather than retyped so the two cannot drift.
+#: Hoisted to module level because the filter runs per degraded row and rebuilding
+#: the set per call would be pure waste.  ``None`` IS a member (healthy/replay),
+#: which is why the filter must be a membership test and never a truthiness one.
+_WEDGE_SHAPES: frozenset[str | None] = frozenset(MODE_WEDGE_SHAPE.values())
+
 #: Full-sample offsets (seconds since spawn).  Recorded as PROVENANCE only — no
 #: test asserts a wall-clock threshold, because none is achievable (host load,
 #: SessionStart hook duration, MCP server count and FS cache all move these).
@@ -341,17 +348,29 @@ def _bool_or_none(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-#: Anchored, length-bounded shapes for the two PROBE-AUTHORED identity strings a
+#: Anchored, length-bounded shapes for the PROBE-AUTHORED identity strings a
 #: degraded row is allowed to carry (see :func:`_poisoned_observation`).  Matching
-#: one is what makes the value clean BY CONSTRUCTION rather than by a scan: both
-#: alphabets exclude every named marker (``sk-ant-``, ``accessToken``, ...), and
-#: the longest ``[A-Za-z0-9_-]`` stretch either shape admits is 36 characters (a
-#: whole UUID), well under the 64-character generic run threshold.  ``fullmatch``
-#: is load-bearing — an unanchored match would let arbitrary text ride along.
+#: one is what makes the value clean BY CONSTRUCTION rather than by a scan: every
+#: alphabet excludes every named marker (``sk-ant-``, ``accessToken``, ...), and
+#: the longest ``[A-Za-z0-9_-]`` stretch any of these shapes admits is 36
+#: characters (a whole UUID), well under the 64-character generic run threshold.
+#: ``fullmatch`` is load-bearing — an unanchored match would let arbitrary text
+#: ride along.
 _ISO_TIMESTAMP_RE = re.compile(
     r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[+-]\d{2}:\d{2}|Z)'
 )
 _UUID_RE = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+
+#: The default ``probe_run_id`` :func:`main` builds — ``f'{args.mode}-{uuid4().hex[:12]}'``.
+#: Built FROM ``MODES`` rather than hand-spelled, so a new mode cannot leave the
+#: validator rejecting ids the probe itself just generated.  Its longest
+#: ``[A-Za-z0-9_-]`` stretch is ``len(max(MODES, key=len)) + 1 + 12`` = 24
+#: characters (``build_wedge-`` plus 12 hex), far under the 64-character generic
+#: threshold, and the alphabet ``[a-z_]``/``[0-9a-f]`` excludes every named marker
+#: — so it keeps the row clean by construction under exactly the argument above.
+_PROBE_RUN_ID_RE = re.compile(
+    '(?:' + '|'.join(re.escape(mode) for mode in MODES) + r')-[0-9a-f]{12}'
+)
 
 
 def _shaped_or_none(value: Any, shape: re.Pattern[str]) -> str | None:
@@ -379,37 +398,53 @@ def _poisoned_observation(
     pre-first-token path — a placeholder without it would merely trade the
     AssertionError for a KeyError at exactly the same blast radius.
 
-    ATTRIBUTION.  ``captured_at`` and ``session_id`` are carried too, because
-    ``main()`` APPENDS to ``--out``: one JSONL file routinely holds several runs
-    and several modes, and a row saying only ``mode='healthy', sample_index=2``
-    cannot be traced back to the run that produced it — which makes the stderr
-    warning's "fix ``_scrub_value``, then re-run the probe" advice unactionable.
-    Both are probe-authored (``datetime.now(UTC).isoformat()`` and a ``uuid4``)
-    and both are validated against an anchored shape before being carried, so
-    they keep the row's clean-by-construction property rather than trusting their
-    provenance: a value the probe did not author simply degrades to ``None``.
+    ATTRIBUTION.  ``captured_at``, ``session_id`` and ``probe_run_id`` are carried
+    too, because ``main()`` APPENDS to ``--out``: one JSONL file routinely holds
+    several runs and several modes, and a row saying only ``mode='healthy',
+    sample_index=2`` cannot be traced back to the run that produced it — which
+    makes the stderr warning's "fix ``_scrub_value``, then re-run the probe"
+    advice unactionable.  All three are probe-authored by default
+    (``datetime.now(UTC).isoformat()``, a ``uuid4``, and
+    ``f'{args.mode}-{uuid4().hex[:12]}'``) and all three are validated against an
+    anchored shape before being carried, so they keep the row's
+    clean-by-construction property rather than trusting their provenance: a value
+    the probe did not author simply degrades to ``None``.  ``probe_run_id`` earns
+    its place over the other two specifically because it is the corpus JOIN KEY —
+    ``test_every_row_is_linked_to_a_raw_probe_run`` fails a curated row whose
+    ``probe_run_id`` is absent from the raw capture, and ``session_id`` appears
+    nowhere in that provenance contract.  An operator-supplied ``--probe-run-id``
+    simply will not ``fullmatch`` and degrades to ``None``, which is exactly the
+    behaviour before it was carried, so there is no regression path.
+    ``wedge_shape`` is carried under the same closed-set treatment as ``mode``,
+    against a set the probe itself owns (``MODE_WEDGE_SHAPE``).
 
     Nothing else survives.  Dropping ``transcript_records`` / ``config_dir_tree``
     / ``run_exit`` / ``spawn_argv`` is what costs this ONE sample its analytical
-    value — the deliberate price of not losing the other N.  ``cli_version`` and
-    ``probe_run_id`` are dropped with them: the first is ``claude --version``
-    output and the second can come straight from ``--probe-run-id``, so neither
-    is probe-authored and neither has a shape that could be validated.
+    value — the deliberate price of not losing the other N.  ``cli_version`` is
+    dropped with them: it is ``claude --version`` output, so it is neither
+    probe-authored nor owner of a shape that could be validated.
     """
     substrate = observation.get('substrate_returns')
     if not isinstance(substrate, dict):
         substrate = {}
     mode = observation.get('mode')
+    wedge_shape = observation.get('wedge_shape')
     sample_kind = observation.get('sample_kind')
     return {
         'redaction_failed': True,
         'redaction_failure_pattern': pattern_name,
         'mode': mode if mode in MODES else None,
+        # `in`, never truthiness: None is a legitimate member of _WEDGE_SHAPES
+        # (the healthy and replay regimes both stamp it).
+        'wedge_shape': wedge_shape if wedge_shape in _WEDGE_SHAPES else None,
         'sample_kind': sample_kind if sample_kind in SAMPLE_KINDS else None,
         'sample_index': _int_or_none(observation.get('sample_index')),
         'sample_offset_secs': _number_or_none(observation.get('sample_offset_secs')),
         'captured_at': _shaped_or_none(observation.get('captured_at'), _ISO_TIMESTAMP_RE),
         'session_id': _shaped_or_none(observation.get('session_id'), _UUID_RE),
+        'probe_run_id': _shaped_or_none(
+            observation.get('probe_run_id'), _PROBE_RUN_ID_RE
+        ),
         'substrate_returns': {
             key: (substrate.get(key) if isinstance(substrate.get(key), int) else None)
             for key in _SUBSTRATE_KEYS
