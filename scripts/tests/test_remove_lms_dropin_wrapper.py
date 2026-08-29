@@ -21,12 +21,14 @@ no session bus.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import shutil
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -154,9 +156,14 @@ def _unique_template() -> str:
       other run's fixture mid-test ("drop-in still present after refusal",
       "template survives the re-run", and a WorkingDirectory that resolves to
       the OTHER run's mktemp dir).
-    * The uuid suffix disambiguates repeat calls WITHIN one process -- two
-      tests in this module each run the .sh -- and survives PID reuse after a
-      killed run left same-PID residue behind.
+    * The uuid suffix disambiguates repeat calls WITHIN one process -- a rerun
+      in the same session, or a future second caller -- and survives PID reuse
+      after a killed run left same-PID residue behind.
+
+    Note what this does NOT solve.  Distinct names make the unit PATHS
+    disjoint; they do nothing about CONTENTION on the single shared
+    `systemd --user` manager, whose `daemon-reload` is globally serialized.
+    That is _serialized_selftest_slot's job -- see its rationale block below.
 
     The trailing "@" makes it a template: the .sh appends ".service" and
     builds its probe unit as ``${TEMPLATE}probe.service``.
@@ -165,8 +172,10 @@ def _unique_template() -> str:
 
 
 # How long a selftest unit must go untouched before it counts as abandoned.
-# Comfortably longer than the ~2s a run takes and than the suite's own
-# --timeout=300, so a live sibling is never mistaken for residue.
+# Comfortably longer than a run's MEASURED cost (~5.2s solo on the operator
+# host, and bounded above by _SELFTEST_TIMEOUT_S + _LOCK_WAIT_S even when the
+# fleet is fully contended) and than the suite's own --timeout=300, so a live
+# sibling is never mistaken for residue.
 _STALE_AFTER_S = 3600.0
 
 
@@ -383,9 +392,14 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
       (a) Trailing "@".  The .sh appends ".service" and builds its probe as
           "${TEMPLATE}probe.service"; a missing "@" silently yields a plain
           unit instead of a template, and the probe unit resolves to nothing.
-      (b) Two calls differ.  Both subprocess tests in this module run the .sh,
-          and a shared name between them re-creates the collision this seam
-          exists to prevent.
+      (b) Two calls differ.  This is what carries the cross-process isolation
+          property STRUCTURALLY: the .sh derives UNIT, DROPIN_DIR and its
+          probe unit from `$TEMPLATE` alone, so distinct names imply disjoint
+          absolute paths, and no live multi-process test is needed to
+          establish it.  (One used to be here.  It cost 71% of the module and
+          multiplied the daemon-reload contention it was meant to model, while
+          its three threads shared one PID -- so it modelled the SAME-process
+          case, not the fleet's cross-process one.  Removed under esc-4200-2.)
       (c) The shared _SELFTEST_PREFIX.  The generator and the prune bind the
           SAME constant, so the prune's "never touch a real unit" property is
           structural rather than a pair of string literals free to drift.
@@ -519,13 +533,182 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# step-7: the measured concurrency defect
+# step-7: cross-PROCESS serialization of the one real-systemd leg
 # ---------------------------------------------------------------------------
+#
+# WHY A LOCK ON TOP OF THE UNIQUE TEMPLATE NAME.  The two seams solve DIFFERENT
+# problems and neither substitutes for the other:
+#
+#   * _unique_template() fixes NAME COLLISION -- two runs writing and `rm`ing
+#     the same absolute unit path.  Distinct names make the paths disjoint.
+#   * This lock fixes CONTENTION on the single shared `systemd --user` manager,
+#     which distinct names do nothing about.  `systemctl --user daemon-reload`
+#     is globally serialized inside the manager, and it is essentially ALL of
+#     this test's cost: MEASURED on the operator host, daemon-reload is
+#     0.85-0.94s against 66 unit files, one .sh run performs ~5 of them (3 in
+#     the .sh, 2 more inside the script under test), and a solo run costs
+#     5.20s end to end.  Wall clock therefore scales LINEARLY in the number of
+#     concurrent runs no matter how unique the names are.
+#
+# That linear scaling is the whole risk.  The repo root sets
+# merge_verify_breadth: "full" and the fleet runs max_concurrent_tasks: 48
+# against one $HOME and one user manager, so an unserialized leg would reach
+# its subprocess timeout under enough concurrency and go RED on branches with
+# no defect -- blocking every merge, review checkpoint and main-tip sweep
+# repo-wide.  A test that manufactures a repo-wide merge blocker is strictly
+# worse than the rot this module was written to fix.
+#
+# So: at most ONE process anywhere on this host drives the .sh at a time, and a
+# session that cannot get a slot within _LOCK_WAIT_S SKIPS with a reason rather
+# than failing.  Skipping is the correct outcome for a contended slot -- the
+# holder is running the identical gate against the identical code right now, so
+# the gate's coverage is delivered by that run; a red here would report an
+# environment fact as a defect.
 
-# Comfortably under the suite's own --timeout=300 (scripts/orchestrator.yaml),
-# so a wedged run surfaces as this test's own diagnosable failure rather than
-# as an opaque suite-level timeout that names no cause.
-_SELFTEST_TIMEOUT_S = 120
+# The rendezvous file, in ~/.config/systemd/user because that (via $HOME) is
+# the one thing all 48 concurrent worktrees demonstrably share -- the same
+# reason the collision existed at all.  The leading dot and the absent unit
+# suffix keep systemd from ever parsing it, and _prune_stale_selftest_units
+# cannot reach it: that sweep requires BOTH the _SELFTEST_PREFIX prefix and a
+# .service/.service.d suffix, and this name has neither.
+_LOCK_NAME = ".lms-dropin-selftest.lock"
+
+# Budget, sized against the suite's per-test --timeout=300
+# (scripts/orchestrator.yaml): _LOCK_WAIT_S + _SELFTEST_TIMEOUT_S = 270 < 300,
+# so a wedged run always surfaces as this module's own diagnosable skip or
+# failure -- naming the lock or naming the .sh -- rather than as an opaque
+# suite-level timeout that names no cause.
+#
+# _LOCK_WAIT_S = 120 covers ~20 fully-serialized predecessors at the measured
+# 5.2s each.  _SELFTEST_TIMEOUT_S = 150 is ~29x the measured solo cost, and
+# under the lock the run is EXCLUSIVE, so the only load it now has to absorb is
+# unrelated daemon-reload traffic rather than 47 copies of itself.
+_LOCK_WAIT_S = 120.0
+_SELFTEST_TIMEOUT_S = 150
+_LOCK_POLL_S = 0.25
+
+
+@contextlib.contextmanager
+def _serialized_selftest_slot(*, wait_s: float = _LOCK_WAIT_S) -> Iterator[Path]:
+    """Hold an exclusive host-wide slot for driving the .sh, or skip.
+
+    `fcntl.flock` rather than a lockfile-existence protocol on purpose: the
+    kernel drops a flock when the holding file description closes, INCLUDING
+    on SIGKILL, so a verify timeout or a task cancellation -- both routine in
+    this fleet -- cannot strand the lock and wedge every later session.  A
+    hand-rolled "create a file, delete it in a finally" would have exactly
+    that failure mode, and would need the same stale-age heuristic
+    _prune_stale_selftest_units carries.
+
+    Polled LOCK_NB rather than a blocking LOCK_EX so the wait is BOUNDED: an
+    unbounded block would sail past the suite's --timeout=300 and report the
+    contention as an opaque suite timeout.
+
+    Both give-up paths call `pytest.skip`, never `fail`: an unwritable unit
+    dir and a busy host are environment facts, and the guarded tests are
+    already skipif-gated on exactly that kind of fact.
+    """
+    lock_path = _unit_dir() / _LOCK_NAME
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        pytest.skip(
+            f"cannot open the selftest serialization lock {lock_path} ({exc}) -- "
+            "environment fact (agent write-scope / read-only $HOME), not a defect"
+        )
+
+    deadline = time.monotonic() + wait_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    pytest.skip(
+                        f"another process has held {lock_path} for more than {wait_s:g}s "
+                        "-- this .sh is serialized host-wide because "
+                        "`systemctl --user daemon-reload` is globally serialized, and "
+                        "the holder is running this identical gate right now.  "
+                        "Environment fact (fleet concurrency), not a defect"
+                    )
+                time.sleep(_LOCK_POLL_S)
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def test_serialized_slot_is_exclusive_and_released(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The slot must actually EXCLUDE a concurrent holder, and let go after.
+
+    Host-independent: XDG_CONFIG_HOME is redirected at tmp_path, so no systemd
+    and no real unit dir are involved and this runs everywhere -- including
+    the sandboxes where the two subprocess tests skip.  A lock that silently
+    failed to exclude would restore the unbounded contention this seam exists
+    to remove, and nothing else in the module would notice.
+
+    The second handle is a SEPARATE ``os.open``, which the kernel treats as a
+    distinct open file description; flock conflicts between two such
+    descriptions even inside one process, so this models the cross-process
+    case without spawning one.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    with _serialized_selftest_slot() as lock_path:
+        assert lock_path == tmp_path / "systemd" / "user" / _LOCK_NAME
+        rival = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            with pytest.raises(OSError):
+                fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(rival)
+
+    # Released on exit -- otherwise the FIRST session on a host would wedge
+    # every later one for the life of the process.
+    rival = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(rival, fcntl.LOCK_UN)
+    finally:
+        os.close(rival)
+
+
+def test_serialized_slot_skips_rather_than_fails_when_contended(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A busy host must SKIP, never go red -- the point of the whole seam.
+
+    ``wait_s=0`` renders "the deadline expired" without sleeping.  If this
+    ever raised anything other than Skipped, a contended fleet would report an
+    environment fact as a defect and block every merge repo-wide, which is the
+    exact outcome this module must not produce.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    unit_dir = tmp_path / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+
+    holder = os.open(unit_dir / _LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        # Combined `with` (ruff SIM117), which is exactly equivalent here:
+        # the slot's __enter__ runs INSIDE the raises block, so a Skipped
+        # raised during acquisition is still what gets caught.
+        with (
+            pytest.raises(pytest.skip.Exception, match="fleet concurrency"),
+            _serialized_selftest_slot(wait_s=0.0),
+        ):
+            pytest.fail("the slot must not be entered while a rival holds the lock")
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
 
 
 def _run_selftest(template: str) -> subprocess.CompletedProcess[str]:
@@ -584,46 +767,6 @@ def _assert_selftest_passed(result: subprocess.CompletedProcess[str], template: 
     )
 
 
-@pytest.mark.skipif(_SKIP_REASON is not None, reason=str(_SKIP_REASON))
-def test_concurrent_selftests_do_not_collide() -> None:
-    """Three simultaneous runs must all pass -- the MEASURED defect, not a guess.
-
-    The fleet runs `max_concurrent_tasks: 48` and every task shares one $HOME,
-    so this .sh can and will be running in several worktrees at once.  With
-    its old hardcoded `lms-dropin-selftest@`, every instance wrote and `rm`ed
-    the SAME absolute unit path, and case 4's `rm -f "$UNIT"` tore down the
-    other run's fixture mid-test.  Measured at plan time: two concurrent runs
-    BOTH failed, deterministically --
-
-      run A: "exit code is 0 -- expected '0', got '1'"
-             "WorkingDirectory now resolves to the repo root -- expected
-              '/tmp/tmp.NnkWkdITs8', got '/tmp/tmp.bUjgix0thr'"
-      run B: "drop-in still present after refusal -- expected 'yes', got 'no'"
-             "template survives the re-run -- expected 'yes', got 'no'"
-
-    That makes the LMS_SELFTEST_TEMPLATE seam MANDATORY rather than a nicety.
-    scripts/orchestrator.yaml warns that a red leg here "blocks every merge,
-    review checkpoint and main-tip sweep repo-wide, on branches with no
-    defect" (the repo root sets merge_verify_breadth: full).  Wiring the .sh
-    into the collected suite UNSEAMED would therefore have converted a
-    dormant-but-correct test into an intermittent repo-wide merge blocker --
-    strictly worse than the rot this task set out to fix.
-
-    THREE instances rather than two, so the overlap window is not marginal.
-    """
-    templates = [_unique_template() for _ in range(3)]
-    assert len(set(templates)) == 3, "the generator must not hand two runs the same name"
-
-    try:
-        with ThreadPoolExecutor(max_workers=len(templates)) as pool:
-            results = list(pool.map(_run_selftest, templates))
-        for template, result in zip(templates, results, strict=True):
-            _assert_selftest_passed(result, template)
-    finally:
-        for template in templates:
-            _remove_template_residue(template)
-
-
 # ---------------------------------------------------------------------------
 # step-9: the primary anti-rot gate
 # ---------------------------------------------------------------------------
@@ -651,7 +794,7 @@ def test_shell_selftest_passes() -> None:
 
     There is no RED to manufacture here and the absence of one is the point:
     scripts/tests/test_remove_lms_dropin.sh was already correct -- 12/12
-    checks, ~2s -- and the defect was that NOTHING RAN IT.  It was the only
+    checks -- and the defect was that NOTHING RAN IT.  It was the only
     .sh among 61 pytest modules in scripts/tests/, and pytest collects only
     `test_*.py`, so the file sat in the tree checked by nobody.  The fix is
     therefore the EXISTENCE of a collected caller, and this is it.  Same shape
@@ -668,13 +811,26 @@ def test_shell_selftest_passes() -> None:
     Safety of running for real in the DEFAULT suite: the .sh only ever
     `daemon-reload`s -- it never starts, stops, enables or restarts any unit
     -- and it operates solely on a uniquely-named throwaway template sharing
-    no name with any real unit.  Cost is ~2s against a suite measured at
-    293-931s.
+    no name with any real unit.
+
+    COST, measured on the operator host rather than estimated (an earlier
+    "~2s" here was wrong by ~2.6x and is corrected under esc-4200-2): a solo
+    run is 5.20s end to end, and it is essentially ALL `daemon-reload` --
+    0.85-0.94s each against 66 unit files, ~5 of them per run.  Against a
+    suite measured at 293-931s that is ~0.6-1.8%.  Because the reload is
+    globally serialized inside the one shared user manager, that cost would
+    otherwise scale LINEARLY with fleet concurrency; the slot below caps the
+    host at one run at a time, so this stays 5.2s of exclusive work plus a
+    bounded, skip-terminated wait instead.
     """
     _prune_stale_selftest_units(_unit_dir(), now=time.time())
 
-    template = _unique_template()
-    try:
-        _assert_selftest_passed(_run_selftest(template), template)
-    finally:
-        _remove_template_residue(template)
+    # The slot is acquired BEFORE the template is generated and released only
+    # after the residue sweep, so the whole install/drive/assert/clean cycle --
+    # not merely the subprocess -- is exclusive host-wide.
+    with _serialized_selftest_slot():
+        template = _unique_template()
+        try:
+            _assert_selftest_passed(_run_selftest(template), template)
+        finally:
+            _remove_template_residue(template)

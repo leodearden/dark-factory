@@ -29,6 +29,18 @@
 # passes a unique per-invocation name through this seam.  Three concurrent runs
 # with distinct templates all pass 12/12.
 #
+# COST, and why the wrapper ALSO serializes.  Distinct names fix the collision
+# above; they do nothing about CONTENTION on the one shared `systemd --user`
+# manager.  MEASURED on the operator host: `systemctl --user daemon-reload` is
+# globally serialized at 0.85-0.94s against 66 unit files, this file performs 3
+# of them and the script under test 2 more, and a solo run costs 5.20s -- so a
+# run is essentially all daemon-reload and its wall clock scales LINEARLY in
+# the number of concurrent runs, unique names or not.  The wrapper therefore
+# holds an flock over ~/.config/systemd/user/.lms-dropin-selftest.lock for the
+# whole cycle, so at most one process on the host drives this file at a time.
+# Running it BY HAND does not take that lock; expect to slow (not break) a
+# concurrent verify if you do.
+#
 # Usage: scripts/tests/test_remove_lms_dropin.sh
 #        LMS_SELFTEST_TEMPLATE='lms-dropin-selftest-<unique>@' scripts/tests/test_remove_lms_dropin.sh
 
