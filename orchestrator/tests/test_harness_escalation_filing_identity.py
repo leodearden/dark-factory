@@ -231,8 +231,11 @@ class TestEveryHarnessFilingSiteIsStamped:
     def test_all_escalation_constructions_pass_filing_claimant_run_id(self) -> None:
         calls = _escalation_call_sites(_HARNESS_SRC_PATH)
         # Baseline at the time of writing; a drop means sites moved out of
-        # this module and the tripwire's coverage silently shrank.
-        assert len(calls) >= 27, f'expected >=27 Escalation(...) sites, found {len(calls)}'
+        # this module and the tripwire's coverage silently shrank.  Raised
+        # 27 -> 28 when this branch rebased onto main: task 3172 step-14 added
+        # _file_stale_l0_strand_escalation, a 28th filing site, which this
+        # rebase stamps like the other 27.
+        assert len(calls) >= 28, f'expected >=28 Escalation(...) sites, found {len(calls)}'
 
         unstamped = [
             node.lineno for node in calls

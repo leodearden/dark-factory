@@ -2037,7 +2037,7 @@ class Harness:
         :attr:`TaskWorkflow._filing_claimant_run_id`:
 
         1. The harness is a PROCESS-level filer, not a task-workflow
-           incarnation.  None of its ~27 filing sites has a per-task
+           incarnation.  None of its ~28 filing sites has a per-task
            ``session_id``, and there is no live-``TaskWorkflow`` registry to
            look one up from — :meth:`is_workflow_active` is a bare
            ``_workflow_cancel_events`` membership test, not a workflow map.
@@ -11928,6 +11928,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_stranded_escalation',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             logger.warning(
