@@ -1800,3 +1800,223 @@ class TestWallClockDeadlineCrossCodeIsolation:
             _checker._RULE_C_CODE,
         }
         assert _checker._RULE_C_CODE == 'wall-clock-deadline'
+
+
+# The Rule C census (task 4246, base 1d75322218): 618 violations across 20 files,
+# every one under orchestrator/tests/.  Counted as VIOLATIONS, not sites — one call
+# can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
+# and is deliberately ABSENT, exactly as it is absent from Rule B's baseline.
+_EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
+    'orchestrator/tests/test_merge_queue.py',
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py',
+    'orchestrator/tests/test_concurrent_verify_boundary.py',
+    'orchestrator/tests/test_merge_queue_permit_conservation.py',
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_resolve_release.py',
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_equivalence.py',
+    'orchestrator/tests/test_merge_queue_restart_hook.py',
+    'orchestrator/tests/test_merge_queue_request_liveness.py',
+    'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_persistent_worktree.py',
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
+    'orchestrator/tests/test_merge_guard_pipeline.py',
+    'orchestrator/tests/test_merge_queue_supervisor.py',
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
+    'orchestrator/tests/test_merge_queue_warm_cold_shadow.py',
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py',
+})
+
+# A Rule C debt file with a budget small enough to drive at-budget / over-budget
+# behaviour with a handful of synthetic sources.
+_RULE_C_DEBT_FILE = 'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py'
+
+# Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
+# so N copies produce N violations and the arithmetic in the budget tests is exact.
+_RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
+
+
+class TestWallClockDeadlineDebtBaseline:
+    """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
+
+    618 pre-existing violations across 20 files mean a hot default-on rule would
+    turn orchestrator/tests' lint_command red immediately and stall the merge lane
+    repo-wide — the identical situation Rule B faced at 95 sites/11 files, solved
+    the identical way.
+
+    Opt-OUT rather than opt-in, deliberately: an opt-in list would exempt precisely
+    the brand-new file this rule exists to catch, and "which files are covered"
+    would become a hand-maintained list — the exact failure mode task 3980's
+    amendment pass deleted a class list to escape.
+
+    Mirrors TestDataclassDoubleDebtBaseline one-for-one, and additionally pins that
+    the now-shared machinery keeps the three baselines strictly independent.
+    """
+
+    def test_debt_baseline_holds_exactly_the_measured_census_paths(self):
+        """_WALL_CLOCK_DEADLINE_DEBT == the 20 census paths — no more, no less."""
+        debt = _checker._WALL_CLOCK_DEADLINE_DEBT
+        assert set(debt) == _EXPECTED_WALL_CLOCK_DEBT_PATHS, (
+            'Rule C debt baseline drifted from the measured census.\n'
+            f'  unexpected additions: {sorted(set(debt) - _EXPECTED_WALL_CLOCK_DEBT_PATHS)}\n'
+            f'  missing entries:      {sorted(_EXPECTED_WALL_CLOCK_DEBT_PATHS - set(debt))}\n'
+            'The list is SHRINK-ONLY: entries may be removed as files are migrated '
+            'onto wait_responsive(...), never added.'
+        )
+
+    def test_test_merge_speculation_is_not_grandfathered(self):
+        """test_merge_speculation.py must NOT be on the Rule C baseline.
+
+        It measures ZERO today because task 3980 migrated it. Even a budgeted entry
+        of zero would be a blanket suppression letting a regression land there
+        silently — which is what 3980 spent a task removing, and what makes it safe
+        to delete that module's file-local copy of this guard in step-12.
+        """
+        assert (
+            'orchestrator/tests/test_merge_speculation.py'
+            not in _checker._WALL_CLOCK_DEADLINE_DEBT
+        ), (
+            'test_merge_speculation.py must stay OFF the Rule C baseline — it is at '
+            'zero and must FAIL the gate on a regression, not be grandfathered'
+        )
+
+    def test_same_source_opposite_verdicts_by_filename(self):
+        """The identical offending source is suppressed in a debt file and flagged elsewhere."""
+        assert _rule_c(_RULE_C_SOURCE, _RULE_C_DEBT_FILE) == [], (
+            'Rule C must be suppressed in a debt-listed file'
+        )
+        flagged = _rule_c(_RULE_C_SOURCE, _NON_DEBT_FILE)
+        assert len(flagged) == 2, (
+            'the SAME source in a non-debt file must still flag — otherwise the '
+            f'baseline is not a baseline but a global off switch; got {flagged!r}'
+        )
+
+    def test_suppression_works_for_absolute_paths(self):
+        """An absolute path ending in the debt components is suppressed too.
+
+        The nine call sites pass repo-relative paths; pytest passes absolutes. Both
+        must reach the same verdict or the baseline would be invisible to one caller.
+        """
+        absolute = str(_REPO_ROOT / _RULE_C_DEBT_FILE)
+        assert _rule_c(_RULE_C_SOURCE, absolute) == [], (
+            f'an absolute path to a debt file must be suppressed; filename={absolute!r}'
+        )
+
+    def test_matching_is_path_component_aware_not_substring(self):
+        """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
+        assert _rule_c(_RULE_C_SOURCE, 'evil/' + _RULE_C_DEBT_FILE) == [], (
+            'a path whose real trailing components are a debt entry is suppressed'
+        )
+        not_suppressed = _rule_c(
+            _RULE_C_SOURCE, 'orchestrator/tests/not_test_merge_queue.py'
+        )
+        assert len(not_suppressed) == 2, (
+            'not_test_merge_queue.py merely CONTAINS a debt filename as a substring; '
+            f'a substring match must not grandfather it. got {not_suppressed!r}'
+        )
+        bare = _rule_c(_RULE_C_SOURCE, 'test_merge_queue.py')
+        assert len(bare) == 2, (
+            'a bare basename at another root shares only ONE trailing component and '
+            f'must not be suppressed. got {bare!r}'
+        )
+
+    def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
+        """The budget is what makes 'shrink-only' checked rather than merely commented.
+
+        Without it a debt entry grandfathers its file WHOLESALE, so a brand-new
+        wall-clock wait added to test_merge_queue.py (317 violations, an
+        actively-developed hub) would be invisible to the gate forever.
+        """
+        budget = _checker._WALL_CLOCK_DEADLINE_DEBT[_RULE_C_DEBT_FILE]
+        assert budget == 1, f'this test is written against a budget of 1; got {budget}'
+
+        at_budget = _rule_c(_RULE_C_ONE_HIT, _RULE_C_DEBT_FILE)
+        assert at_budget == [], (
+            f'a debt file carrying exactly its recorded {budget} violation(s) must stay '
+            f'silent — that is the grandfathering the baseline exists for; got {at_budget!r}'
+        )
+
+        over_budget = _rule_c(_RULE_C_ONE_HIT * 3, _RULE_C_DEBT_FILE)
+        assert len(over_budget) == 2, (
+            'a debt file that GROWS past its recorded budget must report exactly the '
+            f'overrun (3 - budget {budget} = 2); got {over_budget!r}'
+        )
+
+    def test_reported_overrun_sites_are_the_last_in_source_order(self):
+        """The anchor is positional and deterministic, not a claim about which site is new."""
+        over_budget = _rule_c(_RULE_C_ONE_HIT * 4, _RULE_C_DEBT_FILE)
+        assert [v.lineno for v in over_budget] == [2, 3, 4], (
+            f'expected the LAST 3 of 4 sites (budget 1); got {[v.lineno for v in over_budget]}'
+        )
+
+    def test_overrun_message_names_the_budget_and_forbids_raising_it(self):
+        """The overrun message must not read as a normal Rule C hit.
+
+        The remedy differs: a normal hit says "route this wait through
+        wait_responsive", an overrun says "you added debt to a file that may only
+        shrink". Conflating them invites the reader to fix it by editing the number.
+        """
+        message = _rule_c(_RULE_C_ONE_HIT * 2, _RULE_C_DEBT_FILE)[0].message
+        for needle in ('debt baseline', 'budget of 1', '2 were found', 'Do NOT raise'):
+            assert needle in message, (
+                f'the overrun message must name {needle!r} so the reader fixes the debt '
+                f'rather than the baseline; got {message!r}'
+            )
+
+    def test_overrun_message_carries_rule_c_remedies_not_rule_b_ones(self):
+        """A Rule C overrun must never prescribe _fake_verify_result."""
+        message = _rule_c(_RULE_C_ONE_HIT * 2, _RULE_C_DEBT_FILE)[0].message
+        assert 'wall-clock-deadline' in message
+        assert 'wait_responsive' in message
+        assert 'MERGE_RESULT_TIMEOUT' in message
+        for foreign in ('_fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
+            assert foreign not in message, (
+                f'Rule C overrun message must not offer {foreign!r}: {message!r}'
+            )
+
+    def test_rule_b_overrun_message_is_unchanged_by_the_parameterisation(self):
+        """Regression pin: Rule B's wording is pinned by its own tests and must not drift."""
+        entry = 'orchestrator/tests/test_merge_item_union.py'
+        message = find_violations(_RULE_B_SOURCE * 2, entry)[0].message
+        assert message == _checker._debt_overrun_msg(1, 2), (
+            'Rule B must still build its overrun message through _debt_overrun_msg '
+            'with byte-identical text after the debt helpers were parameterised'
+        )
+
+
+class TestDebtBaselineIsolation:
+    """The three baselines are independent: no rule's debt entry suppresses another rule."""
+
+    def test_rule_a_is_reported_in_full_in_a_rule_c_debt_file(self):
+        """The Rule C baseline grandfathers wall-clock debt, not all test-quality discipline."""
+        violations = find_violations(_RULE_A_SOURCE, _RULE_C_DEBT_FILE)
+        assert len(violations) == 1, (
+            'a bare config MagicMock in a Rule-C-debt file is still a Rule A '
+            f'violation; got {violations}'
+        )
+        assert 'mock_orch_config' in violations[0].message
+
+    def test_rule_b_is_reported_in_full_in_a_rule_c_only_debt_file(self):
+        """A file on the Rule C baseline but NOT Rule B's still reports Rule B in full."""
+        assert _RULE_C_DEBT_FILE not in _checker._DATACLASS_DOUBLE_DEBT, (
+            'this test needs a file on the Rule C baseline only'
+        )
+        violations = find_violations(_RULE_B_SOURCE, _RULE_C_DEBT_FILE)
+        assert len(violations) == 1, (
+            f'Rule B must be unaffected by a Rule C debt entry; got {violations}'
+        )
+        assert '_fake_verify_result' in violations[0].message
+
+    def test_rule_c_is_reported_in_full_in_a_rule_b_only_debt_file(self):
+        """A file on the Rule B baseline but NOT Rule C's still reports Rule C in full."""
+        entry = 'orchestrator/tests/test_merge_item_union.py'
+        assert entry in _checker._DATACLASS_DOUBLE_DEBT, entry
+        assert entry not in _checker._WALL_CLOCK_DEADLINE_DEBT, (
+            'this test needs a file on the Rule B baseline only'
+        )
+        violations = _rule_c(_RULE_C_SOURCE, entry)
+        assert len(violations) == 2, (
+            f'Rule C must be unaffected by a Rule B debt entry; got {violations!r}'
+        )
