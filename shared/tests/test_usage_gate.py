@@ -849,6 +849,47 @@ class TestProbeConfigDirLeakSweep:
         """Start every case as if this were a fresh process."""
         monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
 
+    def test_gate_construction_delegates_to_the_shared_once_helper(self):
+        """The once-per-process bookkeeping lives in shared.config_dir now.
+
+        Its twin used to live here in ~45 near-verbatim lines — same one-shot
+        flag, same set-before-call ordering, same broad except, same
+        silent-on-zero rule — and the two could drift apart with nothing to
+        notice.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs_once', return_value=0) as once:
+            make_gate(['work'])
+
+        once.assert_called_once()
+        assert once.call_args.args[0] == PROBE_DIR_PREFIX
+
+    def test_the_module_level_sweep_name_is_still_the_interception_point(self):
+        """`shared.usage_gate.sweep_stale_pid_dirs` must stay what actually runs.
+
+        The ANTI-REGRESSION guard for the whole hoist, written BEFORE the rewire
+        so the guarantee is pinned rather than asserted after the fact. If the
+        helper ever resolves the sweep out of `shared.config_dir`'s own globals
+        instead — which is exactly what giving it a def-time default parameter
+        would do — then `_keep_gates_off_the_real_tmp` and the ~dozen sibling
+        `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
+        class silently stop intercepting, and this suite starts scandir-ing and
+        deleting the developer's real /tmp.
+        """
+        calls: list[str] = []
+
+        def _recording_sweep(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            return 0
+
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', _recording_sweep):
+            make_gate(['work'])
+
+        assert calls == [PROBE_DIR_PREFIX], (
+            'the sweep patched onto shared.usage_gate was not what ran — every '
+            'patch site in this module has stopped intercepting, and the suite '
+            'is now deleting real /tmp dirs'
+        )
+
     def test_gate_construction_sweeps_stale_probe_dirs(self):
         with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
             make_gate(['work'])
