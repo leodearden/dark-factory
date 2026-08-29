@@ -4053,6 +4053,72 @@ class TestCreateWorktreeWarmLaneRouting:
         with pytest.raises(WarmLaneDiskPressure):
             await git_ops.create_worktree('task-dp')
 
+    # ── task 4211: LANE_LOCK_CONTENDED → WarmLaneLockContention ───────────
+
+    async def test_warm_lane_lock_contention_is_a_warm_lane_requeue(self):
+        """It inherits the requeue routing, not the blocked+L1 RuntimeError one.
+
+        A lane-lock refusal means another live consumer holds
+        ``<lane_dir>.lock`` — a transient shared-resource condition and no
+        fault of this task, so it must requeue via the shared
+        :class:`WarmLaneRequeue` handler in workflow.run().
+        """
+        from orchestrator.git_ops import WarmLaneLockContention, WarmLaneRequeue
+
+        assert issubclass(WarmLaneLockContention, WarmLaneRequeue)
+
+    async def test_create_worktree_lane_lock_contended_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch,
+    ):
+        """The discriminant LANE_LOCK_CONTENDED routes to its own raise arm.
+
+        Isolates the create_worktree routing from the seed subprocess by
+        pinning acquire_warm_lane's return value directly: before task 4211
+        this discriminant had no arm and fell through to the generic
+        FAULT/DISABLED ``RuntimeError`` (blocked + L1), which is the wrong
+        routing for transient contention.
+        """
+        from orchestrator.git_ops import WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        async def _contended(*_args, **_kwargs):
+            return WarmLaneUnavailable.LANE_LOCK_CONTENDED
+
+        monkeypatch.setattr(git_ops, 'acquire_warm_lane', _contended)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-contended')
+
+        message = str(excinfo.value)
+        assert 'lock contention' in message.lower(), message
+        assert 'task-contended' in message, message
+        # The whole point of task 4211: the operator-facing string must no
+        # longer say "disk pressure" for what is a lane-lock refusal.
+        assert 'disk pressure' not in message.lower(), message
+
+    async def test_create_worktree_seed_exit_77_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """End-to-end sibling of the seed-exit-75 DISK_PRESSURE test above.
+
+        Drives the REAL seam — seed subprocess rc 77 → _seed_rc_to_unavailable
+        → discriminant → create_worktree raise arm — rather than pinning the
+        discriminant, so the two halves cannot drift apart.
+        """
+        from orchestrator.git_ops import WarmLaneDiskPressure, WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=77)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-lock')
+
+        assert not isinstance(excinfo.value, WarmLaneDiskPressure), (
+            'rc 77 must NOT be rendered as disk pressure (task 4211)'
+        )
+
     async def test_create_worktree_success_returns_worktree_info_on_lane(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
