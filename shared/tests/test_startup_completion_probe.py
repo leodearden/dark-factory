@@ -290,6 +290,65 @@ class TestScrubbedKeysDoNotCollide:
 _ENCODING_EXTENDED_LEAF = '\t' + 'A' * 63
 
 
+class TestUnencodableValuesAnswerClean:
+    """``_encodes_clean``'s ``except (TypeError, ValueError): return True`` branch.
+
+    PREMISE — this is a DEFENSIVE contract, not a live path.  ``_gate`` cannot
+    deliver an unencodable value here: it does ``json.dumps(observation)`` on the
+    whole document before any scrub runs, so an observation carrying one raises
+    there and never reaches ``_scrub_value``.  The branch exists so
+    ``_encodes_clean`` stays safe for DIRECT callers — this test is one, and a
+    future sampler could be another.
+
+    Pinned because the branch is load-bearing the moment it does fire, and its
+    correct answer is counter-intuitive: True means "clean", i.e. an unencodable
+    value is CARRIED rather than redacted.  That is right — it can never appear
+    in the encoded document at all, so it cannot contribute a match there — but
+    it reads like a fail-open, which is exactly the shape a future edit would
+    "fix" by turning the ``except`` into a ``raise``.  Mutation-checked: doing
+    that turns these tests red and nothing else.
+    """
+
+    @staticmethod
+    def _circular() -> dict:
+        """A structure ``json.dumps`` rejects with ValueError, not TypeError."""
+        d: dict[str, Any] = {}
+        d['self'] = d
+        return d
+
+    def test_an_unserializable_object_encodes_clean(self):
+        # TypeError: Object of type object is not JSON serializable.
+        assert (
+            probe._encodes_clean(object(), probe._GENERIC_CREDENTIAL_PATTERNS) is True
+        ), (
+            'an unencodable value must answer True (clean): it cannot appear in the '
+            'encoded document, so it cannot contribute a match there'
+        )
+
+    def test_a_circular_structure_encodes_clean(self):
+        # ValueError: Circular reference detected — the OTHER excepted class, and
+        # the one a `except TypeError` narrowed by a future edit would drop.
+        assert (
+            probe._encodes_clean(self._circular(), probe._GENERIC_CREDENTIAL_PATTERNS)
+            is True
+        )
+
+    def test_scrub_value_carries_an_unserializable_scalar_through(self):
+        # The composition, not just the leaf: _scrub_value's non-str/non-container
+        # branch routes through _encodes_clean, so a raising _encodes_clean would
+        # surface HERE — inside the scrub the gate calls — rather than in isolation.
+        sentinel = object()
+        assert (
+            probe._scrub_value(sentinel, probe._GENERIC_CREDENTIAL_PATTERNS)
+            is sentinel
+        ), 'the value must be carried through unchanged, not replaced by <redacted>'
+
+    # No _scrub_value case for the circular structure: a dict is a CONTAINER, so
+    # _scrub_value recurses into it and never reaches the scalar branch that
+    # consults _encodes_clean.  Its ValueError half is therefore pinned at the
+    # leaf (test_a_circular_structure_encodes_clean) and only there.
+
+
 class TestEncodedDomainParity:
     """``_scrub_value`` must produce a value clean in its JSON-ENCODED form.
 
