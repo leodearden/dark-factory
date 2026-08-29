@@ -168,6 +168,16 @@ _FLAGGED_VERDICTS = frozenset({
     'commit_not_on_main', 'misattributed', 'reverted', 'deliverable_absent',
 })
 
+# Bound on the second-parent walk in _git_second_parent_commits, passed as
+# `-n` to `git log`. Largest real second parent measured on main at HEAD
+# 72286f53b9 is c7dcc4f9d4 with 104 commits, so 500 is ~5x headroom for
+# this corpus. `git log`'s default order is newest-first, so a cap
+# truncates the OLDEST commits; a self-citation lost to truncation leaves
+# the task flagged for human review rather than silently cleared — the
+# conservative direction (mirrors the `[]`-default policy on the wrapper
+# itself, see _git_second_parent_commits below).
+_SECOND_PARENT_WALK_CAP = 500
+
 
 @dataclass
 class TaskProvenanceAudit:
@@ -496,6 +506,61 @@ async def _git_commit_message(project_root: str, commit: str) -> str:
     if proc.returncode != 0:
         return ''
     return stdout.decode('utf-8', errors='replace').strip()
+
+
+async def _git_second_parent_commits(
+    project_root: str, commit: str,
+) -> list[tuple[str, str]]:
+    """Return ``(sha, message)`` pairs for the commits *commit*'s second
+    parent brought in, or ``[]`` on any failure.
+
+    Walks ``<commit>^1..<commit>^2`` — commits reachable from the SECOND
+    parent but not the first, i.e. exactly what a no-ff merge commit
+    brought in from the branch it merged. On an ordinary single-parent
+    commit that range is unresolvable (git exits 128 with `fatal:
+    ambiguous argument`; verified empirically), so this single subprocess
+    call degrades to ``[]`` for a non-merge with no separate parent-count
+    probe needed.
+
+    ``[]`` is deliberately indistinguishable-by-design between "not a
+    merge", "git failed" (timeout, missing binary, non-zero exit) and "cap
+    exceeded" — every one of those collapses to the same safe default, so a
+    caller consulting this fact for a self-citation can never have a git
+    failure manufacture a false clearance; the absence of evidence lands on
+    the loud, already-reviewed outcome instead.
+
+    Capped at :data:`_SECOND_PARENT_WALK_CAP` commits via ``-n``; `git
+    log`'s default order is newest-first, so a cap truncates the OLDEST
+    commits — a self-citation lost to truncation leaves the task flagged
+    for human review rather than silently cleared, the conservative
+    direction.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'log', '-z', '--format=%H%n%B',
+            '-n', str(_SECOND_PARENT_WALK_CAP), f'{commit}^1..{commit}^2',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except TimeoutError:
+            proc.kill()
+            return []
+    except FileNotFoundError:
+        return []
+    if proc.returncode != 0:
+        return []
+    payload = stdout.decode('utf-8', errors='replace')
+    pairs: list[tuple[str, str]] = []
+    for record in payload.split('\0'):
+        if not record.strip():
+            continue
+        sha, _sep, message = record.partition('\n')
+        if not sha:
+            continue
+        pairs.append((sha, message))
+    return pairs
 
 
 class GitFacts:
