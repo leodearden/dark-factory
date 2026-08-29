@@ -191,6 +191,20 @@ class GcDecision:
         return {path: reason for path, reason in self.prune}
 
 
+# The prune-reason vocabulary. These three strings are WIRE FORMAT: they land
+# in the JSON report's `reason_counts`, in every per-dir prune log line, and in
+# the count-axis classification the count-cap alarm keys on. Named here and
+# emitted from :func:`select_prunable` below, then consumed by
+# :func:`summarize_count_cap` via `_COUNT_REASONS`, so the emitter and the
+# classifier are genuinely single-sourced rather than two independently
+# editable sets of literals (INV-5). That matters because the divergence fails
+# QUIETLY: rename a tag at the emit site alone and the alarm stops firing
+# instead of erroring, which is the exact silence this leaf exists to remove.
+REASON_AGE = 'age'
+REASON_COUNT = 'count'
+REASON_AGE_COUNT = 'age+count'
+
+
 def select_prunable(
     task_dirs: list[tuple[Path, float]],
     now: float,
@@ -228,24 +242,25 @@ def select_prunable(
         is_age = age_cutoff is not None and mtime < age_cutoff
         is_count = max_task_dirs > 0 and rank >= max_task_dirs
         if is_age and is_count:
-            prune.append((path, 'age+count'))
+            prune.append((path, REASON_AGE_COUNT))
         elif is_age:
-            prune.append((path, 'age'))
+            prune.append((path, REASON_AGE))
         elif is_count:
-            prune.append((path, 'count'))
+            prune.append((path, REASON_COUNT))
         else:
             keep.append(path)
 
     return GcDecision(keep=keep, prune=prune)
 
 
-# The two prune reasons the COUNT axis produces. The distinction is the whole
-# point of :func:`summarize_count_cap`: 'count' means the AGE policy would have
-# kept that dir, while 'age+count' means the age policy was discarding it
-# anyway. Enumerated once, here, beside the :func:`select_prunable` that emits
-# them, so the alarm and the classifier can never drift apart.
-_COUNT_ONLY_REASON = 'count'
-_COUNT_REASONS = frozenset({'count', 'age+count'})
+# The two prune reasons the COUNT axis produces, DERIVED from the vocabulary
+# the emitter uses (REASON_* above) rather than restated as literals here — so
+# a rename is one edit both sides follow, and the alarm cannot silently drift
+# out of agreement with the classifier. The distinction is the whole point of
+# :func:`summarize_count_cap`: 'count' means the AGE policy would have kept
+# that dir, while 'age+count' means the age policy was discarding it anyway.
+_COUNT_ONLY_REASON = REASON_COUNT
+_COUNT_REASONS = frozenset({REASON_COUNT, REASON_AGE_COUNT})
 
 
 def summarize_count_cap(

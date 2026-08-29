@@ -171,6 +171,42 @@ def test_union_age_and_count_reasons():
     assert decision.reasons[old_d] == "age+count"
 
 
+def test_prune_reason_vocabulary_is_single_sourced():
+    """AMENDMENT (review): the reason tags are emitted from the REASON_*
+    constants the count-cap classifier consumes, not from parallel literals.
+
+    The tags are wire format — they land in the JSON report's `reason_counts`,
+    in the per-dir log lines, and in the count-axis classification the alarm
+    keys on. Two independently editable sets of literals would let a rename at
+    the emit site silently stop the alarm firing (a non-count reason simply
+    falls through the `_COUNT_REASONS` filter) rather than raising. This pins
+    both halves: the constants ARE the wire strings, and the classifier's set
+    is derived from them.
+    """
+    assert (gct.REASON_AGE, gct.REASON_COUNT, gct.REASON_AGE_COUNT) == (
+        "age",
+        "count",
+        "age+count",
+    )
+    assert gct._COUNT_ONLY_REASON == gct.REASON_COUNT
+    assert set(gct._COUNT_REASONS) == {gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+    # ...and the emitter really draws from that vocabulary: across both axes,
+    # every reason select_prunable produces is one of the three constants.
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 100 * DAY),
+    ]
+    vocabulary = {gct.REASON_AGE, gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+
+    tight = set(select_prunable(task_dirs, NOW, 90, 1).reasons.values())
+    slack = set(select_prunable(task_dirs, NOW, 90, HIGH_COUNT_CAP).reasons.values())
+
+    assert tight == {gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+    assert slack == {gct.REASON_AGE}
+    assert (tight | slack) == vocabulary  # all three exercised, none invented
+
+
 # ---------------------------------------------------------------------------
 # step-5: scan_task_dirs(root) against a real filesystem archive
 # ---------------------------------------------------------------------------
