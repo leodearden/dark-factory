@@ -1097,6 +1097,17 @@ _GREP_CHECK_IDS = [
 #: (`- {kind: grep, ...}`) at the start of a line.
 _GREP_KIND_RE = re.compile(r'^[ \t]*[-{ ]*kind:\s*[\'"]?grep\b', re.MULTILINE)
 
+#: The `discover_manifests() is None` predicate — "git could not answer at
+#: all" — evaluated ONCE at import instead of once per test item.
+#:
+#: The corpus classes above call discover_manifests() inline inside each
+#: guard, which is free at their scale (a handful of items each). The
+#: per-descriptor ratchet below is parametrized over 563 rows, and every
+#: inline call is a fresh `git ls-files` subprocess: measured at ~40s of that
+#: class's ~70s wall clock, i.e. more than the entire corpus sweep it guards.
+#: Same predicate, same skip, one subprocess.
+_CORPUS_DISCOVERABLE = discover_manifests() is not None
+
 #: The three codes shared.delivered_check_polarity emits that are STRUCTURAL
 #: statements about a descriptor's SHAPE rather than about its polarity
 #: relative to a tree: a descriptor matching only its own manifest/PRD family,
@@ -1571,7 +1582,59 @@ class TestCheckedInScriptCheckTargets:
 #: sweep reports TODAY. Populated by MEASUREMENT, never by hand — see
 #: TestCheckedInGrepDescriptorHygiene's docstring for the baseline and the
 #: date. Each entry carries the owning task id so the debt is attributable.
-_KNOWN_STRUCTURAL_DEBT: frozenset[tuple[str, str, str, str]] = frozenset()
+_KNOWN_STRUCTURAL_DEBT: frozenset[tuple[str, str, str, str]] = frozenset(
+    {
+        # task 3199 — the pattern's only match is a markdown heading in a
+        # sibling report, so the check asserts the heading was written.
+        (
+            'docs/prds/memory-metadata-vocabulary.capability-manifest.yaml',
+            'zeta',
+            'decision-table-report-committed',
+            'vacuous_present_comment_only',
+        ),
+        # task 2792 — one of the two specimens task 3500 was filed on: the sole
+        # `archive_task_transcripts` match in git_ops.py is a COMMENT
+        # (git_ops.py:14282), so the check was green before the backstop existed.
+        (
+            'plans/agent-transcript-archival-prd.capability-manifest.yaml',
+            'β',
+            'backstop-at-cleanup-worktree-chokepoint',
+            'vacuous_present_comment_only',
+        ),
+        # task 2862 — matches only the script's own header comments.
+        (
+            'plans/fable-architect-eval-admission-prd.capability-manifest.yaml',
+            'τ1',
+            'eval-bootstrap-smoke-gate',
+            'vacuous_present_comment_only',
+        ),
+        # task 3633 — matches only the descriptor's own `pattern:` line and the
+        # PRD sentence describing it; satisfied by its own existence.
+        (
+            'plans/fable-architect-trial-v2-prd.capability-manifest.yaml',
+            'γ1',
+            'planrate-is-judge-free',
+            'vacuous_present_self_referential',
+        ),
+        # task 2900 — matches only a comment in standing_decision_constants.py.
+        (
+            'plans/stage1-entity-standing-decision-prd.capability-manifest.yaml',
+            'η',
+            'backfill-migration-script-committed',
+            'vacuous_present_comment_only',
+        ),
+        # task 3536 — the other filing specimen (MODE 3): the pattern is the
+        # module name test_workflow_merge_gating_strand, which exists as a
+        # tracked PATH and appears in no file's CONTENTS, so the check can
+        # never go green however completely the capability is delivered.
+        (
+            'plans/task-escalation-state-graph-prd.capability-manifest.yaml',
+            'γ1',
+            'no-steward-less-escalated-exit-at-merge-entry',
+            'filename_shaped',
+        ),
+    }
+)
 
 
 class TestCheckedInGrepDescriptorHygiene:
@@ -1614,6 +1677,15 @@ class TestCheckedInGrepDescriptorHygiene:
     The baseline is recorded here rather than asserted as a count: a count
     assertion would go red on an unrelated sidecar landing, and
     `_KNOWN_STRUCTURAL_DEBT` already pins the identities exactly.
+
+    RED SIGNAL, PROVEN BY MUTATION. A ratchet frozen at today's measurement is
+    green on arrival by construction, which is inherent to the shape and not a
+    reason to trust it unverified — so both halves were mutated, following
+    TestCheckedInManifestCorpus's precedent: (1) dropping one real violator
+    from `_KNOWN_STRUCTURAL_DEBT` turned that descriptor's row red with the
+    attributed message while a clean descriptor's row stayed green; (2)
+    inserting an entry for a descriptor that does not violate turned
+    test_every_allowlisted_descriptor_still_violates red naming it.
     """
 
     def test_grep_check_corpus_is_not_vacuous(self):
@@ -1657,7 +1729,7 @@ class TestCheckedInGrepDescriptorHygiene:
     @pytest.mark.timeout(300)
     @pytest.mark.parametrize('ref', _GREP_CHECKS, ids=_GREP_CHECK_IDS)
     def test_descriptor_has_no_unallowlisted_structural_defect(self, ref):
-        if discover_manifests() is None:
+        if not _CORPUS_DISCOVERABLE:
             pytest.skip('not a git checkout (git ls-files failed)')
         code = _structural_sweep()[ref]
         if code is None:
@@ -1678,7 +1750,7 @@ class TestCheckedInGrepDescriptorHygiene:
         # The anti-rot half. Without it the allowlist only ever grows: a
         # descriptor someone else repairs leaves a stale entry that silently
         # re-permits the same defect if the same key is ever re-declared.
-        if discover_manifests() is None:
+        if not _CORPUS_DISCOVERABLE:
             pytest.skip('not a git checkout (git ls-files failed)')
         live = {
             _structural_debt_key(ref, code)

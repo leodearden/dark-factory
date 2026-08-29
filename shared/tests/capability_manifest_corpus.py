@@ -243,6 +243,74 @@ def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
     ]
 
 
+@dataclass(frozen=True)
+class GrepCheckRef:
+    """One ``kind: grep`` delivered_check, attributed back to its author.
+
+    The :class:`ScriptCheckRef` counterpart for the other mechanical check
+    kind (task 3500). Same attribution triple — sidecar, Greek-label task
+    block, capability — plus the three fields that make the descriptor
+    re-evaluable: the ERE ``pattern`` verbatim, the ``expect`` polarity, and
+    the ``paths`` pathspecs.
+
+    ``paths`` is a TUPLE where the model carries a list, so the ref stays
+    hashable. ``test_capability_manifest.py`` keys its once-per-session
+    classification cache on the ref itself, which a list field would make
+    impossible.
+    """
+
+    manifest: Path
+    task_label: str
+    capability: str
+    pattern: str
+    expect: str | None
+    paths: tuple[str, ...]
+
+
+def iter_grep_checks(path: Path) -> list[GrepCheckRef]:
+    """Every ``kind: grep`` delivered_check declared in one sidecar.
+
+    The :func:`iter_script_checks` counterpart, and deliberately identical in
+    shape down to the swallowed exception set — see that function's docstring
+    for the full rationale, which carries over unchanged:
+
+    1. No signal is lost. ``TestCheckedInManifestCorpus.
+       test_checked_in_manifest_validates`` already reports an unloadable
+       sidecar loudly, with a better field-path-attributed message.
+    2. The swallow cannot hide a dropped descriptor:
+       ``TestCheckedInGrepDescriptorHygiene.test_sweep_covers_every_declared_grep_check``
+       re-derives the expected count by regex over the sidecar TEXT,
+       bypassing this loader entirely, and asserts equality.
+    3. It is load-bearing for collection — the consumer builds its
+       ``@pytest.mark.parametrize`` list at module import time.
+
+    ``pattern`` is guaranteed non-empty for ``kind='grep'`` by
+    ``_check_kind_conditional_fields``' grep branch, and is filtered on
+    anyway: a descriptor with nothing to grep for is a SCHEMA defect that
+    belongs to the corpus validator, not to a structural sweep that would
+    have to invent a verdict for it.
+    """
+    try:
+        doc = load_capability_manifest(path)
+    except (yaml.YAMLError, ValidationError, OSError):
+        return []
+    return [
+        GrepCheckRef(
+            manifest=path,
+            task_label=task.label,
+            capability=cap.name,
+            pattern=cap.delivered_check.pattern,
+            expect=cap.delivered_check.expect,
+            paths=tuple(cap.delivered_check.paths),
+        )
+        for task in doc.tasks
+        for cap in task.capabilities
+        if cap.delivered_check is not None
+        and cap.delivered_check.kind == 'grep'
+        and cap.delivered_check.pattern
+    ]
+
+
 def check_script_target(ref: ScriptCheckRef, repo_root: Path = REPO_ROOT) -> str | None:
     """Check one script target exists and is executable in the WORKING tree.
 

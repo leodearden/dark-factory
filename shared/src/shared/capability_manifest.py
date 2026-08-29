@@ -148,6 +148,18 @@ class DeliveredCheck(_CheckFieldsBase):
     ``extra='forbid'`` — this is a strict authoring schema whose deliverable
     is rejecting malformed/typo'd entries, unlike ``shared.task_metadata``'s
     ``extra='allow'`` round-trip sub-models.
+
+    WHAT THIS SCHEMA CANNOT EXPRESS. Validity here is purely structural:
+    every field a ``kind`` requires is present and well-typed. It cannot say
+    whether the descriptor will ever CHANGE VERDICT — a ``kind='grep'``
+    ``expect='present'`` pattern that already matches, or one that names a
+    FILE rather than a symbol inside it, is perfectly schema-valid and can
+    never go green, so it wedges whatever depends on it. Those rules are
+    tree-relative rather than field-relative, so they live in
+    :mod:`shared.delivered_check_polarity`, which ``commit_planning`` and
+    ``stamp_capability_manifests`` run at authoring time (task 3500). Authors
+    hitting a ``DeliveredCheckPolarityViolation`` should read that module's
+    docstring, not this one.
     """
 
     kind: Literal['grep', 'script', 'manual']
@@ -319,6 +331,12 @@ class DeliveredCheckMeta(_CheckFieldsBase):
     failed). Shares :class:`DeliveredCheck`'s descriptor fields (via
     :class:`_CheckFieldsBase`) and grep/script cross-field validation (via
     :func:`_check_kind_conditional_fields`).
+
+    Shares :class:`DeliveredCheck`'s limits too: passing this model says the
+    entry is well-SHAPED, not that it can ever change verdict. The
+    authoring-time polarity rules that catch the un-satisfiable shapes live in
+    :mod:`shared.delivered_check_polarity` and run against these entries in
+    ``commit_planning`` and ``stamp_capability_manifests`` (task 3500).
     """
 
     name: str = Field(min_length=1)
