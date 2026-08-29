@@ -21,6 +21,7 @@ import json
 import re
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1716,8 +1717,8 @@ class _FakeReader:
         rows: list[list],
         node_ids: set[str] | None = None,
         *,
-        edge_read: object | None = None,
-        node_read: object | None = None,
+        edge_read: Any = None,
+        node_read: Any = None,
     ):
         self.rows = rows
         self.node_ids = set(node_ids or ())
@@ -1730,14 +1731,14 @@ class _FakeReader:
             expected_rows=len(self.node_ids), reason=None,
         )
 
-    async def fetch_edges(self) -> tuple[list[list], object]:
+    async def fetch_edges(self) -> tuple[list[list], Any]:
         return list(self.rows), self.edge_read
 
-    async def read_task_node_ids(self) -> tuple[set[str], object]:
+    async def read_task_node_ids(self) -> tuple[set[str], Any]:
         return set(self.node_ids), self.node_read
 
 
-def _args(**over) -> object:
+def _args(**over) -> Any:
     """Parsed CLI defaults with the named options overridden.
 
     Built through the real parser rather than a hand-made Namespace, so a
@@ -1779,7 +1780,7 @@ ROW_SUPPRESSED = [
 class TestSweepGraph:
     """The three-way accounting that produces every published denominator."""
 
-    async def _sweep(self, rows, node_ids=()) -> object:
+    async def _sweep(self, rows, node_ids=()) -> Any:
         return await _sweep_graph(_FakeReader(rows, set(node_ids)), GRAPH)
 
     async def test_each_row_shape_lands_in_exactly_one_bucket(self) -> None:
@@ -1869,7 +1870,7 @@ class TestRunEndToEnd:
     the precedent this script's ``reader_factory`` hook was copied from.
     """
 
-    async def _run_capture(self, capsys, readers, **over):
+    async def _run_capture(self, capsys, readers, **over) -> tuple[int, Any, str]:
         """Run and return (exit code, parsed report or None, raw stdout).
 
         *readers* is a graph -> _FakeReader mapping, so a multi-graph sweep
