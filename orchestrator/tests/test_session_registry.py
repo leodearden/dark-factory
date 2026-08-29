@@ -307,6 +307,20 @@ def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
     assert record.claude_session_id is None
 
 
+def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
+    # Sibling to the claude_session_id regression test above (task 4660
+    # review follow-up): pins the from_dict call site for claude_owner_pid
+    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
+    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
+    # otherwise survive as a real-looking pid, which could silently compare
+    # equal to a real pid in session_hooks._env_slug_ownership
+    # (session_hooks.py:329).
+    data = _make_record().to_dict()
+    data['claude_owner_pid'] = True
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_owner_pid is None
+
+
 def test_spawn_mode_enum_values() -> None:
     assert issubclass(sr.SpawnMode, str)
     assert {m.value for m in sr.SpawnMode} == {'child', 'sibling', 'detached'}

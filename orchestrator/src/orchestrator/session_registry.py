@@ -273,6 +273,8 @@ class SessionRecord:
         ``session_hooks.hook_session_slug`` compares it against the current
         hook's stdin session_id to tell the session spawn-claude.sh launched
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
+        A non-str or whitespace-only value in a record body reads back as
+        None instead of surviving unchanged (see ``_coerce_session_id``).
     claude_owner_pid: pid of the ``claude`` PROCESS that bound
         ``claude_session_id``, stamped at the same moment, or None for a
         record bound before this field existed (or where the pid could not
@@ -281,7 +283,9 @@ class SessionRecord:
         alone cannot tell "the owner re-minted" from "a nested claude
         inherited the env var". The owning process keeps its pid across a
         re-mint; a nested ``claude`` never shares it. See
-        ``session_hooks._env_slug_is_owned``.
+        ``session_hooks._env_slug_is_owned``. A non-int, bool, or
+        non-positive value in a record body reads back as None instead of
+        surviving unchanged (see ``_coerce_owner_pid``).
     """
 
     session_slug: str
