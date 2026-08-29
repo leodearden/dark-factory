@@ -1416,3 +1416,88 @@ class TestAllScannedTestDirsClean:
             f'Violations:\n{result.stdout}\n'
             f'stderr:\n{result.stderr}'
         )
+
+
+# ===========================================================================
+# Rule C — wall-clock-deadline (task 4246)
+# ===========================================================================
+
+
+def _expr(source: str) -> ast.expr:
+    """Parse *source* as a single expression and return its AST node.
+
+    Rule C's shape predicate takes an ``ast.expr`` (the first positional
+    argument of a wait call), so the unit tests below drive it with parsed
+    expressions rather than with hand-built nodes.
+    """
+    return ast.parse(source, mode='eval').body
+
+
+class TestWallClockLoadBearingTarget:
+    """Rule C's shape predicate: which wait targets are load-bearing.
+
+    Ported from orchestrator/tests/test_merge_speculation.py::_load_bearing_wait_target
+    (task 3980), whose file-local copy this shared rule replaces.
+
+    Exactly two shapes are load-bearing, and both gate a hard assertion
+    downstream: a ``MergeRequest.result`` future (its resolution IS the event
+    the test waits for) and a ``gate*.wait()`` ``asyncio.Event`` barrier
+    (already event-driven; only its deadline is wall-clock).
+
+    The Name negative is the load-bearing one: it is what keeps the
+    ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
+    inside ``contextlib.suppress``, asserting nothing — exempt STRUCTURALLY by
+    its Name-vs-Attribute/Call shape rather than by a hand-maintained name list.
+    """
+
+    def test_attribute_result_is_a_merge_request_future(self):
+        """``req_a.result`` → described as a MergeRequest.result future."""
+        described = _checker._load_bearing_wait_target(_expr('req_a.result'))
+        assert described is not None
+        assert 'req_a.result' in described
+        assert 'MergeRequest.result future' in described
+
+    def test_subscripted_attribute_result_is_a_merge_request_future(self):
+        """``follower_reqs[tid].result`` → still an ast.Attribute named 'result'."""
+        described = _checker._load_bearing_wait_target(_expr('follower_reqs[tid].result'))
+        assert described is not None
+        assert 'follower_reqs[tid].result' in described
+        assert 'MergeRequest.result future' in described
+
+    def test_gate_wait_call_is_an_event_barrier(self):
+        """``gate_a_entered.wait()`` → described as an asyncio.Event gate barrier."""
+        described = _checker._load_bearing_wait_target(_expr('gate_a_entered.wait()'))
+        assert described is not None
+        assert 'gate_a_entered.wait()' in described
+        assert 'asyncio.Event gate barrier' in described
+
+    def test_bare_gate_prefix_wait_call_is_an_event_barrier(self):
+        """``gate_entered.wait()`` → the prefix is 'gate', not 'gate_<letter>_'."""
+        described = _checker._load_bearing_wait_target(_expr('gate_entered.wait()'))
+        assert described is not None
+        assert 'asyncio.Event gate barrier' in described
+
+    def test_bare_name_target_is_not_load_bearing(self):
+        """``worker_task`` → None.
+
+        THE load-bearing negative. ``_stop_worker``'s teardown join targets a
+        bare Name; that shape — not a name list — is what exempts it, which is
+        what lets the rule scan every scope in every scanned file.
+        """
+        assert _checker._load_bearing_wait_target(_expr('worker_task')) is None
+
+    def test_wrong_attribute_name_is_not_load_bearing(self):
+        """``obj.results`` → None (the attribute must be exactly 'result')."""
+        assert _checker._load_bearing_wait_target(_expr('obj.results')) is None
+
+    def test_non_gate_name_wait_call_is_not_load_bearing(self):
+        """``notagate.wait()`` → None (the receiver Name must start with 'gate')."""
+        assert _checker._load_bearing_wait_target(_expr('notagate.wait()')) is None
+
+    def test_wrong_method_on_a_gate_is_not_load_bearing(self):
+        """``gate_a.set()`` → None (only ``.wait()`` blocks)."""
+        assert _checker._load_bearing_wait_target(_expr('gate_a.set()')) is None
+
+    def test_wait_on_a_non_name_receiver_is_not_load_bearing(self):
+        """``some_call().wait()`` → None (``func.value`` is a Call, not a Name)."""
+        assert _checker._load_bearing_wait_target(_expr('some_call().wait()')) is None
