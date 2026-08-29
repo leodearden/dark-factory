@@ -816,13 +816,18 @@ class MarkupGuardMiddleware(Middleware):
             # Identity from the RAW arguments: no recovery validated, so
             # nothing from the tail may be believed.
             identity = self._identity(arguments)
+            # Hoisted, not re-computed at the refusal: ONE resolution feeds
+            # both the burst record and the residue record, so the two cannot
+            # disagree about who leaked. ``_subject`` is pure over an
+            # unmutated ``arguments``, so this is behaviour-preserving.
+            subject = self._subject(arguments)
             await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
-            storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
+            storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity, subject)
             await self._refuse_unrepairable(
-                name, identity, self._subject(arguments),
+                name, identity, subject,
                 param, value, pattern, storm,
             )
 
@@ -883,18 +888,26 @@ class MarkupGuardMiddleware(Middleware):
                 name, identity, param, pattern,
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
             )
-            storm = await self._record_storm(_OUTCOME_REJECTED, identity[1])
+            # The REPAIRED view, matching the ``identity`` resolved from that
+            # same merged map one line above — if the leak ate the caller's own
+            # ``task_id`` the pre-repair read would lose it. This path does not
+            # file a residue record, so this is the one caller-attribution it
+            # gets at all.
+            storm = await self._record_storm(
+                _OUTCOME_REJECTED, identity, self._subject({**arguments, **fix.recovered}),
+            )
             return self._reject(name, arguments, param, fix, storm)
 
         await self._emit_fact(
             name, identity, param, pattern,
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
-        storm = await self._record_storm(_OUTCOME_REPAIRED, identity[1])
+        subject = self._subject({**arguments, **fix.recovered})
+        storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
         residue_id = None
         if unrecovered:
             residue_id = await self._preserve_unrecovered(
-                name, identity, self._subject({**arguments, **fix.recovered}),
+                name, identity, subject,
                 param, pattern, unrecovered,
             )
         return await self._forward(
@@ -1007,7 +1020,12 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- the storm escape (INV-4) -----------------------------------------
 
-    async def _record_storm(self, outcome: str, project: str | None) -> dict[str, Any] | None:
+    async def _record_storm(
+        self,
+        outcome: str,
+        identity: tuple[str | None, str | None],
+        subject: tuple[str | None, str | None],
+    ) -> dict[str, Any] | None:
         """Count this outcome; escalate and return a summary iff a burst fired.
 
         Repair is a FAIL-SOFT path, so it owes the rate/streak escalation. One
@@ -1026,7 +1044,26 @@ class MarkupGuardMiddleware(Middleware):
         Threshold and window are passed PER CALL, honouring ``StormCounter``'s
         reload-safety contract, so a registration site backed by a green-tier
         config leaf can read them live rather than capturing them here.
+
+        ``identity`` and ``subject`` are the SAME ``(agent_id, project)`` /
+        ``(task_id, agent_role)`` tuples :meth:`_emit_fact`,
+        :meth:`_refuse_unrepairable` and :meth:`_preserve_unrecovered` already
+        take, so this reads like its three sibling record builders and one
+        hoisted local can feed both this and the residue filer — which is also
+        what stops the storm record and the residue record disagreeing about
+        who leaked. Taken as tuples rather than four scalars for exactly that
+        reason: they are threaded, not re-resolved.
+
+        They are recorded because a burst record that cannot name a caller is
+        an alarm with no address. Measured on four real
+        ``esc-plan-tools-markup-storm-*`` records: the only route to the caller
+        was a grep of this method's own log line, and they were read 6-7 days
+        old — past this host's ~72h ``journald --user`` retention, on a server
+        whose stderr never reaches journald at all.
         """
+        agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
+
         key = f'{project}\x1f{outcome}'
         counter = self._storms.get(key)
         if counter is None:
@@ -1055,15 +1092,38 @@ class MarkupGuardMiddleware(Middleware):
             'window_seconds': summary['window_seconds'],
             'outcome': outcome,
             'project': project,
+            # ``crossing_``, and the prefix is the whole claim. ``project`` is
+            # the counter's own key, so every event in this window shares it
+            # and the bare name is honest. These three describe ONE call — the
+            # one that happened to cross the threshold — and have no such
+            # guarantee: on a shared, long-lived server (the escalation server,
+            # fused-memory) a burst can be several agents at once. A field
+            # named plainly ``agent_id`` on a burst record would read as "the
+            # agent that caused the burst", a claim this layer cannot make, and
+            # shipping it would replace an unattributed record with a
+            # confidently misattributed one — trading the reported defect for a
+            # worse one. ``_identity``'s own rule, applied to the record shape.
+            #
+            # PRESENT-AND-NULL, never absent, and never guessed or defaulted:
+            # a consumer must not have to tell "no caller declared" apart from
+            # "that emitter forgot the key".
+            'crossing_agent_id': agent_id,
+            'crossing_subject_task_id': subject_task_id,
+            'crossing_subject_agent_role': subject_agent_role,
         }
         # ERROR, and greppable: markup_tripwire's split again — the summary
         # folded into the response reaches ONLY the leaking caller, which is
         # the one party that already knows, so the operator-facing half cannot
         # ride on it.
+        # The ``markup_guard_storm:`` prefix stays EXACTLY where it is —
+        # markup_tripwire's dedup-fold path and several tests grep that token.
+        # The crossing caller is appended, not interpolated into the prefix.
         logger.error(
             'markup_guard_storm: %d %s outcome(s) in %ss for project=%r — the '
-            'serialization leak is ACTIVE (see DF 3083)',
+            'serialization leak is ACTIVE (see DF 3083); crossing call '
+            'agent_id=%r task_id=%r agent_role=%r',
             storm['count'], outcome, storm['window_seconds'], project,
+            agent_id, subject_task_id, subject_agent_role,
         )
         await self._file_storm_escalation(storm)
         return storm
