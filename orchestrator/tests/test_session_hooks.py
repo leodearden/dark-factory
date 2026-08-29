@@ -3593,3 +3593,127 @@ def test_event_probes_verdict_matches_unmemoized_verdict_bit_for_bit(
     monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
     monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
     assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
+
+
+# ---------------------------------------------------------------------------
+# ONE EVENT, ONE /proc WALK (task 4662)
+#
+# The fixture below is the exact shape where all three walks fire today: a
+# still-LAUNCHING, still-unbound spawn record whose OWNER_PPID verdict is
+# True -- the owner's own pre-SessionStart event, task 4193 L2 ruling item
+# 4-iii. _env_slug_ownership takes its verdict, _withhold_from_launching
+# takes it again, and _bind_claude_session_id stamps claude_owner_pid from a
+# third walk. Each assertion pairs the count with an OUTCOME check, so the
+# pin cannot be satisfied by simply skipping a probe.
+# ---------------------------------------------------------------------------
+
+
+def _owner_shape(
+    slug: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pid: int
+) -> tuple[dict[str, str], list[int]]:
+    """LAUNCHING+unbound record whose OWNER_PPID verdict resolves to True."""
+    _launching_record(slug, tmp_path, pid=pid)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
+    calls = _count_owning_claude_pid(monkeypatch, 4193501)
+    return _owner_ppid_env(slug, 4193500), calls
+
+
+def test_notification_walks_proc_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slug = 'session-cockpit-4662001'
+    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662001)
+
+    sh.run_notification(
+        {
+            'session_id': 'uuid-owner',
+            'cwd': '/home/leo/src/dark-factory',
+            'message': 'may I proceed?',
+        },
+        env,
+        root=tmp_path,
+    )
+
+    assert len(calls) == 1
+    # OUTCOME PARITY (mirrors test_owner_stop_is_not_withheld_...).
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.AWAITING_INPUT
+    assert record.question is not None and record.question.text == 'may I proceed?'
+    assert record.claude_session_id == 'uuid-owner'
+
+
+def test_stop_walks_proc_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slug = 'session-cockpit-4662002'
+    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662002)
+
+    sh.run_stop(
+        {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+    )
+
+    assert len(calls) == 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
+    assert record.claude_session_id == 'uuid-owner'
+
+
+def test_session_start_walks_proc_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slug = 'session-cockpit-4662003'
+    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662003)
+
+    sh.run_session_start(
+        {
+            'session_id': 'uuid-owner',
+            'cwd': '/home/leo/src/dark-factory',
+            'source': 'startup',
+        },
+        env,
+        root=tmp_path,
+    )
+
+    assert len(calls) == 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.RUNNING
+    assert record.claude_session_id == 'uuid-owner'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_nested_session_start_walks_proc_at_most_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fork mirror: memoizing must not weaken the nested-inheritor guard.
+
+    Mirrors test_nested_session_start_cannot_capture_an_unbound_launching_record
+    -- the spawn record must be left unbound and LAUNCHING -- while pinning
+    that the fork path (ownership verdict, _nested_claude_liveness_pid's
+    liveness pid, and the bind-time stamp) also settles on one walk.
+    """
+    slug = 'session-cockpit-4662004'
+    _launching_record(slug, tmp_path, pid=4662004)
+    env = _owner_ppid_env(slug, 4193500)
+    # A nested claude's parent is its agent's Bash-tool shell, not the
+    # payload bash spawn-claude.sh exported.
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193776)
+    calls = _count_owning_claude_pid(monkeypatch, 4193777)
+
+    nested = {
+        'session_id': 'uuid-nested',
+        'cwd': '/home/leo/src/dark-factory',
+        'source': 'startup',
+    }
+    sh.run_session_start(nested, env, root=tmp_path)
+
+    assert len(calls) <= 1
+    spawn_record = sr.read_record(slug, root=tmp_path)
+    assert spawn_record.claude_session_id is None
+    assert spawn_record.status is sr.Status.LAUNCHING
+    forked = sr.read_record(
+        sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path
+    )
+    assert forked.claude_session_id == 'uuid-nested'
+    assert forked.parent_session_id == slug
