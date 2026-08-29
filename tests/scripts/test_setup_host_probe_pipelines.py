@@ -89,7 +89,14 @@ def _dispatch_stub_body(branches):
     return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
 
 
-def _run_probe(tmp_path, section_text, *, stub_name=None, stub_body=None, env_extra=None):
+def _run_probe(
+    tmp_path,
+    section_text,
+    *,
+    stub_name: str | None = None,
+    stub_body: str | None = None,
+    env_extra=None,
+):
     """Run *section_text* in a tmp tree, with at most one scripted PATH stub.
 
     One scaffold for every probe site: build the stub dir, write the site's
@@ -98,10 +105,16 @@ def _run_probe(tmp_path, section_text, *, stub_name=None, stub_body=None, env_ex
     a new probe site is a wrapper, not another copy of this.
 
     *stub_name* None writes no stub at all, which is how the no-`claude` host
-    is expressed.
+    is expressed. The two travel together — every site that names a stub also
+    scripts its body — so a name without a body is a harness bug. It is
+    asserted rather than defaulted to "": an empty default would quietly
+    install a stub that runs nothing and exits 0, which is a PASSING probe
+    for a producer that was never scripted, i.e. exactly the vacuous green
+    `_dispatch_stub_body` is written to avoid.
     """
     stub_bin = _stub_bin(tmp_path)
     if stub_name is not None:
+        assert stub_body is not None, f"stub_name={stub_name!r} passed without a stub_body"
         write_stub(stub_bin, stub_name, stub_body)
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
