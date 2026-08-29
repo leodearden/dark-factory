@@ -19,7 +19,7 @@ from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, reset_sweep_once_state
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -845,9 +845,18 @@ class TestProbeConfigDirLeakSweep:
     """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
 
     @pytest.fixture(autouse=True)
-    def _reset_sweep_guard(self, monkeypatch):
-        """Start every case as if this were a fresh process."""
-        monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
+    def _reset_sweep_guard(self):
+        """Start — and END — every case as if this were a fresh process.
+
+        The one-shot state moved into ``shared.config_dir`` with the sweep
+        wrapper itself, so this clears it through the hoisted test hook. Cleared
+        on the way out too, keeping the promise symmetric: the state is
+        module-global, so a case that marked the prefix and did not clear it
+        would leak into whichever test ran next.
+        """
+        reset_sweep_once_state()
+        yield
+        reset_sweep_once_state()
 
     def test_gate_construction_delegates_to_the_shared_once_helper(self):
         """The once-per-process bookkeeping lives in shared.config_dir now.
