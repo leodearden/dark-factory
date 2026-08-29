@@ -1487,6 +1487,89 @@ class EscalationQueue:
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
 
+    def declare_pin(
+        self, escalation_id: str, *, declared_by: list[str], reason: str = '',
+    ) -> Escalation | None:
+        """Declare that something outside the escalation store RELIES on this
+        record staying OPEN (task 4377).
+
+        NOT a triage-class annotation, despite the shared shape.  ``stamp_triage``
+        records that a watcher looked at a record; this CHANGES WHAT A RESOLVER
+        MAY DO to it — ``escalation/server.py::resolve_issue`` refuses every
+        non-``park`` action on a marked record (via
+        ``escalation/declared_pins.py::blocking_pin_declarations``) unless the
+        caller names its id in ``acknowledge_declared_pins``.  That is why a
+        no-op stamp here returns ``None`` rather than quietly succeeding: a
+        declarer who believes a record is protected when it is not is exactly
+        the failure this marker exists to close.
+
+        *declared_by* names WHAT relies on the record — a deviation notice, an
+        operator gate (``'task-3546-second-deviation-notice'``) — NOT who
+        stamped it.  Entries are stripped, blanks dropped, and entries already
+        present dropped, then APPENDED in declaration order.  When nothing
+        survives that normalisation (empty, all-blank, or wholly redundant)
+        this returns ``None`` and writes nothing — including when *reason* was
+        supplied, since a reason with no new declarer changes no protection.
+
+        *reason* is the free-text why, overwritten only when NON-EMPTY — the
+        asymmetric-overwrite contract ``stamp_triage`` establishes for
+        ``triage_note``, so appending a second declarer with no new prose does
+        not silently wipe the recorded rationale.
+
+        **Concurrency contract (sidecar flock).**  Serialized per-id by
+        ``escalation_id_lock``, mirroring ``stamp_triage`` /
+        ``add_members_to_l2`` / ``attach_dedupe_child``.
+
+        Loads the record directly from ``queue_dir/{escalation_id}.json``
+        (queue root ONLY) — deliberately NOT ``self.get()``, which falls back
+        to the archive.  Declaring a dependency on an already-closed record is
+        meaningless, and loading via the archive fallback followed by
+        ``_rewrite`` (which always targets the queue root) would RESURRECT an
+        archived record into the pending pile — the Defect-2 class of bug that
+        motivated task 1498's ``add_members_to_l2`` guard.
+
+        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``.
+        ``add_members_to_l2`` remains the SOLE ``updated_at`` writer, so that
+        signal keeps meaning exactly one thing ("real member append"); the
+        protection here is the loud refusal at resolve time, not a freshness
+        bump (see the task's design decision).
+
+        Returns the updated ``Escalation``, or ``None`` when *escalation_id* is
+        not found in the queue root, fails to parse, is not pending, or when
+        *declared_by* normalises to nothing new.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return None
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status != 'pending':
+                return None
+
+            existing = list(esc.pin_declared_by)
+            added: list[str] = []
+            for entry in declared_by:
+                stripped = entry.strip()
+                if stripped and stripped not in existing and stripped not in added:
+                    added.append(stripped)
+            if not added:
+                return None
+
+            esc.pin_declared_by = existing + added
+            if reason:
+                esc.pin_declared_reason = reason
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'declare_pin: %s is now declared load-bearing by %s (reason=%r)',
+                escalation_id, ', '.join(added), esc.pin_declared_reason,
+            )
+            return esc
+
     def attach_dedupe_child(
         self, parent_id: str, child_id: str, *, child_severity: str = 'info',
     ) -> Escalation | None:
