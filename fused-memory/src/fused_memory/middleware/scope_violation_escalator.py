@@ -24,8 +24,8 @@ Since task 3123 a THIRD event is reported, by
 
 * **ROUTING OVERRIDE bypass** — the caller supplied a non-blank
   ``routing_override_reason``, so BOTH outcomes above were skipped
-  entirely.  Nothing is blocked and the task IS created; the record is
-  purely an audit trail.  It exists because a bypass with no
+  entirely.  Nothing is blocked, the submission proceeds, and the record
+  is purely an audit trail.  It exists because a bypass with no
   operator-visible record is indistinguishable from no bypass at all — the
   parameter is caller-supplied over a public MCP surface, validated only as
   "non-blank after stripping", and its only prior trace was a
@@ -43,7 +43,9 @@ resolved at all, so it cannot state that a task exists.  The stamp above
 reaches a task only when one is actually CREATED from the submission — a
 candidate that is dropped, or folded into an existing task, never carries
 it (``_execute_combine`` does not propagate it to a combine target).
-Both outcomes are severity ``info`` — the FLOOR of the
+The same bound binds the override record: it is written from that same
+PHASE-1 seam, so it too reports only that nothing was blocked, never that a
+task exists.  All three records are severity ``info`` — the FLOOR of the
 ``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
 wording is what distinguishes them, not the severity.
 
@@ -603,10 +605,13 @@ class ScopeViolationEscalator:
 
         Unlike :meth:`report_rejection`, this fires on the BYPASS path: the
         caller supplied a non-blank ``routing_override_reason``, so ALL of the
-        module taxonomy's outcomes were skipped, NOTHING was blocked, and the
-        task WAS created.  The record exists so that fact is visible somewhere
-        an operator actually reads — before task 3123 the only trace was a
-        ``logger.warning``, which made a bypass operationally
+        module taxonomy's outcomes were skipped and NOTHING was blocked.  Like
+        the advisory (task 4159) this record is written from the ``submit_task``
+        PHASE-1 guard, before the submission has been resolved, so it reports
+        the BYPASS and never claims a task exists — the emitted detail says so
+        explicitly, and a test pins it.  The record exists so the bypass is
+        visible somewhere an operator actually reads — before task 3123 the
+        only trace was a ``logger.warning``, which made a bypass operationally
         indistinguishable from no bypass at all.
 
         *matched_paths* / *suggested_project* describe what the guard WOULD
