@@ -105,6 +105,12 @@ async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
     return tool.fn(**kwargs)
 
 
+async def _declare_pin(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('declare_pin')
+    # declare_pin is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
 async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
     tool = await server.get_tool('get_task_escalations')
     # get_task_escalations is a sync def, so tool.fn(...) returns directly
@@ -8196,3 +8202,199 @@ class TestDeclaredPinSurfacing:
         """Widening the one constant is what widens BOTH compact tools."""
         assert 'pin_declared_by' in _COMPACT_ESCALATION_FIELDS
         assert 'pin_declared_reason' not in _COMPACT_ESCALATION_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# task 4377 — the declare_pin MCP tool (the marker's writer)
+# ---------------------------------------------------------------------------
+
+
+class TestDeclarePinTool:
+    """declare_pin stamps the load-bearing marker ON the record (task 4377).
+
+    Before this tool the only way to say "something relies on this record
+    staying open" was prose somewhere else — which is exactly how esc-3371-2
+    was lost: its marker lived in a deviation notice nothing linked from, so
+    the 2026-08-08 cascade close could not see it.
+
+    In-process ``tool.fn()`` calls see empty headers, so the level-ungated
+    property is asserted here over the in-process path; the real
+    ``X-Escalation-Levels`` header path is covered by
+    ``test_capability_guard_http.py::TestTriageAnnotationUngated``, the
+    established ungated-annotation-tool precedent this tool mirrors.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _seed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str = 'esc-3371-2',
+        task_id: str = '3371',
+        level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) stamps a pending record, returning the FULL record dict ---
+
+    @pytest.mark.asyncio
+    async def test_stamps_pending_record_and_returns_full_dict(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result['pin_declared_by'] == [self.DECLARER]
+        assert result['pin_declared_reason'] == self.REASON
+        # Full record dict, mirroring stamp_triage's return shape — not a
+        # projection: a caller gets the whole record back, unchanged elsewhere.
+        assert result['id'] == esc.id
+        assert result['status'] == 'pending'
+        assert result['level'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stamp_is_visible_on_disk(self, tmp_path: Path):
+        """The write went through queue._rewrite, not just the returned copy."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.pin_declared_by == [self.DECLARER]
+        assert refreshed.pin_declared_reason == self.REASON
+
+    # --- (b) an empty/all-blank declared_by is a LOUD failure, not a no-op ---
+
+    @pytest.mark.asyncio
+    async def test_empty_declared_by_is_refused_with_a_typed_code(self, tmp_path: Path):
+        """A silent no-op stamp would leave the declarer believing the record is
+        protected when it is not — the exact failure class this task closes."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(server, escalation_id=esc.id, declared_by=[])
+
+        assert result.get('code') == 'empty_declared_by', result
+        assert 'error' in result
+
+    @pytest.mark.asyncio
+    async def test_all_blank_declared_by_is_refused_with_a_typed_code(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=['', '   ', '\t'], reason=self.REASON,
+        )
+
+        assert result.get('code') == 'empty_declared_by', result
+
+    @pytest.mark.asyncio
+    async def test_empty_declared_by_changes_nothing_on_the_record(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=['  '], reason=self.REASON,
+        )
+
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.pin_declared_by == []
+        assert refreshed.pin_declared_reason == ''
+
+    # --- (c) unknown / archived ids error rather than raising or resurrecting ---
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_returns_error_naming_the_id(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _declare_pin(
+            server, escalation_id='esc-does-not-exist', declared_by=[self.DECLARER],
+        )
+
+        assert 'error' in result, f'Expected error dict, got: {result}'
+        assert 'esc-does-not-exist' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_resolved_id_returns_error_and_is_not_resurrected(self, tmp_path: Path):
+        """Declaring a dependency on a closed record is meaningless — and must
+        never re-materialise it in the queue root (the Defect-2 class of bug)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        queue.resolve(esc.id, 'Fixed')
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' in result, f'Expected error dict, got: {result}'
+        assert esc.id in result['error']
+        assert not (queue.queue_dir / f'{esc.id}.json').exists()
+
+    # --- (d) END-TO-END: the writer and the guard share one field ---
+
+    @pytest.mark.asyncio
+    async def test_declared_record_is_then_refused_by_resolve_issue(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert result['declared_pins'] == [
+            {
+                'escalation_id': esc.id,
+                'declared_by': [self.DECLARER],
+                'reason': self.REASON,
+            }
+        ]
+
+    # --- (e) NOT level-gated (stamp_triage's stated reason) ---
+
+    @pytest.mark.asyncio
+    async def test_an_l2_record_can_be_stamped(self, tmp_path: Path):
+        """A declaration is restrictive-only — it can never widen what a
+        connection may do — so gating it would let a level-capped connection
+        observe a pin it is forbidden to declare."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue, esc_id='esc-3105-3', task_id='3105', level=2)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result['level'] == 2
+        assert result['pin_declared_by'] == [self.DECLARER]
