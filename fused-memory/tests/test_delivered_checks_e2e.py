@@ -808,3 +808,168 @@ class TestMalformedSidecar:
             f"a malformed capability must not stamp metadata.delivered_checks; "
             f"got {producer_task['metadata']!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestPolarityRefusal — task 3500: the full authoring-time arc, per mode
+#
+# The task's originating incident, end to end. Task 5799 authored
+# `expect=present` checks for a pattern its own diff was scoped to REMOVE; the
+# pattern was therefore necessarily present when the check was written, the
+# check passed on day one, and 5919 sat behind a gate that measured nothing.
+# The arc asserted here is that such a descriptor never reaches the producer's
+# metadata at all: the stamper refuses to copy it, names it in the report, and
+# the dependent is consequently never gated on an unsatisfiable capability.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INVERTED_PRD_PATH = 'plans/e2e-inverted-fixture-prd.md'
+#: Landed on main BEFORE planning, so an `expect=present` grep for it is
+#: already green at the authoring tree — the 5799 shape.
+_ALREADY_LANDED_TOKEN = 'ALREADY_LANDED_TOKEN_V1'
+
+_FILENAME_PRD_PATH = 'plans/e2e-filename-fixture-prd.md'
+#: A tracked path whose CONTENTS never mention its own name — the measured
+#: task-3536 specimen (`test_workflow_merge_gating_strand`), MODE 3.
+_FILENAME_ONLY_REL = 'src/zeta_gate_strand.py'
+_FILENAME_ONLY_PATTERN = 'zeta_gate_strand'
+
+
+class TestPolarityRefusal:
+    """Rows for task 3500: an unsound descriptor is refused at authoring time.
+
+    Each test files a real planning batch through the product's own
+    ``submit_task(planning_mode=True)`` + ``commit_planning`` path against a
+    real git repo, so the verdict is reached the same way the runtime gate
+    would reach it — the parity contract in
+    ``shared.delivered_check_polarity``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inverted_polarity_capability_is_refused(self, backend_stack):
+        """MODE 1: an already-green `expect=present` check never reaches metadata."""
+        server, _interceptor, project_root = backend_stack
+
+        # Land the token on main FIRST — this is what makes the descriptor
+        # vacuous, and it is exactly the state a removal-scoped task is in
+        # when its author writes an expect=present check for the thing being
+        # removed.
+        _commit_capability(project_root, _MARKER_REL_PATH, _ALREADY_LANDED_TOKEN)
+
+        _write_sidecar(
+            project_root,
+            prd_path=_INVERTED_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name='inverted_cap',
+            pattern=_ALREADY_LANDED_TOKEN,
+            paths=[_MARKER_REL_PATH],
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_INVERTED_PRD_PATH,
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        # The refusal is named, with the diagnosis code a reader can act on.
+        errors = result['manifest_stamping']['errors']
+        joined = ' '.join(errors)
+        assert 'inverted_cap' in joined, f'got {errors!r}'
+        assert 'vacuous_present' in joined, f'got {errors!r}'
+
+        # The stamp itself survives — a descriptor defect does not invalidate
+        # the decompose session's record of which task owns the label.
+        assert result['manifest_stamping']['stamped'] == [_PRODUCER_LABEL]
+
+        # THE POINT: the unsatisfiable check never reached the producer, so
+        # the dependent is not gated on it.
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f"a refused check must never be persisted; got "
+            f"{producer_task['metadata']!r}"
+        )
+        assert producer_task['status'] == 'pending'
+        dependent_task = await _get_task(server, project_root, dependent_id)
+        assert dependent_task['status'] == 'pending'
+
+    @pytest.mark.asyncio
+    async def test_filename_shaped_capability_is_refused(self, backend_stack):
+        """MODE 3: a pattern naming a tracked FILE, not a symbol inside one."""
+        server, _interceptor, project_root = backend_stack
+
+        target = project_root / _FILENAME_ONLY_REL
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Contents deliberately never mention the module's own name — which is
+        # exactly why a grep for that name can never go green.
+        target.write_text('def run():\n    return None\n', encoding='utf-8')
+        _run_git(project_root, 'add', _FILENAME_ONLY_REL)
+        _run_git(project_root, 'commit', '-m', 'add a strand module')
+
+        _write_sidecar(
+            project_root,
+            prd_path=_FILENAME_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name='filename_cap',
+            pattern=_FILENAME_ONLY_PATTERN,
+            paths=[],
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_FILENAME_PRD_PATH,
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        errors = result['manifest_stamping']['errors']
+        joined = ' '.join(errors)
+        assert 'filename_cap' in joined, f'got {errors!r}'
+        assert 'filename_shaped' in joined, f'got {errors!r}'
+
+        producer_task = await _get_task(server, project_root, producer_id)
+        assert 'delivered_checks' not in producer_task['metadata'], (
+            f"a refused check must never be persisted; got "
+            f"{producer_task['metadata']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_forward_looking_capability_keeps_the_exact_legacy_report(
+        self, backend_stack,
+    ):
+        """Control: the ordinary forward-looking capability is copied unchanged.
+
+        This is the majority case and the headline's own shape — the gate must
+        be completely invisible on it, including leaving the stamping report's
+        exact four-key shape (asserted verbatim at line 435) untouched.
+        """
+        server, _interceptor, project_root = backend_stack
+
+        _write_sidecar(
+            project_root,
+            prd_path=_PRD_PATH,
+            label=_PRODUCER_LABEL,
+            capability_name=_CAPABILITY_NAME,
+            pattern=_CAPABILITY_TOKEN,
+            paths=[_MARKER_REL_PATH],
+        )
+        producer_id, dependent_id = await _file_planning_batch(
+            server, project_root, prd_path=_PRD_PATH,
+        )
+
+        result = await _commit_planning(
+            server, project_root, [producer_id, dependent_id],
+        )
+
+        expected_sidecar_rel = re.sub(r'\.md$', '', _PRD_PATH) + '.capability-manifest.yaml'
+        assert result['manifest_stamping'] == {
+            'path': expected_sidecar_rel,
+            'stamped': [_PRODUCER_LABEL],
+            'missing_labels': [],
+            'errors': [],
+        }
+        assert 'delivered_check_warnings' not in result
+
+        producer_task = await _get_task(server, project_root, producer_id)
+        checks = producer_task['metadata']['delivered_checks']
+        assert [c['name'] for c in checks] == [_CAPABILITY_NAME]
+        assert checks[0]['pattern'] == _CAPABILITY_TOKEN
