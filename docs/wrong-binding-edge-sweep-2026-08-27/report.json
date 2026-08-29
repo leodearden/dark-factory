@@ -1,33 +1,36 @@
 {
-  "swept_at": "2026-08-27T06:51:37.767043+00:00",
+  "swept_at": "2026-08-29T21:00:05.089029+00:00",
   "graphs": [
     "dark_factory",
     "reify"
   ],
-  "scanned": 26674,
-  "population": 6961,
-  "unverifiable": 305,
+  "scanned": 27012,
+  "population": 7048,
+  "unverifiable": 311,
   "summary": {
-    "findings": 181,
-    "rate": 0.026002011205286595,
+    "findings": 192,
+    "rate": 0.02724177071509648,
     "by_graph": {
-      "dark_factory": 76,
+      "dark_factory": 87,
       "reify": 105
     },
     "by_end": {
-      "object": 73,
-      "subject": 108
+      "object": 72,
+      "subject": 120
     },
     "by_proximity": {
-      "one_digit_diff": 97,
+      "not_computed": 0,
+      "one_digit_diff": 106,
       "prefix": 8,
       "similar": 0,
-      "unrelated": 76
+      "unrelated": 78
     },
     "correct_node_present": {
-      "false": 70,
-      "true": 111
+      "false": 79,
+      "not_computed": 0,
+      "true": 113
     },
+    "suppressed_by_bare_id": 47,
     "families": [
       {
         "graph": "dark_factory",
@@ -80,11 +83,33 @@
       },
       {
         "graph": "dark_factory",
+        "node_name": "Task 3513",
+        "findings": 4,
+        "edge_uuids": [
+          "2394fc2f-c005-4811-8cee-0f581ab14400",
+          "310a4da8-b325-4b43-826b-42286ff8fc2a",
+          "b3d1dbcc-91e3-4ec9-b1a2-e60360b52f28",
+          "ea328e61-d2eb-483e-b7ea-8ad12a2053fd"
+        ]
+      },
+      {
+        "graph": "dark_factory",
         "node_name": "Task 3729",
         "findings": 2,
         "edge_uuids": [
           "73b42fd2-6de8-4ee9-aa32-62cb172bd722",
           "f85d19f9-239b-45fa-a04a-ebc5c617fb56"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 3786",
+        "findings": 4,
+        "edge_uuids": [
+          "18c54e40-b3c3-43eb-8e29-ca9a3d03ef9e",
+          "8d2db99b-d564-411e-8966-1834637a0ebb",
+          "985452a2-58e4-432a-977d-35e0bfacb014",
+          "9de1c8b3-4453-4edc-a3c7-7607e84c7cf4"
         ]
       },
       {
@@ -106,6 +131,16 @@
           "44c9a2d0-492d-4ce7-aa82-3ab9f1511d1f",
           "7d954b0e-96d5-4ba8-8e3d-f77865853f72",
           "e7757b46-a48a-4b56-b947-02e1aaf5deae"
+        ]
+      },
+      {
+        "graph": "dark_factory",
+        "node_name": "Task 4375",
+        "findings": 3,
+        "edge_uuids": [
+          "06e7b2cd-5a03-464c-98bf-c1d34b584f56",
+          "198134eb-9262-494e-86b0-08abd8a2f9f9",
+          "e80efcc4-2659-4fc5-b831-ee68cf962f56"
         ]
       },
       {
@@ -179,11 +214,10 @@
       {
         "graph": "reify",
         "node_name": "Task 5633",
-        "findings": 5,
+        "findings": 4,
         "edge_uuids": [
           "22beeeed-ef7b-4971-aec2-821fc0df3e25",
           "3eb80b01-ec5c-4879-93ff-6018006f8444",
-          "5ae2c86c-a22c-4229-938d-31b75e81e1af",
           "7a913250-ef6a-469d-9dd6-dc46df41e70a",
           "9a6102bf-6d00-4455-aa52-7b24226f6063"
         ]
@@ -340,6 +374,7 @@
   "caveats": [
     "CANDIDATES, NOT VERDICTS: every finding is a candidate for HUMAN adjudication. Some are legitimate cross-task relations that merely hang off a task-shaped node \u2014 e.g. \"BOOKMARK task 4043 tracks the ... work surfaced by esc-3437-13\" on node \"task 3443\". Auto-reassigning on a regex verdict is exactly what this task's scope note forbids, and this script has no path to do it.",
     "DETECTION BOUND, RECALL: endpoints and facts are read with the SHARED vocabulary in fused_memory.utils.canonical_labels, which is documented precision-over-recall. A node named with bare digits, a reference made by task TITLE, an alias/codename, and a hard-wrapped qualified ref are all invisible by design. The rate reported here is therefore a LOWER BOUND on Class A.",
+    "DETECTION BOUND, SUPPRESSION: an endpoint whose bare digits appear as a standalone run in the fact is treated as NAMED and never flagged \u2014 the backstop absorbing the shared scanner's \"#4262\" and \"task-1836\" blind spots. Digit runs joined to another digit run by -:./ are excluded, so an ISO timestamp (\"2026-05-09T17:09\") no longer suppresses an endpoint \"Task 2026\" or \"Task 17\". The check is still CONTEXT-FREE by design (requiring a preceding \"task\"/\"#\" would be a second vocabulary), so a bare COUNT in a fact \u2014 \"192 flags\" \u2014 does suppress an endpoint \"Task 192\". summary.suppressed_by_bare_id counts every suppression, so the size of this bound is measured rather than assumed. It is the SECOND reason the rate here is a LOWER BOUND.",
     "DENOMINATOR: \"rate\" divides by \"population\" \u2014 edges with at least one task-shaped endpoint AND at least one task id named in the fact. Edges whose fact names no task id are UNVERIFIABLE, not clean, and are counted separately; they are never folded into the denominator and never summed with the findings.",
     "COVERAGE, CLASS: this sweep covers ONE sub-class \u2014 an endpoint the fact does not name. See known_gaps for the two it provably does not cover.",
     "LIVE CORPUS: both graphs are written to continuously, so every count here is a snapshot at swept_at, not a fixed population."
@@ -924,6 +959,24 @@
       "correct_node_present": false
     },
     {
+      "edge_uuid": "d951eb5b-5166-4db5-afb2-e00648ee6b64",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 2979",
+      "node_task_id": "2979",
+      "node_referent": "Task 2979",
+      "fact_referents": [
+        "Task 4818"
+      ],
+      "fact": "Task 4818 includes the three-way get_memory_by_id contract as part of its filing.",
+      "episodes": [
+        "e5320ae8-298f-4ac2-b819-a8a60a692183"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "4818",
+      "correct_node_present": true
+    },
+    {
       "edge_uuid": "6464ee7b-405f-4e63-a867-f0ed0b701b37",
       "graph": "dark_factory",
       "end": "subject",
@@ -958,24 +1011,6 @@
       "proximity": "one_digit_diff",
       "nearest_id": "3067",
       "correct_node_present": false
-    },
-    {
-      "edge_uuid": "f60f403a-8905-4402-adcc-05efcb5d3dc3",
-      "graph": "dark_factory",
-      "end": "object",
-      "node_name": "Task 3074",
-      "node_task_id": "3074",
-      "node_referent": "Task 3074",
-      "fact_referents": [
-        "Task 3075"
-      ],
-      "fact": "Task 3075's design implication is that any subprocess timeout on lane_protect_glob must be sized against the loaded figure, not the plan's figure.",
-      "episodes": [
-        "8562760e-cf33-4f9d-be2e-f5f4b6d653b9"
-      ],
-      "proximity": "one_digit_diff",
-      "nearest_id": "3075",
-      "correct_node_present": true
     },
     {
       "edge_uuid": "2b29bd0f-3a10-42e3-b284-f9abd4e06503",
@@ -1215,6 +1250,78 @@
       "correct_node_present": true
     },
     {
+      "edge_uuid": "2394fc2f-c005-4811-8cee-0f581ab14400",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3513",
+      "node_task_id": "3513",
+      "node_referent": "Task 3513",
+      "fact_referents": [
+        "Task 3517"
+      ],
+      "fact": "The action='restart' was triggered for task 3517 as it was blocked with no live workflow.",
+      "episodes": [
+        "80ddcb15-3058-4f73-beac-9b4e90e2f2f4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3517",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "310a4da8-b325-4b43-826b-42286ff8fc2a",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3513",
+      "node_task_id": "3513",
+      "node_referent": "Task 3513",
+      "fact_referents": [
+        "Task 3517"
+      ],
+      "fact": "The rebase-merge for task 3517 is gone after the abort.",
+      "episodes": [
+        "80ddcb15-3058-4f73-beac-9b4e90e2f2f4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3517",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "b3d1dbcc-91e3-4ec9-b1a2-e60360b52f28",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3513",
+      "node_task_id": "3513",
+      "node_referent": "Task 3513",
+      "fact_referents": [
+        "Task 3517"
+      ],
+      "fact": "Task 3517 was changed to pending for re-dispatch onto the clean branch.",
+      "episodes": [
+        "80ddcb15-3058-4f73-beac-9b4e90e2f2f4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3517",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "ea328e61-d2eb-483e-b7ea-8ad12a2053fd",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3513",
+      "node_task_id": "3513",
+      "node_referent": "Task 3513",
+      "fact_referents": [
+        "Task 3517"
+      ],
+      "fact": "Task 3517 is 23 commits ahead of main after the abort.",
+      "episodes": [
+        "80ddcb15-3058-4f73-beac-9b4e90e2f2f4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3517",
+      "correct_node_present": false
+    },
+    {
       "edge_uuid": "1f2ceb0e-930b-4601-a7cf-bff27a3b92ca",
       "graph": "dark_factory",
       "end": "object",
@@ -1378,6 +1485,80 @@
       "correct_node_present": true
     },
     {
+      "edge_uuid": "18c54e40-b3c3-43eb-8e29-ca9a3d03ef9e",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3786",
+      "node_task_id": "3786",
+      "node_referent": "Task 3786",
+      "fact_referents": [
+        "Task 3780",
+        "Task 4533"
+      ],
+      "fact": "Task 3780 was restored and re-filed as task 4533 after reversing a curator combine.",
+      "episodes": [
+        "be92ec29-4fc9-4499-935d-4fd6de3a9261"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3780",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "8d2db99b-d564-411e-8966-1834637a0ebb",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3786",
+      "node_task_id": "3786",
+      "node_referent": "Task 3786",
+      "fact_referents": [
+        "Task 3780"
+      ],
+      "fact": "Task 3780 carries a reblock_guard and a stranded-blocked history.",
+      "episodes": [
+        "be92ec29-4fc9-4499-935d-4fd6de3a9261"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3780",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "985452a2-58e4-432a-977d-35e0bfacb014",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3786",
+      "node_task_id": "3786",
+      "node_referent": "Task 3786",
+      "fact_referents": [
+        "Task 3777",
+        "Task 3780"
+      ],
+      "fact": "Task 3780 has a GAP B blocked behind task 3777.",
+      "episodes": [
+        "be92ec29-4fc9-4499-935d-4fd6de3a9261"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3780",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "9de1c8b3-4453-4edc-a3c7-7607e84c7cf4",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 3786",
+      "node_task_id": "3786",
+      "node_referent": "Task 3786",
+      "fact_referents": [
+        "Task 3780"
+      ],
+      "fact": "Task 3780 was submitted by the curator.",
+      "episodes": [
+        "be92ec29-4fc9-4499-935d-4fd6de3a9261"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "3780",
+      "correct_node_present": false
+    },
+    {
       "edge_uuid": "b8fabad7-42d3-4596-af13-666e697a8f8b",
       "graph": "dark_factory",
       "end": "object",
@@ -1520,6 +1701,60 @@
       ],
       "proximity": "one_digit_diff",
       "nearest_id": "4202",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "06e7b2cd-5a03-464c-98bf-c1d34b584f56",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4375",
+      "node_task_id": "4375",
+      "node_referent": "Task 4375",
+      "fact_referents": [
+        "Task 4374"
+      ],
+      "fact": "Task 4374 incorrectly asserts that the sweep applies to both _FLAG_FOR_STAGE2_ENUM_FILTERS and _FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS.",
+      "episodes": [
+        "0bbe4025-05e0-432f-be7f-d39e1a17cab4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4374",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "198134eb-9262-494e-86b0-08abd8a2f9f9",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4375",
+      "node_task_id": "4375",
+      "node_referent": "Task 4375",
+      "fact_referents": [
+        "Task 4374"
+      ],
+      "fact": "Task 4374 aims to shorten the maximum age for the flag_for_stage2 from 14 to 7 days.",
+      "episodes": [
+        "0bbe4025-05e0-432f-be7f-d39e1a17cab4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4374",
+      "correct_node_present": false
+    },
+    {
+      "edge_uuid": "e80efcc4-2659-4fc5-b831-ee68cf962f56",
+      "graph": "dark_factory",
+      "end": "subject",
+      "node_name": "Task 4375",
+      "node_task_id": "4375",
+      "node_referent": "Task 4375",
+      "fact_referents": [
+        "Task 4374"
+      ],
+      "fact": "Task 4374's change would affect the flag_for_stage2 GC sweep, which currently has no kind discriminator.",
+      "episodes": [
+        "0bbe4025-05e0-432f-be7f-d39e1a17cab4"
+      ],
+      "proximity": "one_digit_diff",
+      "nearest_id": "4374",
       "correct_node_present": false
     },
     {
@@ -3079,6 +3314,24 @@
       "correct_node_present": true
     },
     {
+      "edge_uuid": "b7435956-85ba-4eb6-b8ac-9dc4b40f4ce9",
+      "graph": "reify",
+      "end": "subject",
+      "node_name": "Task 4666",
+      "node_task_id": "4666",
+      "node_referent": "Task 4666",
+      "fact_referents": [
+        "Task 6554"
+      ],
+      "fact": "Case 4666/4400 is a live architectural contradiction, while task 6554 is a single task with open questions downstream of unlanded work.",
+      "episodes": [
+        "2f9b3850-83e7-47f1-8fbe-734acd05b80b"
+      ],
+      "proximity": "unrelated",
+      "nearest_id": "6554",
+      "correct_node_present": true
+    },
+    {
       "edge_uuid": "10379740-90a8-475e-a821-b66c51dc21e3",
       "graph": "reify",
       "end": "subject",
@@ -3386,24 +3639,6 @@
       "correct_node_present": false
     },
     {
-      "edge_uuid": "5ae2c86c-a22c-4229-938d-31b75e81e1af",
-      "graph": "reify",
-      "end": "subject",
-      "node_name": "Task 5633",
-      "node_task_id": "5633",
-      "node_referent": "Task 5633",
-      "fact_referents": [
-        "Task 5632"
-      ],
-      "fact": "Task 5632 was authorized by Leo.",
-      "episodes": [
-        "d1ec88b9-bc5d-4ab0-89c6-2202b6b41d0f"
-      ],
-      "proximity": "one_digit_diff",
-      "nearest_id": "5632",
-      "correct_node_present": false
-    },
-    {
       "edge_uuid": "7a913250-ef6a-469d-9dd6-dc46df41e70a",
       "graph": "reify",
       "end": "subject",
@@ -3528,7 +3763,7 @@
       ],
       "proximity": "one_digit_diff",
       "nearest_id": "6126",
-      "correct_node_present": false
+      "correct_node_present": true
     },
     {
       "edge_uuid": "317da2e2-39f0-499b-8b45-a02d9aed029a",
