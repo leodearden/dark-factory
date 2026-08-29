@@ -1829,9 +1829,15 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py',
 })
 
-# A Rule C debt file with a budget small enough to drive at-budget / over-budget
-# behaviour with a handful of synthetic sources.
+# A Rule C debt file with a budget of exactly 1, so at-budget / over-budget
+# arithmetic can be driven with a handful of single-violation synthetic sources.
 _RULE_C_DEBT_FILE = 'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py'
+
+# A Rule C debt file with a budget of exactly 2, used by the FILENAME-MATCHING tests
+# so they can drive the two-violation source and still be at budget. Those tests are
+# about which paths resolve to a budget, not about the arithmetic once one is found —
+# a budget-1 entry would report a 1-violation overrun and mask what they measure.
+_RULE_C_DEBT_FILE_BUDGET_2 = 'orchestrator/tests/test_merge_guard_pipeline.py'
 
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
 # so N copies produce N violations and the arithmetic in the budget tests is exact.
@@ -1882,9 +1888,17 @@ class TestWallClockDeadlineDebtBaseline:
             'zero and must FAIL the gate on a regression, not be grandfathered'
         )
 
+    def test_the_budget_2_fixture_still_has_a_budget_of_2(self):
+        """The filename-matching tests assume it; pin it so a later shrink is loud."""
+        budget = _checker._WALL_CLOCK_DEADLINE_DEBT[_RULE_C_DEBT_FILE_BUDGET_2]
+        assert budget == 2, (
+            f'the filename-matching tests drive a two-violation source against this '
+            f'entry and expect silence; got budget {budget}'
+        )
+
     def test_same_source_opposite_verdicts_by_filename(self):
         """The identical offending source is suppressed in a debt file and flagged elsewhere."""
-        assert _rule_c(_RULE_C_SOURCE, _RULE_C_DEBT_FILE) == [], (
+        assert _rule_c(_RULE_C_SOURCE, _RULE_C_DEBT_FILE_BUDGET_2) == [], (
             'Rule C must be suppressed in a debt-listed file'
         )
         flagged = _rule_c(_RULE_C_SOURCE, _NON_DEBT_FILE)
@@ -1899,14 +1913,14 @@ class TestWallClockDeadlineDebtBaseline:
         The nine call sites pass repo-relative paths; pytest passes absolutes. Both
         must reach the same verdict or the baseline would be invisible to one caller.
         """
-        absolute = str(_REPO_ROOT / _RULE_C_DEBT_FILE)
+        absolute = str(_REPO_ROOT / _RULE_C_DEBT_FILE_BUDGET_2)
         assert _rule_c(_RULE_C_SOURCE, absolute) == [], (
             f'an absolute path to a debt file must be suppressed; filename={absolute!r}'
         )
 
     def test_matching_is_path_component_aware_not_substring(self):
         """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
-        assert _rule_c(_RULE_C_SOURCE, 'evil/' + _RULE_C_DEBT_FILE) == [], (
+        assert _rule_c(_RULE_C_SOURCE, 'evil/' + _RULE_C_DEBT_FILE_BUDGET_2) == [], (
             'a path whose real trailing components are a debt entry is suppressed'
         )
         not_suppressed = _rule_c(

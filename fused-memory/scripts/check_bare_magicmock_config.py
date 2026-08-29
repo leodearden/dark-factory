@@ -448,8 +448,13 @@ _DATACLASS_DOUBLE_DEBT: dict[str, int] = {
 }
 
 
-def _debt_budget(filename: str) -> int | None:
-    """Return *filename*'s Rule B debt budget, or None if it is not a debt file.
+def _debt_budget(filename: str, debt: dict[str, int]) -> int | None:
+    """Return *filename*'s budget in the *debt* mapping, or None if it is not listed.
+
+    Parameterised over the mapping rather than copied per rule (task 4246): the
+    trailing-component matching below is what makes repo-relative CLI paths and
+    absolute pytest paths reach the same verdict, and defining it once is what stops
+    the baselines drifting apart in their matching semantics.
 
     Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
     entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
@@ -464,7 +469,7 @@ def _debt_budget(filename: str) -> int | None:
     recorded — report every site" from "budget of zero".
     """
     parts = PurePosixPath(filename.replace('\\', '/')).parts
-    for entry, allowed in _DATACLASS_DOUBLE_DEBT.items():
+    for entry, allowed in debt.items():
         entry_parts = PurePosixPath(entry).parts
         if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
             return allowed
@@ -486,25 +491,33 @@ def _debt_overrun_msg(budget: int, found: int) -> str:
     )
 
 
-def _apply_debt_budget(doubles: list[Violation], budget: int | None) -> list[Violation]:
-    """Filter Rule B violations for a debt file down to just its budget overrun.
+def _apply_debt_budget(
+    found: list[Violation], budget: int | None, overrun_msg: str | None = None
+) -> list[Violation]:
+    """Filter one rule's violations for a debt file down to just its budget overrun.
+
+    *overrun_msg* is prebuilt by the caller (task 4246) rather than derived here,
+    because each rule's overrun carries its OWN remedy: telling a Rule C overrun to
+    migrate onto ``_fake_verify_result`` would send the reader down a dead end.  It
+    is only consulted on the over-budget branch, so callers may pass None when they
+    have no debt entry.
 
     - Not a debt file (*budget* is None) → every violation is reported unchanged.
     - At or under budget → silence: this is the grandfathering the baseline exists for.
     - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping all 63 sites of
-      test_merge_queue.py on someone who added one.
+      proportional to the overrun rather than dumping all 63 Rule B sites (or all
+      317 Rule C ones) of test_merge_queue.py on someone who added one.
 
     The reported sites are the last in source order.  That choice is deterministic
     rather than diagnostic — the checker cannot know which site is new — and the
     message says so explicitly.
     """
     if budget is None:
-        return doubles
-    if len(doubles) <= budget:
+        return found
+    if len(found) <= budget:
         return []
-    ordered = sorted(doubles, key=lambda v: (v.lineno, v.col_offset))
-    message = _debt_overrun_msg(budget, len(ordered))
+    ordered = sorted(found, key=lambda v: (v.lineno, v.col_offset))
+    message = overrun_msg if overrun_msg is not None else _debt_overrun_msg(budget, len(ordered))
     return [v._replace(message=message) for v in ordered[budget:]]
 
 
@@ -587,6 +600,87 @@ def _dataclass_double_violation(
         message=_dataclass_violation_msg(shape, kwargs),
     )
 
+
+# ---------------------------------------------------------------------------
+# Rule C debt baseline — SHRINK-ONLY, and CHECKED.
+#
+# path → the number of pre-existing wall-clock-deadline VIOLATIONS that file
+# carried when Rule C landed (AST census over all seven scanned tests/ directories,
+# task 4246; 618 violations across 20 files, every one under orchestrator/tests/).
+#
+# The number counts VIOLATIONS, not SITES — unlike _DATACLASS_DOUBLE_DEBT above.
+# One call can produce two: `asyncio.wait_for(req.result, timeout=25.0)` is
+# simultaneously the wrong routing (bare-wait_for) and a written number
+# (raw-literal).  The day-one split was 333 bare-wait_for + 285 raw-literal.
+#
+# Shipping the rule hot with no transition would have turned orchestrator/tests'
+# lint_command red on day one and stalled the merge lane repo-wide — the identical
+# situation Rule B faced at 95 sites/11 files, so these are grandfathered.  Rule C
+# ONLY: Rules A and B still apply in full to every file here.
+#
+# The count is a BUDGET, not a comment.  A debt file is silent while it carries at
+# most its recorded number and reports the overrun the moment it carries more, so
+# "shrink-only" is enforced on the same hot path the rule itself runs on rather than
+# trusted.  This matters most for orchestrator/tests/test_merge_queue.py: 317
+# violations in an actively-developed hub, where a wholesale grandfather would have
+# made a brand-new wall-clock wait added tomorrow invisible to the gate.
+#
+# DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
+# migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
+# A NEW file with a load-bearing wall-clock wait must FAIL the gate — that is the
+# entire reason the baseline is opt-OUT rather than opt-in.  An opt-in list would
+# exempt precisely the brand-new file this rule exists to catch, and would make
+# "which files are covered" a hand-maintained list: the exact failure mode task
+# 3980's amendment pass deleted a five-class frozenset to escape.
+#
+# orchestrator/tests/test_merge_speculation.py is deliberately NOT here.  It measures
+# ZERO because task 3980 already migrated it, and even a budgeted entry of zero would
+# be a blanket suppression letting a regression land there silently — which is what
+# 3980 spent a task removing, and what makes it safe for task 4246 to delete that
+# module's file-local copy of this guard.
+_WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
+    'orchestrator/tests/test_merge_queue.py': 317,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 90,
+    'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
+    'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,
+    'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 18,
+    'orchestrator/tests/test_merge_queue_equivalence.py': 12,
+    'orchestrator/tests/test_merge_queue_restart_hook.py': 12,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 8,
+    'orchestrator/tests/test_merge_queue_coalesce.py': 8,
+    'orchestrator/tests/test_merge_queue_persistent_worktree.py': 6,
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 4,
+    'orchestrator/tests/test_merge_guard_pipeline.py': 2,
+    'orchestrator/tests/test_merge_queue_supervisor.py': 2,
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 2,
+    'orchestrator/tests/test_merge_queue_warm_cold_shadow.py': 2,
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py': 1,
+}
+
+
+def _wall_clock_overrun_msg(budget: int, found: int) -> str:
+    """Build the message for a Rule C debt file that has grown past its budget.
+
+    Carries Rule C's OWN remedy, never Rule B's: a wall-clock deadline is not fixed
+    by speccing a double, so offering ``_fake_verify_result`` here would send the
+    reader down a dead end.
+    """
+    return (
+        'this file is on the SHRINK-ONLY wall-clock-deadline debt baseline with a'
+        f' recorded budget of {budget} violation(s), but {found} were found —'
+        f' {found - budget} over budget. The baseline may only shrink.'
+        ' The reported sites are simply the LAST in source order: the anchor is'
+        ' positional and is NOT a claim that these exact sites are the new ones.'
+        ' Fix by migrating a load-bearing wait in this file onto wait_responsive(...)'
+        ' with a descriptive label=, or by deriving its bound from'
+        ' MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
+        ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
+        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+    )
 
 # ---------------------------------------------------------------------------
 # Rule C — wall-clock-deadline
@@ -830,11 +924,13 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up once
     # per file, not per node.
     dataclass_doubles: list[Violation] = []
-    debt_budget = _debt_budget(filename)
+    debt_budget = _debt_budget(filename, _DATACLASS_DOUBLE_DEBT)
 
     # Rule C violations are collected separately for the same reason, and against
-    # their own independent baseline (task 4246).
+    # their own independent baseline (task 4246).  Both budgets are looked up ONCE
+    # per file, not per node.
     wall_clock: list[Violation] = []
+    wall_clock_budget = _debt_budget(filename, _WALL_CLOCK_DEADLINE_DEBT)
 
     # ONE walk, ALL THREE rules.  Rule B was originally a second full ast.walk over the
     # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
@@ -910,11 +1006,27 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 )
             )
 
-    # Rule B's per-file debt budget is applied to the collected COUNT, not to
-    # individual sites: a grandfathered file stays silent while it does not grow,
-    # and reports exactly its overrun once it does.
-    violations.extend(_apply_debt_budget(dataclass_doubles, debt_budget))
-    violations.extend(wall_clock)
+    # Each rule's per-file debt budget is applied to its own collected COUNT, not to
+    # individual sites: a grandfathered file stays silent while it does not grow, and
+    # reports exactly its overrun once it does.  The overrun MESSAGE is built by the
+    # caller because each rule's remedy differs — Rule B's is _fake_verify_result,
+    # Rule C's is wait_responsive / MERGE_RESULT_TIMEOUT.
+    violations.extend(
+        _apply_debt_budget(
+            dataclass_doubles,
+            debt_budget,
+            None if debt_budget is None else _debt_overrun_msg(debt_budget, len(dataclass_doubles)),
+        )
+    )
+    violations.extend(
+        _apply_debt_budget(
+            wall_clock,
+            wall_clock_budget,
+            None
+            if wall_clock_budget is None
+            else _wall_clock_overrun_msg(wall_clock_budget, len(wall_clock)),
+        )
+    )
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
