@@ -2229,3 +2229,113 @@ class TestRuleCCoversMergeSpeculation:
         # The same verdict holds for a synthetic module carrying only the counter-example.
         assert len(_rule_c(_COUNTER_EXAMPLE_CLASS, _MERGE_SPECULATION)) == 2
         assert _rule_c(source, _MERGE_SPECULATION) == []
+
+
+# The Rule B counter-example: a VerifyResult-shaped double with the `passed` anchor
+# plus two more field matches, which is what _matching_shape requires.
+_RULE_B_COUNTER_EXAMPLE = (
+    '\n\n'
+    'class TestSomeBrandNewDoubleCase:\n'
+    '    def test_new_case(self):\n'
+    "        return MagicMock(passed=False, summary='x', verify_skipped=False)\n"
+)
+
+
+class TestRuleBCoversMergeSpeculation:
+    """Two-sided proof that Rule B already covers test_merge_speculation.py.
+
+    The PRECONDITION for deleting that module's file-local
+    `_BARE_DOUBLE_EXEMPT_SCOPES` / `_bare_verify_result_double_offenders` /
+    `TestNoBareVerifyResultDoubles` (task 3980), superseded by Rule B (task 4016).
+
+    MEASURED COVERAGE DELTA THE DELETION ACCEPTS — recorded here so a later reader
+    does not mistake the narrowing for an oversight. The two rules disagree in BOTH
+    directions:
+
+      * Rule B is STRICTER on ``MagicMock(spec=None)`` and on positional-arg specs.
+        ``_is_specced`` treats a literal ``None`` spec as no spec at all (it defeats
+        the rule's intent) and treats any concrete positional as a spec (MagicMock's
+        first positional IS spec). The file-local guard exempted anything carrying a
+        ``spec``/``spec_set`` kwarg, whatever its value.
+
+      * Rule B is NARROWER on a lone ``MagicMock(passed=True)``. It requires the
+        ``passed`` anchor PLUS at least two field matches, where the local guard
+        keyed on ``passed`` alone. That narrowing is deliberate and already argued
+        in ``_matching_shape``: the anchor by itself "would flag a stray
+        MagicMock(passed=True) on an unrelated object" across all seven scanned
+        packages. Every real site behind task 3980 carried four or more kwargs, so
+        the gap holds no measured site — and widening Rule B to close it would trade
+        a documented false negative for undocumented false positives repo-wide.
+    """
+
+    def test_the_module_is_clean_today(self):
+        """(a) Zero Rule B violations: the one deliberate site's pragma does the whole job.
+
+        This is what the deleted _BARE_DOUBLE_EXEMPT_SCOPES frozenset used to do,
+        now carried per-site by `# noqa: bare-dataclass-double` instead.
+        """
+        source = _merge_speculation_source()
+        violations = [
+            v
+            for v in find_violations(source, _MERGE_SPECULATION)
+            if '_fake_verify_result' in v.message
+        ]
+        assert violations == [], (
+            'test_merge_speculation.py must be Rule-B clean. Offenders:\n  '
+            + '\n  '.join(f'{v.lineno}: {v.message}' for v in violations)
+        )
+
+    def test_the_counter_example_flags_under_that_exact_filename(self):
+        """(b) The module is IN SCOPE, not grandfathered onto _DATACLASS_DOUBLE_DEBT."""
+        source = _merge_speculation_source() + _RULE_B_COUNTER_EXAMPLE
+        violations = [
+            v
+            for v in find_violations(source, _MERGE_SPECULATION)
+            if '_fake_verify_result' in v.message
+        ]
+        assert len(violations) == 1, (
+            'a new bare VerifyResult-shaped double must flag under '
+            f'{_MERGE_SPECULATION}; got {violations!r}. If this is empty, the module '
+            'has been grandfathered and its file-local guard must NOT be deleted.'
+        )
+
+    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self):
+        """(c) The exemption is the PRAGMA, not an accident of shape matching.
+
+        Without this, leg (a) is also satisfied by a deliberate site that Rule B
+        simply cannot see — in which case deleting the local guard would silently
+        drop coverage rather than transfer it.
+        """
+        source = _merge_speculation_source()
+        stripped = '\n'.join(
+            line
+            for line in source.splitlines()
+            if 'noqa: bare-dataclass-double —' not in line
+        )
+        assert stripped != source, (
+            'expected a `# noqa: bare-dataclass-double — <reason>` pragma in the '
+            'module; if it is gone, this proof no longer means anything'
+        )
+        violations = [
+            v
+            for v in find_violations(stripped, _MERGE_SPECULATION)
+            if '_fake_verify_result' in v.message
+        ]
+        assert len(violations) == 1, (
+            'with its pragma removed, the deliberate mutation site must flag — that '
+            f'is what proves Rule B sees it at all; got {violations!r}'
+        )
+
+    def test_the_documented_narrowing_is_real_and_deliberate(self):
+        """Pins the accepted delta in BOTH directions, so it stays a decision not a surprise."""
+        # NARROWER: the anchor alone is not enough (needs >= 2 field matches).
+        assert find_violations('m = MagicMock(passed=True)\n', _NON_DEBT_FILE) == [], (
+            'a lone MagicMock(passed=True) is deliberately NOT a Rule B match — the '
+            'anchor alone would flag stray unrelated objects repo-wide'
+        )
+        # STRICTER: spec=None does not exempt, where the file-local guard let it through.
+        assert len(
+            find_violations(
+                "m = MagicMock(spec=None, passed=True, summary='x')\n", _NON_DEBT_FILE
+            )
+        ) == 1, 'spec=None is semantically no spec at all and must NOT exempt'
