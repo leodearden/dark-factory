@@ -897,15 +897,27 @@ def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
 
 
 def find_violations(source: str, filename: str) -> list[Violation]:
-    """Parse *source* and return violations for bare MagicMock() config assignments.
+    """Parse *source* and return every violation of ALL THREE rules.
 
-    A violation is emitted for each ``<config_name> = MagicMock()`` call that:
-      - has at least one ast.Name target whose id matches the config-name set,
-      - calls MagicMock (by name or attribute) with no spec/spec_set,
-      - is NOT preceded (on the nearest non-blank source line) by a valid exemption comment.
+    Rule A — ``bare-magicmock``: each ``<config_name> = MagicMock()`` that has at
+    least one ast.Name target whose id matches the config-name set, calls MagicMock
+    (by name or attribute) with no spec/spec_set, and is NOT preceded on the nearest
+    non-blank source line by a valid exemption comment.  For chained assignments
+    (``mock = config = MagicMock()``) each ast.Name target is evaluated independently
+    and may produce a separate Violation.
 
-    For chained assignments (``mock = config = MagicMock()``), each ast.Name target
-    is evaluated independently and may produce a separate Violation.
+    Rule B — ``bare-dataclass-double``: each unspecced ``MagicMock(...)`` in ANY
+    position whose literal kwargs match a registered ``_DATACLASS_SHAPES`` entry.
+
+    Rule C — ``wall-clock-deadline``: each load-bearing wait (a
+    ``MergeRequest.result`` future or a ``gate*.wait()`` barrier) routed through a
+    bare ``asyncio.wait_for``, and/or carrying a raw numeric ``timeout=`` literal.
+    One call can produce TWO violations — the kinds are independent.
+
+    Rules B and C additionally honour their own SHRINK-ONLY per-file debt budgets
+    (``_DATACLASS_DOUBLE_DEBT`` / ``_WALL_CLOCK_DEADLINE_DEBT``), applied to the
+    collected COUNT after the walk.  Rule A has no baseline and applies in full to
+    every file.
 
     SyntaxError in *source* → returns an empty list.
 
@@ -1034,6 +1046,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Accepts file paths and/or directories.
 
+    Runs all three rules — ``bare-magicmock``, ``bare-dataclass-double`` and
+    ``wall-clock-deadline`` — in a single AST pass per file.
+
     For directories, recursively scans for test_*.py and conftest.py files only.
     Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
 
@@ -1046,7 +1061,12 @@ def main(argv: list[str] | None = None) -> int:
     (missing explicit path or transient read failure).
     """
     parser = argparse.ArgumentParser(
-        description='Check for bare MagicMock() assignments to config-named variables in test files.'
+        description=(
+            'Test-quality lint checks over test files: bare MagicMock() assigned to '
+            'config-named variables (bare-magicmock), unspecced MagicMocks shaped like '
+            'a registered dataclass (bare-dataclass-double), and load-bearing waits '
+            'carrying a wall-clock deadline (wall-clock-deadline).'
+        )
     )
     parser.add_argument('paths', nargs='+', help='Files or directories to check')
     args = parser.parse_args(argv)
