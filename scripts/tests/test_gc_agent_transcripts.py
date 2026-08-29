@@ -902,7 +902,8 @@ def test_max_task_dirs_is_derived_from_live_archive_rate():
 
 # ---------------------------------------------------------------------------
 # step-7 (task 3621): summarize_count_cap(task_dirs, decision, now,
-# max_task_dirs) — a binding count cap is a STRUCTURED FACT, not a silent one.
+# max_task_dirs, max_age_days) — a binding count cap is a STRUCTURED FACT, not
+# a silent one.
 #
 # The count axis prunes OLDEST-FIRST, so when it binds it truncates the age
 # window from the forensic end while the sweep still reports the full
@@ -922,6 +923,7 @@ def test_max_task_dirs_is_derived_from_live_archive_rate():
 # reader keys on `bound` and never has to branch on key presence.
 COUNT_CAP_KEYS = {
     "bound",
+    "age_axis_disabled",
     "max_task_dirs",
     "pruned",
     "truncated",
@@ -934,7 +936,9 @@ def _summarize(task_dirs, *, max_age_days, max_task_dirs):
     """Classify *task_dirs* through the production select_prunable, then
     summarise the count axis over that real decision."""
     decision = select_prunable(task_dirs, NOW, max_age_days, max_task_dirs)
-    return gct.summarize_count_cap(task_dirs, decision, NOW, max_task_dirs)
+    return gct.summarize_count_cap(
+        task_dirs, decision, NOW, max_task_dirs, max_age_days
+    )
 
 
 def test_count_cap_unbound_when_nothing_was_pruned():
@@ -965,7 +969,7 @@ def test_count_cap_unbound_when_only_the_age_axis_pruned():
     decision = select_prunable(task_dirs, NOW, 90, 5)
     assert decision.reasons == {_dir("old"): "age"}  # the count axis is slack
 
-    block = gct.summarize_count_cap(task_dirs, decision, NOW, 5)
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 5, 90)
     assert block["bound"] is False
     assert block["pruned"] == 0
     assert block["truncated"] == 0
@@ -991,6 +995,43 @@ def test_count_cap_unbound_when_the_axis_is_disabled():
         assert set(block) == COUNT_CAP_KEYS
 
 
+def test_count_cap_reports_when_the_AGE_axis_is_disabled():
+    """AMENDMENT (review): under count-only retention the block SAYS so.
+
+    With ``max_age_days <= 0`` the age axis is off, so select_prunable tags
+    every count drop exactly 'count' and `bound` is True on every single sweep.
+    Design decision 1 rules that fire correct — with the age axis off the count
+    cap genuinely IS the only retention policy — so `bound` is left alone. What
+    was missing is the CONTEXT that makes it readable: there is no advertised
+    age window for the cap to have truncated, so the window-truncation claim
+    and its 'x max_age_days x rate x factor' remediation do not apply. That is
+    now a structured fact rather than something a reader has to infer from
+    `caps`, and a consumer wanting only genuine truncation reads
+    `bound and not age_axis_disabled`.
+    """
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    for disabled in (0, -1):
+        block = _summarize(task_dirs, max_age_days=disabled, max_task_dirs=1)
+
+        assert block["age_axis_disabled"] is True, disabled
+        # D1 stands: the count cap is the only policy, so it still fires.
+        assert block["bound"] is True, disabled
+        assert block["pruned"] == 2
+        assert block["truncated"] == 2
+        assert set(block) == COUNT_CAP_KEYS
+
+    # ...and the flag is keyed on the AGE cap alone: an enabled age axis reads
+    # False whether or not the count axis is the thing that bound.
+    for max_task_dirs in (1, HIGH_COUNT_CAP):
+        block = _summarize(task_dirs, max_age_days=90, max_task_dirs=max_task_dirs)
+        assert block["age_axis_disabled"] is False, max_task_dirs
+
+
 def test_count_cap_unbound_when_every_count_drop_would_have_died_of_age():
     """THE FALSE-ALARM CASE. The count axis dropped dirs, but every one is
     tagged 'age+count' — each fails the age cap independently, so the count cap
@@ -1006,7 +1047,7 @@ def test_count_cap_unbound_when_every_count_drop_would_have_died_of_age():
     decision = select_prunable(task_dirs, NOW, 90, 2)
     assert decision.reasons == {_dir("c"): "age+count", _dir("d"): "age+count"}
 
-    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2)
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2, 90)
     assert block["bound"] is False
     assert block["pruned"] == 2       # the count axis really did touch both
     assert block["truncated"] == 0    # ...but neither cost a day of window
@@ -1032,7 +1073,7 @@ def test_count_cap_bound_when_a_dir_fresh_enough_to_keep_is_dropped_by_count():
     assert decision.reasons[_dir("c")] == "count"
     assert decision.reasons[_dir("e")] == "age+count"
 
-    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2)
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2, 90)
     assert block["bound"] is True
     assert block["max_task_dirs"] == 2
     assert block["pruned"] == 3        # every dir the count axis dropped
@@ -1250,3 +1291,83 @@ def test_cli_check_still_warns_while_deleting_nothing(tmp_path):
     # does not contain that substring.
     assert "would prune" in result.stderr
     assert "would prune" not in warnings[0]
+
+
+def test_cli_count_only_retention_alarms_without_the_window_claim(tmp_path):
+    """AMENDMENT (review): with the AGE axis disabled the alarm must not claim
+    a truncated age window, nor print a remediation that evaluates to zero.
+
+    `--max-age-days 0` is a supported fail-safe config (two CLI tests above run
+    in it) under which the count cap is deliberately the only retention bound.
+    Every count drop is then tagged exactly 'count', so `bound` is True on
+    every sweep — which design decision 1 rules correct, and which this test
+    does NOT contest. What it pins is that the LINE stays true in that mode:
+    the previous single wording asserted 'the effective retention window is now
+    X days ... against max_age_days=0' (there is no such window) and told the
+    operator to 're-derive the cap as max_age_days x rate x factor' (which is
+    0 x rate x factor). Both are gone; the count-only variant reports what the
+    cap actually costs instead.
+    """
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "0",  # age axis OFF — count-only retention
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    report = json.loads(result.stdout)
+    block = report["count_cap"]
+    assert block["age_axis_disabled"] is True
+    assert block["bound"] is True           # D1: the count cap is the only policy
+    assert block["pruned"] == 3
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    alarm = warnings[0]
+
+    # Still LOUD and still greppable as the same alarm.
+    assert LOG_PREFIX in alarm
+    assert COUNT_CAP_MARKER in alarm
+    assert f"max_task_dirs={block['max_task_dirs']}" in alarm
+    # It SAYS the age axis is what is missing, and points at the real remedy.
+    assert "--max-age-days=0" in alarm
+    assert "disables the age axis" in alarm
+    # ...and it makes NEITHER false claim.
+    assert "re-derive" not in alarm.lower(), (
+        "the cap-re-derivation remedy is max_age_days x rate x factor, which "
+        "is zero when the age axis is off — it must not be printed there"
+    )
+    assert "against max_age_days=0" not in alarm
+    assert "retention window is now" not in alarm
+    # The wording constraints of the other variant hold here too: the alarm is
+    # not a dry-run line and not a per-removal line.
+    assert "would prune" not in alarm
+    assert "pruned task dir" not in alarm
+
+
+def test_cli_age_enabled_bind_keeps_the_window_truncation_wording(tmp_path):
+    """The count-only variant must not have swallowed the ORIGINAL alarm: with
+    the age axis ON, a bind still gets the window-truncation wording and its
+    re-derivation remedy (the case the whole leaf exists for)."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert json.loads(result.stdout)["count_cap"]["age_axis_disabled"] is False
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    assert "re-derive" in warnings[0].lower()
+    assert "against max_age_days=90" in warnings[0]

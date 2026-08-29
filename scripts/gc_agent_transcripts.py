@@ -39,7 +39,10 @@ a machine-readable ``count_cap`` block in the JSON report (see
 :func:`summarize_count_cap`), carrying how deep the retention window has
 actually been truncated to and how to re-derive the cap. A dir tagged
 ``age+count`` does NOT raise it — the age cap was discarding that dir anyway,
-so the count cap cost no history. ``max_task_dirs`` is sized as a DERIVED
+so the count cap cost no history. Under count-only retention
+(``max_age_days <= 0``) there is no advertised window to truncate, so the
+report carries ``count_cap.age_axis_disabled`` and the WARNING switches to a
+variant that states what the cap costs without the window claim. ``max_task_dirs`` is sized as a DERIVED
 bound precisely so this alarm stays quiet in normal operation; see
 :func:`required_max_task_dirs`.
 
@@ -268,6 +271,7 @@ def summarize_count_cap(
     decision: GcDecision,
     now: float,
     max_task_dirs: int,
+    max_age_days: int,
 ) -> dict:
     """Summarise what the COUNT axis actually cost, as a structured fact (pure).
 
@@ -280,10 +284,12 @@ def summarize_count_cap(
     recover a fact the emitter already held in a variable).
 
     Joins ``decision.prune`` reasons against the scanned ``(path, mtime)``
-    pairs to age each dropped dir in days. Returns a STABLE six-key block:
+    pairs to age each dropped dir in days. Returns a STABLE seven-key block:
 
     * ``bound`` — the alarm. True iff at least one dir carries the reason
       EXACTLY ``count``.
+    * ``age_axis_disabled`` — True iff ``max_age_days <= 0``, i.e. there is no
+      age policy for the count axis to have truncated. See below.
     * ``max_task_dirs`` — the cap actually applied (echoed so the block stands
       alone in a log or an alert).
     * ``pruned`` — every dir the count axis dropped (``count`` +
@@ -305,6 +311,20 @@ def summarize_count_cap(
     A non-positive ``max_task_dirs`` disables the axis upstream in
     :func:`select_prunable`, which then emits no count reason at all, so a
     disabled cap reports unbound with no special case here.
+
+    ``age_axis_disabled`` is the mirror case, and it is REPORTED rather than
+    folded into ``bound``. When ``max_age_days <= 0`` the age axis is off, so
+    EVERY count drop is tagged exactly ``count`` and ``bound`` is True on every
+    sweep — correctly, in the sense the plan's design decision 1 rules: with
+    the age axis off the count cap genuinely is the only retention policy in
+    force. But the interesting claim the alarm makes elsewhere — that an
+    ADVERTISED ``max_age_days`` window is being truncated from the forensic
+    end — is not available there, and its remediation (re-derive the cap as
+    ``max_age_days x rate x factor``) degenerates to zero. So the flag ships as
+    a structured fact and :func:`main` renders a DIFFERENT, truthful line for
+    that mode, rather than repeating a window claim that has no window behind
+    it. A machine reader that only wants genuine window truncation reads
+    ``bound and not age_axis_disabled``.
 
     The age fields are ``None`` — never ``0`` — when the corresponding set is
     empty, so absence of a measurement can never be read as a measured zero.
@@ -335,6 +355,7 @@ def summarize_count_cap(
 
     return {
         'bound': truncated > 0,
+        'age_axis_disabled': max_age_days <= 0,
         'max_task_dirs': max_task_dirs,
         'pruned': pruned,
         'truncated': truncated,
@@ -678,7 +699,9 @@ def build_gc_report(
         'kept': len(decision.keep),
         'pruned': len(decision.prune),
         'reason_counts': reason_counts,
-        'count_cap': summarize_count_cap(scanned, decision, now, max_task_dirs),
+        'count_cap': summarize_count_cap(
+            scanned, decision, now, max_task_dirs, max_age_days
+        ),
         'removed': len(outcome.removed),
         'removed_paths': [str(p) for p in outcome.removed],
         'failed': len(outcome.failed),
@@ -710,7 +733,11 @@ def main(argv: list[str] | None = None) -> int:
 
     A count-cap bind additionally raises a distinct ``COUNT CAP BOUND``
     WARNING, read STRAIGHT OFF the report block so the human line and the
-    machine-readable one cannot drift.
+    machine-readable one cannot drift. It has two wordings: the
+    window-truncation alarm, and — when ``max_age_days <= 0`` leaves the count
+    cap as the ONLY retention bound — a count-only variant that reports what
+    the cap is actually costing without claiming an age window it has no way
+    to truncate. Both carry the same greppable ``COUNT CAP BOUND`` marker.
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
@@ -747,7 +774,34 @@ def main(argv: list[str] | None = None) -> int:
     # 'count-pruned task dirs' and did exactly that. Both exclusions are
     # pinned by tests.
     count_cap = report['count_cap']
-    if count_cap['bound']:
+    if count_cap['bound'] and count_cap['age_axis_disabled']:
+        # COUNT-ONLY RETENTION. With the age axis off there is no advertised
+        # window to truncate, so the branch below would state something false
+        # ('the effective retention window is now X days against
+        # max_age_days=0') and print a remediation that evaluates to a required
+        # cap of ZERO. Still LOUD — the count cap really is the only thing
+        # bounding this archive, and how far back it reaches is worth saying —
+        # but it says the true thing, and it does not ask for a re-derivation
+        # that has no age term to derive from.
+        logger.warning(
+            '%s COUNT CAP BOUND — max_task_dirs=%d is the ONLY retention bound '
+            'in force: --max-age-days=%d disables the age axis, so the count '
+            'axis dropped %d of %d scanned dirs oldest-first (kept=%d) and the '
+            'archive now reaches back %s days (oldest drop was %s days old). '
+            'No advertised age window is being truncated here because none is '
+            'configured, so this is the count-only policy binding as asked, '
+            'NOT a cap that needs re-deriving — enable the age axis if you '
+            'want a time-based retention guarantee.',
+            _LOG_PREFIX,
+            count_cap['max_task_dirs'],
+            args.max_age_days,
+            count_cap['pruned'],
+            report['scanned'],
+            report['kept'],
+            _fmt_days(count_cap['effective_window_days']),
+            _fmt_days(count_cap['oldest_dropped_age_days']),
+        )
+    elif count_cap['bound']:
         logger.warning(
             '%s COUNT CAP BOUND — max_task_dirs=%d dropped %d of %d '
             'count-axis drops that the age policy would have KEPT '
