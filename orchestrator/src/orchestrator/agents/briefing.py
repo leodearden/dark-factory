@@ -623,12 +623,15 @@ work is genuinely incomplete.
 
 a. **Drop genuinely-unneeded entries**: call
    `update_plan_metadata(files=[<narrowed list>])` with a subset of the
-   current plan files.  You may keep some flagged entries if you judge
-   them genuinely needed; the gate's re-check is the source of truth.
+   current plan files.  A flagged entry you LEAVE in the list
+   will re-fire the gate's re-check and escalate — keeping one is a
+   deliberate choice to escalate, not a neutral default.  Either way,
+   the gate's re-check is the source of truth.
 b. **Plan is honest as-is**: call `confirm_plan()` unchanged.  The
    workflow will then file a level-1 escalation (auto-watcher triages; promotes to L2 if a human is needed) — choose this only when the
    work is genuinely incomplete and the flagged files really do need
-   edits.
+   edits.  A DELIVERED branch whose flagged file simply needed no edit
+   is NOT this case — that belongs in (c) via `drop_plan_file`.
 c. **Correctly declared, and correctly needed no change**: call
    `drop_plan_file(path, reason)` — ONCE PER SUCH ENTRY, repeating for
    each one.  Use this when you were right to declare the file AND the
@@ -654,6 +657,11 @@ You must NOT add new files to the plan: the post-pass verifier rejects
 any plan whose `files` list contains entries beyond the current set
 above.  If the work needs new files, call `confirm_plan()` instead and
 let a human triage the scope change.
+
+The plan must also never be narrowed to an empty `files` list — an empty
+list is not a narrowed plan, it is an unchecked one, because the gate has
+nothing left to re-check.  If nothing legitimately remains, that is
+option (b): call `confirm_plan()` and let the escalation triage it.
 """
 
     async def build_simple_task_prompt(
