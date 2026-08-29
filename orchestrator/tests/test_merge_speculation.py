@@ -1997,9 +1997,11 @@ async def _stop_worker(
 
     The join stays best-effort (``suppress(Exception)``): it asserts nothing,
     and a slow join must not convert a real failure above into a confusing
-    second one. It is also the reason this wait is deliberately exempt from
-    ``TestLateArrivalWaitsAreLoadIndependent`` — see
-    ``_load_bearing_wait_target``.
+    second one. It is also why this wait is exempt from the shared
+    ``wall-clock-deadline`` rule
+    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a bare
+    Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
+    exemption is structural rather than a listed name.
     """
     await worker.stop()
     with contextlib.suppress(Exception):
@@ -3818,227 +3820,35 @@ class TestTimeoutMarkCoverage:
 
 
 # ---------------------------------------------------------------------------
-# task 3980: structural guard — load-bearing waits must be load-independent
+# task 3980's wall-clock guard now lives in the SHARED checker (task 4246)
 # ---------------------------------------------------------------------------
 #
-# SCOPE: the WHOLE module, derived from the call shape alone. An earlier
-# revision scanned a hand-maintained frozenset of the five late-arrival class
-# names; a sixth class added tomorrow with `asyncio.wait_for(req_x.result,
-# timeout=25.0)` would have passed this guard in silence — the same "a policy
-# expressed as a list cannot catch what is outside the list" failure the class
-# docstring below criticises task 2376's sweep for, reintroduced by the guard
-# meant to fix it. Deriving the set from `_worst_per_method_wait_budget`
-# instead does not close it either: a 25.0 literal computes 25s, under
-# PYPROJECT_DEFAULT_TIMEOUT, so the hypothetical offender still would not be
-# scanned. Only the shape is a sound key, so there is no set to maintain.
-
-
-def _load_bearing_wait_target(node: ast.expr) -> str | None:
-    """Describe *node* if it is a load-bearing synchronisation point, else None.
-
-    Exactly two shapes are load-bearing in the late-arrival block, and both
-    gate a hard assertion downstream:
-
-      * ``req_a.result`` — a ``MergeRequest.result`` future. Its resolution IS
-        the event the test is waiting for; a deadline here fails a test whose
-        merge pipeline completed correctly.
-      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier. Already
-        event-driven; only its deadline is wall-clock.
-
-    Deliberately NOT load-bearing, and therefore excluded: the
-    ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
-    ``_stop_worker``. It targets a bare ``Name`` (the worker Task), sits inside
-    ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
-    TimeoutError — so it cannot manufacture the flake this task fixes, and
-    stretching it would only slow teardown down. The Name-vs-Attribute/Call
-    distinction is what makes that exclusion structural rather than a
-    hand-maintained name list — which matters more now that the scan covers
-    every scope in the module rather than five named classes.
-    """
-    if isinstance(node, ast.Attribute) and node.attr == 'result':
-        return f'{ast.unparse(node)} (MergeRequest.result future)'
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == 'wait'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id.startswith('gate')
-    ):
-        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
-    return None
-
-
-def _late_arrival_wait_offenders(source: str) -> list[str]:
-    """Statically scan *source* for load-bearing waits that are still charged
-    in wall clock, returning one formatted offender string per site.
-
-    Two offence kinds, both reported as ``file:line`` plus the enclosing scope
-    so the failure is directly actionable:
-
-      1. a load-bearing wait still routed through a bare
-         ``asyncio.wait_for(..., timeout=...)`` instead of ``wait_responsive``;
-      2. a raw numeric wall-clock literal on a load-bearing wait site (on
-         EITHER call shape) instead of a bound derived from
-         ``MERGE_RESULT_TIMEOUT``.
-
-    Scans EVERY scope in the module — every class, every method, every
-    module-level helper — with no name list and no class filter (see the
-    SCOPE note above the section). Selection is entirely by call shape:
-    ``_load_bearing_wait_target`` decides what counts, so a new late-arrival
-    class, a helper that grows a wait, or a test outside the late-arrival block
-    is covered the moment it is written rather than when someone remembers to
-    add it. Scope tracking mirrors ``_bare_verify_result_double_offenders``
-    below, deliberately: two guards over one file should read the same way.
-
-    Must never raise: a crash here would fail the module over an unrelated
-    edit. Unparseable source returns [].
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    name = Path(__file__).name
-    offenders: list[str] = []
-
-    def _check_call(call: ast.Call, where: str) -> None:
-        if not call.args:
-            return
-        func = call.func
-
-        is_bare_wait_for = (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'wait_for'
-            and isinstance(func.value, ast.Name)
-            and func.value.id == 'asyncio'
-        )
-        is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
-        if not (is_bare_wait_for or is_responsive):
-            return
-
-        target = _load_bearing_wait_target(call.args[0])
-        if target is None:
-            return
-
-        if is_bare_wait_for:
-            offenders.append(
-                f'{name}:{call.lineno} — {where} — awaits {target} via a '
-                f'bare asyncio.wait_for, so its deadline is charged in '
-                f'WALL CLOCK. Route it through wait_responsive(...) '
-                f'with a descriptive label=.'
-            )
-
-        timeout_kw = next((kw for kw in call.keywords if kw.arg == 'timeout'), None)
-        if (
-            timeout_kw is not None
-            and isinstance(timeout_kw.value, ast.Constant)
-            and isinstance(timeout_kw.value.value, (int, float))
-            and not isinstance(timeout_kw.value.value, bool)
-        ):
-            offenders.append(
-                f'{name}:{call.lineno} — {where} — awaits {target} with a '
-                f'RAW wall-clock literal timeout='
-                f'{timeout_kw.value.value!r}. Derive the bound from '
-                f'MERGE_RESULT_TIMEOUT instead of writing a number.'
-            )
-
-    def _visit(node: ast.AST, scope: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                _visit(child, f'{scope}::{child.name}' if scope else child.name)
-                continue
-            if isinstance(child, ast.Call):
-                _check_call(child, scope or '<module>')
-            _visit(child, scope)
-
-    _visit(tree, '')
-    return offenders
-
-
-class TestLateArrivalWaitsAreLoadIndependent:
-    """Enforced invariant: no load-bearing wait ANYWHERE in this module may
-    carry a wall-clock deadline.
-
-    This is the guard that stops the class recurring in this file a thirteenth
-    time. The measured failures behind task 3980 were all genuine asyncio
-    deadline expiries on tests whose logic had ALREADY completed — the CleanCAS
-    log tail reads ``verify end (passed=True)`` next to a heartbeat of
-    ``oldest age=46s ... state=finalizing``. Widening the numbers would only
-    move the threshold; charging the budget in loop-responsive time removes the
-    dependence, and this guard is what keeps it removed.
-
-    It also closes the specific hole that produced one of the three failures.
-    Task 2376's sweep replaced merge-pipeline wait literals, but its stated
-    policy only covered literals <= 15 — so the lone ``timeout=25.0`` in
-    test_predecessor_fail_cascades_to_late_arrival sat just above the sweep and
-    survived as the file's only bare mid-range deadline. A policy expressed as
-    "literals up to N" cannot catch the one above N; a structural invariant
-    over the call SHAPE can — which is also why the scan carries no class list
-    of its own (see the SCOPE note above ``_load_bearing_wait_target``).
-    """
-
-    def test_no_load_bearing_wait_is_charged_in_wall_clock(self) -> None:
-        offenders = _late_arrival_wait_offenders(Path(__file__).read_text())
-
-        assert not offenders, (
-            'These synchronisation points still carry wall-clock deadlines:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nA MergeRequest.result future wait and an asyncio.Event '
-            'gate barrier are both load-bearing: a deadline expiry there '
-            'fails a test whose merge pipeline completed correctly, purely '
-            'because the xdist worker was descheduled. Use '
-            'wait_responsive(...), which charges its budget in '
-            'loop-responsive time and still reports a genuine hang red. The '
-            "worker run-task join in _stop_worker is deliberately exempt "
-            '(best-effort cleanup inside contextlib.suppress, asserting '
-            'nothing) — and exempt by its Name target, not by a name list.'
-        )
-
-    def test_scan_reaches_a_class_no_name_list_would_have_covered(self) -> None:
-        """Driven with SYNTHETIC source, because the real module is clean.
-
-        Without this, nothing distinguishes "the scan covers the whole module"
-        from "the scan covers the five classes that happen to be clean". The
-        input is the reviewer's own counter-example: a sixth late-arrival class
-        added tomorrow, outside any list, with the exact bare mid-range deadline
-        that produced one of the three measured failures.
-        """
-        synthetic = (
-            'class TestSomeBrandNewLateArrivalCase:\n'
-            '    async def test_new_case(self):\n'
-            '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
-        )
-
-        offenders = _late_arrival_wait_offenders(synthetic)
-
-        assert len(offenders) == 2, (
-            f'expected BOTH offence kinds (bare asyncio.wait_for on a '
-            f'load-bearing target, and a raw wall-clock literal); got '
-            f'{offenders!r}'
-        )
-        assert all(
-            'TestSomeBrandNewLateArrivalCase::test_new_case' in o for o in offenders
-        ), offenders
-
-    def test_a_name_targeted_join_is_still_exempt_under_the_wider_scope(
-        self,
-    ) -> None:
-        """The widened scope must not start flagging teardown joins.
-
-        ``_stop_worker`` is a module-level helper, so widening the scan from
-        "five classes" to "every scope" newly brings it into range. Its join
-        stays exempt because its target is a bare Name, not because it lives
-        somewhere the scan does not look.
-        """
-        synthetic = (
-            'async def _teardown(worker, worker_task):\n'
-            '    with contextlib.suppress(Exception):\n'
-            '        await asyncio.wait_for(worker_task, timeout=5.0)\n'
-        )
-
-        assert _late_arrival_wait_offenders(synthetic) == []
+# `_load_bearing_wait_target`, `_late_arrival_wait_offenders` and
+# `TestLateArrivalWaitsAreLoadIndependent` were deleted here and reimplemented as
+# rule `wall-clock-deadline` in
+# fused-memory/scripts/check_bare_magicmock_config.py. The invariant is unchanged
+# and is now enforced REPO-WIDE by the seven package lint_commands,
+# dark-factory-orchestrator.yaml and hooks/project-checks, rather than only by
+# this module's own test run.
+#
+# WHAT THE RULE STILL KEYS ON, and why it must stay that way: the call SHAPE.
+# A load-bearing target is `X.result` (a MergeRequest.result future) or
+# `gate*.wait()` (an asyncio.Event barrier); the `_stop_worker` teardown join
+# below is exempt because its target is a bare Name, not because anything lists
+# it. There is no class list, no name table and no budget threshold deciding
+# which sites are scanned — task 2376's sweep expressed its policy as "literals
+# up to 15" and the lone `timeout=25.0` sat just above it, surviving as one of
+# the three measured failures; task 3980's own amendment pass then deleted a
+# hand-maintained five-class frozenset for the same reason. A list cannot catch
+# what is outside it, and a threshold is just another list.
+#
+# Deleting the local copy was gated on a two-sided proof, not on this module
+# merely passing: fused-memory/tests/test_check_bare_magicmock_config.py::
+# TestRuleCCoversMergeSpeculation asserts this file measures ZERO under the
+# shared rule AND that the reviewer's counter-example flags under this exact
+# filename. This module is deliberately absent from the rule's
+# _WALL_CLOCK_DEADLINE_DEBT baseline, so a regression here fails the gate
+# instead of being grandfathered.
 
 
 # ===========================================================================
