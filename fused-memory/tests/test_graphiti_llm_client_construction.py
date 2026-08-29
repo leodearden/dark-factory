@@ -324,12 +324,12 @@ class TestConfiguredMaxTokensReachesEveryArm:
         Measured against the installed graphiti-core 0.28.2 wheel:
 
         - ``OpenAIGenericClient.__init__`` (openai_generic_client.py:61-66,88)
-          declares its own ``max_tokens: int = DEFAULT_MAX_TOKENS`` and,
-          immediately after ``super().__init__(config, cache)`` has correctly
-          set ``self.max_tokens = config.max_tokens`` (client.py:80),
+          declares its own ``max_tokens: int = 16384`` and, immediately after
+          ``super().__init__(config, cache)`` has correctly set
+          ``self.max_tokens = config.max_tokens`` (client.py:80),
           unconditionally re-assigns ``self.max_tokens = max_tokens``.
-          ``_generate_response`` then sends ``max_tokens=self.max_tokens``
-          (:126), ignoring the per-call argument.
+          ``_generate_response`` then sends ``max_tokens=self.max_tokens``,
+          ignoring the per-call argument.
         - ``BaseOpenAIClient.__init__`` (openai_base_client.py:51-67) — the base
           of ``OpenAIClient``, i.e. the SHIPPED DEFAULT arm — performs the
           IDENTICAL override, and ``_generate_response`` sends

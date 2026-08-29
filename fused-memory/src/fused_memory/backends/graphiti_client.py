@@ -256,10 +256,10 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # configured value (4096 with the shipped config). It restores
                 # agreement rather than inventing a new policy — the anthropic
                 # arm below (which honours a passed config, measured) and mem0
-                # (mem0_client.py:179,198) have always read the same
-                # cfg.llm.max_tokens knob. And if the configured value ever
-                # proves too small the failure is LOUD, never silent
-                # ('Output length exceeded max tokens <N>' from
+                # (fused-memory/src/fused_memory/backends/mem0_client.py::Mem0Backend._build_config_dict)
+                # have always read the same cfg.llm.max_tokens knob. And if the
+                # configured value ever proves too small the failure is LOUD,
+                # never silent ('Output length exceeded max tokens <N>' from
                 # openai_base_client.py:191-192, or a truncated body failing
                 # json.loads), retried by graphiti and then dead-lettered
                 # visibly; whereas before, an operator hitting truncation had no
