@@ -5356,6 +5356,78 @@ class TestPremiseGuardRunsOffEventLoop:
         assert decision1 is not None and decision1.action == "refuse"
         assert decision2 is not None and decision2.action == "refuse"
 
+    async def test_concurrent_first_calls_both_see_loaded_registry(self, tmp_path):
+        """RED: concurrent first calls must not observe a half-loaded registry.
+
+        self._premise_registry_load_attempted is set BEFORE the registry
+        assignment. That ordering was safe only while the load was
+        synchronous — there was no await point between the two. Offloading
+        the load (previous step) inserted one, so a second caller can now
+        see load_attempted=True while self._premise_registry is still None,
+        fall into ``if not entries: return None``, and SILENTLY FAIL OPEN:
+        the guard is skipped and the dead-premise task it exists to refuse
+        gets filed.
+
+        This is reachable, not theoretical:
+        task_interceptor.py::TaskInterceptor._get_curator memoises a SINGLE
+        TaskCurator on self._curator with no project key, while
+        task_interceptor.py::TaskInterceptor._curator_lock is keyed
+        PER-PROJECT — so two projects can be inside curate() concurrently on
+        the same TaskCurator instance.
+
+        Uses a slow load_premise_registry wrapper (sleeps inside the worker
+        thread, off the event loop) to guarantee the second concurrent call
+        enters while the first load is still in flight.
+        """
+        import time
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_call_count = 0
+
+        def slow_load(path):
+            nonlocal load_call_count
+            load_call_count += 1
+            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=slow_load,
+        ):
+            d1, d2 = await asyncio.gather(
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+                curator._maybe_premise_refuted_drop(candidate, candidate.payload_hash()),
+            )
+
+        assert d1 is not None and d1.action == "refuse"
+        assert d2 is not None and d2.action == "refuse"
+        assert load_call_count == 1
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
