@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from shared.cli_invoke import (
     detect_resumable_progress,
@@ -165,7 +166,11 @@ class TestDetectResumableProgress:
 
     def test_non_dict_records_are_true(self) -> None:
         """Garbage records cannot prove emptiness → resume, and never raise."""
-        assert detect_resumable_progress(['nonsense', 42, None, ['x']]) is True
+        # list[Any] because these records are DELIBERATELY off-contract: the
+        # annotation keeps the hostile intent visible rather than letting the
+        # checker narrow to whatever this particular garbage happens to be.
+        records: list[Any] = ['nonsense', 42, None, ['x']]
+        assert detect_resumable_progress(records) is True
 
     def test_mixed_garbage_and_text_turn_is_true(self) -> None:
         """A single text-only turn ALONGSIDE unparseable records is ambiguous:
@@ -202,7 +207,10 @@ class TestDetectResumableProgress:
 
     def test_malformed_input_never_raises(self) -> None:
         """Totality contract: every hostile shape returns a bool, never raises."""
-        for records in (
+        # list[Any] for the same reason as test_non_dict_records_are_true: every
+        # entry below is an intentionally off-contract shape, and the annotation
+        # says so instead of narrowing to the union they accidentally form.
+        hostile: tuple[list[Any] | None, ...] = (
             None,
             [],
             [None],
@@ -212,7 +220,8 @@ class TestDetectResumableProgress:
             [{'type': 'assistant', 'content': {'not': 'a list'}}],
             [{'type': None}],
             ['', 0, False, ()],
-        ):
+        )
+        for records in hostile:
             assert isinstance(detect_resumable_progress(records), bool)
 
 
