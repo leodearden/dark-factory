@@ -1796,6 +1796,15 @@ def create_server(
         the cascade's existing best-effort contract (see the in-code note for
         the named limitation).
 
+        Only records this resolve could ACTUALLY CLOSE are considered — the
+        target and each member are both filtered to ``status == 'pending'``.
+        An already-closed record's pin cannot be spent again (``queue.resolve``
+        no-ops on a non-pending record, and its cascade no-ops over an
+        already-archived member), so refusing on one would name a record the
+        close could not touch and would re-block an operator who already spent
+        that pin deliberately.  A spurious refusal is the thing that teaches a
+        rotation to acknowledge reflexively.
+
         ``acknowledge_declared_pins`` is the deliberate override.  It must NAME
         each escalation id whose declared pin is being spent — a list, not a
         boolean, because a boolean is one keystroke and is exactly what a
@@ -2014,10 +2023,26 @@ def create_server(
         # COST, considered: one queue.get per member on a resolve.  A resolve is
         # a rare, human/watcher-driven operation and `get` memoises its archive
         # listing, so this is not an unconsidered N+1.
-        candidates = [rec]
+        #
+        # Only records this resolve could ACTUALLY CLOSE are candidates, hence
+        # the `status == 'pending'` filter on both the target and each member.
+        # An already-closed record's pin cannot be spent again: queue.resolve
+        # early-returns as a no-op on `status != 'pending'`, and its cascade
+        # no-ops over an already-archived member the same way.  Refusing on one
+        # would be a pure false positive that names a record the close could not
+        # touch — and, worse, it would force an operator who ALREADY spent that
+        # pin deliberately (naming it in acknowledge_declared_pins on the close
+        # that archived it) to re-acknowledge it on every subsequent operation
+        # on the cluster.  That erodes exactly the signal this gate exists to
+        # make trustworthy: a rotation that learns the refusal is routinely
+        # spurious starts acknowledging reflexively, which is the failure mode
+        # acknowledge_declared_pins-as-a-list was shaped to prevent.  The target
+        # needs the filter for the same reason a member does — queue.get falls
+        # back to the ARCHIVE, so `rec` itself may already be closed.
+        candidates = [rec] if rec.status == 'pending' else []
         for member_id in rec.members:
             member = queue.get(member_id)
-            if member is not None:
+            if member is not None and member.status == 'pending':
                 candidates.append(member)
         blocked = blocking_pin_declarations(
             candidates, acknowledged=acknowledge_declared_pins or (),

@@ -7955,6 +7955,64 @@ class TestResolveIssueDeclaredPinGuard:
         assert result['status'] == 'dismissed'
 
     @pytest.mark.asyncio
+    async def test_already_archived_marked_member_does_not_block(self, tmp_path: Path):
+        """(e cont.) A pin that has ALREADY been spent cannot be spent again.
+
+        ``queue.get`` falls back to the ARCHIVE, so a closed-and-archived member
+        still reads its ``pin_declared_by`` back.  But ``queue.resolve`` no-ops
+        on a non-pending record, so the cascade could not touch it — refusing
+        here would name a record the close cannot reach and would force the
+        operator who already deliberately spent that pin to re-acknowledge it on
+        every subsequent cluster operation.  A refusal that is routinely
+        spurious is what teaches a rotation to acknowledge reflexively.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        # The operator deliberately spends the pin on the member alone.
+        spend = await _resolve_issue(
+            server, escalation_id='esc-3371-2', resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=['esc-3371-2'],
+        )
+        assert spend['status'] == 'dismissed', spend
+        archived = queue.get('esc-3371-2')
+        assert archived is not None
+        assert archived.pin_declared_by == [self.DECLARER], (
+            'the declaration survives into the archive — which is why the gate '
+            'must filter on status rather than on the marker alone'
+        )
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_already_archived_marked_target_does_not_block(self, tmp_path: Path):
+        """(e cont.) The same filter applies to the TARGET, for the same reason:
+        ``queue.get`` archive-falls-back, so `rec` itself may already be closed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=[esc.id],
+        )
+
+        # A second close of the now-archived record: queue.resolve no-ops, so
+        # there is no pin left to spend and nothing to refuse.
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='again', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
     async def test_wholly_unmarked_cluster_cascades_exactly_as_today(self, tmp_path: Path):
         """(f) The no-regression half."""
         queue = EscalationQueue(tmp_path / 'esc')
