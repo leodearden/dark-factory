@@ -1253,7 +1253,57 @@ def _drop_plan_file(
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
-    plan['files'] = [f for f in plan.get('files', []) if f != path]
+    # Every refusal below returns BEFORE any artifacts.write_plan call — the
+    # module-wide convention that a refusal envelope always implies no write.
+    if not reason or not reason.strip():
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'Cannot drop {path!r} without a reason. Every drop must '
+                    'record WHY the entry was in scope and WHY the branch '
+                    'legitimately needed no edit to it — a drop with no '
+                    'recorded reason is the falsified provenance this tool '
+                    'exists to avoid.'
+                ),
+            },
+            markup_facts,
+        )
+
+    current = plan.get('files', [])
+    if path not in current:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'{path!r} is not in the plan files list, so there is '
+                    'nothing to drop and no declaration to explain. Current '
+                    f'files: {current!r}'
+                ),
+            },
+            markup_facts,
+        )
+
+    # Scoped HERE rather than left to _confirm_plan's own empty-files check:
+    # the narrowing pass's dropping option never calls confirm_plan() at all,
+    # so that check never fires on this route.
+    if len(current) <= 1:
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'Refusing to drop {path!r}: it is the last file in the '
+                    'plan, and the plan must never be narrowed to an empty '
+                    'files list — an empty list is not a narrowed plan, it is '
+                    'an unchecked one. If nothing in the plan legitimately '
+                    'remains, call confirm_plan() instead and let the '
+                    'escalation triage the scope.'
+                ),
+            },
+            markup_facts,
+        )
+
+    plan['files'] = [f for f in current if f != path]
     plan.setdefault('dropped_files', []).append({
         'path': path,
         'reason': reason,
