@@ -3477,3 +3477,119 @@ def test_owner_ppid_verdict_is_none_for_every_unresolvable_input(
     monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
     monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
     assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is None
+
+
+# ---------------------------------------------------------------------------
+# _EventProbes -- the per-event /proc probe memo (task 4662)
+#
+# One hook event consults _owner_ppid_verdict TWICE (slug ownership, then the
+# launch-window withhold) and _owning_claude_pid once more at bind time.
+# Each walk is up to _MAX_CLAUDE_ANCESTOR_HOPS x 2 /proc reads against a hard
+# _HOOK_TIMEOUT_SECS budget. Memoizing collapses them onto one observation --
+# which is also a correctness property: the adopt/fork decision and the
+# withhold decision are then made from the SAME probe result.
+# ---------------------------------------------------------------------------
+
+
+def _count_owning_claude_pid(
+    monkeypatch: pytest.MonkeyPatch, value: int | None
+) -> list[int]:
+    """Patch ``sh._owning_claude_pid`` to return *value*, counting its calls."""
+    calls: list[int] = []
+
+    def _probe() -> int | None:
+        calls.append(1)
+        return value
+
+    monkeypatch.setattr(sh, '_owning_claude_pid', _probe)
+    return calls
+
+
+def test_event_probes_walks_proc_once_for_repeated_pid_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_owning_claude_pid(monkeypatch, 4193501)
+    probes = sh._EventProbes({})
+
+    assert probes.owning_claude_pid() == 4193501
+    assert probes.owning_claude_pid() == 4193501
+    assert probes.owning_claude_pid() == 4193501
+    assert len(calls) == 1
+
+
+def test_event_probes_walks_proc_once_for_repeated_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _count_owning_claude_pid(monkeypatch, 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
+
+    assert probes.owner_ppid_verdict() is True
+    assert probes.owner_ppid_verdict() is True
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('verdict_first', [True, False])
+def test_event_probes_share_one_walk_across_both_probes(
+    monkeypatch: pytest.MonkeyPatch, verdict_first: bool
+) -> None:
+    """The verdict and the bind-time pid stamp consume ONE walk, either order."""
+    calls = _count_owning_claude_pid(monkeypatch, 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
+
+    if verdict_first:
+        assert probes.owner_ppid_verdict() is True
+        assert probes.owning_claude_pid() == 4193501
+    else:
+        assert probes.owning_claude_pid() == 4193501
+        assert probes.owner_ppid_verdict() is True
+    assert len(calls) == 1
+
+
+def test_event_probes_caches_none_as_a_resolved_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None is a legitimate resolved answer, not "not yet computed"."""
+    calls = _count_owning_claude_pid(monkeypatch, None)
+    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
+
+    assert probes.owning_claude_pid() is None
+    assert probes.owning_claude_pid() is None
+    assert len(calls) == 1
+
+    calls_v = _count_owning_claude_pid(monkeypatch, None)
+    probes_v = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
+    assert probes_v.owner_ppid_verdict() is None
+    assert probes_v.owner_ppid_verdict() is None
+    assert len(calls_v) == 1
+
+
+def test_event_probes_verdict_matches_unmemoized_verdict_bit_for_bit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEMANTIC PARITY: the memo must not change a single verdict.
+
+    Mirrors test_owner_ppid_verdict_is_none_for_every_unresolvable_input's
+    enumeration, asserting the memoized and un-memoized spellings agree on
+    each input rather than restating the expected answers independently.
+    """
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    envs: list[dict[str, str]] = [
+        {},
+        {'CLAUDE_SPAWN_OWNER_PPID': '   '},
+        {'CLAUDE_SPAWN_OWNER_PPID': 'not-a-pid'},
+        {'CLAUDE_SPAWN_OWNER_PPID': '1'},
+        {'CLAUDE_SPAWN_OWNER_PPID': '4193500'},  # owner -> True
+        {'CLAUDE_SPAWN_OWNER_PPID': '4193999'},  # nested -> False
+    ]
+    for env in envs:
+        assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
+    # And the two unresolvable-probe shapes.
+    env = {'CLAUDE_SPAWN_OWNER_PPID': '4193500'}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+    assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
+    assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
