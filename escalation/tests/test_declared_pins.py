@@ -27,6 +27,7 @@ from escalation.declared_pins import (
     PinDeclaration,
     blocking_pin_declarations,
     format_refusal,
+    normalise_declarers,
 )
 from escalation.models import Escalation
 
@@ -154,6 +155,48 @@ class TestBlockingPinDeclarations:
     def test_surrounding_whitespace_is_stripped_from_each_declarer(self) -> None:
         (decl,) = blocking_pin_declarations([_esc(pin_declared_by=['  task-3546  '])])
         assert decl.declared_by == ('task-3546',)
+
+    def test_duplicate_declarers_are_reported_once(self) -> None:
+        """The READ side normalises exactly as the WRITE side does.
+
+        ``queue.declare_pin`` de-duplicates, so both docstrings describe
+        de-duplication as a contract of the field.  A record hand-edited (or
+        written by a future second writer) with duplicates must therefore not
+        report them twice in ``declared_pins`` or in the refusal message.
+        """
+        (decl,) = blocking_pin_declarations(
+            [_esc(pin_declared_by=['gate-a', '  gate-a  ', 'gate-b', 'gate-a'])]
+        )
+        assert decl.declared_by == ('gate-a', 'gate-b')
+
+
+# ---------------------------------------------------------------------------
+# normalise_declarers — THE one normalisation, shared with queue.declare_pin
+# ---------------------------------------------------------------------------
+
+
+class TestNormaliseDeclarers:
+    """One helper, so the read side and the write side cannot drift."""
+
+    def test_returns_a_tuple(self) -> None:
+        assert normalise_declarers(['gate-a']) == ('gate-a',)
+
+    def test_empty_input_returns_empty_tuple(self) -> None:
+        assert normalise_declarers([]) == ()
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        assert normalise_declarers(['  gate-a\t']) == ('gate-a',)
+
+    def test_drops_blank_and_whitespace_only_entries(self) -> None:
+        assert normalise_declarers(['', '   ', '\t\n', 'gate-a']) == ('gate-a',)
+
+    def test_de_duplicates_preserving_first_occurrence_order(self) -> None:
+        assert normalise_declarers(
+            ['gate-b', 'gate-a', 'gate-b', '  gate-a  ']
+        ) == ('gate-b', 'gate-a')
+
+    def test_accepts_any_iterable(self) -> None:
+        assert normalise_declarers(iter(['gate-a', 'gate-a'])) == ('gate-a',)
 
 
 # ---------------------------------------------------------------------------

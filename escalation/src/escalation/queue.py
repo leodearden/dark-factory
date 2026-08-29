@@ -25,6 +25,14 @@ from escalation import archive
 from escalation.canonical import canonical_root_cause
 from escalation.classify import default_resolution_class_for_resolver
 
+# The declared-pin field's normalisation (strip / drop blanks / order-preserving
+# de-dup) is ONE contract with two sides — this writer and the read-side
+# predicate `declared_pins.blocking_pin_declarations`.  Sharing the helper is
+# what keeps them from drifting; declared_pins is a pure leaf (it imports
+# models only under TYPE_CHECKING), so there is no cycle.  Imported under its
+# real, public name for the same reason as `max_severity` below.
+from escalation.declared_pins import normalise_declarers
+
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
 # stay total over (task 3976), so server.py can share it without reaching for a
 # module-private symbol.  Imported under its real, public name: it is a shared
@@ -1539,8 +1547,12 @@ class EscalationQueue:
 
         *declared_by* names WHAT relies on the record — a deviation notice, an
         operator gate (``'task-3546-second-deviation-notice'``) — NOT who
-        stamped it.  Entries are stripped, blanks dropped, and entries already
-        present dropped, then APPENDED in declaration order.  When nothing
+        stamped it.  Entries go through
+        ``escalation/declared_pins.py::normalise_declarers`` (stripped, blanks
+        dropped, de-duplicated order-preservingly) — THE one normalisation, so
+        this writer and the read-side predicate cannot drift — and are then
+        filtered against the entries already on the record before being
+        APPENDED in declaration order.  When nothing
         survives that normalisation (empty, all-blank, or wholly redundant)
         this returns ``None`` and writes nothing — including when *reason* was
         supplied, since a reason with no new declarer changes no protection.
@@ -1586,11 +1598,13 @@ class EscalationQueue:
                 return None
 
             existing = list(esc.pin_declared_by)
-            added: list[str] = []
-            for entry in declared_by:
-                stripped = entry.strip()
-                if stripped and stripped not in existing and stripped not in added:
-                    added.append(stripped)
+            # Shared normalisation (strip / drop blanks / order-preserving
+            # de-dup), then the write-side-only step: drop entries the record
+            # already carries, so a re-declaration never duplicates one.
+            added = [
+                declarer for declarer in normalise_declarers(declared_by)
+                if declarer not in existing
+            ]
             if not added:
                 return None
 

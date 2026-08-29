@@ -57,11 +57,44 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Iterable, Sequence
 
     from escalation.models import Escalation
 
-__all__ = ['PinDeclaration', 'blocking_pin_declarations', 'format_refusal']
+__all__ = [
+    'PinDeclaration',
+    'blocking_pin_declarations',
+    'format_refusal',
+    'normalise_declarers',
+]
+
+
+def normalise_declarers(entries: Iterable[str]) -> tuple[str, ...]:
+    """Strip, drop blanks, de-duplicate order-preservingly — THE normalisation.
+
+    The field's normalisation is a contract, cited by both
+    ``queue.declare_pin``'s docstring (the WRITE side, which additionally drops
+    entries already present on the record) and this module's (the READ side).
+    Two implementations of one contract silently drift: before this was
+    extracted the write side de-duplicated and the read side did not, so a
+    record hand-edited — or written by a future second writer — with duplicate
+    declarers reported them twice in ``declared_pins`` and twice in the refusal
+    message, contradicting the write-side rule both docstrings describe.
+
+    Public, not ``_``-prefixed, and imported by ``escalation/queue.py`` under
+    its real name: it is a shared cross-module helper, and the same reasoning
+    ``queue.py`` records for importing ``models.max_severity`` applies — an
+    underscore would signal module-private at every use site, which is the
+    opposite of what this is.
+    """
+    seen: set[str] = set()
+    declarers: list[str] = []
+    for entry in entries:
+        stripped = entry.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            declarers.append(stripped)
+    return tuple(declarers)
 
 
 @dataclass(frozen=True)
@@ -103,10 +136,12 @@ def blocking_pin_declarations(
         through on the one id an error message happened to mention first.
 
     A record is MARKED when ``pin_declared_by`` holds at least one non-blank
-    entry.  Blank/whitespace-only declarers are stripped out, and a record left
-    with none is not a declaration: an all-blank marker declares nothing.
-    ``pin_declared_reason`` is never itself a marker — a reason with no declarer
-    names nothing a closer could go consult, so it blocks nothing.
+    entry.  Declarers are put through :func:`normalise_declarers` — the same
+    helper the WRITE side (``queue.declare_pin``) uses, so the two cannot drift
+    — which strips them, drops blanks and de-duplicates order-preservingly.  A
+    record left with none is not a declaration: an all-blank marker declares
+    nothing.  ``pin_declared_reason`` is never itself a marker — a reason with
+    no declarer names nothing a closer could go consult, so it blocks nothing.
 
     Input order is preserved, so a refusal reports the target before its members
     and members in cluster order.
@@ -121,9 +156,7 @@ def blocking_pin_declarations(
     for record in records:
         if record.id in ack:
             continue
-        declarers = tuple(
-            stripped for entry in record.pin_declared_by if (stripped := entry.strip())
-        )
+        declarers = normalise_declarers(record.pin_declared_by)
         if not declarers:
             continue
         declarations.append(

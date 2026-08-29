@@ -4084,6 +4084,21 @@ class TestDeclarePin:
         assert result is not None
         assert result.pin_declared_by == ['first-gate', 'second-gate']
 
+    def test_duplicates_within_one_call_are_collapsed(self, tmp_path: Path):
+        """The shared normalisation (declared_pins.normalise_declarers) de-dups
+        within the incoming list too, not just against what is already there —
+        so the write side and the read-side predicate agree on what the field
+        holds."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(
+            esc.id, declared_by=['gate-a', '  gate-a  ', 'gate-b', 'gate-a'],
+        )
+
+        assert result is not None
+        assert result.pin_declared_by == ['gate-a', 'gate-b']
+
     # --- (d) asymmetric reason overwrite ---
 
     def test_reason_is_overwritten_only_when_non_empty(self, tmp_path: Path):
