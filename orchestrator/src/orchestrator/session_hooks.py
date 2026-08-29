@@ -1421,11 +1421,29 @@ def _run_status_refresh_and_retitle(
     Resolves the record through the ownership check (task 4193), so a
     nested ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``
     refreshes its OWN record rather than flipping the spawning session's
-    status mid-turn. Binding an as-yet-unbound record is folded into the
-    same conditional write the pending question already used, so an
-    ordinary bound-record event still performs exactly one registry write
-    (``refresh_record``'s own); the extra write happens only on the single
-    event that first binds a legacy record.
+    status mid-turn.
+
+    ONE READ, ONE DECISION, ONE WRITE (task 4662). The event reads the slug
+    it writes exactly once -- on the adopt path that read is the ownership
+    probe's own, handed forward on ``_HookSlugResolution.snapshot`` -- and
+    issues exactly ONE ``write_record`` carrying status, question and
+    binding together. That last part used to be a claim the shape did not
+    deliver: the status came from ``refresh_record``'s write and the
+    question/binding from a conditional second one.
+
+    It also closes a TOCTOU gap. The withhold decision used to be computed
+    from a snapshot taken BEFORE ``refresh_record``'s own internal re-read,
+    so the body written was not the body decided on and two racing events
+    could decide against stale state while writing against fresh state. Both
+    now derive from one snapshot.
+
+    NON-GOAL, deliberate: registry writes remain last-writer-wins.
+    ``session_registry.py::write_record`` is an atomic whole-body replace
+    with no compare-and-swap, so folding two writes into one strictly
+    NARROWS the clobber surface without eliminating it. A CAS/mtime protocol
+    would change the write contract for every registry caller
+    (spawn-claude.sh's launching/exit/refresh/set-display verbs, the reaper,
+    the cockpit) and belongs in its own change.
 
     While the record is still LAUNCHING AND unbound, this event's provenance
     is UNKNOWABLE (``_in_unbound_launch_window``), so NOTHING it carries is
@@ -1450,29 +1468,56 @@ def _run_status_refresh_and_retitle(
     identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
-    prior = _read_record_snapshot(slug, root).record
-    # Decide the launch window BEFORE the refresh: refresh_record is a
-    # read-modify-WRITE, so passing the status here at all would already have
-    # mutated the spawn-created record by the time any later guard ran.
-    # status=None makes it a pure heartbeat bump, leaving status untouched.
-    in_launch_window = prior is not None and _in_unbound_launch_window(
-        prior
-    ) and _withhold_from_launching(prior, env, probes=probes)
-    record = session_registry.refresh_record(
-        slug, root=root, status=None if in_launch_window else status
+    # THE event's only read of the slug it writes: the ownership probe
+    # already read this record on the adopt path, so reuse its snapshot;
+    # every other path (fork, hand-launched) reads here for the first time.
+    snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
+
+    if snapshot.unreadable:
+        # FAULT LANE, deliberately left on the two-read shape. A record that
+        # EXISTS but cannot be read must not be synthesized over, so this
+        # hands the decision back to refresh_record, whose contract is to
+        # re-read and either succeed on a transient fault or propagate
+        # CorruptSessionRecord to main()'s blanket except -- "a *corrupt*
+        # existing body is NOT treated as absent". One extra read on a path
+        # that is rare by construction buys byte-identical fail-soft
+        # behaviour; the fast path below is taken for OK and ABSENT only.
+        record = session_registry.refresh_record(slug, root=root, status=status)
+        bound = may_bind and _bind_claude_session_id(
+            record, hook_input, probes=probes
+        )
+        if question is not None:
+            record.question = question
+        if question is not None or bound:
+            session_registry.write_record(record, root=root)
+        return osc_retitle_sequence(status, hook_display_title(identity, env, record))
+
+    prior = snapshot.record
+    # Decide the launch window BEFORE applying the status: the decision and
+    # the body written below both derive from THIS one snapshot, so they can
+    # never disagree. status=None makes the refresh a pure heartbeat bump,
+    # leaving the spawn-created record's status untouched.
+    # (_in_unbound_launch_window already answers False for prior is None.)
+    in_launch_window = _in_unbound_launch_window(prior) and _withhold_from_launching(
+        prior, env, probes=probes
     )
-    # Bind on the record refresh_record RETURNED (post-status-flip), and write
-    # after both mutations, so status, question and binding land atomically.
-    bound = (
-        not in_launch_window
-        and may_bind
-        and _bind_claude_session_id(record, hook_input, probes=probes)
+    record = session_registry.apply_refresh(
+        slug, prior, status=None if in_launch_window else status
     )
-    stamp_question = question is not None and not in_launch_window
-    if stamp_question:
+    # Bind on the post-status-flip record and write after every mutation, so
+    # status, question and binding land in ONE body -- atomically in fact,
+    # not merely in intent. The guards are unchanged: a withheld event never
+    # binds, and an adopted-but-UNPROVEN one (may_bind False) never claims
+    # the record. Only the return value is now unused -- the single write
+    # below is unconditional, so nothing has to ask whether it bound.
+    if not in_launch_window and may_bind:
+        _bind_claude_session_id(record, hook_input, probes=probes)
+    if question is not None and not in_launch_window:
         record.question = question
-    if stamp_question or bound:
-        session_registry.write_record(record, root=root)
+    # Unconditional: apply_refresh no longer writes the mtime heartbeat
+    # itself, and that bump is owed on EVERY event, a withheld one included
+    # -- it is the whole point of withholding rather than skipping.
+    session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 
