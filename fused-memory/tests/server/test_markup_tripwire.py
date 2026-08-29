@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
@@ -42,6 +43,7 @@ from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
     MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
+    _recorded_outcome,
     emit_markup_storm_escalation,
     markup_override_requested,
     strip_markup_override,
@@ -743,6 +745,147 @@ class TestEmitMarkupStormEscalation:
         assert 'toolcall-markup-containment-prd.md' in payload['detail'], (
             f'must still route at the live successor PRD: {payload!r}'
         )
+
+    # -- the record names its own caller (task 4805) ---------------------
+
+    #: A storm carrying the attribution ``_record_storm`` now resolves. The
+    #: ``crossing_*`` axes name the ONE call that crossed the threshold;
+    #: ``callers`` names every distinct caller seen in the window. Two
+    #: different questions, two keys — on a shared server like this one a
+    #: burst can be several agents at once, so a record naming only whoever
+    #: tripped the wire would be confidently misattributed.
+    _ATTRIBUTED_STORM = {
+        **_REJECTED_STORM,
+        'crossing_agent_id': 'claude-task-4805-implementer',
+        'crossing_subject_task_id': '4805',
+        'crossing_subject_agent_role': 'implementer-4805',
+        'callers': ["task_id='4744'", "task_id='4805'"],
+    }
+
+    def test_the_record_names_the_crossing_caller_and_the_window(self, tmp_path):
+        """The defect this task closes, at this filer.
+
+        The record's only route to the caller was its ``suggested_action`` — a
+        grep of the guard's log lines — and four measured
+        ``esc-plan-tools-markup-storm-*`` records were read at 6-7 days old,
+        past this host's ~72h ``journald --user`` retention. So the answer has
+        to be ON the record.
+
+        Anchored as WHOLE LINES, exactly as the ``count=4`` row above is: a
+        bare substring would be satisfied by a digit or a fragment inside the
+        interpolated ``tmp_path``.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        lines = self._filed(tmp_path, self._ATTRIBUTED_STORM)['detail'].splitlines()
+
+        assert "crossing_agent_id='claude-task-4805-implementer'" in lines, lines
+        assert "crossing_subject_task_id='4805'" in lines, lines
+        assert "crossing_subject_agent_role='implementer-4805'" in lines, lines
+        assert 'callers=' + repr(["task_id='4744'", "task_id='4805'"]) in lines, lines
+
+    def test_the_new_keys_tolerate_the_degenerate_shapes(self, tmp_path):
+        """Extends ``test_tolerates_a_storm_dict_missing_keys`` to the new keys.
+
+        The docstring commits this filer to ``{}`` and the legacy
+        ``{'count': 9}``, both of which are live: the first is what that test
+        files, the second is the anchor squatter
+        ``tests/test_markup_guard_fused_memory.py`` files. A new key read
+        without ``.get`` would turn the shape this record is most needed for
+        into a raise.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        for storm in ({}, {'count': 9}):
+            queue_root = tmp_path / f'root-{len(storm)}'
+            queue_root.mkdir()
+
+            lines = self._filed(queue_root, storm)['detail'].splitlines()
+
+            assert 'crossing_agent_id=None' in lines, lines
+            assert 'crossing_subject_task_id=None' in lines, lines
+            assert 'crossing_subject_agent_role=None' in lines, lines
+            assert 'callers=None' in lines, lines
+
+    def test_a_caller_supplied_newline_cannot_spoof_the_outcome_line(self, tmp_path):
+        """The ``!r`` requirement, made checkable.
+
+        ``_recorded_outcome`` scans an already-open record's ``detail`` for the
+        FIRST line starting with ``outcome=`` and ``ast.literal_eval``s the
+        rest. That read is what tells an operator a later burst folded into a
+        record naming a DIFFERENT outcome — the one channel the docstring says
+        must stay honest, because the queue holds a single record. The new
+        fields carry caller-supplied strings, so an unescaped newline could
+        inject a spoofed line and silently disable that warning.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        spoof = 'evil\noutcome=' + repr('repaired')
+        payload = self._filed(
+            tmp_path,
+            {**_REJECTED_STORM, 'crossing_agent_id': spoof, 'callers': [spoof]},
+        )
+
+        assert spoof not in payload['detail'], 'the raw newline landed verbatim'
+        # Read back through the REAL consumer, not by eyeballing the body: what
+        # matters is that the fold-mismatch warning still sees the true outcome.
+        assert _recorded_outcome(
+            SimpleNamespace(detail=payload['detail'])
+        ) == 'rejected'
+
+    def test_the_remedy_leads_with_the_record_and_not_with_a_grep(self, tmp_path):
+        """The instruction has to be dischargeable from the record itself.
+
+        ``suggested_action`` is compact-projected beside ``summary`` (``detail``
+        is dropped BY NAME), so it is where a triager actually reads the remedy
+        — and it told them to grep a journal that on a per-agent stdio server
+        never receives those lines at all, and elsewhere keeps them for ~72h
+        while these records are read days later.
+
+        The grep tokens SURVIVE as corroboration:
+        ``test_the_remedy_names_the_token_its_producers_actually_log`` asserts
+        ``markup_guard_storm`` appears across detail+suggested_action, and
+        demoting the instruction must not delete the token.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        payload = self._filed(tmp_path, self._ATTRIBUTED_STORM)
+        action = payload['suggested_action']
+
+        assert 'crossing_' in action, (
+            f'the remedy must point at the attribution the record carries: {action!r}'
+        )
+        assert 'callers' in action, action
+        assert 'identify the leaking caller from the markup guard logs' not in action, (
+            f'the undischargeable instruction is still the headline: {action!r}'
+        )
+        # The routing survives — the grep is demoted, not the destination.
+        assert 'plans/toolcall-markup-containment-prd.md' in action, action
+        assert '3083 is done and closed to appends' in action, action
+
+    def test_the_remedy_is_still_static(self, tmp_path):
+        """Never interpolated with the resolved values, and the reason is old.
+
+        The existing comment records it: an operator-facing hint whose text
+        varies with the data cannot be grepped without already knowing the
+        answer, and ``test_each_outcome_names_itself_and_no_other`` depends on
+        this field naming no outcome of its own. So the remedy names the KEYS
+        to read, never their values — the values live in ``detail``.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        attributed = self._filed(tmp_path, self._ATTRIBUTED_STORM)
+        degenerate_root = tmp_path / 'degenerate'
+        degenerate_root.mkdir()
+        degenerate = self._filed(degenerate_root, {})
+
+        assert attributed['suggested_action'] == degenerate['suggested_action']
+        assert '4805' not in attributed['suggested_action']
 
     # -- the anchor parameter (task 4458) -------------------------------
 
