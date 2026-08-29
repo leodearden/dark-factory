@@ -76,8 +76,10 @@ SYSTEMCTL_LOG = "systemctl-calls.log"
 
 # setup-host.sh defines `_parity_verdict` once, below the log shims and above
 # every parity call site, so a sliced block that calls it needs it in scope.
-_VERDICT_HELPER_START = "_parity_verdict() {"
-_VERDICT_HELPER_END = "\n}\n"
+# Named, not spelled out as start/end markers: `slice_shell_function` already
+# derives both endpoints of a shell definition from the name, and a second
+# hand-written pair here would be the same slice expressed twice.
+_VERDICT_HELPER = "_parity_verdict"
 
 
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
@@ -93,16 +95,16 @@ def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
     "reports green because it never ran" class this whole gate family exists to
     catch, reproduced one level up in its own harness.
 
-    Slicing also fails LOUDLY (slice_section asserts, naming the marker) if the
-    helper is ever renamed, rather than leaving the suite testing a helper the
-    installer no longer has.
+    Slicing also fails LOUDLY (`slice_section`, under `slice_shell_function`,
+    asserts naming the marker) if the helper is ever renamed, rather than
+    leaving the suite testing a helper the installer no longer has.
     """
     return (
         "set -euo pipefail\n"
         f'REPO_ROOT="{repo_root}"\n'
         f'UNIT_DIR="{unit_dir}"\n'
         'mkdir -p "$UNIT_DIR"\n'
-    ) + _SHIMS + slice_section(_VERDICT_HELPER_START, _VERDICT_HELPER_END)
+    ) + _SHIMS + slice_shell_function(_VERDICT_HELPER)
 
 
 def setup_host_text() -> str:
