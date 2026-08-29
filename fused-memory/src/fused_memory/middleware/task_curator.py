@@ -986,6 +986,21 @@ class TaskCurator:
         genuinely-fixed bug-fix task. ``payload_hash`` is accepted only for
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
+        Both blocking halves of this method run off the event-loop thread
+        (task 4201, 2026-08-29): the one-shot registry load and the
+        per-match live-source re-verification are each dispatched via
+        ``asyncio.to_thread``. The textual match (``match_candidate``) is
+        deliberately kept ON the loop — it is pure string work with no I/O,
+        so the common case of a non-matching candidate pays no thread-pool
+        dispatch. Measured on the shipped registry: registry load ~9.9ms
+        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
+        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
+        cited file; thread-dispatch overhead ~67us. This resolves an
+        instance of INV-8 ``loop-thread-occupancy-bounded``
+        (docs/legibility/design-invariants.md), mirroring the offload
+        pattern already used by :meth:`_maybe_flag_unverified_claims` and
+        the claim-verification block in :meth:`curate_batch_prepared`.
+
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable (one WARNING logged).
