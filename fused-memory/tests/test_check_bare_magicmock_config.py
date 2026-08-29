@@ -1373,13 +1373,14 @@ class TestAllScannedTestDirsClean:
 
     The checker is wired into seven package ``orchestrator.yaml`` lint_commands,
     ``dark-factory-orchestrator.yaml``, and ``hooks/project-checks``.  Adding Rule B
-    put a hot, position-blind rule in front of all of them at once, so a single
-    unhandled site turns a package's lint_command red and stalls the merge lane
-    repo-wide.
+    — and then Rule C (task 4246) — put a hot, position-blind rule in front of all of
+    them at once, so a single unhandled site turns a package's lint_command red and
+    stalls the merge lane repo-wide.
 
-    This test proves the widening left every one of those callers green.  It is the
-    counterpart to TestDataclassDoubleDebtBaseline: that class pins WHAT is
-    grandfathered, this one pins that nothing else was missed.
+    This test proves each widening left every one of those callers green.  It is the
+    counterpart to TestDataclassDoubleDebtBaseline and
+    TestWallClockDeadlineDebtBaseline: those classes pin WHAT is grandfathered, this
+    one pins that nothing else was missed.
     """
 
     _SCANNED_DIRS = (
@@ -1410,8 +1411,9 @@ class TestAllScannedTestDirsClean:
             'lint_commands, dark-factory-orchestrator.yaml, hooks/project-checks). '
             'Any non-zero exit here means at least one package lint_command is RED.\n'
             'Remedy depends on the rule:\n'
-            '  bare-magicmock       → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
+            '  bare-magicmock        → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
             '  bare-dataclass-double → _fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
+            '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT\n'
             f'Scanned: {present}\n'
             f'Violations:\n{result.stdout}\n'
             f'stderr:\n{result.stderr}'
@@ -2033,4 +2035,117 @@ class TestDebtBaselineIsolation:
         violations = _rule_c(_RULE_C_SOURCE, entry)
         assert len(violations) == 2, (
             f'Rule C must be unaffected by a Rule B debt entry; got {violations!r}'
+        )
+
+
+class TestWallClockDeadlineBaselineIntegrity:
+    """The Rule C baseline is a MEASUREMENT of the real repo, not a list of literals.
+
+    Every assertion here recomputes against the live source with the checker's own
+    predicates.  A baseline asserted only from literals drifts silently: an entry
+    whose file was deleted or renamed becomes a blanket suppression for a path
+    nothing occupies — which would grandfather a NEW file created there — and a
+    budget that drifted BELOW its file makes that package's lint_command red.
+    """
+
+    def _live_count(self, path: Path, entry: str) -> int:
+        """Recount *path*'s Rule C violations with the checker's own predicates."""
+        source = path.read_text(encoding='utf-8')
+        lines = source.splitlines()
+        return sum(
+            len(_checker._wall_clock_deadline_violations(node, lines, entry))
+            for node in ast.walk(ast.parse(source, filename=str(path)))
+            if isinstance(node, ast.Call)
+        )
+
+    def test_every_debt_entry_resolves_to_an_existing_file(self):
+        """A deleted or renamed file must not leave a stale blanket suppression behind."""
+        missing = [
+            entry
+            for entry in _checker._WALL_CLOCK_DEADLINE_DEBT
+            if not (_REPO_ROOT / entry).is_file()
+        ]
+        assert missing == [], (
+            f'Rule C debt baseline entries no longer exist in the repo: {missing}. '
+            'A stale entry silently suppresses Rule C for a path nothing occupies — '
+            'and would grandfather a NEW file created at that path. Remove them.'
+        )
+
+    def test_recorded_budgets_are_not_below_the_live_per_file_census(self):
+        """Every recorded budget still covers what its file actually carries.
+
+        This is the shrink-only invariant measured against the real repo rather than
+        asserted from a literal. A budget that drifted BELOW its file would make
+        orchestrator's lint_command red; one far above would be silent slack.
+        """
+        overruns = []
+        for entry, budget in _checker._WALL_CLOCK_DEADLINE_DEBT.items():
+            path = _REPO_ROOT / entry
+            if not path.is_file():
+                continue  # covered by test_every_debt_entry_resolves_to_an_existing_file
+            actual = self._live_count(path, entry)
+            if actual > budget:
+                overruns.append(f'{entry}: recorded {budget}, found {actual}')
+        assert overruns == [], (
+            'Rule C debt budgets are below the live census, so these files are RED:\n  '
+            + '\n  '.join(overruns)
+            + '\nThe baseline is shrink-only: migrate the new site(s) onto '
+            'wait_responsive(...) with a label=, or derive the bound from '
+            'MERGE_RESULT_TIMEOUT, rather than raising the recorded number.'
+        )
+
+    def test_recorded_budgets_match_the_live_census_exactly(self):
+        """No entry carries silent slack above its file's live count.
+
+        Slack is not harmless: a budget of 10 on a file carrying 6 lets four new
+        wall-clock waits land without ever tripping the gate. The baseline is a
+        measurement, so it must equal the measurement.
+        """
+        slack = []
+        for entry, budget in _checker._WALL_CLOCK_DEADLINE_DEBT.items():
+            path = _REPO_ROOT / entry
+            if not path.is_file():
+                continue
+            actual = self._live_count(path, entry)
+            if actual < budget:
+                slack.append(f'{entry}: recorded {budget}, found only {actual}')
+        assert slack == [], (
+            'Rule C debt budgets carry slack above the live census:\n  '
+            + '\n  '.join(slack)
+            + '\nLower each recorded number to the measured one — slack lets that many '
+            'new wall-clock waits land silently.'
+        )
+
+    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self):
+        """The baseline is complete: every offending file in the seven scanned dirs is listed.
+
+        The complement of test_every_debt_entry_resolves_to_an_existing_file — that one
+        catches stale entries, this one catches a file the census missed (e.g. one added
+        on main since the measurement). Without it the repo-wide gate would be the only
+        signal, and it reports a wall of text rather than a filename.
+        """
+        listed = set(_checker._WALL_CLOCK_DEADLINE_DEBT)
+        unlisted = []
+        for scanned in TestAllScannedTestDirsClean._SCANNED_DIRS:
+            root = _REPO_ROOT / scanned
+            if not root.is_dir():
+                continue
+            for path in sorted(set(root.rglob('test_*.py')) | set(root.rglob('conftest.py'))):
+                entry = str(path.relative_to(_REPO_ROOT))
+                if entry in listed:
+                    continue
+                count = self._live_count(path, entry)
+                if count:
+                    unlisted.append(f'{entry}: {count}')
+        assert unlisted == [], (
+            'These scanned files carry Rule C violations but are NOT on the baseline, '
+            'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
+        )
+
+    def test_the_baseline_totals_the_measured_census(self):
+        """618 violations across 20 files — the pre-1 measurement, pinned."""
+        debt = _checker._WALL_CLOCK_DEADLINE_DEBT
+        assert len(debt) == 20, f'expected 20 census files; got {len(debt)}'
+        assert sum(debt.values()) == 618, (
+            f'expected the measured 618 violations; got {sum(debt.values())}'
         )
