@@ -1340,6 +1340,65 @@ class TestGitFilesMissingOnRef:
 
 
 @pytest.mark.asyncio
+class TestGitSecondParentCommits:
+    """_git_second_parent_commits walks the commits a cited merge's second
+    parent brought in — the new git fact task 4706 adds so the classifier
+    can tell a coalesced merge from a genuine misattribution.
+
+    Referenced as ``_mod._git_second_parent_commits(...)`` throughout rather
+    than bound at module top-level alongside the other five ``_git_*``
+    bindings (see :54-58 above): binding a not-yet-existing helper at import
+    time would turn this RED into a module-collection-time AttributeError
+    that fails every test in this file, not just the five below.
+    """
+
+    async def test_merge_returns_sha_message_pairs_for_second_parent(self, repo_facts):
+        """Covers exactly the three commits the coalesced branch brought
+        in — and, by being an exact-set match, implicitly excludes every
+        first-parent-side commit (main's own history, including c_merge)."""
+        root, shas = repo_facts
+        pairs = await _mod._git_second_parent_commits(str(root), shas['c_coalesce_merge'])
+        result_shas = {sha for sha, _message in pairs}
+        assert result_shas == {
+            shas['c_coalesced_other'], shas['c_coalesced_self'], shas['c_coalesced_slash'],
+        }
+        # Full body, not just the subject line.
+        self_message = next(msg for sha, msg in pairs if sha == shas['c_coalesced_self'])
+        assert 'Brings in the deliverable this task actually shipped.' in self_message
+
+    async def test_single_parent_commit_returns_empty(self, repo_facts):
+        """`git log <sha>^1..<sha>^2` on a single-parent commit is
+        unresolvable — verified empirically: git exits 128 with `fatal:
+        ambiguous argument`, which the wrapper's `rc != 0` branch swallows
+        to the safe `[]` default rather than raising."""
+        root, shas = repo_facts
+        pairs = await _mod._git_second_parent_commits(str(root), shas['c_keep_drop'])
+        assert pairs == []
+
+    async def test_bogus_sha_returns_empty(self, repo_facts):
+        root, _shas = repo_facts
+        pairs = await _mod._git_second_parent_commits(str(root), 'f' * 40)
+        assert pairs == []
+
+    async def test_nonexistent_project_root_returns_empty(self, tmp_path):
+        """The never-raises contract the task demands: 'Never let a git
+        failure flip a verdict.'"""
+        pairs = await _mod._git_second_parent_commits(
+            str(tmp_path / 'does-not-exist'), 'f' * 40,
+        )
+        assert pairs == []
+
+    async def test_walk_is_capped(self, repo_facts, monkeypatch):
+        """Pins that the cap is read at call time and actually passed to
+        git, not merely declared — c_coalesce_merge's second parent has
+        three commits; capping at two must yield exactly two pairs."""
+        root, shas = repo_facts
+        monkeypatch.setattr(_mod, '_SECOND_PARENT_WALK_CAP', 2)
+        pairs = await _mod._git_second_parent_commits(str(root), shas['c_coalesce_merge'])
+        assert len(pairs) == 2
+
+
+@pytest.mark.asyncio
 class TestGitFactsGather:
     """GitFacts.gather() aggregates the four _git_* wrappers per commit, and
     short-circuits all of them when the commit is not on the ref at all."""
