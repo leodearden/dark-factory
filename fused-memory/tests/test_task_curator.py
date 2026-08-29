@@ -5154,6 +5154,83 @@ class TestCuratorPremiseRefutedDrop:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-4201 RED: TestPremiseGuardRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestPremiseGuardRunsOffEventLoop:
+    """Tests that _maybe_premise_refuted_drop's blocking filesystem/YAML work
+    (per-candidate live-source re-verification, and the lazy registry load)
+    runs OFF the event-loop thread, so it cannot stall the fused-memory event
+    loop or any other coroutine sharing it — e.g. a concurrent project's
+    curate() call, since TaskInterceptor._get_curator memoises a single
+    TaskCurator while TaskInterceptor._curator_lock is keyed per-project.
+    """
+
+    async def test_premise_verification_runs_off_event_loop(self, tmp_path):
+        """RED: per-candidate live-source re-verification must be offloaded.
+
+        Asserts thread IDENTITY rather than a wall-clock timing threshold:
+        identity is exact and cannot flake under CI contention, whereas a
+        timing threshold would need a numeric bound with no achievability
+        basis (same rationale as test_recon_claim_verification_wiring.py's
+        test_probe_construction_runs_off_event_loop, and the wall-clock-proxy
+        anti-pattern documented at
+        orchestrator/tests/test_liveness_boundary_gate.py:345-358).
+
+        Patches verify_premise_refuted — the symbol that actually performs
+        the blocking read_text — rather than premise_refuted_entry, so this
+        pins behaviour (the work runs off-loop) rather than call shape; it
+        holds whether the implementation wraps the composite call or
+        decomposes it into match-then-verify.
+        """
+        import threading
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        verify_threads: list[int] = []
+
+        def recording_verify(entry, source_root):
+            verify_threads.append(threading.get_ident())
+            return True
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=recording_verify,
+        ):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert verify_threads and all(tid != loop_thread_id for tid in verify_threads)
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
 # ──────────────────────────────────────────────────────────────────────────────
 
