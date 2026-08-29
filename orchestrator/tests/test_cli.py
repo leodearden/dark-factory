@@ -2180,15 +2180,58 @@ def test_cancel_verify_real_impl_dead_pgid(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.1) -> bool:
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
-    import time
+def _wait_for_pgid_file_or_report_crash(
+    pgf: 'Path',
+    child: 'subprocess.Popen',
+    *,
+    timeout: float = 30.0,
+    interval: float = 0.1,
+) -> None:
+    """Poll for *pgf* to appear; fail promptly and distinctly if *child* has
+    already exited instead of burning the full *timeout* budget.
+
+    verify-merge writes its pgid file before doing any work and removes it
+    in a `finally` (orchestrator/src/orchestrator/cli.py) -- so a subprocess
+    that crashes fast writes-and-removes the file well inside a single poll
+    interval, and a naive poll-then-timeout mislabels that crash as a
+    timeout. Checking child.poll() on every iteration lets a crash (nonzero
+    exit) fail immediately with an honest headline; a subprocess still
+    running after the budget remains a genuine timeout (tasks 2350 and 2770
+    widened this budget repeatedly for load flakiness, not for crash
+    attribution -- do not fold that budget into this change). A fast
+    *successful* exit could also legitimately race the pgid-file window, so
+    the crash/timeout split is on exit code, not merely on exit.
+    """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
+    while True:
+        if pgf.exists():
+            return
+        exit_code = child.poll()
+        if exit_code is not None:
+            # Re-check once more: a fast SUCCESSFUL exit can legitimately
+            # race the write-then-remove window.
+            if pgf.exists():
+                return
+            if exit_code != 0:
+                stdout, stderr = child.communicate(timeout=10)
+                pytest.fail(
+                    f'verify-merge exited with code {exit_code} before/without '
+                    f'writing a stable pgid file (crash, not a timeout)\n'
+                    f'STDOUT: {stdout.decode()[:2000]!r}\n'
+                    f'STDERR: {stderr.decode()[:2000]!r}'
+                )
+            break  # exit_code == 0 -- fast successful race; fall through to timeout report
+        if time.monotonic() >= deadline:
+            break
         time.sleep(interval)
-    return False
+
+    stdout, stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
+    pytest.fail(
+        f'verify-merge did not write pgid file within {timeout:.0f}s '
+        f'(subprocess poll={child.poll()!r})\n'
+        f'STDOUT: {stdout.decode()[:2000]!r}\n'
+        f'STDERR: {stderr.decode()[:2000]!r}'
+    )
 
 
 def _wait_pgid_gone(pgid: int, *, timeout: float = 20.0, interval: float = 0.1) -> None:
@@ -2311,14 +2354,11 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     pgid_val = None
     try:
         # --- Poll for the pgid file (written before asyncio.run) ---
-        if not _wait_for_file_cli(pgf, timeout=30):
-            _debug_stdout, _debug_stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
-            pytest.fail(
-                f'verify-merge did not write pgid file within 30s '
-                f'(subprocess poll={child.poll()!r})\n'
-                f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
-                f'STDERR: {_debug_stderr.decode()[:2000]!r}'
-            )
+        # Distinguishes a crashed verify-merge subprocess (reported
+        # immediately, exit code != 0) from a genuine timeout (subprocess
+        # still running after the budget) -- see
+        # _wait_for_pgid_file_or_report_crash's docstring.
+        _wait_for_pgid_file_or_report_crash(pgf, child, timeout=30)
 
         # Save pgid BEFORE cancel-verify removes the file
         pgid_val = int(pgf.read_text().strip())
