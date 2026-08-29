@@ -769,11 +769,36 @@ def test_required_max_task_dirs_is_falsifiable_against_a_known_peak(tmp_path):
         "the derived-bound comparison must be able to FAIL — a guard that "
         "cannot go red is measuring nothing"
     )
-    assert required >= required  # and it clears when the cap is adequate
-    assert 10 * required >= required
+    # ...and it CLEARS for an adequate cap. Both sides use the shipped
+    # constant rather than a value this test made up, so neither direction is
+    # arithmetic on locally-chosen numbers.
+    assert required <= gct.DEFAULT_MAX_TASK_DIRS
+
+    # AND THE SHIPPED CAP ITSELF IS REACHABLE. The two assertions above show
+    # the COMPARISON can go either way; this one shows the live guard's actual
+    # subject can. A plausible throughput rise — ~2x today's measured peak,
+    # against a peak that already moved 71 -> ~90/day in the 15 days between
+    # the PRD's measurement and this task's — really does exceed the cap we
+    # ship. Without this, raising DEFAULT_MAX_TASK_DIRS to 10**9 would leave
+    # every test in this file green while the live guard became permanently
+    # vacuous, which is the exact failure mode this section exists to rule out.
+    doubled_peak = 200
+    required_at_doubled_peak = gct.required_max_task_dirs(
+        doubled_peak, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+    assert required_at_doubled_peak > gct.DEFAULT_MAX_TASK_DIRS, (
+        f"a {doubled_peak}/day peak requires "
+        f"{required_at_doubled_peak} dirs but DEFAULT_MAX_TASK_DIRS is "
+        f"{gct.DEFAULT_MAX_TASK_DIRS} — the shipped cap is now so large that "
+        "no realistic archive rate can trip the live derived-bound guard, "
+        "which makes that guard vacuous. Either the cap was raised far beyond "
+        "its derivation, or this test's reference peak needs re-deriving from "
+        "a fresh measurement (see the RETENTION_SAFETY_FACTOR comment in "
+        "scripts/gc_agent_transcripts.py)."
+    )
 
 
-def test_required_max_task_dirs_strictly_increases_with_peak_rate(tmp_path):
+def test_required_max_task_dirs_strictly_increases_with_peak_rate():
     """(c) A throughput RISE genuinely raises the bar; it is not absorbed.
 
     This is the property that makes the cap re-derive rather than sit green
@@ -1104,6 +1129,66 @@ def test_count_cap_effective_window_tracks_the_newest_count_only_drop():
     assert block["truncated"] == 3
     assert block["oldest_dropped_age_days"] == 200.0
     assert block["effective_window_days"] == 10.0
+
+
+def test_count_cap_bound_with_no_measurable_age_reports_unknown(caplog, monkeypatch, tmp_path):
+    """AMENDMENT (review): the never-raise defensive branch is EXERCISED.
+
+    `bound` is derived from the prune REASONS while the ages come from joining
+    those paths back to their scanned mtimes, so a caller that hands
+    summarize_count_cap a decision referencing a path absent from `task_dirs`
+    is bound with no age to report. That is a programming error, not an
+    operational one — but this module's contract is never-raise / always-exit-0
+    and loud-over-silent, so the documented response is to say `unknown`
+    LOUDLY, not to crash and not to fall silent about a truncated window.
+
+    Nothing exercised it before, which left a `%d`-style formatting slip in the
+    one code path that is supposed to guarantee never-raise discoverable only
+    in production. Covered here in both halves: the pure block, and the alarm
+    actually rendering through main().
+    """
+    ghost = Path("/archive/ghost")
+    decision = gct.GcDecision(keep=[], prune=[(ghost, gct.REASON_COUNT)])
+
+    # (a) the pure summariser: bound on the REASON, ages honestly absent.
+    block = gct.summarize_count_cap([], decision, NOW, 1, 90)
+    assert block["bound"] is True
+    assert block["pruned"] == 1          # counted from the reason, not the join
+    assert block["truncated"] == 1
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+    assert block["age_axis_disabled"] is False
+    assert set(block) == COUNT_CAP_KEYS
+
+    assert gct._fmt_days(None) == "unknown"
+    assert gct._fmt_days(2.0) == "2.0"    # a real measurement still renders
+
+    # (b) end-to-end through main(), which is where the format string lives.
+    # scan_task_dirs returns nothing, so every prune path is unjoinable.
+    monkeypatch.setattr(gct, "scan_task_dirs", lambda root: [])
+    monkeypatch.setattr(
+        gct, "select_prunable", lambda *args, **kwargs: decision
+    )
+    monkeypatch.setattr(
+        gct, "prune_task_dirs", lambda records, *, dry_run: gct.PruneOutcome()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gc_agent_transcripts"):
+        assert gct.main(
+            ["--root", str(tmp_path), "--now", str(NOW),
+             "--max-task-dirs", "1", "--max-age-days", "90", "--check"]
+        ) == 0
+
+    alarms = [
+        record.getMessage()
+        for record in caplog.records
+        if COUNT_CAP_MARKER in record.getMessage()
+    ]
+    assert len(alarms) == 1, f"expected exactly one alarm, got {alarms!r}"
+    # It renders — no ValueError/TypeError from the format string — and it says
+    # `unknown` rather than a fabricated 0.0.
+    assert "unknown" in alarms[0]
+    assert "0.0 days" not in alarms[0]
 
 
 def test_gc_report_carries_a_stable_count_cap_block_bound_and_unbound():
