@@ -1259,10 +1259,13 @@ def test_two_projects_claiming_the_same_port_still_allocate_past_it(
         cfg = parent / name / "dark-factory-orchestrator.yaml"
         assert fep.escalation_port(cfg) == 8100
 
-    reported = [name for name in ("proj-a", "target") if name in err]
-    assert reported == ["proj-a", "target"], (
-        "both claimants on the collided port 8100 must be reported "
-        f"(see tkt_0RSH4GD31ZE7FQSP1844TQY6VY), got {reported}"
+    # Pin co-location, not just presence: both names must appear on 8100's OWN row
+    # under "Claimed by existing project configs:", not merely somewhere in stderr
+    # (which a regression scattering them across separate rows could still satisfy).
+    row = next(line for line in err.splitlines() if line.strip().startswith("8100"))
+    assert "proj-a" in row and "target" in row, (
+        "both claimants on the collided port 8100 must be reported on that port's row "
+        f"(see tkt_0RSH4GD31ZE7FQSP1844TQY6VY), got {row!r}"
     )
 
 
