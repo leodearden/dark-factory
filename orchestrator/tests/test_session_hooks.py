@@ -10,6 +10,7 @@ skills/spawn/hooks/*.sh entrypoints end-to-end.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import logging
@@ -3719,3 +3720,93 @@ def test_nested_session_start_walks_proc_at_most_once(
     )
     assert forked.claude_session_id == 'uuid-nested'
     assert forked.parent_session_id == slug
+
+
+# ---------------------------------------------------------------------------
+# _RecordSnapshot / _read_record_snapshot -- the TRI-STATE read (task 4662)
+#
+# One read must serve two consumers that want OPPOSITE things from a failed
+# one. The ownership probe must fail soft to "adopt" (_env_slug_ownership:
+# "every failure mode resolves to adopt (True), never to fork"), so it treats
+# corrupt and absent alike. The refresh must NOT: session_registry's
+# refresh_record guarantees "a *corrupt* existing body is NOT treated as
+# absent". A two-state record|None would let a hook synthesize a fresh record
+# over a corrupt body -- silent loss of the record holding role/prompt/
+# result_file. Hence ABSENT and UNREADABLE are distinct states.
+# ---------------------------------------------------------------------------
+
+
+def test_record_snapshot_reads_an_existing_record(tmp_path: Path) -> None:
+    slug = 'session-cockpit-4662010'
+    _launching_record(slug, tmp_path, pid=4662010)
+
+    snapshot = sh._read_record_snapshot(slug, tmp_path)
+
+    assert snapshot.slug == slug
+    assert snapshot.unreadable is False
+    assert snapshot.record is not None
+    assert snapshot.record.to_dict() == sr.read_record(slug, root=tmp_path).to_dict()
+
+
+def test_record_snapshot_absent_is_not_unreadable_and_is_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ABSENT is the state that MAY be synthesized over -- and it is routine.
+
+    An ordinary fresh spawn must log nothing, matching _env_slug_ownership's
+    existing dedicated FileNotFoundError arm ("so an ordinary fresh spawn
+    logs nothing").
+    """
+    with caplog.at_level(logging.WARNING):
+        snapshot = sh._read_record_snapshot('session-cockpit-4662011', tmp_path)
+
+    assert snapshot.record is None
+    assert snapshot.unreadable is False
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_record_snapshot_corrupt_body_is_unreadable_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    slug = 'session-cockpit-4662012'
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('not-json{{{')
+    with pytest.raises(sr.CorruptSessionRecord):
+        sr.read_record(slug, root=tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        snapshot = sh._read_record_snapshot(slug, tmp_path)
+
+    assert snapshot.record is None
+    assert snapshot.unreadable is True
+    # Degradation is never silent (repo's no-silent-fail-soft norm).
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_record_snapshot_arbitrary_oserror_is_unreadable_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+
+    with caplog.at_level(logging.WARNING):
+        snapshot = sh._read_record_snapshot('session-cockpit-4662013', tmp_path)
+
+    assert snapshot.record is None
+    assert snapshot.unreadable is True
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_record_snapshot_is_frozen(tmp_path: Path) -> None:
+    """Immutable: a snapshot is one observation, not a mutable scratchpad."""
+    slug = 'session-cockpit-4662014'
+    _launching_record(slug, tmp_path, pid=4662014)
+    snapshot = sh._read_record_snapshot(slug, tmp_path)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.record = None  # type: ignore[misc]
