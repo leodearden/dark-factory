@@ -85,8 +85,14 @@ class MarkupSinkSpec:
     #: middleware resolves ``agent_id`` from arguments named ``agent_id`` /
     #: ``project_root`` / ``project_id``, and no tool on either of these
     #: servers declares any of the three, so that field is structurally
-    #: ``None`` here (it rides in the detail as the null it is, rather than
-    #: being guessed at).
+    #: ``None`` here (it rides in the detail as the null it is — as
+    #: ``agent_id`` on a residue record and as ``crossing_agent_id`` on a
+    #: storm record — rather than being guessed at).
+    #:
+    #: The axis that DOES resolve on these servers is the SUBJECT, and it does
+    #: not come from the middleware at all: ``make_escalation_sink``'s
+    #: ``subject_task_id`` thunk supplies it per record, and both filers render
+    #: it first. That asymmetry is why the thunk exists.
     agent_role: str
 
     #: The queue routing key for EVERY residue record — a NON-TASK anchor,
@@ -309,19 +315,44 @@ def residue_detail(
     ])
 
 
-def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
-    """The burst alarm's body — the window's own numbers, then what to do.
+def storm_detail(
+    record: Mapping[str, Any], subject_task_id: str, spec: MarkupSinkSpec
+) -> str:
+    """The burst alarm's body — who leaked, the window's numbers, what to do.
 
     Points at ``plans/toolcall-markup-containment-prd.md`` and NOT at DF 3083,
     which is done and CLOSED to appends: nothing reads what is attached there.
 
-    The "identify the leaking caller" sentence is the SPEC's
-    (:attr:`MarkupSinkSpec.attribution_source`), not this module's, because the
-    honest answer differs per boundary — and a wrong one here is worse than
-    none, since a reader who follows it concludes "no evidence" rather than
-    "I looked in the wrong place".
+    ``subject_task_id`` leads for the same reason it leads in
+    :func:`residue_detail` — the record's own ``task_id`` field is the
+    non-gating burst anchor, so this is the only place a reader learns whose
+    calls leaked. It is also the axis that RESOLVES on these servers: the
+    middleware reads its attribution off the call's own arguments, and no tool
+    here declares ``agent_id`` / ``project_root`` / ``project_id``.
+
+    The middleware's own axes are rendered beneath it, nulls included. A
+    ``None`` is a FACT about this boundary, and rendering it as itself is what
+    tells a reader the guard resolved nothing rather than that this sink
+    dropped a field.
+
+    Every line is ``!r``, and on the ``crossing_*`` lines that is load-bearing
+    rather than stylistic: those are strings the leaking CALLER supplied, and
+    ``markup_tripwire._recorded_outcome`` parses a storm ``detail`` back for
+    its first ``outcome=`` line. An unescaped newline would inject a spoofed
+    one and silently disable the outcome-mismatch warning.
+
+    The record's own attribution LEADS; the per-boundary corroboration route
+    follows it and is the SPEC's (:attr:`MarkupSinkSpec.attribution_source`),
+    not this module's, because the honest answer differs per boundary — and a
+    wrong one here is worse than none, since a reader who follows it concludes
+    "no evidence" rather than "I looked in the wrong place".
     """
     return '\n'.join([
+        f'subject_task_id={subject_task_id!r}',
+        f'crossing_agent_id={record.get("crossing_agent_id")!r}',
+        f'crossing_subject_task_id={record.get("crossing_subject_task_id")!r}',
+        f'crossing_subject_agent_role={record.get("crossing_subject_agent_role")!r}',
+        f'callers={record.get("callers")!r}',
         f'count={record.get("count")!r}',
         f'threshold={record.get("threshold")!r}',
         f'window_seconds={record.get("window_seconds")!r}',
@@ -334,9 +365,14 @@ def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
         'now, not that the guard is misfiring — do NOT disable it, or '
         + spec.storm_consequence,
         '',
-        'Identify the leaking caller: ' + spec.attribution_source,
+        'The caller is named ABOVE: subject_task_id is whose plan this server '
+        'was serving, crossing_* names the one call that crossed the '
+        'threshold, and callers lists every distinct caller seen in the '
+        'window. Start there, then report it against '
+        'plans/toolcall-markup-containment-prd.md.',
         '',
-        'Then report it against plans/toolcall-markup-containment-prd.md.',
+        'For per-event corroboration — one line per call rather than the '
+        "window's fold — " + spec.attribution_source + '.',
     ])
 
 
@@ -403,6 +439,7 @@ def file_storm(
     escalation_cls: Any,
     queue: Any,
     worktree: Path,
+    subject_task_id: str,
     record: Mapping[str, Any],
     spec: MarkupSinkSpec,
 ) -> str | None:
@@ -415,6 +452,14 @@ def file_storm(
     A queue READ failure falls THROUGH to filing rather than bailing out —
     losing duplicate suppression is strictly better than losing the alarm for
     an actively running leak. Same posture ``markup_tripwire`` takes.
+
+    ``subject_task_id`` is taken in the position :func:`file_residue` already
+    puts it, so a reader of one filer is not surprised by the other. It rides
+    the summary and the detail ONLY: the escalation's ``task_id`` stays
+    ``spec.storm_anchor_task_id``, because moving the subject there would
+    re-point the dedup lookup at a live task and file a level-1 record against
+    it — the failure :attr:`MarkupSinkSpec.storm_anchor_task_id` exists to
+    rule out.
     """
     try:
         existing = queue.get_by_task(spec.storm_anchor_task_id, status='pending')
@@ -441,17 +486,34 @@ def file_storm(
         agent_role=spec.agent_role,
         severity='blocking',
         category=MARKUP_STORM_CATEGORY,
+        # PREFIXED exactly as ``file_residue`` prefixes its own: the queue's
+        # task_id is the burst anchor, so a reader scanning summaries alone
+        # would otherwise have no way to tell whose calls leaked — and the L2
+        # watcher's notification projects the summary and the suggested_action
+        # and nothing else.
         summary=(
+            f'[{subject_task_id}] '
             f'{record.get("count")} {spec.server_label} tool call(s) '
             f'{record.get("outcome")} for leaked envelope markup in '
             f'{record.get("window_seconds")}s — the serialization leak is '
             'ACTIVE (see plans/toolcall-markup-containment-prd.md)'
         ),
-        detail=storm_detail(record, spec),
+        detail=storm_detail(record, subject_task_id, spec),
+        # Leads with the attribution the record now CARRIES. It used to lead
+        # with "identify the leaking caller from the guard's log lines", an
+        # instruction that on this server cannot be followed at all — a
+        # per-agent stdio subprocess's stderr is consumed by the spawning CLI
+        # and never reaches journald — and that anywhere else expires inside
+        # this host's ~72h `journald --user` window, while the measured
+        # esc-plan-tools-markup-storm-* records were read at 6-7 days old.
         suggested_action=(
-            'identify the leaking caller — ' + spec.attribution_source +
-            ' — and report it against plans/toolcall-markup-containment-prd.md '
-            '(DF task 3083 is done and closed to appends)'
+            f'the record names its caller: subject_task_id={subject_task_id!r}, '
+            'with crossing_* naming the call that crossed the threshold and '
+            'callers listing every caller seen in the window — read those off '
+            'the detail and report it against '
+            'plans/toolcall-markup-containment-prd.md (DF task 3083 is done '
+            'and closed to appends). For per-event corroboration, '
+            + spec.attribution_source
         ),
         worktree=str(worktree),
         level=MARKUP_STORM_LEVEL,
@@ -483,6 +545,12 @@ def make_escalation_sink(
     concrete site can offer may not exist yet at ``create_server`` time — a
     plan-tools ``create_plan`` refused before any plan exists is the case. So
     it is evaluated per record, on the worker thread, never at wiring time.
+
+    It serves BOTH record kinds, not residue alone. A burst alarm whose only
+    route to the caller was a grep of the guard's log lines was undischargeable
+    on this server — a per-agent stdio subprocess's stderr is consumed by the
+    spawning CLI and never reaches journald — so the storm branch reads the
+    same thunk, and this is the axis that resolves for it.
 
     *last_resort* is the FLOOR under a queue that cannot be opened at all — an
     unwritable project root, a missing escalation package. It receives the same
@@ -552,7 +620,9 @@ def make_escalation_sink(
         error_type = record.get('error_type')
         try:
             if error_type == MARKUP_STORM_ERROR_TYPE:
-                return file_storm(escalation_cls, queue, worktree, record, spec)
+                return file_storm(
+                    escalation_cls, queue, worktree, _subject(), record, spec,
+                )
             if error_type != MARKUP_RESIDUE_ERROR_TYPE:
                 # A kind the middleware grew later. FILE IT rather than
                 # dropping it: silently discarding a record kind is the

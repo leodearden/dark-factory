@@ -1192,7 +1192,11 @@ class TestTheStormEscape:
             await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
         filed = rig.queue.submitted[0]
-        assert '\nsubject_task_id=' + repr('test-1') + '\n' in filed.detail
+        # WHOLE-LINE membership, not a substring: ``residue_detail`` renders
+        # this first and ``storm_detail`` mirrors it, so there is no leading
+        # newline to anchor against — and a bare substring would be satisfied
+        # by the id appearing anywhere in the interpolated prose below.
+        assert f'subject_task_id={"test-1"!r}' in filed.detail.splitlines()
 
     @pytest.mark.asyncio
     async def test_the_storm_summary_carries_the_subject_prefix(
@@ -1233,14 +1237,14 @@ class TestTheStormEscape:
         for _ in range(2):
             await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
-        detail = rig.queue.submitted[0].detail
+        lines = rig.queue.submitted[0].detail.splitlines()
         for line in (
             'crossing_agent_id=None',
             'crossing_subject_task_id=None',
             'crossing_subject_agent_role=None',
             'callers=[]',
         ):
-            assert '\n' + line + '\n' in detail, line
+            assert line in lines, line
 
     def test_the_new_detail_lines_escape_a_caller_supplied_newline(self):
         """(i) ``!r``, pinned rather than left to convention.
