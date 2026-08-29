@@ -963,14 +963,40 @@ async def _check_canonical_uniqueness(
       ``enforce`` rejects WRITES and never re-validates the corpus, so
       normalizing records at rest moved the measured false-rejection rate
       by ~1/week (~20 → ~19).  Rejections came from NEW writes by writers
-      who had never been told the rule — and that precondition, leaf ι
-      (task 3202), is now DISCHARGED: ``_MEMORY_INSTRUCTIONS`` carries the
-      metadata vocabulary section, topic-slug shape included, pinned to
-      this module's registry by
-      ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py``.
-      What that leaves open for 3626 is narrower and strictly empirical:
-      whether the measured false-rejection rate ACTUALLY fell once writers
-      were told the rule.  Re-measure it; do not assume it did.
+      who had never been told the rule — and leaf ι (task 3202) has now
+      told SOME of them.  Read the coverage precisely before flipping
+      anything; "ι landed" is the same wrong question θ set above.
+
+      COVERED by ι: ``orchestrator.agents.roles`` splices
+      ``METADATA_VOCABULARY_INSTRUCTIONS`` onto ``_MEMORY_INSTRUCTIONS``,
+      reaching the five memory-writing agent roles (architect, implementer,
+      debugger, deep_reviewer, simple_task), plus the two interactive
+      surfaces ``CLAUDE.md`` and ``.claude/commands/memory.md``.
+
+      NOT COVERED by ι — and this is the one that matters: the
+      reconciliation STAGE prompts.  ``reconciliation/prompts/stage1.py``
+      still says nothing about slugs, kebab-case or ``topic``, and Stage 1's
+      ``recon-stage-memory_consolidator`` is the writer the PRD measured as
+      the TOP source of rejections in BOTH projects
+      (``docs/prds/memory-metadata-vocabulary.md``, the 2026-08-04
+      amendment).  It is unattended, so a hard reject there is silent.
+
+      What the pin actually guarantees is likewise narrower than "the
+      vocabulary agrees with this registry".
+      ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py``
+      relates the prose to this module on exactly two axes: the five
+      ``RESERVED_VOCABULARY_KEYS`` names each have a documented line, and
+      the quoted slug cap resolves to ``TOPIC_SLUG_MAX_LEN``.  The prose's
+      kebab-case DESCRIPTION is not pinned to ``TOPIC_SLUG_RE`` — no test
+      would fail if the regex changed shape and the prose did not.
+
+      So 3626 must do one of two things before flipping ``enforce``, not
+      assume ι discharged the precondition: extend the vocabulary section to
+      the stage prompts (``prompts/stage1.py`` first), or re-measure the
+      rejection rate PER WRITER and confirm the uncovered stages are not
+      still generating it.  Either way the empirical question stands —
+      whether the measured false-rejection rate ACTUALLY fell for the
+      writers that WERE told.  Re-measure it; do not assume it did.
 
     STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
     ``update_memory`` added a third write path, but its enforcement is
