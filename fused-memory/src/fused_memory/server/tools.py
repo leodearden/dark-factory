@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.delivered_check_polarity import (
+    extract_delivered_checks,
+    lint_delivered_checks,
+    polarity_error,
+)
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
@@ -8636,6 +8641,22 @@ def create_mcp_server(
         empty-corpus backfill. ``deferred``/``cancelled`` commits are never
         indexed — an abandoned or discarded batch must not pollute the corpus.
 
+        DELIVERED-CHECK POLARITY GATE (task 3500). Every batch task's
+        ``metadata.delivered_checks`` is linted against the authoring tree
+        (``HEAD`` of *project_root*) before anything is flipped. The invariant:
+        a sound delivered_check FAILS when it is written and PASSES once its
+        producer lands. A check that is already green gates nothing; a check
+        that can never go green wedges its dependent forever, and at runtime a
+        mis-authored check is indistinguishable from a genuinely undelivered
+        capability. A batch containing any such check is rejected WHOLE with
+        ``error_type='DeliveredCheckPolarityViolation'`` — nothing is flipped —
+        and the payload names each offending check, its diagnosis code
+        (``vacuous_present`` / ``vacuous_absent`` / ``filename_shaped``, plus
+        the ``vacuous_present_self_referential`` and
+        ``vacuous_present_comment_only`` refinements) and the remedy. Repair
+        the descriptor and re-commit; ``shared.delivered_check_polarity`` holds
+        the rules and ``docs/task-authoring.md`` §3.3 the author-facing guide.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -8690,11 +8711,69 @@ def create_mcp_server(
         tasks_data = await asyncio.gather(
             *[task_interceptor.get_task(tid, project_root) for tid in ids]
         )
+        # Delivered-check POLARITY gate (task 3500). A delivered_check is a
+        # dep-gate: the scheduler withholds a dependent until the producer's
+        # check reports DELIVERED. A check that is already GREEN when it is
+        # written gates nothing (its dependent dispatches as if unguarded);
+        # one that can NEVER go green wedges its dependent forever — and at
+        # runtime that is indistinguishable from a genuinely undelivered
+        # capability, which is what let the measured 5799 -> 5919 wedge sit
+        # unnoticed. The invariant, enforced here: a sound delivered_check
+        # FAILS at the authoring tree and PASSES once its producer lands.
+        #
+        # The reference tree is simply HEAD, and needs no commit-ordering
+        # premise: commit_planning runs BEFORE the batch is implemented, so
+        # whatever HEAD points at IS the pre-task tree. (That does not
+        # generalize backwards to an already-landed task — see
+        # shared.delivered_check_polarity's module docstring and the
+        # status-aware scripts/audit_delivered_checks.py.)
+        #
+        # Layered INTO the lock-charter loop above deliberately: the tasks
+        # are already fetched, so the lint costs no extra get_task reads, and
+        # running it AFTER the directory_locks check keeps the lock-charter
+        # rejection's precedence — the new gate must never mask the old one.
+        # `lint_delivered_checks` shells out to git and never raises, so it
+        # goes through asyncio.to_thread rather than blocking the MCP event
+        # loop.
+        polarity_warnings: list[dict[str, Any]] = []
         for tid, task in zip(ids, tasks_data, strict=False):
             meta = task.get('metadata') if isinstance(task, dict) else None
             dirs = directory_locks(extract_files(meta))
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
+
+            checks = extract_delivered_checks(meta)
+            if not checks:
+                continue
+            findings = await asyncio.to_thread(
+                lint_delivered_checks,
+                checks,
+                files=extract_files(meta),
+                repo_root=project_root,
+                ref='HEAD',
+            )
+            if any(f.severity == 'reject' for f in findings):
+                # All-or-nothing, before the flip — mirrors the lock-charter
+                # arm above. The caller is a live agent that can repair the
+                # descriptor and re-commit, which is why this wire point
+                # REJECTS where the capability-manifest stamper (contractually
+                # never-blocking) merely refuses to copy.
+                return polarity_error(findings, task_id=tid)
+            # 'warn' (undecidable at authoring time) and 'errored' (the check
+            # could not be EVALUATED — non-git root, git missing, ref
+            # unresolvable) are reported, never blocking: fail closed on a
+            # VERDICT, fail open on INFRASTRUCTURE. Attached to the response
+            # by the step-14 arm below.
+            polarity_warnings.extend(
+                {
+                    'task_id': tid,
+                    'name': f.check_name,
+                    'code': f.code,
+                    'severity': f.severity,
+                    'message': f.message,
+                }
+                for f in findings
+            )
 
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
