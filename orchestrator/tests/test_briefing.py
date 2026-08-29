@@ -178,10 +178,34 @@ class TestBuildPlanTighteningPrompt:
             context='',
         )
 
-    async def test_mentions_both_valid_actions(self, briefing: BriefingAssembler):
+    async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
         prompt = await self._build(briefing)
         assert 'update_plan_metadata' in prompt
         assert 'confirm_plan' in prompt
+        assert 'drop_plan_file' in prompt
+
+    async def test_offers_a_third_action_for_correctly_declared_untouched_files(
+        self, briefing: BriefingAssembler,
+    ):
+        """The honest third exit (task 4807).
+
+        With only (a) drop-silently and (b) confirm on offer, a DELIVERED
+        branch carrying a correctly-declared file that legitimately needed no
+        edit has no truthful move: dropping falsifies the provenance,
+        confirming mislabels complete work as incomplete.
+        """
+        prompt = await self._build(briefing)
+        assert 'drop_plan_file' in prompt
+
+    async def test_third_action_names_the_correctly_declared_case(
+        self, briefing: BriefingAssembler,
+    ):
+        """The option must be discoverable by the reasoning that currently
+        steers architects to ``confirm_plan()`` — that dropping a correctly-
+        declared entry would falsify the plan. Naming the tool is not enough
+        if the prompt never names the case it serves."""
+        prompt = await self._build(briefing)
+        assert 'needed no change' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
         prompt = await self._build(
