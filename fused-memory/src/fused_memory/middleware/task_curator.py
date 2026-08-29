@@ -986,6 +986,7 @@ class TaskCurator:
           premise cannot be verified.
         - The candidate matches an entry, but the live source no longer refutes
           its premise.
+        - The offloaded live-source verification raised (one WARNING logged).
 
         Never raises.
         """
@@ -1037,7 +1038,22 @@ class TaskCurator:
         # task submission while holding the per-project curator write lock
         # (task_interceptor.py _curator_lock, held around curate() and
         # curate_batch_prepared). Mirrors this file's claim-verification offloads.
-        if not await asyncio.to_thread(verify_premise_refuted, entry, self._cwd):
+        try:
+            refuted = await asyncio.to_thread(verify_premise_refuted, entry, self._cwd)
+        except Exception as exc:
+            # Honour this method's documented "Never raises" contract. The guard
+            # module fails open internally on OSError, but asyncio.to_thread adds
+            # a raise path it cannot cover, and curate()/curate_batch_prepared
+            # call this unguarded — an escape would fail the whole submission.
+            # Fail OPEN: let the candidate reach the architect rather than
+            # silently refusing it on an unverified premise.
+            logger.warning(
+                'task_curator: recon-premise verification errored for entry=%s, '
+                'failing open (candidate not dropped): %s',
+                entry.name, exc,
+            )
+            return None
+        if not refuted:
             return None
 
         decision = CuratorDecision(
