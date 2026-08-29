@@ -1,12 +1,22 @@
 """Tests for the cap-hit resume progress predicate (task 4274).
 
-A session killed by the WEEKLY usage cap was resumed with
-CAP_HIT_RESUME_PROMPT ("Continue where you left off and complete your task")
-when its only captured output was one sentence of stated intent — "where you
-left off" was, verifiably, nowhere (legibility census 2026-08-16 §1.2, session
-4396db7a).  The cap-hit branch decided resume-vs-fresh on ONE question: is the
-transcript REACHABLE?  A transcript that EXISTS was assumed to carry resumable
-work.
+The class under guard: a TOP-LEVEL session killed by the usage cap before it
+made any tool call, then resumed with CAP_HIT_RESUME_PROMPT ("Continue where
+you left off and complete your task") when its only captured output was one
+sentence of stated intent — a continuity claim the transcript does not support.
+The cap-hit branch decided resume-vs-fresh on ONE question: is the transcript
+REACHABLE?  A transcript that EXISTS was assumed to carry resumable work.
+
+PROVENANCE — and its limit.  Legibility census 2026-08-16 §1.2 (session
+4396db7a) NAMED this failure mode, but its own specimen is NOT covered by this
+predicate and task 4274 does not close that finding.  4396db7a was an Agent-tool
+SUB-AGENT kill; a sub-agent's turns go to a sidecar
+``<session_id>/subagents/agent-*.jsonl`` under the PARENT's sessionId, so the
+parent transcript ``read_transcript_records`` reads necessarily carries the
+Task/Agent ``tool_use`` that spawned it and ``detect_resumable_progress``
+returns True on it.  Census §4 declined to file a task for 1.2 and left the
+remedy with task **2561**'s runner-side persistence protocol; that ownership
+stands.  These tests therefore pin the ADJACENT top-level-session class only.
 
 ``detect_resumable_progress`` is the pure half of the answer to the next
 question — does the transcript record work to CONTINUE? — and
@@ -87,8 +97,11 @@ class TestDetectResumableProgress:
         assert detect_resumable_progress([]) is False
 
     def test_single_text_only_assistant_turn_is_false(self) -> None:
-        """The observed 4396db7a shape: one sentence of stated intent, no tool
-        call.  This is the whole point of the predicate."""
+        """The covered shape: a top-level session capped before its first tool
+        call — one sentence of stated intent, nothing else.  This is the whole
+        point of the predicate.  (NOT census 1.2's own specimen, which carried
+        an Agent-tool tool_use and stays with task 2561 — see the module
+        docstring.)"""
         records = [
             _user(),
             _assistant([_text('I will start by reading the task plan.')]),
@@ -208,8 +221,10 @@ class TestResumableProgressForSession:
     ``read_transcript_records``, apply the pure predicate, never raise."""
 
     def test_text_only_session_has_no_resumable_progress(self, tmp_path) -> None:
-        """The 4396db7a shape on disk: a reachable transcript whose agent only
-        stated an intention → False, so the cap-hit branch retries FRESH."""
+        """The covered shape on disk: a reachable top-level transcript whose
+        agent only stated an intention, never calling a tool → False, so the
+        cap-hit branch retries FRESH.  (Census 1.2's own specimen is not this
+        shape — see the module docstring.)"""
         _write_transcript(
             tmp_path,
             'sess-empty',

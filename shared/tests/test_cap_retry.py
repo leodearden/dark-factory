@@ -951,11 +951,13 @@ class TestCapRetryTranscriptReachability:
 
 
 def _text_only_session_records() -> list[dict]:
-    """The observed 4396db7a shape: one sentence of stated intent, no tool call.
+    """The covered shape: one sentence of stated intent, no tool call.
 
-    A session killed by the WEEKLY cap before it did anything.  Its transcript
-    is perfectly REACHABLE — which is why the reachability guard passes it
-    through — but there is nothing in it to continue.
+    A TOP-LEVEL session killed by the usage cap before its first tool call.  Its
+    transcript is perfectly REACHABLE — which is why the reachability guard
+    passes it through — but there is nothing in it to continue.  (Census 1.2's
+    own specimen, session 4396db7a, is NOT this shape: it carried an Agent-tool
+    tool_use — see TestCapRetryResumableProgress's docstring.)
     """
     return [
         {'type': 'user', 'content': 'do the task'},
@@ -976,11 +978,21 @@ class TestCapRetryResumableProgress:
     """Reachability is necessary but not sufficient: the cap-hit branch must
     also verify the capped session recorded WORK TO CONTINUE.
 
-    Census 2026-08-16 §1.2 (session 4396db7a): a session killed by the weekly
-    cap was resumed with CAP_HIT_RESUME_PROMPT ("continue where you left off")
-    when its only captured output was one sentence of stated intent.  "Where
-    you left off" was, verifiably, nowhere — a continuity claim the transcript
-    did not support, and a retry spent re-deriving context that never existed.
+    The covered class: a TOP-LEVEL session killed by the usage cap before its
+    first tool call, then resumed with CAP_HIT_RESUME_PROMPT ("continue where
+    you left off") when its only captured output was one sentence of stated
+    intent — a continuity claim the transcript did not support, and a retry
+    spent re-deriving context that never existed.
+
+    PROVENANCE — and its limit.  Legibility census 2026-08-16 §1.2 (session
+    4396db7a) NAMED this failure mode, but its own specimen is NOT covered here
+    and task 4274 does not close finding 1.2.  4396db7a was an Agent-tool
+    SUB-AGENT kill: a sub-agent's turns are written to a sidecar
+    ``<session_id>/subagents/agent-*.jsonl`` under the PARENT's sessionId, so
+    the parent transcript this guard reads necessarily carries the Task/Agent
+    tool_use that spawned it and detect_resumable_progress returns True on it.
+    Census §4 declined to file a task for 1.2 and left the remedy with task
+    **2561**'s runner-side persistence protocol.
 
     Modelled on TestCapRetryTranscriptReachability, including its strongest
     habit: every fires-correctly test is paired with an explicit does-NOT-
