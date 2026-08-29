@@ -1728,6 +1728,23 @@ class TargetedReconciler:
                     'error=%r',
                     dep_id, satisfied_by, error_code,
                 )
+                # Symmetric durable audit row for the rejection path -- mirrors
+                # the 'write' row emitted on success (below) and the
+                # hints_attached/hints_skipped convention at :1014-1042.
+                # 'skip' lets operators filter `WHERE action_type='skip'` to
+                # compute unblock-rejection cardinality without parsing detail
+                # JSON.
+                await self.journal.add_run_action(
+                    run_id, 'skip', 'taskmaster', 'set_task_status',
+                    {
+                        'task_id': dep_id,
+                        'satisfied_by': satisfied_by,
+                        'new_status': 'pending',
+                        'error': error_code,
+                        'actual_status': actual_status,
+                    },
+                    causation_id=run_id,
+                )
                 return {
                     'type': 'dependent_unblock_failed',
                     'task_id': dep_id,
@@ -1735,6 +1752,24 @@ class TargetedReconciler:
                     'error': error_code,
                     'actual_status': actual_status,
                 }
+
+            no_op = bool(isinstance(resp, dict) and resp.get('no_op'))
+            # Durable 'write' audit row (task 4903): without this the flip is
+            # auditably silent on the task row -- set_task_status only stamps
+            # reopen_reason/reopen_from/reopen_at when old_status is terminal
+            # (done/cancelled; task_interceptor.py:1215-1238), and 'blocked'
+            # is not terminal. This is exactly how the defect stayed invisible
+            # through four manual resets.
+            await self.journal.add_run_action(
+                run_id, 'write', 'taskmaster', 'set_task_status',
+                {
+                    'task_id': dep_id,
+                    'satisfied_by': satisfied_by,
+                    'new_status': 'pending',
+                    'no_op': no_op,
+                },
+                causation_id=run_id,
+            )
 
             action: dict[str, Any] = {
                 'type': 'dependent_unblock_applied',
@@ -1747,8 +1782,52 @@ class TargetedReconciler:
             # desired end state was reached, but no flip actually happened.
             # Surface it rather than silently treating a no-op identically
             # to a real write.
-            if isinstance(resp, dict) and resp.get('no_op'):
+            if no_op:
                 action['no_op'] = True
+
+            # Second write: stamp the audit onto the dependent's own metadata,
+            # so the task row itself explains why it became pending (not just
+            # the journal). metadata_mode='merge' gives last-write-wins on
+            # scalar collision -- NOT append=True, whose additive semantics
+            # keep the OLD value on collision (sqlite_task_backend.py
+            # :3294-3295, :3325-3326, :3350-3351) and would freeze
+            # unblocked_by/unblocked_at at the first unblock forever, exactly
+            # the "silently re-blocks and nobody notices" failure this sweep
+            # exists to end. Never pass append alongside metadata_mode --
+            # append=False now raises TaskmasterError (task-2180 guard).
+            #
+            # Structural, not a workaround: set_task_status only writes its
+            # fixed audit-field set, and the backend write-authority floor
+            # refuses any status write routed through update_task
+            # (StatusWriteAuthorityError). This mirrors _sweep_block_orphan's
+            # two-write split (:1357-1394) -- but NOT its append=True choice,
+            # and NOT its stale rationale citing
+            # feedback_set_task_status_replaces_metadata.md (a file that
+            # exists nowhere in the repo or its history): set_task_status
+            # merges rather than replaces metadata today, so that
+            # justification is not carried into this helper.
+            #
+            # Own try/except: the status flip already landed, so a
+            # metadata-stamp failure must not downgrade this action back to
+            # dependent_unblock_failed -- that would make the audit lie in
+            # the opposite direction.
+            try:
+                await self.task_interceptor.update_task(
+                    task_id=dep_id,
+                    project_root=project_root,
+                    metadata=json.dumps({
+                        'unblocked_by': satisfied_by,
+                        'unblocked_at': datetime.now(UTC).isoformat(),
+                        'unblocked_by_reconciler': True,
+                    }),
+                    metadata_mode='merge',
+                )
+            except Exception as e:
+                logger.warning(
+                    'sweep: metadata stamp failed for unblocked dependent %s '
+                    '(satisfied by %s): %s',
+                    dep_id, satisfied_by, e,
+                )
             return action
         except Exception as e:
             logger.warning(
