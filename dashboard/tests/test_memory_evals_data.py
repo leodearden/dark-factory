@@ -966,6 +966,32 @@ class TestVerdicts:
         for issue in payload['issues']:
             assert issue['path'] == str(root / 'verdicts-current.json')
 
+    def test_orphan_verdict_metric_id_and_eval_id_are_capped(self, tmp_path: Path) -> None:
+        """Both interpolations in this ONE detail are unvalidated JSON.
+
+        ``eval_id`` and ``metric_id`` are ``isinstance(..., str)``-guarded at
+        the verdicts read boundary (:583) but never length-guarded — the
+        same size exposure as the duplicate-index details, one field over.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        huge_metric_id = 'p' * 5000
+        huge_eval_id = 'q' * 5000
+        root, esc_dir = _verdicts_tree(tmp_path, entries=[
+            _verdict(huge_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'orphan_verdict'
+        # BOTH halves capped — metric_id and eval_id interpolate into the
+        # same detail, so the ellipsis must appear twice.
+        assert issue['detail'].count('…') == 2
+        assert len(issue['detail']) < 500
+        assert 'matches no metric row in eval' in issue['detail']
+
     def test_missing_root_verdicts_is_named(self, tmp_path: Path) -> None:
         """Trends with a blank verdict column would otherwise look healthy."""
         from dashboard.data.memory_evals import build_memory_evals
@@ -3209,6 +3235,28 @@ class TestStalenessAndDegradedStates:
         assert payload['evals'][0]['latest_run_age_seconds'] is None
         assert payload['evals'][0]['stale'] is False
 
+    def test_unparseable_run_stamp_is_capped(self, tmp_path: Path) -> None:
+        """``latest_run_stamp`` is ``isinstance``-guarded (:1048) but never length-guarded.
+
+        Same size exposure as the other rendering-vocabulary details: a
+        hostile in-body ``run_stamp`` must not blow up the payload.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        huge_stamp = '9' * 5000
+        root, esc_dir = _healthy_tree(tmp_path, run_stamp=huge_stamp)
+
+        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unparseable_run_stamp'
+        assert '…' in issue['detail']
+        assert len(issue['detail']) < 500
+        assert 'is not in' in issue['detail']
+        # The structured field is NOT truncated — only the detail prose is.
+        assert payload['evals'][0]['latest_run_stamp'] == huge_stamp
+
     def test_missing_root_is_empty_but_healthy(self, tmp_path: Path) -> None:
         """"No eval has ever run" is a legitimate state, not a degradation.
 
@@ -3261,6 +3309,119 @@ class TestStalenessAndDegradedStates:
         assert payload['evals'][0]['run_stamps'] == []
         assert payload['issues'] == []
         assert payload['issue_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4261 — the module-wide closure guard
+# ---------------------------------------------------------------------------
+
+
+class TestAllIssueDetailsAreBounded:
+    """No per-site sweep can be re-broken silently by the next ``_issue`` call.
+
+    Every per-site test above protects only the sites that existed when it
+    was written.  This property test converts "we fixed the known list"
+    into "the module cannot emit an unbounded detail": build one tree that
+    is hostile in every dimension the module reads unvalidated JSON from,
+    then assert every issue detail in the resulting payload is bounded AND
+    that the observed issue-kind set actually covers every in-scope kind —
+    so a hostile tree that quietly stopped triggering half its sites cannot
+    pass by accident.
+    """
+
+    def test_every_issue_detail_is_bounded_and_every_kind_is_covered(
+        self, tmp_path: Path,
+    ) -> None:
+        from dashboard.data.memory_evals import _MAX_DISCARDED_VALUE_REPR, build_memory_evals
+
+        huge_dup_metric = 'a' * 5000
+        huge_missing_kind_metric = 'b' * 5000
+        huge_unknown_kind_metric = 'c' * 5000
+        huge_run_kind = 'd' * 5000
+        huge_verdict = 'g' * 5000
+        huge_orphan_metric = 'e' * 5000
+        huge_orphan_eval = 'f' * 5000
+        huge_run_stamp = '9' * 5000
+        huge_escalation_id = 'h' * 5000
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+
+        # eval-a: a duplicated metric record, a metric with no kind, a
+        # metric with an unknown kind, and an unparseable in-body run_stamp
+        # — all in the one run this eval carries.
+        _write_metrics(root, 'eval-a', '20260701T031500Z', [
+            _metric(huge_dup_metric, 'count', 1.0),
+            _metric(huge_dup_metric, 'count', 2.0),
+            {'metric_id': huge_missing_kind_metric, 'value': 1.0, 'n': 1},
+            _metric(huge_unknown_kind_metric, huge_run_kind, 3.0),
+        ], run_stamp=huge_run_stamp)
+        _write_limits(root, 'eval-a', run_stamp='20260701T031500Z', verdicts=[
+            _limits_verdict(huge_dup_metric, 'shift'),
+            _limits_verdict(huge_dup_metric, 'ratio'),
+        ])
+        _write_verdicts(root, [
+            _verdict('eval-a', huge_dup_metric, 'alarm', fingerprint='fp-dup-a'),
+            _verdict('eval-a', huge_dup_metric, 'no_alarm', fingerprint='fp-dup-b'),
+            {
+                'eval_id': 'eval-a',
+                'metric_id': huge_unknown_kind_metric,
+                'verdict': huge_verdict,
+                'fingerprint': 'fp-unknown-verdict',
+                'run_stamp': '20260701T031500Z',
+            },
+            _verdict(huge_orphan_eval, huge_orphan_metric, 'alarm', fingerprint='fp-orphan'),
+        ], run_stamp='20260701T031500Z')
+
+        # A malformed (non-object) queue record, oversized, plus three
+        # escalation records hitting the remaining named-not-dropped kinds.
+        _dump(esc_dir / 'esc-malformed.json', ['x'] * 2000)
+        _write_escalation(
+            esc_dir, 'esc-bad-status', status='quarantined', id=huge_escalation_id,
+        )
+        _write_escalation(
+            esc_dir, 'esc-unfingerprinted', dedupe_fingerprint=None, id=huge_escalation_id,
+        )
+        _write_escalation(
+            esc_dir, 'esc-dup-1', dedupe_fingerprint='f' * 32, id=huge_escalation_id,
+        )
+        _write_escalation(
+            esc_dir, 'esc-dup-2', dedupe_fingerprint='f' * 32, id=huge_escalation_id,
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        required_kinds = {
+            'duplicate_limits_verdict', 'duplicate_metric_id', 'duplicate_verdict_entry',
+            'unknown_escalation_status', 'unfingerprinted_escalation',
+            'duplicate_escalation_fingerprint', 'unparseable_run_stamp', 'missing_kind',
+            'unknown_kind', 'unknown_verdict', 'orphan_verdict', 'malformed_escalation_record',
+        }
+        observed_kinds = {issue['kind'] for issue in payload['issues']}
+        # Anti-vacuity: without this, the bound below would pass trivially
+        # on a hostile tree that quietly stopped triggering half its sites.
+        assert required_kinds <= observed_kinds
+
+        # The bound itself, DERIVED from `_MAX_DISCARDED_VALUE_REPR` rather
+        # than a bare literal, so retuning the knob cannot leave this
+        # assertion stale.  Tight worst case: the widest in-scope detail
+        # interpolates at most two capped values (`unknown_kind`,
+        # `unknown_verdict`, `orphan_verdict`), each at most
+        # `_MAX_DISCARDED_VALUE_REPR` chars plus one ellipsis, plus under
+        # 100 chars of fixed prose around them — near 342 at today's knob
+        # value.  Tripled for a comfortable margin over every OTHER
+        # interpolation in the module, which is bounded by construction
+        # (`type(x).__name__`, integer counts, the `_RUN_STAMP_FORMAT`
+        # constant, and the tmp_path-plus-errno `unreadable_*` messages).
+        tight_worst_case = 2 * (_MAX_DISCARDED_VALUE_REPR + 1) + 100
+        bound = tight_worst_case * 3
+        too_long = {
+            issue['kind']: len(issue['detail'])
+            for issue in payload['issues']
+            if len(issue['detail']) >= bound
+        }
+        assert not too_long, too_long
 
 
 # ---------------------------------------------------------------------------
