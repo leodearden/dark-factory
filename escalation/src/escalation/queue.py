@@ -1706,6 +1706,25 @@ class EscalationQueue:
         INV-4's applicable house pattern here is the storm COUNTER, not a
         threshold escalation.
 
+        WHO HEARS ABOUT IT — INV-4's other half, answered by name rather than
+        left for the next reader to hunt for (amendment pass, task 4499).  The
+        counter is readable from the ``get_escalation(escalation_id)`` MCP tool,
+        which returns ``Escalation.to_dict()`` — a bare ``asdict``, so both
+        ``refiles_suppressed`` and ``citation_sha`` are on that response with no
+        whitelist to widen (verified end-to-end, not assumed).  It is
+        deliberately NOT on the compact LIST rows: ``_COMPACT_ESCALATION_FIELDS``
+        is an exact-key-tested whitelist for triage drains, and a field that is
+        non-zero only on already-adjudicated records has no business inflating
+        every pending row.
+
+        The residual gap is DISCOVERY, not access: the counter accrues only on
+        RESOLVED/DISMISSED records, which no triage surface lists, so reading it
+        means knowing the id to ask about.  The suppression WARNING in
+        ``file_unattributed_landing_escalation`` names that id on every
+        suppression, which is the intended entry point; a listing surface or a
+        named operator query for "resolutions absorbing refiles" is genuine
+        follow-up work and is filed as such rather than being silently assumed.
+
         Locking: unlike ``patch_resolution_metadata`` above (a last-write-wins
         field SET) this is a genuine INCREMENT, so the whole read-modify-write
         runs under ``escalation_id_lock`` — a concurrent same-id bump from
