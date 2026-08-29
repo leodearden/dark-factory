@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
@@ -7836,6 +7837,63 @@ class TestResolveIssueDeclaredPinGuard:
 
         assert 'code' not in result, result
         assert result['status'] == 'dismissed'
+
+    # --- Gate PRECEDENCE: this gate runs LAST, after capability and Table B ---
+
+    @pytest.mark.asyncio
+    async def test_illegal_action_on_a_marked_record_reports_illegal_transition(
+        self, tmp_path: Path,
+    ):
+        """The docstring's "runs LAST" claim, pinned for the Table B half.
+
+        The gate sits AFTER the Table B legality gate, so a caller failing both
+        learns about the illegal action first.  Without this test a later edit
+        that hoists the gate above Table B would silently invert the documented
+        precedence with a green suite.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='bogus',
+        )
+
+        assert result.get('code') == 'illegal_transition', result
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending'
+        assert record.resolution_action is None, 'neither gate may pre-stamp (INV-1)'
+
+    @pytest.mark.asyncio
+    async def test_level_capped_connection_reports_level_forbidden_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The "runs LAST" claim, pinned for the connection-capability half.
+
+        The capability gate reads ``get_http_headers()``, which returns ``{}``
+        for in-process ``tool.fn()`` calls — so the header is injected by
+        patching the name in ``escalation.server``.  The real ASGI path is
+        covered by ``test_capability_guard_http.py``; what is asserted here is
+        the ORDERING between that gate and this one, which is a property of
+        ``resolve_issue`` itself.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue, esc_id='esc-3105-3', task_id='3105', level=2)
+        monkeypatch.setattr(
+            escalation_server, 'get_http_headers', lambda: {'x-escalation-levels': '0,1'},
+        )
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'level_forbidden', result
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending'
+        assert record.resolution_action is None, 'neither gate may pre-stamp (INV-1)'
 
     # --- the CASCADE case — the path that actually spent the specimen ---
 
