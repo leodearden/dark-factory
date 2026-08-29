@@ -1054,7 +1054,7 @@ def _build_eval(
         except ValueError:
             _issue(
                 issues, 'unparseable_run_stamp', eval_id=eval_id, path=eval_dir,
-                detail=f'run_stamp {latest_run_stamp!r} is not in {_RUN_STAMP_FORMAT}',
+                detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
             )
         else:
             age_seconds = (now - run_at).total_seconds()
@@ -1543,5 +1543,8 @@ def _build_payload(
             'orphan_verdict',
             eval_id=eval_id,
             path=memory_evals_dir / 'verdicts-current.json',
-            detail=f'verdict for metric {metric_id!r} matches no metric row in eval {eval_id!r}',
+            detail=(
+                f'verdict for metric {_short_repr(metric_id)} matches no metric row '
+                f'in eval {_short_repr(eval_id)}'
+            ),
         )
