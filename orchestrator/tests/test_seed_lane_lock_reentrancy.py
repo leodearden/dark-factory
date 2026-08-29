@@ -503,6 +503,38 @@ class TestLaneLockRefusalEndToEnd:
         assert disp.requeue_kind is RequeueKind.REQUEUE
         assert disp.counts_against_requeue_cap is False
 
+    async def test_journal_line_names_lock_contention_and_the_lane_lock(
+        self, seed_repo: Path, caplog,
+    ):
+        """The journal an operator actually greps must name the real condition.
+
+        esc-5556-1 was diagnosable only in hindsight because the line read as a
+        generic non-zero seed fault and the block reason said disk pressure.
+        """
+        import logging
+
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        refusals = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'seed refused' in r.getMessage()
+        ]
+        assert len(refusals) == 1, (
+            f'expected exactly one refusal WARNING, got {caplog.messages}'
+        )
+        msg = refusals[0]
+        assert 'lane-lock contention' in msg, msg
+        assert 'NOT disk pressure' in msg, msg
+        lane_lock = f'{git_ops.worktree_base / "_lane-0"}.lock'
+        assert lane_lock in msg, (
+            f'the contended lock path must be named so an operator can find '
+            f'the holder: expected {lane_lock!r} in {msg!r}'
+        )
+
     async def test_pre_5568_lane_is_unchanged_and_still_yields_disk_pressure(
         self, seed_repo: Path,
     ):

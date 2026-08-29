@@ -479,8 +479,8 @@ _RESET_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
 # convention so the sentinel is self-documenting in logs, and is chosen
 # distinct from every other rc _seed_warm_lane's docstring documents (0
-# success, 75 disk-pressure, 127 absent-script/exception sentinel; any other
-# value is a generic script fault). A genuine seed-warm-lane.sh exit code of
+# success, 75 disk-pressure, 77 lane-lock refusal, 127 absent-script/exception
+# sentinel; any other value is a generic script fault). A genuine seed-warm-lane.sh exit code of
 # 124 would be misattributed to a lock-wait timeout, but no script
 # convention in this codebase uses 124 for anything else.
 _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
@@ -968,6 +968,11 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+      Caveat (task 4211): on a lane whose seed script predates reify 5568 this
+      ALSO covers a lane-lock refusal, because such a script exits 75 for both
+      conditions.  On a post-5568 lane the two are disambiguated — a refusal
+      arrives as 77 → ``LANE_LOCK_CONTENDED`` — so a 75 there really is disk
+      pressure.  See :func:`_seed_script_supports_distinct_lock_refusal_rc`.
     * ``SOFT_PRESSURE`` — θ proactive soft-floor throttle (task 2443, §9.5):
       the reify ε script's ``check --soft`` reported soft pressure (rc=3,
       above the hard floor but below the soft one) for a FRESH allocation
@@ -5150,11 +5155,16 @@ class GitOps:
             # 7b20d010c6 (task 5354) — previously opt-in via --lane-lock — and
             # flock is not re-entrant across a process tree, so the script's
             # own flock -n self-refuses against this method's lock and exits
-            # 75. That 75 is indistinguishable from genuine disk pressure at
-            # _classify_seed_rc, so every dispatch requeued as
+            # 75. That 75 WAS indistinguishable from genuine disk pressure at
+            # _seed_rc_to_unavailable, so every dispatch requeued as
             # WarmLaneDiskPressure with agent_invocations=0, released the lane,
             # and re-picked the same lowest-index free lane: a fleet-wide
             # dispatch livelock (349 requeues / 4 completions per day).
+            # (No longer indistinguishable as of task 4211 — a post-5568 lane
+            # reports a refusal as 77 → LANE_LOCK_CONTENDED via the flag
+            # appended just below.  This flag remains the fix for the
+            # SELF-refusal, though: 77 makes the condition legible, it does not
+            # prevent it.)
             # --assume-lane-lock-held (reify db9ea9387b, same task) is the
             # sanctioned opt-out for exactly this caller shape.
             #
@@ -5229,6 +5239,21 @@ class GitOps:
                     'another seed) is still live; failing closed rather '
                     'than risk a torn target/ (rc=%d)',
                     _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock, rc,
+                )
+            elif rc == 77:
+                # task 4211: the script REFUSED — it could not take
+                # <lane_dir>.lock because another live consumer holds it.
+                # Logged as its own branch, beside the 124 outer-lock-timeout
+                # branch above, so the journal names the actual condition and
+                # the contended path.  Before this the line read as a generic
+                # "script exited 75" and the discriminant rendered it as
+                # warm_lane_disk_pressure, which is what operators had to work
+                # from throughout reify esc-5556-1.
+                logger.warning(
+                    '_seed_warm_lane: seed refused for %s — lane lock %s is '
+                    'held by another live consumer (rc=77, lane-lock '
+                    'contention, NOT disk pressure); requeue (stderr=%r)',
+                    lane_dir, lane_lock_path(lane_dir), err,
                 )
             elif rc != 0:
                 logger.warning(
