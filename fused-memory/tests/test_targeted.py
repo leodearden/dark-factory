@@ -5067,3 +5067,158 @@ async def test_unblock_dependent_failure_does_not_strand_siblings(
         f'Expected both dependents to be attempted, got '
         f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
     )
+
+
+# ── task-4903: escalation-pin veto ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_by_open_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """An open (status='pending') escalation pinning the dependent must veto
+    the unblock.
+
+    This is what stops the sweep from fighting the orchestrator:
+    ``Harness._block_and_escalate_external_dep`` (harness.py:7281) and
+    ``_block_and_escalate_delivered_check`` (harness.py:7364) both BLOCK
+    *and* file an escalation, and a human ``/unblock`` park does too --
+    unblocking a task pinned by an open escalation would be immediately
+    undone.
+
+    Writes a real on-disk escalation via ``EscalationQueue.submit`` (reusing
+    the exact construction ``_sweep_escalate_l1`` performs at
+    targeted.py:1441-1454), so the on-disk shape is production-real rather
+    than a hand-rolled JSON blob.
+    """
+    from escalation.models import Escalation
+    from escalation.queue import EscalationQueue
+
+    project_root = str(tmp_path)
+    queue = EscalationQueue(Path(project_root) / 'data/escalations')
+    esc = Escalation(
+        id=queue.make_id('2'),
+        task_id='2',
+        agent_role='harness',
+        severity='blocking',
+        category='dependency_discovered',
+        summary='Task 2 blocked pending external dependency',
+        detail='blocked pending review',
+        suggested_action='wait',
+        level=1,
+    )
+    esc_id = queue.submit(esc)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'An open escalation must veto the unblock, got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_pinned', (
+        f'Expected reason=escalation_pinned, got: {actions[0]!r}'
+    )
+    assert actions[0].get('escalation_ids') == [esc_id], (
+        f'Expected escalation_ids to name the pinning escalation, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_when_escalation_store_unreadable(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """An unreadable escalation store cannot prove "no open escalation", so
+    it must veto rather than flip -- fail-safe direction is deliberate, not
+    assumed. Same rule stated verbatim for the orchestrator's sibling sweep
+    at scheduler.py:6499-6524 (the esc-3163 lesson): a false "no open
+    escalation" would redispatch (here: unblock) a deliberately parked task.
+    """
+    from fused_memory.reconciliation import targeted
+
+    def _raise(*_args, **_kwargs):
+        raise OSError('escalation store unavailable')
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _raise)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'An unreadable escalation store must veto (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_store_unavailable', (
+        f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_proceeds_when_no_open_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """The escalation-pin veto must not become an unconditional block: with
+    no open escalation, the unblock still applies.
+
+    Also pins the lazy per-sweep memo (step-8): the queue must be
+    constructed AT MOST ONCE for a sweep containing two blocked dependents,
+    not once per dependent -- ``EscalationQueue.__init__`` does
+    ``mkdir(parents=True, exist_ok=True)``, so eager per-dependent
+    construction would be wasted I/O on every ``done`` transition.
+    """
+    from escalation.queue import EscalationQueue
+    from fused_memory.reconciliation import targeted
+
+    construct_calls: list[tuple] = []
+
+    class _SpyQueue(EscalationQueue):
+        def __init__(self, *args, **kwargs):
+            construct_calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _SpyQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    for tid in ('2', '3'):
+        actions = _dep_actions_for(result, tid)
+        assert len(actions) == 1, f'Expected exactly one action for task {tid}, got: {actions}'
+        assert actions[0]['type'] == 'dependent_unblock_applied', (
+            f'No open escalation must not become an unconditional block, got: {actions[0]!r}'
+        )
+
+    assert len(construct_calls) == 1, (
+        f'Expected the escalation queue constructed at most once per sweep '
+        f'(lazy per-sweep memo), got {len(construct_calls)} constructions: {construct_calls}'
+    )
+    assert wired_reconciler.task_interceptor.set_task_status.await_count == 2, (
+        f'Expected both dependents to be attempted, got '
+        f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
+    )
