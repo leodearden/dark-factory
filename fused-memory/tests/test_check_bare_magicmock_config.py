@@ -1675,3 +1675,128 @@ class TestWallClockDeadlineMessage:
                 assert needle not in v.message, (
                     f'Rule C message must not offer {needle!r}: {v.message!r}'
                 )
+
+
+# One call, BOTH Rule C offence kinds — so a single suppression check at the site
+# is provably suppressing both, not just the one that happens to be reported first.
+_RULE_C_SOURCE = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
+
+
+class TestWallClockDeadlineExemption:
+    """Rule C honours its OWN noqa code, on the preceding non-blank line, with a reason.
+
+    The contract is inherited verbatim from ``_EXEMPT_TEMPLATE`` / ``_is_exempted``
+    rather than re-parsed, so an author learns the em-dash-or-hyphen,
+    mandatory-reason, preceding-line-only, no-inline-trailing rules once and they
+    hold for all three codes.  What is NOT shared is the code itself: Rule A's
+    remedy is mock_orch_config/pydantic_spec, Rule B's is _fake_verify_result, and
+    Rule C's is wait_responsive/MERGE_RESULT_TIMEOUT — so a pragma written for one
+    is never informed consent for another.
+    """
+
+    def test_em_dash_exemption_suppresses_both_offence_kinds(self):
+        """One pragma at the site silences BOTH kinds, not just the first."""
+        unsuppressed = _rule_c(_RULE_C_SOURCE)
+        assert len(unsuppressed) == 2, (
+            f'this test is written against a source that trips BOTH kinds; got {unsuppressed!r}'
+        )
+        source = '# noqa: wall-clock-deadline — deliberate wall-clock leg\n' + _RULE_C_SOURCE
+        assert _rule_c(source) == []
+
+    def test_ascii_hyphen_exemption_suppresses_rule_c(self):
+        """ASCII-hyphen separator is accepted, same as Rules A and B."""
+        source = '# noqa: wall-clock-deadline - deliberate wall-clock leg\n' + _RULE_C_SOURCE
+        assert _rule_c(source) == []
+
+    def test_exemption_tolerates_intervening_blank_lines(self):
+        """Blank and whitespace-only lines between the pragma and the call are tolerated."""
+        source = (
+            '# noqa: wall-clock-deadline — deliberate wall-clock leg\n\n    \n' + _RULE_C_SOURCE
+        )
+        assert _rule_c(source) == []
+
+    def test_no_exemption_without_a_reason(self):
+        """A pragma with no reason after the separator does not suppress."""
+        for header in ('# noqa: wall-clock-deadline\n', '# noqa: wall-clock-deadline —\n'):
+            violations = _rule_c(header + _RULE_C_SOURCE)
+            assert len(violations) == 2, (
+                f'a reasonless pragma must NOT suppress Rule C; header={header!r} '
+                f'gave {violations!r}'
+            )
+
+    def test_inline_trailing_exemption_is_not_honored(self):
+        """Inline trailing placement is not honored for Rule C either."""
+        source = (
+            'asyncio.wait_for(req_a.result, timeout=25.0)'
+            '  # noqa: wall-clock-deadline — inline\n'
+        )
+        assert len(_rule_c(source)) == 2, (
+            'only the nearest PRECEDING non-blank line is consulted, for all three rules'
+        )
+
+    def test_intervening_code_line_breaks_the_exemption(self):
+        """A non-blank, non-matching line between pragma and call breaks the exemption."""
+        source = (
+            '# noqa: wall-clock-deadline — a reason\nsome_code = 42\n' + _RULE_C_SOURCE
+        )
+        assert len(_rule_c(source)) == 2
+
+
+class TestWallClockDeadlineCrossCodeIsolation:
+    """Registering a third code must not let any rule's pragma leak into another's.
+
+    Both directions are tested for each pairing.  A pragma written years ago for a
+    config assignment must not silently exempt a load-bearing wait that later lands
+    on the following line, and vice versa.
+    """
+
+    def test_rule_b_code_does_not_suppress_rule_c(self):
+        """# noqa: bare-dataclass-double must NOT suppress a Rule C violation."""
+        source = '# noqa: bare-dataclass-double — a reason\n' + _RULE_C_SOURCE
+        assert len(_rule_c(source)) == 2, (
+            "Rule B's noqa code must not suppress Rule C — _fake_verify_result has "
+            'nothing to say about a wall-clock deadline'
+        )
+
+    def test_rule_a_code_does_not_suppress_rule_c(self):
+        """# noqa: bare-magicmock must NOT suppress a Rule C violation."""
+        source = '# noqa: bare-magicmock — legacy config exemption\n' + _RULE_C_SOURCE
+        assert len(_rule_c(source)) == 2, (
+            "Rule A's noqa code must not suppress Rule C"
+        )
+
+    def test_rule_c_code_does_not_suppress_rule_a(self):
+        """# noqa: wall-clock-deadline must NOT suppress a Rule A violation."""
+        source = '# noqa: wall-clock-deadline — a reason\n' + _RULE_A_SOURCE
+        violations = find_violations(source, 'test_cross_c_to_a.py')
+        assert len(violations) == 1, (
+            f"Rule C's noqa code must not suppress a Rule A violation; got {violations}"
+        )
+
+    def test_rule_c_code_does_not_suppress_rule_b(self):
+        """# noqa: wall-clock-deadline must NOT suppress a Rule B violation."""
+        source = '# noqa: wall-clock-deadline — a reason\n' + _RULE_B_SOURCE
+        violations = find_violations(source, 'test_cross_c_to_b.py')
+        assert len(violations) == 1, (
+            f"Rule C's noqa code must not suppress a Rule B violation; got {violations}"
+        )
+
+    def test_rule_a_and_rule_b_exemptions_are_bit_identical_after_registering_rule_c(self):
+        """Regression pin: adding a third _EXEMPT_RES key changed nothing for A or B."""
+        assert find_violations(
+            '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE,
+            'test_a_still_exempt_after_c.py',
+        ) == [], "Rule A's own exemption must remain bit-identical"
+        assert find_violations(
+            '# noqa: bare-dataclass-double — deliberate mutation leg\n' + _RULE_B_SOURCE,
+            'test_b_still_exempt_after_c.py',
+        ) == [], "Rule B's own exemption must remain bit-identical"
+
+    def test_all_three_codes_are_registered_from_the_shared_template(self):
+        """The three codes live in one registry, so the contract cannot drift per rule."""
+        assert set(_checker._EXEMPT_RES) == {
+            _checker._RULE_A_CODE,
+            _checker._RULE_B_CODE,
+            _checker._RULE_C_CODE,
+        }
+        assert _checker._RULE_C_CODE == 'wall-clock-deadline'
