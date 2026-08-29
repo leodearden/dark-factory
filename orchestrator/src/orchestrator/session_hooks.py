@@ -68,6 +68,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,78 @@ def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _RecordSnapshot:
+    """One TRI-STATE read of ``<root>/sessions/<slug>/record.json``.
+
+    The three states, and why two of them are not one:
+
+    * PRESENT -- ``record`` is the body, ``unreadable`` False.
+    * ABSENT -- ``record`` None, ``unreadable`` False. No record exists at
+      this key yet. This state MAY be synthesized over: it is the ordinary
+      fresh-spawn / hand-launched first sight.
+    * UNREADABLE -- ``record`` None, ``unreadable`` True. A record EXISTS but
+      could not be parsed or read. This state may NOT be synthesized over.
+
+    Collapsing the last two into a bare ``record | None`` is the bug this
+    type exists to make unrepresentable. One read serves two consumers that
+    want opposite things from a fault: the ownership probe must fail soft to
+    "adopt" (see ``_env_slug_ownership``: "every failure mode resolves to
+    adopt (True), never to fork"), so it treats ABSENT and UNREADABLE alike;
+    the refresh must not, because
+    ``session_registry.py::refresh_record`` guarantees "a *corrupt* existing
+    body is NOT treated as absent -- it continues to raise
+    ``CorruptSessionRecord`` rather than silently overwriting data". A hook
+    that synthesized a fresh record over a corrupt body would destroy the
+    record carrying role/prompt/result_file -- the one spawn-claude.sh's
+    ``finish()`` writes ``exited`` to.
+
+    Frozen: a snapshot is ONE observation of the registry at one instant,
+    and the whole point of passing it around is that every decision derived
+    from it was derived from the same bytes.
+
+    ``slug`` travels with the body so a snapshot can never be applied to a
+    record it was not read from -- see ``_resolve_hook_slug``'s invariant.
+    """
+
+    slug: str
+    record: session_registry.SessionRecord | None
+    unreadable: bool = False
+
+
+def _read_record_snapshot(slug: str, root: Path | str | None) -> _RecordSnapshot:
+    """Read *slug*'s record once, as a tri-state ``_RecordSnapshot``.
+
+    NEVER raises. ``FileNotFoundError`` maps to ABSENT silently -- an
+    ordinary fresh spawn must log nothing -- and every other fault maps to
+    UNREADABLE with a WARNING, since a degradation that leaves no trace
+    violates the repo's no-silent-fail-soft norm.
+
+    This is the module's single reading seam. Both consumers -- the
+    ownership probe and the status refresh -- go through it, and a hook
+    event that reads the slug it writes reads it exactly ONCE, the snapshot
+    travelling forward on ``_HookSlugResolution``.
+
+    The refresh path needs both the prior status AND the prior binding to
+    recognise the launch window (see ``_in_unbound_launch_window``), which
+    is why the whole body travels rather than a single field.
+    """
+    try:
+        return _RecordSnapshot(slug, session_registry.read_record(slug, root=root))
+    except FileNotFoundError:
+        return _RecordSnapshot(slug, None)
+    except Exception:
+        # A corrupt body, an unreadable fleet root, anything. Callers choose
+        # what to do with it (the probe adopts, the refresh declines to
+        # synthesize over it) -- but nobody gets to be quiet about it.
+        logger.warning(
+            'session record read failed for slug %s; treating it as unreadable',
+            slug,
+            exc_info=True,
+        )
+        return _RecordSnapshot(slug, None, unreadable=True)
+
+
 def _env_slug_ownership(
     slug: str,
     hook_input: Mapping[str, Any],
@@ -275,27 +348,21 @@ def _env_slug_ownership(
         # No discriminator at all, and nothing to bind either: the 'unknown'
         # slug fallback is deliberately not a valid binding.
         return True, True
-    try:
-        record = session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
+    snapshot = _read_record_snapshot(slug, root)
+    if snapshot.unreadable:
+        # A corrupt body, an unreadable fleet root, anything: an ownership
+        # probe that cannot answer must degrade to the pre-task-4193
+        # behaviour (adopt) rather than fork a spurious record or raise --
+        # the hook trio's hard rule is that a registry fault never breaks a
+        # session. Logged (in _read_record_snapshot), never silent.
+        return True, False
+    record = snapshot.record
+    if record is None:
         # No record yet: this hook event IS the slug's first sight. Its own
         # arm, above the broad one, so an ordinary fresh spawn logs nothing.
         # Binding still needs positive proof: an unbound slug with no record
         # is the same open-for-its-owner shape as an unbound record.
         return True, probes.owner_ppid_verdict() is True
-    except Exception:
-        # A corrupt body, an unreadable fleet root, anything: an ownership
-        # probe that cannot answer must degrade to the pre-task-4193
-        # behaviour (adopt) rather than fork a spurious record or raise --
-        # the hook trio's hard rule is that a registry fault never breaks a
-        # session. Logged, never silent.
-        logger.warning(
-            'session-ownership probe failed for slug %s; adopting inherited '
-            'CLAUDE_SPAWN_SESSION_ID unchecked',
-            slug,
-            exc_info=True,
-        )
-        return True, False
     bound = (record.claude_session_id or '').strip()
     if not bound:
         # No binding yet, so the stdin session_id proves nothing: whoever
@@ -1188,34 +1255,6 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
     return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
 
 
-def _prior_record_or_none(
-    slug: str,
-    root: Path | str | None,
-) -> session_registry.SessionRecord | None:
-    """The record at *slug* as it stood BEFORE this event refreshes it.
-
-    None when there is no record yet (the ordinary forked/hand-launched
-    first sight) and, fail-soft, when it cannot be read at all -- the same
-    hard rule the ownership probe follows: a registry fault degrades to the
-    prior behaviour instead of breaking a session. Logged, never silent.
-
-    Callers need both the prior status AND the prior binding to recognise
-    the launch window (see ``_in_unbound_launch_window``), so this returns
-    the whole snapshot rather than a single field.
-    """
-    try:
-        return session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
-        return None
-    except Exception:
-        logger.warning(
-            'pre-refresh record read failed for slug %s; treating it as unsighted',
-            slug,
-            exc_info=True,
-        )
-        return None
-
-
 _LAUNCH_WINDOW_WITHHOLD_MAX_SECS = 600.0
 """How long an event of UNKNOWN provenance may be withheld from a still-
 LAUNCHING, still-unbound record before the rail prefers a possibly-wrong
@@ -1365,7 +1404,7 @@ def _run_status_refresh_and_retitle(
     probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
     slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root, probes=probes)
-    prior = _prior_record_or_none(slug, root)
+    prior = _read_record_snapshot(slug, root).record
     # Decide the launch window BEFORE the refresh: refresh_record is a
     # read-modify-WRITE, so passing the status here at all would already have
     # mutated the spawn-created record by the time any later guard ran.
