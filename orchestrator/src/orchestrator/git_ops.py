@@ -1510,6 +1510,10 @@ class WarmLaneRequeue(Exception):
         WarmLaneReseedContaminated — fresh reseed failed verification: the
             lane still carries a prior occupant's commits (task 2854,
             data-integrity); requeue to re-acquire a DIFFERENT lane.
+        WarmLaneLockContention — seed refused because another live consumer
+            holds <lane_dir>.lock (task 4211, seed exit 77); transient
+            shared-resource contention, deliberately distinct from
+            WarmLaneDiskPressure.
     """
 
 
@@ -1600,6 +1604,38 @@ class WarmLaneReseedContaminated(WarmLaneRequeue):
     ``counts_against_requeue_cap=True`` so a persistent/pathological
     contamination eventually trips the requeue-cap escalation — a loud human
     signal — instead of requeuing forever silently.
+    """
+
+
+class WarmLaneLockContention(WarmLaneRequeue):
+    """Seed exited 77 — it REFUSED because another live consumer holds
+    ``<lane_dir>.lock`` (task 4211).
+
+    Reported by ``reify/scripts/seed-warm-lane.sh`` from both of its lane-lock
+    refusal arms (the ``flock -n`` immediate refusal and the ``flock -w`` queue
+    timeout), with a ``LANE_LOCK_CONTENDED:`` stderr marker, when DF passes the
+    opt-in ``--distinct-lock-refusal-rc`` flag (reify task 5568).  Whether DF
+    passes it is decided per lane by
+    :func:`_seed_script_supports_distinct_lock_refusal_rc`, which fails CLOSED:
+    a lane on a pre-5568 seed script still exits 75 and still surfaces as
+    :class:`WarmLaneDiskPressure`, exactly as before this class existed.
+
+    Transient SHARED-RESOURCE contention and never a fault of this task, so it
+    requeues via the :class:`WarmLaneRequeue` base handler and its
+    disposition-table row sets ``counts_against_requeue_cap=False`` — the
+    :class:`WarmLaneDiskPressure` / :class:`WarmLanePoolHardDown` /
+    :class:`WarmLaneSoftPressure` shape, deliberately NOT
+    :class:`WarmLaneReseedContaminated`'s ``True`` (that is a per-task
+    data-integrity fault; burning this task's requeue cap for someone else's
+    lock hold would punish the wrong party).
+
+    Deliberately DISTINCT from :class:`WarmLaneDiskPressure`.  Both conditions
+    are transient and both requeue, so the routing is the same — but the
+    operator-facing signal is not.  Conflating them is the defect this class
+    exists to fix: seed has no disk-pressure exit-75 path at all, so every lock
+    refusal used to arrive as 75 and render as ``warm_lane_disk_pressure``,
+    which is what operators read throughout reify esc-5556-1 while the real
+    condition was a held lane lock.
     """
 
 
@@ -4249,6 +4285,18 @@ class GitOps:
                     f'warm-lane reseed contamination for branch {branch_name!r} '
                     f"(lane retained a prior occupant's commits beyond base); "
                     f'requeue to re-acquire a different lane (task 2854)'
+                )
+            if pool_info is WarmLaneUnavailable.LANE_LOCK_CONTENDED:
+                # Task 4211: seed exited 77 under reify's opt-in
+                # --distinct-lock-refusal-rc — another live consumer holds
+                # <lane_dir>.lock.  Transient shared-resource contention:
+                # requeue (WarmLaneRequeue), and say so.  Before this arm the
+                # condition arrived as rc 75 and was rendered to operators as
+                # disk pressure, so the message deliberately never says that.
+                raise WarmLaneLockContention(
+                    f'warm-lane seed refused: lane lock contention for branch '
+                    f'{branch_name!r} (another consumer holds the lane lock); '
+                    f'requeue (task 4211)'
                 )
             # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
             # DISABLED is a programming error (caller bypassed the pool-enabled
