@@ -56,7 +56,6 @@ import contextlib
 import threading
 import time
 import uuid
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from shared.cli_invoke import _run_subprocess
@@ -90,9 +89,7 @@ def _make_hanging_proc():
     return proc, call_count
 
 
-def _make_delayed_success_proc(
-    delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}', *, returncode=0
-):
+def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}'):
     """Return a proc whose communicate() sleeps *delay_secs* then succeeds once.
 
     Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._make_delayed_success_proc``
@@ -111,12 +108,7 @@ def _make_delayed_success_proc(
     proc.terminate = MagicMock()
     proc.kill = MagicMock()
     proc.wait = AsyncMock()
-    # returncode is a knob so a caller can build a proc that COMPLETED but whose
-    # returncode still reads None — see
-    # TestCancellationDuringOffLoopRead::test_cancel_during_normal_exit_read_leaves_the_group_alone,
-    # which needs the outer cancel handler's `if proc.returncode is None:` guard
-    # to be TRUE so that a would-be reap is observable.
-    proc.returncode = returncode
+    proc.returncode = 0
     proc.pid = 12345
     return proc
 
@@ -626,4 +618,121 @@ class TestNormalExitReadOffLoop:
         )
         assert result.ended_awaiting_background is False, (
             'Expected the fail-safe default ended_awaiting_background=False'
+        )
+
+
+class TestCompletionRecheckAfterOffLoopRead:
+    """The ``if comm_task.done(): break`` re-check after the off-loop poll reads.
+
+    This is the subtlest change on the branch and the one the other tests reach
+    only by scheduling accident.  Moving the poll reads off the loop turned them
+    into ``await``s — a yield point that did not exist while they were synchronous
+    — so ``comm_task`` can now finish WHILE a read is in flight.  Without the
+    re-check the run falls through to the kill checks and cancels an
+    already-finished task, reporting ``timed_out=True`` and discarding a
+    successful run's stdout.
+
+    DETERMINISM.  Nothing here races on wall-clock time.  The fake
+    ``communicate()`` blocks on an ``asyncio.Event`` that ONLY the fake transcript
+    read can set, and the fake read (running on the worker thread) then blocks on
+    a ``threading.Event`` that ``communicate()`` sets as its last act before
+    returning.  So the completion is forced to land inside the read's ``await``
+    window, in this order:
+
+      1. worker thread ``call_soon_threadsafe(comm_gate.set)`` → returns to the loop
+      2. loop runs ``comm_gate.set()`` → schedules the communicate task's step
+      3. loop runs that step → ``comm_returned.set()``, coroutine returns,
+         ``comm_task`` is marked done IN THAT SAME CALLBACK
+      4. worker thread (woken by step 3) returns; the executor future's completion
+         is delivered by a ``call_soon_threadsafe`` enqueued AFTER step 3's
+         callback, so FIFO ordering on the loop's ready queue guarantees the main
+         task only resumes once ``comm_task.done()`` is already True.
+
+    The ordering rests on the loop being single-threaded and its ready queue being
+    FIFO, not on any sleep — step 4's callback cannot preempt step 3's, which is
+    already executing.
+
+    DISCRIMINATION.  ``startup_grace_secs=0.0`` with a read returning 0 turns
+    arms the startup-wedge kill on the very first poll, so the pre-change code
+    (re-check deleted) reaches ``raise TimeoutError`` and returns
+    ``timed_out=True``.  Verified by reverting the re-check: this test fails, the
+    other seven still pass.
+    """
+
+    async def test_completion_during_the_off_loop_read_is_taken_as_a_normal_exit(
+        self, tmp_path
+    ):
+        loop = asyncio.get_running_loop()
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        comm_gate = asyncio.Event()  # loop-side: released by the worker thread
+        comm_returned = threading.Event()  # thread-side: set by communicate()
+        stdout_bytes = b'{"type":"result","subtype":"success"}'
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            await comm_gate.wait()
+            comm_returned.set()
+            return (stdout_bytes, b'')
+
+        proc = MagicMock()
+        proc.communicate = communicate_side_effect
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+        proc.pid = 12345
+
+        reads: list[int] = []
+        released: list[bool] = []
+
+        def gated_read(config_dir, session_id):
+            """Complete comm_task from inside this read, then return 0 turns."""
+            reads.append(threading.get_ident())
+            loop.call_soon_threadsafe(comm_gate.set)
+            # Bounded so a broken handshake fails the assertion below instead of
+            # hanging the suite; it is never reached on the happy path.
+            released.append(comm_returned.wait(timeout=10.0))
+            return 0
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=gated_read),
+            patch('shared.cli_invoke.read_transcript_records', return_value=[]),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=5.0, startup_grace_secs=0.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        # Ordered so the property under test fails FIRST: the handshake check is a
+        # guard against a vacuous pass (a run that never put the completion inside
+        # the read window), not the thing being asserted.
+        assert released[:1] == [True], (
+            f'The handshake did not complete — communicate() never returned inside the '
+            f'first read window, so this run did not exercise the re-check at all. '
+            f'released={released}'
+        )
+        assert result.timed_out is False, (
+            'comm_task completed DURING the off-loop poll read, but the run was '
+            'reported as timed out — the completion re-check after the read did not '
+            'fire, so an already-finished task was cancelled by the startup-wedge kill.'
+        )
+        assert len(reads) == 1, (
+            f'Expected exactly ONE watchdog poll read: the run must leave the loop via '
+            f'the re-check on that first pass.  A second read means it fell through to '
+            f'the kill block and the except-TimeoutError handler did its own re-read. '
+            f'Got {len(reads)}'
+        )
+        assert result.stdout == stdout_bytes.decode(), (
+            f'The completed run\'s stdout must survive the re-check path — a fall-through '
+            f'to the kill block discards the real result envelope. '
+            f'Got {result.stdout!r}'
         )
