@@ -16,10 +16,35 @@ caller attaches no ``manifest_stamping`` key, keeping the legacy response
 byte-identical); a malformed sidecar or absent labels populate
 ``report['errors']`` but never raise and never block the ``commit_planning``
 status flip that called this helper.
+
+DELIVERED-CHECK POLARITY REFUSAL (task 3500). Every mechanical check is
+linted by :func:`shared.delivered_check_polarity.lint_delivered_checks`
+against the authoring tree before it is copied, and a check the lint
+REJECTS is dropped from the copy and named in ``report['errors']``.
+
+That is the same lint ``commit_planning`` runs, with the OPPOSITE
+contract, and the difference is forced by what each wire point is allowed
+to do. ``commit_planning`` is a synchronous gate whose caller is a live
+agent that can repair the descriptor and re-commit, so it REJECTS the
+whole batch. This helper is contractually never-raising and must not
+block the status flip that called it, so the worst it may do is refuse to
+copy. Dropping degrades toward the SAFE direction — a dependent
+dispatched ungated, exactly as before the delivered-check gate existed —
+rather than toward the wedge this task exists to prevent, where a
+dependent is blocked forever behind a check that can never go green.
+
+Dispositions below ``reject`` are non-blocking by construction: a ``warn``
+(an over-broad ``expect=absent`` pattern, undecidable at authoring time)
+is copied and surfaces under the conditional ``report['polarity_warnings']``
+key, and an ``errored`` (the check could not be EVALUATED at all — no git,
+root not a repo, unresolvable ref) is copied and logged at WARNING. Both
+new report keys are attached only when non-empty, so a clean batch's
+report keeps its exact four-key legacy shape.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -30,6 +55,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
+from shared.delivered_check_polarity import lint_delivered_checks
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 
@@ -122,6 +148,15 @@ async def _stamp_capability_manifests_impl(
     work so anticipated failures are attributed precisely in
     ``report['errors']`` rather than falling through to the generic
     backstop message.
+
+    Step 5 additionally REFUSES to copy any check the polarity lint rejects
+    (task 3500 — see the module docstring for why refusal, not rejection, is
+    the right degradation at this wire point). The refusal is per CHECK, not
+    per label: dropping a whole label would strip a sound gate along with the
+    unsound one. A refused check never rolls back the ``task_id`` stamp step 4
+    already committed to disk — that stamp is the decompose session's record
+    of which task owns the label, and is correct regardless of any descriptor
+    defect on it.
     """
     # 1. Build the manifest-bearing set: (task_id, prd_task_label, derived
     #    sidecar rel path) for batch tasks whose metadata carries BOTH a
@@ -293,6 +328,23 @@ async def _stamp_capability_manifests_impl(
     #    delivered_checks into that producer's metadata.delivered_checks —
     #    a manual-only (or checkless) label collects an empty list and is
     #    skipped, leaving the δ gate a status-only no-op for it.
+    #
+    #    Each copy is POLARITY-LINTED first (task 3500) and a rejected check
+    #    is refused rather than persisted. The task's declared metadata.files
+    #    feeds the lint's scope-sensitive rules, and comes from the batch
+    #    tasks_data already in hand — no extra reads.
+    files_by_task_id: dict[str, list[str]] = {}
+    for tid, batch_task in zip(ids, tasks_data, strict=False):
+        if not isinstance(batch_task, dict):
+            continue
+        batch_meta = batch_task.get('metadata')
+        if not isinstance(batch_meta, dict):
+            continue
+        declared = batch_meta.get('files')
+        if isinstance(declared, list):
+            files_by_task_id[tid] = [f for f in declared if isinstance(f, str)]
+    polarity_warnings: list[dict[str, Any]] = []
+
     for task in doc.tasks:
         if task.label not in stamped_label_set:
             continue
@@ -325,6 +377,67 @@ async def _stamp_capability_manifests_impl(
             if not mechanical:
                 continue
             tid = label_to_task_id[task.label]
+            # Polarity lint (task 3500), AFTER the DeliveredCheckMeta
+            # re-validation above so a schema-invalid check is still
+            # diagnosed by the existing except-arm rather than relabelled by
+            # this one, and BEFORE the write so a rejected check is never
+            # persisted. `manifest_path` is threaded through only for the
+            # lint (it is not a DeliveredCheckMeta field and never reaches
+            # metadata) so the self-reference classifier can tell a match in
+            # the descriptor's own PRD family from a real one. Synchronous
+            # and git-shelling, hence asyncio.to_thread; never raises.
+            findings = await asyncio.to_thread(
+                lint_delivered_checks,
+                [{**check_meta, 'manifest_path': sidecar_rel} for check_meta in mechanical],
+                files=files_by_task_id.get(tid, []),
+                repo_root=str(root),
+                ref='HEAD',
+            )
+            refused = {f.check_name: f for f in findings if f.severity == 'reject'}
+            for finding in findings:
+                if finding.severity == 'reject':
+                    continue
+                if finding.severity == 'warn':
+                    polarity_warnings.append(
+                        {
+                            'task_id': tid,
+                            'label': task.label,
+                            'name': finding.check_name,
+                            'code': finding.code,
+                            'severity': finding.severity,
+                            'message': finding.message,
+                        }
+                    )
+                else:
+                    # 'errored' — the check could not be EVALUATED. Copied
+                    # anyway (fail open on infrastructure) and logged rather
+                    # than reported, because an unevaluable check is the
+                    # DEFAULT state on any non-git root and a report entry
+                    # there would break the exact-shape contract this
+                    # report's callers assert (esc-3500-2).
+                    logger.warning(
+                        'stamp_capability_manifests: could not evaluate '
+                        'delivered_check %r for label %s (task %s) — copying it '
+                        'unvalidated: %s',
+                        finding.check_name, task.label, tid, finding.message,
+                    )
+            if refused:
+                for name, finding in refused.items():
+                    logger.warning(
+                        'stamp_capability_manifests: refusing to copy '
+                        'delivered_check %r for label %s (task %s) — [%s] %s',
+                        name, task.label, tid, finding.code, finding.message,
+                    )
+                    report['errors'].append(
+                        f'{sidecar_rel}: refused to copy delivered_check {name!r} '
+                        f'for label {task.label!r} (task {tid}) — [{finding.code}] '
+                        f'{finding.message}'
+                    )
+                mechanical = [c for c in mechanical if c.get('name') not in refused]
+                # Re-checked AFTER the drop so an all-refused label writes
+                # nothing at all — the same arm a checkless label takes.
+                if not mechanical:
+                    continue
             resp = await task_interceptor.update_task(
                 tid,
                 project_root,
@@ -362,5 +475,12 @@ async def _stamp_capability_manifests_impl(
                 f'{sidecar_rel}: update_task rejected delivered_checks write for '
                 f'label {task.label!r} (task {tid}) — {resp!r}'
             )
+
+    # Non-blocking polarity findings (task 3500), attached in the same
+    # CONDITIONAL shape the caller uses for the whole report: only when
+    # non-empty, so a clean batch's report keeps its exact four-key legacy
+    # shape and every existing exact-dict assertion on it stays valid.
+    if polarity_warnings:
+        report['polarity_warnings'] = polarity_warnings
 
     return report
