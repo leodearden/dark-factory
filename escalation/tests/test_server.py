@@ -7830,3 +7830,156 @@ class TestResolveIssueDeclaredPinGuard:
 
         assert 'code' not in result, result
         assert result['status'] == 'dismissed'
+
+    # --- the CASCADE case — the path that actually spent the specimen ---
+
+    def _homogeneous_cluster(
+        self, queue: EscalationQueue, marked: tuple[str, ...] = ('esc-3371-2',),
+        member_ids: tuple[str, ...] = ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'),
+    ) -> Escalation:
+        """The 2026-08-08 incident shape: a homogeneous L2 cluster whose members
+        are indistinguishable by level/category/severity/agent_role/summary, with
+        the marker on a MEMBER — never on the head."""
+        for member_id in member_ids:
+            self._seed(queue, esc_id=member_id, task_id='3237', level=1)
+        for member_id in marked:
+            queue.declare_pin(member_id, declared_by=[self.DECLARER], reason=self.REASON)
+        l2 = Escalation(
+            id='esc-3237-5',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='rubber-stamp cluster head, itself unmarked',
+            level=2,
+            root_cause='homogeneous cluster',
+            members=list(member_ids),
+        )
+        queue.submit(l2)
+        return l2
+
+    @pytest.mark.asyncio
+    async def test_marked_member_refuses_the_whole_cascade(self, tmp_path: Path):
+        """(a) The HEAD carries no marker; the refusal still fires."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='rubber-stamp bulk close',
+            action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_member_not_just_the_head(self, tmp_path: Path):
+        """(b) A message naming only the head leaves the closer as blind as the
+        2026-08-08 watcher was."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'esc-3371-2' in result['error']
+        assert self.DECLARER in result['error']
+        assert [p['escalation_id'] for p in result['declared_pins']] == ['esc-3371-2']
+
+    @pytest.mark.asyncio
+    async def test_nothing_in_the_cluster_is_mutated(self, tmp_path: Path):
+        """(c) The assertion that distinguishes a PRE-FLIGHT gate from a refusal
+        raised mid-cascade, which would leave the head already archived."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        for esc_id in ('esc-3237-5', 'esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(esc_id)
+            assert rec is not None, esc_id
+            assert rec.status == 'pending', f'{esc_id} should still be pending'
+            assert rec.resolution_action is None, f'{esc_id} was pre-stamped'
+            assert (queue.queue_dir / f'{esc_id}.json').exists(), f'{esc_id} was archived'
+
+    @pytest.mark.asyncio
+    async def test_multiple_marked_members_are_all_named(self, tmp_path: Path):
+        """(d) One declared_pins entry per marked member, all of them named."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert [p['escalation_id'] for p in result['declared_pins']] == [
+            'esc-3237-1', 'esc-3371-2',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dangling_member_id_does_not_blow_up_the_gate(self, tmp_path: Path):
+        """(e) Mirrors the cascade's existing best-effort contract — a record
+        that does not exist cannot carry a marker."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed(queue, esc_id='esc-real-1', task_id='3237', level=1)
+        l2 = Escalation(
+            id='esc-l2-dangling',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='cluster with a dangling member id',
+            level=2,
+            members=['esc-real-1', 'esc-never-existed'],
+        )
+        queue.submit(l2)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_wholly_unmarked_cluster_cascades_exactly_as_today(self, tmp_path: Path):
+        """(f) The no-regression half."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=())
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+        for member_id in ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(member_id)
+            assert rec is not None
+            assert rec.status == 'dismissed', f'{member_id} should have cascaded'
+
+    @pytest.mark.asyncio
+    async def test_park_is_exempt_even_when_a_member_is_marked(self, tmp_path: Path):
+        """(g) The gate protects the record's OPEN status, not every resolver
+        action — park keeps it open and never archives, so it cannot spend a pin."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='holding for a human', action='park',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'pending', 'park keeps the record open'
+        assert result['resolution_action'] == 'park'
+        assert queue.get('esc-3371-2') is not None
+        assert (queue.queue_dir / 'esc-3371-2.json').exists(), 'the pin is untouched'
