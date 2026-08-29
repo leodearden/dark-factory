@@ -41,7 +41,6 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import logging
@@ -2088,7 +2087,8 @@ class TestLateArrivalAttaches:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2320,7 +2320,8 @@ class TestLateArrivalCleanCAS:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2831,7 +2832,8 @@ class TestLateArrivalGuards:
         # ── A's local verify: passes immediately (no gate) ───────────────────
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -2934,7 +2936,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3036,7 +3039,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3151,7 +3155,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3287,7 +3292,8 @@ class TestLateArrivalGuards:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3466,7 +3472,8 @@ class TestLateArrivalSubmissionOrderCAS:
                 gate_a_entered.set()
                 await gate_a_release.wait()
             # task 3980: _fake_verify_result, not a bare MagicMock — see the
-            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            # shared bare-dataclass-double rule
+            # (fused-memory/scripts/check_bare_magicmock_config.py).
             return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
             )
@@ -3852,139 +3859,26 @@ class TestTimeoutMarkCoverage:
 
 
 # ===========================================================================
-# Task 3980 step-9: no unspecced VerifyResult-shaped double may survive here
+# task 3980's bare-double guard now lives in the SHARED checker (task 4016)
 # ===========================================================================
-
-
-# Exactly ONE deliberate bare-MagicMock site is exempt (task 3980 step-12).
-# TestDispositionDoubleFidelity's NEGATIVE leg re-introduces the pre-step-8
-# defect ON PURPOSE and asserts that the classifier fails open on it — that
-# mutation is what makes the POSITIVE leg's "no fail-open" assertion provably
-# two-sided rather than trivially true. A guard that flagged it would force the
-# proof to be deleted to keep the guard green, which is backwards.
 #
-# The exemption is keyed on the enclosing scope, NOT on a line number (which
-# every edit above it invalidates) and NOT on a comment pragma (which is one
-# copy-paste away from exempting a real offender). Adding an entry here is a
-# design decision, not a cleanup: any NEW entry must, like this one, exist to
-# prove a guard can fail.
-_BARE_DOUBLE_EXEMPT_SCOPES = frozenset({
-    'TestDispositionDoubleFidelity::test_bare_double_makes_classifier_fail_open',
-})
-
-
-def _bare_verify_result_double_offenders(source: str) -> list[str]:
-    """Statically scan *source* for unspecced VerifyResult-shaped MagicMocks.
-
-    The tell is a ``passed=`` keyword: it is VerifyResult's first field and no
-    other double in this file carries it. Keying on ``passed=`` rather than on
-    ``MagicMock`` alone is what lets the many legitimate non-VerifyResult
-    MagicMocks here through untouched.
-
-    Flags a construction regardless of POSITION — ``return MagicMock(...)``, an
-    assignment, or an argument. Position-blindness is the whole point: this
-    repo's dedicated detector, fused-memory/scripts/check_bare_magicmock_config.py,
-    provably cannot catch this shape for three independent reasons, any one of
-    which is fatal — it inspects only ``ast.Assign``/``ast.AnnAssign`` while all
-    ten sites behind task 3980 were ``return MagicMock(...)``; its
-    ``_is_config_name`` matches only config/cfg/*_config/*_cfg targets; and its
-    remedies are pydantic-specific (``pydantic_spec`` reads ``model_fields``)
-    while VerifyResult is a stdlib dataclass. Widening that shared, seven-caller
-    gate is filed as a separate follow-up; this gives the file coverage now.
-
-    A ``spec=``/``spec_set=`` argument exempts a site, because that is precisely
-    what makes an unknown-attribute READ raise AttributeError instead of
-    auto-vivifying a truthy child Mock — the root-cause fix rather than a
-    ``cause_hint=''`` patch for today's one known field.
-
-    Must never raise: a crash here would fail the module over an unrelated
-    edit. Unparseable source returns [].
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    name = Path(__file__).name
-    offenders: list[str] = []
-
-    def _is_magicmock(func: ast.expr) -> bool:
-        # Both the bare `MagicMock(...)` this file imports and a qualified
-        # `mock.MagicMock(...)` / `unittest.mock.MagicMock(...)`.
-        if isinstance(func, ast.Name):
-            return func.id == 'MagicMock'
-        if isinstance(func, ast.Attribute):
-            return func.attr == 'MagicMock'
-        return False
-
-    def _visit(node: ast.AST, scope: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                _visit(child, f'{scope}::{child.name}' if scope else child.name)
-                continue
-            if isinstance(child, ast.Call) and _is_magicmock(child.func):
-                kwargs = {kw.arg for kw in child.keywords}
-                if (
-                    'passed' in kwargs
-                    and not ({'spec', 'spec_set'} & kwargs)
-                    and scope not in _BARE_DOUBLE_EXEMPT_SCOPES
-                ):
-                    offenders.append(
-                        f'{name}:{child.lineno} — {scope or "<module>"} — '
-                        f'MagicMock(passed=...) with no spec=.'
-                    )
-            _visit(child, scope)
-
-    _visit(tree, '')
-    return offenders
-
-
-class TestNoBareVerifyResultDoubles:
-    """Enforced invariant: every VerifyResult-shaped double in this module is
-    built through ``_fake_verify_result``, never as a bare MagicMock.
-
-    Task 3980 measured what a bare one costs. An unconfigured attribute READ on
-    a bare MagicMock auto-vivifies a truthy child Mock rather than returning a
-    real default, so the ten inline doubles here — every one of which omitted
-    ``cause_hint`` — made merge_disposition.py's
-    ``_extract_failing_tests_and_candidate_files`` (:218-221) raise
-    ``TypeError: sequence item 0: expected str instance, MagicMock found`` out
-    of ``str.join``. ``classify_merge_failure_disposition`` (:710-719) swallows
-    that into a silent fail-open (WARNING + INDETERMINATE), which is
-    indistinguishable downstream from a genuine verdict — so the affected
-    assertions only APPEARED to exercise disposition classification.
-
-    Every one of these sites also passed ``verify_skipped=``, which is not a
-    VerifyResult field at all (it lives on MergeOutcome, merge_types.py:945).
-    Nothing objected, because a bare MagicMock accepts any kwarg. That is the
-    same silent-drift failure mode from the other direction, and it is why the
-    remedy is ``spec=VerifyResult`` rather than adding ``cause_hint=''``.
-    """
-
-    def test_no_unspecced_verify_result_double_survives(self) -> None:
-        offenders = _bare_verify_result_double_offenders(Path(__file__).read_text())
-
-        assert not offenders, (
-            'These VerifyResult-shaped doubles are still unspecced MagicMocks:\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
-            + '\n\nRemedy: build them with _fake_verify_result(...) (task 3477, '
-            'imported at the top of this module). It seeds a '
-            'MagicMock(spec=VerifyResult) from dataclasses.fields(VerifyResult), '
-            'so every real field gets its real default (cause_hint becomes a '
-            'real str), an unknown-attribute READ raises AttributeError instead '
-            'of auto-vivifying a truthy Mock, and an unknown override such as '
-            'verify_skipped= is rejected with TypeError instead of silently '
-            'setattr-ing onto the mock. Drop lint_output/type_output/timed_out/'
-            'category unless the test needs a non-default value — restating a '
-            'default inline is how these doubles drifted in the first place.\n'
-            'Exactly one site is exempt, by enclosing scope, in '
-            '_BARE_DOUBLE_EXEMPT_SCOPES: TestDispositionDoubleFidelity\'s '
-            'negative leg re-introduces the defect deliberately to prove the '
-            'positive leg can fail. Do not add an entry to silence a real '
-            'offender.'
-        )
+# `_BARE_DOUBLE_EXEMPT_SCOPES`, `_bare_verify_result_double_offenders` and
+# `TestNoBareVerifyResultDoubles` were deleted here (task 4246) and are covered
+# by rule `bare-dataclass-double` in
+# fused-memory/scripts/check_bare_magicmock_config.py, enforced repo-wide.
+#
+# What the shared rule keys on: an unspecced `MagicMock(...)` in ANY position
+# whose literal kwargs carry the `passed` anchor plus at least two VerifyResult
+# field matches. The deletion accepted a measured, two-directional delta —
+# the shared rule is STRICTER on `spec=None` and positional specs, NARROWER on a
+# lone `MagicMock(passed=True)` — recorded and pinned in
+# fused-memory/tests/test_check_bare_magicmock_config.py::
+# TestRuleBCoversMergeSpeculation, which also holds the two-sided proof that the
+# rule reaches this module. This module is deliberately absent from the rule's
+# _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
+#
+# The single deliberate bare double below keeps a per-site
+# `# noqa: bare-dataclass-double` pragma, which is now its SOLE suppression.
 
 
 # ===========================================================================
@@ -4075,22 +3969,21 @@ class TestDispositionDoubleFidelity:
         ``_extract_failing_tests_and_candidate_files``' ``if part`` filter and
         then breaks ``str.join`` (merge_disposition.py:218).
 
-        Exempt from ``TestNoBareVerifyResultDoubles`` by enclosing scope via
-        ``_BARE_DOUBLE_EXEMPT_SCOPES`` — the one site in this module where a
-        bare double is the point.  TWO independent guards cover this shape and
-        the site is deliberately exempted from BOTH: that file-local scope
-        exemption, and the shared detector's ``# noqa: bare-dataclass-double``
-        pragma below (fused-memory/scripts/check_bare_magicmock_config.py,
-        task 4016).  Both suppressions are paired on purpose — neither is a
-        licence to add another bare double here.
+        This is the one site in this module where a bare double is the point,
+        and it is exempted by exactly ONE suppression: the
+        ``# noqa: bare-dataclass-double`` pragma below
+        (fused-memory/scripts/check_bare_magicmock_config.py, task 4016).  The
+        file-local scope exemption that used to pair with it was deleted in task
+        4246 along with the duplicate guard it belonged to.  That single pragma
+        is not a licence to add another bare double here: every other one in this
+        module is still covered, because the module is deliberately OFF the
+        rule's _DATACLASS_DOUBLE_DEBT baseline.
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # Paired with the entry in
-        # orchestrator/tests/test_merge_speculation.py::_BARE_DOUBLE_EXEMPT_SCOPES,
-        # which exempts this same scope from task 3980's file-local guard. This module is
-        # deliberately OFF _DATACLASS_DOUBLE_DEBT so every other double here stays covered.
+        # This module is deliberately OFF _DATACLASS_DOUBLE_DEBT, so the pragma
+        # below is a per-SITE suppression and every other double here stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',
