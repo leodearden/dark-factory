@@ -92,8 +92,12 @@ validated on write:
 - `parent_id` — UUID of a live entry this one attaches to
 - `supersedes` — list of UUIDs this entry replaces
 
-Any other key still writes but warns to a census line; prefix a deliberate
-annotation `x_` and it passes silently.
+A small blessed set of conventional keys — `task_id`, `source`, `transition`,
+`stage` and a few more — is already known and does not warn; use those exact
+spellings rather than an `x_` variant of them, because metadata-keyed lookups
+filter on them. Any key outside that set and the five above still writes but
+warns to a census line; prefix a deliberate annotation `x_` and it passes
+silently.
 
 The exact shapes, validation rules and the kind registry itself live in
 `fused-memory/src/fused_memory/memory_metadata.py` — the single normative

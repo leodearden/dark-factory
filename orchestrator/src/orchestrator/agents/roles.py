@@ -285,14 +285,24 @@ _PLAN_STATUS_TOOLS = [
 # POINTER, NOT A SECOND COPY (INV-5).  The single normative home of the
 # vocabulary is `fused-memory/src/fused_memory/memory_metadata.py` (leaf beta,
 # task 3195) -- RESERVED_VOCABULARY_KEYS, KIND_REGISTRY, TOPIC_SLUG_RE,
-# EXPERIMENTAL_KEY_PREFIX.  The prose below summarises those for a writer; it
-# must never restate the registry's contents.  The drift pin that fails when
-# the two sides disagree lives in
-# `fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py` (that suite
-# has BOTH packages on its pythonpath, so the guard is a hard import there
+# TOPIC_SLUG_MAX_LEN, BLESSED_METADATA_KEYS, EXPERIMENTAL_KEY_PREFIX.  The prose
+# below summarises those for a writer; it must never enumerate a registry
+# COLLECTION (the 336 kinds, the blessed key set) -- name the shape and point at
+# the module instead.  The drift pin that fails when the two sides disagree
+# lives in `fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py` (that
+# suite has BOTH packages on its pythonpath, so the guard is a hard import there
 # rather than a silently-skipped no-op).  That pin is registry-DERIVED only: it
 # asserts the reserved keys reach this text and each memory role's rendered
 # prompt, and never pins wording, so reflowing the prose below stays green.
+#
+# THE ONE SCALAR THIS TEXT DOES QUOTE is the topic-slug length cap, because a
+# writer cannot obey a cap it is not told (review, task 3202).  The orchestrator
+# package cannot import `fused_memory` -- there is no dependency edge -- so the
+# value cannot be interpolated here; instead the drift pin carries a
+# value-RESOLUTION assertion (`str(TOPIC_SLUG_MAX_LEN)` must appear in this
+# text), which goes red if the registry raises the cap and this prose is left
+# behind, while staying green under any reflow.  Any future scalar quoted here
+# must acquire the same kind of assertion.
 #
 # SEQUENCING SEAM -- task 3131 (dep-gated behind 3169) inverts the
 # write-eagerness guidance in the PRECEDING block ("Write when you discover..."
@@ -320,7 +330,11 @@ validated on write:
 - `parent_id` — full 36-character UUID of a live entry this one attaches to; triage attach outcomes only, kinds `amendment` and `sighting`.
 - `supersedes` — LIST of full 36-character UUIDs this entry replaces; never a bare string, even for a single UUID.
 
-Any other key still writes, but WARNS to a census line. If the annotation is
+A small blessed set of conventional keys — `task_id`, `source`, `transition`,
+`stage` and a few more — is already known and does NOT warn; use those exact
+spellings rather than inventing an `x_` variant of them, because downstream
+metadata-keyed lookups filter on them. Any key outside that set and the five
+above still writes, but WARNS to a census line; if such an annotation is
 deliberate, prefix it `x_` and it passes silently.
 
 The registry module `fused-memory/src/fused_memory/memory_metadata.py` is the
