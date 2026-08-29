@@ -23,6 +23,13 @@ a script and not a test.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from audit_delivered_checks import (
     DISPOSITION_BROKEN,
@@ -232,8 +239,6 @@ class TestLoadMetadataChecks:
     def test_connection_is_read_only(self, make_tasks_db):
         # READ-ONLY/REPORT-ONLY is a structural guarantee, not a convention:
         # the URI mode makes writing impossible rather than merely unwritten.
-        import sqlite3
-
         db = make_tasks_db([{'id': 15, 'status': 'done'}])
         conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
         try:
@@ -249,8 +254,6 @@ class TestLoadMetadataChecks:
 
 
 def _init_repo(root, files):
-    import subprocess
-
     root.mkdir(parents=True, exist_ok=True)
     subprocess.run(['git', 'init', '-b', 'main', str(root)], check=True, capture_output=True)
     for rel, text in files.items():
@@ -393,3 +396,406 @@ class TestAuditProject:
         assert '3578' in report
         assert superseded_at != broken_at
         assert 'COVERAGE' in report
+
+
+# ---------------------------------------------------------------------------
+# main() — exercised as a REAL PROCESS, the way an operator runs it.
+#
+# Subprocess rather than in-process for the same reason the exemplar
+# (test_audit_combine_gate_marker_loss.py:1496-1502) does it: the flat-sibling
+# `from _task_db_scan import ...` contract and the `_SHARED_SRC` sys.path bind
+# are only genuinely exercised when sys.path[0] is scripts/ because the
+# interpreter put it there, not because a conftest did.
+# ---------------------------------------------------------------------------
+
+_SCRIPT = str(Path(__file__).parent.parent / 'audit_delivered_checks.py')
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, _SCRIPT, *args], capture_output=True, text=True
+    )
+
+
+def _commit(root, message, files):
+    """Add *files* and commit them under *message*. Returns *root*."""
+    for rel, text in files.items():
+        target = Path(root) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True, capture_output=True)
+    subprocess.run(
+        ['git', '-C', str(root), '-c', 'user.email=t@e', '-c', 'user.name=t',
+         'commit', '-m', message],
+        check=True, capture_output=True,
+    )
+    return root
+
+
+def _make_project(tmp_path, make_tasks_db, project_root_with_tasks_db, *,
+                  tasks, files=None, name='proj'):
+    """A synthetic project root: a real git repo plus a real tasks.db.
+
+    Fixture ORDER matters and is the same trap conftest's
+    project_root_with_tasks_db docstring records — that fixture must run
+    first (it creates .taskmaster/tasks/ and an empty placeholder) and
+    make_tasks_db second, or the seeded rows get blanked.
+    """
+    root = _init_repo(tmp_path / name, files or {'src/a.py': 'pass\n'})
+    project_root_with_tasks_db(root)
+    make_tasks_db(tasks, directory=root / '.taskmaster' / 'tasks')
+    return root
+
+
+def _checks(*entries):
+    return {'delivered_checks': list(entries)}
+
+
+def _seed_dependencies(root, edges):
+    """Add a `dependencies` table to the project's tasks.db and seed *edges*.
+
+    Seeded HERE rather than in conftest's `make_tasks_db` because that fixture
+    is shared with three other sweep-script suites and is not in this task's
+    file scope. The shape mirrors the live store exactly (tag/task_id/depends_on,
+    where task_id is the DEPENDENT and depends_on the PRODUCER), which is also
+    why the script under test must tolerate the table being ABSENT: every root
+    built by the unmodified fixture has no such table, and a raised
+    OperationalError there would be caught by sweep_project_roots as an
+    "unreadable project" and turn a healthy sweep into a false exit 3.
+    """
+    db = Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS dependencies ('
+            "  tag TEXT NOT NULL DEFAULT 'master',"
+            '  task_id INTEGER NOT NULL,'
+            '  depends_on INTEGER NOT NULL,'
+            '  PRIMARY KEY (tag, task_id, depends_on))'
+        )
+        conn.executemany(
+            'INSERT INTO dependencies (tag, task_id, depends_on) VALUES (?, ?, ?)',
+            [('master', dependent, producer) for dependent, producer in edges],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _grep(name, pattern, expect='present', paths=('src/',)):
+    return {'name': name, 'kind': 'grep', 'pattern': pattern,
+            'expect': expect, 'paths': list(paths)}
+
+
+class TestParserContract:
+    def test_project_root_is_repeatable_and_bound_to_the_shared_dest(self):
+        """(a) THE TIER-3 PARSER CONTRACT, checked rather than assumed.
+
+        _task_db_scan.run_audit_cli reads `args.project_roots` straight off the
+        Namespace and documents that the dest is "a convention the two sides
+        must agree on rather than something the shared code guarantees" — a
+        script spelling dest='roots' gets an AttributeError from inside shared
+        code. This is what keeps this adopter honest.
+        """
+        from audit_delivered_checks import _build_parser
+
+        args = _build_parser().parse_args(
+            ['--project-root', '/a', '--project-root', '/b', '--json']
+        )
+
+        assert args.project_roots == ['/a', '/b']
+        assert args.json is True
+
+    def test_defaults_leave_root_resolution_to_the_shared_layer(self):
+        from audit_delivered_checks import _build_parser
+
+        args = _build_parser().parse_args([])
+
+        # None, never [] — resolve_project_roots' precedence chain treats an
+        # empty list as "the operator asked for no roots" and a None as "fall
+        # through to the env / default root".
+        assert args.project_roots is None
+        assert args.json is False
+
+
+class TestExitConstants:
+    def test_exit_constants_alias_the_shared_tier_3_codes(self):
+        """(b) The per-script EXIT_* names must BE the shared values, not
+        copies. Since the returns live in _task_db_scan.run_audit_cli, nothing
+        else stops this script redefining EXIT_OK = 9 while its epilog keeps
+        promising 0 — the exact drift the exemplar's
+        test_exit_constants_alias_the_shared_tier_3_codes exists to prevent."""
+        from _task_db_scan import (
+            AUDIT_EXIT_FINDINGS,
+            AUDIT_EXIT_NO_ROOT,
+            AUDIT_EXIT_NOTHING_AUDITED,
+            AUDIT_EXIT_OK,
+        )
+        from audit_delivered_checks import (
+            EXIT_DEFECTS,
+            EXIT_NO_ROOT,
+            EXIT_NOTHING_AUDITED,
+            EXIT_OK,
+        )
+
+        assert EXIT_OK == AUDIT_EXIT_OK
+        assert EXIT_DEFECTS == AUDIT_EXIT_FINDINGS
+        assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+        assert EXIT_NOTHING_AUDITED == AUDIT_EXIT_NOTHING_AUDITED
+
+
+class TestMainExitCodes:
+    def test_clean_root_exits_ok(self, tmp_path, make_tasks_db,
+                                 project_root_with_tasks_db):
+        """(c) The steady state: a landed producer whose check passes and a
+        live one whose check is still forward-looking. Neither is actionable,
+        so the sweep must exit 0 or it would be permanently red and ignored."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'class Landed:\n    pass\n'},
+            tasks=[
+                {'id': 20, 'status': 'done',
+                 'metadata': _checks(_grep('landed', 'Landed'))},
+                {'id': 23, 'status': 'pending',
+                 'metadata': _checks(_grep('forward', 'NotYetBuilt'))},
+            ],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0
+        assert 'COVERAGE' in result.stdout
+
+    def test_broken_descriptor_exits_with_the_findings_code(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(c) A done producer whose capability is nowhere on main today — the
+        mode-2/mode-3 defect class — is ACTIONABLE and must drive exit 1."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 21, 'status': 'done',
+                    'metadata': _checks(_grep('never-built', 'NeverBuilt'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1
+        assert 'never-built' in result.stdout
+
+    def test_vacuous_live_gate_exits_with_the_findings_code(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """The disposition that justifies the sweep: a LIVE task whose check
+        already passes is gating nothing, so it is actionable today."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'class Landed:\n    pass\n'},
+            tasks=[{'id': 22, 'status': 'pending',
+                    'metadata': _checks(_grep('already-green', 'Landed'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1
+        assert 'already-green' in result.stdout
+
+    def test_live_defects_are_ranked_above_terminal_rows(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(c) RANKING IS THE TRIAGE SIGNAL. A vacuous gate on a LIVE producer
+        is wedging dependents right now; a broken check on a closed one is
+        historical debt. Printing the historical rows first is how a report
+        stops being read."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'class Landed:\n    pass\n'},
+            tasks=[
+                {'id': 21, 'status': 'done',
+                 'metadata': _checks(_grep('terminal-defect', 'NeverBuilt'))},
+                {'id': 22, 'status': 'pending',
+                 'metadata': _checks(_grep('live-defect', 'Landed'))},
+            ],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1
+        assert result.stdout.index('live-defect') < result.stdout.index('terminal-defect')
+
+    def test_open_dependents_are_named_beside_every_defect(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """THE ACTUAL ASK OF SCOPE ITEM 5. A report that names the broken
+        descriptor without naming WHO IS STUCK behind it does not let an
+        operator triage: the whole complaint is that a dependent sits blocked
+        on a capability that can never be delivered."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 21, 'status': 'done',
+                 'metadata': _checks(_grep('never-built', 'NeverBuilt'))},
+                {'id': 77, 'status': 'blocked'},
+                {'id': 78, 'status': 'done'},
+            ],
+        )
+        _seed_dependencies(root, [(77, 21), (78, 21)])
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1
+        # 77 is still open behind the defect; 78 already closed and is not.
+        assert '77' in result.stdout
+        assert 'open_dependents' in result.stdout
+
+    def test_superseded_rows_never_drive_the_exit_code(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(d) SUPERSESSION IS REPORTED, NOT ACTIONED. The measured case: task
+        3618's `expect: absent` gzip checks fail on main today only because
+        task 3578 deliberately restored gzip reading afterwards. Exiting 1 on
+        that would ask an operator to 'fix' correctly-superseded work."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'pass\n'},
+            tasks=[{'id': 3618, 'status': 'done',
+                    'updated_at': '2020-01-01T00:00:00+00:00',
+                    'metadata': _checks(
+                        _grep('gzip-gone', 'GzipReader', expect='absent'))}],
+        )
+        _commit(root, 'fix(task-3578): restore gzip reading',
+                {'src/a.py': 'class GzipReader:\n    pass\n'})
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0          # reported, never actionable
+        assert 'SUPERSEDED' in result.stdout
+        assert 'gzip-gone' in result.stdout
+        assert '3578' in result.stdout
+
+
+class TestReportShape:
+    def test_json_is_an_object_carrying_coverage(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(e) An OBJECT, never a bare array. A top-level array has nowhere to
+        put COVERAGE, so a consumer parsing it could not distinguish a complete
+        sweep from a partial one — the no-silent-fail-soft invariant."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 21, 'status': 'done',
+                    'metadata': _checks(_grep('never-built', 'NeverBuilt'))}],
+        )
+
+        result = _run_cli('--project-root', str(root), '--json')
+        payload = json.loads(result.stdout)
+
+        assert isinstance(payload, dict)
+        project = payload['projects'][0]
+        assert set(project['coverage']) >= {
+            'descriptors_total', 'descriptors_without_task',
+            'unevaluable', 'sidecars_unloadable',
+        }
+        finding = next(f for f in project['findings'] if f['name'] == 'never-built')
+        assert finding['disposition'] == DISPOSITION_BROKEN
+        assert 'open_dependents' in finding
+
+    def test_text_report_always_names_descriptors_that_reached_no_task(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(e) The COVERAGE block is unconditional. Emitting it only when
+        non-empty would let a partial sweep render byte-identically to a
+        complete one."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={
+                'src/a.py': 'pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 999\n'
+                    '    capabilities:\n'
+                    '      - name: orphan\n'
+                    '        binding: b\n'
+                    '        verdict: PASS\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: Orphaned\n'
+                    '          expect: present\n'
+                ),
+            },
+            tasks=[{'id': 20, 'status': 'done'}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert 'COVERAGE' in result.stdout
+        assert 'no task row' in result.stdout
+        # The orphan is COUNTED, not dropped.
+        assert '999' in result.stdout
+
+    def test_every_defect_row_carries_a_reason(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A disposition name alone is a verdict without an argument. The
+        indented `reason:` is what lets a reader decide whether to act without
+        re-deriving the classification from the code."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 21, 'status': 'done',
+                    'metadata': _checks(_grep('never-built', 'NeverBuilt'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert 'reason:' in result.stdout
+
+
+class TestReadOnly:
+    def test_main_run_is_strictly_read_only(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """(f) THE READ-ONLY CLAIM, CHECKED. Every input — the task database,
+        the checked-in sidecar, and the git refs the sweep evaluates against —
+        is fingerprinted by mtime AND sha256 before and after a full run."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={
+                'src/a.py': 'class Landed:\n    pass\n',
+                'plans/x-prd.capability-manifest.yaml': (
+                    'prd: plans/x-prd.md\n'
+                    'schema_version: 1\n'
+                    'tasks:\n'
+                    '  - label: α\n'
+                    '    task_id: 21\n'
+                    '    capabilities:\n'
+                    '      - name: sidecar-cap\n'
+                    '        binding: b\n'
+                    '        verdict: PASS\n'
+                    '        delivered_check:\n'
+                    '          kind: grep\n'
+                    '          pattern: NeverBuilt\n'
+                    '          expect: present\n'
+                ),
+            },
+            tasks=[{'id': 21, 'status': 'done',
+                    'metadata': _checks(_grep('never-built', 'NeverBuilt'))}],
+        )
+        inputs = [
+            root / '.taskmaster' / 'tasks' / 'tasks.db',
+            root / 'plans' / 'x-prd.capability-manifest.yaml',
+            root / '.git' / 'HEAD',
+            root / '.git' / 'refs' / 'heads' / 'main',
+        ]
+
+        def fingerprint():
+            return {
+                str(p): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+                for p in inputs
+            }
+
+        before = fingerprint()
+        _run_cli('--project-root', str(root))
+
+        assert fingerprint() == before
