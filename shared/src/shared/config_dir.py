@@ -16,7 +16,9 @@ import re
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,103 @@ def sweep_stale_pid_dirs(
             prefix, base, exc_info=True,
         )
     return removed
+
+
+#: Prefixes already swept in this process, by :func:`sweep_stale_pid_dirs_once`.
+#: PER-PREFIX rather than one boolean — see that function's docstring.
+_swept_prefixes: set[str] = set()
+
+
+def sweep_stale_pid_dirs_once(
+    prefix: str,
+    *,
+    sweep: Callable[..., int],
+    on_reclaimed: Callable[[int], None] | None = None,
+    on_failure: Callable[[BaseException], None] | None = None,
+    **sweep_kwargs: Any,
+) -> int:
+    """Run *sweep* over *prefix* at most once per process. Never raises.
+
+    Returns the number of dirs *sweep* reported removing — 0 when this prefix was
+    already swept in this process, and 0 on failure.
+
+    WHY ONCE. The sweep reclaims OTHER (dead) processes' leftovers, not this
+    one's, so its result cannot change during a process's life in any way this
+    process caused. Re-running it per gate construction or per probe re-scans a
+    potentially 40 MB /tmp directory inode for no benefit, on the event-loop
+    thread at startup.
+
+    WHY PER-PREFIX. The one-shot state is keyed by prefix rather than being a
+    single module-level flag because the callers sweep DIFFERENT prefixes
+    (``usage-gate-probe-``, ``startup-probe-``). Under one flag, whichever caller
+    initialised first would mark the process as swept and suppress the other's
+    sweep entirely — silently converting the probe's SIGKILL-recovery half into a
+    no-op inside any process that also builds a UsageGate.
+
+    WHY THE MARK IS SET BEFORE THE CALL. So a sweep that raises every time cannot
+    re-run on every subsequent construction. The cost of the ordering is that one
+    failure forfeits the sweep for the life of the process; the next process start
+    retries, and the population still drains.
+
+    WHY THE ``except`` IS BROAD. ``sweep_stale_pid_dirs`` already contains
+    ``OSError`` internally, so anything reaching here is UNFORESEEN — a future
+    bug, a pathological tree, a mocked side effect in a sibling suite. Tmp hygiene
+    must never be able to fail orchestrator startup or a probe capture that costs
+    real money to retake, both of which are strictly worse outcomes than leaving a
+    stale /tmp dir behind.
+
+    WHY REPORTING IS INJECTED. The two callers report through genuinely different
+    sinks and neither converts without loss: ``usage_gate`` logs under its own
+    logger name with ``exc_info=True`` (its tests assert on those caplog records),
+    while the probe deliberately has no logger and prints to stderr (its tests
+    read capsys). ``on_reclaimed`` fires only on a NON-ZERO count — silent in the
+    steady state so an operator sees the population draining rather than
+    rebuilding — and ``on_failure`` receives the exception INSTANCE, so a caller
+    can interpolate it or let ``exc_info`` pick it up. Both are optional.
+
+    *sweep* is REQUIRED and keyword-only, and is deliberately NOT defaulted to
+    :func:`sweep_stale_pid_dirs`. A default binds THIS module's global at ``def``
+    time, which would make ``shared.config_dir`` the single interception point;
+    three existing fixtures instead patch each CALLER's module-level
+    ``sweep_stale_pid_dirs`` name, and one of them
+    (``test_startup_completion_probe.py::_confine_stale_dir_sweep``, autouse and
+    module-wide) is the only thing stopping that suite from rmtree-ing real
+    ``/tmp/claude-config-startup-probe-*`` dirs. Under a def-time default all
+    three would silently stop intercepting: green tests, real deletions. Callers
+    therefore pass their own module-level name explicitly, which is a call-time
+    global lookup and keeps every existing patch target working.
+
+    Extra keyword arguments are forwarded verbatim to *sweep*.
+    """
+    if prefix in _swept_prefixes:
+        return 0
+    _swept_prefixes.add(prefix)
+    try:
+        reclaimed = sweep(prefix, **sweep_kwargs)
+        if reclaimed and on_reclaimed is not None:
+            on_reclaimed(reclaimed)
+        return reclaimed
+    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
+        if on_failure is not None:
+            on_failure(exc)
+        return 0
+
+
+def reset_sweep_once_state(prefix: str | None = None) -> None:
+    """Forget that *prefix* (or every prefix) was swept in this process.
+
+    A TEST hook for simulating a fresh process, not production API: nothing in
+    production should ever want the sweep to run twice, which is the whole point
+    of :func:`sweep_stale_pid_dirs_once`.
+
+    ``discard`` semantics — resetting a prefix that was never swept is a silent
+    no-op, so a fixture calling this in both setup and teardown cannot become
+    order-dependent.
+    """
+    if prefix is None:
+        _swept_prefixes.clear()
+    else:
+        _swept_prefixes.discard(prefix)
 
 
 class TaskConfigDir:
