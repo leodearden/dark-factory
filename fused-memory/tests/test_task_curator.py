@@ -1461,6 +1461,10 @@ class TestZeroOutputBreakerBatchReset:
             )
 
         assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
         assert curator._consecutive_zero_output_timeouts == 0
 
     @pytest.mark.asyncio
@@ -1543,6 +1547,10 @@ class TestZeroOutputBreakerBatchReset:
             )
 
         assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
         assert curator._consecutive_zero_output_timeouts == 0
 
     @pytest.mark.asyncio
@@ -1576,6 +1584,54 @@ class TestZeroOutputBreakerBatchReset:
             )
 
         assert curator._consecutive_zero_output_timeouts == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_closes_already_open_breaker(self):
+        """(5) Deliberate semantic widening, pinned per this task's plan design
+        decision 3: a successful `_call_llm_batch` call closes an ALREADY-OPEN
+        breaker/cooldown too, not just the consecutive counter.
+
+        During a real bisect, `_call_llm_batch_with_fallback`'s two halves run
+        concurrently under asyncio.gather. A left half that bisected down to
+        size-1 curate() calls can open the breaker (two ZOTs, threshold=2)
+        while a sibling right-half batch call is still in flight; when that
+        sibling batch succeeds, this reset now cancels the cooldown the left
+        half just opened. Pre-task-4143 the batch path had no reset at all,
+        so it could never close an open breaker either — this is new
+        behaviour introduced by the fix, not a narrowing of pre-existing
+        behaviour. It is accepted rather than restricted to counter-only
+        because a completed LLM round-trip is still proof the backend isn't
+        wedged (see the plan's design-decision rationale)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Simulate a sibling bisect half having already tripped the breaker.
+        now = time.monotonic()
+        curator._record_zero_output_timeout(now)
+        curator._record_zero_output_timeout(now)
+        assert curator._consecutive_zero_output_timeouts == 2
+        assert curator._zero_output_breaker_open_until is not None
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='E'), CandidateTask(title='F')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        assert curator._consecutive_zero_output_timeouts == 0
+        assert curator._zero_output_breaker_open_until is None
 
 
 class TestCurateHappyPath:
