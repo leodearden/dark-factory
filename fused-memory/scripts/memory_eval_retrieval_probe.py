@@ -1949,6 +1949,12 @@ async def probe_topic(
     built from three results as "top 5". :func:`run_probe` normalises ``ks``
     so that never happens from the CLI; this keeps the label honest for the
     direct callers too, and neither guard depends on the other.
+
+    The superseded-inversion family is pinned at the same ``scored_k`` for the
+    same reason, one level further down: its ``pairs_comparable`` is not just
+    a count but a DENOMINATOR (the metric's ``n``), so if it moved with
+    ``--k`` a deeper fetch would silently change what the rate is a rate of,
+    on top of relabelling it.
     """
     limit = max(ks) if ks else TRIPWIRE_K
     # min(), not max(): a deeper fetch must not silently widen a metric that
@@ -1964,9 +1970,15 @@ async def probe_topic(
                 failed_stores=info.failed_stores,
                 diagnostics=info.diagnostics,
             ))
-        # Hashed ONCE per search, then read by every consumer below: canonical
-        # presence at each k, the inversions, and their comparable exposure.
+        # Hashed ONCE per search, then read by every consumer below. `ranks`
+        # (full depth) feeds canonical presence at each k — canonical_hit and
+        # observe_phrasing deliberately scan the whole list so a hit beyond
+        # the scored depth is reported at its true rank rather than as
+        # absent. `scored_ranks` (derived, not re-hashed — see
+        # ranks_at_depth) feeds the inversion family, which must be pinned to
+        # scored_k like contamination and claim recall.
         ranks = rank_index(info.results)
+        scored_ranks = ranks_at_depth(ranks, scored_k)
         for k in ks:
             observations.phrasings.append(observe_phrasing(
                 info.results, entry, phrasing, k, degraded=info.degraded, ranks=ranks,
@@ -1987,10 +1999,10 @@ async def probe_topic(
             phrasing=phrasing.text,
             k=scored_k,
             pairs_registered=len(entry.supersedes_pairs),
-            pairs_comparable=comparable_pairs(entry, ranks),
+            pairs_comparable=comparable_pairs(entry, scored_ranks),
             inversions=tuple(
                 superseded_inversions(
-                    info.results, entry, phrasing=phrasing.text, ranks=ranks,
+                    info.results[:scored_k], entry, phrasing=phrasing.text, ranks=scored_ranks,
                 ),
             ),
             degraded=info.degraded,
