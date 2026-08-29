@@ -7983,3 +7983,112 @@ class TestResolveIssueDeclaredPinGuard:
         assert result['resolution_action'] == 'park'
         assert queue.get('esc-3371-2') is not None
         assert (queue.queue_dir / 'esc-3371-2.json').exists(), 'the pin is untouched'
+
+    # --- the explicit acknowledgement override ---
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_a_marked_head_lets_the_close_proceed(self, tmp_path: Path):
+        """(a) Naming every blocked id releases the refusal."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=[esc.id],
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'expected it to be archived'
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_a_marked_member_lets_the_cascade_proceed(self, tmp_path: Path):
+        """(a cont.) A marked MEMBER's L2 closes and cascades to every member."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=['esc-3371-2'],
+        )
+
+        assert 'code' not in result, result
+        for member_id in ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(member_id)
+            assert rec is not None
+            assert rec.status == 'dismissed', f'{member_id} should have cascaded'
+
+    @pytest.mark.asyncio
+    async def test_partial_acknowledgement_still_refuses_naming_the_remainder(
+        self, tmp_path: Path,
+    ):
+        """(b) The load-bearing half: a closer cannot blanket-wave a cluster
+        through by naming the first id the error happened to mention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=['esc-3237-1'],
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert [p['escalation_id'] for p in result['declared_pins']] == ['esc-3371-2'], (
+            'only the UN-acknowledged remainder should be reported'
+        )
+        assert queue.get('esc-3237-5').status == 'pending'  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_an_unblocked_id_is_a_harmless_no_op(self, tmp_path: Path):
+        """(c) It does not change the outcome for the ids that ARE blocked."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=['esc-not-in-this-cluster'],
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert [p['escalation_id'] for p in result['declared_pins']] == [esc.id]
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_behaves_exactly_like_an_omitted_argument(self, tmp_path: Path):
+        """(d) The parameter is opt-in — no existing caller changes behaviour."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=None,
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+
+    @pytest.mark.asyncio
+    async def test_an_acknowledged_close_still_emits_the_queue_warning(
+        self, tmp_path: Path, caplog,
+    ):
+        """(e) An override is LOUD in the log even though it is permitted — the
+        audit trail records that a pin was deliberately spent."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            await _resolve_issue(
+                server, escalation_id=esc.id, resolution='deliberately spending it',
+                action='close_only', acknowledge_declared_pins=[esc.id],
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if 'DECLARED PIN' in r.getMessage()
+        ]
+        assert len(warnings) == 1, f'Expected one audit warning, got {warnings}'
+        assert esc.id in warnings[0]
+        assert self.DECLARER in warnings[0]
