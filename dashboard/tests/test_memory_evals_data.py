@@ -1588,6 +1588,86 @@ class TestEscalationJoin:
         assert 'list' in short_detail
         assert "['a']" in short_detail
 
+    def test_oversized_escalation_id_is_capped_in_every_join_issue_detail(self, tmp_path: Path) -> None:
+        """An escalation's ``id`` is unvalidated JSON, exactly like ``status`` and
+        ``dedupe_fingerprint`` on these same three details -- both of which task
+        4168 already bounded here.  ``id`` is the one field left unbounded: this
+        pins ``unknown_escalation_status``, ``unfingerprinted_escalation`` and
+        ``duplicate_escalation_fingerprint`` (BOTH id interpolations) so a huge
+        id cannot blow up the payload the way a huge queue record already cannot.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        huge_id = 'h' * 5000
+
+        root, esc_dir = _join_tree(tmp_path)
+        # Unrecognised status, oversized id -> unknown_escalation_status.
+        _write_escalation(
+            esc_dir, 'esc-huge-status',
+            timestamp=_JOIN_ESC_TIMESTAMP, status='quarantined', id=huge_id,
+        )
+        # Unrecognised status, SHORT id -> the strict-drop-in control: proves
+        # `_short_repr` matches today's `!r` wording byte-for-byte under the cap.
+        _write_escalation(
+            esc_dir, 'esc-short',
+            timestamp=_JOIN_ESC_TIMESTAMP, status='quarantined',
+        )
+        # Open, no usable dedupe_fingerprint, oversized id -> unfingerprinted_escalation.
+        _write_escalation(
+            esc_dir, 'esc-huge-unfingerprinted',
+            dedupe_fingerprint=None, timestamp=_JOIN_ESC_TIMESTAMP, id=huge_id,
+        )
+        # Two escalations sharing one fingerprint, BOTH with oversized ids ->
+        # duplicate_escalation_fingerprint; the detail names the loser's own id
+        # (:867) AND the survivor's id read back out of the index (:868).
+        _write_escalation(
+            esc_dir, 'esc-huge-dup-1',
+            dedupe_fingerprint='f' * 32, timestamp=_JOIN_ESC_TIMESTAMP, id=huge_id,
+        )
+        _write_escalation(
+            esc_dir, 'esc-huge-dup-2',
+            dedupe_fingerprint='f' * 32, timestamp=_JOIN_ESC_TIMESTAMP, id=huge_id,
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # `_join_tree` is a zero-issue baseline; five new records, four new issues
+        # (the duplicate pair contributes one issue between the two of them).
+        assert payload['issue_count'] == len(payload['issues']) == 4
+
+        status_issues = [i for i in payload['issues'] if i['kind'] == 'unknown_escalation_status']
+        assert len(status_issues) == 2
+        truncated = [i for i in status_issues if '…' in i['detail']]
+        not_truncated = [i for i in status_issues if '…' not in i['detail']]
+        assert len(truncated) == 1
+        assert len(not_truncated) == 1
+        assert len(truncated[0]['detail']) < 500
+        assert 'has unrecognised status' in truncated[0]['detail']
+        # The strict-drop-in control -- `_short_repr` on a short id must read
+        # exactly like the raw `!r` it replaces.
+        assert "'esc-short'" in not_truncated[0]['detail']
+        assert 'has unrecognised status' in not_truncated[0]['detail']
+
+        unfingerprinted = [i for i in payload['issues'] if i['kind'] == 'unfingerprinted_escalation']
+        assert len(unfingerprinted) == 1
+        unfingerprinted_detail = unfingerprinted[0]['detail']
+        assert '…' in unfingerprinted_detail
+        assert len(unfingerprinted_detail) < 500
+        assert 'is open but carries no usable dedupe_fingerprint' in unfingerprinted_detail
+
+        dup = [i for i in payload['issues'] if i['kind'] == 'duplicate_escalation_fingerprint']
+        assert len(dup) == 1
+        dup_detail = dup[0]['detail']
+        # BOTH halves capped: the loser's own id and the survivor's id read back
+        # out of the index are the SAME huge value, so the ellipsis must appear
+        # twice in one detail, not just for whichever interpolation comes first.
+        assert dup_detail.count('…') == 2
+        assert len(dup_detail) < 500
+        assert 'shares dedupe_fingerprint' in dup_detail
+        assert 'the first is used' in dup_detail
+
+        assert set(payload) == _PAYLOAD_KEYS
+
 
 # ---------------------------------------------------------------------------
 # a verdict value outside the closed M2 vocabulary
