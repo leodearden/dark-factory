@@ -1040,6 +1040,26 @@ def _build_test_repo(root: Path) -> dict[str, str]:
          one commit, ``c_feature``, adding src/feature.py) into main. The
          "commit under test" for _git_show_files' merge-commit regression:
          plain ``git show --name-only`` reports NOTHING for a merge commit.
+      7. ``c_coalesce_merge`` — a no-ff merge of a ``coalesced`` branch (three
+         commits: ``c_coalesced_other`` citing only task 77, ``c_coalesced_self``
+         citing task 50 in conventional-commit form with a body line, and
+         ``c_coalesced_slash`` citing task 50 via the ``task/50`` slash form —
+         reproducing task 3103's real clearing shape) into main, itself
+         subjected ``Merge task/77 into main`` — i.e. the merge SUBJECT cites
+         only the *owning* task 77, while its second parent secretly carries
+         a commit citing the *audited* task 50.
+      8. ``c_fabrication_merge`` — a no-ff merge of a ``fabricated`` branch
+         (two commits, ``c_fabricated_one``/``c_fabricated_two``, both citing
+         ONLY task 77) into main, also subjected ``Merge task/77 into main``.
+         The negative control: nothing under its second parent cites task 50
+         at all, synthesizing the PRD's two proven fabrications (tasks 2394 /
+         2531).
+      9. ``c_prose_merge`` — a no-ff merge of a ``prose_cited`` branch (three
+         commits reproducing the real non-clearing shapes measured for tasks
+         2724, 2949 and 3610 — see esc-4706-1) into main, also subjected
+         ``Merge task/77 into main``. Each commit mentions task 50 as a raw
+         substring but not in a form ``extract_cited_task_ids`` accepts, so
+         the walk must not clear it either.
 
     Plus a sibling branch (``sidebranch``, off ``c_init``) holding one commit
     (``c_side``) that is never merged into ``main`` — not an ancestor of it.
@@ -1094,6 +1114,95 @@ def _build_test_repo(root: Path) -> dict[str, str]:
     _git(root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
     c_merge = _git(root, 'rev-parse', 'HEAD')
 
+    # --- Coalesce shape: merge subject cites only the owning task (77), but
+    # the second parent secretly carries a commit citing the audited task
+    # (50) — this is the real shape task 4706 exists to clear. Reproduces
+    # task 3103's real clearing form via the task/50 slash-citation commit.
+    _git(root, 'checkout', '-q', '-b', 'coalesced', 'main')
+    _write(root, 'src/coalesced_other.py', 'other = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'impl(77): unrelated step on the owning branch',
+    )
+    c_coalesced_other = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/coalesced_self.py', 'self_step = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        "impl(50): the audited task's own step commit\n\n"
+        'Brings in the deliverable this task actually shipped.',
+    )
+    c_coalesced_self = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/coalesced_slash.py', 'slash = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'resolve: merge conflicts for task/50')
+    c_coalesced_slash = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main', 'coalesced')
+    c_coalesce_merge = _git(root, 'rev-parse', 'HEAD')
+
+    # --- Fabrication shape (negative control): merge subject cites only 77,
+    # and NOTHING under the second parent cites 50 in any form — synthesizes
+    # the PRD's two proven fabrications (tasks 2394 / 2531). Must stay
+    # misattributed after this task's fix.
+    _git(root, 'checkout', '-q', '-b', 'fabricated', 'main')
+    _write(root, 'src/fabricated_one.py', 'one = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'impl(77): step one')
+    c_fabricated_one = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/fabricated_two.py', 'two = 1\n')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'test(77): step two')
+    c_fabricated_two = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(
+        root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main',
+        'fabricated',
+    )
+    c_fabrication_merge = _git(root, 'rev-parse', 'HEAD')
+
+    # --- Real non-clearing shapes (esc-4706-1): each commit mentions task 50
+    # as a raw substring, in exactly the forms measured on tasks 2724, 2949
+    # and 3610 — none of which extract_cited_task_ids accepts as a citation,
+    # so the walk must not clear these either.
+    _git(root, 'checkout', '-q', '-b', 'prose_cited', 'main')
+    _write(root, 'src/prose_2724.py', 'a = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'feat(orchestrator): allowlist-gate terminal-subject sweep (task 50 step-8)',
+    )
+    c_prose_2724 = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/prose_2949.py', 'b = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'amend: tighten the predicate\n\nAddresses the review pass on task 50.',
+    )
+    c_prose_2949 = _git(root, 'rev-parse', 'HEAD')
+
+    _write(root, 'src/prose_3610.py', 'c = 1\n')
+    _git(root, 'add', '-A')
+    _git(
+        root, 'commit', '-q', '--no-verify', '-m',
+        'amend: repair three assertions\n\nrestoring the pre-50 cost of two scans',
+    )
+    c_prose_3610 = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-q', 'main')
+    _git(
+        root, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge task/77 into main',
+        'prose_cited',
+    )
+    c_prose_merge = _git(root, 'rev-parse', 'HEAD')
+
     return {
         'c_init': c_init,
         'c_keep_drop': c_keep_drop,
@@ -1103,6 +1212,17 @@ def _build_test_repo(root: Path) -> dict[str, str]:
         'c_side': c_side,
         'c_feature': c_feature,
         'c_merge': c_merge,
+        'c_coalesced_other': c_coalesced_other,
+        'c_coalesced_self': c_coalesced_self,
+        'c_coalesced_slash': c_coalesced_slash,
+        'c_coalesce_merge': c_coalesce_merge,
+        'c_fabricated_one': c_fabricated_one,
+        'c_fabricated_two': c_fabricated_two,
+        'c_fabrication_merge': c_fabrication_merge,
+        'c_prose_2724': c_prose_2724,
+        'c_prose_2949': c_prose_2949,
+        'c_prose_3610': c_prose_3610,
+        'c_prose_merge': c_prose_merge,
     }
 
 
