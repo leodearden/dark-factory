@@ -27,6 +27,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
+from shared.task_claimant import has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
@@ -254,6 +255,22 @@ _CONFIG_UNKNOWN_KEYS_SENTINEL: str = 'config-unknown-keys-startup'
 # The explicit merge-deferred early-return in _reconcile_one_stranded mirrors
 # the open-L1 /unblock veto guard (harness.py _reconcile_one_stranded:~1598).
 _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'})
+
+# Statuses a resolution-driven `resume` may re-pend (task 3540 / PRD
+# `plans/task-escalation-state-graph-prd.md` D8, spec E9).  Deliberately an
+# ALLOW-list, not a deny-list: a deny-list would silently acquire every future
+# status added to the vocabulary — the "sweep carve-out treadmill" D2 rejects.
+# Every excluded status is excluded for its own reason:
+#   'done' / 'cancelled'  — terminal; a flip would resurrect completed work
+#   'deferred'            — a deliberate operator park
+#   'merge-deferred'      — owned by the merge queue, whose train/derail
+#                            machinery would lose its member
+#   'review'              — human-only (PRD open question 3)
+#   'pending'             — already the target; a no-op write that would still
+#                            spuriously charge the re-block guard
+# 'infra-hold' never reaches the gate — its pre-gate in
+# `_cascade_unblock_member` returns first.
+_RESUME_REPEND_STATUSES: frozenset[str] = frozenset({'blocked', 'in-progress'})
 
 # heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
 # with — the staleness threshold TG-3's live_claimant folding applies to the
@@ -14519,39 +14536,78 @@ class Harness:
             return
 
         if effect.workflow_disposition == WORKFLOW_RESUME:
-            # Re-pend the blocked task.  D7: level>=1 gate — covers L1 members
-            # and born-at-L2 orphans alike.
+            # Re-pend the task.  The discrimination is LIVENESS, at every
+            # level (task 3540 / PRD plans/task-escalation-state-graph-prd.md
+            # D8, spec E9).
+            #
+            # What this replaced, and why: a `level >= 1` wrapper (D7) used to
+            # enclose everything below, on the premise that every L0 has a live
+            # workflow already waiting on the synchronous `event.set()` above,
+            # so re-pending an L0 here would only race it.  That premise is
+            # false for exactly the workflows this path exists to rescue: one
+            # that died between filing its escalation and exiting has already
+            # had its `_escalation_events` entry POPPED (the `finally` in
+            # `harness.py::Harness._run_slot`), so the wake sets nothing, and
+            # the level gate then dropped the re-pend in silence — leaving the
+            # row in-progress with nothing heartbeating it and its escalation
+            # now closed.  Recovery was not gone, it was DEFERRED to the
+            # stranded sweep: `task_ground_truth.py::_RECOVERY` rows (c)/(d)
+            # map exactly that shape to REVERT_TO_PENDING, at
+            # stranded_reconcile_interval_secs cadence — and only for the
+            # branch states those two rows cover.  What this delivers is an
+            # immediate, shape-independent resume from the resolution that
+            # authorised it.
+            #
+            # A LIVE workflow is still skipped here at every level, by the
+            # `_escalation_events` membership test below — that test is the
+            # local half of the liveness question and is unchanged.  The
+            # store-side claimant oracle inside `_cascade_unblock_member` is
+            # the authoritative half, and is the one that sees a claimant held
+            # by ANOTHER orchestrator, which a process-local dict structurally
+            # cannot.
+            #
+            # Consequence, and intended: the re-block guard is now charged for
+            # orphaned-L0 re-pends too.  Re-pend semantics are unchanged — the
+            # resolution-driven flip still charges the guard — so an L0 that
+            # re-blocks on the same signature repeatedly is damped by the same
+            # budget as an L1.  With a caveat worth naming: the damping is
+            # only truly binding for a BLOCKED-origin re-pend, where a
+            # withheld flip leaves the row parked.  Withholding an
+            # IN-PROGRESS-origin re-pend leaves precisely the
+            # `task_ground_truth.py::_RECOVERY` row (c)/(d) shape, which the
+            # stranded sweep re-pends anyway — so there the guard delays the
+            # resume rather than stopping it.
+            #
             # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
             # fired _resolve_callback for the L2 first, then each member with
             # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
             # NOT in _escalation_events (a live workflow owns its own re-pend).
-            if escalation.level >= 1:
-                is_l2_cascade = (
-                    isinstance(escalation.resolved_by, str)
-                    and escalation.resolved_by.startswith('l2-cascade:')
+            is_l2_cascade = (
+                isinstance(escalation.resolved_by, str)
+                and escalation.resolved_by.startswith('l2-cascade:')
+            )
+            if is_l2_cascade:
+                # Scheduled via _schedule_coro_threadsafe so it works whether
+                # this callback fires on the orchestrator loop or off it (sync
+                # MCP resolve_issue on a FastMCP worker — where a bare
+                # asyncio.create_task raised "no running event loop").
+                self._schedule_coro_threadsafe(
+                    self._cascade_unblock_member(escalation),
+                    label=(
+                        f'cascade-unblock task {escalation.task_id} '
+                        f'(via {escalation.resolved_by})'
+                    ),
                 )
-                if is_l2_cascade:
-                    # Scheduled via _schedule_coro_threadsafe so it works whether
-                    # this callback fires on the orchestrator loop or off it (sync
-                    # MCP resolve_issue on a FastMCP worker — where a bare
-                    # asyncio.create_task raised "no running event loop").
-                    self._schedule_coro_threadsafe(
-                        self._cascade_unblock_member(escalation),
-                        label=(
-                            f'cascade-unblock task {escalation.task_id} '
-                            f'(via {escalation.resolved_by})'
-                        ),
-                    )
-                elif escalation.task_id not in self._escalation_events:
-                    # Fix #1a — direct/orphan re-pend.  A live workflow owns its
-                    # own re-pend (woken by event.set()); only flip when orphaned.
-                    self._schedule_coro_threadsafe(
-                        self._cascade_unblock_member(escalation),
-                        label=(
-                            f'orphan-unblock task {escalation.task_id} '
-                            f'(via {escalation.resolved_by})'
-                        ),
-                    )
+            elif escalation.task_id not in self._escalation_events:
+                # Fix #1a — direct/orphan re-pend.  A live workflow owns its
+                # own re-pend (woken by event.set()); only flip when orphaned.
+                self._schedule_coro_threadsafe(
+                    self._cascade_unblock_member(escalation),
+                    label=(
+                        f'orphan-unblock task {escalation.task_id} '
+                        f'(via {escalation.resolved_by})'
+                    ),
+                )
             return
 
         # restart / park / abandon → teardown + status write.
@@ -15308,43 +15364,350 @@ class Harness:
         normalized = ' '.join(raw.split()).lower()
         return f'{escalation.category}:{normalized[:120]}'
 
-    async def _cascade_unblock_member(self, escalation) -> None:
-        """Async helper: flip a cascade-resolved L1 member task from blocked→pending.
+    def _resume_repend_liveness(self, task_id: str, row: Mapping | None) -> bool:
+        """True when *task_id* currently has a LIVE claimant.
 
-        Only 'blocked' tasks are flipped. Every other status — including
-        terminal statuses (done, cancelled), non-terminal live statuses
-        (deferred, in-progress, pending, merge-deferred), and any future
-        status — is DEBUG-skipped. The intent of this feature is purely to
-        unblock 'blocked' tasks; terminal members completing normally while
-        their L2 cluster is still pending is an expected, common outcome and
-        should not produce operator-visible WARNINGs.
+        The status-agnostic half of the resume gate (task 3540 / PRD
+        ``plans/task-escalation-state-graph-prd.md`` D8, spec E9). Folds two
+        signals, in-memory FIRST:
+
+          1. ``Scheduler.is_actively_held`` — dispatched, holding a module
+             lock, or inside the cancel-grace window. Consulted first,
+             mirroring ``TaskGroundTruth._resolve_live_claimant``'s priority
+             order: it closes the dispatch race where a workflow holds the slot
+             and the locks but has not yet stamped a claimant row, which a
+             DB-only oracle would read as stranded. ``_escalation_events`` does
+             not cover this — it is popped at slot exit, while
+             ``is_actively_held`` also folds in the cancel-grace window.
+          2. ``shared.task_claimant.has_live_claimant`` on the store row — the
+             only member of that module that fits, since ``is_stranded`` gates
+             on ``status == 'in-progress'`` and ``is_stranded_blocked`` on
+             ``status == 'blocked'``, so neither can answer the single
+             status-agnostic question this fork asks. This is also the half
+             that sees a claimant held by ANOTHER orchestrator, which the
+             process-local ``_escalation_events`` check structurally cannot.
+
+        TTL choice: ``config.claimant_liveness_ttl_secs`` (300s, operator-
+        tunable and green-tier hot-reloadable), NOT this module's hardcoded
+        600s ``_RECONCILE_HEARTBEAT_TTL``. The re-pend's immediate downstream
+        consumer is ``Scheduler._eligible_for_dispatch``, which gates on
+        exactly this knob and this same ``has_live_claimant`` call; aligning
+        them guarantees we never write ``pending`` to a row the dispatcher
+        would then refuse to dispatch — which would be a fresh silent hold.
+
+        A ``None``/absent row reads as NOT live (no claimant column at all), so
+        an unreadable row never suppresses a re-pend here. The write-time
+        corroborating read applies the opposite, fail-safe rule for a row it
+        cannot read at all — see :meth:`_cascade_unblock_member`.
+        """
+        if self.scheduler.is_actively_held(task_id):
+            return True
+        return has_live_claimant(
+            row or {},
+            datetime.now(UTC),
+            timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+        )
+
+    async def _fold_granted_files_on_repend(self, task_id: str, escalation) -> None:
+        """Deliver the steward's ``granted_files`` scope grant before a re-pend.
+
+        The re-pend-path twin of ``workflow.py::TaskWorkflow._collect_granted_
+        files`` + ``_set_task_scope`` (task 3540 / PRD
+        ``plans/task-escalation-state-graph-prd.md`` D8, spec E9).
+
+        ``granted_files`` — the structured scope expansion a steward stamps via
+        ``resolve_issue(..., action='resume', granted_files=[...])`` on a
+        ``scope_violation`` — is written to the escalation RECORD by
+        ``escalation/queue.py::EscalationQueue.resolve``. Its only production
+        reader was ``TaskWorkflow._collect_granted_files``, reached from
+        exactly one site: the LIVE in-workflow L0 resume loop. So a grant
+        resolved against a task with NO live workflow was recorded and never
+        applied — the task re-pended against its ORIGINAL scope and the agent
+        re-escalated for the same files. This closes that gap for the
+        re-pend path.
+
+        Both halves are written, and both are load-bearing:
+
+          - **plan.json is the durable half.** On redispatch,
+            ``workflow.py::TaskWorkflow._apply_revalidation_skip`` re-derives
+            the module set from ``plan['files']`` and calls
+            ``_reconcile_scope_locks(plan_files)``, which persists
+            ``metadata.files = plan_files``. A metadata-only widen would
+            therefore be silently NARROWED back away on the very next
+            dispatch.
+          - **``metadata.files`` is the half the next dispatch derives its
+            module LOCKS from**, so writing only plan.json leaves the two
+            diverged until the redispatch reconciles them — which is also what
+            the MERGE-entry ``_check_scope_invariant`` divergence tripwire
+            fires on.
+
+        The two halves are written DIFFERENTLY, and the asymmetry is the same
+        one ``workflow.py::TaskWorkflow._set_task_scope`` already has: plan.json
+        takes the RAW union (it is allowed directory charters, which
+        ``module_charter.derive_modules`` strips again at derive time), while
+        ``metadata.files`` goes through ``sanitize_files_for_persist`` per that
+        function's stated whole-repo contract — every ``metadata.files`` write
+        path must call it so the field only ever holds genuine file-level
+        paths. The hazard here is concrete, not theoretical: ``granted_files``
+        reaches this method UNVALIDATED (``escalation/server.py::resolve_issue``
+        and ``escalation/queue.py::EscalationQueue.resolve`` both write whatever
+        the steward typed through verbatim), and a single unsanitized
+        directory entry makes the ``lock_charter_guard`` middleware reject the
+        ENTIRE payload as a ``LockCharterViolation`` — which
+        ``scheduler.py::Scheduler.update_task`` classifies as a failure — so
+        the VALID file-level entries in the same grant are silently dropped
+        alongside it. That is the incident class of commit 54ec90fefc.
+        A grant that sanitizes down to what ``metadata.files`` already holds
+        (e.g. an all-directory one) skips the ``update_task`` round-trip
+        entirely rather than re-writing an unchanged list: same rule as
+        ``_tag_task_modules``' "an all-directory prediction … is treated
+        exactly like an empty/omitted one (sentinel alone, no clobber)". The
+        flip and the plan write are unaffected.
+
+        Deliberately does NOT call ``handle_blast_radius_expansion``: the slot
+        exit already released every module lock this task held, so there is no
+        live lock to expand. The next dispatch acquires from the widened
+        ``metadata.files`` through the ordinary path.
+
+        Ownership: ``set_plan_files`` STAMPS ``_session_id`` when the caller
+        does not already own the plan, so the plan's OWN owner id
+        (``_session_id``, else ``_revalidated_by_session``) is passed back —
+        taking the ``already_owner`` branch, leaving provenance untouched and
+        never tripping ``_escalate_plan_overwrite``. The synthetic fallback is
+        reached only for a plan carrying neither, which cannot be owned by
+        anyone.
+
+        Failure is WARNING-and-continue by design, never a raise and never a
+        withheld re-pend. The grant is ADDITIVE: a failed fold degrades to the
+        pre-3540 status quo — the task re-pends against its original scope and
+        the agent re-escalates — which is self-healing and observable.
+        Withholding the flip instead would leave the task parked with its
+        escalation already closed and nothing left to advance it, i.e. exactly
+        the permanent silent hold INV-4 exists to prevent.
+
+        COST GATE (review amendment): the *resolving* record's own
+        ``granted_files`` is checked FIRST, and an empty one returns before
+        any I/O at all. ``EscalationQueue.get_by_task`` with ``status=None``
+        globs the queue root AND rglobs the whole dated archive subtree, then
+        JSON-parses every candidate — a scan whose cost grows monotonically
+        with the archive, paid per member on an L2 cascade. The overwhelming
+        majority of resumes grant nothing, and made that scan only to compute
+        an empty list. What the short-circuit gives up is a resume that
+        carries NO grant re-folding a grant from an EARLIER resolution: since
+        3540 that earlier resolution folded it at the time, so the union would
+        be a no-op — and the pre-3540 backlog is covered by the next resume
+        that does carry a grant, or by the agent re-escalating. When the scan
+        IS reached it runs via ``asyncio.to_thread``, because it is
+        synchronous filesystem I/O on the orchestrator event loop.
+        """
+        if not getattr(escalation, 'granted_files', None):
+            # See "COST GATE" above — the common case, and it costs no I/O.
+            return
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:
+            # Bare-harness / eval mode — nothing to read (mirrors
+            # _collect_granted_files' own `if not self.escalation_queue` guard).
+            return
+        try:
+            # Union across the task's WHOLE resolved history, order-preserving
+            # — a verbatim structural mirror of _collect_granted_files. Not
+            # just the resolving record: a grant from an earlier resolution
+            # would otherwise be dropped on a later re-pend, silently
+            # narrowing a scope the steward already widened. A still-PENDING
+            # record is a request, not a grant, and is skipped.
+            # Off the event loop: get_by_task is a glob + full archive rglob +
+            # a JSON parse per candidate (see "COST GATE" above).
+            records = await asyncio.to_thread(queue.get_by_task, task_id)
+            seen: set[str] = set()
+            granted: list[str] = []
+            for esc in records:
+                if esc.status != 'resolved':
+                    continue
+                for f in esc.granted_files:
+                    if f not in seen:
+                        seen.add(f)
+                        granted.append(f)
+            if not granted:
+                return
+
+            # Resolve the plan artifacts new-then-old, mirroring
+            # _resolve_recovery_artifact: the W11 `.task-meta` SIBLING first,
+            # the legacy `<worktree>/.task` second. Without the fallback arm
+            # every pre-relocation task would take the "no plan" exit below.
+            wt = self._resolve_task_worktree(task_id)
+            new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
+            if (new_root / 'plan.json').exists():
+                arts = TaskArtifacts(wt, meta_root=new_root)
+            elif (wt / '.task' / 'plan.json').exists():
+                arts = TaskArtifacts(wt)
+            else:
+                # A task can legitimately have no plan (never reached the
+                # architect, or its worktree was reclaimed). There is no scope
+                # to widen and the re-pend is still correct — the grant is not
+                # a precondition of the resume.
+                logger.debug(
+                    'granted-files fold: task %s has no plan.json at %s or %s '
+                    '— nothing to widen (grant %s)',
+                    task_id, new_root, wt / '.task', granted,
+                )
+                return
+
+            plan = arts.read_plan()
+            current = plan.get('files') or []
+            union = current + [f for f in granted if f not in current]
+            if union == current:
+                # The overwhelmingly common case (a resume with no NEW files):
+                # costs neither a plan rewrite nor an update_task round-trip.
+                return
+
+            # Pass the plan's OWN owner id back — see "Ownership" above.
+            arts.set_plan_files(
+                union,
+                plan.get('_session_id')
+                or plan.get('_revalidated_by_session')
+                or f'harness-repend:{task_id}',
+            )
+            # metadata.files takes only the FILE-LEVEL entries — see "The two
+            # halves are written differently" above. plan.json keeps the raw
+            # union written just now.
+            honest = sanitize_files_for_persist(union)
+            dropped = sorted(set(union) - set(honest))
+            if dropped:
+                # Mirrors _persist_files_metadata's dropped-entry diagnostic.
+                logger.debug(
+                    'granted-files fold: task %s — %d directory-shaped entr%s '
+                    '(%s) have no file-level representation in metadata.files '
+                    'and were stripped before the persist; they survive in '
+                    'plan.json and are α-stripped again at derive time by '
+                    'module_charter.derive_modules',
+                    task_id, len(dropped), 'ies' if len(dropped) > 1 else 'y',
+                    dropped,
+                )
+            if honest == sanitize_files_for_persist(current):
+                # An all-directory grant widens plan.json but has nothing NEW
+                # to persist to metadata — the same rule _tag_task_modules
+                # applies ("an all-directory prediction sanitizes to [] and is
+                # treated exactly like an empty/omitted one (sentinel alone, no
+                # clobber)"). The flip and the plan write still happen.
+                logger.info(
+                    'granted-files fold: widened task %s plan.files %s → %s '
+                    'before the re-pend; metadata.files unchanged (%s — the '
+                    'grant carries no file-level entry) (grant %s)',
+                    task_id, current, union, honest, granted,
+                )
+                return
+            # Same call shape as _check_reblock_guard's persist.
+            # metadata_mode='merge': shallow last-write-wins, so the files key
+            # is replaced wholesale while sibling metadata keys survive.
+            # 'additive' resolves scalar conflicts OLD-wins and would not
+            # replace the list.
+            await self.scheduler.update_task(
+                task_id, {'files': honest}, metadata_mode='merge',
+            )
+            logger.info(
+                'granted-files fold: widened task %s scope %s → %s before the '
+                're-pend — plan.files got the raw union, metadata.files the '
+                'sanitized %s (grant %s)',
+                task_id, current, union, honest, granted,
+            )
+        except Exception:
+            # Warn-and-continue by design — see the docstring. The plan write
+            # precedes the metadata write inside this try, so a failed plan
+            # write also skips the metadata write: a metadata-only widen would
+            # diverge from plan.files and be narrowed back on the next
+            # redispatch anyway.
+            logger.warning(
+                'granted-files fold: could not deliver the scope grant for '
+                'task %s — re-pending against the unwidened scope (the agent '
+                'will re-escalate)', task_id, exc_info=True,
+            )
+
+    async def _cascade_unblock_member(self, escalation) -> None:
+        """Async helper: re-pend a resolution-resumed task to Table B's target.
+
+        The gate is CLAIMANT LIVENESS, not ``status == 'blocked'`` (task 3540 /
+        PRD ``plans/task-escalation-state-graph-prd.md`` D8, spec E9). Two
+        conditions must hold for the flip:
+
+          1. The status is in :data:`_RESUME_REPEND_STATUSES`
+             (``{blocked, in-progress}``). Every other status — terminal
+             (done, cancelled), operator-parked (deferred), queue-owned
+             (merge-deferred), human-only (review), already-the-target
+             (pending), and any future status — is DEBUG-skipped. Terminal
+             members completing normally while their L2 cluster is still
+             pending is an expected, common outcome and must not produce
+             operator-visible WARNINGs.
+          2. The task has NO live claimant. A live claimant means a workflow
+             is running and owns its own re-pend — it was already woken
+             synchronously by ``event.set()`` in ``_on_escalation_resolved``,
+             and flipping here would race it.
+
+        What this replaced, and why: the old gate skipped every non-``blocked``
+        row on its status alone. So a task whose workflow died between filing
+        the escalation and exiting was left ``in-progress`` with nothing
+        heartbeating it and its escalation now closed, and its recovery was
+        DEFERRED to the stranded sweep rather than delivered by the
+        resolution that authorised it. That sweep does cover part of the
+        shape — ``task_ground_truth.py::_RECOVERY`` rows (c) and (d) map
+        (in-progress, not live, no open escalation, branch off-main / gone
+        with no marker) to ``REVERT_TO_PENDING`` — so the honest claim is
+        "one sweep interval late", not "lost". It IS lost for the shapes the
+        sweep's branch-state classification routes elsewhere (rows (a)/(b)
+        auto-mark-done on landing evidence; the escalation-pinned rows veto
+        while any record is still open). Re-pending here makes the resume
+        immediate and shape-independent.
+
+        The live-claimant skip applies to ``blocked`` rows too, which is a
+        genuine behaviour change (``blocked`` previously flipped
+        unconditionally). Its recovery edge is named rather than assumed: the
+        scheduler's stranded-blocked-redispatch sweep
+        (``scheduler.py::Scheduler`` / ``shared.task_claimant.is_stranded_blocked``,
+        ``stranded_blocked_redispatch_enabled`` default True) re-owns exactly a
+        ``blocked`` row with no live claimant and no open escalation — precisely
+        the shape left behind if the skipped row's claimant later dies with the
+        record already closed. In practice the skip fires rarely: production
+        ``blocked`` rows commonly carry a STALE claimant that was never cleared,
+        and only a heartbeat fresher than ``claimant_liveness_ttl_secs``
+        suppresses the flip.
 
         EXCEPTION: an infra-held task (first-class status == 'infra-hold',
         via is_infra_held — task 2200/ω4) is checked FIRST, before the
-        'blocked'-only gate below, because its status is 'infra-hold', never
-        'blocked' — see the A1 guard.
+        status/liveness gate below, because its status is 'infra-hold', never
+        'blocked' or 'in-progress' — see the A1 guard.
 
-        TOCTOU note: get_status and set_task_status are separate MCP
-        round-trips with no atomic compare-and-set. If the task transitions
-        away from 'blocked' between the read and the write (e.g. a workflow
-        picks it up → 'in-progress'), set_task_status('pending') may succeed
-        and clobber the newer status. This is accepted as a best-effort
-        policy; the race window is narrow in practice.
+        Between the corroborating read below and the write, a FULLY authorised
+        re-pend also DELIVERS any ``granted_files`` scope grant the steward
+        stamped on this task's resolved escalations — see
+        :meth:`_fold_granted_files_on_repend`, and the three ordering
+        constraints named at that call site. It sits after the corroboration,
+        not before it, so an aborted resume leaves no partial widen behind.
 
-        Efficiency note (review amendment, task 2200): get_task above (used
-        only for the is_infra_held pre-gate) and get_status below both
-        dispatch the same underlying fused-memory 'get_task' RPC, so the
-        non-infra-held path pays for two round-trips over the same row. This
-        is intentional, not an oversight: get_status is kept as an
-        independent, as-late-as-possible read to narrow the TOCTOU window
-        above rather than reuse the earlier (by-then slightly staler)
-        get_task snapshot. Collapsing the two would also require reworking
-        test_cascade_unblock.py (outside this task's locked module scope),
-        whose mixed-status-cascade coverage
-        (test_criterion_7_mixed_status_cascade) drives get_status with a
-        per-task_id side_effect while get_task's mock stays fixed/shared —
-        i.e. that suite already treats the two reads as independent by
-        design.
+        TOCTOU note: these are separate MCP round-trips with no atomic
+        compare-and-set, so the window cannot be closed — only narrowed. It is
+        narrowed by a CORROBORATING ``get_task`` immediately before the write
+        (task 3540): status AND claimant liveness are re-derived from that ONE
+        snapshot, and a disagreement aborts without writing. The remaining
+        window is (corroborating get_task → [granted-files fold, only when the
+        resolving record actually carries a grant] → set_task_status), versus
+        the previous (get_status → guard get_task → guard update_task →
+        set_task_status). Status and claimant also now come from a single
+        snapshot rather than two skewed reads. The fold sits INSIDE the
+        remaining window by choice (review amendment) — see the three ordering
+        constraints at its call site: paying a slightly wider window is the
+        price of never leaving a partial scope widen behind on an aborted
+        resume, and on the common no-grant path it costs nothing at all.
+
+        Efficiency note (review amendment, task 2200; refreshed by 3540):
+        get_task above (the is_infra_held pre-gate AND, since 3540, the
+        claimant-liveness fork) and get_status below both dispatch the same
+        underlying fused-memory 'get_task' RPC, so the non-infra-held path
+        pays for two round-trips over the same row. This is intentional, not
+        an oversight: get_status is kept as an independent,
+        as-late-as-possible read to narrow the TOCTOU window above rather
+        than reuse the earlier (by-then slightly staler) get_task snapshot.
+        Task 3540's corroborating read is a THIRD read of the same row on the
+        flip path (a fourth counting the re-block guard's own), bought for
+        the same reason and paid only by rows that actually reach the write.
         """
         task_id = escalation.task_id
 
@@ -15443,19 +15806,34 @@ class Harness:
         # docstring.
         status = await self.scheduler.get_status(task_id)
 
-        if status != 'blocked':
+        if status not in _RESUME_REPEND_STATUSES:
             logger.debug(
-                'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
+                'cascade-unblock: task %s is %s (not a re-pendable status; '
+                'skipping flip via %s)',
+                task_id, status, escalation.resolved_by,
+            )
+            return
+
+        # Claimant-liveness fork (task 3540 / PRD D8, spec E9).  Evaluated
+        # against the _infra_task snapshot already fetched for the infra
+        # pre-gate above, so the SKIP path costs no extra round-trip.
+        if self._resume_repend_liveness(task_id, _infra_task):
+            logger.debug(
+                'cascade-unblock: task %s is %s with a live claimant — the '
+                'synchronous wake path owns the re-pend; skipping flip via %s',
                 task_id, status, escalation.resolved_by,
             )
             return
 
         # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
-        # withhold the flip when the threshold is reached.
+        # withhold the flip when the threshold is reached.  Deliberately AFTER
+        # the status/liveness gate, so a skipped row never charges the counter —
+        # and it now charges for in-progress-originated re-pends too, which is
+        # intended: the resolution-driven flip still charges the guard.
         if not await self._check_reblock_guard(escalation, task_id):
             return
 
-        # Only 'blocked' reaches here — attempt the flip.
+        # Only a re-pendable status with no live claimant reaches here.
         # Table B (ω3, task 2196): source the target from the same authority
         # _on_escalation_resolved / escalation.server.resolve_issue use, so
         # resume→pending cannot drift into a third independent copy.
@@ -15475,11 +15853,85 @@ class Harness:
                 "%s — defaulting to 'pending'", task_id,
             )
             _resume_target = 'pending'
+
+        # INV-3 corroborating read (task 3540 / PRD D8, spec E9).  Everything
+        # above authorised the flip against snapshots taken BEFORE the re-block
+        # guard's own read-and-persist round-trips; re-authorise it here against
+        # a single snapshot taken immediately before the write, so the TOCTOU
+        # window narrows from (get_status → guard get_task → guard update_task →
+        # set_task_status) to (this read → the granted-files fold, which is
+        # entered only when the resolving record carries a grant →
+        # set_task_status).  Status and claimant liveness are re-derived from
+        # the SAME row, so they can no longer be two skewed reads that never
+        # described the task at the same instant.
+        _late = await self.scheduler.get_task(task_id)
+        if _late is None:
+            # Fail-SAFE, not fail-open.  Deliberately the OPPOSITE default from
+            # _resume_repend_liveness, where an absent row reads as "no live
+            # claimant" so an unreadable row never SUPPRESSES a flip: there a
+            # missing row means missing claimant columns and the conservative
+            # reading is "not live"; here it means no evidence at all that the
+            # write is still correct, and the conservative action is to write
+            # nothing.  Nothing is stranded by the skip — the resolution has
+            # already been recorded, and the next dispatch, sweep or resolution
+            # re-derives the row.
+            logger.warning(
+                'cascade-unblock: could not re-read task %s before the '
+                '%s→%s flip (store unreachable?) — skipping the write via %s',
+                task_id, status, _resume_target, escalation.resolved_by,
+            )
+            return
+        _late_status = _late.get('status')
+        if (
+            _late_status not in _RESUME_REPEND_STATUSES
+            or self._resume_repend_liveness(task_id, _late)
+        ):
+            # A benign lost race: some other owner (a completing workflow, a
+            # freshly-dispatched one, an operator) wrote this row between the
+            # gate and here, and that write is newer than ours.  Deliberately
+            # NOT escalated — INV-4's silent-permanent-hold concern does not
+            # apply, because the row is in a status somebody just chose, not
+            # parked with nothing to advance it.  INFO rather than DEBUG: it is
+            # rare and worth seeing when reconstructing a resume that "did
+            # nothing".
+            logger.info(
+                'cascade-unblock: task %s changed under the resume — re-read '
+                'shows status %s / claimant %s (the gate saw %s); skipping the '
+                '%s write via %s',
+                task_id, _late_status, _late.get('claimant_run_id'), status,
+                _resume_target, escalation.resolved_by,
+            )
+            return
+
+        # Deliver the steward's scope grant BEFORE the row goes re-pendable
+        # (task 3540 / PRD D8, spec E9).  THREE ordering constraints pin this
+        # call site, and all three are load-bearing:
+        #   1. AFTER the re-block guard — a withheld flip re-pends nothing and
+        #      so may widen nothing.
+        #   2. AFTER the corroborating read above (review amendment) — the fold
+        #      is a read-modify-write of two DURABLE artifacts (plan.json and
+        #      metadata.files), so it must be gated by the SAME authorisation
+        #      as the status write.  Folding first would leave a partial widen
+        #      behind on every aborted resume, and in the newly-claimed case
+        #      that plan is already owned in memory by a freshly-dispatched
+        #      TaskWorkflow — two writers, either able to clobber the other.
+        #   3. BEFORE the status write — the status write is what makes the
+        #      task dispatchable again and dispatch derives its locks from
+        #      metadata.files, so a fold landing after it would race the
+        #      scheduler and the redispatched agent could observe the
+        #      unwidened scope.
+        # Best-effort: never raises.  The window between the corroborating read
+        # and the write is now (fold → set_task_status) rather than one hop;
+        # that is the price of making the fold conditional on the same gate,
+        # and it is bounded by a filesystem read-modify-write plus one
+        # update_task, on the rare path where a grant actually exists.
+        await self._fold_granted_files_on_repend(task_id, escalation)
+
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(
-                'cascade-unblock: task %s flipped blocked→%s (via %s)',
-                task_id, _resume_target, escalation.resolved_by,
+                'cascade-unblock: task %s flipped %s→%s (via %s)',
+                task_id, status, _resume_target, escalation.resolved_by,
             )
         except SetTaskStatusRejected as e:
             # Defensive TOCTOU guard: task may have transitioned to a terminal
@@ -15510,8 +15962,8 @@ class Harness:
             # record and nothing that will retry — exactly the silent permanent
             # hold INV-4 exists to close.
             logger.warning(
-                'cascade-unblock: blocked→%s resume failed for %s',
-                _resume_target, task_id, exc_info=True,
+                'cascade-unblock: %s→%s resume failed for %s',
+                status, _resume_target, task_id, exc_info=True,
             )
             self._escalate_cascade_status_rejection(
                 task_id, _resume_target, e, resolved_by=escalation.resolved_by,
