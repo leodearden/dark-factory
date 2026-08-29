@@ -295,11 +295,20 @@ def test_task_authoring_tier_a_listing_mirrors_the_blessed_frozenset():
     them a blessed key is unblessed, over-listing tells them an unblessed key is
     safe to write.
 
-    MEASURED RED at base: the marker pair did not exist, and the listing was
-    missing ``execution_class``. Both legs of that RED are this task's own doing —
-    verified mechanically beforehand that the listing was otherwise exactly
-    ``sorted(_BLESSED_METADATA_KEYS)`` (42 names, 42 unique, empty symmetric
-    difference), so this guard was sound before it was needed.
+    MEASURED RED at the ORIGINAL base (2026-08-18): the marker pair did not
+    exist, and the listing was missing ``execution_class``. Both legs of that RED
+    were this task's own doing — verified mechanically beforehand that the listing
+    was otherwise exactly ``sorted(_BLESSED_METADATA_KEYS)`` (42 names, 42 unique,
+    empty symmetric difference), so this guard was sound before it was needed.
+
+    That "otherwise exact" property did NOT survive the rebase onto main, and the
+    difference is the guard earning its keep on its first contact with real drift:
+    task 3122 blessed ``files_tagged_empty`` in commit ``0197216782`` and never
+    mirrored it into the doc, so main's listing was silently under-listing it —
+    exactly the hand-maintained-prose failure this guard exists to catch, landed
+    independently of this task and found only because the guard ran. The mirror
+    entry was added in this branch's post-rebase reconcile commit; the blessing
+    itself is main's, not this task's.
     """
     documented = _documented_blessed_keys(
         TASK_AUTHORING_PATH.read_text(encoding="utf-8")
