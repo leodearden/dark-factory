@@ -4905,3 +4905,165 @@ async def test_unblock_dependent_guards(
             reconciler.task_interceptor.set_task_status.assert_not_awaited()
     else:
         mock_taskmaster.set_task_status.assert_not_called()
+
+
+# ── task-4903: durability of the write + per-dependent isolation ───────────
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_not_persisted_is_not_reported_as_applied(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A post-write read-back failure must be reported as failed, never applied.
+
+    Real ``StatusWriteNotPersistedResult`` shape (backends/task_backend_types.py
+    :38-51): returned instead of a fabricated success when the status column
+    did not actually take the requested value.
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '2',
+        'requested_status': 'pending',
+        'actual_status': 'blocked',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_failed', (
+        f'A not-persisted write must not be reported as applied, got: {actions[0]!r}'
+    )
+    assert actions[0]['error'] == 'status_write_not_persisted', (
+        f'Expected the stable error code, got: {actions[0]!r}'
+    )
+    assert actions[0]['actual_status'] == 'blocked', (
+        f'Expected the live actual_status surfaced, got: {actions[0]!r}'
+    )
+    assert not any(a['type'] == 'dependent_unblock_applied' for a in result.get('actions', [])), (
+        f'No dependent_unblock_applied action must exist anywhere, got: {result.get("actions")}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_gate_rejection_is_not_reported_as_applied(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A gate rejection (no `success` key at all, e.g. BacklogVerdict) is a
+    failure, and the stable `error_type` code is preferred over the rendered
+    `error` message -- the same precedence already used at the
+    hints_attached/hints_skipped audit pair (targeted.py:~1037-1039).
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'error': 'ReconciliationBacklogExceeded: backlog too deep',
+        'error_type': 'ReconciliationBacklogExceeded',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_failed', (
+        f'A gate rejection must not be reported as applied, got: {actions[0]!r}'
+    )
+    assert actions[0]['error'] == 'ReconciliationBacklogExceeded', (
+        f'error_type must be preferred over the rendered error message, got: {actions[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_no_op_is_reported_distinctly(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A same-status race (something already re-pended the task) must not
+    claim a flip that didn't happen, while still recording that the desired
+    end state was reached. Real shape from the interceptor's same-status
+    early return (task_interceptor.py:1159).
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'success': True, 'no_op': True, 'task_id': '2',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'The desired end state (pending) was reached; expected _applied, got: {actions[0]!r}'
+    )
+    assert actions[0].get('no_op') is True, (
+        f'Expected a truthy no_op field distinguishing a race from a real flip, '
+        f'got: {actions[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_failure_does_not_strand_siblings(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """One dependent's write failure must not abandon the rest of the sweep.
+
+    Mirrors the isolation contract scheduler.py:6562-6577 documents for its
+    sibling sweep: two blocked dependents of the same just-done task, one
+    write raises, the other must still land.
+    """
+    async def _set_task_status(*, task_id, **kwargs):
+        if task_id == '2':
+            raise RuntimeError('db locked')
+        return {'message': 'ok', 'tasks': [{'taskId': task_id, 'newStatus': 'pending'}]}
+
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(side_effect=_set_task_status)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    actions_2 = _dep_actions_for(result, '2')
+    actions_3 = _dep_actions_for(result, '3')
+    assert len(actions_2) == 1, f'Expected exactly one action for task 2, got: {actions_2}'
+    assert actions_2[0]['type'] == 'dependent_unblock_failed', (
+        f'Expected task 2 to fail in isolation, got: {actions_2[0]!r}'
+    )
+    assert 'db locked' in actions_2[0].get('error', ''), (
+        f'Expected the truncated exception string in detail, got: {actions_2[0]!r}'
+    )
+    assert len(actions_3) == 1, (
+        f"Task 3's unblock must not be stranded by task 2's failure, got: {actions_3}"
+    )
+    assert actions_3[0]['type'] == 'dependent_unblock_applied', (
+        f'Expected task 3 to still be applied, got: {actions_3[0]!r}'
+    )
+    assert wired_reconciler.task_interceptor.set_task_status.await_count == 2, (
+        f'Expected both dependents to be attempted, got '
+        f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
+    )
