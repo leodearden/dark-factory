@@ -28,15 +28,19 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from shared.delivered_check_polarity import (
+    CheckFinding,
     CheckOutcome,
     build_grep_argv,
     evaluate_grep_at_tree,
+    extract_delivered_checks,
     interpret_grep_rc,
     lint_delivered_checks,
+    polarity_error,
 )
 
 # ---------------------------------------------------------------------------
@@ -1030,3 +1034,307 @@ class TestAbsentOverbroad:
         )
 
         assert [f.severity for f in findings] == ['warn']
+
+
+# ---------------------------------------------------------------------------
+# TestExtractDeliveredChecks (task 3500 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDeliveredChecks:
+    """BENIGN-ABSENT, mirroring
+    ``fused_memory.middleware.lock_charter_guard.extract_files`` exactly.
+
+    The extractor runs on the wire path of ``commit_planning``, where
+    ``metadata`` arrives as a dict OR a JSON string OR nothing at all. Every
+    malformed shape resolves to "no checks to lint", never to an exception:
+    a gate that can raise on a metadata shape it did not anticipate would
+    take down planning for a defect it was not even built to catch.
+    """
+
+    def test_none_is_no_checks(self):
+        assert extract_delivered_checks(None) == []
+
+    def test_empty_string_is_no_checks(self):
+        assert extract_delivered_checks('') == []
+
+    def test_unparseable_json_string_is_no_checks(self):
+        assert extract_delivered_checks('{not json at all') == []
+
+    def test_json_string_decoding_to_a_non_object_is_no_checks(self):
+        assert extract_delivered_checks('[1, 2, 3]') == []
+        assert extract_delivered_checks('"a string"') == []
+        assert extract_delivered_checks('42') == []
+
+    @pytest.mark.parametrize('metadata', [[], ['a'], 42, 3.5, True, object()])
+    def test_a_non_str_non_dict_is_no_checks(self, metadata):
+        assert extract_delivered_checks(metadata) == []
+
+    def test_dict_without_the_key_is_no_checks(self):
+        assert extract_delivered_checks({'files': ['a.py']}) == []
+
+    @pytest.mark.parametrize(
+        'value', [None, 'grep', 42, {'name': 'cap'}, True]
+    )
+    def test_delivered_checks_that_is_not_a_list_is_no_checks(self, value):
+        assert extract_delivered_checks({'delivered_checks': value}) == []
+
+    def test_a_valid_json_string_blob_round_trips(self):
+        blob = (
+            '{"files": ["a.py"], "delivered_checks": '
+            '[{"name": "cap", "kind": "grep", "pattern": "X", "expect": "present"}]}'
+        )
+
+        assert extract_delivered_checks(blob) == [
+            {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'}
+        ]
+
+    def test_non_dict_entries_inside_the_list_are_filtered_out(self):
+        metadata = {
+            'delivered_checks': [
+                {'name': 'keeper', 'kind': 'grep'},
+                'a bare string',
+                None,
+                42,
+                ['nested', 'list'],
+            ]
+        }
+
+        assert extract_delivered_checks(metadata) == [{'name': 'keeper', 'kind': 'grep'}]
+
+    def test_a_dict_metadata_is_used_directly(self):
+        checks = [{'name': 'cap', 'kind': 'script'}]
+
+        assert extract_delivered_checks({'delivered_checks': checks}) == checks
+
+
+# ---------------------------------------------------------------------------
+# TestPolarityError (task 3500 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+def _reject(name: str, code: str = 'vacuous_present') -> CheckFinding:
+    return CheckFinding(
+        check_name=name,
+        severity='reject',
+        code=code,
+        message=f'{name} is vacuous',
+        detail=(f'{name}-site.py:1: token',),
+    )
+
+
+class TestPolarityError:
+    """The reject payload, shaped like ``lock_charter_error`` on purpose.
+
+    ``commit_planning`` already rejects a batch atomically for a lock-charter
+    violation, and MCP callers handle that error through one code path.
+    Mirroring its ``{error, error_type, <detail>, hint}`` convention means
+    ``DeliveredCheckPolarityViolation`` needs no new caller handling at all.
+    """
+
+    def test_error_type_is_the_new_violation(self):
+        payload = polarity_error([_reject('cap-a')], task_id='3500')
+
+        assert payload['error_type'] == 'DeliveredCheckPolarityViolation'
+
+    def test_key_set_matches_the_lock_charter_convention(self):
+        payload = polarity_error([_reject('cap-a')], task_id='3500')
+
+        assert set(payload) == {'error', 'error_type', 'checks', 'hint'}
+
+    def test_error_names_the_task_in_the_parenthetical_convention(self):
+        payload = polarity_error([_reject('cap-a')], task_id='3500')
+
+        assert '(task 3500)' in payload['error']
+
+    def test_error_names_every_reject_check_and_code(self):
+        findings = [
+            _reject('cap-a', 'vacuous_present'),
+            _reject('cap-b', 'vacuous_absent'),
+            _reject('cap-c', 'filename_shaped'),
+        ]
+
+        error = polarity_error(findings, task_id='3500')['error']
+
+        for name in ('cap-a', 'cap-b', 'cap-c'):
+            assert name in error
+        for code in ('vacuous_present', 'vacuous_absent', 'filename_shaped'):
+            assert code in error
+
+    def test_checks_carries_one_structured_entry_per_reject(self):
+        payload = polarity_error(
+            [_reject('cap-a'), _reject('cap-b', 'vacuous_absent')], task_id='3500'
+        )
+
+        assert payload['checks'] == [
+            {
+                'name': 'cap-a',
+                'code': 'vacuous_present',
+                'message': 'cap-a is vacuous',
+                'detail': ['cap-a-site.py:1: token'],
+            },
+            {
+                'name': 'cap-b',
+                'code': 'vacuous_absent',
+                'message': 'cap-b is vacuous',
+                'detail': ['cap-b-site.py:1: token'],
+            },
+        ]
+
+    def test_warn_and_errored_findings_are_excluded(self):
+        """A WARN is undecidable (MODE 2) and an ERRORED is an availability
+        failure. Letting either into the reject payload would turn the
+        deliberate non-blocking dispositions into blocking ones — the exact
+        inversion decisions #3 and #8's WARN choice exist to prevent."""
+        findings = [
+            _reject('cap-a'),
+            CheckFinding('cap-warn', 'warn', 'absent_overbroad', 'too broad'),
+            CheckFinding('cap-err', 'errored', 'unevaluable', 'git said no'),
+        ]
+
+        payload = polarity_error(findings, task_id='3500')
+
+        assert [c['name'] for c in payload['checks']] == ['cap-a']
+        assert 'cap-warn' not in payload['error']
+        assert 'cap-err' not in payload['error']
+
+    def test_hint_prescribes_asserting_the_new_symbol_positively(self):
+        """All three measured repairs took the same shape: assert the symbol
+        the producer INTRODUCES with expect=present, rather than banning the
+        one it removes. Naming that remedy is the difference between a reject
+        an author can act on and one they can only be annoyed by."""
+        hint = polarity_error([_reject('cap-a')], task_id='3500')['hint']
+
+        assert 'new symbol' in hint.lower()
+        assert 'expect=present' in hint
+
+    def test_hint_states_the_invariant(self):
+        hint = polarity_error([_reject('cap-a')], task_id='3500')['hint'].lower()
+
+        assert 'authoring' in hint
+        assert 'lands' in hint or 'producer' in hint
+
+    def test_task_id_is_optional(self):
+        """``lock_charter_error``'s ``task_id`` is optional and the
+        parenthetical simply disappears; mirroring that keeps the two
+        payloads interchangeable for a caller that has no task id yet."""
+        payload = polarity_error([_reject('cap-a')], task_id=None)
+
+        assert '(task' not in payload['error']
+        assert payload['error_type'] == 'DeliveredCheckPolarityViolation'
+
+
+# ---------------------------------------------------------------------------
+# TestLintImmunity (task 3500 — step-9 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestLintImmunity:
+    """``lint_delivered_checks`` NEVER raises, on any input.
+
+    Both wire points depend on this unconditionally and for opposite
+    reasons: ``commit_planning`` would turn an exception into a planning
+    outage, and the capability-manifest stamper is contractually
+    never-raising, so an exception there would abort the very status flip it
+    was called from.
+    """
+
+    def test_empty_batch(self, authoring_repo):
+        assert lint_delivered_checks([], files=[], repo_root=authoring_repo) == []
+
+    def test_script_kind_costs_no_subprocess(self, authoring_repo):
+        """The short-circuit must come BEFORE the git call, not after it: a
+        batch of script checks is common and should cost nothing."""
+        with patch(
+            'shared.delivered_check_polarity.subprocess.run',
+            side_effect=AssertionError('lint must not shell out for a script check'),
+        ):
+            findings = lint_delivered_checks(
+                [{'name': 'cap', 'kind': 'script', 'script': 'scripts/x.sh'}],
+                files=[],
+                repo_root=authoring_repo,
+            )
+
+        assert findings == []
+
+    @pytest.mark.parametrize('name', [None, '', 42, ['cap'], {'a': 1}])
+    def test_missing_or_non_string_name_is_skipped_before_any_git_call(
+        self, authoring_repo, name
+    ):
+        """A finding is addressed to a check BY NAME; without a usable one
+        there is nothing a caller could report or an author could fix, so the
+        entry is skipped rather than reported under a name that does not
+        exist."""
+        with patch(
+            'shared.delivered_check_polarity.subprocess.run',
+            side_effect=AssertionError('lint must not shell out for a nameless check'),
+        ):
+            findings = lint_delivered_checks(
+                [_grep_check(name=name)], files=[], repo_root=authoring_repo
+            )
+
+        assert findings == []
+
+    @pytest.mark.parametrize('entry', [None, 'a string', 42, ['a', 'list'], object()])
+    def test_a_non_dict_entry_is_skipped(self, authoring_repo, entry):
+        findings = lint_delivered_checks(
+            [entry, _grep_check(name='real')], files=[], repo_root=authoring_repo
+        )
+
+        assert [f.check_name for f in findings] == ['real']
+
+    def test_non_string_paths_entries_are_dropped_not_crashed_on(self, authoring_repo):
+        """A non-string in ``paths`` would be handed straight to
+        ``subprocess`` as an argv element and raise ``TypeError``. Dropping
+        it keeps the check EVALUABLE against the paths that are usable —
+        degrading to a reject-or-clean verdict rather than to an exception."""
+        findings = lint_delivered_checks(
+            [_grep_check(name='cap', paths=['src/producer.py', 42, None])],
+            files=['src/producer.py'],
+            repo_root=authoring_repo,
+        )
+
+        assert [(f.check_name, f.code) for f in findings] == [('cap', 'vacuous_present')]
+
+    def test_non_string_files_entries_are_dropped_not_crashed_on(self, tmp_path):
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {'src/owned.py': 'legacy_token = 1\n', 'src/other.py': 'legacy_token = 2\n'},
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'legacy-gone',
+                    'kind': 'grep',
+                    'pattern': 'legacy_token',
+                    'expect': 'absent',
+                    'paths': [],
+                }
+            ],
+            files=['src/owned.py', 42, None],
+            repo_root=repo,
+        )
+
+        assert [(f.check_name, f.severity) for f in findings] == [('legacy-gone', 'warn')]
+
+    @pytest.mark.parametrize('pattern', [None, 42, '', ['x']])
+    def test_a_missing_or_non_string_pattern_is_skipped(self, authoring_repo, pattern):
+        """``kind='grep'`` without a usable pattern is a schema defect, not a
+        polarity defect — and there is nothing to grep for."""
+        findings = lint_delivered_checks(
+            [_grep_check(pattern=pattern)], files=[], repo_root=authoring_repo
+        )
+
+        assert findings == []
+
+    def test_checks_is_not_required_to_be_a_list(self, authoring_repo):
+        """A tuple, a generator, anything iterable — the extractor's output
+        is a list, but the lint is also called directly."""
+        findings = lint_delivered_checks(
+            (c for c in [_grep_check(name='gen')]),
+            files=['src/producer.py'],
+            repo_root=authoring_repo,
+        )
+
+        assert [f.check_name for f in findings] == ['gen']
