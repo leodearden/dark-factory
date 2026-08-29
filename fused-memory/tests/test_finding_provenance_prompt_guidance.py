@@ -46,6 +46,7 @@ but itself.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pytest
 from shared.task_metadata import parse_metadata
@@ -466,6 +467,13 @@ class TestRelayChannelFieldNames:
         red on any unrelated field addition, which is a legitimate change.
         """
         state, run_id, _stage = _state_with_finding()
+        # Bound as dict[str, Any] rather than splatted inline: a bare
+        # `**{CONST: 'f1'}` literal infers dict[str, str], which pyright then
+        # checks against EVERY unfilled parameter of add_finding — reporting a
+        # spurious reportArgumentType against `actionable: bool | None`. The
+        # runtime behaviour under test (add_finding takes no **kwargs, so the
+        # call raises TypeError) is identical either way.
+        extra_kwargs: dict[str, Any] = {FINDING_ID_METADATA_KEY: 'f1'}
         with pytest.raises(TypeError):
             state.add_finding(
                 run_id=run_id,
@@ -473,7 +481,7 @@ class TestRelayChannelFieldNames:
                 category='systemic_pattern',
                 description='d2',
                 suggested_action='a',
-                **{FINDING_ID_METADATA_KEY: 'f1'},
+                **extra_kwargs,
             )
 
     def test_stage1_holds_the_citation_tool_its_clause_names(self):
