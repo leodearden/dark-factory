@@ -4223,3 +4223,60 @@ class TestObservationDepthIsHonest:
             | {o.k for o in observations.inversions}
         )
         assert len(depths) == 1
+
+
+class TestInversionFamilyIsPinnedToScoredDepth:
+    """The inversion/comparable-pair family is scored at ``scored_k``, not the
+    fetch depth — the same comparability contract `contamination` and `claim
+    recall` already hold, verified end-to-end through `probe_topic`."""
+
+    def _observe(self, *, superseded_rank, successor_rank, ks=(10,), total=10):
+        m = _mod()
+        entry = _pair_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        results = _filler(total)
+        results[superseded_rank - 1] = _R(content='old text', id='OLD')
+        results[successor_rank - 1] = _R(content='new text', id='NEW')
+        search = _search_returning({}, default_factory=lambda: _healthy(results))
+
+        import asyncio  # noqa: PLC0415
+
+        asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
+        return observations
+
+    def test_a_pair_visible_only_beyond_the_scored_depth_is_not_comparable(self):
+        """A deeper fetch must not widen the family: both members return only
+        beyond the tripwire depth (rank 6, 7 at ks=(10,)). This is the failing
+        assertion today: at full fetch depth the pair is comparable and
+        6 < 7 fires one inversion."""
+        observations = self._observe(superseded_rank=6, successor_rank=7)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
+
+    def test_a_pair_inside_the_scored_depth_stays_comparable(self):
+        """The pin narrows only what is genuinely out of scope: a pair fully
+        inside the top 5 (rank 1, 2) is still comparable and still inverts."""
+        observations = self._observe(superseded_rank=1, successor_rank=2)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 1
+            assert len(obs.inversions) == 1
+
+    def test_a_straddling_pair_is_not_comparable(self):
+        """One member inside the scored depth (rank 1), one beyond it
+        (rank 6): a pair that cannot both be seen at the scored depth is no
+        exposure, even though both are visible at the full fetch depth."""
+        observations = self._observe(superseded_rank=1, successor_rank=6)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
