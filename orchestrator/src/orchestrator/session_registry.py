@@ -831,22 +831,66 @@ def refresh_record(
     A *corrupt* existing body is NOT treated as absent -- it continues to
     raise ``CorruptSessionRecord`` rather than silently overwriting data the
     reaper's own 'corrupt' rule already accounts for.
+
+    The upsert body itself lives in ``apply_refresh`` (the pure half); this
+    function is read -> apply_refresh -> write.
     """
     try:
-        record = read_record(slug, root=root)
+        prior = read_record(slug, root=root)
     except FileNotFoundError:
+        prior = None
+    record = apply_refresh(slug, prior, status=status)
+    write_record(record, root=root)
+    return record
+
+
+def apply_refresh(
+    slug: str,
+    prior: SessionRecord | None,
+    *,
+    status: Status | None = None,
+) -> SessionRecord:
+    """PURE (no-I/O) half of ``refresh_record``: the upsert body alone.
+
+    Performs NO filesystem access whatsoever -- it neither reads nor writes.
+    *prior* is the already-read record for *slug*, or None when no record
+    exists at that key yet.
+
+    When *prior* is not None it is MUTATED AND RETURNED IN PLACE (the same
+    read-modify contract ``refresh_record``/``update_status`` have always
+    had), so a caller holding the object sees the applied status. When
+    *prior* is None a fresh, well-formed ``SessionRecord`` is synthesized
+    under the same key: schema_version/session_slug/start_ts/status are
+    populated and every other field is left at its documented default.
+
+    Why this exists as its own function:
+    ``session_hooks.py::_run_status_refresh_and_retitle`` already holds the
+    record (the ownership probe read it) and must settle one hook event on
+    ONE snapshot and ONE write -- calling ``refresh_record`` would force a
+    redundant re-read and a second write. It cannot instead re-derive the
+    upsert inline: the module docstring's PRD Section 6 G5 rule is that
+    consumers import the shared record contract and never re-derive it, so
+    there must stay exactly one definition of what a freshly-upserted
+    record looks like. This is that definition.
+
+    Note *prior* being None is the ABSENT state only. A record that exists
+    but is unreadable must NOT be routed here as None -- see
+    ``refresh_record``'s corrupt-body guarantee, which callers preserve by
+    letting ``CorruptSessionRecord`` propagate rather than synthesizing over
+    the body.
+    """
+    if prior is None:
         # No prior write for this slug: synthesize a fresh record. LAUNCHING
         # is the sensible default identity for "a record just came into
         # being" when the caller upserts without an explicit status.
-        record = SessionRecord(
+        return SessionRecord(
             session_slug=slug,
             status=status if status is not None else Status.LAUNCHING,
             start_ts=datetime.now(UTC).isoformat(),
         )
     if status is not None:
-        record.status = status
-    write_record(record, root=root)
-    return record
+        prior.status = status
+    return prior
 
 
 def write_decision(record: DecisionRecord, root: Path | str | None = None) -> bool:
