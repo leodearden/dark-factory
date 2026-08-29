@@ -272,10 +272,13 @@ def _env_slug_ownership(
     env: Mapping[str, str],
     allow_remint: bool = False,
     probes: _EventProbes | None = None,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, _RecordSnapshot | None]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
-    Returns ``(owned, may_bind)``. ``owned`` is the adopt/fork answer
+    Returns ``(owned, may_bind, snapshot)``. ``snapshot`` is the record read
+    performed to answer, so an adopting caller can reuse it instead of
+    reading the same record again -- None only on the early return that
+    reads nothing at all. ``owned`` is the adopt/fork answer
     documented below. ``may_bind`` is the SEPARATE question of whether this
     event may stamp its ``session_id`` onto the adopted record, and the two
     are deliberately not the same bit: adopting is fail-soft (it degrades to
@@ -346,8 +349,9 @@ def _env_slug_ownership(
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         # No discriminator at all, and nothing to bind either: the 'unknown'
-        # slug fallback is deliberately not a valid binding.
-        return True, True
+        # slug fallback is deliberately not a valid binding. Nothing is read
+        # here, so there is no snapshot to hand forward.
+        return True, True, None
     snapshot = _read_record_snapshot(slug, root)
     if snapshot.unreadable:
         # A corrupt body, an unreadable fleet root, anything: an ownership
@@ -355,14 +359,14 @@ def _env_slug_ownership(
         # behaviour (adopt) rather than fork a spurious record or raise --
         # the hook trio's hard rule is that a registry fault never breaks a
         # session. Logged (in _read_record_snapshot), never silent.
-        return True, False
+        return True, False, snapshot
     record = snapshot.record
     if record is None:
         # No record yet: this hook event IS the slug's first sight. Its own
         # arm, above the broad one, so an ordinary fresh spawn logs nothing.
         # Binding still needs positive proof: an unbound slug with no record
         # is the same open-for-its-owner shape as an unbound record.
-        return True, probes.owner_ppid_verdict() is True
+        return True, probes.owner_ppid_verdict() is True, snapshot
     bound = (record.claude_session_id or '').strip()
     if not bound:
         # No binding yet, so the stdin session_id proves nothing: whoever
@@ -374,9 +378,9 @@ def _env_slug_ownership(
         # the record stays open for its true owner instead of being
         # captured by whoever happened to arrive first.
         verdict = probes.owner_ppid_verdict()
-        return verdict is not False, verdict is True
+        return verdict is not False, verdict is True, snapshot
     if bound == hook_session_id:
-        return True, True
+        return True, True, snapshot
     # A re-mint is forgiven only when the OWNING PROCESS is the one
     # presenting it. The `source` string alone proves the emitter holds *a*
     # session, not *this* one -- and automatic compaction fires
@@ -387,7 +391,7 @@ def _env_slug_ownership(
     if not (allow_remint and _is_owner_only_session_start(hook_input)):
         # Forked onto the hand-launched keying, whose slug embeds this very
         # session_id: binding there is tautological, never a capture.
-        return False, True
+        return False, True, snapshot
     owner_pid = record.claude_owner_pid
     current_pid = probes.owning_claude_pid()
     if owner_pid is None or current_pid is None:
@@ -399,8 +403,8 @@ def _env_slug_ownership(
         # on every routine automatic compaction, a universal regression
         # strictly worse than the rare inversion it would prevent
         # (task 4193 L2 ruling item 4-ii).
-        return True, True
-    return owner_pid == current_pid, True
+        return True, True, snapshot
+    return owner_pid == current_pid, True, snapshot
 
 
 def _env_slug_is_owned(
@@ -423,6 +427,25 @@ def _env_slug_is_owned(
     )[0]
 
 
+@dataclass(frozen=True)
+class _HookSlugResolution:
+    """One hook event's resolved registry identity -- see ``_resolve_hook_slug``.
+
+    A frozen dataclass rather than a 4-tuple deliberately: this is the
+    surface task 4193 spent seven review cycles stabilizing, and named
+    fields make a mis-ordered unpack a type error rather than a silent
+    ownership inversion.
+
+    INVARIANT: ``snapshot is None or snapshot.slug == slug``. See
+    ``_resolve_hook_slug``'s docstring for why that is load-bearing.
+    """
+
+    slug: str
+    rejected_env_slug: str | None
+    may_bind: bool
+    snapshot: _RecordSnapshot | None
+
+
 def _resolve_hook_slug(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -430,8 +453,8 @@ def _resolve_hook_slug(
     *,
     allow_remint: bool = False,
     probes: _EventProbes | None = None,
-) -> tuple[str, str | None, bool]:
-    """Resolve ``(slug, rejected_env_slug, may_bind)`` for one hook event.
+) -> _HookSlugResolution:
+    """Resolve this hook event's registry identity -- see ``_HookSlugResolution``.
 
     ``slug`` is exactly what ``hook_session_slug`` returns -- see its
     docstring for the adoption / fall-through contract.
@@ -456,6 +479,20 @@ def _resolve_hook_slug(
     docstring). Callers that would bind must honour it; callers that only
     need an identity can ignore it.
 
+    ``snapshot`` is the record read the ownership probe already performed,
+    handed forward so the caller need not read the same record again -- the
+    single-read collapse this whole path exists to enable. It is attached
+    ONLY on the adopt branch, where the slug READ is the slug RETURNED.
+
+    That restriction is load-bearing, not tidiness. On the FORK branch the
+    slug returned is the hand-launched one -- a DIFFERENT record.json --
+    and handing the rejected spawner's snapshot forward would apply a
+    nested ``claude``'s status/question/binding decision to the SPAWNING
+    session's record: exactly the ownership inversion tasks 4193 and 2511
+    exist to prevent, re-introduced through a plumbing shortcut. Every
+    other branch (fork, no env slug, and the blank-stdin-session_id early
+    return that reads nothing) carries ``snapshot=None``.
+
     *allow_remint* is forwarded to ``_env_slug_ownership``; SessionStart is
     the only caller that sets it. *probes* is likewise forwarded, so the
     resolution's ownership walk is shared with the rest of the event.
@@ -467,7 +504,7 @@ def _resolve_hook_slug(
         # (task 4112) intact, and means an adversarial env token can no more
         # escape sessions_dir when READ than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
-        owned, may_bind = _env_slug_ownership(
+        owned, may_bind, snapshot = _env_slug_ownership(
             candidate,
             hook_input,
             root,
@@ -476,7 +513,9 @@ def _resolve_hook_slug(
             probes=probes,
         )
         if owned:
-            return candidate, None, may_bind
+            # The slug READ is the slug RETURNED, so the snapshot describes
+            # exactly the record the caller is about to refresh.
+            return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
 
     identity = resolve_hook_identity(hook_input, env)
@@ -492,7 +531,8 @@ def _resolve_hook_slug(
         session_id,  # type: ignore[arg-type]
     )
     # This slug embeds session_id itself, so binding it is tautological.
-    return slug, rejected, True
+    # No snapshot: any read above was of a DIFFERENT record than this slug.
+    return _HookSlugResolution(slug, rejected, True, None)
 
 
 def hook_session_slug(
@@ -546,7 +586,7 @@ def hook_session_slug(
     BIND the record it resolved to; callers that enrich or bind a record
     need those bits, callers that only need an identity do not.
     """
-    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint)[0]
+    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
 
 
 def _bind_claude_session_id(
@@ -1176,8 +1216,13 @@ def run_session_start(
     """
     probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
-    slug, forked_from, may_bind = _resolve_hook_slug(
+    resolution = _resolve_hook_slug(
         hook_input, env, root, allow_remint=True, probes=probes
+    )
+    slug, forked_from, may_bind = (
+        resolution.slug,
+        resolution.rejected_env_slug,
+        resolution.may_bind,
     )
     try:
         record = session_registry.read_record(slug, root=root)
@@ -1403,7 +1448,8 @@ def _run_status_refresh_and_retitle(
     """
     probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
-    slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root, probes=probes)
+    resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
+    slug, may_bind = resolution.slug, resolution.may_bind
     prior = _read_record_snapshot(slug, root).record
     # Decide the launch window BEFORE the refresh: refresh_record is a
     # read-modify-WRITE, so passing the status here at all would already have
