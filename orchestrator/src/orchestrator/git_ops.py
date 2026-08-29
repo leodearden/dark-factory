@@ -3140,7 +3140,39 @@ class GitOps:
                         seed_rc = await self._seed_warm_lane(
                             tmp_path, '--fresh-checkout', take_lane_lock=False,
                         )
-                        if seed_rc != 0:
+                        _seed_self_refused = seed_rc != 0 and (
+                            _seed_rc_to_unavailable(seed_rc)
+                            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+                        )
+                        if _seed_self_refused:
+                            # task 4211: name the SELF-refusal rather than
+                            # letting it read as a generic seed failure.  This
+                            # CM holds <tmp_path>.lock for its whole lifetime
+                            # and passes take_lane_lock=False, and
+                            # --assume-lane-lock-held is gated on
+                            # take_lane_lock — so it is never sent, and any
+                            # post-reify-5354 seed script (which self-locks by
+                            # default under --fresh-checkout) refuses against
+                            # OUR OWN lock every time.  flock is not re-entrant
+                            # across a process tree, so the "other live
+                            # consumer" here is this very process: warm_seed is
+                            # effectively a no-op for post-5354 lanes and the
+                            # body silently runs COLD.  rc 77 is the first
+                            # signal that makes that legible; DECOUPLING the
+                            # assume-flag from take_lane_lock (so an external
+                            # holder can assert it) is filed as follow-up work,
+                            # deliberately not done inline here because it
+                            # changes what this CM actually seeds.
+                            logger.info(
+                                'ephemeral_worktree(%s): warm seed SELF-refused '
+                                'on %s.lock (rc=%d, lane-lock contention) — this '
+                                'CM holds that lock itself and cannot assert it '
+                                'to seed, so the seed is a no-op against a '
+                                'self-locking script; proceeding COLD '
+                                '(fail-soft)',
+                                kind.name, tmp_path, seed_rc,
+                            )
+                        elif seed_rc != 0:
                             logger.info(
                                 'ephemeral_worktree(%s): warm seed failed (rc=%d) '
                                 'for %s — proceeding COLD (fail-soft)',
