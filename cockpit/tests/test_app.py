@@ -1138,6 +1138,68 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert 'session:renew-1' not in app._dropped
             assert queue.row_count == 1
 
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_on_a_reask_with_identical_text(self, tmp_path):
+        """A re-ask carrying the SAME text as the dropped one must still expire it.
+
+        Identical text is the COMMON case, not an edge case:
+        orchestrator.session_hooks._extract_question sets
+        `text=str(message)` verbatim from the Claude Code Notification
+        hook's `message`, and `asked_at=datetime.now(UTC).isoformat()` -- a
+        FRESH stamp on every hook. A repeated permission-prompt notification
+        therefore carries its canned message string unchanged and differs
+        from the previous ask ONLY in asked_at, which is exactly this shape.
+
+        This is the case the sibling
+        test_..._without_a_status_change cannot detect, because it also
+        changes the question TEXT ('First ask?' -> 'Totally different
+        ask?'): a text change moves build_snapshot's per-session tuple all
+        by itself, so _apply_scan never short-circuits there. Here the whole
+        difference lives in asked_at, so the prune only ever runs if the
+        WAKE-UP TRIGGER (the snapshot) is at least as strong as the overlay
+        identity (_ask_identity's `(question.text, question.asked_at)`).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='same title')
+        first_ask = _make_record(
+            session_slug='same-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:same-1' in app._dropped
+
+            # The next Notification hook: still AWAITING_INPUT, the very same
+            # canned message text, only a fresh asked_at stamp. It is a
+            # genuinely new ask and must be visible to the operator again.
+            second_ask = _make_record(
+                session_slug='same-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:same-1' not in app._dropped
+            assert queue.row_count == 1
+
 
 class TestBoostAndDeferOverlaysExpireWithTheAsk:
     @pytest.mark.timeout(10)
