@@ -3014,6 +3014,91 @@ class TestTheStormNamesItsCrossingCaller:
             assert key in storm, f'{key} is absent, not null'
             assert storm[key] is None
 
+    # -- the window-wide axis: EVERY caller, not only the crossing one ------
+
+    async def test_the_storm_names_every_caller_in_the_window(self):
+        """The crossing call is one event of many.
+
+        On a shared, long-lived server (the escalation server, fused-memory)
+        a burst can be several agents at once, and naming only whoever
+        happened to trip the wire is exactly the confident misattribution
+        ``_identity``'s docstring rules against. All three calls land in ONE
+        counter — ``escalate_info_typed`` declares no project axis, so
+        ``project`` is ``None`` for every one and the outcome is identical —
+        so one storm fires over two distinct callers.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) == 2, callers
+        assert callers == sorted(callers)
+        assert any('4805' in c and 'implementer-4805' in c for c in callers)
+        assert any('4744' in c and 'architect-4744' in c for c in callers)
+
+    async def test_the_crossing_call_still_names_only_itself(self):
+        """The two axes answer DIFFERENT questions and must not be conflated.
+
+        ``callers`` is "who was in this window"; ``crossing_*`` is "who tripped
+        it". Folding either into the other loses the one an operator needs.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['crossing_subject_task_id'] == '4805'
+        assert storm['crossing_subject_agent_role'] == 'implementer-4805'
+
+    async def test_an_unattributable_burst_names_nobody_but_still_counts(self):
+        """``StormCounter``'s own rule, made visible on the record.
+
+        An unlabelled event still counts toward the burst; there is simply
+        nothing to name it against. ``callers`` is therefore PRESENT and
+        EMPTY — never absent, and never holding a placeholder string — so
+        ``count`` and ``len(callers)`` can never be read as the same number.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for _ in range(3):
+            await self._anonymous_repair(h)
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        assert storm['count'] == 3
+        assert storm['callers'] == []
+
+    async def test_the_caller_set_is_not_degenerate(self):
+        """NON-CIRCULAR pin on the defect itself.
+
+        Before this fix the label handed to ``StormCounter.record`` was
+        ``f'{project}\\x1f{outcome}'`` — the very string the counter is keyed
+        by — so the distinct-label set was degenerate BY CONSTRUCTION and
+        could never hold two entries however many callers leaked. A
+        one-element ``callers`` on the two-caller burst above is that bug,
+        not a smaller-than-expected list.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        for subject in (self.SUBJECT, self.OTHER_SUBJECT, self.SUBJECT):
+            await self._typed_repair(h, **subject)
+            clock.advance(60)
+
+        callers = self._storms(h)[0]['callers']
+        assert len(callers) != 1, callers
+        # Spelled ``chr(0x1f)`` and not as an escape, so this reads as the
+        # counter's real separator byte rather than a four-character literal.
+        assert not any(chr(0x1f) in c for c in callers), callers
+
     # -- (d) one dict, so the caller-facing shapes cannot drift -------------
 
     async def test_the_rejected_payload_storm_carries_the_attribution(self):
