@@ -562,8 +562,21 @@ to start over from nothing.
 
         The merge gate flagged ``not_touched``: plan-declared files that
         no commit on the branch actually touched.  Give the architect
-        ONE bounded chance to drop genuinely-unneeded entries via
-        ``update_plan_metadata(files=[narrowed list])``.
+        ONE bounded chance to reconcile the plan with branch reality.
+
+        THREE actions are on offer, not two.  A two-action menu (drop the
+        entries silently, or confirm the plan unchanged) leaves a real case
+        with no truthful move, and the merge gate names that dilemma verbatim
+        in two places —
+        ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
+        and
+        ``orchestrator/src/orchestrator/merge_gates.py::ALREADY_LANDED_REASON_PREFIX``:
+        "drop = falsify provenance, confirm = mislabel complete work".  The
+        third action closes it for the over-declaration shape: a file that was
+        CORRECTLY declared and CORRECTLY needed no change leaves the ``files``
+        list via ``drop_plan_file(path, reason)``, which records WHY in the
+        plan record, so the gate's re-check can pass without the provenance
+        being falsified.
 
         Lenient semantics — the architect may keep some flagged entries
         (treating them as genuinely needed; the gate's re-check is then
@@ -606,7 +619,7 @@ work is genuinely incomplete.
 
 {not_touched_list}
 
-## Action — choose exactly ONE
+## Action — choose ONE of (a) or (b); (c) is per-entry and may be repeated
 
 a. **Drop genuinely-unneeded entries**: call
    `update_plan_metadata(files=[<narrowed list>])` with a subset of the
@@ -616,6 +629,20 @@ b. **Plan is honest as-is**: call `confirm_plan()` unchanged.  The
    workflow will then file a level-1 escalation (auto-watcher triages; promotes to L2 if a human is needed) — choose this only when the
    work is genuinely incomplete and the flagged files really do need
    edits.
+c. **Correctly declared, and correctly needed no change**: call
+   `drop_plan_file(path, reason)` — ONCE PER SUCH ENTRY, repeating for
+   each one.  Use this when you were right to declare the file AND the
+   branch was right to leave it alone: the work landed, and this entry
+   simply needed no change.  `reason` is one line saying why the entry
+   was in scope and why no edit was needed.
+
+   This is not falsification, and that is the whole point of the
+   separate call.  The entry leaves the `files` list, so the gate's
+   re-check can pass; the reason stays in the plan record, so why the
+   file was ever declared remains auditable.  Dropping an entry with no
+   recorded reason is what would falsify the plan — which is why (a)
+   is the wrong tool for this case and `drop_plan_file` refuses a blank
+   reason.
 
 ## Forbidden for this pass
 
