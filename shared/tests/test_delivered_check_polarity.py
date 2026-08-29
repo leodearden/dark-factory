@@ -566,3 +566,467 @@ class TestLintFailsOpenOnInfrastructure:
         )
 
         assert [f.severity for f in findings] == ['errored']
+
+
+# ---------------------------------------------------------------------------
+# TestSelfReferentialRefinement (task 3500 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+#
+# THE REFINEMENTS ARE MESSAGES, NOT GATES. At authoring time a
+# self-referential match and a comment-only match are both just sub-species
+# of "a check that already matches", so the 2x2 has ALREADY rejected them by
+# the time a refinement runs (design decision #1). What the refinement buys
+# is legibility: `vacuous_present` tells an author their check is green on
+# day one, `vacuous_present_self_referential` tells them WHY — the only
+# thing their pattern matches is the descriptor that declares it.
+
+#: The measured t2863 specimen's shape: match #1 of the capability token
+#: under `plans/` was the descriptor's OWN `pattern:` line.
+_SELF_REF_TREE = {
+    'plans/foo-prd.md': (
+        '# Foo PRD\n'
+        '\n'
+        'The capability lands as foo_capability_token in the scheduler.\n'
+    ),
+    'plans/foo-prd.capability-manifest.yaml': (
+        'capabilities:\n'
+        '  - name: foo-cap\n'
+        '    delivered_check:\n'
+        '      kind: grep\n'
+        '      pattern: foo_capability_token\n'
+        '      expect: present\n'
+    ),
+    'src/scheduler.py': 'def dispatch():\n    return None\n',
+}
+
+
+class TestSelfReferentialRefinement:
+    """An ``expect='present'`` pattern whose only matches are the descriptor
+    that declares it, plus the PRD that describes it.
+
+    This is the emptiest possible check: it is satisfied by its own
+    existence. It stays a REJECT — the 2x2 already decided that — but earns
+    the sharper ``vacuous_present_self_referential`` code so the author is
+    told the actual problem rather than left to rediscover it.
+    """
+
+    @pytest.fixture
+    def self_ref_repo(self, tmp_path: Path) -> Path:
+        return _init_git_repo(tmp_path / 'repo', _SELF_REF_TREE)
+
+    def _check(self, **overrides: object) -> dict[str, object]:
+        check: dict[str, object] = {
+            'name': 'foo-cap',
+            'kind': 'grep',
+            'pattern': 'foo_capability_token',
+            'expect': 'present',
+            'paths': [],
+            # Threaded through by the stamper, which knows which sidecar it
+            # is copying from (step-18).
+            'manifest_path': 'plans/foo-prd.capability-manifest.yaml',
+        }
+        check.update(overrides)
+        return check
+
+    def test_matches_confined_to_the_descriptor_family_get_the_sharper_code(
+        self, self_ref_repo
+    ):
+        findings = lint_delivered_checks(
+            [self._check()], files=['src/scheduler.py'], repo_root=self_ref_repo, ref='HEAD'
+        )
+
+        assert len(findings) == 1
+        assert findings[0].severity == 'reject'
+        assert findings[0].code == 'vacuous_present_self_referential'
+
+    def test_message_names_the_self_match(self, self_ref_repo):
+        findings = lint_delivered_checks(
+            [self._check()], files=['src/scheduler.py'], repo_root=self_ref_repo, ref='HEAD'
+        )
+
+        assert 'plans/foo-prd.capability-manifest.yaml' in findings[0].message
+
+    def test_without_a_manifest_path_it_falls_back_to_the_unrefined_code(
+        self, self_ref_repo
+    ):
+        """``commit_planning`` has no sidecar to point at, so the refinement
+        is simply unavailable there. Falling back to plain ``vacuous_present``
+        keeps the REJECT — losing the refinement must never lose the
+        rejection."""
+        findings = lint_delivered_checks(
+            [self._check(manifest_path=None)],
+            files=['src/scheduler.py'],
+            repo_root=self_ref_repo,
+            ref='HEAD',
+        )
+
+        assert len(findings) == 1
+        assert findings[0].severity == 'reject'
+        assert findings[0].code == 'vacuous_present'
+
+    def test_a_match_outside_the_family_defeats_the_refinement(self, tmp_path):
+        """One live match in real code and the check is no longer merely
+        self-referential — it is an ordinary vacuous check."""
+        tree = dict(_SELF_REF_TREE)
+        tree['src/scheduler.py'] = 'foo_capability_token = 1\n'
+        repo = _init_git_repo(tmp_path / 'repo', tree)
+
+        findings = lint_delivered_checks(
+            [self._check()], files=['src/scheduler.py'], repo_root=repo, ref='HEAD'
+        )
+
+        assert len(findings) == 1
+        assert findings[0].code == 'vacuous_present'
+
+
+# ---------------------------------------------------------------------------
+# TestCommentOnlyRefinement (task 3500 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestCommentOnlyRefinement:
+    """An ``expect='present'`` pattern whose every match line is a comment.
+
+    The measured t2792 specimen: the sole ``archive_task_transcripts`` match
+    in ``git_ops.py`` is a comment. A comment cannot be a capability, so a
+    check satisfied only by comments is asserting that someone wrote the
+    word down — which is true before the producer lands and stays true if it
+    never does.
+    """
+
+    @pytest.mark.parametrize(
+        ('marker', 'rel_path'),
+        [
+            ('#', 'src/mod.py'),
+            ('//', 'src/mod.ts'),
+            ('*', 'src/mod.c'),
+            ('"""', 'src/doc.py'),
+            ("'''", 'src/doc2.py'),
+        ],
+    )
+    def test_every_match_on_a_comment_line_gets_the_sharper_code(
+        self, tmp_path, marker, rel_path
+    ):
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {
+                rel_path: (
+                    f'    {marker} archive_task_transcripts is handled elsewhere\n'
+                    'def unrelated():\n'
+                    '    return 0\n'
+                ),
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'archival-cap',
+                    'kind': 'grep',
+                    'pattern': 'archive_task_transcripts',
+                    'expect': 'present',
+                    'paths': [rel_path],
+                }
+            ],
+            files=[rel_path],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert len(findings) == 1
+        assert findings[0].severity == 'reject'
+        assert findings[0].code == 'vacuous_present_comment_only'
+
+    def test_one_live_code_line_among_the_comments_falls_back_to_plain_vacuous(
+        self, tmp_path
+    ):
+        """The CONTROL. The refinement claims "every match is a comment"; a
+        single live match makes that claim false, and over-claiming it would
+        put a wrong diagnosis in front of the author on a hard reject."""
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {
+                'src/mod.py': (
+                    '# archive_task_transcripts is handled elsewhere\n'
+                    'def archive_task_transcripts():\n'
+                    '    return 0\n'
+                ),
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'archival-cap',
+                    'kind': 'grep',
+                    'pattern': 'archive_task_transcripts',
+                    'expect': 'present',
+                    'paths': ['src/mod.py'],
+                }
+            ],
+            files=['src/mod.py'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert len(findings) == 1
+        assert findings[0].code == 'vacuous_present'
+
+
+# ---------------------------------------------------------------------------
+# TestRefinementPrecedence (task 3500 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRefinementPrecedence:
+    """AT MOST ONE finding per check, with a deterministic winner.
+
+    Both refinements can hold at once (a manifest ``pattern:`` line reached
+    through a markdown bullet in the sibling PRD is self-referential AND
+    comment-shaped). Emitting two findings would double-count one defect in
+    the reject payload, so the order is pinned: self-referential is the more
+    specific diagnosis and wins.
+    """
+
+    def test_self_reference_outranks_comment_only(self, tmp_path):
+        repo = _init_git_repo(
+            tmp_path / 'repo',
+            {
+                # Every match line here is BOTH inside the descriptor family
+                # and comment-shaped (a markdown bullet starts with '*').
+                'plans/foo-prd.md': '# Foo PRD\n\n* foo_capability_token lands here\n',
+                'plans/foo-prd.capability-manifest.yaml': (
+                    'capabilities:\n'
+                    '  - name: foo-cap\n'
+                    '    delivered_check:\n'
+                    '      # pattern: foo_capability_token\n'
+                    '      kind: grep\n'
+                ),
+                'src/scheduler.py': 'def dispatch():\n    return None\n',
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'foo-cap',
+                    'kind': 'grep',
+                    'pattern': 'foo_capability_token',
+                    'expect': 'present',
+                    'paths': [],
+                    'manifest_path': 'plans/foo-prd.capability-manifest.yaml',
+                }
+            ],
+            files=['src/scheduler.py'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert len(findings) == 1
+        assert findings[0].code == 'vacuous_present_self_referential'
+
+
+# ---------------------------------------------------------------------------
+# TestFilenameShaped (task 3500 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+#
+# MODE 3 is the ONE class the 2x2 cannot see: at authoring time the file the
+# pattern names does not exist yet, so nothing matches, the check evaluates
+# FAIL, and it looks like an ordinary healthy forward-looking check. It only
+# reveals itself once the producer lands and the check STILL fails, because
+# the module never mentions its own name. Design decision #4 takes SCOPE
+# item 3's SECOND sanctioned option for it (reject a filename-shaped grep)
+# rather than its first (a new `kind='path'`), which is filed as a follow-up.
+
+
+class TestFilenameShaped:
+    """An ``expect='present'`` pattern that matches a tracked PATH but no
+    file CONTENT.
+
+    The measured task-3536 specimen: ``test_workflow_merge_gating_strand``
+    is a tracked module under ``orchestrator/tests/`` and ``git grep`` for
+    it there yields ZERO content matches — a test module does not mention
+    its own name.
+    """
+
+    @pytest.fixture
+    def strand_repo(self, tmp_path: Path) -> Path:
+        return _init_git_repo(
+            tmp_path / 'repo',
+            {
+                'orchestrator/tests/test_workflow_merge_gating_strand.py': (
+                    'import pytest\n\n\ndef test_strand():\n    assert True\n'
+                ),
+                'orchestrator/tests/test_other.py': 'def test_other():\n    assert True\n',
+            },
+        )
+
+    def test_pattern_matching_only_a_tracked_path_is_rejected(self, strand_repo):
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'gating-strand',
+                    'kind': 'grep',
+                    'pattern': 'test_workflow_merge_gating_strand',
+                    'expect': 'present',
+                    'paths': ['orchestrator/tests'],
+                }
+            ],
+            files=['orchestrator/tests'],
+            repo_root=strand_repo,
+            ref='HEAD',
+        )
+
+        assert len(findings) == 1
+        assert findings[0].severity == 'reject'
+        assert findings[0].code == 'filename_shaped'
+
+    def test_message_tells_the_author_to_assert_a_symbol_inside_the_file(
+        self, strand_repo
+    ):
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'gating-strand',
+                    'kind': 'grep',
+                    'pattern': 'test_workflow_merge_gating_strand',
+                    'expect': 'present',
+                    'paths': ['orchestrator/tests'],
+                }
+            ],
+            files=['orchestrator/tests'],
+            repo_root=strand_repo,
+            ref='HEAD',
+        )
+
+        message = findings[0].message.lower()
+        assert 'inside' in message
+        assert 'filename' in message or 'path' in message
+
+    def test_no_content_match_and_no_path_match_is_healthy(self, strand_repo):
+        """The CONTROL, and the reason this rule is narrow: an ordinary
+        forward-looking check has zero content matches too. Only the PATH
+        coincidence separates the two."""
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'forward-looking',
+                    'kind': 'grep',
+                    'pattern': 'not_yet_landed_symbol',
+                    'expect': 'present',
+                    'paths': ['orchestrator/tests'],
+                }
+            ],
+            files=['orchestrator/tests'],
+            repo_root=strand_repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
+    def test_absent_polarity_is_never_filename_shaped(self, strand_repo):
+        """The rule is scoped to ``expect='present'``. The absent polarity
+        with the same pattern is not MODE 3 at all — it is the 2x2's own
+        cell (d), because a pattern with no content match today has nothing
+        left for the task to remove. Pinned so the MODE 3 rule cannot leak
+        across polarities and relabel an ordinary vacuous check."""
+        findings = lint_delivered_checks(
+            [
+                {
+                    'name': 'strand-removed',
+                    'kind': 'grep',
+                    'pattern': 'test_workflow_merge_gating_strand',
+                    'expect': 'absent',
+                    'paths': ['orchestrator/tests'],
+                }
+            ],
+            files=['orchestrator/tests'],
+            repo_root=strand_repo,
+            ref='HEAD',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_absent']
+
+
+# ---------------------------------------------------------------------------
+# TestAbsentOverbroad (task 3500 — step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestAbsentOverbroad:
+    """MODE 2/2b is a WARN, never a reject.
+
+    An ``expect='absent'`` pattern that also matches files the task does not
+    own will keep failing after the task lands, wedging its dependent. But
+    it is genuinely UNDECIDABLE at authoring time — task 3534's pattern
+    legitimately matched inside the very file it owned — and this gate is
+    hard-blocking, so a false reject here costs more than a missed catch.
+    """
+
+    @pytest.fixture
+    def two_file_repo(self, tmp_path: Path) -> Path:
+        return _init_git_repo(
+            tmp_path / 'repo',
+            {
+                'src/owned.py': 'legacy_token = 1\n',
+                'src/elsewhere.py': 'legacy_token = 2\n',
+            },
+        )
+
+    def _check(self) -> dict[str, object]:
+        return {
+            'name': 'legacy-gone',
+            'kind': 'grep',
+            'pattern': 'legacy_token',
+            'expect': 'absent',
+            'paths': [],
+        }
+
+    def test_matches_outside_the_declared_files_warn(self, two_file_repo):
+        findings = lint_delivered_checks(
+            [self._check()], files=['src/owned.py'], repo_root=two_file_repo, ref='HEAD'
+        )
+
+        assert len(findings) == 1
+        assert findings[0].severity == 'warn'
+        assert findings[0].code == 'absent_overbroad'
+
+    def test_detail_names_the_out_of_scope_files(self, two_file_repo):
+        findings = lint_delivered_checks(
+            [self._check()], files=['src/owned.py'], repo_root=two_file_repo, ref='HEAD'
+        )
+
+        joined = '\n'.join(findings[0].detail)
+        assert 'src/elsewhere.py' in joined
+        # The file the task DOES own is not the author's problem.
+        assert 'src/owned.py' not in joined
+
+    def test_all_matches_inside_the_declared_files_is_healthy(self, two_file_repo):
+        findings = lint_delivered_checks(
+            [self._check()],
+            files=['src/owned.py', 'src/elsewhere.py'],
+            repo_root=two_file_repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
+    def test_a_declared_directory_covers_the_files_beneath_it(self, two_file_repo):
+        """``metadata.files`` routinely names a DIRECTORY; treating that as
+        covering nothing would warn on every task that declares scope
+        coarsely — a false positive on the common shape."""
+        findings = lint_delivered_checks(
+            [self._check()], files=['src'], repo_root=two_file_repo, ref='HEAD'
+        )
+
+        assert findings == []
+
+    def test_a_warn_is_never_promoted_to_a_reject(self, two_file_repo):
+        """Pins the disposition itself, not just the code: MODE 2 is
+        undecidable, so this finding must stay out of the reject payload no
+        matter how the codes are renamed later."""
+        findings = lint_delivered_checks(
+            [self._check()], files=[], repo_root=two_file_repo, ref='HEAD'
+        )
+
+        assert [f.severity for f in findings] == ['warn']
