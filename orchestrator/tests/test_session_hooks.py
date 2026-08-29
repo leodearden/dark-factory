@@ -1592,7 +1592,9 @@ def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(
     # claude, so a fork stamped with it would never satisfy
     # reap_stale_records' stale_pid rule -- one permanent extra row per
     # nested `claude -p` an agent shells out to.
-    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', lambda: 424242)
+    # **_kw absorbs the per-event `probes` memo the caller now forwards
+    # (task 4662); the stub's VALUE and every assertion below are unchanged.
+    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', lambda **_kw: 424242)
 
     slug = 'session-cockpit-3215093'
     _write_bound_parent(slug, tmp_path, 3215093)

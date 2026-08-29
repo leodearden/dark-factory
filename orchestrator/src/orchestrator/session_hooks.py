@@ -198,6 +198,7 @@ def _env_slug_ownership(
     *,
     env: Mapping[str, str],
     allow_remint: bool = False,
+    probes: _EventProbes | None = None,
 ) -> tuple[bool, bool]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
@@ -262,7 +263,13 @@ def _env_slug_ownership(
     pid arm below: an owner pid missing on EITHER side is "cannot prove",
     not "disproved" -- forking there would split the owner's own record on
     every routine automatic compaction wherever ``/proc`` is unavailable.
+
+    *probes* is this event's ``_EventProbes`` memo, so the ownership walk it
+    performs here is the SAME observation ``_withhold_from_launching`` and
+    ``_bind_claude_session_id`` later consult -- see that class's docstring.
+    None builds a single-use memo, leaving a direct call unchanged.
     """
+    probes = probes or _EventProbes(env)
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         # No discriminator at all, and nothing to bind either: the 'unknown'
@@ -275,7 +282,7 @@ def _env_slug_ownership(
         # arm, above the broad one, so an ordinary fresh spawn logs nothing.
         # Binding still needs positive proof: an unbound slug with no record
         # is the same open-for-its-owner shape as an unbound record.
-        return True, _owner_ppid_verdict(env) is True
+        return True, probes.owner_ppid_verdict() is True
     except Exception:
         # A corrupt body, an unreadable fleet root, anything: an ownership
         # probe that cannot answer must degrade to the pre-task-4193
@@ -299,7 +306,7 @@ def _env_slug_ownership(
         # None) ADOPTS -- the fail-soft direction -- but does NOT bind, so
         # the record stays open for its true owner instead of being
         # captured by whoever happened to arrive first.
-        verdict = _owner_ppid_verdict(env)
+        verdict = probes.owner_ppid_verdict()
         return verdict is not False, verdict is True
     if bound == hook_session_id:
         return True, True
@@ -315,7 +322,7 @@ def _env_slug_ownership(
         # session_id: binding there is tautological, never a capture.
         return False, True
     owner_pid = record.claude_owner_pid
-    current_pid = _owning_claude_pid()
+    current_pid = probes.owning_claude_pid()
     if owner_pid is None or current_pid is None:
         # Legacy record bound before the pid existed, a bind where it could
         # not be resolved, or a platform with no /proc (macOS -- a
@@ -336,6 +343,7 @@ def _env_slug_is_owned(
     *,
     env: Mapping[str, str],
     allow_remint: bool = False,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
 
@@ -344,7 +352,7 @@ def _env_slug_is_owned(
     ``_resolve_hook_slug``.
     """
     return _env_slug_ownership(
-        slug, hook_input, root, env=env, allow_remint=allow_remint
+        slug, hook_input, root, env=env, allow_remint=allow_remint, probes=probes
     )[0]
 
 
@@ -354,6 +362,7 @@ def _resolve_hook_slug(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
+    probes: _EventProbes | None = None,
 ) -> tuple[str, str | None, bool]:
     """Resolve ``(slug, rejected_env_slug, may_bind)`` for one hook event.
 
@@ -381,7 +390,8 @@ def _resolve_hook_slug(
     need an identity can ignore it.
 
     *allow_remint* is forwarded to ``_env_slug_ownership``; SessionStart is
-    the only caller that sets it.
+    the only caller that sets it. *probes* is likewise forwarded, so the
+    resolution's ownership walk is shared with the rest of the event.
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
     rejected: str | None = None
@@ -391,7 +401,12 @@ def _resolve_hook_slug(
         # escape sessions_dir when READ than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
         owned, may_bind = _env_slug_ownership(
-            candidate, hook_input, root, env=env, allow_remint=allow_remint
+            candidate,
+            hook_input,
+            root,
+            env=env,
+            allow_remint=allow_remint,
+            probes=probes,
         )
         if owned:
             return candidate, None, may_bind
@@ -472,6 +487,7 @@ def _bind_claude_session_id(
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Stamp this hook's Claude Code session_id onto an unbound *record*.
 
@@ -489,6 +505,10 @@ def _bind_claude_session_id(
     ``_is_owner_only_session_start`` says no nested ``claude`` could have
     produced this event -- never on the Notification/Stop refresh path,
     where no such ``source`` field exists to vouch for the caller.
+
+    *probes* supplies the owning pid from this event's memo, so the stamp
+    reads the SAME process-tree observation the adopt/fork decision was made
+    from rather than walking ``/proc`` a third time.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
@@ -504,7 +524,7 @@ def _bind_claude_session_id(
     # told apart from a nested claude presenting a different id. None when
     # it cannot be resolved -- recorded honestly rather than guessed, and
     # read back as "cannot prove ownership".
-    record.claude_owner_pid = _owning_claude_pid()
+    record.claude_owner_pid = (probes or _EventProbes({})).owning_claude_pid()
     return True
 
 
@@ -792,7 +812,7 @@ def _owner_ppid_verdict(
     return actual == expected
 
 
-def _nested_claude_liveness_pid() -> int:
+def _nested_claude_liveness_pid(*, probes: _EventProbes | None = None) -> int:
     """A liveness pid that actually DIES with a forked inheritor's session.
 
     ``_hand_launched_liveness_pid``'s ``os.getsid(0)`` is deliberately the
@@ -823,8 +843,12 @@ def _nested_claude_liveness_pid() -> int:
     than guessing. Note the fallback is only ever *coarser*: ``stale_pid``
     also requires ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a
     mis-resolved pid cannot reap a record that is still being written to.
+
+    *probes* supplies the owning pid from this event's memo rather than
+    walking ``/proc`` again -- the fork path has already resolved it once to
+    reach the ownership verdict that sent it here.
     """
-    return _owning_claude_pid() or _hand_launched_liveness_pid()
+    return (probes or _EventProbes({})).owning_claude_pid() or _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
@@ -1083,9 +1107,10 @@ def run_session_start(
     ``_resolve_display``) and ``launcher_pid`` comes from
     ``_nested_claude_liveness_pid`` so the forked record stays reapable.
     """
+    probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
     slug, forked_from, may_bind = _resolve_hook_slug(
-        hook_input, env, root, allow_remint=True
+        hook_input, env, root, allow_remint=True, probes=probes
     )
     try:
         record = session_registry.read_record(slug, root=root)
@@ -1095,7 +1120,7 @@ def run_session_start(
         if forked_from is not None:
             # An inherited CLAUDE_SPAWN_LAUNCHER_PID would be the SPAWNER's,
             # and the terminal's session leader outlives this nested claude.
-            launcher_pid = _nested_claude_liveness_pid()
+            launcher_pid = _nested_claude_liveness_pid(probes=probes)
         elif launcher_pid_raw:
             launcher_pid = int(launcher_pid_raw)
         else:
@@ -1135,7 +1160,10 @@ def run_session_start(
     # side (esc-4193-10).
     if may_bind:
         _bind_claude_session_id(
-            record, hook_input, allow_rebind=_is_owner_only_session_start(hook_input)
+            record,
+            hook_input,
+            allow_rebind=_is_owner_only_session_start(hook_input),
+            probes=probes,
         )
     session_registry.write_record(record, root=root)
     return record
@@ -1267,6 +1295,8 @@ def _in_unbound_launch_window(
 def _withhold_from_launching(
     prior: session_registry.SessionRecord,
     env: Mapping[str, str],
+    *,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Given a record in the unbound launch window, withhold this event?
 
@@ -1284,8 +1314,12 @@ def _withhold_from_launching(
 
     Otherwise the event's provenance is genuinely unknowable and nothing it
     carries may land on the spawn-created record.
+
+    *probes* shares the event's single ownership observation with the
+    adopt/fork decision, so the two can never disagree because the process
+    tree changed between two walks.
     """
-    if _owner_ppid_verdict(env) is True:
+    if (probes or _EventProbes(env)).owner_ppid_verdict() is True:
         return False
     return not _launch_window_withholding_expired(prior)
 
@@ -1328,8 +1362,9 @@ def _run_status_refresh_and_retitle(
     which would misroute the OWNER's session whenever its SessionStart is
     merely slow -- trading a rare stale status for a routine wrong one.
     """
+    probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
-    slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root)
+    slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root, probes=probes)
     prior = _prior_record_or_none(slug, root)
     # Decide the launch window BEFORE the refresh: refresh_record is a
     # read-modify-WRITE, so passing the status here at all would already have
@@ -1337,7 +1372,7 @@ def _run_status_refresh_and_retitle(
     # status=None makes it a pure heartbeat bump, leaving status untouched.
     in_launch_window = prior is not None and _in_unbound_launch_window(
         prior
-    ) and _withhold_from_launching(prior, env)
+    ) and _withhold_from_launching(prior, env, probes=probes)
     record = session_registry.refresh_record(
         slug, root=root, status=None if in_launch_window else status
     )
@@ -1346,7 +1381,7 @@ def _run_status_refresh_and_retitle(
     bound = (
         not in_launch_window
         and may_bind
-        and _bind_claude_session_id(record, hook_input)
+        and _bind_claude_session_id(record, hook_input, probes=probes)
     )
     stamp_question = question is not None and not in_launch_window
     if stamp_question:
