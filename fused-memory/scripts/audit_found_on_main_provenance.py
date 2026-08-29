@@ -632,12 +632,24 @@ class GitFacts:
     ) -> dict[str, Any]:
         """Gather every git fact :func:`classify` needs about *commit* vs *ref*.
 
-        Checks ``is_ancestor`` first and short-circuits the remaining four
-        subprocess calls (commit message/diff, revert-log search, and the
-        batched declared-files existence check) when it is False:
-        ``classify()`` resolves to ``commit_not_on_main`` at its very first
-        precedence check in that case and never consults any of the other
-        facts, so gathering them would be pure wasted subprocess work.
+        Checks ``is_ancestor`` first and short-circuits the remaining five
+        subprocess calls (commit message/diff, revert-log search, the
+        batched declared-files existence check, and the second-parent walk)
+        when it is False: ``classify()`` resolves to ``commit_not_on_main``
+        at its very first precedence check in that case and never consults
+        any of the other facts, so gathering them would be pure wasted
+        subprocess work.
+
+        The second-parent walk (``second_parent_commits``) is issued
+        unconditionally on the ancestor path rather than being gated on
+        merge-ness: this method's injected-facts contract is ``(commit,
+        ref, declared_files)`` and deliberately carries no ``task_id``, so
+        it has no way to know whether the subject already self-cites. The
+        walk itself is a single ``git log`` call that exits 128 immediately
+        for an ordinary non-merge commit (see
+        :func:`_git_second_parent_commits`), so gating it would cost a
+        separate parent-count probe just to save a call that is already
+        cheap to fail.
         """
         is_ancestor = await _git_is_ancestor(self.project_root, commit, ref)
         if not is_ancestor:
@@ -646,6 +658,7 @@ class GitFacts:
                 'commit_subject': '',
                 'commit_message': '',
                 'commit_files': [],
+                'second_parent_commits': [],
                 'revert_commit': None,
                 'declared_files_missing_on_main': [],
                 'declared_files_inconclusive': [],
@@ -659,6 +672,7 @@ class GitFacts:
             'commit_subject': message.splitlines()[0] if message else '',
             'commit_message': message,
             'commit_files': await _git_show_files(self.project_root, commit),
+            'second_parent_commits': await _git_second_parent_commits(self.project_root, commit),
             'revert_commit': await _git_find_revert(self.project_root, commit, ref),
             'declared_files_missing_on_main': missing,
             'declared_files_inconclusive': inconclusive,
@@ -708,6 +722,11 @@ async def build_audit_report(
         audit.commit_subject = facts.get('commit_subject', '')
         audit.commit_message = facts.get('commit_message', '')
         audit.commit_files = facts.get('commit_files') or []
+        # Conservative default, same reasoning as commit_files/is_ancestor
+        # above: an alternate facts provider that omits this key must
+        # reproduce the pre-change verdict (still misattributed), never
+        # silently clear a task.
+        audit.second_parent_commits = facts.get('second_parent_commits') or []
         audit.revert_commit = facts.get('revert_commit')
         audit.declared_files_missing_on_main = facts.get('declared_files_missing_on_main') or []
         audit.declared_files_inconclusive = facts.get('declared_files_inconclusive') or []
