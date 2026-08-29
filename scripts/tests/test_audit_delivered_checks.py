@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 from audit_delivered_checks import (
+    _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
     DISPOSITION_DELIVERED,
     DISPOSITION_HEALTHY,
@@ -418,12 +419,22 @@ def _run_cli(*args):
 
 
 def _commit(root, message, files):
-    """Add *files* and commit them under *message*. Returns *root*."""
+    """Add *files* — and ONLY *files* — and commit them under *message*.
+
+    Staged by explicit pathspec rather than `git add -A`, which is not a style
+    preference: by the time a test calls this, _make_project has already
+    written .taskmaster/tasks/tasks.db into the tree, and that database
+    contains each descriptor's pattern verbatim inside its metadata JSON. An
+    `add -A` commits it, and every pattern then appears to have been
+    reintroduced by whatever this commit's subject names — which silently
+    fakes the supersession signal the tests below exist to check.
+    """
     for rel, text in files.items():
         target = Path(root) / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding='utf-8')
-    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(root), 'add', '--', *files],
+                   check=True, capture_output=True)
     subprocess.run(
         ['git', '-C', str(root), '-c', 'user.email=t@e', '-c', 'user.name=t',
          'commit', '-m', message],
@@ -799,3 +810,102 @@ class TestReadOnly:
         _run_cli('--project-root', str(root))
 
         assert fingerprint() == before
+
+
+class TestSupersessionAttribution:
+    """The supersession probe's two measured failure modes, pinned.
+
+    Both were found by running the finished sweep against the REAL corpus and
+    seeing the module docstring's own exemplar — task 3618's gzip checks,
+    undone by task 3578 — come out as `broken`. A disposition that is
+    unreachable for the case it was written for is worse than absent: the
+    report asserts a defect the docstring promises it will not assert.
+    """
+
+    def test_a_regex_pattern_is_pickaxed_as_a_regex_not_a_literal(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """`git log -S` is a LITERAL pickaxe by default, but every pattern here
+        is the POSIX ERE `git grep -E` evaluates. Without --pickaxe-regex the
+        probe searches for the characters `^import gzip` instead of the line
+        they describe, finds nothing, and reports the measured 3618/3578 case
+        as an authoring defect."""
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'pass\n'},
+            tasks=[{'id': 3618, 'status': 'done',
+                    'updated_at': '2020-01-01T00:00:00+00:00',
+                    'metadata': _checks(
+                        _grep('writer-emits-plain-jsonl', '^import gzip',
+                              expect='absent'))}],
+        )
+        _commit(root, 'Merge task/3578 into main',
+                {'src/a.py': 'import gzip\n'})
+
+        audit = audit_project(str(root))
+        finding = audit.findings[0]
+
+        assert finding.disposition == DISPOSITION_SUPERSEDED
+        assert finding.superseded_by == '3578'
+
+    def test_a_manifest_quoting_its_own_pattern_never_attributes_supersession(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A sidecar quotes its descriptor's pattern VERBATIM, so the commit
+        that ADDED the manifest changes the pickaxe count for that pattern. A
+        false positive here silently downgrades a real defect to a footnote —
+        the expensive direction — so the sidecars are excluded from the probe.
+        """
+        root = _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/a.py': 'class NeverBuilt:\n    pass\n'},
+            tasks=[{'id': 21, 'status': 'done',
+                    'updated_at': '2020-01-01T00:00:00+00:00',
+                    'metadata': _checks(
+                        _grep('gone', 'NeverBuilt', expect='absent', paths=()))}],
+        )
+        # The ONLY post-stamp commit that touches this pattern is the manifest
+        # declaring it — which is evidence about nothing.
+        _commit(root, 'Merge task/9999 into main', {
+            'plans/y-prd.capability-manifest.yaml': (
+                'prd: plans/y-prd.md\n'
+                'schema_version: 1\n'
+                'tasks:\n'
+                '  - label: α\n'
+                '    task_id: 21\n'
+                '    capabilities:\n'
+                '      - name: gone\n'
+                '        binding: b\n'
+                '        verdict: PASS\n'
+                '        delivered_check:\n'
+                '          kind: grep\n'
+                '          pattern: NeverBuilt\n'
+                '          expect: absent\n'
+            ),
+        })
+
+        audit = audit_project(str(root))
+        finding = next(f for f in audit.findings if f.row.name == 'gone')
+
+        assert finding.superseded_by is None
+        assert finding.disposition == DISPOSITION_BROKEN
+
+    @pytest.mark.parametrize('subject, expected', [
+        ('Merge task/3578 into main', '3578'),
+        ('feat(shared): GREEN — restore the gzip corpus (task 3578)', '3578'),
+        ('chore: retire the marker for task-3578', '3578'),
+    ])
+    def test_attributing_subject_conventions(self, subject, expected):
+        assert _TASK_IN_SUBJECT_RE.search(subject).group(1) == expected
+
+    @pytest.mark.parametrize('subject', [
+        # A PRD/manifest commit naming a RANGE of tasks attributes to none of
+        # them: it declares the descriptors, it does not undo them.
+        'plans: capability manifest for the seam PRD (tasks 3618-3621)',
+        # In-lane commits are the producer's OWN pre-merge work, not a later
+        # undoing; they reach the probe through their merge commit instead.
+        'impl(3540): GREEN — sanitize the granted_files fold',
+        'amend(4776): close the capture_file race',
+    ])
+    def test_non_attributing_subject_conventions(self, subject):
+        assert _TASK_IN_SUBJECT_RE.search(subject) is None

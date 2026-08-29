@@ -61,6 +61,7 @@ docs/legibility/design-invariants.md.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sqlite3
@@ -74,7 +75,16 @@ from typing import NamedTuple
 # scripts/, and this script must NEVER be invoked via `python -m` — the CLI
 # tests shell out to the script path and resolve this import solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0].
-from _task_db_scan import tasks_db_path
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+    format_coverage_block,
+    format_kv_line,
+    run_audit_cli,
+    tasks_db_path,
+)
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -154,12 +164,23 @@ class DescriptorRow(NamedTuple):
 
 
 class Finding(NamedTuple):
-    """One classified descriptor. ``superseded_by`` is set only when the
-    supersession probe attributed a later task to the pattern's return."""
+    """One classified descriptor.
+
+    ``superseded_by`` is set only when the supersession probe attributed a
+    later task to the pattern's return.
+
+    ``open_dependents`` names the still-open tasks that depend on this
+    descriptor's producer — the tasks a defective check actually holds up. It
+    is populated only for ACTIONABLE dispositions, because it answers "who is
+    stuck", and nobody is stuck behind a healthy or a delivered check. Both
+    trailing fields carry defaults so a synthetic Finding in a test can be
+    built from the two that define it.
+    """
 
     row: DescriptorRow
     disposition: str
     superseded_by: str | None = None
+    open_dependents: tuple[int, ...] = ()
 
 
 class AuditCoverage(NamedTuple):
@@ -428,13 +449,31 @@ def load_manifest_checks(
 #: id from anything else would be guessing; a commit this cannot attribute
 #: simply yields no supersession claim, which degrades toward reporting the
 #: row as the defect it appears to be rather than explaining it away.
-_TASK_IN_SUBJECT_RE = re.compile(r"task[/-](\d+)")
+#: The two subject spellings that ATTRIBUTE a commit to a task explicitly: the
+#: merge-lane convention (`Merge task/3578 into main`, also `task-3578`) and the
+#: direct-to-main trailing parenthetical (`... (task 3578)`). MEASURED against
+#: this repo's real log, and deliberately narrow at both edges. It does NOT
+#: match `tasks 3618-3621` (the `s` breaks the character class), which is how a
+#: PRD/manifest commit naming a RANGE of tasks stays unattributed; and it does
+#: not match the in-lane `impl(3540):` / `amend(4776):` prefixes, which are the
+#: producer's own pre-merge commits rather than a later undoing — those still
+#: reach us through their `Merge task/3540 into main` commit. Widening this is
+#: how a false positive gets in, and a false positive here silently downgrades
+#: a REAL defect to a footnote.
+_TASK_IN_SUBJECT_RE = re.compile(r"task[\s/-]#?(\d+)")
+
+#: Sidecars quote a descriptor's pattern VERBATIM on their `pattern:` line, so
+#: the commit that introduced a manifest changes the pickaxe count for its own
+#: pattern and would be attributed as a superseding task. Excluded for the same
+#: reason the authoring gate carries a `self_referential` code: a descriptor
+#: matching its own declaration is evidence about nothing.
+_SUPERSESSION_EXCLUDE_PATHSPEC = f":(exclude)*{MANIFEST_SUFFIX}"
 
 
 def find_superseding_task(
     row: DescriptorRow, *, repo_root: str, since: str | None
 ) -> str | None:
-    """A LATER task that reintroduced *row*'s pattern, or ``None``.
+    r"""A LATER task that reintroduced *row*'s pattern, or ``None``.
 
     Only ever consulted for a would-be ``broken`` row, and only ever able to
     DOWNGRADE it — so a false negative costs a footnote and a false positive
@@ -446,15 +485,29 @@ def find_superseding_task(
     producer's own work, not a later undoing. Absent, no claim is made at all
     rather than scanning all of history and attributing the producer's own
     merge to it.
+
+    ``--pickaxe-regex`` IS LOAD-BEARING, not a refinement. A bare ``-S`` is a
+    LITERAL-string pickaxe, but every pattern here is the POSIX ERE that
+    ``git grep -E`` evaluates — so without it the probe searches for the
+    characters ``^import gzip`` rather than for the line they describe, and
+    silently finds nothing for any pattern carrying a metacharacter. That is
+    not a rare corner: it is exactly the measured exemplar this disposition
+    exists for (task 3618's ``^import gzip`` / ``gzip\.open`` checks, undone by
+    task 3578), which a literal pickaxe reports as ``broken`` — the precise
+    false positive the module docstring promises not to emit. Verified on this
+    repo: literal ``-S`` returns nothing for both patterns, ``--pickaxe-regex``
+    returns 3578's commits for both.
     """
     if not since or not row.pattern:
         return None
     argv = [
         "git", "-C", repo_root, "log", "--format=%s",
-        f"--since={since}", "-S", row.pattern,
+        f"--since={since}", "-S", row.pattern, "--pickaxe-regex",
     ]
-    if row.paths:
-        argv += ["--", *row.paths]
+    # A pathspec of nothing-but-exclusions applies the exclusion to the
+    # implicit "everything" — verified against this repo's git rather than
+    # assumed, since older git treats it as matching nothing.
+    argv += ["--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
@@ -471,6 +524,53 @@ def find_superseding_task(
 # ---------------------------------------------------------------------------
 # The join
 # ---------------------------------------------------------------------------
+
+
+#: A dependent in one of these statuses is no longer waiting on anything, so a
+#: defective producer check is not holding it up. `deferred` is deliberately
+#: NOT here: a deferred task still needs the capability, it is just not being
+#: dispatched today, so it belongs in the "who is stuck" list.
+CLOSED_DEPENDENT_STATUSES = ("done", "cancelled")
+
+
+def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
+    """``{producer_task_id: (open dependent ids, ...)}``, read-only.
+
+    THE POINT OF SCOPE ITEM 5. A report naming a broken descriptor without
+    naming who is stuck behind it does not let an operator triage — the
+    originating complaint is precisely that a dependent sits blocked on a
+    capability that can never be delivered.
+
+    A MISSING ``dependencies`` TABLE IS NOT AN ERROR HERE, and the swallow is
+    narrow and deliberate. ``sweep_project_roots`` catches ``sqlite3.Error``
+    and turns it into "unreadable project"; an ``OperationalError`` escaping
+    this function would therefore demote a perfectly readable project to a
+    skip, and — if it were the only root — turn a healthy sweep into a false
+    exit 3, the exact silent-fail-soft that exit code exists to prevent. Only
+    the "no such table" shape is swallowed; every other ``sqlite3.Error``
+    propagates so a genuinely corrupt database still surfaces.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute(
+                "SELECT d.depends_on AS producer, d.task_id AS dependent "
+                "FROM dependencies d JOIN tasks t "
+                "  ON t.id = d.task_id AND t.tag = d.tag "
+                f"WHERE t.status NOT IN ({','.join('?' * len(CLOSED_DEPENDENT_STATUSES))})",
+                CLOSED_DEPENDENT_STATUSES,
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            return {}
+        out: dict[int, list[int]] = {}
+        for record in cursor:
+            out.setdefault(int(record["producer"]), []).append(int(record["dependent"]))
+        return {producer: tuple(sorted(set(v))) for producer, v in out.items()}
+    finally:
+        conn.close()
 
 
 def _load_statuses(db_path: str) -> tuple[dict[int, tuple[str, str]], dict[int, str]]:
@@ -503,6 +603,7 @@ def audit_project(project_root: str, ref: str = "HEAD") -> ProjectAudit:
     """
     db = str(tasks_db_path(project_root))
     statuses, stamps = _load_statuses(db)
+    open_dependents = load_open_dependents(db)
     metadata_rows = load_metadata_checks(db)
     manifest_rows, unloadable = load_manifest_checks(project_root, statuses)
 
@@ -517,13 +618,21 @@ def audit_project(project_root: str, ref: str = "HEAD") -> ProjectAudit:
             superseded_by = find_superseding_task(
                 row, repo_root=project_root, since=stamps.get(row.task_id)
             )
+        disposition = classify_descriptor(
+            outcome, status=row.status, superseded_by=superseded_by
+        )
         findings.append(
             Finding(
                 row=row,
-                disposition=classify_descriptor(
-                    outcome, status=row.status, superseded_by=superseded_by
-                ),
+                disposition=disposition,
                 superseded_by=superseded_by,
+                # Only for a defect: "who is stuck" is a triage question, and
+                # nobody is stuck behind a delivered or forward-looking check.
+                open_dependents=(
+                    open_dependents.get(row.task_id, ())
+                    if disposition in DEFECT_DISPOSITIONS
+                    else ()
+                ),
             )
         )
 
@@ -544,39 +653,126 @@ def audit_project(project_root: str, ref: str = "HEAD") -> ProjectAudit:
 
 
 # ---------------------------------------------------------------------------
-# Reporting (the CLI itself lands in step-24)
+# Reporting
 # ---------------------------------------------------------------------------
 
-#: Section order is severity order, and SUPERSEDED sits below the defects
-#: deliberately: it is a correctly-authored descriptor that later work undid,
-#: and filing it beside real defects is what makes a report get ignored.
-_SECTIONS = (
-    ("BROKEN", DISPOSITION_BROKEN),
+#: LIVE defects first, TERMINAL ones after — the report's whole triage claim.
+#: A vacuous gate on a live producer is holding dependents up RIGHT NOW and can
+#: be repaired by editing a task that is still open; a broken check on a closed
+#: producer is historical debt whose repair is a follow-up. Printing the
+#: history first is how a report stops being read.
+_LIVE_SECTIONS = (
     ("VACUOUS LIVE GATES", DISPOSITION_VACUOUS_LIVE_GATE),
+)
+
+#: SUPERSEDED sits below BROKEN and is deliberately in this group rather than
+#: among the defects: it is a correctly-authored descriptor that later work
+#: legitimately undid, and filing it beside real defects is what makes a report
+#: get ignored.
+_TERMINAL_SECTIONS = (
+    ("BROKEN", DISPOSITION_BROKEN),
     ("SUPERSEDED", DISPOSITION_SUPERSEDED),
     ("UNEVALUABLE", DISPOSITION_UNEVALUABLE),
 )
+
+_SECTIONS = _LIVE_SECTIONS + _TERMINAL_SECTIONS
+
+#: One line per disposition saying WHY, in the reader's terms. A disposition
+#: name alone is a verdict without an argument: it tells an operator what the
+#: classifier concluded but not whether to act, which forces them back into
+#: this file to re-derive the rule. Keyed by disposition so a new one cannot be
+#: added without noticing the reason is missing.
+_REASONS = {
+    DISPOSITION_BROKEN: (
+        "the producer is done, but this check does not pass against main "
+        "today — whatever it was meant to gate was never gated, and any "
+        "dependent still waiting on it waits forever"
+    ),
+    DISPOSITION_VACUOUS_LIVE_GATE: (
+        "the check ALREADY passes on main while its producer is still open, "
+        "so landing the producer cannot change the verdict — it gates "
+        "nothing, and a dependent is released for a reason unrelated to the "
+        "capability"
+    ),
+    DISPOSITION_SUPERSEDED: (
+        "correctly authored and delivered, then legitimately undone by later "
+        "work — REPORTED, NOT ACTIONABLE; repairing it would revert the "
+        "superseding change"
+    ),
+    DISPOSITION_UNEVALUABLE: (
+        "git could not answer for this descriptor (rc >= 2, a missing ref, or "
+        "no repository) — ERRORED is not FAIL, so nothing is claimed about "
+        "delivery either way"
+    ),
+    DISPOSITION_NO_TASK: (
+        "no row in this project's tasks.db carries this task id, so the "
+        "producer's status is unknown and the descriptor cannot be classified"
+    ),
+}
 
 _COVERAGE_CAVEAT = (
     "COVERAGE — what this sweep could NOT classify. A descriptor whose task is\n"
     "  absent from tasks.db, or whose sidecar would not load, is counted here\n"
     "  rather than dropped: a report that showed only findings would let a\n"
-    "  partial sweep read as a complete one."
+    "  partial sweep read as a complete one. The orphan class is real and\n"
+    "  measured, not hypothetical — of 543 mechanical sidecar capabilities, 35\n"
+    "  reach no task at all; 34 of those sit on tasks carrying no\n"
+    "  delivered_checks whatsoever, and 10 of THOSE are still open."
 )
 
 
-def _format_finding(finding: Finding) -> str:
+def _format_finding(finding: Finding) -> list[str]:
+    """One finding as a key=value line plus its indented ``reason:``.
+
+    ``format_kv_line`` owns the indent and the separator and nothing else, so
+    the field set and the column ORDER stay here — deliberately, per that
+    helper's docstring: what it buys is that this script's finding lines cannot
+    drift in SHAPE from the other audit scripts', not that they share fields.
+    """
     row = finding.row
-    parts = [
-        f"task_id={row.task_id}",
-        f"name={row.name}",
-        f"expect={row.expect}",
-        f"pattern={row.pattern!r}",
-        f"source={row.source}",
+    pairs: list[tuple[str, object]] = [
+        ("task_id", row.task_id),
+        ("status", row.status),
+        ("name", row.name),
+        ("expect", row.expect),
+        ("pattern", repr(row.pattern)),
+        ("source", row.source),
     ]
+    if row.manifest:
+        pairs.append(("manifest", row.manifest))
     if finding.superseded_by:
-        parts.append(f"superseded_by={finding.superseded_by}")
-    return "  " + " ".join(parts)
+        pairs.append(("superseded_by", finding.superseded_by))
+    if finding.disposition in DEFECT_DISPOSITIONS:
+        # ALWAYS emitted for a defect, including when empty: "nothing is stuck
+        # behind this one" is itself a triage answer, and omitting the field
+        # would make it indistinguishable from "we did not look".
+        pairs.append(
+            (
+                "open_dependents",
+                ",".join(str(d) for d in finding.open_dependents) or "none",
+            )
+        )
+    lines = [format_kv_line(pairs)]
+    reason = _REASONS.get(finding.disposition)
+    if reason:
+        lines.append(f"      reason: {reason}")
+    return lines
+
+
+def _coverage_details(audit: ProjectAudit) -> list[str]:
+    """NAME the unclassified descriptors, never just count them.
+
+    A bare count tells an operator that coverage is incomplete but not where to
+    look, which is a half-measure the shared block's own docstring calls out.
+    """
+    details = []
+    for finding in audit.findings:
+        if finding.disposition == DISPOSITION_NO_TASK:
+            details.append(
+                f"no task row for task_id={finding.row.task_id} "
+                f"(capability {finding.row.name!r} in {finding.row.manifest})"
+            )
+    return sorted(details)
 
 
 def format_report(audits: list[ProjectAudit]) -> str:
@@ -587,20 +783,26 @@ def format_report(audits: list[ProjectAudit]) -> str:
         for label, disposition in _SECTIONS:
             rows = [f for f in audit.findings if f.disposition == disposition]
             lines.append(f"  {label} ({len(rows)})")
-            lines.extend(_format_finding(f) for f in rows)
+            for finding in rows:
+                lines.extend(_format_finding(finding))
         lines.append("")
-        lines.append("  " + _COVERAGE_CAVEAT)
-        for label, value in (
-            ("descriptors swept", audit.coverage.descriptors_total),
-            ("descriptors with no task row", audit.coverage.descriptors_without_task),
-            ("descriptors git could not evaluate", audit.coverage.unevaluable),
-            ("sidecars that would not load", audit.coverage.sidecars_unloadable),
-        ):
-            lines.append(f"    {label:<36}{value}")
+        lines.extend(format_coverage_block(
+            _COVERAGE_CAVEAT,
+            (
+                ("descriptors swept", audit.coverage.descriptors_total),
+                ("descriptors with no task row", audit.coverage.descriptors_without_task),
+                ("descriptors git could not evaluate", audit.coverage.unevaluable),
+                ("sidecars that would not load", audit.coverage.sidecars_unloadable),
+            ),
+            _coverage_details(audit),
+        ))
         lines.append("")
     if not audits:
-        # Even an empty sweep names its sections, so a reader can tell "no
-        # defects" from "this tool does not report that".
+        # Even an empty sweep names its sections and its caveat, so a reader
+        # can tell "no defects" from "this tool does not report that". See
+        # run_audit_cli's STDOUT ON EXIT 3 warning: this payload is well-formed
+        # and empty on a total-failure sweep too, so only the exit code
+        # distinguishes them.
         lines.append("no projects audited")
         for label, _ in _SECTIONS:
             lines.append(f"  {label} (0)")
@@ -609,6 +811,13 @@ def format_report(audits: list[ProjectAudit]) -> str:
 
 
 def format_json(audits: list[ProjectAudit]) -> str:
+    """A JSON OBJECT, never a bare array.
+
+    An array has nowhere to hang COVERAGE, so a consumer reading it could not
+    tell a complete sweep from a partial one — and per run_audit_cli's contract
+    a consumer must branch on the EXIT CODE anyway, because an empty
+    ``projects`` list is also what a total-failure sweep emits.
+    """
     return json.dumps(
         {
             "projects": [
@@ -620,6 +829,8 @@ def format_json(audits: list[ProjectAudit]) -> str:
                             "paths": list(finding.row.paths),
                             "disposition": finding.disposition,
                             "superseded_by": finding.superseded_by,
+                            "open_dependents": list(finding.open_dependents),
+                            "reason": _REASONS.get(finding.disposition),
                         }
                         for finding in audit.findings
                     ],
@@ -631,3 +842,121 @@ def format_json(audits: list[ProjectAudit]) -> str:
         indent=2,
         sort_keys=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+# ALIASES, never re-spellings. The returns live in _task_db_scan.run_audit_cli,
+# so a local `EXIT_OK = 0` could drift from what actually gets returned while
+# the epilog below kept promising 0 — exactly the drift
+# test_exit_constants_alias_the_shared_tier_3_codes exists to catch, here and
+# in audit_combine_gate_marker_loss.py.
+EXIT_OK = AUDIT_EXIT_OK                        # audited; no ACTIONABLE defect
+EXIT_DEFECTS = AUDIT_EXIT_FINDINGS             # a broken or vacuous-live-gate
+                                               # descriptor was found
+EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT              # no project root resolved to a
+                                               # readable tasks.db
+EXIT_NOTHING_AUDITED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
+                                                   # one failed to audit
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "READ-ONLY, STATUS-AWARE audit of checked-in delivered_checks: "
+            "reports every kind=grep descriptor whose polarity against main "
+            "today disagrees with its producer's status — a closed producer "
+            "whose capability is nowhere on main (broken), or an open one "
+            "whose check already passes and therefore gates nothing (vacuous "
+            "live gate). Reporting only — never mutates a task or a manifest. "
+            "Remediation is a separate, individually-reviewed follow-up."
+        ),
+        epilog=(
+            "exit codes: 0 = audited, no ACTIONABLE defect; 1 = at least one "
+            "actionable defect (broken, or a vacuous live gate); 2 = no "
+            "project root resolved to a readable tasks.db; 3 = roots resolved "
+            "but every one failed to audit, so NOTHING was swept (never treat "
+            "3 as a clean run). Superseded, unevaluable, delivered, inert and "
+            "forward-looking rows are reported in full but never affect the "
+            "exit code."
+        ),
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to audit (resolves <root>/.taskmaster/tasks/tasks.db "
+            "and the tracked *.capability-manifest.yaml sidecars, evaluated "
+            "against that checkout's HEAD). May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON object (findings plus coverage) instead of a report.",
+    )
+    return parser
+
+
+def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
+    """Audit ONE project root. Exactly one audit, or ``sqlite3.Error``.
+
+    That is :func:`_task_db_scan.sweep_project_roots`' one-audit-per-root
+    contract, and the exit-3 gate depends on it — a sentinel return to "skip"
+    a root would silently re-open the false green.
+    """
+    del args  # this script takes no flag that varies the per-root audit
+    return audit_project(root)
+
+
+def _render(audits: list[ProjectAudit], args: argparse.Namespace) -> str:
+    return format_json(audits) if args.json else format_report(audits)
+
+
+def _is_dirty(audits: list[ProjectAudit]) -> bool:
+    """Exit 1 keys ONLY on the two ACTIONABLE dispositions.
+
+    Everything else is reported in full and counted in COVERAGE but stays out
+    of the exit code, for the reason the exemplar's terminal-row suppression
+    records: a detector that is permanently red is a detector nobody reads.
+    Specifically excluded, each for its own reason —
+
+    * ``superseded``: correctly delivered work that later work undid. Acting on
+      it means reverting the superseding change.
+    * ``inert`` (a cancelled producer): promised nothing, gates nothing.
+    * ``delivered`` / ``healthy``: the success and the ordinary
+      forward-looking states, i.e. the overwhelming majority of the corpus.
+    * ``unevaluable`` / ``no_task``: coverage facts, not verdicts. Letting
+      "git could not answer" exit 1 would make an infrastructure failure
+      indistinguishable from a real defect.
+    """
+    return any(
+        f.disposition in DEFECT_DISPOSITIONS for a in audits for f in a.findings
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = audited, no actionable defect; 1 = at least one ``broken``
+    or ``vacuous_live_gate`` descriptor; 2 = no project root resolved to a
+    readable tasks.db; 3 = roots resolved but every one failed to audit, so
+    NOTHING was swept (never treat 3 as a clean run).
+
+    A thin delegation to :func:`_task_db_scan.run_audit_cli` (Tier 3), shared
+    with audit_combine_gate_marker_loss.py and audit_wiped_metadata_files.py.
+    What stays here is what genuinely differs: this script's parser and epilog,
+    its report and JSON shapes, and its actionable-disposition predicate.
+    Nothing in this file returns a bare integer.
+    """
+    return run_audit_cli(
+        argv,
+        parser=_build_parser(),
+        audit_fn=_audit_root,
+        render=_render,
+        is_dirty=_is_dirty,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
