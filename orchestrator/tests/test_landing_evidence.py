@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -608,7 +609,9 @@ class TestValidateLandingEvidenceEffectDivergenceProbe:
 
 #: "argument not supplied", distinct from an explicitly-passed ``None`` — for
 #: helpers whose default must not collide with a MEANINGFUL None (task 4499).
-_UNSET: object = object()
+#: Annotated ``Any`` so it can stand in as the default of a narrower parameter,
+#: exactly as the sibling sentinel in escalation/tests/test_queue.py does.
+_UNSET: Any = object()
 
 
 def _verdict(reason: str, **probe_extra) -> LandingEvidenceVerdict:

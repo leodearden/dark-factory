@@ -64,7 +64,7 @@ _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue  # noqa: E402  (import after path fix)
 
 
 def main():

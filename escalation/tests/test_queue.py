@@ -31,7 +31,6 @@ from escalation.queue import (
     iter_all_escalation_paths,
 )
 
-
 #: "argument not supplied", distinct from an explicitly-passed ``None``.
 #: Needed wherever a helper's default must not collide with a MEANINGFUL
 #: ``None`` value — e.g. seeding a record whose ``citation_sha`` is genuinely
@@ -6087,7 +6086,8 @@ class TestFindTerminalByCitation:
         queue = EscalationQueue(tmp_path / 'queue')
         self._filed(queue, 'esc-1-1', citation_sha=stored)
         queue.resolve('esc-1-1', 'confirmed benign')
-        assert queue.get('esc-1-1').citation_sha == stored, (
+        seeded = queue.get('esc-1-1')
+        assert seeded is not None and seeded.citation_sha == stored, (
             'Pre-condition: the record must really be stored WITHOUT an identity'
         )
 
