@@ -26,7 +26,9 @@ from shared.config_dir import (
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
     _pid_alive,
+    reset_sweep_once_state,
     sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 
 # The prefix the UsageGate probe dirs actually use. Built from the module
@@ -433,6 +435,208 @@ class TestSweepStalePidDirsBounding:
         assert removed == len(planted)
         assert not any(p.exists() for p in planted)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# The once-per-process wrapper around the sweep, hoisted out of its two callers
+# (shared.usage_gate and shared/tests/startup_completion_probe.py), which held
+# ~45 lines of near-verbatim twin apiece.
+# ---------------------------------------------------------------------------
+
+
+class TestSweepStalePidDirsOnce:
+    """The one-shot wrapper's contract, pinned against a recording stub.
+
+    Never the real filesystem: this whole module is offline by construction, and
+    the wrapper's job is bookkeeping — WHICH prefixes have been swept in this
+    process, in what order relative to the call, and what happens when the sweep
+    raises. The sweep itself is covered by the classes above.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_process(self):
+        """Start and END every case as if this were a fresh process.
+
+        Symmetric on purpose: the one-shot state is module-global, so a case that
+        marked a prefix and did not clear it would leak into whichever test ran
+        next and make it pass or fail by ordering.
+        """
+        reset_sweep_once_state()
+        yield
+        reset_sweep_once_state()
+
+    @staticmethod
+    def _recorder(result: int = 0):
+        calls: list[tuple[str, dict]] = []
+
+        def _sweep(prefix: str, **kwargs) -> int:
+            calls.append((prefix, kwargs))
+            return result
+
+        return _sweep, calls
+
+    def test_the_first_call_sweeps_and_returns_the_count(self):
+        sweep, calls = self._recorder(result=3)
+
+        assert sweep_stale_pid_dirs_once('a-', sweep=sweep) == 3
+        assert calls == [('a-', {})]
+
+    def test_later_calls_for_the_same_prefix_do_nothing(self):
+        sweep, calls = self._recorder(result=3)
+
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        assert sweep_stale_pid_dirs_once('a-', sweep=sweep) == 0
+        assert sweep_stale_pid_dirs_once('a-', sweep=sweep) == 0
+        assert calls == [('a-', {})], (
+            'the sweep reclaims OTHER processes\' dead-PID leftovers, so re-running '
+            'it re-scans a potentially 40 MB /tmp inode for no benefit'
+        )
+
+    def test_the_one_shot_is_per_prefix_not_global(self):
+        """The correctness reason this cannot be a single boolean.
+
+        The two production callers sweep DIFFERENT prefixes
+        (``usage-gate-probe-`` and ``startup-probe-``). Under one global flag,
+        whichever module initialised first would mark the process as swept and
+        suppress the other's sweep entirely — silently converting the probe's
+        SIGKILL-recovery half into a no-op inside any process that also builds a
+        UsageGate (the orchestrator, and orchestrator/evals/runner.py, which
+        constructs gates repeatedly).
+        """
+        sweep, calls = self._recorder()
+
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep)
+
+        assert [prefix for prefix, _ in calls] == ['a-', 'b-']
+
+    def test_the_mark_is_set_before_the_call_so_a_raising_sweep_cannot_rerun(self):
+        calls: list[str] = []
+
+        def _exploding(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            raise OSError('boom')
+
+        sweep_stale_pid_dirs_once('a-', sweep=_exploding)
+        sweep_stale_pid_dirs_once('a-', sweep=_exploding)
+
+        assert calls == ['a-'], (
+            'the mark must be set BEFORE the call, or a sweep that raises every '
+            'time re-runs on every subsequent construction'
+        )
+
+    @pytest.mark.parametrize(
+        'exc',
+        # sweep_stale_pid_dirs already contains OSError internally, so the
+        # realistic escapee is the UNFORESEEN one — a future bug, a pathological
+        # tree, a mocked side effect in a sibling suite. Both are covered because
+        # the callers' own suites distinguish them.
+        [OSError('boom'), RuntimeError('unforeseen')],
+        ids=['oserror', 'unforeseen'],
+    )
+    def test_never_raises_for_any_exception_class(self, exc):
+        def _exploding(prefix: str, **kwargs) -> int:
+            raise exc
+
+        assert sweep_stale_pid_dirs_once('a-', sweep=_exploding) == 0, (
+            'tmp hygiene must never be able to fail orchestrator startup or a '
+            'real-money probe capture'
+        )
+
+    def test_on_reclaimed_fires_only_when_the_count_is_non_zero(self):
+        """The silent-on-zero rule both call sites share.
+
+        Quiet in the steady state, loud when there is something to say — so an
+        operator can see the /tmp population draining rather than rebuilding.
+        """
+        seen: list[int] = []
+        sweep, _ = self._recorder(result=0)
+        sweep_stale_pid_dirs_once('a-', sweep=sweep, on_reclaimed=seen.append)
+        assert seen == []
+
+        sweep, _ = self._recorder(result=2)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep, on_reclaimed=seen.append)
+        assert seen == [2]
+
+    def test_on_reclaimed_does_not_fire_on_the_failure_path(self):
+        def _exploding(prefix: str, **kwargs) -> int:
+            raise OSError('boom')
+
+        seen: list[int] = []
+        sweep_stale_pid_dirs_once('a-', sweep=_exploding, on_reclaimed=seen.append)
+        assert seen == []
+
+    def test_on_failure_fires_once_with_the_exception_instance(self):
+        boom = RuntimeError('unforeseen')
+
+        def _exploding(prefix: str, **kwargs) -> int:
+            raise boom
+
+        seen: list[BaseException] = []
+        sweep_stale_pid_dirs_once('a-', sweep=_exploding, on_failure=seen.append)
+        assert seen == [boom], (
+            'the exception instance itself, not a pre-formatted message: one '
+            'caller interpolates {exc!r} and the other needs a live exc_info'
+        )
+
+    def test_on_failure_does_not_fire_on_the_success_path(self):
+        seen: list[BaseException] = []
+        sweep, _ = self._recorder(result=1)
+        sweep_stale_pid_dirs_once('a-', sweep=sweep, on_failure=seen.append)
+        assert seen == []
+
+    def test_both_callbacks_are_optional(self):
+        # Omitting them must work silently on BOTH paths, so a third caller that
+        # does not care about reporting is not forced to pass no-ops.
+        sweep, _ = self._recorder(result=4)
+        assert sweep_stale_pid_dirs_once('a-', sweep=sweep) == 4
+
+        def _exploding(prefix: str, **kwargs) -> int:
+            raise OSError('boom')
+
+        assert sweep_stale_pid_dirs_once('b-', sweep=_exploding) == 0
+
+    def test_sweep_kwargs_are_forwarded_verbatim(self, tmp_path):
+        """Needed by the probe suite's autouse confinement wrapper.
+
+        ``test_startup_completion_probe.py::_confine_stale_dir_sweep`` patches the
+        probe's module-level sweep with a wrapper that accepts ``**kwargs`` and
+        injects ``base_dir``; a helper that swallowed extra kwargs would break it.
+        """
+        sweep, calls = self._recorder()
+
+        sweep_stale_pid_dirs_once(
+            'a-', sweep=sweep, base_dir=tmp_path, min_age_secs=1.0
+        )
+
+        assert calls == [('a-', {'base_dir': tmp_path, 'min_age_secs': 1.0})]
+
+    def test_reset_clears_every_prefix(self):
+        sweep, calls = self._recorder()
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep)
+
+        reset_sweep_once_state()
+
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep)
+        assert [prefix for prefix, _ in calls] == ['a-', 'b-', 'a-', 'b-']
+
+    def test_reset_of_one_prefix_leaves_the_others_marked(self):
+        sweep, calls = self._recorder()
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep)
+
+        reset_sweep_once_state('a-')
+
+        sweep_stale_pid_dirs_once('a-', sweep=sweep)
+        sweep_stale_pid_dirs_once('b-', sweep=sweep)
+        assert [prefix for prefix, _ in calls] == ['a-', 'b-', 'a-']
+
+    def test_reset_of_an_unswept_prefix_is_a_no_op(self):
+        # discard, not remove: a test hook that raised on an unswept prefix would
+        # make every fixture using it order-dependent.
+        reset_sweep_once_state('never-swept-')
 
 
 # ---------------------------------------------------------------------------
