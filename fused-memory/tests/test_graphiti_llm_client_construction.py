@@ -352,6 +352,7 @@ class TestConfiguredMaxTokensReachesEveryArm:
 
         client = build_llm_client(mock_config)
 
+        assert client is not None
         assert type(client) is _expected_client_class(arm)
         assert client.max_tokens == MAX_TOKENS_SENTINEL
 

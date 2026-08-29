@@ -25,6 +25,7 @@ construction, no real graph. The LLM path is exercised through the extracted
 """
 
 import json
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -79,8 +80,8 @@ def _config(
     llm_url: str,
     embedder_url: str,
     *,
-    client_class: str = 'openai_generic',
-    structured_output_mode: str = 'json_object',
+    client_class: Literal['openai', 'openai_generic'] = 'openai_generic',
+    structured_output_mode: Literal['auto', 'json_object'] = 'json_object',
 ) -> FusedMemoryConfig:
     """One config builder for every arm.
 
