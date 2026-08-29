@@ -1501,3 +1501,177 @@ class TestWallClockLoadBearingTarget:
     def test_wait_on_a_non_name_receiver_is_not_load_bearing(self):
         """``some_call().wait()`` → None (``func.value`` is a Call, not a Name)."""
         assert _checker._load_bearing_wait_target(_expr('some_call().wait()')) is None
+
+
+# A brand-new orchestrator test file: NOT on any debt baseline, so Rule C
+# reports every violation it finds.  This is the filename that proves the rule
+# is opt-OUT — a file nobody has grandfathered is covered the day it is created.
+_NON_DEBT_FILE = 'orchestrator/tests/test_brand_new.py'
+
+
+def _rule_c(source: str, filename: str = _NON_DEBT_FILE) -> list:
+    """Return only the Rule C violations find_violations reports for *source*."""
+    return [
+        v
+        for v in find_violations(source, filename)
+        if 'wall-clock-deadline' in v.message
+    ]
+
+
+class TestWallClockDeadlineDetection:
+    """Rule C end-to-end through find_violations: two offence kinds, position-blind.
+
+    Both counter-examples from the file-local suite this rule replaces
+    (orchestrator/tests/test_merge_speculation.py::TestLateArrivalWaitsAreLoadIndependent,
+    task 3980) are ported here so deleting that copy loses no coverage.
+    """
+
+    def test_a_class_no_name_list_would_have_covered_flags_both_kinds(self):
+        """The reviewer's own counter-example: a sixth late-arrival class.
+
+        An earlier revision of the file-local guard scanned a hand-maintained
+        frozenset of five class names; a sixth class added tomorrow with the
+        exact bare mid-range deadline that produced one of task 3980's three
+        measured failures would have passed it in silence.  Keying on call
+        SHAPE is what closes that, so this input must flag BOTH kinds.
+        """
+        source = (
+            'class TestSomeBrandNewLateArrivalCase:\n'
+            '    async def test_new_case(self):\n'
+            '        await asyncio.wait_for(req_x.result, timeout=25.0)\n'
+        )
+        violations = _rule_c(source)
+        assert len(violations) == 2, (
+            'expected BOTH offence kinds (bare asyncio.wait_for on a load-bearing '
+            f'target, and a raw wall-clock literal); got {violations!r}'
+        )
+        assert all(v.lineno == 3 for v in violations), violations
+
+    def test_a_name_targeted_teardown_join_is_clean(self):
+        """``_stop_worker``'s join stays exempt by its Name target, not by a list.
+
+        The rule scans every scope in every scanned file, so a module-level
+        teardown helper is squarely in range.  It must stay silent anyway.
+        """
+        source = (
+            'async def _teardown(worker, worker_task):\n'
+            '    with contextlib.suppress(Exception):\n'
+            '        await asyncio.wait_for(worker_task, timeout=5.0)\n'
+        )
+        assert _rule_c(source) == []
+
+    def test_detection_is_position_blind(self):
+        """The same offending call flags in a return, an argument, a comprehension and at module level."""
+        positions = {
+            'module level': 'asyncio.wait_for(req.result, timeout=1.0)\n',
+            'return': 'def f():\n    return asyncio.wait_for(req.result, timeout=1.0)\n',
+            'argument': 'def f():\n    g(asyncio.wait_for(req.result, timeout=1.0))\n',
+            'comprehension': 'def f():\n    return [asyncio.wait_for(r.result, timeout=1.0) for r in rs]\n',
+        }
+        for label, source in positions.items():
+            violations = _rule_c(source)
+            assert len(violations) == 2, (
+                f'Rule C must be position-blind; {label} yielded {violations!r}'
+            )
+
+    def test_migrated_site_with_a_raw_literal_flags_the_literal_kind_only(self):
+        """``wait_responsive(req.result, timeout=45.0, label='x')`` moved the accounting but kept the number.
+
+        wait_responsive takes a ``timeout`` keyword, so a migrated site can
+        still carry a hand-written wall-clock number.  That is the raw-literal
+        offence and nothing else — it is no longer a bare asyncio.wait_for.
+        """
+        source = "wait_responsive(req.result, timeout=45.0, label='x')\n"
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'MERGE_RESULT_TIMEOUT' in violations[0].message
+        assert 'bare asyncio.wait_for' not in violations[0].message
+
+    def test_fully_migrated_site_is_clean(self):
+        """``wait_responsive(req.result, label='x')`` with no literal is the remedy itself."""
+        assert _rule_c("wait_responsive(req.result, label='x')\n") == []
+
+    def test_gate_barrier_with_a_derived_timeout_flags_the_bare_wait_for_kind_only(self):
+        """A non-literal timeout is a derived bound, so only the routing is wrong."""
+        source = 'asyncio.wait_for(gate_a_entered.wait(), timeout=MERGE_RESULT_TIMEOUT / 2)\n'
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'wait_responsive' in violations[0].message
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_boolean_timeout_is_not_a_numeric_literal(self):
+        """``timeout=True`` must not count as a raw number (bool is an int subclass)."""
+        source = 'asyncio.wait_for(req.result, timeout=True)\n'
+        violations = _rule_c(source)
+        assert len(violations) == 1, (
+            f'only the bare-wait_for kind should fire for timeout=True; got {violations!r}'
+        )
+        assert 'wait_responsive' in violations[0].message
+
+    def test_a_call_with_no_positional_args_does_not_crash(self):
+        """``asyncio.wait_for()`` has no args[0] to inspect — it must be skipped, not raise."""
+        assert _rule_c('asyncio.wait_for()\nwait_responsive()\n') == []
+
+    def test_unparseable_source_returns_empty(self):
+        """A SyntaxError must never fail the gate over an unrelated edit."""
+        assert find_violations('def broken(:\n', _NON_DEBT_FILE) == []
+
+    def test_a_non_wait_call_on_a_load_bearing_target_is_clean(self):
+        """The func shape gates the rule: ``foo(req.result)`` is not a wait."""
+        assert _rule_c('foo(req.result, timeout=5.0)\n') == []
+
+
+class TestWallClockDeadlineMessage:
+    """Rule C's message vocabulary is its own, and distinct per offence kind."""
+
+    _BOTH_KINDS = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
+
+    def test_the_two_kinds_carry_distinct_remedies(self):
+        """Each kind names its own remedy; conflating them sends the reader down a dead end."""
+        messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
+        assert len(messages) == 2, messages
+        bare = [m for m in messages if 'wait_responsive' in m and 'label=' in m]
+        literal = [m for m in messages if 'MERGE_RESULT_TIMEOUT' in m]
+        assert len(bare) == 1, f'exactly one message must prescribe wait_responsive: {messages}'
+        assert len(literal) == 1, (
+            f'exactly one message must prescribe deriving from MERGE_RESULT_TIMEOUT: {messages}'
+        )
+        assert bare[0] != literal[0], 'the two kinds must not share a message'
+
+    def test_messages_name_the_load_bearing_target(self):
+        """The described target is what makes the failure directly actionable."""
+        for v in _rule_c(self._BOTH_KINDS):
+            assert 'req_a.result' in v.message
+            assert 'MergeRequest.result future' in v.message
+
+    def test_messages_explain_the_consequence(self):
+        """A deadline expiry on a load-bearing sync point fails a test that PASSED."""
+        for v in _rule_c(self._BOTH_KINDS):
+            assert 'WALL CLOCK' in v.message or 'wall-clock' in v.message
+            assert 'completed correctly' in v.message, v.message
+
+    def test_messages_name_the_suppression_code(self):
+        """Every rule's message tells the reader how to suppress that rule specifically."""
+        for v in _rule_c(self._BOTH_KINDS):
+            assert '# noqa: wall-clock-deadline' in v.message
+
+    def test_messages_share_no_vocabulary_with_rule_a_or_rule_b(self):
+        """Rule A's and Rule B's remedies are unusable here and must not appear.
+
+        mock_orch_config / pydantic_spec read pydantic model_fields;
+        _fake_verify_result / spec=VerifyResult spec a stdlib dataclass.  Neither
+        has anything to say about a wall-clock deadline on a future.
+        """
+        foreign = (
+            'mock_orch_config',
+            'pydantic_spec',
+            '_fake_verify_result',
+            'spec=VerifyResult',
+            'bare-magicmock',
+            'bare-dataclass-double',
+        )
+        for v in _rule_c(self._BOTH_KINDS):
+            for needle in foreign:
+                assert needle not in v.message, (
+                    f'Rule C message must not offer {needle!r}: {v.message!r}'
+                )
