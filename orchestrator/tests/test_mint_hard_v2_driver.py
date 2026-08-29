@@ -15,6 +15,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -916,7 +917,7 @@ _AFTER_ROWS = [
 ]
 
 
-def _fake_distance(table: dict[tuple[str, str], int | None]):
+def _fake_distance(table: Mapping[tuple[str, str], int | None]):
     """Injected ``distance(project_root, a, b) -> int | None``."""
     def distance(project_root: str, a: str, b: str) -> int | None:
         return table.get((a, b))
