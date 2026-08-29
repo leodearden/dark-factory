@@ -154,19 +154,28 @@ _OVERRIDE_ANCHOR_TASK_ID: str = 'task-path-guard-override'
 # string here would be rendered verbatim into an agent briefing (task 3119)
 # and read as an order to redo landed work.
 #
-# KNOWN CONSUMER GAP, and this string does NOT close it: escalation-watcher-auto
-# has a single unconditional ``scope_violation`` recipe (update_task on
-# metadata.modules, then resolve_issue(action='resume')), and its SKILL.md
-# explicitly says not to branch on suggested_action.  Every record in this
-# family is filed under a SYNTHETIC anchor task_id rather than a real task, so
-# that recipe's update_task targets a task that does not exist and the resume
-# no-ops.  The shape pre-dates task 3123 — the rejection and advisory records
-# under _ANCHOR_TASK_ID have always had it — but the override record fires
-# UNCONDITIONALLY, so the volume is materially higher.  The fix belongs in
-# skills/escalation-watcher-auto/SKILL.md (an audit-only branch keyed on the
-# esc-task-path-guard id prefix), not here: re-gating the producer would undo
-# the census this record exists to be.  Filed as follow-up ticket
-# tkt_0RRYVFP6S8SXJ3TDEH4W5AYK83.
+# The CONSUMER exists, and it is deliberately NOT keyed on this string.  Every
+# record in this family carries a SYNTHETIC anchor as ``task_id``, so the
+# generic ``scope_violation`` recipe (``update_task`` on metadata.modules, then
+# ``resolve_issue(action='resume')``) would target a task that does not exist
+# and no-op, leaving the record pending forever.  Task 3465 closed that
+# (``skills/escalation-watcher-auto/SKILL.md``, landed on main as ``e560568c4c``
+# / ``80337b2161``): an audit-only branch keyed on ``category ==
+# 'scope_violation'`` AND (``agent_role == 'fused-memory/path-guard'`` OR an id
+# starting with ``esc-task-path-guard``) closes these with ``close_only`` /
+# ``resolution_class='benign'`` plus a mandatory one-line operator digest, and a
+# drain-step-5 carve-out stops a fresh triage stamp from skipping them.  The
+# override record matches BOTH halves of that discriminator — ``_submit`` stamps
+# ``_AGENT_ROLE``, and _OVERRIDE_ANCHOR_TASK_ID yields ids reading
+# ``esc-task-path-guard-override-N`` — so it is consumed, not stranded.  That
+# branch matches on structural fields, never on ``suggested_action``, so this
+# string stays prose for a human reader (same rule as _ADVISORY_SUGGESTED_ACTION).
+#
+# Residual, and a follow-up rather than a defect here: that branch's mode table
+# names only ``rejection`` and ``advisory``, both under _ANCHOR_TASK_ID, so an
+# override record is closed benign in the ``unrecognised-anchor`` digest bucket
+# rather than under a mode of its own.  The census is emitted either way;
+# naming the third mode is a SKILL.md change outside this module.
 _OVERRIDE_SUGGESTED_ACTION: str = 'review_override_justification'
 
 # Dedup discriminator for the override mode.  TWO composition points, both
@@ -274,11 +283,12 @@ class ScopeViolationEscalator:
     * **scope_violation / routing override** (:meth:`report_routing_override`)
       — filed on the BYPASS path, where a caller-supplied
       ``routing_override_reason`` skipped the guard outright.  NOTHING was
-      blocked and the task exists; this is an audit record, filed because a
-      bypass that leaves no operator-visible trace is indistinguishable from
-      no bypass at all.  Uses its own anchor task id so the ids are
-      independently greppable, and folds independently of the two
-      ``report_rejection`` modes.
+      blocked; the submission proceeded and this is an audit record, filed
+      because a bypass that leaves no operator-visible trace is
+      indistinguishable from no bypass at all.  Like the other two modes it is
+      written from the PHASE-1 seam, so it never claims a task exists.  Uses
+      its own anchor task id so the ids are independently greppable, and folds
+      independently of the two ``report_rejection`` modes.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
