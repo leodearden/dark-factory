@@ -991,7 +991,8 @@ class TaskCurator:
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import (
             load_premise_registry,
-            premise_refuted_entry,
+            match_candidate,
+            verify_premise_refuted,
         )
 
         cfg_path = self._config.curator.recon_code_fix_premise_registry_path
@@ -1019,8 +1020,24 @@ class TaskCurator:
         if not entries:
             return None
 
-        entry = premise_refuted_entry(candidate, entries, self._cwd)
+        # Pure string ops over the registry, no I/O — deliberately kept ON the
+        # loop so the overwhelmingly common non-matching candidate never pays a
+        # thread-pool dispatch (measured 67us) nor extra curator-lock hold.
+        # premise_refuted_entry composes exactly these two halves and already
+        # short-circuits here; we split it so only the blocking half is offloaded.
+        entry = match_candidate(candidate, entries)
         if entry is None:
+            return None
+
+        # Off the event loop: verify_premise_refuted re-reads EVERY cited file
+        # fresh on every call (that is what makes the guard self-correcting).
+        # Measured on the shipped registry: the stage2_flag_query entry cites
+        # tests/test_stages.py at 664 KB => 1.2 ms warm, 6.2 ms cold, 29 ms worst;
+        # the 3-assertion entry is 170 us warm. curate() reaches this on EVERY
+        # task submission while holding the per-project curator write lock
+        # (task_interceptor.py _curator_lock, held around curate() and
+        # curate_batch_prepared). Mirrors this file's claim-verification offloads.
+        if not await asyncio.to_thread(verify_premise_refuted, entry, self._cwd):
             return None
 
         decision = CuratorDecision(
