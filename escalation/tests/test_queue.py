@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -4484,6 +4485,11 @@ class TestEscalationIdLock:
 # ---------------------------------------------------------------------------
 
 _CHILD_SCRIPT = Path(__file__).parent / '_concurrent_queue_child.py'
+#: A SECOND child-runner, for `note_suppressed_refile`'s cross-process
+#: increment.  It would naturally be a fifth op on `_CHILD_SCRIPT` above; that
+#: file was outside the editable scope of task 4499, so the op lives in its own
+#: file.  Folding it back in is a clean follow-up (see the script's docstring).
+_SUPPRESSED_REFILE_CHILD = Path(__file__).parent / '_suppressed_refile_child.py'
 
 
 class TestAddMembersToL2Concurrency:
@@ -6258,4 +6264,85 @@ class TestNoteSuppressedRefile:
 
         assert (queue.queue_dir / 'esc-1-1.json').read_text() == before, (
             'a pending record must be left byte-identical'
+        )
+
+    @pytest.mark.timeout(60)
+    def test_concurrent_bumps_lose_no_count(self, tmp_path: Path):
+        """(7) TWO OS PROCESSES — the increment runs under the lock, so no bump is lost.
+
+        The one property `escalation_id_lock` exists to provide here, and the
+        only test in this class that can see it: every other test is
+        single-process and sequential, so the lock could be deleted outright (or
+        the read-modify-write hoisted out of the ``with`` block) and they would
+        all still pass.
+
+        This matters because the counter is an INCREMENT, not the last-write-
+        wins field SET that ``patch_resolution_metadata`` performs — two
+        processes that both read N and both write N+1 silently lose one, and a
+        lost bump is invisible in the final value unless the expected total is
+        known exactly.  The under-count would land precisely under the
+        concurrent load that makes a storm likely, which is when the counter is
+        the only signal anyone has.
+
+        Mirrors ``TestAddMembersToL2VariantConcurrency`` above, which pins the
+        analogous lost-update on ``root_cause_variants``.
+
+        The RENDEZVOUS BARRIER is what makes it non-vacuous, and was added only
+        after measuring that its absence made it so: spawn-and-wait alone has
+        the children racing their own interpreter startup rather than the
+        counter, so process A finished all its bumps before B had imported and
+        the test passed with the lock deleted.  Releasing both children from a
+        barrier — after each has paid its startup and parked — is what puts two
+        read-modify-writes on the same record at the same time.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        count = 150
+        go = tmp_path / 'go'
+        ready = {tag: tmp_path / f'ready-{tag}' for tag in ('a', 'b')}
+        child_args = [
+            sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir), 'esc-1-1',
+            str(count),
+        ]
+        procs = {
+            tag: subprocess.Popen(child_args + [str(ready[tag]), str(go)], env=env)
+            for tag in ('a', 'b')
+        }
+        rc_a = rc_b = None
+        try:
+            deadline = time.monotonic() + 40
+            while not all(p.exists() for p in ready.values()):
+                assert time.monotonic() < deadline, (
+                    'children never reached the barrier: '
+                    f'{ {tag: p.exists() for tag, p in ready.items()} }'
+                )
+                time.sleep(0.005)
+            go.write_text('go')
+
+            rc_a = procs['a'].wait(timeout=50)
+            rc_b = procs['b'].wait(timeout=50)
+        finally:
+            for proc in procs.values():
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 2 * count, (
+            'concurrent bumps were LOST — the storm counter under-reports under '
+            f'exactly the load that makes a storm likely: expected {2 * count}, '
+            f'got {record.refiles_suppressed}'
+        )
+        assert record.status == 'resolved', (
+            f'the concurrent bumps disturbed the adjudication: {record.status!r}'
         )
