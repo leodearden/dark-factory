@@ -1109,6 +1109,7 @@ def _create_plan(
         'steps': [],
         'design_decisions': [],
         'reuse': [],
+        'dropped_files': [],
     }
     artifacts.write_plan(plan)
     return {'status': 'ok', 'task_id': task_id}
@@ -1221,6 +1222,51 @@ def _add_reuse_item(
     artifacts.write_plan(plan)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
+    )
+
+
+def _drop_plan_file(
+    artifacts: TaskArtifacts,
+    path: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Drop a declared file from ``plan['files']`` AND record why, atomically.
+
+    The honest third exit from the architect narrowing pass. The pre-merge
+    plan-files gate names the dilemma twice —
+    ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
+    and ``::ALREADY_LANDED_REASON_PREFIX``: "drop = falsify provenance,
+    confirm = mislabel complete work". A bare
+    ``update_plan_metadata(files=[narrowed])`` is the falsifying half — the
+    entry vanishes with no record that it was ever correctly in scope. Dropping
+    and recording the reason in ONE call closes that: the entry leaves the
+    gate's re-check surface while the plan keeps why it was declared and why
+    the branch legitimately needed no edit to it.
+
+    Atomicity is the invariant, not a convenience. Because the removal and the
+    note are the same write, it is structurally impossible to note a file that
+    was kept, to drop without a reason, or to ADD a file — so
+    ``workflow._try_narrow_plan``'s ``after.issubset(before)`` guard holds by
+    construction and needs no change.
+    """
+    plan, markup_facts = _read_plan_repaired(artifacts)
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    plan['files'] = [f for f in plan.get('files', []) if f != path]
+    plan.setdefault('dropped_files', []).append({
+        'path': path,
+        'reason': reason,
+    })
+    artifacts.write_plan(plan)
+    return _with_markup_repairs(
+        {
+            'status': 'ok',
+            'dropped': path,
+            'total_dropped': len(plan['dropped_files']),
+            'files': len(plan['files']),
+        },
+        markup_facts,
     )
 
 
