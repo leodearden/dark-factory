@@ -35,6 +35,7 @@ from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
 from escalation.canonical import canonical_root_cause
+from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
@@ -1737,6 +1738,40 @@ def create_server(
         this ordering is an error-reporting precedence only, not a correctness
         difference.
 
+        **Declared-pin gate** (task 4377).  A record carrying
+        ``pin_declared_by`` has something OUTSIDE the escalation store relying
+        on it staying OPEN — a deviation notice, an operator gate.  That
+        matters because an open escalation is a PRESERVATION MECHANISM for its
+        subject task: ``orchestrator/task_ground_truth.py::_RECOVERY`` has no
+        row for the pinned shape, so it falls through to
+        ``RecoveryAction.LEAVE`` and the row survives; closing the record flips
+        ``has_open_escalation`` and the same shape recovers to
+        REVERT_TO_PENDING.  So closing a marked record is a state-changing act
+        on its subject task even under ``action='close_only'``.
+
+        Any such close is refused with
+        ``{'error': ..., 'code': 'declared_pin_refused', 'declared_pins':
+        [{escalation_id, declared_by, reason}, ...]}`` — structured as well as
+        prose, per INV-2, so a caller never has to parse the message to recover
+        a fact the emitter held in a variable.  The predicate is
+        ``escalation/declared_pins.py::blocking_pin_declarations``.
+
+        COVERS every action EXCEPT ``park``: ``resume``, ``restart``,
+        ``abandon`` and ``close_only`` all run ``queue.resolve()`` and archive
+        the record, flipping the boolean identically — a ``resume`` would spend
+        a pin just as completely as the ``close_only`` cascade that spent the
+        mu-gate specimen on 2026-08-08, and would additionally re-dispatch the
+        very task the pin preserves.  ``park`` keeps ``status='pending'`` and
+        never archives, so it cannot spend a pin; the exemption is encoded
+        POSITIONALLY (the gate sits after park's early return) so it cannot be
+        got wrong by a later edit.
+
+        In the **Gate precedence** ordering this gate runs LAST: after
+        ``bad_capability_header`` / ``level_forbidden`` and after
+        ``illegal_transition``, so a caller failing several gates learns about
+        the capability and legality problems first.  None of the four mutates
+        the record, so the ordering is an error-reporting precedence only.
+
         NOTE: the ``target_status`` values above are not yet written by
         resolve_issue — this call changes only the escalation record; the
         task-status effects described in the table earlier in this docstring
@@ -1889,6 +1924,29 @@ def create_server(
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
             return esc.to_dict()
+
+        # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
+        # this docstring.  Its POSITION is load-bearing in two ways.  It sits
+        # AFTER the `park` early-return above, so park is structurally exempt
+        # with no `action != 'park'` condition that a later edit could get wrong
+        # — park keeps the record OPEN and never archives it, so it cannot spend
+        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
+        # refusal persists nothing (INV-1), exactly as the capability and Table B
+        # gates do.
+        blocked = blocking_pin_declarations([rec])
+        if blocked:
+            return {
+                'error': format_refusal(blocked),
+                'code': 'declared_pin_refused',
+                'declared_pins': [
+                    {
+                        'escalation_id': d.escalation_id,
+                        'declared_by': list(d.declared_by),
+                        'reason': d.reason,
+                    }
+                    for d in blocked
+                ],
+            }
 
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
