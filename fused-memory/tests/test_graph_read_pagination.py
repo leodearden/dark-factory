@@ -1663,19 +1663,28 @@ class TestApplyIncompletenessPolicy:
         names = [r.name for r in _warning_records(caplog)]
         assert names == [_LOGGER_NAME]
 
-    def test_log_is_keyword_only(self):
+    def test_log_is_not_positionally_reachable(self):
         """`log` must not be positionally reachable.
 
         The five existing keyword-only parameters are already position-proof;
         a positional sixth would let a caller pass a logger where a future
-        parameter lands, so pin the shape rather than trusting call sites.
+        parameter lands.  Asserted as the thing a CALLER can observe — the
+        call raises — rather than by introspecting the parameter's `kind`,
+        which would only re-state what the `*` in the definition already
+        enforces and would couple this test to the parameter's spelling.
         """
-        import inspect
-
         from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 
-        param = inspect.signature(apply_incompleteness_policy).parameters['log']
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        with pytest.raises(TypeError):
+            apply_incompleteness_policy(
+                complete_paged_read(rows_seen=1),
+                'enumerate_all_valid_edges',
+                'test-group',
+                7,
+                'entities',
+                'must not drive a staleness verdict',
+                logging.getLogger('test.4386.positional'),
+            )
 
 
 class TestShimPolicyIsUnchangedByThePromotion:

@@ -546,9 +546,20 @@ kind, so a future fifth structural path is covered by construction.
 #     roll-up counting PROJECTS, and renders it as a Corpus column with a
 #     warning line on the operator-facing summary table.
 # So "swept a complete corpus" and "swept what we could fetch" are now
-# distinguishable at every consumer.  The ONLY safe predicate is `is True`:
-# `is not False` would admit the UNKNOWN case, letting a cycle that never
-# looked pass as one that looked and found everything.
+# distinguishable at THOSE THREE consumers.  The ONLY safe predicate is
+# `is True`: `is not False` would admit the UNKNOWN case, letting a cycle that
+# never looked pass as one that looked and found everything.
+#
+# STILL UNWIRED, and deliberately so — task 4386 scoped itself to the three
+# consumers its ticket named.  Two whole-graph consumers remain on the SHIMS
+# and report no completeness at all: MemoryService.rebuild_entity_summaries
+# (services/memory_service.py) and detect_stale_with_edges below.  Their
+# fail-closed guard is intact (the shims still RAISE on a STRUCTURAL
+# incompleteness), so the gap is the EMPIRICAL half — a census disagreement or
+# short read WARNS and proceeds, and this is the summary WRITE-BACK path this
+# block keeps naming as the corrupting one, so rebuilt summaries can be
+# missing facts with nothing in the returned result saying the corpus was
+# partial.  Closing that residual is ticket tkt_0RT0V3VJ6E64R9RZPTGADMP0BF.
 #
 # MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
 # 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
