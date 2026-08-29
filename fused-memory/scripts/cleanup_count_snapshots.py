@@ -387,6 +387,29 @@ def _corpus_marker(project_summary: dict[str, Any]) -> str:
     return '?'
 
 
+def _corpus_total_marker(incomplete_enumerations: int) -> str:
+    """Render the TOTALS row's Corpus cell in the COLUMN's vocabulary.
+
+    The per-project cells are words (``ok`` / ``PARTIAL`` / ``?``), so
+    rendering the roll-up as a bare integer put a ``0`` or a ``2`` in a column
+    of words: ``0`` is not ``ok`` and reads ambiguously — exactly the
+    legibility failure this signal exists to close.  So ``ok`` when every
+    project's corpus was PROVEN whole, and an explicitly-labelled ``N
+    partial`` otherwise.  (amendment, reviewer_comprehensive observability
+    finding, task 4386)
+
+    Lowercase ``partial``, not the per-project ``PARTIAL`` token: the count
+    rolls up projects marked ``PARTIAL`` *and* ``?`` (its source counts every
+    project not proven whole), so borrowing the uppercase token would
+    over-claim observation for the unmeasured ones — and it would trip the
+    "nothing was partial, so nothing may claim it was" assertion that guards
+    the all-clear table.
+    """
+    if incomplete_enumerations:
+        return f'{incomplete_enumerations} partial'
+    return 'ok'
+
+
 def format_summary_table(report: dict[str, Any]) -> str:
     """Render a human-readable per-project summary table from an audit report.
 
@@ -400,14 +423,19 @@ def format_summary_table(report: dict[str, Any]) -> str:
     this table is to re-run with ``--apply`` and invalidate the matched edges,
     and that is precisely the move that is unsafe over a partial read: the
     counts describe whatever was fetched, so on a truncated corpus a small
-    ``Matched`` is not evidence that little is wrong.
+    ``Matched`` is not evidence that little is wrong.  Per project it reads
+    ``ok`` / ``PARTIAL`` / ``?`` (:func:`_corpus_marker`); on the TOTALS row it
+    reads ``ok`` or ``N partial`` (:func:`_corpus_total_marker`) — a roll-up of
+    PROJECTS, in the column's own vocabulary rather than as a bare integer.
     """
     projects = report.get('projects', {})
     totals = report.get('totals', {})
 
+    # Corpus is 10 wide, not 8: the TOTALS cell reads 'N partial' (see
+    # _corpus_total_marker), which overflows 8 and would ragged the column.
     header = (
         f"{'Project':<30} {'Entities':>9} {'Matched':>9} {'Invalidated':>12} "
-        f"{'RefFail':>8} {'Corpus':>8}"
+        f"{'RefFail':>8} {'Corpus':>10}"
     )
     sep = '-' * len(header)
     rows = [header, sep]
@@ -421,7 +449,7 @@ def format_summary_table(report: dict[str, Any]) -> str:
         rows.append(
             f"{pid:<30} {p.get('entities_scanned', 0):>9} "
             f"{p.get('edges_matched', 0):>9} {p.get('edges_invalidated', 0):>12} "
-            f"{p.get('refresh_failures', 0):>8} {marker:>8}"
+            f"{p.get('refresh_failures', 0):>8} {marker:>10}"
         )
 
     rows.append(sep)
@@ -429,7 +457,7 @@ def format_summary_table(report: dict[str, Any]) -> str:
         f"{'TOTAL':<30} {totals.get('entities_scanned', 0):>9} "
         f"{totals.get('edges_matched', 0):>9} {totals.get('edges_invalidated', 0):>12} "
         f"{totals.get('refresh_failures', 0):>8} "
-        f"{totals.get('incomplete_enumerations', 0):>8}"
+        f"{_corpus_total_marker(totals.get('incomplete_enumerations', 0)):>10}"
     )
 
     dry_tag = ' [DRY RUN]' if report.get('dry_run') else ''
@@ -761,6 +789,13 @@ async def run(
             returned_count=len(entities),
             noun='nodes',
             consequence='must not drive a staleness verdict or a summary rewrite',
+            # `log=` so the one message about a truncated corpus surfaces
+            # under THIS script's logger, beside the rest of the run's
+            # diagnostics, rather than detached under the backend module.
+            # Both reconciliation sweeps pass their own for the same reason;
+            # the parameter exists precisely for this.  (amendment,
+            # reviewer_comprehensive observability finding)
+            log=logger,
         )
         entities_by_project[pid] = entities
         per_project_counts[pid] = len(entities)
@@ -819,6 +854,7 @@ async def run(
             returned_count=len(edges_by_entity),
             noun='entities',
             consequence='must not be written back',
+            log=logger,  # same reason as the node read above
         )
         scan_results_by_project[pid] = scan_entities_for_snapshots(
             pid, entities_by_project[pid], edges_by_entity

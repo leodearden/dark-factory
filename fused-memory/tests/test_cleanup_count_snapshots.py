@@ -562,12 +562,13 @@ class TestFormatSummaryTable:
     # widening a test failure, which teaches the next reader to edit the
     # assertion rather than think about it.
 
-    def _report_with(self, enumeration_by_project):
+    def _report_with(self, enumeration_by_project, pids=('p1',)):
         return _mod.build_audit_report(
             scan_results_by_project={
-                'p1': [EntityScanResult('p1', 'e1', 'E1', [
-                    EdgeMatch('edg1', 'snap', 'p1', ['e1']),
-                ])],
+                pid: [EntityScanResult(pid, f'e-{pid}', f'E-{pid}', [
+                    EdgeMatch(f'edg-{pid}', 'snap', pid, [f'e-{pid}']),
+                ])]
+                for pid in pids
             },
             applied_edges=set(),
             failed_refreshes=[],
@@ -582,6 +583,16 @@ class TestFormatSummaryTable:
         matches = [line for line in table.splitlines() if line.startswith(pid)]
         assert len(matches) == 1, f'expected exactly one {pid!r} row in:\n{table}'
         return matches[0]
+
+    @staticmethod
+    def _warning_lines(table: str) -> list[str]:
+        """The trailing warning line(s), isolated from the table body.
+
+        Asserting against the WHOLE table cannot distinguish "the warning
+        names p1" from "a p1 row exists", which is always true — so the
+        contract has to be checked against this line specifically.
+        """
+        return [line for line in table.splitlines() if line.startswith('WARNING:')]
 
     def test_a_whole_corpus_renders_ok_and_warns_about_nothing(self):
         table = _mod.format_summary_table(self._report_with({
@@ -630,13 +641,111 @@ class TestFormatSummaryTable:
                 'edges_complete': True, 'edges_incomplete_kind': None,
             },
         }))
-        assert 'not proof' in table.lower(), (
+        warnings = self._warning_lines(table)
+        assert len(warnings) == 1, (
+            f'A partial corpus must append exactly one warning; got:\n{table}'
+        )
+        assert 'not proof' in warnings[0].lower(), (
             'A partial corpus must carry the "absence of matches is not proof '
             f'of cleanliness" warning; got:\n{table}'
         )
-        assert 'p1' in table.split('PARTIAL', 1)[-1] or 'p1' in table, (
+        assert 'p1' in warnings[0], (
             f'The warning must name the affected project; got:\n{table}'
         )
+
+    def test_the_warning_names_the_partial_project_and_not_the_whole_one(self):
+        """The naming is the whole point of the warning.
+
+        With one project the "names the affected project" assertion is
+        untestable against the table as a whole — 'p1' is in it either way,
+        because 'p1' has a ROW. Two projects, one partial, makes the
+        interpolation load-bearing: drop it and the warning still fires but
+        stops telling the operator WHERE it is unsafe to --apply, which on a
+        many-project run is the difference between a usable warning and one
+        that condemns everything.
+        """
+        table = _mod.format_summary_table(self._report_with(
+            {
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+                'p2': {
+                    'entities_complete': True, 'entities_incomplete_kind': None,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+            },
+            pids=('p1', 'p2'),
+        ))
+        warnings = self._warning_lines(table)
+        assert len(warnings) == 1, f'expected exactly one warning; got:\n{table}'
+        assert 'p1' in warnings[0], (
+            f'The warning must name the PARTIAL project; got:\n{table}'
+        )
+        assert 'p2' not in warnings[0], (
+            'The warning must not condemn a project whose corpus was proven '
+            f'whole; got:\n{table}'
+        )
+        # And the per-project cells still disagree, so the row and the warning
+        # tell the same story.
+        assert 'PARTIAL' in self._row_for(table, 'p1'), f'got:\n{table}'
+        assert 'ok' in self._row_for(table, 'p2'), f'got:\n{table}'
+
+    # -- the TOTALS row's Corpus cell --------------------------------------
+    #
+    # The roll-up is a count of PROJECTS, but it lands in a column whose
+    # per-project vocabulary is words.  Rendered bare it put a `0` or a `2`
+    # in a column of `ok`/`PARTIAL`/`?` — and `0` is not `ok`, so the one
+    # cell summarising whether the whole report is trustworthy read
+    # ambiguously.  (amendment, reviewer_comprehensive observability finding)
+
+    @staticmethod
+    def _total_row(table: str) -> str:
+        matches = [line for line in table.splitlines() if line.startswith('TOTAL')]
+        assert len(matches) == 1, f'expected exactly one TOTAL row in:\n{table}'
+        return matches[0]
+
+    def test_the_totals_corpus_cell_reads_ok_when_every_project_is_whole(self):
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': True, 'edges_incomplete_kind': None,
+            },
+        }))
+        total = self._total_row(table)
+        assert total.rstrip().endswith('ok'), (
+            'With nothing partial the roll-up must speak the column\'s own '
+            f'vocabulary, not render a bare 0; got:\n{table}'
+        )
+        assert not total.rstrip().endswith('0'), (
+            f'A bare 0 in a column of words reads ambiguously; got:\n{table}'
+        )
+
+    def test_the_totals_corpus_cell_labels_the_partial_count(self):
+        """Two not-ok projects for two DIFFERENT reasons — one observed and
+        found partial, one never measured — because the count rolls both up.
+        That is also why the label is lowercase `partial` rather than the
+        per-project `PARTIAL` token: p2 was never observed, so claiming it
+        was observed-and-incomplete would overstate what is known."""
+        table = _mod.format_summary_table(self._report_with(
+            {
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+                # p2 deliberately absent -> UNKNOWN, which is also not `ok`.
+            },
+            pids=('p1', 'p2'),
+        ))
+        total = self._total_row(table)
+        assert '2 partial' in total, (
+            'The roll-up must be an explicitly-labelled count, not a bare '
+            f'integer; got:\n{table}'
+        )
+        assert 'PARTIAL' in self._row_for(table, 'p1'), f'got:\n{table}'
+        assert '?' in self._row_for(table, 'p2'), f'got:\n{table}'
 
     def test_a_whole_corpus_appends_no_warning_line(self):
         table = _mod.format_summary_table(self._report_with({

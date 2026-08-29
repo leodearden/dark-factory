@@ -44,8 +44,13 @@ Output:
   - `totals` carries `incomplete_enumerations` — the count of **projects** (not
     reads) whose corpus was not proven whole.
 - **stderr** — Human-readable per-project summary table (not part of the JSON),
-  with a `Corpus` column (`ok` / `PARTIAL` / `?`) and, when any project is not
-  `ok`, a trailing warning naming them.
+  with a `Corpus` column and, when any project is not `ok`, a trailing warning
+  naming them. Per project the cell reads `ok` (both reads proven whole),
+  `PARTIAL` (a read was observed and found incomplete) or `?` (a read was never
+  measured — deliberately **not** `ok`). On the **TOTAL** row the same cell is a
+  roll-up of *projects*, written in that same vocabulary rather than as a bare
+  count: `ok` when every project's corpus was proven whole, otherwise
+  `N partial` — the value of `totals.incomplete_enumerations`, labelled.
 
 Redirect the JSON to a file for review (summary table stays on terminal via stderr):
 
