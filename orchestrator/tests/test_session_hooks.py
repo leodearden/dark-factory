@@ -10,6 +10,7 @@ skills/spawn/hooks/*.sh entrypoints end-to-end.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import io
 import json
@@ -3931,3 +3932,195 @@ def test_resolution_snapshot_slug_invariant_holds_on_every_shape(
         public = sh.hook_session_slug(hook_input, env, root=tmp_path)
         assert isinstance(public, str)
         assert public == resolution.slug
+
+
+# ---------------------------------------------------------------------------
+# ONE READ, ONE DECISION, ONE WRITE for Notification/Stop (task 4662)
+#
+# Today one adopted-spawn event reads record.json THREE times (the ownership
+# probe, the pre-refresh snapshot, and refresh_record's own internal read)
+# and writes up to TWICE. The counts are the efficiency half; the
+# same-snapshot assertion below is the correctness half -- today the withhold
+# decision is computed from read #2 while the body written derives from read
+# #3, so two racing hook events decide against stale state and write against
+# fresh state.
+# ---------------------------------------------------------------------------
+
+
+class _RegistryIO:
+    """Count reads per slug and record every body handed to write_record.
+
+    Each read stamps a per-call marker into the returned body's ``cwd`` so a
+    written record can be traced back to the read it derives from -- the
+    technique that turns "how many reads" into "which read did the write
+    come from", which is the TOCTOU property, not merely an I/O count.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.reads: list[str] = []
+        self.writes: list[sr.SessionRecord] = []
+        real_read, real_write = sr.read_record, sr.write_record
+
+        def _read(slug: str, *args: object, **kwargs: object) -> sr.SessionRecord:
+            self.reads.append(slug)
+            record = real_read(slug, *args, **kwargs)  # type: ignore[arg-type]
+            record.cwd = f'read-{len(self.reads)}'
+            return record
+
+        def _write(record: sr.SessionRecord, *args: object, **kwargs: object) -> None:
+            self.writes.append(record)
+            real_write(record, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(sr, 'read_record', _read)
+        monkeypatch.setattr(sr, 'write_record', _write)
+
+    def reads_of(self, slug: str) -> int:
+        return self.reads.count(slug)
+
+
+def _adopted_bound_record(slug: str, tmp_path: Path) -> dict[str, object]:
+    """A record already bound to this event's stdin session_id (adopt path)."""
+    _write_bound_parent(slug, tmp_path, 4662030)
+    return {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+
+
+@pytest.mark.parametrize('handler', ['notification', 'stop'])
+def test_refresh_path_reads_the_written_record_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, handler: str
+) -> None:
+    slug = f'session-cockpit-466203{0 if handler == "notification" else 1}'
+    hook_input = _adopted_bound_record(slug, tmp_path)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    io = _RegistryIO(monkeypatch)
+
+    if handler == 'notification':
+        sh.run_notification({**hook_input, 'message': 'may I proceed?'}, env, root=tmp_path)
+        expected = sr.Status.AWAITING_INPUT
+    else:
+        sh.run_stop(hook_input, env, root=tmp_path)
+        expected = sr.Status.IDLE
+
+    assert io.reads_of(slug) == 1
+    # OUTCOME PARITY.
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is expected
+    if handler == 'notification':
+        assert record.question is not None and record.question.text == 'may I proceed?'
+
+
+def test_hand_launched_refresh_reads_the_written_record_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
+    sh.run_session_start(hook_input, {}, root=tmp_path)
+    slug = sh.hook_session_slug(hook_input, {}, root=tmp_path)
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_stop(hook_input, {}, root=tmp_path)
+
+    assert io.reads_of(slug) == 1
+    assert sr.read_record(slug, root=tmp_path).status is sr.Status.IDLE
+
+
+def test_refresh_writes_the_body_it_decided_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE TOCTOU INVARIANT, not merely a count.
+
+    The withhold/bind decision and the body written must come from the SAME
+    read. Today the decision is made on read #2 while refresh_record writes
+    a body it re-read as #3, so a concurrent writer's change can land in
+    between and be decided against stale state.
+    """
+    slug = 'session-cockpit-4662032'
+    hook_input = _adopted_bound_record(slug, tmp_path)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert len(io.writes) == 1
+    assert io.writes[0].cwd == 'read-1'
+
+
+def test_first_bind_event_writes_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two-write case: an adoptable record that this event first BINDS.
+
+    Status, question and binding must land in ONE body, which is what the
+    handler's docstring already claimed but the two-write shape did not
+    deliver.
+    """
+    slug = 'session-cockpit-4662033'
+    # RUNNING + unbound: adoptable (not in the launch window), so this event
+    # both refreshes the status and stamps the first binding.
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4662033
+        ),
+        root=tmp_path,
+    )
+    env = _owner_ppid_env(slug, 4193500)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_notification(
+        {
+            'session_id': 'uuid-owner',
+            'cwd': '/home/leo/src/dark-factory',
+            'message': 'may I proceed?',
+        },
+        env,
+        root=tmp_path,
+    )
+
+    assert io.reads_of(slug) == 1
+    assert len(io.writes) == 1
+    written = io.writes[0]
+    assert written.status is sr.Status.AWAITING_INPUT
+    assert written.question is not None and written.question.text == 'may I proceed?'
+    assert written.claude_session_id == 'uuid-owner'
+
+
+def test_fork_path_reads_each_of_its_two_slugs_at_most_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACHIEVABILITY GUARD: a fork legitimately touches TWO records.
+
+    So the bound is per-slug, never one read in total -- asserting the
+    latter would be unsatisfiable without breaking the ownership split.
+    """
+    spawner = 'session-cockpit-4662034'
+    _write_bound_parent(spawner, tmp_path, 4662034)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': spawner}
+    forked = sh.hook_session_slug(hook_input, env, root=tmp_path)
+    io = _RegistryIO(monkeypatch)
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert io.reads_of(spawner) <= 1
+    assert io.reads_of(forked) <= 1
+    # The spawner's record is untouched; the fork carries the IDLE.
+    assert sr.read_record(spawner, root=tmp_path).status is sr.Status.RUNNING
+    assert sr.read_record(forked, root=tmp_path).status is sr.Status.IDLE
+
+
+def test_refresh_never_overwrites_a_corrupt_body(tmp_path: Path) -> None:
+    """CHARACTERIZATION (green before and after) -- pinned because step 12
+    puts it at risk. refresh_record's "a *corrupt* existing body is NOT
+    treated as absent" contract means run_stop must leave the bytes alone.
+    """
+    slug = 'session-cockpit-4662035'
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('not-json{{{')
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+
+    with contextlib.suppress(sr.CorruptSessionRecord):
+        sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert record_path.read_text() == 'not-json{{{'
