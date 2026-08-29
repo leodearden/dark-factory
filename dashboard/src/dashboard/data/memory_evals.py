@@ -398,7 +398,7 @@ def _read_limits(
             # Last-wins would silently change the displayed ``rule_kind``.
             _issue(
                 issues, 'duplicate_limits_verdict', eval_id=eval_dir.name, path=path,
-                detail=f'metric {metric_id!r} has more than one limits verdict; the first is used',
+                detail=f'metric {_short_repr(metric_id)} has more than one limits verdict; the first is used',
             )
             continue
         by_metric[metric_id] = record
@@ -448,7 +448,7 @@ def _by_metric_id(
         if metric_id in by_id:
             _issue(
                 issues, 'duplicate_metric_id', eval_id=eval_id, path=path,
-                detail=f'metric {metric_id!r} appears more than once in this run; the first record is used',
+                detail=f'metric {_short_repr(metric_id)} appears more than once in this run; the first record is used',
             )
             continue
         by_id[metric_id] = record
@@ -598,7 +598,7 @@ def _read_verdicts(
                 # link) by array order alone.  First wins, and the drop is named.
                 _issue(
                     issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
-                    detail=f'metric {metric_id!r} has more than one verdict entry; the first is used',
+                    detail=f'metric {_short_repr(metric_id)} has more than one verdict entry; the first is used',
                 )
                 continue
             index[key] = entry
