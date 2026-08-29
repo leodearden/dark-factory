@@ -688,6 +688,10 @@ def _only(rows: list[dict], metric_id: str) -> dict:
 # in what value survives as the row's own identity.
 _HUGE_METRIC_ID = 'm' * 5000
 
+# An oversized `kind` -- wholly unvalidated JSON, no type guard at all (unlike
+# `metric_id` above), used by the `unknown_kind` capping test.
+_HUGE_KIND = 'k' * 5000
+
 
 class TestLimitsProvenance:
     """The limits artifact contributes provenance + ``rule_kind``. Nothing else.
@@ -1855,6 +1859,27 @@ class TestUnknownVerdict:
         assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
         assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
 
+    def test_oversized_verdict_is_capped_in_the_detail(self, tmp_path: Path) -> None:
+        """``verdict`` is wholly unvalidated JSON -- no type guard at all.
+
+        Mirrors the ``unknown_kind`` size exposure one field over: an
+        oversized value outside the M2 vocabulary must not blow up the
+        payload.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        huge_verdict = 'v' * 5000
+        root, esc_dir = _unknown_verdict_tree(tmp_path, huge_verdict, linked=False)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
+        assert len(named) == 1
+        detail = named[0]['detail']
+        assert '…' in detail
+        assert len(detail) < 500
+        assert 'M2 vocabulary' in detail
+
 
 class TestParityVocabularyIsClosedAndExported:
     """``PARITY_STATES`` is the single source of truth for the badge vocabulary.
@@ -2693,6 +2718,54 @@ class TestStalenessAndDegradedStates:
         assert row['kind'] == 'histogram'
         assert row['current_value'] == 1.4
 
+    def test_unknown_kind_metric_id_and_run_kind_are_capped(self, tmp_path: Path) -> None:
+        """``run_kind`` is wholly unvalidated JSON -- no type guard at all.
+
+        Both interpolations in this ONE detail (metric_id and run_kind) must
+        be independently capped, so a hostile artifact cannot blow up the
+        payload through either one.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric(_HUGE_METRIC_ID, _HUGE_KIND, 1.4)])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unknown_kind'
+        assert issue['eval_id'] == 'eval-a'
+        assert issue['detail'].count('…') == 2
+        assert len(issue['detail']) < 500
+        assert 'which has no chart primitive' in issue['detail']
+
+    def test_two_distinct_huge_kinds_sharing_a_prefix_are_not_deduped(self, tmp_path: Path) -> None:
+        """The ``seen_kinds`` dedup key (:1103/:1105) stays UNCAPPED, on purpose.
+
+        It is an internal set key, never emitted into the payload -- capping
+        it would make two distinct kinds differing only past char 120 collide
+        on their shared prefix and silently swallow the second metric's
+        ``unknown_kind`` issue.  Bounding the DETAIL text (this task) must not
+        touch this key: two runs carrying the SAME metric_id but two distinct
+        oversized kinds sharing a >120-char prefix must still yield TWO
+        issues, both before and after the detail-capping change.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        prefix = 'k' * 200
+        _write_metrics(root, 'eval-a', '20260701T031500Z', [_metric(_HUGE_METRIC_ID, prefix + 'A', 1.0)])
+        _write_metrics(root, 'eval-a', '20260702T031500Z', [_metric(_HUGE_METRIC_ID, prefix + 'B', 2.0)])
+        _write_limits(root, 'eval-a', run_stamp='20260702T031500Z')
+        _write_verdicts(root, [], run_stamp='20260702T031500Z')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        unknown_kind_issues = [i for i in payload['issues'] if i['kind'] == 'unknown_kind']
+        assert len(unknown_kind_issues) == 2
+
     def test_metric_record_with_no_kind_is_named(self, tmp_path: Path) -> None:
         """A missing ``kind`` is as unrenderable as an unknown one.
 
@@ -2720,6 +2793,23 @@ class TestStalenessAndDegradedStates:
         row = _only(payload['evals'][0]['metrics'], 'kindless')
         assert row['kind'] is None
         assert row['current_value'] == 5.0
+
+    def test_missing_kind_metric_id_is_capped(self, tmp_path: Path) -> None:
+        """Same size exposure as ``unknown_kind``, the sibling "no chart primitive" detail."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(
+            tmp_path, metrics=[{'metric_id': _HUGE_METRIC_ID, 'value': 5.0, 'n': 1}],
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'missing_kind'
+        assert '…' in issue['detail']
+        assert len(issue['detail']) < 500
+        assert 'so it has no chart primitive' in issue['detail']
 
     def test_a_metric_absent_from_a_run_is_not_a_missing_kind(self, tmp_path: Path) -> None:
         """The hole case and the defect case both read as ``None`` — only one is a defect.
