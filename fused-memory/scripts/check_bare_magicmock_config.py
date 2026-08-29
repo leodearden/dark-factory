@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Lint checks: mock-spec discipline in test files.
+"""Lint checks: test-quality guards over test files.
 
-This script carries TWO INDEPENDENT RULES.  They share only the AST predicates
-(``_is_magicmock_call`` / ``_is_specced``), the exemption-comment contract and the
-output format; they have separate detection pipelines, separate message vocabularies
-and separate ``# noqa`` codes.  Every statement in the "Rule A" section below is
-scoped to Rule A and says nothing about Rule B.
+This script carries THREE INDEPENDENT RULES.  Rules A and B are mock-spec
+discipline and share the AST predicates ``_is_magicmock_call`` / ``_is_specced``;
+Rule C is a wait-deadline rule and shares none of them.  What ALL THREE share is
+only the exemption-comment contract (``_EXEMPT_TEMPLATE`` / ``_is_exempted``), the
+per-file debt-budget machinery (``_debt_budget`` / ``_apply_debt_budget``), the
+single ``ast.walk`` and the output format.  They have separate detection pipelines,
+separate message vocabularies and separate ``# noqa`` codes.  Every statement in the
+"Rule A" section below is scoped to Rule A and says nothing about Rule B or Rule C.
 
   Rule A — ``bare-magicmock`` (tasks 1339/1372)
       Config-NAMED bindings only, ``ast.Assign``/``ast.AnnAssign`` positions only.
@@ -21,6 +24,15 @@ scoped to Rule A and says nothing about Rule B.
       grandfathered file is silent while it carries at most its recorded number of
       sites and reports the overrun as soon as it carries more.
 
+  Rule C — ``wall-clock-deadline`` (task 4246)
+      NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
+      synchronisation point (a ``MergeRequest.result`` future or a ``gate*.wait()``
+      barrier) awaited through a bare ``asyncio.wait_for`` instead of
+      ``wait_responsive``, or carrying a raw numeric ``timeout=`` literal on either
+      call shape.  Remedies are wait-specific (``wait_responsive(...)`` with a
+      ``label=``, bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own
+      shrink-only per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
+
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
 lint_commands, ``dark-factory-orchestrator.yaml``, ``hooks/project-checks``), a second
@@ -31,6 +43,19 @@ rule's boundary; adding a second rule with its own name, vocabulary and noqa cod
 opposite of that scope creep.  The FILENAME is therefore a deliberately retained legacy
 name — it no longer describes the whole file, and renaming it would touch those same nine
 call sites and break every in-flight branch, for a cosmetic gain.
+
+Task 4246 added Rule C under that same ruling, unchanged: the nine wiring edits, the
+extra ``python3`` process and the second fleet-lint-coverage entry a sibling script
+would have cost are all still there, and Rule C is per-``ast.Call`` exactly like
+Rule B, so it folds into the SAME ``ast.walk`` for very nearly free rather than
+paying for a second pass (a second full walk was measured at ~43% of total checker
+runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling does NOT
+say: it is not "put every future check here".  It applies because Rule C is another
+AST pass over exactly the same file set with exactly the same stdlib-only budget.
+A guard needing runtime import, pytest marks or a non-stdlib dependency does not
+qualify and stays where it is — which is why
+``orchestrator/tests/test_merge_speculation.py::TestTimeoutMarkCoverage`` was
+deliberately left file-local by task 4246 rather than moved here.
 
 ---------------------------------------------------------------------------
 Rule A — ``bare-magicmock``
@@ -115,6 +140,54 @@ Preferred alternatives named in the rejection message:
 
 Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
 file-local guard), task 4016 (this shared, repo-wide guard).
+
+---------------------------------------------------------------------------
+Rule C — ``wall-clock-deadline``
+---------------------------------------------------------------------------
+
+Rule: a LOAD-BEARING synchronisation point — a ``MergeRequest.result`` future
+(``req.result``) or an ``asyncio.Event`` gate barrier (``gate*.wait()``) — awaited
+with a wall-clock deadline.  Two independent offence kinds, so ONE call can produce
+TWO violations:
+
+  1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
+     ``wait_responsive(...)``, so its deadline is charged in WALL CLOCK; and
+  2. the call carries a RAW numeric ``timeout=`` literal — on EITHER call shape.
+     ``wait_responsive`` takes a ``timeout`` keyword too, so a migrated site can
+     have moved the accounting while keeping a hand-written number.
+
+Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
+line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
+
+Why this shape and not a list: task 3980's measured failures were genuine asyncio
+deadline expiries on tests whose logic had ALREADY completed — the log tail reads
+``verify end (passed=True)`` beside a heartbeat of ``oldest age=46s``.  Widening the
+numbers only moves the threshold; charging the budget in loop-responsive time removes
+the dependence.  Task 2376's earlier sweep expressed its policy as "literals up to 15"
+and the lone ``timeout=25.0`` sat just above it, surviving as one of the three measured
+failures — a policy expressed as a list, or as a threshold, cannot catch what is
+outside it.  Task 3980's own amendment pass then deleted a hand-maintained five-class
+frozenset for the same reason.  So selection here is by call SHAPE alone: there is no
+class list, no name table and no budget threshold deciding which sites are scanned.
+
+What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
+``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
+inside ``contextlib.suppress(Exception)``, asserts nothing and swallows its own
+TimeoutError, so it cannot manufacture the flake this rule exists to prevent.  That
+exclusion is STRUCTURAL — the Name-vs-Attribute/Call distinction — precisely so it is
+not one more hand-maintained name list.
+
+Scope paths are NOT carried in the message (the file-local guard printed
+``Class::method``): this script's output contract is ruff-style
+``path:lineno:col: message``, which already locates the site.
+
+Preferred alternatives named in the rejection message:
+  • ``wait_responsive(aw, *, timeout=MERGE_RESULT_TIMEOUT, label, ...)``
+    (orchestrator/tests/_orch_helpers.py::wait_responsive)
+  • a bound derived from ``MERGE_RESULT_TIMEOUT``, never a written number
+
+Origin: task 2376 (the sweep whose threshold left the gap), task 3980 (migrated the
+sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
 
 ---------------------------------------------------------------------------
 
@@ -554,6 +627,142 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
     return None
 
+_RULE_C_CODE = 'wall-clock-deadline'
+
+# Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
+# (a bare asyncio.wait_for that also writes a number) or exactly one (a migrated
+# wait_responsive that kept its literal; a bare wait_for whose bound is derived).
+_WALL_CLOCK_BARE_WAIT_FOR = 'bare-wait_for'
+_WALL_CLOCK_RAW_LITERAL = 'raw-literal'
+
+# Shared by both kinds: WHY a wall-clock deadline on a load-bearing sync point is a
+# defect rather than a style preference.  Task 3980's three measured failures were
+# all genuine deadline expiries on tests that had already passed.
+_WALL_CLOCK_CONSEQUENCE = (
+    ' A deadline expiry on a load-bearing synchronisation point fails a test whose'
+    ' merge pipeline completed correctly, purely because the worker was descheduled.'
+)
+
+_WALL_CLOCK_SUPPRESS = (
+    ' To suppress: add # noqa: wall-clock-deadline — <reason> on the preceding'
+    ' non-blank line.'
+)
+
+
+def _wall_clock_violation_msg(kind: str, target: str) -> str:
+    """Build Rule C's rejection message for one offence *kind* on *target*.
+
+    Deliberately shares NO vocabulary with ``_VIOLATION_MSG`` or
+    ``_dataclass_violation_msg``: Rule A's remedies read pydantic ``model_fields``
+    and Rule B's spec a stdlib dataclass — neither has anything to say about a
+    wall-clock deadline on a future, so offering either here would send the reader
+    down a dead end.  The two KINDS also keep separate remedies from each other for
+    the same reason: routing through ``wait_responsive`` and deriving the bound from
+    ``MERGE_RESULT_TIMEOUT`` are independent fixes, and a site can need one, the
+    other, or both.
+    """
+    if kind == _WALL_CLOCK_BARE_WAIT_FOR:
+        return (
+            f'load-bearing wait on {target} is routed through a bare asyncio.wait_for,'
+            ' so its deadline is charged in WALL CLOCK.'
+            + _WALL_CLOCK_CONSEQUENCE
+            + ' Route it through wait_responsive(...) with a descriptive label='
+            ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
+            ' budget in loop-responsive time and still reports a genuine hang red.'
+            + _WALL_CLOCK_SUPPRESS
+        )
+    return (
+        f'load-bearing wait on {target} carries a RAW wall-clock literal timeout=.'
+        + _WALL_CLOCK_CONSEQUENCE
+        + ' Derive the bound from MERGE_RESULT_TIMEOUT instead of writing a number:'
+        ' a written literal is a threshold, and task 2376 measured that a policy'
+        ' expressed as "literals up to N" cannot catch the one just above N.'
+        + _WALL_CLOCK_SUPPRESS
+    )
+
+
+def _wall_clock_deadline_violations(
+    call: ast.Call, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule C, evaluated for ONE ``ast.Call``: return 0, 1 or 2 Violations.
+
+    Returns a LIST, not an Optional, because the two offence kinds are independent
+    and a single call can trip both — ``asyncio.wait_for(req.result, timeout=25.0)``
+    is simultaneously the wrong routing and a written number.
+
+    Gating order is cheapest-first, and deliberately so:
+      1. the call has at least one positional argument (no ``args[0]`` to inspect
+         otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
+      2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
+      3. ``_load_bearing_wait_target`` recognises ``args[0]``.
+    Only then is the exemption line-walk run (see ``_wall_clock_deadline_violations``'s
+    call to ``_is_exempted``), so the upward walk keeps Rule B's cost profile rather
+    than running on every ``ast.Call`` in the tree.
+
+    Position-blind by construction: the caller hands this every ``ast.Call``, so a
+    wait in a ``return``, an argument, a comprehension body or at module level is
+    covered identically.  There is no class list and no scope filter — see the Rule C
+    section of the module docstring for why a list, or a threshold, is not a sound key.
+
+    Per-NODE rather than per-tree so ``find_violations`` can evaluate all three rules
+    in a SINGLE ``ast.walk``; a second full walk was measured at ~43% of total checker
+    runtime (20.8s -> 30.7s over the seven scanned dirs), paid on every merge-queue
+    verify across all nine call sites.
+
+    Violations carry ``call.col_offset``, so a node tripping several rules yields
+    deterministically-ordered entries under ``find_violations``' final sort.  Both
+    kinds from one call share a position; Python's stable sort keeps them in the
+    fixed order they are appended here.
+
+    Must never raise: a crash would fail every caller's lint over an unrelated edit.
+    """
+    if not call.args:
+        return []
+
+    func = call.func
+    is_bare_wait_for = (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'wait_for'
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    )
+    is_responsive = isinstance(func, ast.Name) and func.id == 'wait_responsive'
+    if not (is_bare_wait_for or is_responsive):
+        return []
+
+    target = _load_bearing_wait_target(call.args[0])
+    if target is None:
+        return []
+
+    kinds: list[str] = []
+    if is_bare_wait_for:
+        kinds.append(_WALL_CLOCK_BARE_WAIT_FOR)
+
+    # A raw numeric literal is an offence on EITHER call shape: wait_responsive
+    # also takes a ``timeout`` keyword, so a migrated site can have moved the
+    # accounting into loop-responsive time while keeping a hand-written number.
+    #
+    # ``bool`` is excluded explicitly because it is an int SUBCLASS — without the
+    # guard, ``timeout=True`` would be reported as a wall-clock number.
+    timeout_kw = next((kw for kw in call.keywords if kw.arg == 'timeout'), None)
+    if (
+        timeout_kw is not None
+        and isinstance(timeout_kw.value, ast.Constant)
+        and isinstance(timeout_kw.value.value, (int, float))
+        and not isinstance(timeout_kw.value.value, bool)
+    ):
+        kinds.append(_WALL_CLOCK_RAW_LITERAL)
+
+    return [
+        Violation(
+            filename=filename,
+            lineno=call.lineno,
+            col_offset=call.col_offset,
+            message=_wall_clock_violation_msg(kind, target),
+        )
+        for kind in kinds
+    ]
+
 def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
     """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
 
@@ -614,12 +823,17 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     dataclass_doubles: list[Violation] = []
     debt_budget = _debt_budget(filename)
 
-    # ONE walk, BOTH rules.  Rule B was originally a second full ast.walk over the same
-    # tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
+    # Rule C violations are collected separately for the same reason, and against
+    # their own independent baseline (task 4246).
+    wall_clock: list[Violation] = []
+
+    # ONE walk, ALL THREE rules.  Rule B was originally a second full ast.walk over the
+    # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
     # scanned tests/ dirs) — a cost paid on every merge-queue verify across all nine
     # call sites.  Rule A's walk already visits every node and simply skips non-Assign
-    # ones, so folding Rule B's per-Call handling in here makes it nearly free.  Output
-    # is unchanged: the final sort by (lineno, col_offset) still normalises ordering.
+    # ones, so folding Rule B's and Rule C's per-Call handling in here makes them nearly
+    # free.  Output is unchanged: the final sort by (lineno, col_offset) still
+    # normalises ordering.
     for node in ast.walk(tree):
         # ---- Rule B: bare-dataclass-double, position-blind over every ast.Call ----
         # An ast.Call is never an ast.Assign/ast.AnnAssign, so this branch and Rule A's
@@ -628,6 +842,10 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             double = _dataclass_double_violation(node, lines, filename)
             if double is not None:
                 dataclass_doubles.append(double)
+            # Rule C shares this branch rather than adding its own `continue`:
+            # a second early exit here would shadow Rule B for any node Rule C
+            # matched first.  Both run, then the single existing continue fires.
+            wall_clock.extend(_wall_clock_deadline_violations(node, lines, filename))
             continue
 
         # ---- Rule A: bare-magicmock, ast.Assign/ast.AnnAssign only ----
@@ -687,6 +905,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     # individual sites: a grandfathered file stays silent while it does not grow,
     # and reports exactly its overrun once it does.
     violations.extend(_apply_debt_budget(dataclass_doubles, debt_budget))
+    violations.extend(wall_clock)
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
