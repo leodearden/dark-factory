@@ -1511,12 +1511,27 @@ class TargetedReconciler:
         ``get_tasks`` snapshot instead of the old nested
         any()-inside-all() scan, which was O(N·D) per dependent (O(N²·D) per
         done-transition).
+
+        A ``blocked`` dependent pinned by an open escalation, or one whose
+        escalation store cannot be read, is vetoed rather than unblocked --
+        see :meth:`_escalation_queue_for` and :meth:`_unblock_dependent`.
         """
         status_by_id: dict[str, str] = {
             str(t.get('id')): str(t.get('status') or '')
             for t in all_tasks
             if isinstance(t, dict)
         }
+
+        # Tri-state lazy memo for the escalation-pin veto's EscalationQueue,
+        # mirroring the `live_status` lazy memo idiom used by
+        # _sweep_cancelled_descendants (:1203-1204 nearby). Built at most
+        # once per sweep -- and only when the FIRST blocked dependent is
+        # encountered -- via _escalation_queue_for, so a sweep with no
+        # blocked dependents never touches the escalation store, and a
+        # construction failure is remembered (not retried) for the rest of
+        # this sweep. Empty list = not yet attempted; single-element list
+        # holds the queue instance, or None if construction failed/unavailable.
+        queue_memo: list[Any] = []
 
         actions: list[dict] = []
         for t in all_tasks:
@@ -1544,8 +1559,52 @@ class TargetedReconciler:
                     satisfied_by=task_id,
                     project_root=project_root,
                     run_id=run_id,
+                    queue_memo=queue_memo,
                 ))
         return actions
+
+    def _escalation_queue_for(
+        self, project_root: ProjectRoot, queue_memo: list,
+    ) -> Any:
+        """Lazily construct the per-project ``EscalationQueue`` used by the
+        dependent-unblock veto, memoizing the result (success OR failure) in
+        *queue_memo* so it is built at most once per sweep.
+
+        Returns the queue instance, or ``None`` when unavailable -- either
+        because the ``escalation`` package isn't importable in this env
+        (mirrors the module's defensive import at :43-50), or because
+        construction raised (logged at warning with ``exc_info=True``, same
+        as the caller does for a subsequent ``get_by_task`` failure). Both
+        arms veto rather than flip: an unreadable/absent store cannot prove
+        "no open escalation" for a task, and a false negative there would
+        unblock a task the orchestrator (or a human) deliberately parked --
+        the same fail-safe direction ``scheduler.py``'s stranded-blocked
+        sweep states verbatim at :6499-6524 (the esc-3163 lesson).
+
+        ``EscalationQueue.__init__`` does ``mkdir(parents=True,
+        exist_ok=True)`` (escalation/queue.py:388-390), which is why this is
+        called lazily from :meth:`_unblock_dependent` rather than eagerly
+        from :meth:`_sweep_unblock_dependents` -- a sweep with no blocked
+        dependents must not create ``data/escalations/`` as a side effect of
+        an unrelated ``done`` transition.
+        """
+        if queue_memo:
+            return queue_memo[0]
+        if not _HAS_ESCALATION or EscalationQueue is None:
+            queue_memo.append(None)
+            return None
+        try:
+            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+        except Exception:
+            logger.warning(
+                'sweep: could not construct escalation queue for the '
+                'dependent-unblock veto at project_root=%s',
+                project_root,
+                exc_info=True,
+            )
+            queue = None
+        queue_memo.append(queue)
+        return queue
 
     async def _unblock_dependent(
         self,
@@ -1554,6 +1613,7 @@ class TargetedReconciler:
         satisfied_by: str,
         project_root: ProjectRoot,
         run_id: str,
+        queue_memo: list,
     ) -> dict:
         """Flip one 'blocked' dependent to 'pending' now its deps are done.
 
@@ -1562,11 +1622,19 @@ class TargetedReconciler:
         ``self.taskmaster`` write would bypass the per-project write_lock and
         the status-FSM gates.
 
-        Everything past that guard — the metadata veto check, the write, and
-        classifying its response — runs inside one try/except so a single
-        dependent's I/O failure (a raised exception, not just a rejection
-        response) can never abandon the rest of the sweep; the caller loops
-        over every dependent unconditionally.
+        Checks run cheapest-first, before any write is attempted: the
+        interceptor-wired guard (above) -> ``_unblock_veto_reason`` (pure,
+        no I/O) -> the escalation-pin veto (filesystem, via
+        :meth:`_escalation_queue_for`) -> the write itself.
+
+        Everything past the interceptor guard — both veto checks, the write,
+        and classifying its response — runs inside one try/except so a
+        single dependent's I/O failure (a raised exception, not just a
+        rejection response) can never abandon the rest of the sweep; the
+        caller loops over every dependent unconditionally. The escalation
+        read has its own inner try/except so a read failure is classified as
+        a veto (``escalation_store_unavailable``) rather than falling through
+        to the generic ``dependent_unblock_failed`` outcome.
         """
         dep_id = str(dependent.get('id') or '')
         if self.task_interceptor is None:
@@ -1591,6 +1659,49 @@ class TargetedReconciler:
                     'title': dependent.get('title'),
                     'satisfied_by': satisfied_by,
                     'reason': veto_reason,
+                }
+
+            # Escalation-pin veto (task 4903): a task the orchestrator (or a
+            # human) blocked *and* pinned with an open escalation must not be
+            # unblocked here, or this sweep would immediately undo that park.
+            # See _escalation_queue_for for the fail-safe rationale.
+            queue = self._escalation_queue_for(project_root, queue_memo)
+            if queue is None:
+                return {
+                    'type': 'dependent_unblock_vetoed',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': 'escalation_store_unavailable',
+                }
+            try:
+                # status='pending' explicitly: the fast path that scans the
+                # queue root only and skips the archive rglob entirely
+                # (escalation/queue.py:642-644) -- resolved/dismissed
+                # escalations don't pin anything.
+                open_escalations = queue.get_by_task(dep_id, status='pending')
+            except Exception:
+                logger.warning(
+                    'sweep: escalation store read failed for dependent-unblock '
+                    'veto on task %s (satisfied by %s)',
+                    dep_id, satisfied_by,
+                    exc_info=True,
+                )
+                return {
+                    'type': 'dependent_unblock_vetoed',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': 'escalation_store_unavailable',
+                }
+            if open_escalations:
+                return {
+                    'type': 'dependent_unblock_vetoed',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': 'escalation_pinned',
+                    'escalation_ids': [e.id for e in open_escalations],
                 }
 
             resp = await self.task_interceptor.set_task_status(

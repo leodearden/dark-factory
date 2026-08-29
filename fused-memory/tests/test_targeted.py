@@ -5185,6 +5185,7 @@ async def test_unblock_proceeds_when_no_open_escalation(
     construction would be wasted I/O on every ``done`` transition.
     """
     from escalation.queue import EscalationQueue
+
     from fused_memory.reconciliation import targeted
 
     construct_calls: list[tuple] = []
