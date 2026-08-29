@@ -7653,3 +7653,180 @@ class TestRootCauseOverfoldReport:
         assert len(refreshed.dedupe_children) == 1, (
             f'the folded child must be recorded: {refreshed.dedupe_children!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4377 — the declared-pin guard at the resolve_issue chokepoint
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueDeclaredPinGuard:
+    """resolve_issue refuses to CLOSE a record carrying a declared pin (task 4377).
+
+    An OPEN escalation is a preservation mechanism for its subject task
+    (``orchestrator/task_ground_truth.py::_RECOVERY`` has no row for the pinned
+    shape, so it falls through to ``LEAVE``), which makes closing one a
+    state-changing act on that task even under ``action='close_only'``.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    #: Every action that CLOSES the record (i.e. archives it and flips
+    #: has_open_escalation).  `park` is deliberately absent — it keeps the
+    #: record open at L2 and never archives, so it cannot spend a pin.
+    CLOSING_ACTIONS = ('resume', 'restart', 'abandon', 'close_only')
+
+    def _seed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str = 'esc-3371-2',
+        task_id: str = '3371',
+        level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _seed_declared(self, queue: EscalationQueue, **kwargs: Any) -> Escalation:
+        esc = self._seed(queue, **kwargs)
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    # --- (a) the refusal, with a message naming id / declarer / reason ---
+
+    @pytest.mark.asyncio
+    async def test_close_only_is_refused_with_a_typed_code(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert 'error' in result
+
+    @pytest.mark.asyncio
+    async def test_refusal_message_names_id_declarer_and_reason(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        message = result['error']
+        assert esc.id in message
+        assert self.DECLARER in message
+        assert self.REASON in message
+
+    # --- (b) STRUCTURED, not prose-only (INV-2) ---
+
+    @pytest.mark.asyncio
+    async def test_refusal_carries_a_structured_declared_pins_payload(self, tmp_path: Path):
+        """No consumer should have to parse the message to recover a fact the
+        emitter held in a variable."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result['declared_pins'] == [
+            {
+                'escalation_id': esc.id,
+                'declared_by': [self.DECLARER],
+                'reason': self.REASON,
+            }
+        ]
+
+    # --- (c) NOTHING IS PERSISTED on refusal (INV-1) ---
+
+    @pytest.mark.asyncio
+    async def test_refusal_persists_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending'
+        assert reread.resolution is None
+        assert reread.resolution_action is None, (
+            'the resolution_action pre-stamp must not have run'
+        )
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), 'must not be archived'
+
+    # --- (d) every CLOSING action is refused, not just close_only ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('action', CLOSING_ACTIONS)
+    async def test_every_closing_action_is_refused(self, tmp_path: Path, action: str):
+        """All four archive the record and flip has_open_escalation identically."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue, esc_id=f'esc-3371-{action}')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action=action,
+        )
+
+        assert result.get('code') == 'declared_pin_refused', f'{action}: {result}'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'{action} must not have closed the record'
+
+    # --- (e) an UNMARKED record closes exactly as today ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('action', CLOSING_ACTIONS)
+    async def test_unmarked_record_closes_exactly_as_today(self, tmp_path: Path, action: str):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue, esc_id=f'esc-plain-{action}')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action=action,
+        )
+
+        assert 'code' not in result, f'{action}: unexpected refusal {result}'
+        assert result['status'] in ('resolved', 'dismissed'), result
+        assert result['resolution_action'] == action
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'expected it to be archived'
+
+    # --- (f) a reason with no declarer is not a marker ---
+
+    @pytest.mark.asyncio
+    async def test_reason_without_a_declarer_does_not_block(self, tmp_path: Path):
+        """The declarer list is the marker, not the prose."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        rec = queue.get(esc.id)
+        assert rec is not None
+        rec.pin_declared_reason = 'I feel like this one matters'
+        queue._rewrite(esc.id, rec)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
