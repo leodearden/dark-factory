@@ -445,7 +445,8 @@ class TTLCache(Generic[V]):
         return None
 
     def _evict_expired(self) -> int:
-        """Drop store entries past the eviction horizon and their idle locks.
+        """Drop store entries past the eviction horizon, their idle locks,
+        and any now-dead bypass-streak counter.
 
         Returns the number of store entries dropped (for tests/observability).
 
@@ -516,6 +517,19 @@ class TTLCache(Generic[V]):
         ]
         for key in idle:
             del self._locks[key]
+        # A bypass streak for a key with no live lock and no cached value
+        # cannot be reached by anything but a fresh cold miss, so re-arming
+        # its opening WARNING on a future bypass is the desired behavior,
+        # not a regression (see _note_lock_bypass). Pruned AFTER the lock
+        # sweep above so a lock idled out in THIS same pass has its streak
+        # reclaimed in the same pass too, rather than lingering one more
+        # sweep cycle.
+        dead_streaks = [
+            k for k in self._bypass_streaks
+            if k not in self._store and k not in self._locks
+        ]
+        for key in dead_streaks:
+            del self._bypass_streaks[key]
         return len(stale)
 
     async def _refresh_and_store(
