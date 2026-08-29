@@ -100,6 +100,8 @@ and runtime call sites share code at all.
 
 from __future__ import annotations
 
+import logging
+import re
 import subprocess
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -115,6 +117,8 @@ __all__ = [
     'interpret_grep_rc',
     'lint_delivered_checks',
 ]
+
+logger = logging.getLogger(__name__)
 
 #: Wall-clock ceiling for ONE authoring-time ``git grep``. Generous
 #: relative to a real grep (milliseconds on this repo) because exceeding it
@@ -378,19 +382,354 @@ def _lint_one_check(
     if outcome is CheckOutcome.PASS:
         # The whole rule: a check that is ALREADY green at the authoring
         # tree can never signal anything, whichever polarity it claims.
-        if expect == 'present':
+        if expect != 'present':
             return CheckFinding(
                 check_name=name,
                 severity='reject',
-                code='vacuous_present',
-                message=_vacuous_present_message(name, pattern, ref),
+                code='vacuous_absent',
+                message=_vacuous_absent_message(name, pattern, ref),
             )
+        # The REJECTION is already decided; only the CODE and the evidence
+        # are still open. Every refinement below is therefore wrapped so a
+        # git failure or a malformed record degrades to the unrefined code
+        # — never to a crash, and never to a dropped rejection.
+        try:
+            code, sites = _refine_vacuous_present(
+                _grep_matches(pattern, paths, repo_root=repo_root, ref=ref),
+                manifest_path=check.get('manifest_path'),
+            )
+            message = _vacuous_present_refined_message(code, name, pattern, ref, sites)
+        except Exception:  # noqa: BLE001 - a refinement must never lose the reject
+            logger.warning(
+                'delivered_check polarity: refinement failed for check %r '
+                '(pattern=%r, ref=%s, repo_root=%s); reporting the unrefined '
+                'vacuous_present rejection',
+                name, pattern, ref, repo_root, exc_info=True,
+            )
+            code, sites = 'vacuous_present', ()
+            message = _vacuous_present_message(name, pattern, ref)
         return CheckFinding(
             check_name=name,
             severity='reject',
-            code='vacuous_absent',
-            message=_vacuous_absent_message(name, pattern, ref),
+            code=code,
+            message=message,
+            detail=sites,
         )
 
-    # CheckOutcome.FAIL — the healthy, forward-looking majority case.
+    # CheckOutcome.FAIL — healthy under the 2x2. The two classes the 2x2
+    # cannot see live here, and BOTH are scoped to an explicit polarity so
+    # a malformed `expect` can never be relabelled by one of them.
+    try:
+        if expect == 'present':
+            return _filename_shaped_finding(name, pattern, paths, repo_root=repo_root)
+        if expect == 'absent':
+            return _absent_overbroad_finding(
+                name, pattern, paths, files=files, repo_root=repo_root, ref=ref
+            )
+    except Exception:  # noqa: BLE001 - these are advisory; never fail the lint
+        # Degrading here loses only a diagnosis, never a rejection: the 2x2
+        # has already declared this check healthy. Logged rather than
+        # swallowed so the gate's own coverage gaps stay visible.
+        logger.warning(
+            'delivered_check polarity: advisory rule failed for check %r '
+            '(expect=%s, pattern=%r, ref=%s, repo_root=%s); no finding emitted',
+            name, expect, pattern, ref, repo_root, exc_info=True,
+        )
+        return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic refinements, and the two rules the 2x2 cannot see
+# ---------------------------------------------------------------------------
+
+#: Mirrors ``fused_memory.server.manifest_stamping._SIDECAR_SUFFIX`` and
+#: ``shared/tests/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
+#: Re-declared rather than imported for the same reason the latter does it:
+#: ``shared`` must not depend on ``fused_memory``.
+_MANIFEST_SUFFIX = '.capability-manifest.yaml'
+
+#: A match line starting (after leading whitespace) with any of these is
+#: PROSE, not a capability. ``*`` covers both a C block-comment
+#: continuation and a markdown bullet — both are prose for this purpose.
+_COMMENT_MARKERS = ('#', '//', '*', '"""', "'''")
+
+
+@dataclass(frozen=True)
+class _GrepMatch:
+    """One ``file:line:text`` site, so a classifier can inspect WHERE a
+    check matches rather than only the pass/fail bit."""
+
+    path: str
+    line_no: int
+    text: str
+
+
+def _grep_matches(
+    pattern: str,
+    paths: Sequence[str] | None,
+    *,
+    repo_root: str | Path,
+    ref: str,
+    timeout_secs: float = GREP_TIMEOUT_SECS,
+) -> list[_GrepMatch] | None:
+    """The match SITES for a check. ``None`` means git could not answer.
+
+    ``-n`` is INSERTED into the argv :func:`build_grep_argv` returns rather
+    than a second argv being assembled here: the pattern's ``-e``
+    separator, the ``--`` pathspec placement and the ref position all stay
+    owned by the one builder, so a refinement can never search a different
+    corpus than the verdict it is refining (module docstring, PARITY
+    CONTRACT). ``argv.index('-E')`` finds the FLAG even when the pattern is
+    itself the literal ``'-E'``, since the flag precedes the pattern.
+
+    ``None`` (not ``[]``) for an unanswerable question is the load-bearing
+    distinction: ``[]`` would read as "matches, but none of them are
+    interesting", which is exactly how a refinement would silently drop a
+    rejection.
+    """
+    argv = build_grep_argv(pattern, paths, project_root=repo_root, ref=ref)
+    argv.insert(argv.index('-E'), '-n')
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_secs
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode >= 2:
+        return None
+
+    prefix = f'{ref}:'
+    matches: list[_GrepMatch] = []
+    for record in completed.stdout.splitlines():
+        rest = record[len(prefix):] if record.startswith(prefix) else record
+        path, _, remainder = rest.partition(':')
+        line_no, _, text = remainder.partition(':')
+        if not path or not line_no.isdigit():
+            # A record this parser cannot read degrades to "no refinement",
+            # never to a wrong one.
+            continue
+        matches.append(_GrepMatch(path=path, line_no=int(line_no), text=text))
+    return matches
+
+
+def _tracked_paths(
+    paths: Sequence[str] | None,
+    *,
+    repo_root: str | Path,
+    timeout_secs: float = GREP_TIMEOUT_SECS,
+) -> list[str] | None:
+    """Tracked paths under *paths* (whole tree when empty). ``None`` on any
+    git failure — same never-guess contract as :func:`_grep_matches`."""
+    argv = ['git', '-C', str(repo_root), 'ls-files', '-z']
+    if paths:
+        argv.append('--')
+        argv.extend(paths)
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_secs
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return [record for record in completed.stdout.split('\0') if record]
+
+
+def _descriptor_family(manifest_path: str) -> frozenset[str]:
+    """The sidecar plus the PRD it annotates.
+
+    ``plans/foo-prd.capability-manifest.yaml`` →
+    ``{plans/foo-prd.capability-manifest.yaml, plans/foo-prd.md}``. Both
+    count as "the descriptor talking about itself": the measured t2863
+    specimen matched on the sidecar's own ``pattern:`` line, and a PRD
+    naming the token it is specifying is the same non-evidence.
+    """
+    if manifest_path.endswith(_MANIFEST_SUFFIX):
+        stem = manifest_path[: -len(_MANIFEST_SUFFIX)]
+        return frozenset({manifest_path, f'{stem}.md'})
+    return frozenset({manifest_path})
+
+
+def _is_comment_line(text: str) -> bool:
+    return text.lstrip().startswith(_COMMENT_MARKERS)
+
+
+def _covered_by_declared_files(path: str, declared: Sequence[str]) -> bool:
+    """Is *path* inside the task's declared ``metadata.files``?
+
+    A declared entry may name a FILE or a DIRECTORY — tasks routinely
+    declare scope coarsely — so a directory entry covers everything
+    beneath it. Treating a directory as covering nothing would warn on the
+    common shape.
+    """
+    return any(
+        path == entry or path.startswith(entry.rstrip('/') + '/') for entry in declared
+    )
+
+
+def _format_sites(matches: Sequence[_GrepMatch], *, limit: int = 5) -> tuple[str, ...]:
+    """``path:line: text`` evidence lines, truncated so a pathological
+    pattern cannot put thousands of lines into a reject payload."""
+    shown = [f'{m.path}:{m.line_no}: {m.text.strip()}' for m in matches[:limit]]
+    if len(matches) > limit:
+        shown.append(f'... and {len(matches) - limit} more match(es)')
+    return tuple(shown)
+
+
+def _refine_vacuous_present(
+    matches: list[_GrepMatch] | None, *, manifest_path: object
+) -> tuple[str, tuple[str, ...]]:
+    """Sharpen ``vacuous_present`` into a code that says WHY.
+
+    Order is pinned: self-reference is the more specific diagnosis and wins
+    when both hold (a markdown bullet in the sibling PRD is inside the
+    descriptor family AND comment-shaped). Emitting both would double-count
+    one defect in the reject payload.
+
+    ``None`` matches — git could not answer — degrades to the unrefined
+    code. The rejection itself was already decided by the 2x2 and is never
+    at stake here.
+    """
+    if not matches:
+        return 'vacuous_present', ()
+
+    sites = _format_sites(matches)
+
+    if isinstance(manifest_path, str) and manifest_path:
+        family = _descriptor_family(manifest_path)
+        if all(m.path in family for m in matches):
+            return 'vacuous_present_self_referential', sites
+
+    if all(_is_comment_line(m.text) for m in matches):
+        return 'vacuous_present_comment_only', sites
+
+    return 'vacuous_present', sites
+
+
+def _vacuous_present_refined_message(
+    code: str, name: str, pattern: str, ref: str, sites: Sequence[str]
+) -> str:
+    """The refined half of a ``vacuous_present`` message.
+
+    Falls through to the unrefined message for the plain code, so the
+    invariant and the concrete repair are stated exactly once.
+    """
+    if code == 'vacuous_present_self_referential':
+        return (
+            f'delivered_check {name!r} (expect=present, pattern {pattern!r}) matches '
+            f'ONLY the descriptor that declares it and the PRD that describes it, at '
+            f'{ref}: {"; ".join(sites)}. The check is satisfied by its own existence '
+            f'— it was green before this task started and would stay green if the '
+            f'capability were never built. {_INVARIANT} Assert a symbol the '
+            f'IMPLEMENTATION will introduce, and scope `paths` to the code rather '
+            f'than to plans/.'
+        )
+    if code == 'vacuous_present_comment_only':
+        return (
+            f'delivered_check {name!r} (expect=present, pattern {pattern!r}) matches '
+            f'ONLY comment or docstring lines at {ref}: {"; ".join(sites)}. A comment '
+            f'is not a capability, so this check asserts that someone wrote the word '
+            f'down — true before the producer lands and still true if it never does. '
+            f'{_INVARIANT} Assert a symbol in live code.'
+        )
+    return _vacuous_present_message(name, pattern, ref)
+
+
+def _filename_shaped_finding(
+    name: str,
+    pattern: str,
+    paths: Sequence[str] | None,
+    *,
+    repo_root: str | Path,
+) -> CheckFinding | None:
+    """MODE 3: an ``expect='present'`` pattern that names a FILE, not a symbol.
+
+    The one class the 2x2 cannot see. At authoring time the producer's file
+    does not exist yet, so the check evaluates FAIL and looks like an
+    ordinary healthy forward-looking check; it only reveals itself once the
+    producer lands and the check STILL fails, because a test module does not
+    mention its own name (the measured task-3536 specimen,
+    ``test_workflow_merge_gating_strand``).
+
+    This is SCOPE item 3's SECOND sanctioned option — "reject a kind=grep
+    expect=present pattern whose only repo matches are FILENAMES rather than
+    file contents" — taken in preference to its first, adding a
+    ``kind='path'`` check kind, whose blast radius spans
+    ``DeliveredCheck``/``DeliveredCheckMeta``'s closed ``kind`` Literals and
+    every hard-coded mechanical-kind tuple in the fleet (design decision
+    #4). ``kind='path'`` is filed as the follow-up.
+
+    ``re.search`` — Python's engine, not the POSIX ERE ``git grep -E`` uses
+    — is deliberate and safe HERE and nowhere else in this module: the
+    subject is a path LIST that git offers no grep mode over, the result is
+    a diagnostic rather than the verdict the runtime must reproduce, and any
+    pattern Python cannot compile yields ``None`` (no finding) rather than a
+    guess. A verdict is never decided this way.
+    """
+    tracked = _tracked_paths(paths, repo_root=repo_root)
+    if not tracked:
+        return None
+    try:
+        matcher = re.compile(pattern)
+    except re.error:
+        return None
+    hits = [path for path in tracked if matcher.search(path)]
+    if not hits:
+        return None
+    return CheckFinding(
+        check_name=name,
+        severity='reject',
+        code='filename_shaped',
+        message=(
+            f'delivered_check {name!r} (expect=present, pattern {pattern!r}) has ZERO '
+            f'content matches, but matches the FILENAME of a tracked path: '
+            f'{", ".join(hits[:5])}. A grep check reads file CONTENTS, so this one '
+            f'can never go green — the file existing is not something git grep can '
+            f'see. Assert a symbol defined INSIDE the file instead (a class, '
+            f'function or constant the producer adds).'
+        ),
+        detail=tuple(hits[:5]),
+    )
+
+
+def _absent_overbroad_finding(
+    name: str,
+    pattern: str,
+    paths: Sequence[str] | None,
+    *,
+    files: Sequence[str] | None,
+    repo_root: str | Path,
+    ref: str,
+) -> CheckFinding | None:
+    """MODE 2/2b, as a WARN that is never promoted.
+
+    An ``expect='absent'`` pattern that also matches files the task does not
+    own will keep failing after the task lands, wedging its dependent. But
+    it is genuinely UNDECIDABLE at authoring time — task 3534's pattern
+    legitimately matched inside the very file it owned — and this gate is
+    hard-blocking, so a false reject costs more than a missed catch.
+    """
+    matches = _grep_matches(pattern, paths, repo_root=repo_root, ref=ref)
+    if not matches:
+        return None
+    declared = list(files or ())
+    outside = [m for m in matches if not _covered_by_declared_files(m.path, declared)]
+    if not outside:
+        return None
+    offenders = sorted({m.path for m in outside})
+    return CheckFinding(
+        check_name=name,
+        severity='warn',
+        code='absent_overbroad',
+        message=(
+            f'delivered_check {name!r} (expect=absent, pattern {pattern!r}) currently '
+            f'matches {len(outside)} line(s) in {len(offenders)} file(s) OUTSIDE this '
+            f'task\'s declared files: {", ".join(offenders[:5])}. If those matches '
+            f'survive the task, the check stays red after the producer lands and its '
+            f'dependent is blocked. Narrow `paths` (or the pattern) to the code this '
+            f'task actually removes. Reported, NOT blocking: an over-broad-looking '
+            f'pattern is sometimes correct, so this is a warning by design.'
+        ),
+        detail=_format_sites(outside),
+    )
