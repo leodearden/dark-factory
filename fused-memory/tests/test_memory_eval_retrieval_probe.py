@@ -1991,6 +1991,13 @@ class TestBuildSeries:
 
         assert 'observations_served_by_mem0_at_k5' in str(excinfo.value)
 
+        inversion_observations = m.ProbeObservations(inversions=[_inversion_obs('a', k=5)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _build(inversion_observations, counts={'inversion_observations_at_k5': 99})
+
+        assert 'inversion_observations_at_k5' in str(excinfo.value)
+
     def test_a_non_colliding_caller_key_passes_through(self):
         """The guard must not be a ban on caller-supplied counts."""
         counts = _build(counts={'entities_and_relations': 12}).corpus.counts
@@ -3902,6 +3909,40 @@ class TestStoresServedDisclosure:
         assert counts['degraded_queries'] == 1
         assert counts['degraded_observations_at_k5'] == 1
         assert counts['degraded_observations_at_k10'] == 1
+
+    def test_the_inversion_family_disclosure_counts_ride_in_the_machine_readable_artifact(self):
+        """Prose-only disclosure is invisible to every consumer that reads JSON.
+
+        The two non-degraded observations are the same population
+        `superseded-above-successor`'s exposure (`n`) is summed over, so this
+        row must be comparable to exactly that metric. The degraded one must
+        be walled off into its own key rather than polluting either count —
+        the same discipline `degraded_observations_at_k` holds the phrasing
+        family to.
+        """
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=3, inversions=1, k=5),
+            _inversion_obs('b', pairs=2, k=5),
+            _inversion_obs('c', pairs=99, k=5, degraded=True),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 2
+        assert counts['inversion_pairs_registered_at_k5'] == 5
+        assert counts['degraded_inversion_observations_at_k5'] == 1
+
+    def test_inversion_observations_at_different_depths_produce_separate_keys(self):
+        """Two coexisting depths must not be merged into one number — the
+        same hazard the serving-store disclosure guards against, restated
+        for the inversion family."""
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=1, k=5),
+            _inversion_obs('a', pairs=1, k=10),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 1
+        assert counts['inversion_observations_at_k10'] == 1
 
     def test_the_probe_band_records_both_exposures_distinctly(self):
         """Registered pairs and comparable pairs are different facts.
