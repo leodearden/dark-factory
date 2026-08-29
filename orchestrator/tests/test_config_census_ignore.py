@@ -15,6 +15,7 @@ cover the new entry grammar, the violation taxonomy, and citation liveness.
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -320,9 +321,14 @@ def _seed_tasks_db(project_root: Path) -> Path:
     return db
 
 
-def _probe(**overrides) -> dict[int, TaskCiteStatus]:
-    """Dict-backed fake probe — the taxonomy is testable with no sqlite at all."""
-    base = {
+def _probe() -> dict[int, TaskCiteStatus]:
+    """Dict-backed fake probe — the taxonomy is testable with no sqlite at all.
+
+    Keys are task ids (``int``), so this deliberately takes no ``**overrides``
+    escape hatch: keyword names are ``str`` by construction and could never
+    reach this mapping.  A caller wanting a variant mutates the returned dict.
+    """
+    return {
         _DONE_ID: TaskCiteStatus('done', False),
         _CANCELLED_ID: TaskCiteStatus('cancelled', False),
         _PENDING_ID: TaskCiteStatus('pending', False),
@@ -330,8 +336,6 @@ def _probe(**overrides) -> dict[int, TaskCiteStatus]:
         _PLAIN_DEFERRED_ID: TaskCiteStatus('deferred', False),
         _DO_NOT_DISPATCH_ID: TaskCiteStatus('deferred', False),
     }
-    base.update(overrides)
-    return base
 
 
 def test_read_task_statuses_reads_the_master_tag(tmp_path):
@@ -522,7 +526,7 @@ def test_structural_findings_survive_an_unresolvable_project_root(tmp_path, proj
     """FAIL-OPEN, the strong form: when the task store cannot be reached the
     liveness half goes quiet but the structural half is still returned IN
     FULL — the audit degrades in one dimension only."""
-    tree = {'config_key_census': {'ignore': [
+    tree: dict[str, Any] = {'config_key_census': {'ignore': [
         'bare.entry',
         {'path': 'stale.cite', 'reason': f'temporary — pending #{_DONE_ID}'},
     ]}}

@@ -29,8 +29,6 @@ from pydantic_settings import (
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
-from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
-
 # Strictly one-way (config -> config_census_ignore): the census-ignore grammar
 # and audit are kept OUT of this already-oversized module, and that module
 # depends only on stdlib plus shared/, so there is no cycle.
@@ -41,6 +39,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
 logger = logging.getLogger(__name__)
 

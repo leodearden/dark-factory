@@ -56,7 +56,6 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
-
 from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)

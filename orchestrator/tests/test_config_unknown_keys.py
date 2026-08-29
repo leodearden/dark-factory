@@ -828,8 +828,13 @@ def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path, mon
 
 
 def test_census_config_accepts_reasoned_entry():
-    cfg = ConfigKeyCensusConfig(
-        ignore=['a.b', {'path': 'c.d', 'reason': 'read by scripts/x.sh'}]
+    # model_validate, not the ctor: the raw mapping is exactly what an operator
+    # writes in YAML, and it is the dict -> CensusIgnoreEntry coercion that is
+    # under test.  The declared field type is ``list[str | CensusIgnoreEntry]``,
+    # so feeding the pre-validation dict through the ctor is a type error even
+    # though pydantic accepts it at runtime.
+    cfg = ConfigKeyCensusConfig.model_validate(
+        {'ignore': ['a.b', {'path': 'c.d', 'reason': 'read by scripts/x.sh'}]}
     )
     assert cfg.ignore[0] == 'a.b'
     assert isinstance(cfg.ignore[0], str)
