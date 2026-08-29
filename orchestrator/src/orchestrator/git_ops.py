@@ -548,66 +548,91 @@ def _df_warm_lane_script_dir() -> Path:
     return _DF_WARM_LANE_SCRIPT_DIR
 
 
+# ── seed-script capability probing ───────────────────────────────────────────
+#
+# Both optional flags below are read from the LANE's OWN checked-out copy of
+# seed-warm-lane.sh, so availability varies per lane: a lane sitting on an
+# older base predates the flag and would reject it as a usage error (exit 2),
+# converting a working seed into a hard fault.  A text probe is the cheapest
+# reliable capability check — a supported flag's string appears in that
+# version's arg parser, and an unsupported one's appears nowhere.
+#
+# The two named probes below share ONE cached read (amendment,
+# reviewer_comprehensive code-reuse-duplication).  Before this they were
+# near-verbatim copies with independent caches, so every seed read the same
+# script file twice.
+
+
 @functools.lru_cache(maxsize=256)
+def _seed_script_text(script: Path, mtime_ns: int, size: int) -> str:
+    """Cached read of a lane seed script, keyed on its on-disk IDENTITY.
+
+    ``mtime_ns`` / ``size`` are unused in the body — they are cache-key
+    components supplied by :func:`_seed_script_supports` so that a script
+    REPLACED at the same path invalidates the entry instead of serving the
+    previous vintage's answer.  That matters because ``acquire_warm_lane``'s
+    create-once route removes and re-adds ``_lane-N`` at a fixed path, and a
+    reseed rewrites the checkout in place — so within one orchestrator
+    lifetime the same path can hold seed scripts of different vintages.
+
+    Keying on the path alone (as the two probes did before this amendment)
+    made a stale TRUE possible, and a stale TRUE is NOT safe-by-degradation:
+    the flag would be handed to a parser that rejects it, the script would
+    exit 2, and :func:`_seed_rc_to_unavailable` maps that to ``FAULT`` —
+    blocked + L1, strictly WORSE than the rc-75 fallback a stale FALSE gives.
+    The asymmetry is why the cache key carries the script's identity rather
+    than the docstring merely claiming both directions are safe.
+
+    Returns ``''`` — i.e. "advertises no optional flag" — on any read error,
+    which is the fail-CLOSED answer for every caller.
+    """
+    del mtime_ns, size  # cache-key components only; see docstring
+    try:
+        return script.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        logger.debug(
+            '_seed_script_text: unreadable %s — treating it as advertising '
+            'no optional flags', script, exc_info=True,
+        )
+        return ''
+
+
+def _seed_script_supports(script: Path, flag: str) -> bool:
+    """Does this lane's ``seed-warm-lane.sh`` accept ``flag``?
+
+    Fails CLOSED (``False``) on any stat/read error, and omitting either flag
+    is a safe degradation:
+
+    * ``--assume-lane-lock-held`` (reify 5354) omitted restores the pre-5354
+      behaviour, in which the script never takes the lane lock itself.
+    * ``--distinct-lock-refusal-rc`` (reify 5568) omitted means a lane-lock
+      refusal exits 75 and surfaces as
+      :attr:`WarmLaneUnavailable.DISK_PRESSURE` — byte-identical to the
+      behaviour before task 4211.
+
+    The ``stat`` here is what makes the shared :func:`_seed_script_text` cache
+    self-invalidating on a same-path script swap; see that docstring for why
+    a stale TRUE would not have been a safe degradation.
+    """
+    try:
+        st = script.stat()
+    except OSError:
+        logger.debug(
+            '_seed_script_supports(%s): cannot stat %s — assuming unsupported',
+            flag, script, exc_info=True,
+        )
+        return False
+    return flag in _seed_script_text(script, st.st_mtime_ns, st.st_size)
+
+
 def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
-    """Does this lane's ``seed-warm-lane.sh`` accept ``--assume-lane-lock-held``?
-
-    The seed script is read from the LANE's own checkout, so its vintage varies
-    per lane: a lane sitting on a pre-reify-5354 base predates the flag and
-    would reject it as a usage error (exit 2), converting a working seed into a
-    hard fault.  Probing the script text is the cheapest reliable capability
-    check — the flag string appears in the arg parser of every version that
-    supports it, and in none that don't.
-
-    Fails CLOSED (``False``) on any read error: omitting the flag restores the
-    pre-5354 behaviour, in which the script never takes the lane lock itself,
-    so a false negative is never worse than not having this fix at all.
-
-    Cached per resolved path — lane scripts change only on reseed, and a wrong
-    cached answer degrades to the same safe fallback.
-    """
-    try:
-        return _SEED_ASSUME_LANE_LOCK_HELD_FLAG in script.read_text(
-            encoding='utf-8', errors='replace',
-        )
-    except OSError:
-        logger.debug(
-            '_seed_script_supports_assume_lane_lock_held: unreadable %s — '
-            'assuming unsupported', script, exc_info=True,
-        )
-        return False
+    """Named probe for ``--assume-lane-lock-held`` (see :func:`_seed_script_supports`)."""
+    return _seed_script_supports(script, _SEED_ASSUME_LANE_LOCK_HELD_FLAG)
 
 
-@functools.lru_cache(maxsize=256)
 def _seed_script_supports_distinct_lock_refusal_rc(script: Path) -> bool:
-    """Does this lane's ``seed-warm-lane.sh`` accept ``--distinct-lock-refusal-rc``?
-
-    Same per-lane-vintage problem as
-    :func:`_seed_script_supports_assume_lane_lock_held`, and solved the same
-    way: the seed script is read from the LANE's own checkout, so a lane
-    sitting on a pre-reify-5568 base predates the flag and would reject it as a
-    usage error (exit 2), converting a working seed into a hard fault.  The
-    flag string appears in the arg parser of every version that supports it and
-    in none that don't, so a text probe is the cheapest reliable check.
-
-    Fails CLOSED (``False``) on any read error.  A false negative simply omits
-    the flag, so a lane-lock refusal exits 75 and surfaces as
-    :attr:`WarmLaneUnavailable.DISK_PRESSURE` — byte-identical to the behaviour
-    before task 4211, i.e. never worse than not having this fix at all.
-
-    Cached per resolved path — lane scripts change only on reseed, and a wrong
-    cached answer degrades to that same safe fallback.
-    """
-    try:
-        return _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG in script.read_text(
-            encoding='utf-8', errors='replace',
-        )
-    except OSError:
-        logger.debug(
-            '_seed_script_supports_distinct_lock_refusal_rc: unreadable %s — '
-            'assuming unsupported', script, exc_info=True,
-        )
-        return False
+    """Named probe for ``--distinct-lock-refusal-rc`` (see :func:`_seed_script_supports`)."""
+    return _seed_script_supports(script, _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
 
 
 # Short window (seconds) over which the θ soft-floor defer path memoizes the

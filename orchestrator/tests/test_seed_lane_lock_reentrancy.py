@@ -319,10 +319,13 @@ class TestDistinctLockRefusalRcProbe:
     def _probe(self):
         from orchestrator.git_ops import (
             _seed_script_supports_distinct_lock_refusal_rc,
+            _seed_script_text,
         )
-        # lru_cache'd per resolved path; clear so a prior test's answer for a
-        # same-named path can never leak in.
-        _seed_script_supports_distinct_lock_refusal_rc.cache_clear()
+        # The probe itself is a thin named wrapper; the lru_cache lives on the
+        # shared _seed_script_text read (both probes go through it, so one seed
+        # is one read).  Clear THAT so a prior test's answer for a same-named
+        # path can never leak in.
+        _seed_script_text.cache_clear()
         return _seed_script_supports_distinct_lock_refusal_rc
 
     def test_true_when_the_script_advertises_the_flag(self, tmp_path: Path):
@@ -349,6 +352,37 @@ class TestDistinctLockRefusalRcProbe:
         d = tmp_path / 'seed-warm-lane.sh'
         d.mkdir()
         assert self._probe()(d) is False
+
+    def test_a_same_path_script_swap_is_not_served_from_cache(
+        self, tmp_path: Path,
+    ):
+        """A stale TRUE is NOT a safe degradation — the cache must invalidate.
+
+        The create-once acquire route removes and re-adds ``_lane-N`` at a
+        FIXED path, and a reseed rewrites the checkout in place, so within one
+        orchestrator lifetime the same path can hold seed scripts of different
+        vintages.  Keyed on the path alone, a lane re-checked-out on an OLDER
+        base would keep the cached True, the flag would go to a parser that
+        rejects it, the script would exit 2, and _seed_rc_to_unavailable maps
+        that to FAULT -> blocked + L1 — strictly worse than the rc-75 fallback
+        a stale False gives.  So this direction is the one that must be pinned.
+        """
+        from orchestrator.git_ops import (
+            _seed_script_supports_distinct_lock_refusal_rc as probe,
+        )
+
+        script = tmp_path / 'seed-warm-lane.sh'
+        script.write_text(_ARGV_RECORDING_SEED_SCRIPT)
+        assert probe(script) is True
+
+        # Same path, older vintage — mtime and size both move, so the shared
+        # text cache key changes and the entry cannot be reused.
+        script.write_text(_LEGACY_ARGV_RECORDING_SEED_SCRIPT)
+        assert probe(script) is False, (
+            'the capability answer was served from a cache keyed on the path '
+            'alone — a lane re-checked-out on a pre-5568 base would be handed '
+            'a flag its parser rejects (exit 2 -> FAULT -> blocked + L1)'
+        )
 
 
 @pytest.mark.asyncio
