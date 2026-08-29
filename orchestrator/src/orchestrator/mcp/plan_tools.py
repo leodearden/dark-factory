@@ -293,6 +293,11 @@ _ADD_DESIGN_DECISION_TARGETS: Mapping[str, str] = MappingProxyType(
 _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
     {'what': 'what', 'where': 'where', 'how': 'how'}
 )
+# ``path`` is deliberately EXCLUDED, for the same reason ``files`` and
+# ``task_id`` are: it is not prose. Letting an absorbed tail land there would
+# re-point a recorded drop at a different file, turning an honest-drop record
+# into a false one.
+_DROP_PLAN_FILE_TARGETS: Mapping[str, str] = MappingProxyType({'reason': 'reason'})
 
 #: The OTHER tools that write a given field, per row of the table below. Each
 #: entry is machine-checked to name a real plan-tools entry point that is
@@ -318,7 +323,7 @@ _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 #: :func:`_coerce_files`) and every future non-prose key, rewriting values this
 #: surface has no business touching.
 #:
-#: Bound ONCE, immediately below the five writer functions it derives its
+#: Bound ONCE, immediately below the six writer functions it derives its
 #: ``schema_params`` from (``_params_of`` needs them to exist). Annotated but
 #: deliberately UNBOUND here, so a use before that point raises a loud
 #: NameError instead of silently reading an empty table and repairing nothing.
@@ -373,6 +378,13 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
         _PlanField(
             'reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
         ),
+        _PlanField(
+            'dropped_files',
+            'reason',
+            _params_of(_drop_plan_file),
+            _DROP_PLAN_FILE_TARGETS,
+            (),
+        ),
     )
 
 #: The collection's SCHEMA OWNER — the tool whose parameter vocabulary defines
@@ -394,6 +406,7 @@ _COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
     'steps': 'add_plan_step',
     'design_decisions': 'add_design_decision',
     'reuse': 'add_reuse_item',
+    'dropped_files': 'drop_plan_file',
 }
 
 
@@ -1320,7 +1333,7 @@ def _drop_plan_file(
     )
 
 
-# The repairable-field table, bound here because ``_params_of`` reads the five
+# The repairable-field table, bound here because ``_params_of`` reads the six
 # writer signatures above off the live functions. Declared and documented at
 # its annotation further up; nothing between that point and here reads it.
 _REPAIRABLE_PLAN_FIELDS = _build_repairable_plan_fields()
