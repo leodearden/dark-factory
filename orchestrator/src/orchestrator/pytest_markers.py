@@ -33,7 +33,7 @@ from __future__ import annotations
 import ast
 import shlex
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 
 class _Unsupported(Exception):
@@ -393,14 +393,16 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
       and a test nested inside another function;
     * a ``ClassDef`` anywhere below ``tree.body`` — nested in another class,
       or inside a top-level ``if`` — whose body this fold never reaches;
-    * a top-level ``pytest_*`` hook (``pytest_collection_modifyitems``,
+    * a MODULE-SCOPE ``pytest_*`` hook (``pytest_collection_modifyitems``,
       ``pytest_generate_tests``), which can add items this walk never sees;
     * a star import, whose bound names are statically unknowable;
     * any import binding a ``test``-prefixed name case-insensitively,
       honouring ``asname`` — an imported ``Test*`` CLASS or ``test_*``
       FUNCTION is collected in THIS module;
-    * a top-level ``Assign``/``AnnAssign`` binding a ``test*``-prefixed name
-      (``test_generated = _make_case()``) — a dynamically generated item;
+    * a MODULE-SCOPE ``Assign``/``AnnAssign`` binding a ``test*``-prefixed name
+      (``test_generated = _make_case()``) — a dynamically generated item.
+      Every target spelling counts, including the unpackings
+      (``test_a, test_b = ...``, ``test_first, *test_rest = ...``, nested);
     * ZERO collectable classes.  Guarded EXPLICITLY rather than left to the
       fold: ``frozenset.intersection()`` over an empty family is
       conventionally "every marker", which would prove any expression false.
@@ -425,6 +427,17 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
     class that happens to define a ``test*``-named method counts as
     collectable and so must be marked or refuse.
 
+    MODULE SCOPE, NOT ``tree.body``.  The last two rules and the hook rule are
+    keyed on :func:`_module_scope_statements` — every statement that executes at
+    module scope, including one nested inside a top-level ``if``/``try``/
+    ``for``/``while``/``with`` — because a name bound in any of those is still a
+    module ATTRIBUTE and a hook defined in any of them is still registered.
+    Keying them on DIRECT CHILDREN of ``tree.body`` (as they originally were)
+    conflated the two, and let ``if True:\n    test_generated = _mk()`` past the
+    very rule this docstring's first bullet claims to cover.  The ClassDef rule
+    deliberately keeps the stricter direct-child test: an out-of-body class
+    refuses outright rather than being reasoned about.
+
     ASSUMPTIONS THIS WALK CANNOT CHECK, identical to
     :func:`per_item_marker_names`': the caller's pytest configuration uses the
     DEFAULT collection prefixes (``python_functions = test*``,
@@ -435,6 +448,13 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
     reach.  Both are pre-existing limits of a purely per-file static analysis,
     recorded here rather than fixed, since fixing them would need reading
     files this function is not given.
+
+    ONE KNOWN RESIDUE, left unfixed deliberately: the dynamic-binding rule reads
+    ``Assign``/``AnnAssign`` targets only, so a module-scope ``for test_x in
+    ...:``, a ``with _ctx() as test_x:``, or a walrus ``(test_x := ...)`` binds a
+    ``test*`` module attribute this walk does not see.  All three are vanishingly
+    rare as a way to define a test and none appears anywhere in this repo; they
+    are recorded rather than fixed so the rule stays one readable predicate.
 
     STRICTLY ADDITIVE.  Every guard failure returns exactly
     ``module_level_marker_names``' answer — never a smaller set — so this
@@ -454,6 +474,7 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
     module_markers = _module_level_marker_names_from_tree(tree)
 
     body_ids = {id(statement) for statement in tree.body}
+    module_scope_ids = {id(statement) for statement in _module_scope_statements(tree)}
     class_body_ids = {
         id(statement)
         for node in tree.body
@@ -467,7 +488,7 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             if node.name.startswith('test') and id(node) not in class_body_ids:
                 return module_markers
-            if node.name.startswith('pytest_') and id(node) in body_ids:
+            if node.name.startswith('pytest_') and id(node) in module_scope_ids:
                 return module_markers
         elif isinstance(node, ast.ImportFrom):
             if any(alias.name == '*' for alias in node.names):
@@ -478,7 +499,7 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
             (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
             or (
                 isinstance(node, ast.Assign | ast.AnnAssign)
-                and id(node) in body_ids
+                and id(node) in module_scope_ids
                 and _assign_binds_test_prefixed_name(node)
             )
         ):
@@ -493,6 +514,39 @@ def guaranteed_marker_names(source: str | None) -> frozenset[str]:
         return module_markers
     shared = frozenset.intersection(*(_class_marker_names(node) for node in collectable))
     return module_markers | shared
+
+
+def _module_scope_statements(node: ast.AST) -> Iterator[ast.stmt]:
+    """Every statement of the enclosing module that executes at MODULE SCOPE.
+
+    Yields ``tree.body`` and everything nested below it through compound
+    statements that do NOT open a new scope — ``if``/``else``, ``try``/
+    ``except``/``finally``, ``for``, ``while``, ``with``, ``match`` — because a
+    name bound in any of those is still a MODULE ATTRIBUTE, which is exactly
+    what pytest's ``python_functions``/``python_classes`` collection reads, and
+    a ``pytest_*`` hook defined in any of them is still registered for the
+    module.
+
+    ``FunctionDef``/``AsyncFunctionDef``/``ClassDef`` ARE yielded — they are
+    module-scope statements themselves — but are not descended INTO: a name
+    bound in a function body is a local pytest never sees, and one bound in a
+    class body is a class attribute collected, if at all, under that class's own
+    node, where it inherits the class's marks.  Descending would refuse on
+    ordinary modules and cost both tiers most of their reach.
+
+    This replaces an ``id(statement) in {id(s) for s in tree.body}`` test used by
+    :func:`guaranteed_marker_names` and :func:`per_item_marker_names`, which
+    conflated "at module scope" with "a DIRECT CHILD of ``tree.body``".  The two
+    coincide for the common case and diverge for exactly the case
+    ``guaranteed_marker_names``' own docstring claimed to cover: an item binding
+    or a hook one level down inside a top-level ``if``.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.stmt):
+            yield child
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        yield from _module_scope_statements(child)
 
 
 def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
@@ -512,21 +566,40 @@ def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
     )
 
 
+def _target_binds_test_prefixed_name(target: ast.expr) -> bool:
+    """True iff assignment *target* binds any ``test``-prefixed name (case-insensitive).
+
+    Recurses through the UNPACKING forms, which bind exactly the same module
+    attributes a bare ``Name`` target does: ``ast.Tuple``/``ast.List``
+    (``test_a, test_b = ...``, arbitrarily nested) and ``ast.Starred``
+    (``test_first, *test_rest = ...``).  Reading only ``ast.Name`` let every one
+    of those spellings through.
+
+    An ``Attribute`` or ``Subscript`` target (``obj.test_x = ...``) binds no
+    module attribute of its own and is correctly ignored.
+    """
+    if isinstance(target, ast.Name):
+        return target.id.lower().startswith('test')
+    if isinstance(target, ast.Starred):
+        return _target_binds_test_prefixed_name(target.value)
+    if isinstance(target, ast.Tuple | ast.List):
+        return any(_target_binds_test_prefixed_name(element) for element in target.elts)
+    return False
+
+
 def _assign_binds_test_prefixed_name(node: ast.Assign | ast.AnnAssign) -> bool:
-    """True iff *node* binds a ``test*``-prefixed name (case-insensitive) to a ``Name`` target.
+    """True iff *node* binds a ``test*``-prefixed name (case-insensitive).
 
     Pytest's default ``python_functions = test*`` collects any module
     attribute so named that resolves to a callable — including one bound by
     a plain assignment (``test_generated = _make_case()``), not only a
     ``def``.  This walk cannot tell statically whether the bound value is
     actually callable, so any ``test*``-prefixed target refuses, in the safe
-    direction.
+    direction.  Targets are read by :func:`_target_binds_test_prefixed_name`,
+    which covers the unpacking spellings as well as a bare ``Name``.
     """
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    return any(
-        isinstance(target, ast.Name) and target.id.lower().startswith('test')
-        for target in targets
-    )
+    return any(_target_binds_test_prefixed_name(target) for target in targets)
 
 
 def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
@@ -632,6 +705,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
         return None
 
     body_ids = {id(statement) for statement in tree.body}
+    module_scope_ids = {id(statement) for statement in _module_scope_statements(tree)}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             return None
@@ -639,7 +713,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             is_top_level = id(node) in body_ids
             if node.name.startswith('test') and not is_top_level:
                 return None
-            if node.name.startswith('pytest_') and is_top_level:
+            if node.name.startswith('pytest_') and id(node) in module_scope_ids:
                 return None
         elif isinstance(node, ast.ImportFrom):
             if any(alias.name == '*' for alias in node.names):
@@ -650,7 +724,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
             or (
                 isinstance(node, ast.Assign | ast.AnnAssign)
-                and id(node) in body_ids
+                and id(node) in module_scope_ids
                 and _assign_binds_test_prefixed_name(node)
             )
         ):

@@ -577,6 +577,49 @@ class TestPerItemMarkerNames:
         source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{assignment_line}\n'
         assert per_item_marker_names(source) is None
 
+    @pytest.mark.parametrize(
+        'binding',
+        [
+            'test_a1, test_a2 = _mk(), _mk()',
+            'test_first, *test_rest = _mk_all()',
+            'if True:\n    test_generated = _mk()',
+            'try:\n    test_generated = _mk()\nexcept Exception:\n    pass',
+            'for _ in range(1):\n    test_generated = _mk()',
+        ],
+    )
+    def test_refuses_on_an_unpacked_or_conditionally_bound_test_prefixed_name(self, binding):
+        """THE SAME dynamic-binding hole in its unpacking and nested spellings.
+
+        This tier shares its accounted-for guard with ``guaranteed_marker_names``
+        (``_assign_binds_test_prefixed_name`` and the module-SCOPE statement
+        walk), so both inherit the widened rule and cannot drift apart on which
+        bindings count.  A ``test*`` name is a module attribute whether it is
+        bound by a bare ``Name`` target, an unpacking, or one level down inside
+        a top-level compound statement.
+        """
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{binding}\n'
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'hook_name',
+        ['pytest_collection_modifyitems', 'pytest_generate_tests'],
+    )
+    def test_refuses_on_a_pytest_hook_defined_below_a_top_level_if(self, hook_name):
+        """A conditionally-defined hook is still registered for this module."""
+        source = (
+            '@pytest.mark.slow\ndef test_a():\n    pass\n\n\n'
+            f'if True:\n    def {hook_name}(*args):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_a_pytest_prefixed_local_helper_does_not_refuse(self):
+        """THE SCOPE CONTROL: only a MODULE-scope ``pytest_*`` def is a hook."""
+        source = (
+            '@pytest.mark.slow\ndef test_a():\n    pass\n\n\n'
+            'def _outer():\n    def pytest_generate_tests(m):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
     def test_a_local_test_prefixed_assignment_inside_a_function_does_not_refuse(self):
         """Only a TOP-LEVEL binding is pytest-collectible; a local variable is not."""
         source = (
@@ -905,6 +948,100 @@ class TestGuaranteedMarkerNames:
         """
         source = _classes_marked_plus(assignment_line)
         assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'target',
+        [
+            'test_a1, test_a2',
+            '(test_a1, test_a2)',
+            '[test_a1, test_a2]',
+            'test_first, *test_rest',
+            '_keep, test_a2',
+            'test_a1, (_inner, test_nested)',
+        ],
+    )
+    def test_refuses_on_a_tuple_or_list_unpacking_that_binds_a_test_prefixed_name(
+        self, target,
+    ):
+        """THE SAME dynamic-binding hole, spelled as an unpacking rather than a Name.
+
+        ``test_a1, test_a2 = _mk(), _mk()`` binds exactly the module attributes
+        the single-``Name`` rule above exists to refuse; reading only
+        ``ast.Name`` targets let the identical shape through.  Nested and
+        ``Starred`` targets are the same case one level down, and the
+        ``_keep, test_a2`` row pins that ONE test-prefixed name anywhere in the
+        target is enough.
+        """
+        source = _classes_marked_plus(f'{target} = _mk(), _mk()')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_an_unpacking_that_binds_no_test_prefixed_name_does_not_refuse(self):
+        """THE REVERSE CONTROL: the recursive target walk must not be over-broad."""
+        source = _classes_marked_plus('_first, (_second, _third) = _mk(), _mk()')
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    @pytest.mark.parametrize(
+        'wrapper',
+        [
+            'if True:',
+            'if os.environ.get("X"):',
+            'try:',
+            'for _ in range(1):',
+            'with _ctx():',
+            'while False:',
+        ],
+    )
+    def test_refuses_on_a_dynamic_binding_below_a_top_level_compound_statement(
+        self, wrapper,
+    ):
+        """A ``test*`` binding is a module attribute wherever it executes.
+
+        The rule keyed on DIRECT children of ``tree.body``, so the very shape
+        the guard's own docstring claims to cover — "a test hidden inside a
+        top-level ``if``" — escaped it whenever the item was bound by
+        assignment rather than ``def``.  What actually matters is lexical
+        SCOPE, not nesting depth: everything here still binds at module scope.
+        """
+        tail = 'except Exception:\n    pass\n' if wrapper == 'try:' else ''
+        source = _classes_marked_plus(f'{wrapper}\n    test_generated = _mk()\n{tail}')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'hook_name',
+        ['pytest_collection_modifyitems', 'pytest_generate_tests'],
+    )
+    def test_refuses_on_a_pytest_hook_defined_below_a_top_level_if(self, hook_name):
+        """The hook rule had the identical ``tree.body``-only hole.
+
+        A conditionally-defined hook is still registered for this module and
+        can still add items this walk never sees.
+        """
+        source = _classes_marked_plus(
+            f'if True:\n    def {hook_name}(*args):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'nested_source',
+        [
+            'def _helper():\n    test_local = _mk()\n    return test_local\n',
+            'class _Cfg:\n    test_attr = _mk()\n',
+        ],
+    )
+    def test_a_test_prefixed_binding_inside_a_function_or_class_body_does_not_refuse(
+        self, nested_source,
+    ):
+        """THE SCOPE CONTROL that keeps the widened rule from swallowing the tier.
+
+        Dropping the "direct child of ``tree.body``" restriction must widen the
+        rule to module SCOPE, not to every node in the tree.  A binding inside
+        a ``def`` is a local pytest never sees; one inside a class body is a
+        class attribute, and if it is collected at all it is collected UNDER
+        that class's node and carries its marks — so neither is a hole, and
+        refusing on either would kill the tier on ordinary modules.
+        """
+        source = _classes_marked_plus(nested_source)
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
 
     def test_an_ordinary_helper_import_does_not_refuse(self):
         """THE CONTROL: the ``test``-prefix guard must not be over-broad."""
