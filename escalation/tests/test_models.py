@@ -1584,3 +1584,185 @@ class TestEscalationRootCauseVariants:
 
         assert not hasattr(restored, 'not_a_real_field')
         assert restored.root_cause_variants == []
+
+
+class TestDeclaredPinMarker:
+    """`pin_declared_by` / `pin_declared_reason` — the declared-dependency marker (task 4377).
+
+    An OPEN escalation record is a PRESERVATION MECHANISM for its subject task
+    (`orchestrator/task_ground_truth.py::_RECOVERY` has no row for the pinned
+    shape, so it falls through to ``RecoveryAction.LEAVE``), which makes closing
+    a record a state-changing act on that task even under ``action='close_only'``.
+    These two fields are what makes that dependency DECLARABLE on the record
+    itself instead of living in prose nothing links from.
+
+    These tests pin the FIELDS' storage/round-trip behaviour only.  The
+    enforcement seam is `escalation/declared_pins.py::blocking_pin_declarations`
+    consulted by `escalation/server.py::resolve_issue`, exercised in
+    tests/test_declared_pins.py and tests/test_server.py.
+    """
+
+    #: A real declarer pair — WHAT relies on the record, not WHO stamped it.
+    DECLARED_BY = ['task-3546-second-deviation-notice', 'esc-3914-1']
+    REASON = 'mu-gate validation specimen; see task 3546 SECOND DEVIATION NOTICE'
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-3105-3',
+            task_id='3105',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test escalation for the declared-pin marker',
+        )
+
+    def _seeded(self) -> Escalation:
+        esc = self._make_base_esc()
+        esc.pin_declared_by = list(self.DECLARED_BY)
+        esc.pin_declared_reason = self.REASON
+        return esc
+
+    # --- (a) Default values ---
+
+    def test_pin_declared_by_defaults_to_empty_list(self):
+        """A minimally-constructed Escalation has pin_declared_by=[] (not None)."""
+        assert self._make_base_esc().pin_declared_by == []
+
+    def test_pin_declared_reason_defaults_to_empty_string(self):
+        """A minimally-constructed Escalation has pin_declared_reason='' (not None)."""
+        assert self._make_base_esc().pin_declared_reason == ''
+
+    def test_default_pin_declared_by_is_not_shared_between_instances(self):
+        """The default list uses default_factory — instances do not share it."""
+        a = self._make_base_esc()
+        b = self._make_base_esc()
+
+        a.pin_declared_by.append('task-3546-second-deviation-notice')
+
+        assert b.pin_declared_by == [], (
+            'default pin_declared_by list is SHARED between instances — '
+            f'b saw {b.pin_declared_by!r}'
+        )
+
+    def test_construction_preserves_the_marker_verbatim(self):
+        """Both fields are stored verbatim (no parsing/normalisation at the model layer)."""
+        esc = Escalation(
+            id='esc-3105-3',
+            task_id='3105',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='s',
+            pin_declared_by=list(self.DECLARED_BY),
+            pin_declared_reason=self.REASON,
+        )
+        assert esc.pin_declared_by == self.DECLARED_BY
+        assert esc.pin_declared_reason == self.REASON
+
+    # --- (b) both keys present in serialised JSON at their defaults ---
+
+    def test_both_keys_present_in_serialised_json_at_defaults(self):
+        """to_json() emits both keys even when unset — never silently dropped."""
+        payload = json.loads(self._make_base_esc().to_json())
+
+        assert 'pin_declared_by' in payload
+        assert 'pin_declared_reason' in payload
+        assert payload['pin_declared_by'] == []
+        assert payload['pin_declared_reason'] == ''
+
+    # --- (c) to_dict / to_json round-trips ---
+
+    def test_marker_round_trips_via_to_dict_from_dict(self):
+        """Escalation.from_dict(esc.to_dict()) round-trips both fields exactly."""
+        restored = Escalation.from_dict(self._seeded().to_dict())
+
+        assert restored.pin_declared_by == self.DECLARED_BY
+        assert restored.pin_declared_reason == self.REASON
+
+    def test_marker_round_trips_via_to_json_from_json(self):
+        """Escalation.from_json(esc.to_json()) round-trips both fields exactly."""
+        restored = Escalation.from_json(self._seeded().to_json())
+
+        assert restored.pin_declared_by == self.DECLARED_BY
+        assert restored.pin_declared_reason == self.REASON
+
+    def test_declarer_order_is_preserved(self):
+        """Declarer order survives a round-trip — the list is ordered, not a set."""
+        restored = Escalation.from_json(self._seeded().to_json())
+
+        assert restored.pin_declared_by[0] == 'task-3546-second-deviation-notice'
+        assert restored.pin_declared_by[1] == 'esc-3914-1'
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def _legacy_payload(self) -> dict:
+        """A pre-4377 on-disk payload — every field EXCEPT the two marker keys."""
+        return {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without the declared-pin marker',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'evidence': [],
+            'train_state': None,
+            'index_health': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            'triaged_at': None,
+            'triaged_by': None,
+            'triage_note': '',
+            'updated_at': None,
+            'granted_files': [],
+            'filing_claimant_run_id': None,
+            'amendments': [],
+            'amendments_truncated': 0,
+            'amendments_chars_elided': 0,
+            'root_cause_variants': [],
+            'root_cause_variants_truncated': 0,
+            # NOTE: pin_declared_by / pin_declared_reason are intentionally absent
+        }
+
+    def test_from_dict_legacy_payload_deserialises_to_defaults(self):
+        """Legacy JSON without the keys deserialises to []/'' — zero migration."""
+        restored = Escalation.from_dict(self._legacy_payload())
+
+        assert restored.pin_declared_by == []
+        assert restored.pin_declared_reason == ''
+
+    def test_from_json_legacy_payload_does_not_raise(self):
+        """Legacy JSON deserialises through from_json without raising."""
+        restored = Escalation.from_json(json.dumps(self._legacy_payload()))
+
+        assert restored.id == 'esc-task-1-0001'
+        assert restored.pin_declared_by == []
+        assert restored.pin_declared_reason == ''
+
+    # --- (f) the __dataclass_fields__ filter is not weakened ---
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """from_dict's filter surface is unchanged by the two added fields."""
+        payload = self._legacy_payload()
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.pin_declared_by == []
