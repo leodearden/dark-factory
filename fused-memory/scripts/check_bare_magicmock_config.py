@@ -345,14 +345,16 @@ def _is_specced(call: ast.Call) -> bool:
 # Requires at least one non-space character after the separator.
 #
 # Each rule gets its OWN code so a suppression written for one can never silently
-# exempt the other: the remedies are unrelated (mock_orch_config/pydantic_spec vs
-# _fake_verify_result/spec=VerifyResult), so a pragma for one is not informed
-# consent for the other.  Both are built from the same template, so the
-# em-dash/ASCII-hyphen and mandatory-reason contract is identical across rules.
+# exempt another: the remedies are unrelated (mock_orch_config/pydantic_spec vs
+# _fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
+# pragma for one is not informed consent for another.  All three are built from the
+# same template, so the em-dash/ASCII-hyphen and mandatory-reason contract is
+# identical across rules and an author learns it once.
 _EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
 
 _RULE_A_CODE = 'bare-magicmock'
 _RULE_B_CODE = 'bare-dataclass-double'
+_RULE_C_CODE = 'wall-clock-deadline'
 
 # Kept at its historical value so Rule A's behaviour is bit-identical.
 _EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
@@ -360,6 +362,7 @@ _EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
 _EXEMPT_RES: dict[str, re.Pattern[str]] = {
     _RULE_A_CODE: _EXEMPT_RE,
     _RULE_B_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_B_CODE))),
+    _RULE_C_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_C_CODE))),
 }
 
 _VIOLATION_MSG = (
@@ -627,8 +630,6 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
     return None
 
-_RULE_C_CODE = 'wall-clock-deadline'
-
 # Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
 # (a bare asyncio.wait_for that also writes a number) or exactly one (a migrated
 # wait_responsive that kept its literal; a bare wait_for whose bound is derived).
@@ -734,6 +735,13 @@ def _wall_clock_deadline_violations(
     if target is None:
         return []
 
+    # Computed lazily — only after the func shape AND the load-bearing target have
+    # both matched — so the upward line walk keeps Rule B's cost profile rather than
+    # running on every ast.Call in the tree.  ONE check per SITE suppresses BOTH
+    # offence kinds: a pragma is consent for the site, not for one half of it.
+    if _is_exempted(lines, call.lineno, _RULE_C_CODE):
+        return []
+
     kinds: list[str] = []
     if is_bare_wait_for:
         kinds.append(_WALL_CLOCK_BARE_WAIT_FOR)
@@ -770,10 +778,11 @@ def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
     If that line matches ``code``'s exemption regex the node is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
 
-    The *code* parameter keeps the two rules' suppressions strictly separate: a
-    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double``
-    violation, or vice versa.  Only the regex differs — the walk, the blank-line
-    tolerance and the mandatory-non-empty-reason contract are shared verbatim.
+    The *code* parameter keeps all three rules' suppressions strictly separate: a
+    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double`` or
+    ``wall-clock-deadline`` violation, in any direction.  Only the regex differs —
+    the walk, the blank-line tolerance and the mandatory-non-empty-reason contract
+    are shared verbatim.
 
     Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
     is inspected.  A ``# noqa: ...`` comment on the same line as the node (inline
