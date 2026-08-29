@@ -4754,3 +4754,154 @@ async def test_on_task_done_unblocks_blocked_dependent_when_last_dep_completes(
         f'dependent_unblocked must stay reserved for already-pending dependents, '
         f'got: {result.get("actions")}'
     )
+
+
+# The full vocabulary this sweep emits, keyed off the dependent's own
+# task_id -- used by the guard table below to isolate "our" actions from
+# the rest of a done-transition's unrelated actions (fast-path echo, search,
+# verification, ...).
+_DEP_ACTION_TYPES = {
+    'dependent_unblocked',
+    'dependent_unblock_applied',
+    'dependent_unblock_failed',
+    'dependent_unblock_vetoed',
+    'dependent_unblock_skipped',
+}
+
+
+def _dep_actions_for(result: dict, task_id: str) -> list[dict]:
+    """The subset of ``result['actions']`` naming *task_id* from the
+    dependent-unblock sweep's own vocabulary (see ``_DEP_ACTION_TYPES``)."""
+    return [
+        a for a in result.get('actions', [])
+        if a.get('type') in _DEP_ACTION_TYPES and a.get('task_id') == task_id
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'dependent_overrides, extra_tasks, wired, expected_type, expected_reason',
+    [
+        pytest.param(
+            {'status': 'pending'}, [], True, 'dependent_unblocked', None,
+            id='pending_all_deps_done_observed_only',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [{'id': '9', 'status': 'pending', 'dependencies': []}],
+            True, None, None,
+            id='blocked_sibling_dep_still_pending',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [{'id': '9', 'status': 'cancelled', 'dependencies': []}],
+            True, None, None,
+            id='blocked_sibling_dep_cancelled_fails_closed',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [],
+            True, None, None,
+            id='blocked_sibling_dep_absent_from_snapshot',
+        ),
+        pytest.param(
+            {
+                'status': 'blocked',
+                'metadata': {'parent_cancelled': '7', 'needs_recheck_against_main': True},
+            },
+            [], True, 'dependent_unblock_vetoed', 'parent_cancelled',
+            id='blocked_vetoed_parent_cancelled',
+        ),
+        pytest.param(
+            {
+                'status': 'blocked',
+                'metadata': {'external_deps': {'other_project:12': 'pending'}},
+            },
+            [], True, 'dependent_unblock_vetoed', 'external_deps',
+            id='blocked_vetoed_external_deps',
+        ),
+        pytest.param({'status': 'in-progress'}, [], True, None, None, id='in_progress_untouched'),
+        pytest.param({'status': 'deferred'}, [], True, None, None, id='deferred_untouched'),
+        pytest.param({'status': 'review'}, [], True, None, None, id='review_untouched'),
+        pytest.param(
+            {'status': 'merge-deferred'}, [], True, None, None, id='merge_deferred_untouched',
+        ),
+        pytest.param(
+            {'status': 'blocked'}, [], False, 'dependent_unblock_skipped', 'interceptor_unwired',
+            id='blocked_interceptor_unwired',
+        ),
+        pytest.param(
+            {'status': 'blocked'}, [], True, 'dependent_unblock_applied', None,
+            id='blocked_positive_control',
+        ),
+    ],
+)
+async def test_unblock_dependent_guards(
+    reconciler, mock_taskmaster, tmp_path,
+    dependent_overrides, extra_tasks, wired, expected_type, expected_reason,
+):
+    """Every shape that must NOT be flipped, plus the positive control.
+
+    ``wired`` is applied by attaching a mocked TaskInterceptor directly to
+    the plain (unwired-by-default) ``reconciler`` fixture -- deliberately
+    NOT via the ``wired_reconciler`` fixture, since that fixture mutates
+    and returns the very ``reconciler`` instance this test also requests
+    directly; requesting both in one test would make the "unwired" case
+    (``wired=False``) silently observe the wired instance instead.
+
+    The ``blocked_sibling_dep_cancelled_fails_closed`` case is a deliberate
+    divergence from ``Scheduler._deps_satisfied`` (scheduler.py:4444-4460),
+    which counts ``cancelled`` deps as satisfied: this sweep fires
+    immediately on a ``done`` transition with none of that sweep's
+    claimant-liveness/cooldown guards, so its only defense against
+    over-unblocking is a conservative, ``done``-only predicate. Under-
+    unblocking here is self-healing (the orchestrator's own stranded-blocked
+    sweep still covers it); over-unblocking is the exact defect this task
+    exists to close, so the predicate must fail closed.
+    """
+    if wired:
+        interceptor = AsyncMock()
+        interceptor.set_task_status = AsyncMock(return_value={
+            'message': 'status updated',
+            'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
+        })
+        interceptor.update_task = AsyncMock(return_value={'success': True})
+        reconciler.task_interceptor = interceptor
+
+    dependent = {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']}
+    dependent.update(dependent_overrides)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(dependent, *extra_tasks))
+
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    actions = _dep_actions_for(result, '2')
+    if expected_type is None:
+        assert actions == [], (
+            f'Expected no dependent-unblock action for task 2, got: {actions}'
+        )
+    else:
+        assert len(actions) == 1, (
+            f'Expected exactly one dependent-unblock action for task 2, got: {actions}'
+        )
+        assert actions[0]['type'] == expected_type, (
+            f'Expected type={expected_type!r}, got: {actions[0]!r}'
+        )
+        if expected_reason is not None:
+            assert actions[0].get('reason') == expected_reason, (
+                f'Expected reason={expected_reason!r}, got: {actions[0]!r}'
+            )
+
+    if wired:
+        if expected_type == 'dependent_unblock_applied':
+            reconciler.task_interceptor.set_task_status.assert_awaited_once()
+        else:
+            reconciler.task_interceptor.set_task_status.assert_not_awaited()
+    else:
+        mock_taskmaster.set_task_status.assert_not_called()
