@@ -793,6 +793,45 @@ class TestSeedRcToUnavailable:
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
 
+    # ── task 4211: rc 77 → LANE_LOCK_CONTENDED ────────────────────────────
+    #
+    # reify's seed-warm-lane.sh emits 75 at exactly two sites, BOTH lane-lock
+    # refusal arms (flock -n immediate refusal; flock -w queue timeout) — seed
+    # has no disk-pressure exit-75 path at all.  So every lane-lock refusal was
+    # unconditionally rendered as "disk pressure", which is the operator-facing
+    # string that ran throughout reify esc-5556-1.  reify task 5568 added the
+    # OPT-IN ``--distinct-lock-refusal-rc`` flag under which those two arms exit
+    # 77 instead; these tests pin DF's half of that seam.
+
+    def test_77_is_lane_lock_contended(self):
+        """77 is reify's opt-in distinct lane-lock refusal code (reify 5568)."""
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+
+    def test_lane_lock_contended_enum_member_value(self):
+        """The enum member exists and carries the documented wire value."""
+        assert WarmLaneUnavailable.LANE_LOCK_CONTENDED.value == 'lane_lock_contended'
+
+    def test_77_arm_is_additive_and_does_not_narrow_75(self):
+        """Regression fence — the rc 77 arm is purely ADDITIVE.
+
+        75 must KEEP meaning DISK_PRESSURE: a lane whose checked-out seed
+        script predates reify 5568 still emits 75 for a lock refusal (the
+        capability probe fails CLOSED for such lanes, so the flag is omitted
+        and the old code is what arrives), and DF has its own genuine exit-75
+        producer that is NOT seed — the ε pre-acquire disk-guard path, where
+        75 really does mean disk pressure.  Narrowing 75 would break both.
+        Disambiguation comes ONLY from the opt-in 77.
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+
 
 class TestWarmLaneBaseResolvable:
     """GitOps._warm_lane_base_resolvable() — tri-state warm-base health probe.
