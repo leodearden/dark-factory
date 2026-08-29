@@ -809,6 +809,28 @@ class EscalationQueue:
         members still pending at callback time; they should re-query member state
         rather than assuming terminality.  This ordering is stable — do not rely
         on members being resolved at the moment the L2 callback fires.
+
+        **Declared pins (task 4377): this method WARNS but never REFUSES.**
+        Closing a record carrying ``pin_declared_by`` logs a WARNING naming the
+        id, every declarer and the reason — an audit line, so an un-gated close
+        is observable from ANY caller rather than silent.  Cascade members are
+        covered for free by the self-recursion below.
+
+        REFUSAL lives one layer up, at the
+        ``escalation/server.py::resolve_issue`` chokepoint, which consults
+        ``escalation/declared_pins.py::blocking_pin_declarations`` as a
+        PRE-FLIGHT over the target plus every member.  Two mechanical reasons
+        it cannot live here: (i) this method archives the L2 head BEFORE it
+        cascades, so a refusal discovered per-member could only ever produce a
+        half-closed cluster — head archived, members still pending — which is
+        worse than either outcome; and (ii) ``resolve()`` returns
+        ``Escalation | None``, so a refusal is indistinguishable from "not
+        found" unless it raises, and most in-repo callers (harness
+        self-clearing sentinels, workflow.py / steward.py L0 teardown,
+        ``dismiss_all_pending``) wrap this call in a best-effort ``try/except``
+        — a raise would be swallowed into a silent no-op, turning a protection
+        into an invisible one and potentially wedging a sentinel auto-clearing
+        a record it filed itself.
         """
         if resolution_class is not None and resolution_class not in RESOLUTION_CLASSES:
             raise ValueError(
@@ -845,6 +867,18 @@ class EscalationQueue:
             self._archive_resolved(escalation_id, esc.resolved_at)
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
+
+        # Declared-pin AUDIT LINE (task 4377) — see the "Declared pins" section
+        # of this docstring.  Because resolve() recurses into itself for each L2
+        # member below, cascade members are covered by this same line with no
+        # extra code — which matters, since the cascade is the path that spent
+        # the mu-gate specimen on 2026-08-08.
+        if esc.pin_declared_by:
+            logger.warning(
+                'Escalation %s closed (%s) despite a DECLARED PIN — declared_by=%s reason=%r. '
+                'An open escalation preserves its subject task; this close may have spent it.',
+                escalation_id, esc.status, ', '.join(esc.pin_declared_by), esc.pin_declared_reason,
+            )
 
         if self._resolve_callback:
             try:
