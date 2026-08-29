@@ -802,30 +802,18 @@ class TargetedReconciler:
                     causation_id=run_id,
                 )
 
-        # 3. Check dependent tasks — are they unblocked?
+        # 3. Check dependent tasks: observe already-pending ones, and durably
+        #    unblock ones stuck at 'blocked' whose dependencies are now done.
         try:
             all_tasks_data = await self.taskmaster.get_tasks(project_root=scope.project_root)
             all_tasks = all_tasks_data.get('tasks', [])
             if isinstance(all_tasks, list):
-                for t in all_tasks:
-                    if not isinstance(t, dict):
-                        continue
-                    deps = task_dependency_ids(t)
-                    if task_id in deps:
-                        all_deps_done = all(
-                            any(
-                                str(dt.get('id')) == str(dep_id) and dt.get('status') == 'done'
-                                for dt in all_tasks
-                                if isinstance(dt, dict)
-                            )
-                            for dep_id in deps
-                        )
-                        if all_deps_done and t.get('status') == 'pending':
-                            result['actions'].append({
-                                'type': 'dependent_unblocked',
-                                'task_id': t.get('id'),
-                                'title': t.get('title'),
-                            })
+                result['actions'].extend(await self._sweep_unblock_dependents(
+                    task_id=task_id,
+                    project_root=scope.project_root,
+                    all_tasks=all_tasks,
+                    run_id=run_id,
+                ))
         except Exception as e:
             logger.warning(f'Dependency check failed: {e}')
 
@@ -1488,6 +1476,117 @@ class TargetedReconciler:
             'task_id': task_id,
             'parent_id': parent_id,
             'escalation_id': esc_id,
+        }
+
+    async def _sweep_unblock_dependents(
+        self,
+        *,
+        task_id: str,
+        project_root: ProjectRoot,
+        all_tasks: list,
+        run_id: str,
+    ) -> list[dict]:
+        """Observe already-pending dependents; durably unblock 'blocked' ones.
+
+        For each task in *all_tasks* that depends on *task_id* and whose own
+        dependencies are now all ``done``:
+
+        * already ``pending`` -> unchanged legacy observation
+          (``dependent_unblocked``); two existing tests pin this byte-for-byte.
+        * stuck at ``blocked`` -> the actual defect this sweep exists to close
+          (reify 5662/5759: a dependent never left ``blocked`` once its last
+          dependency completed, because nothing ever wrote its status). Routed
+          through :meth:`_unblock_dependent`.
+        * anything else (in-progress, deferred, review, ...) -> left alone.
+
+        The ``blocked -> pending`` transition performed here is legal per
+        ``shared.task_transitions._UNION`` and survives the
+        ``ActorClass.RECONCILIATION`` restriction (which subtracts only
+        ``(in-progress, *)`` pairs) — no FSM change is required. It also needs
+        no recursion guard analogous to ``_PARENT_CANCELLED_REOPEN_PREFIX``:
+        ``TaskInterceptor.STATUS_TRIGGERS`` excludes ``'pending'``, so this
+        write fires no nested ``reconcile_task``.
+
+        Builds the ``{str(id): status}`` map once from the caller's single
+        ``get_tasks`` snapshot instead of the old nested
+        any()-inside-all() scan, which was O(N·D) per dependent (O(N²·D) per
+        done-transition).
+        """
+        status_by_id: dict[str, str] = {
+            str(t.get('id')): str(t.get('status') or '')
+            for t in all_tasks
+            if isinstance(t, dict)
+        }
+
+        actions: list[dict] = []
+        for t in all_tasks:
+            if not isinstance(t, dict):
+                continue
+            deps = task_dependency_ids(t)
+            if task_id not in deps:
+                continue
+            # A dep id absent from the snapshot yields status_by_id.get(...) is
+            # None, which is != 'done' -- fails closed, same as before.
+            all_deps_done = all(status_by_id.get(str(dep_id)) == 'done' for dep_id in deps)
+            if not all_deps_done:
+                continue
+
+            status = t.get('status')
+            if status == 'pending':
+                actions.append({
+                    'type': 'dependent_unblocked',
+                    'task_id': t.get('id'),
+                    'title': t.get('title'),
+                })
+            elif status == 'blocked':
+                actions.append(await self._unblock_dependent(
+                    dependent=t,
+                    satisfied_by=task_id,
+                    project_root=project_root,
+                    run_id=run_id,
+                ))
+        return actions
+
+    async def _unblock_dependent(
+        self,
+        *,
+        dependent: dict,
+        satisfied_by: str,
+        project_root: ProjectRoot,
+        run_id: str,
+    ) -> dict:
+        """Flip one 'blocked' dependent to 'pending' now its deps are done.
+
+        Requires ``self.task_interceptor`` to be wired — mirrors the guard
+        used by ``_sweep_cancelled_descendants``: a direct
+        ``self.taskmaster`` write would bypass the per-project write_lock and
+        the status-FSM gates.
+        """
+        dep_id = str(dependent.get('id') or '')
+        if self.task_interceptor is None:
+            logger.warning(
+                'sweep: task_interceptor not wired; skipping dependent-unblock '
+                'for task %s (satisfied by %s)',
+                dep_id, satisfied_by,
+            )
+            return {
+                'type': 'dependent_unblock_skipped',
+                'reason': 'interceptor_unwired',
+                'task_id': dep_id,
+                'satisfied_by': satisfied_by,
+            }
+
+        await self.task_interceptor.set_task_status(
+            task_id=dep_id,
+            status='pending',
+            project_root=project_root,
+            reopen_reason=f'dependency_satisfied:{satisfied_by}',
+        )
+        return {
+            'type': 'dependent_unblock_applied',
+            'task_id': dep_id,
+            'title': dependent.get('title'),
+            'satisfied_by': satisfied_by,
         }
 
     async def _on_task_deferred(
