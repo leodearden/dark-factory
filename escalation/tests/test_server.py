@@ -8441,6 +8441,97 @@ class TestDeclarePinTool:
         assert refreshed.pin_declared_by == []
         assert refreshed.pin_declared_reason == ''
 
+    # --- a wholly-redundant re-declaration is reported TRUTHFULLY ---
+
+    @pytest.mark.asyncio
+    async def test_redundant_redeclaration_is_not_reported_as_not_found(self, tmp_path: Path):
+        """An idempotent retry must not claim the record is gone.
+
+        ``queue.declare_pin`` returns None for THREE distinct outcomes, one of
+        which is a re-declaration on a record that IS found and IS pending.
+        Borrowing the "not found or not pending" message for it is factually
+        false about the record — and an idempotent retry is the natural thing
+        for an operator or a script to do.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert result.get('code') == 'already_declared', result
+        assert 'not found' not in result['error'], result['error']
+        assert self.DECLARER in result['error']
+        # The record is untouched and still protected.
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending'
+        assert reread.pin_declared_by == [self.DECLARER]
+
+    @pytest.mark.asyncio
+    async def test_redundant_redeclaration_returns_the_declarers_structurally(
+        self, tmp_path: Path,
+    ):
+        """INV-2 — the caller recovers what the record carries without parsing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        result = await _declare_pin(server, escalation_id=esc.id, declared_by=[self.DECLARER])
+
+        assert result['pin_declared_by'] == [self.DECLARER]
+        assert result['pin_declared_reason'] == self.REASON
+
+    @pytest.mark.asyncio
+    async def test_reason_only_correction_is_reported_as_already_declared(
+        self, tmp_path: Path,
+    ):
+        """A reason cannot be corrected without a new declarer — and the caller
+        is TOLD so, rather than being told the record does not exist."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason='first reason',
+        )
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER],
+            reason='a corrected reason',
+        )
+
+        assert result.get('code') == 'already_declared', result
+        assert 'reason' in result['error'], (
+            'the message must say the rationale was not updated'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_reason == 'first reason', 'nothing was written'
+
+    @pytest.mark.asyncio
+    async def test_a_partially_redundant_call_still_succeeds(self, tmp_path: Path):
+        """The no-regression half: a call carrying ONE new declarer is a success,
+        not an already_declared report."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(server, escalation_id=esc.id, declared_by=[self.DECLARER])
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER, 'operator-gate'],
+        )
+
+        assert 'error' not in result, result
+        assert result['pin_declared_by'] == [self.DECLARER, 'operator-gate']
+
     # --- (c) unknown / archived ids error rather than raising or resurrecting ---
 
     @pytest.mark.asyncio

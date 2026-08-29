@@ -2440,13 +2440,25 @@ def create_server(
           connection declared this", which names nothing a closer could go
           consult.  The asymmetry is deliberate; please do not "fix" it.
 
-        Returns the updated record as a full dict on success.  The two failure
-        modes are distinguished so a caller is not left guessing:
-        ``{'error': ..., 'code': 'empty_declared_by'}`` when *declared_by*
-        normalises to nothing (checked here, before the queue is touched — a
-        silent no-op would leave the declarer believing the record is protected
-        when it is not), and ``{'error': ...}`` when the record is not found in
-        the queue root or is not pending.
+        Returns the updated record as a full dict on success.  The THREE
+        non-success outcomes are distinguished so a caller is not left guessing
+        — ``queue.declare_pin`` collapses them all into ``None``:
+
+        - ``{'error': ..., 'code': 'empty_declared_by'}`` — *declared_by*
+          normalises to nothing (checked here, before the queue is touched: a
+          silent no-op would leave the declarer believing the record is
+          protected when it is not).
+        - ``{'error': ..., 'code': 'already_declared', 'pin_declared_by': [...],
+          'pin_declared_reason': ...}`` — the record is found and pending and
+          ALREADY carries every declarer named, so nothing was added.  An
+          idempotent retry is the natural thing for an operator or a script to
+          do, and reporting "not found" for it would be false about the record;
+          the current declarers come back structurally (INV-2) so the caller
+          need not parse the message.  NOTE this outcome also means *reason* was
+          not updated — a wholly-redundant call writes nothing at all, so a
+          rationale correction needs a declarer that is not already present.
+        - ``{'error': ...}`` — the record is not in the queue root, is
+          unparseable, or is not pending.
         """
         if not [entry for entry in declared_by if entry.strip()]:
             return {
@@ -2460,6 +2472,32 @@ def create_server(
             }
         esc = queue.declare_pin(escalation_id, declared_by=declared_by, reason=reason)
         if esc is None:
+            # queue.declare_pin collapses several outcomes into None, and one of
+            # them — a WHOLLY REDUNDANT re-declaration — is not a missing record
+            # at all: the record is found, pending, and already carries every
+            # declarer named.  Reporting "not found or not pending" for it would
+            # be factually false about the record, and an idempotent retry (the
+            # natural thing for an operator or a script to do) is exactly when
+            # it happens.  So re-read before choosing the message.  A record
+            # resolved between the two calls reads as non-pending here and
+            # correctly falls through to the generic message.
+            existing = queue.get(escalation_id)
+            if existing is not None and existing.status == 'pending':
+                return {
+                    'error': (
+                        f'Escalation {escalation_id} is ALREADY declared by '
+                        f'{", ".join(existing.pin_declared_by)}; nothing was added. '
+                        'The record IS protected — resolve_issue already refuses '
+                        'every non-park action on it. NOTE: a wholly-redundant '
+                        'call does not update `reason` either; to record a '
+                        'different rationale, name a declarer not already present.'
+                    ),
+                    'code': 'already_declared',
+                    # Structural, per INV-2 — a caller should never have to parse
+                    # the message to recover what the record already carries.
+                    'pin_declared_by': list(existing.pin_declared_by),
+                    'pin_declared_reason': existing.pin_declared_reason,
+                }
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
