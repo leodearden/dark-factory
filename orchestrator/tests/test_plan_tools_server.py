@@ -22,6 +22,7 @@ from orchestrator.mcp.plan_tools import (
     _coerce_files,
     _confirm_plan,
     _create_plan,
+    _drop_plan_file,
     _mark_step_done,
     _remove_plan_step,
     _replace_plan_step,
@@ -424,6 +425,44 @@ class TestUpdatePlanMetadata:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+
+class TestDropPlanFile:
+    """The honest third exit from the narrowing pass (task 4807).
+
+    ``update_plan_metadata(files=[...])`` can drop a flagged entry, but it
+    records NOTHING about why — which is the falsified provenance
+    ``merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX`` objects to.
+    ``_drop_plan_file`` drops the entry AND records the reason atomically, so
+    a correctly-declared file that legitimately needed no edit can leave the
+    ``files`` list without the plan record losing why it was ever in scope.
+    """
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    def test_drops_the_entry_and_records_the_reason(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        reason = 'Declared defensively; the branch never needed to touch it'
+        result = _drop_plan_file(artifacts, path='mod_a/bar.py', reason=reason)
+
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        # (a) the dropped path is gone from the gate's re-check surface.
+        assert 'mod_a/bar.py' not in plan['files']
+        # (b) the entries the architect did NOT drop survive, in order — the
+        # partial-narrow half of the signal: an entry left in the list still
+        # reaches the gate's re-check.
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        # (c) the provenance the drop would otherwise have destroyed.
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/bar.py', 'reason': reason}
+        ]
 
 
 class TestRemovePlanStep:
