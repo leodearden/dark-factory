@@ -1009,13 +1009,18 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
+        # Lazy load — run at most once per TaskCurator instance. Offloaded:
+        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
+        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
+        # single event-loop stall in this method, paid on the first task
+        # submission per process while the per-project curator write lock is
+        # held.
         if not self._premise_registry_load_attempted:
             self._premise_registry_load_attempted = True
             raw_path = Path(cfg_path)
             if not raw_path.is_absolute():
                 raw_path = self._cwd / raw_path
-            self._premise_registry = load_premise_registry(raw_path)
+            self._premise_registry = await asyncio.to_thread(load_premise_registry, raw_path)
 
         entries = self._premise_registry
         if not entries:
