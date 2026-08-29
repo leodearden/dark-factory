@@ -818,19 +818,28 @@ class TestSeedRcToUnavailable:
     def test_77_arm_is_additive_and_does_not_narrow_75(self):
         """Regression fence — the rc 77 arm is purely ADDITIVE.
 
-        75 must KEEP meaning DISK_PRESSURE: a lane whose checked-out seed
-        script predates reify 5568 still emits 75 for a lock refusal (the
-        capability probe fails CLOSED for such lanes, so the flag is omitted
-        and the old code is what arrives), and DF has its own genuine exit-75
-        producer that is NOT seed — the ε pre-acquire disk-guard path, where
-        75 really does mean disk pressure.  Narrowing 75 would break both.
-        Disambiguation comes ONLY from the opt-in 77.
+        75 must KEEP meaning DISK_PRESSURE *alongside* 77 meaning
+        LANE_LOCK_CONTENDED: a lane whose checked-out seed script predates
+        reify 5568 still emits 75 for a lock refusal (the capability probe
+        fails CLOSED for such lanes, so the flag is omitted and the old code
+        is what arrives), and DF has its own genuine exit-75 producer that is
+        NOT seed — the ε pre-acquire disk-guard path, where 75 really does
+        mean disk pressure.  Narrowing 75 would break both.  Disambiguation
+        comes ONLY from the opt-in 77.
+
+        Deliberately asserts ONLY the 75/77 coexistence, not the whole
+        taxonomy: 76 -> BASE_ABSENT and 1/127 -> FAULT are already pinned by
+        test_76_is_base_absent / test_1_is_fault / test_127_is_fault directly
+        above, and re-asserting them here would make one future taxonomy
+        change fail in two places for a single reason (amendment,
+        reviewer_comprehensive test-coverage).
         """
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
-        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
-        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
-        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
 
 
 class TestWarmLaneBaseResolvable:
