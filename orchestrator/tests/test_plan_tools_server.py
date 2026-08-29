@@ -1270,3 +1270,61 @@ class TestMarkStepCommitted:
         confirm = plan_tools._confirm_plan(artifacts)
         assert confirm['status'] == 'ok'
         assert confirm['finalized'] is True
+
+
+@pytest.mark.asyncio
+class TestDropPlanFileTool:
+    """The REGISTERED ``drop_plan_file`` MCP tool, not only its helper.
+
+    Helper coverage is not enough (see the files-arg boundary guards above):
+    a regression that never wired the @mcp.tool() closure, or wired it with a
+    different parameter spelling, would still pass every ``_drop_plan_file``
+    unit test in ``TestDropPlanFile``.
+    """
+
+    def _three_file_plan(self, artifacts):
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+
+    async def test_registered_tool_drops_via_fn(self, artifacts):
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        # drop_plan_file is a sync def — call tool.fn() directly.
+        result = tool.fn(  # type: ignore[union-attr]
+            path='mod_a/bar.py',
+            reason='Declared for a rename that the final design avoided',
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/baz.py']
+        assert plan['dropped_files'] == [{
+            'path': 'mod_a/bar.py',
+            'reason': 'Declared for a rename that the final design avoided',
+        }]
+
+    async def test_registered_tool_refuses_unknown_path_via_run(self, artifacts):
+        # tool.run() goes through FastMCP's pydantic argument validation,
+        # which tool.fn() bypasses — the real wire-level boundary.
+        self._three_file_plan(artifacts)
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('drop_plan_file')
+        assert tool is not None
+
+        result = await tool.run({
+            'path': 'mod_a/nope.py',
+            'reason': 'Never needed',
+        })
+
+        assert result.structured_content is not None
+        assert result.structured_content['status'] == 'error'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        assert plan.get('dropped_files', []) == []
