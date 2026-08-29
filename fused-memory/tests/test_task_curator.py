@@ -5284,6 +5284,78 @@ class TestPremiseGuardRunsOffEventLoop:
             if r.levelno >= logging.WARNING
         )
 
+    async def test_registry_load_runs_off_event_loop(self, tmp_path):
+        """RED: the one-shot lazy registry load must also be offloaded.
+
+        This site is NOT the one task 4201 was filed against, but
+        measurement is what promotes it: load_premise_registry on the
+        shipped 11 KB config/recon_code_fix_premise_registry.yaml measures
+        9,917 us, of which only 21 us is read_text and 8,152 us is
+        pure-Python yaml.safe_load — ~8x the worst per-candidate
+        verification read, and by far the largest single event-loop stall
+        in this method. It runs on the first task submission each
+        fused-memory process sees, while the per-project curator write lock
+        is held. INV-8 (loop-thread-occupancy-bounded,
+        docs/legibility/design-invariants.md) names filesystem work
+        explicitly and gives asyncio.to_thread as the house pattern.
+
+        Delegates to the REAL load_premise_registry (captured before
+        patching) rather than stubbing a return value: a stub returning []
+        would make the thread-identity assertion vacuous by short-circuiting
+        at ``if not entries: return None`` before ever reaching the match/
+        verify path, and would not exercise a genuine refusal.
+        """
+        import threading
+
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        load_threads: list[int] = []
+
+        def recording_load(path):
+            load_threads.append(threading.get_ident())
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=recording_load,
+        ):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
+        assert len(load_threads) == 1  # lazy load, at most once per instance
+        assert decision1 is not None and decision1.action == "refuse"
+        assert decision2 is not None and decision2.action == "refuse"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
