@@ -3810,3 +3810,124 @@ def test_record_snapshot_is_frozen(tmp_path: Path) -> None:
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         snapshot.record = None  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# _HookSlugResolution -- carry the probe's read forward (task 4662)
+#
+# The ownership probe already reads the candidate slug's record. On the ADOPT
+# branch that candidate IS the slug the handler goes on to write, so its
+# snapshot is exactly the record about to be refreshed -- handing it forward
+# is what collapses the event onto one read. On the FORK branch the resolver
+# returns a DIFFERENT slug, so offering the rejected spawner's snapshot would
+# apply a nested claude's decision to the spawning session's record: the
+# ownership inversion tasks 4193 and 2511 both exist to prevent. Hence the
+# invariant asserted on EVERY shape below.
+# ---------------------------------------------------------------------------
+
+
+def test_resolution_adopts_and_carries_the_probes_snapshot(tmp_path: Path) -> None:
+    slug = 'session-cockpit-4662020'
+    _write_bound_parent(slug, tmp_path, 4662020)
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+
+    assert resolution.slug == slug
+    assert resolution.rejected_env_slug is None
+    assert resolution.snapshot is not None
+    assert resolution.snapshot.slug == resolution.slug
+    assert resolution.snapshot.record is not None
+    assert (
+        resolution.snapshot.record.to_dict()
+        == sr.read_record(slug, root=tmp_path).to_dict()
+    )
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == resolution.slug
+
+
+def test_resolution_forks_without_offering_the_rejected_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The snapshot belongs to the REJECTED slug, so it must not travel."""
+    slug = 'session-cockpit-4662021'
+    _write_bound_parent(slug, tmp_path, 4662021)
+    # Proven mismatch: the record is bound to 'uuid-parent', this is not it.
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+
+    assert resolution.slug != slug
+    assert resolution.rejected_env_slug == slug
+    assert resolution.snapshot is None
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == resolution.slug
+
+
+def test_resolution_reads_nothing_for_a_hand_launched_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No env slug: nothing to probe, so nothing is read (must-not-be-called)."""
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('nothing to probe for a hand-launched session')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+    hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
+
+    resolution = sh._resolve_hook_slug(hook_input, {}, tmp_path)
+
+    assert resolution.snapshot is None
+    assert resolution.rejected_env_slug is None
+    assert resolution.may_bind is True
+    assert sh.hook_session_slug(hook_input, {}, root=tmp_path) == resolution.slug
+
+
+def test_resolution_blank_stdin_session_id_reads_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-discriminator early return reads nothing, so carries nothing."""
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('the blank-session_id early return reads no record')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+    slug = 'session-cockpit-4662022'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    hook_input = {'session_id': '  ', 'cwd': '/home/leo/src/dark-factory'}
+
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+
+    assert resolution.slug == slug
+    assert resolution.may_bind is True
+    assert resolution.snapshot is None
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == resolution.slug
+
+
+def test_resolution_snapshot_slug_invariant_holds_on_every_shape(
+    tmp_path: Path,
+) -> None:
+    """INVARIANT: a snapshot is attached only when it IS the returned slug.
+
+    Asserted across all four resolver shapes rather than left to the reader
+    of the branch, because a mis-attached snapshot would fail silently and
+    only under a nested-claude race.
+    """
+    adopted = 'session-cockpit-4662023'
+    forked = 'session-cockpit-4662024'
+    _write_bound_parent(adopted, tmp_path, 4662023)
+    _write_bound_parent(forked, tmp_path, 4662024)
+    cwd = '/home/leo/src/dark-factory'
+    shapes = [
+        ({'session_id': 'uuid-parent', 'cwd': cwd}, {'CLAUDE_SPAWN_SESSION_ID': adopted}),
+        ({'session_id': 'uuid-nested', 'cwd': cwd}, {'CLAUDE_SPAWN_SESSION_ID': forked}),
+        ({'session_id': 'sess-hand', 'cwd': cwd}, {}),
+        ({'session_id': '  ', 'cwd': cwd}, {'CLAUDE_SPAWN_SESSION_ID': adopted}),
+    ]
+    for hook_input, env in shapes:
+        resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+        assert resolution.snapshot is None or resolution.snapshot.slug == resolution.slug
+        # hook_session_slug's public signature and str return are unchanged.
+        public = sh.hook_session_slug(hook_input, env, root=tmp_path)
+        assert isinstance(public, str)
+        assert public == resolution.slug
