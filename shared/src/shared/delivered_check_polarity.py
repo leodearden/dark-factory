@@ -91,6 +91,16 @@ non-obvious and easy to diverge on:
 One builder plus one interpreter makes divergence structurally
 impossible.
 
+NEVER RAISES. :func:`lint_delivered_checks` returns findings for any
+input — malformed check entries, a non-repo root, a missing ``git``, a
+metadata blob that will not parse. Both wire points depend on that
+unconditionally and for OPPOSITE reasons: ``commit_planning`` would turn
+an exception into a planning outage, and ``stamp_capability_manifests``
+is contractually never-raising, so an exception there would abort the
+very status flip it was called from. The three dispositions
+(:class:`CheckFinding`'s ``severity``) are how a caller tells a measured
+defect from an undecidable case from an availability failure.
+
 IMPORT-LIGHT BY DESIGN. stdlib only — no pydantic, no ``fused_memory``,
 no ``orchestrator``. ``shared/`` is the only package both fused-memory
 and orchestrator already depend on (fused-memory must not import
@@ -100,6 +110,7 @@ and runtime call sites share code at all.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -114,8 +125,10 @@ __all__ = [
     'CheckOutcome',
     'build_grep_argv',
     'evaluate_grep_at_tree',
+    'extract_delivered_checks',
     'interpret_grep_rc',
     'lint_delivered_checks',
+    'polarity_error',
 ]
 
 logger = logging.getLogger(__name__)
@@ -320,6 +333,18 @@ def _unevaluable_message(name: str, ref: str, repo_root: str | Path) -> str:
     )
 
 
+def _strings_only(values: object) -> list[str]:
+    """The string entries of *values*, or ``[]`` for a non-sequence.
+
+    Mirrors ``extract_files``' closing ``[f for f in files if
+    isinstance(f, str)]`` — the same benign filtering, applied to the
+    ``paths``/``files`` lists the lint is handed.
+    """
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [v for v in values if isinstance(v, str)]
+
+
 def lint_delivered_checks(
     checks: Iterable[object],
     *,
@@ -358,14 +383,37 @@ def _lint_one_check(
 
     *check* is typed ``Any`` because it is a RAW metadata dict off the
     wire, not a validated ``DeliveredCheckMeta`` — the lint runs at
-    authoring time precisely to catch entries a schema check cannot.
+    authoring time precisely to catch entries a schema check cannot. Every
+    field is therefore re-checked here rather than trusted.
+
+    The three skip guards below all run BEFORE any subprocess:
+
+    * ``kind != 'grep'`` — the 2x2 is a statement about grep POLARITY, and
+      a script check has no ``expect`` to invert. A script-only batch must
+      cost nothing.
+    * no usable ``name`` — a finding is addressed to a check BY NAME;
+      without one there is nothing a caller could report or an author could
+      fix, so reporting it under a name that does not exist would be worse
+      than skipping.
+    * no usable ``pattern`` — a grep check without one is a SCHEMA defect,
+      not a polarity defect, and there is nothing to grep for. The metadata
+      validator owns that diagnosis.
     """
-    if check.get('kind') != 'grep':
+    if not isinstance(check, dict) or check.get('kind') != 'grep':
         return None
     name = check.get('name')
+    if not isinstance(name, str) or not name:
+        return None
     pattern = check.get('pattern')
+    if not isinstance(pattern, str) or not pattern:
+        return None
     expect = check.get('expect')
-    paths = check.get('paths')
+    # A non-string entry in `paths` would be handed to subprocess as an argv
+    # element and raise TypeError; in `files` it would reach `.rstrip`.
+    # Dropping them keeps the check EVALUABLE against the usable entries,
+    # degrading to a verdict rather than to an exception.
+    paths = _strings_only(check.get('paths'))
+    files = _strings_only(files)
 
     outcome = evaluate_grep_at_tree(
         pattern, paths, expect=expect, repo_root=repo_root, ref=ref
@@ -733,3 +781,126 @@ def _absent_overbroad_finding(
         ),
         detail=_format_sites(outside),
     )
+
+
+# ---------------------------------------------------------------------------
+# Wire adapters
+# ---------------------------------------------------------------------------
+
+
+def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
+    """Pull ``metadata.delivered_checks`` out of whatever shape arrived.
+
+    BENIGN-ABSENT: every malformed or missing shape resolves to ``[]``
+    rather than raising, because a gate that can raise on a metadata shape
+    it did not anticipate would take down planning for a defect it was not
+    even built to catch.
+
+    Rules, mirroring
+    ``fused_memory.middleware.lock_charter_guard.extract_files`` case for
+    case:
+
+    * ``None`` → ``[]``
+    * ``dict`` → used directly
+    * ``''`` → ``[]`` (benign-absent, not a discard)
+    * ``str`` → ``json.loads``; on failure, or a non-object result → ``[]``
+    * anything else (list, int, ...) → ``[]``
+    * no ``delivered_checks`` key, or a non-list value → ``[]``
+    * non-dict entries inside the list are filtered out
+
+    That function is the SPEC this is kept in sync with, and it is
+    DUPLICATED rather than imported for one structural reason: it lives in
+    ``fused_memory``, and ``shared`` must not import ``fused_memory`` (the
+    dependency runs the other way — this module exists in ``shared``
+    precisely so both ``fused_memory`` and ``orchestrator`` can reach it).
+    ``capability_manifest_corpus.MANIFEST_SUFFIX`` re-declares a
+    ``fused_memory`` constant for the same reason.
+
+    The one deliberate divergence: ``extract_files`` routes its ``str``
+    branch through ``shared.task_metadata.parse_metadata`` to emit a
+    ``task_metadata.schema_warning``. That warning is the lock-charter
+    guard's own contract, not this one's — here an unreadable metadata blob
+    means "no checks to lint", and the caller's own metadata validation is
+    what reports the blob itself.
+    """
+    parsed: dict[str, Any] | None = None
+    if isinstance(metadata, dict):
+        parsed = metadata
+    elif isinstance(metadata, str) and metadata:
+        try:
+            decoded = json.loads(metadata)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(decoded, dict):
+            parsed = decoded
+
+    if parsed is None:
+        return []
+
+    checks = parsed.get('delivered_checks')
+    if not isinstance(checks, list):
+        return []
+    return [c for c in checks if isinstance(c, dict)]
+
+
+#: The remedy every measured repair actually used. Stated POSITIVELY on
+#: purpose: all three specimens were fixed by asserting the symbol the
+#: producer INTRODUCES rather than by banning the one it removes, and a
+#: reject an author cannot act on is only noise.
+_POLARITY_HINT = (
+    'Replace each rejected check with one that asserts the NEW symbol the '
+    'producer introduces (kind=grep, expect=present, pattern = a class, '
+    'function or constant that does not exist yet), scoped with `paths` to the '
+    'files this task actually writes. That is the shape every measured repair '
+    'took, and it is the only shape the gate can observe going green. '
+    'The invariant: a sound delivered_check FAILS at the authoring tree and '
+    'PASSES once its producer lands. A check that is already green the day it '
+    'is written can never signal anything — it gates nothing, and its dependent '
+    'is dispatched as if unguarded. A check that can NEVER go green is worse: '
+    'it blocks its dependent forever, and at runtime that is indistinguishable '
+    'from a genuinely undelivered capability.'
+)
+
+
+def polarity_error(
+    findings: Sequence[CheckFinding], *, task_id: str | None = None
+) -> dict[str, Any]:
+    """Build the ``DeliveredCheckPolarityViolation`` reject payload.
+
+    Shape mirrors
+    ``fused_memory.middleware.lock_charter_guard.lock_charter_error``'s
+    ``{error, error_type, <detail>, hint}`` convention — including the
+    ``(task N)`` parenthetical and its disappearance when *task_id* is
+    ``None`` — so an MCP caller handles this through the same code path it
+    already uses for ``LockCharterViolation``.
+
+    ONLY ``severity='reject'`` findings enter the payload. A ``'warn'`` is
+    undecidable at authoring time (MODE 2) and an ``'errored'`` is an
+    availability failure; letting either in would silently convert a
+    deliberately non-blocking disposition into a blocking one, which is the
+    exact inversion the WARN and fail-open-on-infra choices exist to
+    prevent. Those findings are still REPORTED by the caller, just not here.
+    """
+    rejects = [f for f in findings if f.severity == 'reject']
+    task_clause = f' (task {task_id})' if task_id else ''
+    check_list = ', '.join(f'{f.check_name!r} [{f.code}]' for f in rejects)
+    return {
+        'error': (
+            f'metadata.delivered_checks contains {len(rejects)} check(s) that are '
+            f'already satisfied at the authoring tree, or can never be satisfied'
+            f'{task_clause}: {check_list}. Such a check gates nothing (or gates '
+            f'forever), and at runtime a mis-authored check is indistinguishable '
+            f'from a genuinely undelivered capability.'
+        ),
+        'error_type': 'DeliveredCheckPolarityViolation',
+        'checks': [
+            {
+                'name': f.check_name,
+                'code': f.code,
+                'message': f.message,
+                'detail': list(f.detail),
+            }
+            for f in rejects
+        ],
+        'hint': _POLARITY_HINT,
+    }
