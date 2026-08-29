@@ -11,9 +11,18 @@ ARM 1 — the writer instructions. ``METADATA_VOCABULARY_INSTRUCTIONS`` in
 every memory-writing agent role. Adding a key to ``RESERVED_VOCABULARY_KEYS``
 without documenting it, or renaming one, fails here.
 
-ARM 2 — the reconciliation stage prompts, whose ``'kind': '<literal>'`` filter
-examples must name kinds that are in ``KIND_REGISTRY``, so a kind rename cannot
-silently strand recon agents emitting filters that match nothing.
+ARM 2 — the agent-facing surfaces that show a memory kind: the reconciliation
+stage prompts and the ``count_memories_by_metadata`` tool docstring. Every kind
+literal they show — in the ``'kind': '<literal>'`` filter-dict spelling AND in
+the ``metadata.kind = "<literal>"`` / ``record_kind = "<literal>"`` schema
+spelling the stage prompts' schema sections use — must name a kind that is in
+``KIND_REGISTRY``, so a kind rename cannot silently strand agents emitting
+filters that match nothing.
+
+ARM 2 is deliberately NOT exhaustive over every possible spelling: it pins the
+surfaces and syntaxes that were measured to carry kinds, and a novel spelling
+introduced later would be invisible to it. Extend the regex and
+``_PROMPT_SOURCES`` when one appears rather than assuming the coverage is total.
 
 WHY THIS FILE LIVES IN fused-memory/tests: this suite's pytest config already
 declares ``pythonpath = ["src", "../orchestrator/src"]``, so BOTH
@@ -39,7 +48,10 @@ those sentences, so that edit and this pin cannot collide.
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import re
+from pathlib import Path
 
 import pytest
 from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS, METADATA_VOCABULARY_INSTRUCTIONS, ROLES
@@ -47,6 +59,7 @@ from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS, METADATA_VOCABULARY_
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
     RESERVED_VOCABULARY_KEYS,
+    TOPIC_SLUG_MAX_LEN,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
@@ -64,20 +77,69 @@ _MEMORY_ROLES = sorted(
 )
 
 
+def _defines(text: str, key: str) -> bool:
+    """Does *text* carry a line whose LEADING reserved key is *key*?
+
+    A bare ``key in text`` substring check is vacuous for the deletion case on
+    two of the five keys (review, task 3202): ``topic`` also occurs inside the
+    ``canonical`` bullet ("requires ``topic``") and ``kind`` inside the
+    ``parent_id`` bullet ("kinds ``amendment``…"), so deleting either bullet
+    outright leaves a bare check green while writers lose the documentation.
+
+    "Leads a line" is the weakest structure that separates a key's own
+    DEFINITION from an incidental cross-reference to it: wherever the section
+    defines a key it names that key before it names any other, and wherever it
+    merely cites one, some other key came first. Deliberately NOT a bullet /
+    backtick / em-dash shape pin — an earlier such regex was removed in review
+    for going red on cosmetic reflow — so markers, punctuation, ordering and
+    wording all stay free to change.
+
+    Known and accepted limit: if a reflow ever wrapped a cross-reference onto
+    its own continuation line, that line would "lead" with the cited key and
+    this would go falsely green for it. That is strictly better than the bare
+    substring check it replaces, and it never goes falsely RED.
+    """
+    for line in text.splitlines():
+        positions = {k: line.find(k) for k in RESERVED_VOCABULARY_KEYS}
+        present = {k: i for k, i in positions.items() if i >= 0}
+        if key in present and present[key] == min(present.values()):
+            return True
+    return False
+
+
 class TestReservedKeysReachTheWriters:
     """ARM 1: the writer-facing text names every key the write path validates.
 
-    Registry-derived and reflow-proof: each reserved key is looked up as a
-    plain substring, so the section can be reworded or relaid-out freely. What
-    it does catch is the PRD §6 gap this task closes — a key that the writer
-    path enforces but no agent was ever told about.
+    Registry-derived and reflow-proof: the key set is read from
+    ``RESERVED_VOCABULARY_KEYS`` and located structurally (see ``_defines``),
+    so the section can be reworded or relaid-out freely. What it does catch is
+    the PRD §6 gap this task closes — a key that the writer path enforces but
+    no agent was ever told about — and, now, a documented key that later gets
+    deleted.
     """
 
     @pytest.mark.parametrize('key', sorted(RESERVED_VOCABULARY_KEYS))
     def test_every_reserved_key_is_documented(self, key: str) -> None:
-        assert key in METADATA_VOCABULARY_INSTRUCTIONS, (
-            f'reserved key {key!r} is validated on write but never named in the '
-            f'writer instructions — writers cannot use a key they are not told about'
+        assert _defines(METADATA_VOCABULARY_INSTRUCTIONS, key), (
+            f'reserved key {key!r} is validated on write but has no line of its own '
+            f'in the writer instructions — writers cannot use a key they are not '
+            f'told about, and a passing mention elsewhere is not documentation'
+        )
+
+    def test_topic_slug_cap_resolves_to_the_registry_value(self) -> None:
+        """The one registry SCALAR the writer prose quotes must be the live one.
+
+        The orchestrator package cannot import ``fused_memory``, so the cap
+        cannot be interpolated into ``METADATA_VOCABULARY_INSTRUCTIONS`` and is
+        hand-written there. Raising ``TOPIC_SLUG_MAX_LEN`` without updating the
+        prose would leave every agent briefing quietly stating the wrong limit
+        — the exact miscommunication this leaf exists to close (review, task
+        3202). A value-RESOLUTION check, not a wording pin: any reflow that
+        keeps the number stays green.
+        """
+        assert str(TOPIC_SLUG_MAX_LEN) in METADATA_VOCABULARY_INSTRUCTIONS, (
+            f'the writer instructions do not state the live topic-slug cap '
+            f'({TOPIC_SLUG_MAX_LEN}); writers cannot obey a cap they are not told'
         )
 
     @pytest.mark.parametrize('role_name', _MEMORY_ROLES)
@@ -94,28 +156,98 @@ class TestReservedKeysReachTheWriters:
         assert _MEMORY_ROLES
 
 
-_KIND_LITERAL_RE = re.compile(r"'kind':\s*'([^']+)'")
+#: Both spellings an agent-facing surface uses to show a memory kind:
+#:
+#: * the MAPPING form ``'kind': '<value>'`` / ``"kind": "<value>"`` — the filter
+#:   dict a recon prompt or a tool docstring tells the agent to emit;
+#: * the ASSIGNMENT form ``metadata.kind = "<value>"`` / ``record_kind =
+#:   "<value>"`` — how the stage prompts' schema sections state the kind a
+#:   record must carry (``render_suppression_schema_section``,
+#:   ``render_entity_standing_decision_schema_section``,
+#:   ``render_investigation_outcome_section``, all spliced into STAGE1/STAGE2).
+#:   The assignment form was invisible to this pin until review (task 3202), so
+#:   a rename of ``stage1_flag_suppression`` / ``entity_standing_decision`` /
+#:   ``investigation_outcome`` was unguarded.
+#:
+#: The ``kind`` token must be quote- or dot-/underscore-prefixed, which is what
+#: keeps ``task_kind='deterministic'`` and ``task_kind='predicate'`` out: those
+#: are TASK metadata (see ``docs/task-authoring.md``) and are deliberately not
+#: KIND_REGISTRY members, so matching them would fail this pin spuriously.
+_KIND_LITERAL_RE = re.compile(
+    r"""(?:
+          'kind':\s*'(?P<sq_mapping>[^']+)'
+        | "kind":\s*"(?P<dq_mapping>[^"]+)"
+        | (?:metadata\.|record_)kind\s*=\s*'(?P<sq_assign>[^']+)'
+        | (?:metadata\.|record_)kind\s*=\s*"(?P<dq_assign>[^"]+)"
+        )""",
+    re.VERBOSE,
+)
 
+
+def _tool_docstring(module_name: str, func_name: str) -> str:
+    """Return the docstring of the tool function *func_name* in *module_name*.
+
+    Parsed out of the module SOURCE with ``ast`` rather than read off an
+    attribute, because MCP tools are nested inside the registration function
+    and only exist once a server has been constructed — a dependency this pin
+    must not acquire. ``find_spec`` locates the file without executing it.
+
+    Scoped to the one function on purpose. Scanning the whole module was
+    measured and is wrong: ``server/tools.py`` also documents
+    ``done_provenance``'s ``'kind': 'merged'``, which is TASK metadata and
+    correctly absent from ``KIND_REGISTRY``.
+    """
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        raise RuntimeError(f'cannot locate source of {module_name!r} to pin its tool docstrings')
+    tree = ast.parse(Path(spec.origin).read_text(encoding='utf-8'))
+    defs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name
+    ]
+    if len(defs) != 1:
+        raise RuntimeError(
+            f'expected exactly one def of {func_name!r} in {module_name}, found {len(defs)} — '
+            f'the tool was renamed or duplicated; update this pin rather than dropping it'
+        )
+    doc = ast.get_docstring(defs[0])
+    if not doc:
+        raise RuntimeError(f'{func_name} in {module_name} has no docstring left to pin')
+    return doc
+
+
+#: Agent-facing surfaces carrying kind examples. "Prompt" here means anything
+#: an agent reads and copies from: the recon stage prompts AND the MCP tool
+#: docstrings, which reach an agent through the tool listing just as directly.
 _PROMPT_SOURCES = {
     'STAGE1_SYSTEM_PROMPT': STAGE1_SYSTEM_PROMPT,
     'STAGE2_SYSTEM_PROMPT': STAGE2_SYSTEM_PROMPT,
     "build_stage2_system_prompt('dark_factory')": build_stage2_system_prompt('dark_factory'),
     'STAGE3_SYSTEM_PROMPT': STAGE3_SYSTEM_PROMPT,
     'render_cycle_summary_section()': render_cycle_summary_section(),
+    'count_memories_by_metadata.__doc__': _tool_docstring(
+        'fused_memory.server.tools', 'count_memories_by_metadata'
+    ),
 }
 
 
 def _kind_literals(text: str) -> set[str]:
-    """Extract the ``'kind': '<value>'`` filter literals a prompt shows an agent.
+    """Extract the memory-kind literals an agent-facing surface shows.
 
-    This matches the literal dict syntax the agent is being told to emit — not
-    prose formatting — which is why it is a fair thing to pin.
+    This matches the literal syntax the agent is being told to emit or expect —
+    not prose formatting — which is why it is a fair thing to pin.
     """
-    return set(_KIND_LITERAL_RE.findall(text))
+    return {
+        value
+        for match in _KIND_LITERAL_RE.finditer(text)
+        for value in match.groups()
+        if value is not None
+    }
 
 
 class TestReconPromptKindLiteralsPinned:
-    """ARM 2: every ``'kind'`` filter example a recon prompt shows is REGISTERED.
+    """ARM 2: every kind example an agent-facing surface shows is REGISTERED.
 
     This is the INV-5 guard for ``render_cycle_summary_section``: if it re-typed
     the literal instead of interpolating ``CYCLE_SUMMARY_KIND``, a rename in
