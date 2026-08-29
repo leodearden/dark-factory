@@ -199,8 +199,11 @@ class TestDetectResumableProgress:
         ) is True
 
     def test_unknown_block_type_is_true(self) -> None:
-        """A block type this predicate does not model (e.g. a future
-        'thinking'/'server_tool_use' shape) must not be read as emptiness."""
+        """A block type this predicate does not model must not be read as
+        emptiness.  'thinking' is NOT a future shape -- it is present in all 89
+        measured orchestrator transcripts -- so this arm is live today; see the
+        block-classification comment in
+        ``shared/src/shared/cli_invoke.py::detect_resumable_progress``."""
         assert detect_resumable_progress(
             [_assistant([{'type': 'server_tool_use', 'name': 'WebSearch'}])]
         ) is True
