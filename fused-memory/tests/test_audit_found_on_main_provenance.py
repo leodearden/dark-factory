@@ -605,6 +605,216 @@ class TestCitationGatePositiveArmStampChoice:
         assert verdict == 'ok'
 
 
+def _merge_audit(*, task_id='50', commit_message='', second_parent_commits=None, **kw):
+    """Build a TaskProvenanceAudit carrying second-parent facts.
+
+    Constructs TaskProvenanceAudit directly (not via _audit(), which would
+    make the whole classify suite RED) so that passing the not-yet-existing
+    `second_parent_commits` kwarg gives a clean, localized RED —
+    ``TypeError: __init__() got an unexpected keyword argument
+    'second_parent_commits'`` — rather than silently no-opping.
+    """
+    return TaskProvenanceAudit(
+        task_id=task_id, title='t', commit='a' * 40, note='n',
+        declared_files=list(kw.pop('declared_files', []) or []),
+        is_ancestor=True, commit_message=commit_message,
+        second_parent_commits=list(second_parent_commits or []), **kw,
+    )
+
+
+class TestClassifyCoalescedMerge:
+    """The coalesce clearance: a cited merge's second parent can clear a
+    misattribution when the audited task cites itself somewhere in what
+    the merge actually brought in (see plan.json's "THE FIX" for task
+    4706). All pure classify() tests, no git."""
+
+    # -- Clearance --------------------------------------------------------
+
+    def test_self_citation_under_second_parent_is_not_misattributed(self):
+        """Merge subject cites only task 77; the second parent carries a
+        commit citing task 50 — the audited task's own work was coalesced
+        into someone else's merge, so this is not misattribution."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
+        assert verdict != 'misattributed'
+
+    def test_reason_records_why_it_was_cleared(self):
+        """A human sees WHY it was cleared: the clearing commit's sha and
+        the audited task id both appear in the reasons (task 4706's
+        requirement 3)."""
+        clearing_sha = 'b' * 40
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        _verdict, reasons = classify(audit)
+        joined = ' '.join(reasons)
+        assert clearing_sha in joined
+        assert '50' in joined
+
+    def test_task_slash_form_under_second_parent_clears(self):
+        """The task/50 slash form is the ONLY one of the four real records
+        this mechanism actually clears — task 3103 / c7dcc4f9d4, see
+        esc-4706-1 — so it's pinned here by name as the load-bearing case."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('c' * 40, 'resolve: merge conflicts for task/50')],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict != 'misattributed'
+
+    def test_clearance_still_yields_reverted_when_the_commit_was_reverted(self):
+        """Clearance never changes which verdict wins the ladder — a
+        reverted commit still resolves to reverted, with the clearance
+        reason present alongside the revert reason."""
+        clearing_sha = 'b' * 40
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            revert_commit='f' * 40,
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'reverted'
+        joined = ' '.join(reasons)
+        assert 'revert' in joined.lower()
+        assert clearing_sha in joined
+
+    def test_clearance_still_yields_deliverable_absent_when_no_declared_file_landed(self):
+        """Clearance tightens on content lineage without loosening
+        deliverable_absent — a cleared task whose declared file never
+        landed is still deliverable_absent, with the clearance reason
+        present alongside."""
+        clearing_sha = 'b' * 40
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[(clearing_sha, 'impl(50): the audited task step')],
+            declared_files=['src/f.py'], commit_files=['other.py'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'deliverable_absent'
+        assert clearing_sha in ' '.join(reasons)
+
+    # -- Negative controls (do not omit) -----------------------------------
+
+    def test_second_parent_citing_only_other_tasks_is_still_misattributed(self):
+        """Synthetic reproduction of the PRD's two proven fabrications —
+        task 2394 / b045a72de2 (12 commits under ^2, 0 self-citing) and
+        task 2531 / b929f4441d (16 commits under ^2, 0 self-citing) — both
+        stay misattributed after this fix: nothing under the second parent
+        cites the audited task at all."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[
+                ('b' * 40, 'impl(77): step one'),
+                ('c' * 40, 'test(77): step two'),
+            ],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    def test_empty_second_parent_commits_is_still_misattributed(self):
+        """`[]` covers non-merge, git failure, timeout, and missing binary
+        alike — a git failure must not change the verdict, at the
+        classifier level too."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main', second_parent_commits=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    def test_bare_paren_self_citation_under_second_parent_does_not_clear(self):
+        """Task 4705 retired the bare-paren citation form, and this walk
+        reuses the SAME extract_cited_task_ids — so a bare-paren self-
+        citation under the second parent does not clear either, keeping
+        the two siblings consistent."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'chore: sweep (50)')],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    # -- Real non-clearing shapes (measured limit, esc-4706-1) --------------
+
+    @pytest.mark.parametrize('message', [
+        pytest.param(
+            'feat(orchestrator): allowlist-gate terminal-subject sweep (task 50 step-8)',
+            id='task_2724_shape',
+        ),
+        pytest.param(
+            'amend: tighten the predicate\n\nAddresses the review pass on task 50.',
+            id='task_2949_shape',
+        ),
+        pytest.param(
+            'amend: repair assertions\n\nrestoring the pre-50 cost of two scans',
+            id='task_3610_shape',
+        ),
+    ])
+    def test_real_shapes_that_do_not_clear(self, message):
+        """Measured limit (esc-4706-1): these three real found_on_main
+        records — tasks 2724, 2949 and 3610 — are NOT cleared by this
+        change, correcting the task description's Details line. Recorded
+        as a measured fact, not an aspiration: each message mentions task
+        50 only as a raw substring, never in a form
+        extract_cited_task_ids accepts."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, message)],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'misattributed'
+
+    # -- Unverifiable arm ----------------------------------------------------
+
+    def test_clearance_with_no_declared_files_is_ok_not_unverifiable(self):
+        """Clearance and 'no declared files' both answer the same question
+        ('did this task's work actually ride in?') — answering differently
+        would emit a reasons list contradicting itself."""
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[('b' * 40, 'impl(50): the audited task step')],
+            declared_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
+    def test_no_clearance_and_no_declared_files_is_still_unverifiable(self):
+        """No citation anywhere (not even of another task) and no
+        clearance — unverifiable stays unchanged."""
+        audit = _merge_audit(
+            commit_message='chore: general cleanup', second_parent_commits=[],
+            declared_files=[],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'unverifiable'
+
+    # -- First-match determinism ----------------------------------------------
+
+    def test_first_matching_commit_in_walk_order_is_reported(self):
+        """When two commits under ^2 both cite 50, the reason names the
+        FIRST one in the given walk order, not the second."""
+        first_sha = 'b' * 40
+        second_sha = 'c' * 40
+        audit = _merge_audit(
+            commit_message='Merge task/77 into main',
+            second_parent_commits=[
+                (first_sha, 'impl(50): first matching commit'),
+                (second_sha, 'impl(50): second matching commit'),
+            ],
+            declared_files=['src/f.py'], commit_files=['src/f.py'],
+        )
+        _verdict, reasons = classify(audit)
+        joined = ' '.join(reasons)
+        assert first_sha in joined
+        assert second_sha not in joined
+
+
 # ===========================================================================
 # Step-9/10: classify — reverted (post-hoc-revert blind spot)
 # ===========================================================================
