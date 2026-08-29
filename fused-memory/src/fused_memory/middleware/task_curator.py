@@ -606,6 +606,15 @@ class TaskCurator:
         # only the YAML load itself is cached for the instance lifetime.
         self._premise_registry: list | None = None
         self._premise_registry_load_attempted: bool = False
+        # Guards the one-shot lazy load above. Needed because the load is
+        # offloaded via asyncio.to_thread: the await point means a concurrent
+        # caller could otherwise observe load_attempted=True with
+        # _premise_registry still None and silently fail the guard open. One
+        # TaskCurator instance is shared across projects while the
+        # interceptor's curator lock is per-project, so concurrent entry is
+        # reachable. asyncio.Lock() is loop-agnostic at construction on
+        # Python 3.13, so building it here in __init__ is safe.
+        self._premise_registry_load_lock = asyncio.Lock()
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
@@ -1015,12 +1024,25 @@ class TaskCurator:
         # single event-loop stall in this method, paid on the first task
         # submission per process while the per-project curator write lock is
         # held.
+        #
+        # Double-checked lock: the await point inside the offloaded load
+        # means a concurrent second caller could otherwise observe
+        # load_attempted=True while self._premise_registry is still None and
+        # silently fail the guard open. The outer unlocked check keeps the
+        # steady-state path (every call after the first) lock-free; the
+        # inner re-check under the lock is what makes concurrent first calls
+        # correct. The flag is set only AFTER the assignment so nobody can
+        # observe the attempted-but-unassigned window.
         if not self._premise_registry_load_attempted:
-            self._premise_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                raw_path = self._cwd / raw_path
-            self._premise_registry = await asyncio.to_thread(load_premise_registry, raw_path)
+            async with self._premise_registry_load_lock:
+                if not self._premise_registry_load_attempted:
+                    raw_path = Path(cfg_path)
+                    if not raw_path.is_absolute():
+                        raw_path = self._cwd / raw_path
+                    self._premise_registry = await asyncio.to_thread(
+                        load_premise_registry, raw_path,
+                    )
+                    self._premise_registry_load_attempted = True
 
         entries = self._premise_registry
         if not entries:
