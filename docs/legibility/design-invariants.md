@@ -11,9 +11,10 @@ the reconciliation loop-blocking incident (task 3778); INV-9 was added
 (esc-6107-7, plus five further instances measured 2026-08-22→24);
 INV-10 was added 2026-08-30 from the doc-guard reconciliation
 (task 4666); INV-11 was added by promoting `no-silent-fail-soft`,
-which this codebase had minted independently across 56 files and
-cited as if canonical while no heading defined it (task 3803;
-rehearsal walked 2026-08-20). They gate `/prd`
+which this codebase had minted independently across 55 tracked files
+(measured on base eba215060c — a pinned measurement, not a live count:
+it grows as citations accrue) and cited as if canonical while no
+heading defined it (task 3803; rehearsal walked 2026-08-20). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -336,7 +337,8 @@ an empty/None value with no WARN+ log and no re-raise, against the
 burn-down allowlist `shared/tests/silent_fallthrough_allowlist.py`
 (scanner `shared/tests/silent_fallthrough_scan.py`, PRD
 `plans/silent-fallthrough-dedup-prd.md`). The concept was ALSO minted
-independently as a bare phrase across 56 files; where those citations
+independently as a bare phrase across 55 tracked files (measured on base
+eba215060c; the figure grows as citations accrue); where those citations
 reached for a number they split five to INV-2 and one to INV-4, and the
 INV-4 one needed both invariants in a single sentence because neither fit
 alone (task 3803).

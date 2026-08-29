@@ -641,7 +641,7 @@ def invariant_alias_pairs(text: str, *, source: str) -> list[AliasPair]:
     attributed exactly once, to the line it starts on. MEASURED on base
     eba215060c: 21 pairings span a line break repo-wide and one of them is
     genuine drift — ``fused-memory/scripts/census_memory_metadata.py:163``,
-    where ``INV-2`` ends :162 and ``no-silent-fail-soft`` opens :163. A
+    where ``INV-2`` ends :163 and ``no-silent-fail-soft`` opens :164. A
     line-scoped extractor misses it while reporting a smaller, cleaner result.
 
     A hyphen-wrapped slug (``contracts-machine-`` / ``checked``) yields its
@@ -734,14 +734,26 @@ def near_miss_alias_pairs(
     1. Under its OWN number, a token equal to the canonical slug is clean — and
        so is a segment-wise PROPER PREFIX of it. The prefix carve-out is
        load-bearing: without it the guard fires on twelve correct citations
-       against eight true hits (``INV-4 storm-escape`` at merge_queue.py:2784,
-       workflow.py:6633, deterministic_runner.py:293 and :1567,
-       test_merge_queue.py:14976, test_workflow_ready_to_merge.py:551,
-       test_memory_service.py:2408, test_referent_queue_threading.py:658,
-       test_prompt_artifact.py:736; ``INV-2 structured-facts`` at
-       consolidation.py:282 and test_task_interceptor.py:8729; and
-       ``INV-1 contracts-machine`` at task_runtime.py:25, where the full slug is
-       hyphen-wrapped across a comment line break). Shorthand and line wraps are
+       against eight true hits (measured on base eba215060c) —
+       ``INV-4 storm-escape`` at
+       ``orchestrator/src/orchestrator/merge_queue.py::_run_post_merge_verify``,
+       ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_ready_to_merge_report``,
+       ``orchestrator/src/orchestrator/deterministic_runner.py``'s module
+       docstring and
+       ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._file_curator_adjudication_missing_and_block``,
+       ``orchestrator/tests/test_merge_queue.py::TestRunPostMergeVerify.test_deterministic_red_attempt0_never_narrowed_retried``,
+       ``orchestrator/tests/test_workflow_ready_to_merge.py::TestReadyToMergeIdempotency``,
+       ``fused-memory/tests/test_memory_service.py::TestUpdateMemoryStormCounter``,
+       ``fused-memory/tests/test_referent_queue_threading.py::TestReferentSourceCounter``,
+       ``shared/tests/test_prompt_artifact.py::TestUnreadableProvenanceWarns``;
+       ``INV-2 structured-facts`` at
+       ``fused-memory/src/fused_memory/server/consolidation.py::validate_consolidate_args``
+       and
+       ``fused-memory/tests/test_task_interceptor.py::TestProseAdvisoryDeliverableAttribution.test_suppression_is_logged_with_structured_facts``;
+       and ``INV-1 contracts-machine`` in the module docstring of
+       ``dashboard/src/dashboard/data/task_runtime.py`` (NOT the same-basename
+       ``orchestrator/src/orchestrator/task_runtime.py``), where the full slug is
+       hyphen-wrapped across a comment line break. Shorthand and line wraps are
        how this repo actually cites invariants in prose, and a guard wrong more
        often than right gets silenced.
 
