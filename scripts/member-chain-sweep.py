@@ -33,7 +33,9 @@ action on it -- and on any L2 whose cascade would close it -- with
 `declared_pin_refused`. Check that field before proposing any
 disposition. It does NOT make this output actionable: the marker is
 opt-in, so an EMPTY `pin_declared_by` means "not declared", not "safe" --
-esc-3105-3 is exactly the shape that would be lost to that assumption.
+esc-3105-3 is exactly the shape that would be lost to that assumption,
+and it is itself still undeclared (writing the marker is operator/
+steward-only via the `declare_pin` MCP tool; no rotation holds it).
 
 Usage:
     member-chain-sweep.py                 # sweep the default fleet queues

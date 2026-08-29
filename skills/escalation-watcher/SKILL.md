@@ -1034,7 +1034,11 @@ read it on the drain; `pin_declared_reason` (the free-text why) is only on the f
 exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
 check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
 it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
-companions before proposing any disposition remains the protection.
+companions before proposing any disposition remains the protection. Note also who can WRITE the
+marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
+(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
+likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
+appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
 
 **If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
 done by hand): before designating any survivor, run this check on the shared members. Never keep

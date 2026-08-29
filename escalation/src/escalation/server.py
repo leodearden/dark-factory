@@ -2424,6 +2424,23 @@ def create_server(
         APPENDED in declaration order.  *reason* is the free-text why,
         overwritten only when non-empty.
 
+        WHO CAN CALL THIS, stated because it is a real limitation and not an
+        oversight: declaring is **operator/steward/interactive-session only**
+        in this task's scope.  The escalation-watcher-auto rotation — the agent
+        most likely to *notice* that a record is load-bearing — CANNOT declare
+        one: ``orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS``
+        grants it ``stamp_triage`` (the ungated-annotation precedent this tool
+        mirrors) but not ``declare_pin``, and dispatched task agents hold only
+        ``escalate_info`` / ``escalate_blocker``
+        (``orchestrator/src/orchestrator/agents/roles.py``).  Wiring the
+        rotation as a writer is deliberately OUT OF SCOPE here — this task holds
+        no lock on the orchestrator package — so until that follow-up lands, a
+        watcher that spots a candidate pin REPORTS it (its skill says so) and a
+        human or steward runs this tool.  Consequence worth naming: the refusal
+        gate can only fire for records a human has actually marked, so the
+        surviving sibling pin esc-3105-3 stays protected by prose until someone
+        declares it.
+
         Two deliberate departures from ``stamp_triage``, its structural twin:
 
         - **NOT level-gated**, for ``stamp_triage``'s stated reason: a
