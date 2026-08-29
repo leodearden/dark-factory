@@ -1675,10 +1675,20 @@ class TestApplyIncompletenessPolicy:
         """
         from fused_memory.backends.graphiti_client import apply_incompleteness_policy
 
+        # The `pyright: ignore` is not a workaround — it is a SECOND proof of
+        # the same contract: pyright reports this call as
+        # reportCallIssue ("Expected 1 positional argument"), so the guard
+        # holds statically as well as at runtime, and suppressing it here is
+        # the only way to keep the runtime half executable. If a future edit
+        # made `log` positional, this suppression would go UNUSED — and the
+        # `pytest.raises(TypeError)` below would fail — so the test still
+        # breaks in the direction that matters.
         with pytest.raises(TypeError):
             apply_incompleteness_policy(
                 complete_paged_read(rows_seen=1),
-                'enumerate_all_valid_edges',
+                # The suppression sits on the FIRST extra positional argument
+                # because that is where pyright anchors the diagnostic.
+                'enumerate_all_valid_edges',  # pyright: ignore[reportCallIssue]
                 'test-group',
                 7,
                 'entities',
