@@ -4191,6 +4191,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {expected}
         assert {o.k for o in observations.claims} == {expected}
+        assert {o.k for o in observations.inversions} == {expected}
 
     def test_a_deep_call_still_scores_at_the_pinned_depth(self):
         """min(), not max(): contamination and claim recall are DEFINED at the
@@ -4200,6 +4201,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
 
     def test_the_default_path_is_unchanged(self):
         m = _mod()
@@ -4207,3 +4209,16 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
+
+    def test_one_run_reports_the_same_depth_across_every_family(self):
+        """Record-level statement of 'one run, one scored depth': contamination,
+        claims and inversions must never disagree about what depth was scored."""
+        observations = self._observe((10,))
+
+        depths = (
+            {o.k for o in observations.contamination}
+            | {o.k for o in observations.claims}
+            | {o.k for o in observations.inversions}
+        )
+        assert len(depths) == 1
