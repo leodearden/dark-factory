@@ -8092,3 +8092,107 @@ class TestResolveIssueDeclaredPinGuard:
         assert len(warnings) == 1, f'Expected one audit warning, got {warnings}'
         assert esc.id in warnings[0]
         assert self.DECLARER in warnings[0]
+
+
+class TestDeclaredPinSurfacing:
+    """The marker is VISIBLE to a bulk closer BEFORE it acts (task 4377).
+
+    A rotating watcher drains COMPACT rows.  A marker invisible there leaves it
+    exactly as blind as the 2026-08-08 cascade was — all eleven members of
+    esc-3237-5 were indistinguishable by id, level, category, severity,
+    agent_role and summary.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _seed_and_declare(
+        self, queue: EscalationQueue, esc_id: str = 'esc-3371-2', declare: bool = True,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='3371',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=1,
+        )
+        queue.submit(esc)
+        if declare:
+            queue.declare_pin(esc_id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    # --- (a) FULL mode carries both fields ---
+
+    @pytest.mark.asyncio
+    async def test_full_mode_carries_both_fields(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (pending,) = await _get_pending(server)
+        (by_task,) = await _get_task_escalations(server, task_id='3371')
+
+        for row in (pending, by_task):
+            assert row['pin_declared_by'] == [self.DECLARER]
+            assert row['pin_declared_reason'] == self.REASON
+
+    # --- (b)/(c) COMPACT mode carries pin_declared_by on BOTH apply sites ---
+
+    @pytest.mark.asyncio
+    async def test_compact_pending_carries_pin_declared_by(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (row,) = await _get_pending(server, compact=True)
+
+        assert row['pin_declared_by'] == [self.DECLARER]
+
+    @pytest.mark.asyncio
+    async def test_compact_task_escalations_carries_pin_declared_by(self, tmp_path: Path):
+        """Both compact tools route through _compact_escalation — one seam."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (row,) = await _get_task_escalations(server, task_id='3371', compact=True)
+
+        assert row['pin_declared_by'] == [self.DECLARER]
+
+    # --- (d) the unbounded free text is NOT projected ---
+
+    @pytest.mark.asyncio
+    async def test_compact_omits_pin_declared_reason(self, tmp_path: Path):
+        """Same reason `detail` is dropped: pin_declared_by is the signal to
+        pull the full record via get_escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (pending,) = await _get_pending(server, compact=True)
+        (by_task,) = await _get_task_escalations(server, task_id='3371', compact=True)
+
+        assert 'pin_declared_reason' not in pending
+        assert 'pin_declared_reason' not in by_task
+
+    # --- (e) ALWAYS projected, never conditionally omitted ---
+
+    @pytest.mark.asyncio
+    async def test_unmarked_compact_row_carries_an_empty_list(self, tmp_path: Path):
+        """`_compact_escalation`'s omission contract already means 'could not be
+        computed' for pins_recovery; a second meaning for absence would be a
+        legibility trap."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue, esc_id='esc-plain-1', declare=False)
+
+        (row,) = await _get_pending(server, compact=True)
+
+        assert row['pin_declared_by'] == []
+
+    def test_the_field_is_in_the_shared_projection_constant(self):
+        """Widening the one constant is what widens BOTH compact tools."""
+        assert 'pin_declared_by' in _COMPACT_ESCALATION_FIELDS
+        assert 'pin_declared_reason' not in _COMPACT_ESCALATION_FIELDS
