@@ -5229,6 +5229,61 @@ class TestPremiseGuardRunsOffEventLoop:
         assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
 
+    async def test_verification_failure_fails_open(self, tmp_path, caplog):
+        """RED: an exception from the offloaded verification must fail OPEN.
+
+        _maybe_premise_refuted_drop's own docstring promises "Never raises",
+        and both its callers — curate() and curate_batch_prepared() — invoke
+        it unguarded, so an escaping exception would take down the whole
+        task submission. That contract held for free while the callees were
+        the guard module's own never-raising functions; offloading
+        verify_premise_refuted via asyncio.to_thread (this task) is a NEW
+        raise path (thread-pool failure, or anything the real/patched callee
+        raises) that does not route through the guard module's internal
+        except. Failing open (returning None) is the direction every other
+        failure mode this method already enumerates takes, and it means "let
+        the candidate through to the architect" — never "silently file a
+        dead-premise task". Mirrors task 4091's
+        TestClaimVerificationGuardFailsOpen, which needed a review amendment
+        to close this exact gap on the sibling claim-verification guard.
+        """
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            side_effect=RuntimeError("boom"),
+        ), caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "premise" in r.message.lower()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
