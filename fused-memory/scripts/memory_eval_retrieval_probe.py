@@ -1059,6 +1059,29 @@ def rank_index(results: list) -> dict[str, int]:
     return first_rank
 
 
+def ranks_at_depth(ranks: dict[str, int], k: int) -> dict[str, int]:
+    """The depth-scoped view of a full-depth :func:`rank_index` mapping.
+
+    Exactly equal to ``rank_index(results[:k])``: :func:`rank_index` keeps
+    the FIRST rank a content hash appeared at, so a hash whose first rank is
+    ``<= k`` has that same first rank in the truncated list, and a hash
+    whose first rank is ``> k`` does not appear in the truncated list at
+    all. Filtering the existing mapping therefore reproduces re-hashing the
+    truncation exactly, without re-deriving it.
+
+    Deriving rather than re-hashing preserves :func:`rank_index`'s own
+    contract: the list is sha256'd once per query rather than once per
+    consumer. A second, truncated re-hash would reintroduce the very second
+    pass that contract exists to avoid.
+
+    Returns a NEW mapping — the full-depth index the canonical-presence
+    family reads (``canonical_hit`` / ``observe_phrasing``, which deliberately
+    scan the whole list so a hit beyond ``k`` is reported at its true rank
+    rather than as absent) is left untouched.
+    """
+    return {content_hash: rank for content_hash, rank in ranks.items() if rank <= k}
+
+
 def canonical_hit(
     results: list,
     entry: RegistryEntry,
