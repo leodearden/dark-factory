@@ -283,12 +283,33 @@ main's current HEAD and never from an eyeballed listing:
 git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
 ```
 
-**A non-empty result is NOT authoritative on its own here.** On this arm the branch ref still
-exists, and `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in exactly
-that situation — "this prevents finding a stale merge marker from a *previous* run of a
-re-opened task that shared the same branch name". Running the search anyway (as we do, because
-the marker is still the best first candidate) means re-supplying that guard ourselves. Require
-containment before stamping:
+**If that returned a sha**, whether it is authoritative depends on whether the branch ref still
+exists, so establish that before stamping — this section is reached from call sites on both
+sides of it. (If it returned nothing, skip to "An empty marker search is NOT a not-landed
+verdict" below.)
+
+```bash
+git rev-parse --verify --quiet task/<TASK_ID>; echo "ref rc=$?"
+```
+
+- **ref rc≠0 (branch GONE)** → the marker **is** authoritative on its own. This is the ordinary
+  post-merge state, not an anomaly: `GitOps._delete_branch_if_on_main`
+  (`orchestrator/src/orchestrator/git_ops.py`) deletes any branch carrying no commits beyond
+  main, which is exactly what a successful merge leaves behind — `skills/unblock/SKILL.md` calls
+  the resulting rc=128 "the single most common post-merge state". A deleted ref is also
+  precisely the regime `GitOps.find_merge_marker` itself searches in, so its stale-marker
+  concern below cannot apply (no ref exists to have been recreated). Stamp
+  `{"kind": "found_on_main", "commit": "<marker sha>", "note": "merge commit located by
+  exact-subject marker search"}` and stop here. The `note` is **mandatory**, not decoration —
+  `DoneProvenance` rejects `kind='found_on_main'` without one (see the contract restated below).
+- **ref rc=0 (branch still EXISTS)** → the marker is **NOT authoritative on its own**, and
+  `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in exactly that
+  situation — "this prevents finding a stale merge marker from a *previous* run of a re-opened
+  task that shared the same branch name". Running the search anyway (as we do, because the
+  marker is still the best first candidate) means re-supplying that guard ourselves. Require
+  containment before stamping, per the ladder immediately below.
+
+Only on the **ref rc=0** arm:
 
 ```bash
 git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"; echo "containment rc=$?"
@@ -305,8 +326,9 @@ marker from a previous incarnation does not: it predates the recreated ref, so t
   without one (see the contract restated below).
 - **containment rc=1** → stale marker from a previous incarnation of a re-opened task. Do
   **not** stamp it. Fall through to step (2)/(3) below and let them decide.
-- **containment rc=128** → the marker sha or the branch ref would not resolve; the check never
-  rendered a verdict. Do not stamp, and do not read it as either outcome — re-derive.
+- **containment rc=128** → the marker sha would not resolve (the branch ref already resolved, or
+  you would not be on this arm); the check never rendered a verdict. Do not stamp, and do not
+  read it as either outcome — re-derive.
 
 (The escalation server layers a second guard on the same risk — the marker must not predate the
 recorded `branch_base_sha`; see `_found_on_main_response` / the merge_status Tier-3.5 docstring.
