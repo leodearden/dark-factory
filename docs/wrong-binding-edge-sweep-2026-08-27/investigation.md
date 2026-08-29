@@ -1,7 +1,7 @@
 # Wrong-binding in extracted edges — detection, quantification, cause
 
-**Task 4717** · escalation `esc-4639-1` · swept 2026-08-27T06:51:37Z ·
-branch `task/4717` · sweep code at `7a64b2a499` · `graphiti_core` 0.28.2
+**Task 4717** · escalation `esc-4639-1` · swept 2026-08-29T21:00:05Z ·
+branch `task/4717` · sweep code at `794a9e9b42` · `graphiti_core` 0.28.2
 
 A *wrong-binding* edge is one whose `fact` is a faithful restatement of its
 source episode, but which is **attached to the wrong entity**. Reading it off
@@ -12,11 +12,58 @@ fact-CONTENT family (a fact asserting more than its episode said), which
 
 Every number below is cited from `report.json` in this directory, which is
 byte-for-byte the stdout of
-`fused-memory/scripts/audit_wrong_binding_edges.py` at `7a64b2a499`. Run
+`fused-memory/scripts/audit_wrong_binding_edges.py` at `794a9e9b42`. Run
 provenance, including the read-population census, is in `provenance.json`.
 
-**This artifact was regenerated once, and a reader comparing against the
-superseded numbers in git history is entitled to know which reads changed.**
+**This artifact has been regenerated twice, and a reader comparing against
+the superseded numbers in git history is entitled to know which reads
+changed.**
+
+### Regeneration 2 (`7a64b2a499` → `794a9e9b42`, 2026-08-29T21:00Z)
+
+A review amendment pass changed both the report's **shape** and what the
+detector **sees**.
+
+*Shape.* `summary.by_proximity` and `summary.correct_node_present` gained a
+`not_computed` bucket. A `Finding`'s two cause columns default to `None`
+meaning *not measured*, and `build_report` used to tally that as `unrelated`
+/ `false` — publishing a measured cause-attribution result for a column
+nobody computed. Since §3.3's whole argument rests on those two
+distributions, the fold was the wrong direction to fail in. `not_computed`
+is **0** in both breakdowns on this run, which is now an *assertable fact*
+rather than an assumption. `summary.suppressed_by_bare_id` was added; see
+the LOWER BOUND discussion in §2.
+
+*Detection.* `bare_id_present` — the containment backstop that absorbs the
+shared scanner's `#4262` and `task-1836` blind spots — matched any
+word-boundary digit run, and `\b` treats `-`, `:`, `.` and `/` as
+boundaries. So the parts of a compound number read as standalone ids, and a
+mis-bound endpoint was **suppressed before a finding was minted** — i.e.
+invisibly in every published count. Digit runs joined to another digit run
+by `-:./` are now excluded.
+
+**What that cost, held against corpus drift.** The corpus was read once and
+classified twice — narrowed check and previous check — so the delta is
+attributable rather than confounded. On 27 012 rows: narrowed **192**
+findings / 47 suppressions, previous **191** / 48. **Net +1 finding**: reify
+`b7435956` on node `Task 4666`, whose fact —
+
+> "Case 4666/4400 is a live architectural contradiction, while task 6554 is
+> a single task with open questions downstream of unlanded work."
+
+— is about task **6554**, while its `4666` is half of the compound
+`Case 4666/4400`. The previous check read that half as the endpoint naming
+itself. So the defect was real and its measured magnitude on this corpus is
+one edge.
+
+Against the superseded run: **192/7 048 (2.72 %) vs 181/6 961 (2.60 %)**. Of
+the +11, exactly **+1** is the detection change above and the other **+10**
+is two days of live-corpus growth (`scanned` 26 674 → 27 012). 179 of the
+181 prior `(edge_uuid, end)` identities persist; the 2 absent are edges no
+longer live, not detector regressions. Both predicted families persist.
+
+### Regeneration 1 (`8bc5f763a2` → `7a64b2a499`, 2026-08-27T06:51Z)
+
 The first published run (`8bc5f763a2`, 04:50Z) read Entity nodes through a
 page template ordered on `n.name`, which is **not a total order** — measured
 the same day, dark_factory holds 17 260 Entity nodes against 17 210 distinct
@@ -26,7 +73,7 @@ a row and duplicate another *invisibly*, leaving `rows_seen` unchanged and
 `graphiti_client.py::_ENTITY_NODES_PAGE_TEMPLATE`.
 
 **The edge population was unaffected** — the edge page already ordered on
-`r.uuid` — and, measured rather than assumed, so was everything else: the
+`r.uuid` — and, measured rather than assumed, so was everything else: that
 re-run returned the *identical* set of 181 `(edge_uuid, end)` findings, and
 identical `by_graph`, `by_end`, `by_proximity` and
 `correct_node_present` breakdowns, with **zero** `correct_node_present`
@@ -42,9 +89,12 @@ the superseded artifact was ever wrong because of it.
 **On line numbers.** `CLAUDE.md` asks for `path/to/module.py::symbol`
 citations rather than bare line pins, because pins go stale. This document
 cites symbol-first and gives line numbers only as *measurement evidence* —
-here the line is part of the observation. All line numbers were read at
-`7a64b2a499` (in-tree) and at `graphiti_core` 0.28.2 (the installed wheel);
-if a pin has drifted, the symbol is authoritative.
+here the line is part of the observation. **In-tree references carry no line
+numbers at all** — every one names a resolvable symbol, so there is nothing
+to drift. Bare line pins survive only for `graphiti_core` 0.28.2, which is
+an installed wheel this repo cannot patch and where the line *is* the
+observation; those were read at that version, and where a symbol is also
+named the symbol is authoritative.
 
 **Reproduce the whole sweep:**
 
@@ -100,9 +150,9 @@ SUBJECT node's name" — returns *clean* here. The mis-bound end is the
 **OBJECT** (`Task 6128`, while the fact says `6126`).
 
 This drove the design decision to check **both** endpoints. It is not an edge
-case: **73 of 181 findings (40%) are object-end**
+case: **72 of 192 findings (38%) are object-end**
 (`report.json` → `summary.by_end`). A subject-only detector would have missed
-two fifths of the population.
+well over a third of the population.
 
 ### Reproduction
 
@@ -127,16 +177,17 @@ Over the **complete live population of both graphs**:
 
 | measure | value |
 |---|---|
-| rows scanned | **26 674** (dark_factory 11 418 + reify 15 256 live `RELATES_TO`) |
-| qualifying population | **6 961** |
-| unverifiable (fact names no task id) | 305 |
-| **findings** | **181** |
-| **rate** | **2.60 %** |
-| by graph | dark_factory 76 · reify 105 |
-| by end | subject 108 · object 73 |
+| rows scanned | **27 012** (dark_factory 11 551 + reify 15 461 live `RELATES_TO`) |
+| qualifying population | **7 048** |
+| unverifiable (fact names no task id) | 311 |
+| suppressed by the containment backstop | 47 |
+| **findings** | **192** |
+| **rate** | **2.72 %** |
+| by graph | dark_factory 87 · reify 105 |
+| by end | subject 120 · object 72 |
 | truncated | `null` — nothing silently capped |
 
-**Pagination is load-bearing and the run proves it.** reify holds 15 256 live
+**Pagination is load-bearing and the run proves it.** reify holds 15 461 live
 `RELATES_TO` rows against a server `RESULTSET_SIZE` of 10 000. An unpaginated
 `MATCH` — the shape `audit_unverified_completion_claims.py` uses, correctly,
 for its smaller population — would have returned exactly 10 000 of them
@@ -148,16 +199,33 @@ first-class report key rather than a footnote.
 
 The task description cited 13/111 = 11.7 %. That figure was a **narrow
 pocket** — edges whose subject is a *ruling task* — not the whole corpus.
-**2.60 % is the whole-corpus rate over 6 961 qualifying edges.** Both stand;
+**2.72 % is the whole-corpus rate over 7 048 qualifying edges.** Both stand;
 they measure different denominators. Neither supersedes the other.
 
-**2.60 % is a LOWER BOUND.** Endpoints and facts are read with the shared
-vocabulary in `fused_memory/utils/canonical_labels.py`, which is documented
-*precision over recall*. A node named with bare digits, a reference made by
-task **title**, an alias/codename, and a hard-wrapped qualified ref are all
-invisible by design.
+**2.72 % is a LOWER BOUND, for two separate reasons.**
 
-### The 181 findings are NOT one homogeneous population
+*Recall.* Endpoints and facts are read with the shared vocabulary in
+`fused_memory/utils/canonical_labels.py`, which is documented *precision over
+recall*. A node named with bare digits, a reference made by task **title**,
+an alias/codename, and a hard-wrapped qualified ref are all invisible by
+design.
+
+*Suppression.* `bare_id_present` — the containment backstop that recovers the
+`#4262` and `task-1836` spellings the shared scanner declines to parse —
+treats any standalone digit run as the endpoint naming itself. It is
+**context-free by construction**: requiring a preceding `task`/`#` would mean
+compiling a second task-label vocabulary, which is exactly what INV-5 / task
+3667 forbids, so the residue is *measured* instead of narrowed away.
+`summary.suppressed_by_bare_id` is **47** on this run. Inspected by hand: 17
+sit in an explicit `#N` / `task N` context, and 30 are bare digit runs — of
+which the sampled majority are also genuine references the shared scanner
+under-reads (`Dependencies 1720`; `tasks 3061 and 3062`, where only the first
+id is scanned; and foreign `dark_factory:2500` endpoints, matched on their
+bare number by design). So most of the 47 look like *correct* suppressions —
+but "most" is not "all", and the count is published so the size of the bound
+is a number rather than a shrug.
+
+### The 192 findings are NOT one homogeneous population
 
 This is the most important analytic result for whoever adjudicates them, and
 it is not visible from the headline rate. Crossing proximity against whether
@@ -165,18 +233,18 @@ the correctly-named node already exists:
 
 | proximity | correct node absent | correct node present |
 |---|---|---|
-| `one_digit_diff` | **57** | 40 |
+| `one_digit_diff` | **66** | 40 |
 | `prefix` | 2 | 6 |
-| `unrelated` | 11 | **65** |
+| `unrelated` | 11 | **67** |
 
 Two distinct modes fall out:
 
-**Mode 1 — near-miss substitution (the ~57-edge cell).** The correct node does
+**Mode 1 — near-miss substitution (the ~66-edge cell).** The correct node does
 not exist, and the bound node's id differs by one digit. This is the
 `Task 6165` family, and §3 traces its mechanism exactly. High confidence
 these are true defects.
 
-**Mode 2 — shared-sink collapse (the ~65-edge cell).** The bound node's id
+**Mode 2 — shared-sink collapse (the ~67-edge cell).** The bound node's id
 isn't close to anything the fact names, *and* the correctly-named node
 already exists. Worked example — dark_factory node `task 1155` carries 5 live
 edges, of which **3 come from one episode `64315ec6` and are each about a
@@ -243,21 +311,25 @@ asyncio.run(m())"
 
 ### 3.3 Corpus-wide, this is mis-resolution rather than a missing node
 
-- **105/181 (58 %)** of mis-bound endpoint ids are a *near miss* of an id the
-  fact names — 97 one-digit-different at equal length, 8 a strict prefix.
-  Against 1 424 + 2 111 task-shaped nodes — harvested by the corrected
+- **114/192 (59 %)** of mis-bound endpoint ids are a *near miss* of an id the
+  fact names — 106 one-digit-different at equal length, 8 a strict prefix.
+  Against 1 447 + 2 129 task-shaped nodes — harvested by the corrected
   uuid-ordered node page — the chance baseline is near zero.
-- **111/181 (61 %)** have `correct_node_present = true`: the node the fact
-  actually names **already exists** in that graph. This column is the one
-  the node page feeds, so it was re-checked against the regenerated
-  artifact rather than carried over — 111/70 in both, with zero per-finding
-  flips.
+- **113/192 (59 %)** have `correct_node_present = true`: the node the fact
+  actually names **already exists** in that graph.
 
-Both reproduce the planning-time measurement (62.5 % and 64 %) within the
-movement of a live corpus.
+Both reproduce the planning-time measurement (62.5 % and 64 %) and the two
+superseded runs (58 % and 61 %) within the movement of a live corpus.
+
+**Neither figure is a fold of an unmeasured column.** Both are tallied with
+`not_computed` as a bucket of its own, and `not_computed` is **0** in each —
+so every finding reached the report *enriched*, and "not measured" cannot be
+silently reading here as "measured negative". Before the amendment pass a
+`None` would have tallied as `unrelated` / `false`, i.e. as evidence for
+exactly the conclusion this section draws.
 
 **The canonical specimen is not representative** — because `Task 6164` is
-absent, the `Task 6165` family sits in the 39 % *minority*. A reader
+absent, the `Task 6165` family sits in the 41 % *minority*. A reader
 generalising from that family alone reaches the wrong diagnosis. The report
 carries both counts so this is visible.
 
@@ -266,7 +338,7 @@ carries both counts so this is visible.
 Planning recorded "100 % of the qualifying population traces to
 `add_memory:*` episodes". **Re-measured, that is true and completely
 vacuous:** *every* `Episodic` node in both graphs is `add_memory:*` —
-dark_factory 3 261/3 261, reify 4 656/4 656. There is no other ingestion path
+dark_factory 3 298/3 298, reify 4 695/4 695. There is no other ingestion path
 represented in these graphs at all.
 
 It therefore establishes *which* write path is implicated, and carries
@@ -368,16 +440,17 @@ print('jaccard', _jaccard_similarity(_cached_shingles('task 6164'),
 
 ### 3.6 fused_memory supplies almost no resolution levers, and no config governs any threshold
 
-`fused_memory/backends/graphiti_client.py` calls `Graphiti.add_episode` at
-L1442-1454 with: `name`, `episode_body`, `source`, `group_id`,
+`fused_memory/backends/graphiti_client.py::GraphitiBackend.add_episode` calls
+`Graphiti.add_episode` with: `name`, `episode_body`, `source`, `group_id`,
 `source_description`, `reference_time`, `entity_types`, `uuid`.
 
-> **Correction to the planning note:** an `entity_types=` kwarg **is** passed
-> (L1450). The substance nevertheless holds: it is a pure pass-through of the
-> wrapper's own `entity_types: dict | None = None` (L1421), those two lines
-> are the *only* occurrences of `entity_types` in `fused-memory/src/`, and the
-> sole production caller (`memory_service.py` L3923-3932) omits it — so it is
-> **always `None`** in production.
+> **Correction to the planning note:** an `entity_types=` kwarg **is**
+> passed. The substance nevertheless holds: it is a pure pass-through of that
+> method's own `entity_types: dict | None = None` parameter, the two are the
+> *only* occurrences of `entity_types` in `fused-memory/src/`, and the sole
+> production caller
+> (`fused_memory/services/memory_service.py::MemoryService._execute_graphiti_write`)
+> omits it — so it is **always `None`** in production.
 
 `excluded_entity_types`, `custom_extraction_instructions`, `edge_types` and
 `edge_type_map` appear **nowhere** in `fused-memory/src/`, `shared/` or
@@ -449,8 +522,8 @@ central finding of §5: no new detection logic is needed.
 ### What already exists
 
 `fused_memory/services/memory_service.py::MemoryService._verify_episode_referents`
-(L3223-3599) **already performs exactly this check, post-write**, as a
-set-membership test (L3524-3529):
+**already performs exactly this check, post-write**, as a set-membership
+test:
 
 ```python
 if endpoint_referent not in referent_set:
@@ -461,25 +534,24 @@ else:
     continue
 ```
 
-It computes `resolvable = len(candidates) == 1` (L3539), resolves
-`new_endpoint_uuid` (L3569-3582) via the read-only
-`_intended_endpoint_uuid` (L3602-3639) — and then **only logs a warning**
-(L3596-3598). Its own docstring (L3235) says so: *"DETECTS AND RECORDS ONLY
-— it performs no writes of any kind"*, pinned by
-`tests/test_referent_verification.py` L213-226 (`_WRITE_PRIMITIVES` /
+It computes `resolvable = len(candidates) == 1`, resolves
+`new_endpoint_uuid` via the read-only
+`MemoryService._intended_endpoint_uuid` — and then **only logs a warning**.
+Its own docstring says so: *"DETECTS AND RECORDS ONLY — it performs no writes
+of any kind"*, pinned by
+`fused-memory/tests/test_referent_verification.py` (`_WRITE_PRIMITIVES` /
 `assert_never_repaired()`).
 
 The repair chain — **leaf ETA**, `ensure_entity_node` → `reassign_edge` →
-`refresh_entity_summary` — is documented at `memory_service.py` L3236 and in
-`plans/memory-referent-fidelity-prd.md` L123 and L321 (where η is still
-listed as a **leaf**, depending on α and ζ). It has **no production wiring**:
-`ensure_entity_node` is defined at
-`fused_memory/backends/graphiti_client.py` L3156 and has **zero production
-call sites** repo-wide — every occurrence outside its own body is either a
-test (`test_write_time_identity.py`, `test_referent_verification.py`) or
-prose.
+`refresh_entity_summary` — is documented in that same method's docstring and
+in `plans/memory-referent-fidelity-prd.md` (where η is still listed as a
+**leaf**, depending on α and ζ). It has **no production wiring**:
+`fused_memory/backends/graphiti_client.py::GraphitiBackend.ensure_entity_node`
+has **zero production call sites** repo-wide — every occurrence outside its
+own body is either a test (`test_write_time_identity.py`,
+`test_referent_verification.py`) or prose.
 
-So the system already *knows* about these 181 edges at write time and
+So the system already *knows* about these 192 edges at write time and
 deliberately does nothing.
 
 ### Recommendation
@@ -490,26 +562,28 @@ deliberately does nothing.
    repair path: `ensure_entity_node` → `reassign_edge` →
    `refresh_entity_summary`, + streak escalation"*, **status
    `in-progress`**, priority high. This sweep does not propose new work here;
-   it supplies 3672 with a measured population (181 edges) and one design
+   it supplies 3672 with a measured population (192 edges) and one design
    constraint it should honour:
 
-   > **Gate the repair on `resolvable`, and exclude mode 2.** 111/181 (61 %)
-   > already have an existing correct node (recomputed on the regenerated
-   > artifact, not carried over — the ratio did not move, so neither does
-   > the strength of this recommendation); mode 1 (§2) supplies the rest via
-   > `ensure_entity_node`. **Do not** auto-repair the mode-2 cell
-   > (`unrelated` proximity + node present, ~65 edges): it contains
+   > **Gate the repair on `resolvable`, and exclude mode 2.** 113/192 (59 %)
+   > already have an existing correct node (recomputed on each regenerated
+   > artifact, never carried over — the ratio has held across three runs, so
+   > neither does the strength of this recommendation move); mode 1 (§2)
+   > supplies the rest via `ensure_entity_node`. **Do not** auto-repair the
+   > mode-2 cell (`unrelated` proximity + node present, ~67 edges): it
+   > contains
    > legitimate cross-task relations, and it is precisely where an automated
    > verdict would corrupt good data.
 
 2. **Remediation of the existing edges — already tracked as task 3673**
-   (leaf θ, `pending`), which remediates measured live conflations. The 181
+   (leaf θ, `pending`), which remediates measured live conflations. The 192
    findings here are candidate input to it, **not** a mandate: each still
    needs human adjudication (§5, below).
 
 3. **Complementary prevention — NOT currently tracked; filed by this task.**
-   `graphiti_client.py` L1442-1454 is the only place fused_memory can pass
-   resolution levers into `add_episode`, and it passes none that bite (§3.6).
+   `graphiti_client.py::GraphitiBackend.add_episode` is the only place
+   fused_memory can pass resolution levers into graphiti, and it passes none
+   that bite (§3.6).
    A `custom_extraction_instructions` / `excluded_entity_types` constraint
    requiring an exact referent match for task-shaped names would attack the
    cause rather than the symptom. Note this **cannot** be fixed by patching
@@ -520,7 +594,7 @@ deliberately does nothing.
    2110 (node-name canonicalisation, done) and 3335 (cross-project collapse,
    cancelled). None passes resolution levers into `add_episode`.
 
-### Remediation of the existing ~181 edges stays human-gated
+### Remediation of the existing ~192 edges stays human-gated
 
 `reassign_edge` is the lossless remediation primitive for them, but
 **remediation is deliberately out of scope for this task.** Every finding is
@@ -540,28 +614,30 @@ class. The graph is read only over `GRAPH.RO_QUERY`, where read-only is
 
 **Any prior investigation that read "the Task 6165 ruling" out of the reify
 graph was reading task 6164's ruling.** Six of the seven live edges on that
-node are about 6164 (§1). The same hazard applies to all 181 findings and,
+node are about 6164 (§1). The same hazard applies to all 192 findings and,
 by the recall bound in §2, to an unknown number of edges the shared
 vocabulary cannot see.
 
 **Re-derivation must go through `r.episodes`.** It is populated on **100 % of
-live `RELATES_TO` edges in both graphs** — reify 15 256/15 256, dark_factory
-11 418/11 418, zero null-or-empty — so it is the right handle for recovering
+live `RELATES_TO` edges in both graphs** — reify 15 461/15 461, dark_factory
+11 551/11 551, zero null-or-empty — so it is the right handle for recovering
 what an edge was actually extracted from. Never trust the endpoint node name
 alone.
 
-**But `r.episodes` is not always sufficient.** Of the **116** distinct
-episode uuids cited by the 181 findings, **7 (6 %) are dangling** — the
+**But `r.episodes` is not always sufficient.** Of the **120** distinct
+episode uuids cited by the 192 findings, **7 (6 %) are dangling** — the
 `Episodic` node no longer exists:
 
-- dark_factory: `64315ec6` (1 of 51) — the `task 1155` shared-sink cluster in §2
+- dark_factory: `64315ec6` (1 of 54) — the `task 1155` shared-sink cluster in §2
 - reify: `6ee043e1`, `4b64388f`, `71dcbcde`, `9ee72340`, `5735728d`,
-  `15a1b133` (6 of 65)
+  `15a1b133` (6 of 66)
 
 Those edges are **permanently un-adjudicable from the graph alone**. A lookup
 by episode uuid returning empty means the episode was deleted — not that the
 query was malformed. This was discovered incidentally here; its corpus-wide
 extent is **not** scoped by this sweep and is filed as follow-up work.
 
-*(The `109/109 add_memory:*` census in §3.4 is over the 109 episodes that
-still exist — 116 cited minus these 7. The figures reconcile exactly.)*
+*(The `add_memory:*` census in §3.4 holds over the **113** cited episodes
+that still exist — 120 cited minus these 7, all 113 `add_memory:*`. The
+figures reconcile exactly. The same seven uuids were dangling on the
+superseded run, so this is a stable defect, not a fresh one.)*
