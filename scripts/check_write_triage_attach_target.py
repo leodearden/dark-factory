@@ -204,13 +204,35 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
     except Exception as exc:  # noqa: BLE001 - a raising selector is unverifiable
         raise _Unverifiable(f'select_judge_candidates raised: {exc!r}') from exc
     ids = [getattr(c, 'id', None) for c in slate]
-    if _CHILD_ID not in ids:
-        raise _Unverifiable(
-            'select_judge_candidates did not rescue the hoisted parent\'s evidence '
-            f'child into the slate (got {ids!r}); the probe has no attach target to '
-            'reason about',
+    if _CHILD_ID in ids:
+        # The strongest case, and the one main actually produces: the rescued
+        # evidence child of a hoisted parent, sitting wherever the selector
+        # put it.
+        index = ids.index(_CHILD_ID)
+    else:
+        # The winner-rescue APPEND is a MECHANISM. All this probe needs is an
+        # attach target that is not slate[0], so that a candidates[0]-marking
+        # implementation is still caught; a selector that reaches the hoisted
+        # parent some other way is no less verifiable. Requiring the append
+        # would fail a CORRECT fix closed forever for a reason unrelated to
+        # which candidate the attach touches — the same false-FAIL defect this
+        # probe exists to remove, one level down. Take the LAST candidate that
+        # is distinguishable from slate[0].
+        index = max(
+            (
+                position
+                for position, ident in enumerate(ids)
+                if ident is not None and ident != ids[0]
+            ),
+            default=-1,
         )
-    index = ids.index(_CHILD_ID)
+        if index < 0:
+            raise _Unverifiable(
+                f'select_judge_candidates returned no candidate distinguishable '
+                f'from slate[0] (got {ids!r}); there is no attach target to '
+                'reason about, so nothing here can tell a correct fix from the '
+                'candidates[0] bug',
+            )
     return slate, slate[index], index
 
 
@@ -858,12 +880,28 @@ _FAIL_NEITHER = [
 
 
 def _rescue_note(slate_ids: list[Any], index: int) -> list[str]:
-    """The measured warning that marking ``candidates[0]`` is not sufficient."""
-    return [
+    """The measured warning that marking ``candidates[0]`` is not sufficient.
+
+    Only cites the winner-rescue APPEND when this run actually OBSERVED it.
+    ``_build_slate`` no longer requires that mechanism, so a selector that
+    reaches the hoisted parent another way must not be told, in the gate's own
+    report, that it does something it does not do.
+    """
+    head = [
         '      Marking candidates[0] as the attach target is NOT sufficient:',
-        '      select_judge_candidates rescues a hoisted parent\'s evidence child by',
-        '      APPENDING it (selected = [*selected[: max(n - 1, 0)], winner]), so on',
-        '      a hoisted-parent slate the attach target is LAST, not first. Measured',
+    ]
+    if index < len(slate_ids) and slate_ids[index] == _CHILD_ID:
+        head += [
+            '      select_judge_candidates rescues a hoisted parent\'s evidence child by',
+            '      APPENDING it (selected = [*selected[: max(n - 1, 0)], winner]), so on',
+            '      a hoisted-parent slate the attach target is LAST, not first. Measured',
+        ]
+    else:
+        head += [
+            '      the attach target is whichever candidate the band picked, which is',
+            '      not in general the first one the selector returned. Measured',
+        ]
+    return head + [
         f'      on this probe\'s own fixture: slate {slate_ids!r}, attach target at',
         f'      index {index}.',
     ]
