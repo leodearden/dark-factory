@@ -488,8 +488,8 @@ def _binds_candidate(result: Any) -> bool:
     return result is not None and not isinstance(result, _NOT_A_CANDIDATE_BINDING)
 
 
-def _recoverable(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[int] | None = None) -> bool:
-    """True when *ident* appears as a DISCRETE string value inside *result*.
+def _occurrences(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[int] | None = None) -> int:
+    """How many times *ident* appears as a DISCRETE string value inside *result*.
 
     This is the evidence half of the option-(a) branch. A non-scalar return is
     only a SHAPE that could carry a candidate; unless the id actually handed in
@@ -518,17 +518,20 @@ def _recoverable(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[in
     Recovering the id from a nested ECHO of the probe's own payload is still
     possible here by construction — a value equal to the payload cannot be
     told from a binding by inspection alone. ``_echoes_payload`` is the
-    control that separates them.
+    control that separates them, and it needs the COUNT rather than a bare
+    yes/no: a parser that both reads the candidate field and carries the
+    payload it read it from surfaces the id once for the binding and once for
+    the copy, where a pure echo surfaces it only for the copy.
     """
     if depth < 0:
-        return False
+        return 0
     if isinstance(result, str):
-        return result == ident
+        return 1 if result == ident else 0
     if seen is None:
         seen = set()
     marker = id(result)
     if marker in seen:
-        return False
+        return 0
     seen.add(marker)
 
     children: list[Any] = []
@@ -546,16 +549,23 @@ def _recoverable(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[in
         except Exception:  # noqa: BLE001 - a hostile __getattr__ is not evidence
             continue
 
+    total = 0
     for child in children:
         try:
-            if _recoverable(child, ident, depth - 1, seen):
-                return True
+            total += _occurrences(child, ident, depth - 1, seen)
         except Exception:  # noqa: BLE001 - a hostile container is not evidence
             continue
-    return False
+    return total
 
 
-def _echoes_payload(parse: Any, key: str, word: str, ident: str) -> str | None:
+def _recoverable(result: Any, ident: str) -> bool:
+    """True when *ident* appears at least once inside *result*. See _occurrences."""
+    return _occurrences(result, ident) > 0
+
+
+def _echoes_payload(
+    parse: Any, key: str, word: str, ident: str, bound: Any,
+) -> str | None:
     """The CONTROL for the option-(a) evidence test: is the parser just echoing?
 
     Recoverability of an id from a result is only a BINDING if the parser got
@@ -572,11 +582,26 @@ def _echoes_payload(parse: Any, key: str, word: str, ident: str) -> str | None:
 
     Returns the reason string when the echo is detected, else ``None``.
 
+    A CARRIED PAYLOAD IS NOT AN ECHO ON ITS OWN. A parser that reads the
+    candidate field AND hands back the payload it read it from —
+    ``(verdict, payload.get('candidate_id'), payload)`` — surfaces the decoy
+    too, and no yes/no inspection of the control can tell it from a pure echo,
+    because both reproduce their input. What separates them is the COUNT: the
+    binder surfaces the id once for the BINDING and once for the copy, where a
+    pure echo surfaces it only for the copy. So the echo is only reported when
+    the real payload's result carries the id NO MORE OFTEN than the control's
+    result carries the decoy — that is, when there is no extra occurrence for
+    the binding to live in. Both sides are counted against the SAME id, so a
+    parser that duplicates its payload is measured symmetrically and is still
+    caught.
+
     FAILS TOWARDS THE PASS, deliberately: a parser that RAISES on the control
     is a validating one (the stricter option (a) — see the
     ``option_a_rejects_dangling`` fixture — refuses a verdict carrying no
     candidate id at all), and a raise is not evidence of echoing. Only a
     successful parse that surfaces the decoy id counts.
+
+    *bound* is the result of parsing the REAL payload for the same *ident*.
     """
     control = {key: word, _DECOY_FIELD: ident}
     try:
@@ -596,7 +621,13 @@ def _echoes_payload(parse: Any, key: str, word: str, ident: str) -> str | None:
             word, key, type(exc).__name__, exc,
         )
         return None
-    if not _recoverable(result, ident):
+    echoed = _occurrences(result, ident)
+    if not echoed:
+        return None
+    if _occurrences(bound, ident) > echoed:
+        # The real result carries the id more often than the control carries
+        # the decoy. The surplus cannot come from reproducing the input --
+        # the control reproduces just as much -- so it is the binding.
         return None
     return (
         f'the id is ECHOED, not bound — a control payload naming {ident!r} only '
@@ -704,7 +735,7 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
             # The CONTROL. Recoverability alone cannot tell a parser that READS
             # the candidate field from one that hands the whole payload back;
             # both round-trip the id and both make the two results differ.
-            echo = _echoes_payload(parse, key, word, id_b)
+            echo = _echoes_payload(parse, key, word, id_b, res_b)
             if echo is not None:
                 inert.append(f'{field!r} — {echo}')
                 continue
