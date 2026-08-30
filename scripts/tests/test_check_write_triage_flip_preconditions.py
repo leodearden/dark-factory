@@ -496,6 +496,62 @@ def parse_judge_verdict(raw):
 }
 
 
+# The winner-rescue APPEND is a MECHANISM, not the invariant. These two
+# variants redefine select_judge_candidates to plain top-n, shadowing the
+# preamble's, so the hoisted parent's evidence child never enters the slate.
+# Nothing about "which candidate will the attach touch" has changed.
+_NO_RESCUE_SELECTOR = r"""
+
+def select_judge_candidates(results, n, *, canonical_id):
+    # Plain top-n by cosine: a later refactor that reaches the hoisted parent
+    # some other way, so no winner-rescue APPEND happens here.
+    scored = [
+        (_cosine_of(r), r)
+        for r in results or ()
+        if _cosine_of(r) is not None
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    limit = n if n > 0 else _DEFAULT_JUDGE_CANDIDATE_COUNT
+    return [r for _, r in scored[:limit]]
+"""
+
+# A correct option (b) -- an inline id marker -- on a selector that does not
+# rescue. The invariant HOLDS, so the gate must open.
+_VARIANT_TAILS['no_rescue'] = _NO_RESCUE_SELECTOR + r"""
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if str(candidate.id) == str(attach_target_id) else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+# The control for the above: the SAME non-rescuing selector, but the judge
+# marks candidates[0] regardless. Tolerating a non-rescued slate must not cost
+# the probe its ability to catch that.
+_VARIANT_TAILS['no_rescue_positional'] = _NO_RESCUE_SELECTOR + r"""
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '']
+    lines.append('ATTACH TARGET: ' + str(candidates[0].id))
+    lines.append('')
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+
 def _write_fake_judge(src_root: Path, *, variant: str) -> Path:
     """Lay down a standalone judge module at *src_root* and return *src_root*.
 
@@ -660,6 +716,36 @@ class TestEchoedArgumentIsNotATarget:
         assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+
+
+class TestRescueAppendIsAMechanism:
+    """The probe must not pin HOW the attach target comes to sit somewhere
+    other than slate[0] — only THAT it can, and that the judge tracks it.
+
+    Reported as a review-cycle-4 suggestion: requiring the winner-rescue
+    APPEND is a mechanism pin in the same false-FAIL direction task 4810
+    exists to remove. A selector that reaches the hoisted parent another way
+    would fail the gate closed forever, re-blocking task 3169 against a
+    correct fix for a reason unrelated to the invariant.
+    """
+
+    def test_valid_fix_passes_without_the_rescue_append(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='no_rescue')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            'a correct option (b) was failed for its SELECTOR\'s shape:\n'
+            f'{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+
+    def test_candidates_zero_still_caught_without_the_rescue_append(self, tmp_path):
+        """Tolerating a non-rescued slate must not cost the probe its teeth."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='no_rescue_positional')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, (
+            f'a candidates[0]-marking judge passed:\n{proc.stdout}'
+        )
+        assert _MARKS_FIRST in proc.stdout, proc.stdout
 
 
 class TestDiagnosticsAndProvenance:
