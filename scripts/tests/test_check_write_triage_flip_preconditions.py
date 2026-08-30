@@ -57,6 +57,9 @@ _OUTSIDE_SRC_ROOT = 'outside --src-root'
 #: The marker of item 1's full remedy block. Stated once, by whoever
 #: MEASURED it -- see TestReportSurvivesTruncation for why twice is costly.
 _REMEDY_GUIDANCE = 'Marking candidates[0]'
+#: What a PASS deliberately does NOT prove. Emitted on the pass path only,
+#: where the operator is about to act on it.
+_PASS_SCOPE = 'does NOT assert'
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +742,40 @@ class TestEchoedArgumentIsNotATarget:
         assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+
+
+class TestPassStatesItsOwnScope:
+    """A PASS authorises a production flag flip, so it must say what it did
+    NOT measure.
+
+    Reported as a review-cycle-4 suggestion: item 1 is satisfied by the JUDGE
+    PATH binding a verdict to a determinate candidate, and neither remedy is
+    checked for being consumed downstream -- option (a) does not prove the id
+    is validated against the slate or threaded through BandDecision, and
+    option (b) does not prove the attach touches whatever the prompt named.
+    Closing that gap needs a probe of the attach path itself, which is a
+    materially wider assertion than this gate makes (filed as follow-up work).
+    Until then the gate must not let a PASS be read as more than it is.
+    """
+
+    def test_option_b_pass_states_what_it_did_not_measure(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS_SCOPE in proc.stdout, proc.stdout
+
+    def test_option_a_pass_states_what_it_did_not_measure(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS_SCOPE in proc.stdout, proc.stdout
+
+    def test_the_caveat_does_not_appear_on_a_fail(self, tmp_path):
+        """A FAIL report's window is the scarce one; spend it on the remedy."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='flat')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, proc.stdout
+        assert _PASS_SCOPE not in proc.stdout, proc.stdout
 
 
 class TestPayloadCarryingBinderIsNotAnEcho:
