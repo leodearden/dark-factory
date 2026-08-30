@@ -1664,10 +1664,18 @@ def _spawn_verify_merge_bound_names(func_node) -> set[str]:
 
 
 def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
-    """``"func:lineno"`` for every swept holder's ``.kill()`` called directly in a
-    ``try`` handler/finalbody that does NOT also call ``kill_holder_tree``.
+    """``"func:lineno"`` for every swept holder's raw-kill spelling called directly
+    in a ``try`` handler/finalbody that does NOT also call ``kill_holder_tree``.
 
-    Each ``finally``/``except`` body is checked independently: a ``.kill()``
+    Three raw-kill spellings are matched, each a way a future teardown
+    could reintroduce the exact orphan task 4092 fixed: ``<holder>.kill()``,
+    ``<holder>.terminate()``, and an ``os.kill``/``os.killpg`` call whose
+    argument subtree mentions a swept holder name -- most pointedly the
+    ``os.killpg(os.getpgid(holder.pid), SIGKILL)`` one-liner
+    ``kill_holder_tree``'s own docstring calls out as the dangerous thing a
+    future author would reach for instead.
+
+    Each ``finally``/``except`` body is checked independently: a raw kill
     in one body is not excused by a ``kill_holder_tree`` call living in a
     DIFFERENT body of the same ``try``.
     """
@@ -1687,9 +1695,19 @@ def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
                         continue
                     if (
                         isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr == 'kill'
+                        and sub.func.attr in ('kill', 'terminate')
                         and isinstance(sub.func.value, ast.Name)
                         and sub.func.value.id in holder_names
+                    ) or (
+                        isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id == 'os'
+                        and sub.func.attr in ('kill', 'killpg')
+                        and any(
+                            isinstance(name_node, ast.Name) and name_node.id in holder_names
+                            for arg in sub.args
+                            for name_node in ast.walk(arg)
+                        )
                     ):
                         bare_kill_lines.append(sub.lineno)
                     elif isinstance(sub.func, ast.Name) and sub.func.id == 'kill_holder_tree':
@@ -1708,11 +1726,13 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
     For every ``test_*`` function, collects the local names bound from a
     bare ``X = spawn_verify_merge(...)`` call, then asserts that no ``try``
-    handler/finalbody in that function calls ``<holder>.kill()`` directly
-    unless the SAME body also calls ``kill_holder_tree`` -- a direct
-    ``.kill()``/``.wait()`` teardown SIGKILLs only the leader, orphaning any
-    session-escaped descendant (e.g. one of verify.py's ``start_new_session``
-    build commands) for the rest of its natural life (task 4092).
+    handler/finalbody in that function calls ``<holder>.kill()``,
+    ``<holder>.terminate()``, or ``os.kill``/``os.killpg`` (with a swept
+    holder name anywhere in the argument subtree) directly unless the SAME
+    body also calls ``kill_holder_tree`` -- any of those raw-kill spellings
+    SIGKILLs/terminates only the leader, orphaning any session-escaped
+    descendant (e.g. one of verify.py's ``start_new_session`` build
+    commands) for the rest of its natural life (task 4092).
 
     Carries the sibling sweep's anti-vacuity discipline: a matcher that
     silently stops matching is a guard reporting PASS while guarding
@@ -1742,10 +1762,11 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     )
 
     assert not offenders, (
-        'these holder teardown(s) call .kill() directly instead of routing '
-        'through kill_holder_tree, so a session-escaped descendant (e.g. a '
-        "verify.py start_new_session build command) survives the leader's "
-        'own death as an orphan:\n  ' + '\n  '.join(offenders)
+        'these holder teardown(s) call .kill()/.terminate()/os.kill()/'
+        'os.killpg() directly instead of routing through kill_holder_tree, '
+        'so a session-escaped descendant (e.g. a verify.py '
+        "start_new_session build command) survives the leader's own death "
+        'as an orphan:\n  ' + '\n  '.join(offenders)
     )
 
 
