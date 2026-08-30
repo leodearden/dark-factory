@@ -187,6 +187,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'refuse:read_error',
     'refuse:not_found',
     'refuse:preimage_mismatch',
+    'refuse:correction_reverted',
     'refuse:store_unavailable',
     'refuse:write_error',
     'refuse:write_failed',
@@ -358,17 +359,45 @@ def classify_amend_target(
     - ``'refuse:not_found'`` -- the record is genuinely gone (consolidated
       away, reaped). Nothing to amend, and inventing it back is not this
       script's job.
-    - ``'skip:already_amended'`` -- content carries :data:`AMENDED_SENTINEL`.
-    - ``'amend'`` -- content still equals the pinned pre-image exactly.
-    - ``'refuse:preimage_mismatch'`` -- content exists but is neither. Somebody
-      else changed this record; REFUSE rather than clobber.
+    - ``'skip:already_amended'`` -- content carries :data:`AMENDED_SENTINEL`,
+      i.e. it holds the landed correction. This is the outcome BOTH real
+      targets produce on a healthy corpus, and the whole reason the live run
+      writes nothing.
+    - ``'refuse:correction_reverted'`` -- content IS
+      :data:`REVERSION_PREIMAGE`: the record has gone back to the known-false
+      bare causal claim. Named separately from a generic mismatch so an
+      operator can tell "the correction was undone" from "somebody rewrote
+      this into something unrecognised" without reading the content back
+      themselves, and folded into :data:`ERROR_OUTCOMES` so an automated
+      caller gates on the exit code alone.
+    - ``'amend'`` -- content still equals the pinned pre-image exactly. For a
+      VERIFY-ONLY target (``new_content is None``, which is both real targets)
+      this means only "still matches its pin"; :func:`_apply_amendments`
+      demotes it to ``'skip:verify_only'`` rather than writing.
+    - ``'refuse:preimage_mismatch'`` -- content exists but is none of the
+      above. Somebody else changed this record; REFUSE rather than clobber.
 
-    The check ORDER is load-bearing. The sentinel test precedes the pre-image
-    comparison because after a successful apply the live content no longer
-    equals the pre-image -- it equals the replacement. Pre-image-first would
-    therefore report every re-run as ``refuse:preimage_mismatch``, turning the
-    idempotency property into a false tamper alarm and leaving an operator
-    unable to tell a safe re-run from a genuine race.
+    The check ORDER is load-bearing, in both directions.
+
+    The sentinel test precedes the pre-image comparison because once a
+    correction lands the live content no longer equals whatever pre-image
+    predated it. Pre-image-first would therefore report every subsequent run
+    as ``refuse:preimage_mismatch``, turning the idempotency property into a
+    false tamper alarm and leaving an operator unable to tell a safe re-run
+    from a genuine race.
+
+    The reversion test sits BETWEEN the sentinel and the pre-image comparison,
+    and compares by strict EQUALITY (after ``.strip()``) rather than by
+    substring. The equality is not a stylistic choice -- it is the difference
+    between a working guard and one that fails on every healthy corpus. BOTH
+    landed corrections quote the original bare sentence VERBATIM: target A
+    inside its "This entry's original framing -- ..." preamble, target B
+    inside the paragraph recording the measured store_scores. A substring test
+    would therefore classify both corrected records as reverted and exit 1
+    with the corpus in exactly the state this script exists to confirm. Only
+    content that IS the bare claim, with nothing around it, is a reversion.
+    Sentinel-first then guarantees that a record which both quotes the
+    sentence and carries the correction can never reach this branch at all.
 
     And the mismatch branch REFUSES rather than overwrites because an in-place
     amend is invisible to every downstream reader: silently rewriting a record
@@ -388,6 +417,9 @@ def classify_amend_target(
 
     if AMENDED_SENTINEL in content:
         return {**result, 'action': 'skip:already_amended'}
+
+    if content.strip() == REVERSION_PREIMAGE:
+        return {**result, 'action': 'refuse:correction_reverted'}
 
     if content == target.expected_preimage:
         return {**result, 'action': 'amend'}
