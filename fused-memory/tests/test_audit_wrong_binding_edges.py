@@ -685,8 +685,9 @@ class TestClassifyEdge:
     """The Class-A detector: an endpoint the fact does not name.
 
     Mirrors the write-time guard's ``set-membership`` check
-    (memory_service.py:3524-3529) deliberately, so the retrospective and live
-    views of one defect cannot drift into two different verdicts.
+    (``memory_service.py::MemoryService._verify_episode_referents``)
+    deliberately, so the retrospective and live views of one defect cannot
+    drift into two different verdicts.
     """
 
     def test_the_canonical_specimen_flags_its_subject(self) -> None:
@@ -1852,6 +1853,65 @@ class TestSweepGraph:
         ]
         swept = await self._sweep([row], node_ids={'6164'})
         assert swept.findings[0].nearest_id == '6164'
+
+    async def test_an_all_foreign_fact_leaves_the_cause_columns_not_computed(
+        self
+    ) -> None:
+        """No own-project candidate exists, so NOTHING is measured.
+
+        The live specimen this pins is reify edge 05602754, object-end
+        ``dark_factory:1791``, whose fact names only ``dark_factory:1799``
+        and ``dark_factory:1800``. ``named`` drops both as foreign and is
+        empty — so the columns must stay None and tally into NOT_COMPUTED
+        rather than falling back to ``id_proximity``'s ``('unrelated', '')``
+        and ``correct_node_present('')`` -> False, which would publish a
+        MEASURED negative for a comparison that never ran.
+
+        Distinguished from ``test_a_foreign_referent_is_dropped_before_
+        proximity`` above, which covers the MIXED fact where a local id
+        survives the drop and IS measurable. The finding itself is still
+        minted: the endpoint really is unnamed by the fact — it is only the
+        cause attribution that is out of scope for a foreign endpoint.
+        """
+        row = [
+            'ElasticResult.rotation', 'dark_factory:1791', 'e-all-foreign',
+            'The task dark_factory:1800 was deliberately not filed as a reify '
+            'task with an external dependency on dark_factory:1799.', [],
+        ]
+        swept = await self._sweep([row], node_ids={'1799', '1800'})
+        (finding,) = swept.findings
+        assert finding.end == 'object'
+        assert finding.proximity is None
+        assert finding.nearest_id is None
+        assert finding.correct_node_present is None
+
+    async def test_the_not_computed_columns_survive_into_the_report(self) -> None:
+        """End to end: an unmeasured finding is PUBLISHED as unmeasured.
+
+        Guards the seam between the two halves of the fix — a caller that
+        left the columns None, and a ``build_report`` that tallies None into
+        its own bucket. Were either half to regress, the row would land in
+        ``unrelated``/``false`` and be indistinguishable from a measured one.
+        """
+        row = [
+            'ElasticResult.rotation', 'dark_factory:1791', 'e-all-foreign',
+            'The task dark_factory:1800 was deliberately not filed as a reify '
+            'task with an external dependency on dark_factory:1799.', [],
+        ]
+        swept = await self._sweep([row], node_ids={'1799', '1800'})
+        report = build_report(
+            swept.findings,
+            swept_at='2026-08-30T00:00:00+00:00',
+            graphs=[GRAPH],
+            scanned=swept.scanned,
+            population=swept.population,
+            unverifiable=swept.unverifiable,
+            reads=swept.reads,
+        )
+        assert report['summary']['by_proximity'][NOT_COMPUTED] == 1
+        assert report['summary']['by_proximity']['unrelated'] == 0
+        assert report['summary']['correct_node_present'][NOT_COMPUTED] == 1
+        assert report['summary']['correct_node_present']['false'] == 0
 
     async def test_suppressions_are_collected_for_the_tally(self) -> None:
         swept = await self._sweep([ROW_SUPPRESSED])

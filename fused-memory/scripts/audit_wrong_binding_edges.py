@@ -647,9 +647,18 @@ def id_proximity(
     re-running the committed script, not by trusting a transcript.
 
     Ties are broken on the numerically LOWEST id, so the report is
-    byte-stable across runs and cannot depend on set iteration order. An
-    empty *named_ids* yields ``('unrelated', '')`` — defensive only:
-    :func:`classify_edge` never emits a finding for a fact naming nothing.
+    byte-stable across runs and cannot depend on set iteration order.
+
+    An empty *named_ids* yields ``('unrelated', '')``, and that return is a
+    TOTALITY fallback rather than a measurement. It used to be documented as
+    unreachable, on the grounds that :func:`classify_edge` never emits a
+    finding for a fact naming nothing — true of the FACT, but not of the
+    candidate set the caller derives from it: :func:`_sweep_graph` keeps only
+    own-project referents, which is empty whenever a fact names foreign ids
+    exclusively (live specimen 05602754). The caller therefore checks for
+    that case and leaves the cause columns None — see the comment there — so
+    this branch is not how an unmeasured finding reaches the report. Do not
+    re-derive "unreachable" from the fact-side precondition alone.
     """
     best: tuple[int, tuple[int, str], str] | None = None
     for candidate in named_ids:
@@ -1385,6 +1394,29 @@ async def _sweep_graph(reader: Any, graph: str) -> GraphSweep:
     enriched: list[Finding] = []
     for finding in findings:
         named = {r.number for r in finding.fact_referents if not r.project_id}
+        if not named:
+            # Every referent the fact names is FOREIGN-qualified, so this
+            # graph's own-project census — the only scope either cause column
+            # is defined over (see EdgeReader.read_task_node_ids, which
+            # deliberately harvests no foreign id) — holds no candidate to
+            # measure against. The columns stay None so build_report tallies
+            # them into NOT_COMPUTED. Publishing the fallbacks instead
+            # ('unrelated' / False) would state a MEASURED negative for a
+            # comparison that never happened, which is the exact fold
+            # NOT_COMPUTED exists to prevent, in the two distributions the
+            # artifact's whole cause argument rests on.
+            #
+            # NOT theoretical, and not fixable by widening the candidate set
+            # here: live specimen 05602754 is object-end `dark_factory:1791`
+            # inside reify, whose fact names only `dark_factory:1799` and
+            # `dark_factory:1800`. Comparing the bare numbers would read
+            # 1791/1799 as a one_digit_diff, but `correct_node_present` would
+            # then ask whether REIFY holds a node for a DARK_FACTORY id —
+            # a different question with a meaningless answer. Answering
+            # cross-project needs a cross-project node census, which this
+            # sweep does not read.
+            enriched.append(finding)
+            continue
         bucket, nearest = id_proximity(finding.node_referent.number, named)
         enriched.append(
             Finding(**{
