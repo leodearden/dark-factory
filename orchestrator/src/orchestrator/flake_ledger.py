@@ -699,6 +699,121 @@ def read_occurrences(
         return []
 
 
+# ---------------------------------------------------------------------------
+# The de-flake task ζ files at write time (§5.5, §5.9)
+# ---------------------------------------------------------------------------
+
+# The binding corollary of §5.5, carried IN the filed task rather than left for the
+# de-flake agent to already know.  Task 1836 widened a 10s timeout to 30s and thereby
+# MASKED a real SIGHUP bug for a day, until task 1841 found it; `esc-3650-2` was itself
+# a real production bug (SIGPIPE under `pipefail`, task 3552), not a bad test.
+#
+# DELIBERATE NON-DEDUP with `chronic_flake.py::_ROOT_CAUSE_INSTRUCTION`, which says the
+# same thing in remedy framing ('ROOT-CAUSE this...').  The two texts differ in FRAMING,
+# which is the entire point of §5.5: chronic_flake's presupposes a fix, and this one must
+# not.  Sharing one string would force one framing on both.  Importing `chronic_flake`
+# here would also break this module's import discipline (it depends on `shared` alone)
+# and drag `orchestrator.config` into a module the merge path calls on every suppression.
+# Task κ — which migrates chronic_flake onto this ledger — OWNS converging the two texts.
+NEVER_WIDEN_A_TIMEOUT = (
+    'CONSTRAINT, binding: do NOT widen a timeout, lengthen a sleep, or add a retry as '
+    'the remedy. That makes the observation rarer and harder to reproduce without '
+    'removing its cause, and it has already masked a real defect here (task 1836 '
+    'widened 10s->30s and hid a genuine SIGHUP bug for a day, until task 1841 found '
+    'it). Prefer condition-polling (wait for the state the test actually depends on) '
+    'and structural asserts (assert on state, not on log/prose output).'
+)
+
+# §5.9's invariant names TWO responsibilities, and both belong to the SAME task.  Split
+# into two constants because a task carrying only the first would fix the defect and
+# leave the ledger row open forever — which is precisely what task θ's class-2 AGE
+# backstop then escalates on, turning a successful fix into a false non-convergence
+# signal.
+RESPONSIBILITY_FIX_ROOT_DEFECT = (
+    'You are responsible for finding and fixing the ROOT DEFECT behind this observation'
+)
+RESPONSIBILITY_REMOVE_FROM_LEDGER = (
+    'You are ALSO responsible for removing this test from the flake ledger once it is '
+    'fixed (resolve its debt row), which is what closes the cycle'
+)
+
+
+def build_deflake_task_arguments(row: DebtRow) -> dict:
+    """The ``submit_task`` argument block for the task that owns *row*'s debt (§5.9).
+
+    Pure and side-effect free: :func:`open_debt` files the result, this only shapes it.
+
+    Follows ``orchestrator/src/orchestrator/chronic_flake.py::build_chronic_flake_fix_task_arguments``'s
+    block shape (title / description / priority / metadata), RE-FRAMED per §5.5 so the
+    text records the OBSERVATION and never presupposes a remedy — see
+    :data:`NEVER_WIDEN_A_TIMEOUT` for why the instruction text is re-derived here rather
+    than shared with that module's ``_ROOT_CAUSE_INSTRUCTION``, and which task owns
+    converging them.
+
+    Two keys are load-bearing and easy to "clean up" wrongly:
+
+    - ``planning_mode: True`` — this is what makes ``submit_task`` return a REAL task id
+      SYNCHRONOUSLY (fused-memory ``task_interceptor.py::_submit_task_planning_mode``),
+      bypassing the curator ticket store, which PRD §5.4 explicitly sanctions "for
+      exactly the tasks this subsystem files".  The default two-phase path returns only
+      ``{'ticket': 'tkt_...'}`` and the curator decides create/combine/drop
+      ASYNCHRONOUSLY — so there would be no id to store in ``owner_task_id`` and the task
+      might never exist at all, making §5.9's invariant silently hollow exactly where
+      §5.7 has already landed the merge.  The task is born ``deferred``; the caller
+      completes it with ``commit_planning``.
+    - NO ``project_root`` — :func:`open_debt` takes a ``db_path``, not a project root
+      (§8.3), and the only way to name one from here would be ``db_path.parent.parent
+      .parent``, a silent position-dependent inversion of :func:`ledger_db_path` that
+      breaks for every non-standard path.  The adapter already HOLDS the project root and
+      injects it (``chronic_flake.py::SchedulerChronicFlakeTaskClient.submit_task``).
+
+    ``metadata.files`` is likewise omitted deliberately: a ``test_id`` may be a reify
+    script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
+    derived from a guess is worse than no lock — the de-flake agent discovers the files.
+    """
+    return {
+        'title': (
+            f'Flake debt: {row.test_id} — {FlakeVerdict.passes_in_isolation.value} '
+            f'after a merge-gate red was suppressed'
+        ),
+        'description': (
+            f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
+            f'observation for this test and SUPPRESSED the red it produced, so a merge '
+            f'landed on a gate that had gone red:\n'
+            f'\n'
+            f'  test:        {row.test_id}\n'
+            f'  project:     {row.project_id}\n'
+            f'  opened_at:   {row.opened_at}\n'
+            f'  open_count:  {row.open_count}\n'
+            f'\n'
+            f'What that verdict means, precisely: the test failed under load in the '
+            f'merge verify and then PASSED on an isolated, serial re-run. Read that as '
+            f'evidence about the SYSTEM, not as a verdict on the test — a test that '
+            f'passes alone and fails under load has repeatedly turned out to be a real '
+            f'production defect here (task 1836 -> 1841: a widened timeout masked a '
+            f'genuine SIGHUP bug for a day; esc-3650-2 was a real SIGPIPE-under-pipefail '
+            f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
+            f'\n'
+            f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
+            f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+            f'\n'
+            f'{NEVER_WIDEN_A_TIMEOUT}\n'
+            f'\n'
+            f'Auto-filed by the flake ledger when the debt row was opened (PRD '
+            f'plans/flake-ledger-prd.md §5.9). The merge already landed, so this is '
+            f'visible, owned debt rather than an incident.'
+        ),
+        'priority': 'medium',
+        'planning_mode': True,
+        'metadata': {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': row.test_id,
+            'flake_debt_open_count': row.open_count,
+            'flake_debt_opened_at': row.opened_at,
+        },
+    }
+
+
 def _to_debt_row(row: sqlite3.Row) -> DebtRow:
     return DebtRow(
         test_id=row['test_id'],
