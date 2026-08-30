@@ -151,6 +151,17 @@ class TestAmendTargetShape:
             target.memory_id = 'mutated'  # type: ignore[misc]
 
 
+def _synthetic_target(preimage: str, **kwargs):
+    """An AmendTarget with an arbitrary pre-image, for classifier tests.
+
+    The classifier is pure and target-agnostic, but both REAL targets now pin
+    post-correction text carrying the sentinel -- so a real target can no
+    longer reach the 'amend' branch at all. Synthesising one keeps each
+    classifier branch pinned by a test that isolates it.
+    """
+    return _mod.AmendTarget(memory_id=STALE_ID, expected_preimage=preimage, **kwargs)
+
+
 class TestClassifyAmendTarget:
     """The pure classifier: what a live read means for one target.
 
@@ -162,7 +173,7 @@ class TestClassifyAmendTarget:
     """
 
     def test_exact_preimage_classifies_amend(self):
-        target = _mod.AMEND_TARGETS[0]
+        target = _synthetic_target('a record still in its pinned state')
         decision = _mod.classify_amend_target(
             target, {'found': True, 'content': target.expected_preimage},
         )
@@ -170,28 +181,41 @@ class TestClassifyAmendTarget:
         assert decision['id'] == target.memory_id
 
     def test_already_amended_content_classifies_skip(self):
-        target = _mod.AMEND_TARGETS[0]
+        target = _synthetic_target('anything at all')
         decision = _mod.classify_amend_target(
-            target, {'found': True, 'content': target.new_content},
+            target,
+            {'found': True, 'content': f'corrected -- {_mod.AMENDED_SENTINEL}'},
         )
         assert decision['action'] == 'skip:already_amended'
 
+    def test_both_real_targets_read_as_already_corrected(self):
+        # The live corpus, classified: the correction landed on 2026-08-30, so
+        # a healthy read of either record is a skip. This is the whole verifier
+        # in one assertion.
+        for target in _mod.AMEND_TARGETS:
+            decision = _mod.classify_amend_target(
+                target, {'found': True, 'content': target.expected_preimage},
+            )
+            assert decision == {
+                'id': target.memory_id, 'action': 'skip:already_amended',
+            }
+
     def test_sentinel_is_checked_before_the_preimage_comparison(self):
-        # A re-run reads back content that no longer equals the pre-image (it
-        # equals the replacement). If the pre-image check ran first, every
-        # re-run would report a mismatch REFUSAL and an operator would have to
-        # decide whether the corpus had been tampered with. The sentinel test
-        # must therefore win -- assert it with text that is neither the
-        # pre-image nor the exact replacement, so only ordering can explain it.
-        target = _mod.AMEND_TARGETS[0]
-        drifted = f'prefix added later. {target.new_content} suffix added later.'
+        # After a correction lands the live content no longer equals whatever
+        # pre-image was pinned before it. If the pre-image check ran first,
+        # every subsequent run would report a mismatch REFUSAL and an operator
+        # would have to decide whether the corpus had been tampered with. The
+        # sentinel test must therefore win -- assert it with text that is
+        # neither the pre-image nor anything else recognised, so only ordering
+        # can explain the result.
+        target = _synthetic_target('the pinned pre-image')
+        drifted = f'prefix added later. {_mod.AMENDED_SENTINEL} suffix added later.'
         assert drifted != target.expected_preimage
-        assert drifted != target.new_content
         decision = _mod.classify_amend_target(target, {'found': True, 'content': drifted})
         assert decision['action'] == 'skip:already_amended'
 
     def test_unrecognised_content_classifies_preimage_mismatch(self):
-        target = _mod.AMEND_TARGETS[0]
+        target = _synthetic_target('the pinned pre-image')
         decision = _mod.classify_amend_target(
             target, {'found': True, 'content': 'something else entirely'},
         )
@@ -219,13 +243,103 @@ class TestClassifyAmendTarget:
         )
         assert missing['action'] != errored['action']
 
-    def test_classifier_is_pure_over_both_targets(self):
+    def test_classifier_is_pure(self):
         # Same input twice -> same answer, and no target is special-cased.
         for target in _mod.AMEND_TARGETS:
             fetched = {'found': True, 'content': target.expected_preimage}
-            first = _mod.classify_amend_target(target, fetched)
-            second = _mod.classify_amend_target(target, fetched)
-            assert first == second == {'id': target.memory_id, 'action': 'amend'}
+            assert (
+                _mod.classify_amend_target(target, fetched)
+                == _mod.classify_amend_target(target, fetched)
+            )
+
+
+class TestReversionGuard:
+    """The script's remaining standing value once the write arm is retired.
+
+    An in-place amend is invisible to every downstream reader. The corpus
+    demonstrably re-worded these two records twice inside a single day, so a
+    later consolidation that dropped the SUPERSEDED marker and restored the
+    bare causal claim would silently re-open exactly the hazard esc-3578-5 was
+    filed for -- with the top-ranked hit on the 'sessions stored
+    per-project-directory' query once again asserting an unmeasured inference
+    as fact. This guard turns that invisible regression into a non-zero exit.
+    """
+
+    def test_content_reverted_to_the_bare_claim_is_named_as_such(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': _mod.REVERSION_PREIMAGE},
+        )
+        assert decision['action'] == 'refuse:correction_reverted'
+
+    def test_reversion_is_recognised_through_surrounding_whitespace(self):
+        target = _mod.AMEND_TARGETS[0]
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': f'\n  {_mod.REVERSION_PREIMAGE}  \n'},
+        )
+        assert decision['action'] == 'refuse:correction_reverted'
+
+    def test_a_reversion_is_distinguished_from_a_generic_mismatch(self):
+        # The point of a named outcome: an operator can tell "the correction
+        # was undone" from "somebody rewrote this into something unrecognised"
+        # without reading the content back themselves.
+        target = _mod.AMEND_TARGETS[0]
+        reverted = _mod.classify_amend_target(
+            target, {'found': True, 'content': _mod.REVERSION_PREIMAGE},
+        )
+        drifted = _mod.classify_amend_target(
+            target, {'found': True, 'content': 'some unrelated rewrite'},
+        )
+        assert reverted['action'] != drifted['action']
+        assert drifted['action'] == 'refuse:preimage_mismatch'
+
+    def test_the_landed_correction_is_not_misread_as_a_reversion(self):
+        # THE test this guard could most easily fail. Target A's live content
+        # QUOTES the original bare sentence verbatim inside its SUPERSEDED
+        # preamble -- so a substring test would classify the healthy, corrected
+        # record as reverted and exit 1 on a perfectly good corpus.
+        target = _mod.AMEND_TARGETS[0]
+        assert _mod.REVERSION_PREIMAGE in target.expected_preimage  # the hazard
+        decision = _mod.classify_amend_target(
+            target, {'found': True, 'content': target.expected_preimage},
+        )
+        assert decision['action'] == 'skip:already_amended'
+
+    def test_a_desentineled_record_quoting_the_claim_is_a_mismatch_not_a_reversion(self):
+        # Isolates equality-from-substring with the sentinel out of the way:
+        # text that merely CONTAINS the bare claim, and carries no sentinel, is
+        # unrecognised content -- not a reversion. Only content that IS the
+        # bare claim is a reversion.
+        target = _mod.AMEND_TARGETS[0]
+        quoting = f'Historical note: "{_mod.REVERSION_PREIMAGE}" was the original claim.'
+        assert _mod.AMENDED_SENTINEL not in quoting
+        decision = _mod.classify_amend_target(target, {'found': True, 'content': quoting})
+        assert decision['action'] == 'refuse:preimage_mismatch'
+
+    def test_reversion_is_an_error_outcome(self):
+        assert 'refuse:correction_reverted' in _mod.ERROR_OUTCOMES
+
+    def test_a_reverted_record_exits_non_zero(self):
+        # An automated caller must be able to gate on the exit code alone.
+        report = _mod.build_amend_report(
+            [_decision(STALE_ID, 'refuse:correction_reverted')],
+            applied_ids=set(), dry_run=True,
+            generated_at='2026-08-30T00:00:00+00:00',
+        )
+        assert report['totals']['refused'] == 1
+        assert _mod.resolve_exit_code(report) == 1
+
+    def test_the_read_error_and_not_found_branches_are_unchanged(self):
+        # The reversion branch is inserted between the sentinel and the
+        # pre-image comparison; the two envelope-shape branches above it must
+        # still answer exactly as before.
+        target = _mod.AMEND_TARGETS[0]
+        assert _mod.classify_amend_target(
+            target, {'found': False},
+        )['action'] == 'refuse:not_found'
+        assert _mod.classify_amend_target(
+            target, {'error': 'boom', 'error_type': 'TimeoutError'},
+        )['action'] == 'refuse:read_error'
 
 
 def _decision(memory_id: str, action: str) -> dict:
