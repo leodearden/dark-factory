@@ -226,18 +226,6 @@ def run_section(
     systemctl.write_text(
         "#!/usr/bin/env bash\n"
         f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\n"
-        'if [ "${1:-}" = "--user" ]; then shift; fi\n'
-        'if [ "${1:-}" = "enable" ]; then\n'
-        "  shift\n"
-        '  for _u in "$@"; do\n'
-        '    case "$_u" in -*) continue ;; esac\n'
-        '    case "$_u" in *.service|*.timer|*.socket|*.target|*.path|*.mount) _f="$_u" ;; *) _f="$_u.service" ;; esac\n'
-        f'    if [ ! -f "{unit_dir}/$_f" ]; then\n'
-        "      printf 'Failed to enable unit: Unit file %s does not exist.\\n' \"$_f\" >&2\n"
-        "      exit 1\n"
-        "    fi\n"
-        "  done\n"
-        "fi\n"
         "exit 0\n",
         encoding="utf-8",
     )
