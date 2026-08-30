@@ -30,11 +30,16 @@ whose merged index carries other surviving fields is NOT an in-place catalog
 mutation — FalkorDB builds a REPLACEMENT index for those fields, and any
 catalog read taken before that build finishes can still see the pre-drop row,
 including the just-dropped VECTOR property.  Every post-drop
-``list_indices()`` / ``drop_vector_indices()`` call in this module is
-therefore barriered by ``await_index_operational``, guarding the production
-contract documented on
-``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``;
-those barrier calls are load-bearing, not defensive.
+``list_indices()`` / ``drop_vector_indices()`` call in THIS MODULE is
+therefore barriered by ``await_index_operational`` — these are TEST-only
+barriers, load-bearing rather than defensive, and they do NOT mean production
+is exposed to the same race:
+``fused_memory/backends/graphiti_client.py::GraphitiBackend.drop_vector_indices``
+issues its own ``list_indices()`` read exactly ONCE, BEFORE any drop, so a
+single production call can never observe its own rebuild window.  Only a
+rapid second call — what
+``test_is_idempotent_and_reports_zero_on_a_second_run`` below exercises — or
+a caller that re-reads the catalog after a drop, can land in it.
 """
 
 from __future__ import annotations
@@ -75,6 +80,18 @@ pytestmark = [
 ]
 
 
+def _types_contain(raw, kind: str) -> bool:
+    """True if a raw db.indexes() per-property type value (str or list) contains *kind*.
+
+    FalkorDB reports a property's index type(s) as a bare string for a single
+    type or a list for merged types (e.g. ``['RANGE', 'VECTOR']``). Every
+    VECTOR/RANGE membership check in this module normalizes that the same
+    way; this is the one place to change if that normalization ever needs to
+    differ, rather than a fourth hand-rolled copy.
+    """
+    return kind in ([raw] if isinstance(raw, str) else raw)
+
+
 def _vector_properties(records) -> set[tuple[str, str]]:
     """Every (label, property) in *records* whose type list contains 'VECTOR'.
 
@@ -87,7 +104,7 @@ def _vector_properties(records) -> set[tuple[str, str]]:
     for record in records:
         types = record.get('type') or {}
         for prop, raw in types.items():
-            if 'VECTOR' in ([raw] if isinstance(raw, str) else raw):
+            if _types_contain(raw, 'VECTOR'):
                 found.add((record['label'], prop))
     return found
 
@@ -195,20 +212,11 @@ class TestDropVectorIndicesLive:
             assert all(set(d) == {'label', 'field'} for d in dropped)
             assert all(isinstance(d['field'], str) for d in dropped)
 
-            # MANDATORY (task 4748) — do NOT delete this as redundant with the
-            # fixture's barrier. DROP re-opens the window the fixture's barrier
-            # closed: dropping a VECTOR field from a label whose merged index
-            # carries other fields makes FalkorDB BUILD A REPLACEMENT index, and
-            # until that build finishes CALL db.indexes() returns BOTH rows in
-            # one result set — the new ['name'] row reading '[Indexing] N/M:
-            # UNDER CONSTRUCTION' and the OLD row still advertising the dropped
-            # name_embedding VECTOR as OPERATIONAL. Without this barrier `after`
-            # can capture the stale row and the `_vector_properties(after) ==
-            # set()` assertion below fails with "vector indices survived
-            # drop_vector_indices()". Measured against FalkorDB v41800; not a
-            # read-path artifact — RO_QUERY and QUERY agree at every instant.
-            # (RELATES_TO is never the phantom: its index has only the one
-            # field, so dropping it removes the whole index and opens no window.)
+            # MANDATORY (task 4748) — see the drop-side HAZARD in the module
+            # docstring; do NOT delete as redundant with the fixture's
+            # barrier. Without this, `after` can capture the stale row and
+            # the `_vector_properties(after) == set()` assertion below fails
+            # with "vector indices survived drop_vector_indices()".
             await await_index_operational(live_vector_graph)
 
             after = await backend.list_indices(group_id=TEST_GRAPH)
@@ -221,7 +229,7 @@ class TestDropVectorIndicesLive:
                 (record['label'], prop)
                 for record in after
                 for prop, raw in (record.get('type') or {}).items()
-                if 'RANGE' in ([raw] if isinstance(raw, str) else raw)
+                if _types_contain(raw, 'RANGE')
             }, f'the RANGE index on Entity.name was collateral damage: {after!r}'
         finally:
             await backend.close()
@@ -242,16 +250,11 @@ class TestDropVectorIndicesLive:
             first = await backend.drop_vector_indices(group_id=TEST_GRAPH)
             assert len(first) == 2
 
-            # MANDATORY (task 4748) — do NOT delete this as redundant with the
-            # fixture's barrier. DROP re-opens the window the fixture's barrier
-            # closed: dropping a VECTOR field from a label whose merged index
-            # carries other fields makes FalkorDB BUILD A REPLACEMENT index, and
-            # until that build finishes CALL db.indexes() returns BOTH rows in
-            # one result set — the new ['name'] row reading '[Indexing] N/M:
-            # UNDER CONSTRUCTION' and the OLD row still advertising the dropped
-            # name_embedding VECTOR as OPERATIONAL. drop_vector_indices() opens
-            # with its own list_indices(), so without this barrier pass 2's
-            # internal read can land in the window, see the stale
+            # MANDATORY (task 4748) — see the drop-side HAZARD in the module
+            # docstring; do NOT delete as redundant with the fixture's
+            # barrier. drop_vector_indices() opens with its own
+            # list_indices(), so without this barrier pass 2's internal read
+            # can land in the rebuild window, see the stale
             # Entity{name_embedding: ['VECTOR']} row, and re-issue
             # `DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)` — which
             # FalkorDB then answers with:
@@ -259,10 +262,7 @@ class TestDropVectorIndicesLive:
             #   :Entity(name_embedding): no such index.
             # drop_vector_indices() deliberately does not absorb per-statement
             # failures, so that ERRORS the test rather than failing an
-            # assertion. Measured against FalkorDB v41800; not a read-path
-            # artifact — RO_QUERY and QUERY agree at every instant. (RELATES_TO
-            # is never the phantom: its index has only the one field, so
-            # dropping it removes the whole index and opens no window.)
+            # assertion.
             await await_index_operational(live_vector_graph)
 
             second = await backend.drop_vector_indices(group_id=TEST_GRAPH)
@@ -332,6 +332,11 @@ def _entity_index_rows(result) -> list[tuple[dict, str]]:
     under test must not be able to make its own verification pass.
     """
     header_names = [col[1] for col in result.header]
+    for col in ('label', 'types', 'status'):
+        assert col in header_names, (
+            f'CALL db.indexes() has no {col!r} column (header={header_names}); '
+            'await_index_operational cannot be trusted.'
+        )
     label_idx = header_names.index('label')
     types_idx = header_names.index('types')
     status_idx = header_names.index('status')
@@ -344,10 +349,7 @@ def _entity_index_rows(result) -> list[tuple[dict, str]]:
 
 def _row_has_vector(types: dict) -> bool:
     """True if any property in a raw db.indexes() 'types' dict carries VECTOR."""
-    return any(
-        'VECTOR' in ([raw] if isinstance(raw, str) else raw)
-        for raw in types.values()
-    )
+    return any(_types_contain(raw, 'VECTOR') for raw in types.values())
 
 
 @pytest.mark.timeout(30)
