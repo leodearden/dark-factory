@@ -258,6 +258,7 @@ from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
@@ -4026,5 +4027,253 @@ def filter_contamination_ceiling_findings(
             # do NOT append — flag is dropped
         else:
             kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting that an entry's content was injected, fabricated, or
+#: written by someone outside this deployment.  Several spellings are listed
+#: because the family has no committed schema entry — Stage 1 emits it as
+#: free-form LLM output, so the set is a best-effort census of the plausible
+#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
+#: spelling degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
+    'possible_injection',
+    'prompt_injection',
+    'injected_content',
+    'possible_fabrication',
+    'fabricated_content',
+    'foreign_authorship',
+    'suspicious_authorship',
+})
+
+
+def _classify_authorship(agent_id: Any) -> str:
+    """Classify one citation's stored ``agent_id``.
+
+    ``'internal'`` — a recognised house writer (the only value that can clear
+    a flag).  ``'missing'`` — no usable provenance at all (absent key, None,
+    empty, or a non-string).  ``'foreign'`` — a real agent_id that matches no
+    house writer family.  These are kept distinct because they read very
+    differently to an operator: a foreign id is a positive signal, a missing
+    one is a gap.  (A fourth value, ``'unresolved'``, is assigned by the
+    caller when the record could not be read at all — see
+    :func:`filter_style_only_authorship_flags`.)
+    """
+    if is_internal_writer(agent_id):
+        return 'internal'
+    if not isinstance(agent_id, str) or not agent_id:
+        return 'missing'
+    return 'foreign'
+
+
+def _authorship_keep_decision(checked: list[dict[str, Any]]) -> str:
+    """Summarise WHY a candidate flag survived, from its checked citations.
+
+    A positively-foreign author is the most informative outcome, and reads
+    differently depending on whether a house writer sits alongside it
+    (``kept_mixed_authors``) or not (``kept_foreign_author``).  Absent any
+    foreign author, the flag can only have survived because some citation
+    yielded no usable agent_id — absent, empty, or unreadable — which is
+    ``kept_missing_agent_id``.
+    """
+    if not checked:
+        return 'kept_no_resolvable_citations'
+    classifications = {c['classification'] for c in checked}
+    if 'foreign' in classifications:
+        return 'kept_mixed_authors' if 'internal' in classifications else 'kept_foreign_author'
+    # No positively-foreign author, yet the flag survived — so at least one
+    # citation yielded no usable agent_id (absent, empty, or unreadable).
+    return 'kept_missing_agent_id'
+
+
+async def filter_style_only_authorship_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop injection/fabrication flags whose cited entries are house-authored.
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign to
+    it — it never read the stored ``agent_id``.  Writing style is not evidence
+    of authorship; provenance is.
+
+    A flag is a CANDIDATE iff its ``flag_type`` is in
+    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
+    citation in ``cited_memories`` is resolved via
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
+    ``metadata`` is the raw Qdrant payload and therefore still carries the
+    top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
+    on the search and ``get`` paths — and classified with
+    :func:`~fused_memory.reconciliation.internal_writers.is_internal_writer`.
+
+    **Fail-safe direction**: this filter DROPS a security-shaped signal, so it
+    drops ONLY on positively-confirmed wholly-internal authorship — at least
+    one agent_id resolved AND every resolved one is a recognised house writer.
+    Every other outcome KEEPS the flag: a foreign agent_id, a missing/empty
+    one, a mixed citation set (a partially-internal claim is not cleared), a
+    citation the backend could not resolve (a raised error or a not-found
+    record is ``'unresolved'`` — unknown, never internal — and is never
+    propagated to the caller), and a candidate with no resolvable citations at
+    all (an unattributable claim stays flaggable).  The asymmetry is
+    deliberate — wrongly keeping a flag costs one noisy finding the next cycle
+    clears, while wrongly dropping one silently disables the detection.
+
+    Degrades to an unchanged pass-through when ``memory_service`` or
+    ``project_id`` is falsy.
+
+    Every SURVIVING candidate is annotated with ``authorship_provenance``::
+
+        {'checked': [{'memory_id', 'agent_id', 'classification'}, ...],
+         'decision': 'kept_foreign_author' | 'kept_missing_agent_id'
+                     | 'kept_mixed_authors' | 'kept_no_resolvable_citations'}
+
+    — the structured fact at the decision point (INV-2), so Stage 2 and any
+    operator read the agent_ids this gate actually checked as a field instead
+    of re-deriving them from the description prose.  Non-candidate flags pass
+    through untouched: never looked up, never annotated.
+
+    Args:
+        memory_service: Object with an async ``get_memory_by_id(project_id,
+            memory_id)`` method, typically ``self.memory`` in
+            MemoryConsolidator.
+        project_id: Project scope for the lookup.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        A new list, in input order, with confirmed-house-authored authorship
+        flags removed.  The input LIST is never mutated; surviving candidate
+        dicts gain the ``authorship_provenance`` key described above.
+    """
+    if not memory_service or not project_id:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_already_tracked_systemic_patterns.  Provenance is unreadable,
+        # so nothing can be positively confirmed internal.
+        return list(flags)
+
+    candidate_positions: list[int] = [
+        i for i, flag in enumerate(flags)
+        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
+    # committed schema entry, so an unrecognised spelling would silently make
+    # the gate a no-op; this log makes that observable (the
+    # filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
+        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    async def _classify(flag: dict[str, Any]) -> list[dict[str, Any]]:
+        """Resolve every mem0 citation on *flag* to a provenance record."""
+        checked: list[dict[str, Any]] = []
+        for entry in flag.get('cited_memories') or []:
+            # Skip anything we cannot — or must not — resolve, without a lookup
+            # and without recording a verdict: a non-dict entry (malformed), an
+            # entry with no truthy memory_id, or a non-mem0 citation.
+            # get_memory_by_id is a Mem0/Qdrant point-id read, so resolving a
+            # graphiti edge uuid through it would return not-found for EVERY
+            # graph citation (citation_verifier's guard).  Such an entry
+            # therefore neither clears a flag nor blocks a clearance — a
+            # candidate citing only these ends up with an empty ``checked`` and
+            # is kept as unattributable.
+            if (
+                not isinstance(entry, dict)
+                or entry.get('store') != 'mem0'
+                or not entry.get('memory_id')
+            ):
+                continue
+            memory_id = entry.get('memory_id')
+            try:
+                record = await memory_service.get_memory_by_id(project_id, memory_id)
+            except Exception as exc:
+                # A raised backend error is 'unknown', not 'house-authored'.
+                # Record the uncertainty, KEEP the flag, and never propagate —
+                # a check error must not crash the stage.
+                logger.debug(
+                    'reconciliation.style_only_authorship_lookup_error '
+                    'memory_id=%s error=%s',
+                    memory_id, exc,
+                )
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            if not record:
+                # Not found — also unknown, never internal.
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            agent_id = (record.get('metadata') or {}).get('agent_id')
+            checked.append({
+                'memory_id': memory_id,
+                'agent_id': agent_id,
+                'classification': _classify_authorship(agent_id),
+            })
+        return checked
+
+    checked_by_pos: dict[int, list[dict[str, Any]]] = dict(
+        zip(
+            candidate_positions,
+            await asyncio.gather(*[_classify(flags[i]) for i in candidate_positions]),
+            strict=True,
+        ),
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        checked = checked_by_pos.get(i)
+        if checked is None:
+            # Not a candidate — never looked up, never annotated, byte-identical.
+            kept.append(flag)
+            continue
+        if checked and all(c['classification'] == 'internal' for c in checked):
+            logger.info(
+                'reconciliation.style_only_authorship_flag_dropped '
+                'flag_type=%s agent_ids=%s memory_ids=%s',
+                flag.get('flag_type'),
+                [c['agent_id'] for c in checked],
+                [c['memory_id'] for c in checked],
+            )
+            continue  # drop: every cited entry is provably house-authored
+        # Survives. Record the provenance actually read at the decision point
+        # (INV-2), so Stage 2 and any operator read the checked agent_ids as a
+        # field rather than re-deriving them from the description prose.
+        # ``setdefault`` mirrors citation_verifier's ``citation_failures``
+        # idiom: annotate the finding, never rewrite it.
+        flag.setdefault(
+            'authorship_provenance',
+            {'checked': checked, 'decision': _authorship_keep_decision(checked)},
+        )
+        kept.append(flag)
 
     return kept
