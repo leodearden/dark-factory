@@ -43,6 +43,7 @@ import difflib
 import importlib
 import inspect
 import json
+import logging
 import re
 import sys
 import traceback
@@ -51,6 +52,8 @@ from typing import Any
 
 EXIT_OK = 0
 EXIT_FAIL = 1
+
+logger = logging.getLogger(__name__)
 
 _MODULE_NAME = 'fused_memory.server.write_triage_judge'
 
@@ -542,7 +545,20 @@ def _echoes_payload(parse: Any, key: str, word: str, ident: str) -> str | None:
     control = {key: word, _DECOY_FIELD: ident}
     try:
         result = parse(json.dumps(control))
-    except Exception:  # noqa: BLE001 - a refusal is a validating parser, not an echo
+    except Exception as exc:  # noqa: BLE001 - a refusal is a validating parser
+        # Not an error, and deliberately not fatal: a parser that REFUSES the
+        # decoy is a validating one, which is the stricter option (a). But the
+        # control then did NOT run, so a subsequent option-(a) PASS rests on
+        # weaker evidence than one where the control executed and came back
+        # clean. Say so at WARN+ rather than swallowing it -- this gate
+        # authorises a production flag flip, and stderr is folded into the
+        # report the operator reads.
+        logger.warning(
+            'echo control not exercised for verdict word %r under field %r: '
+            'parse_judge_verdict refused the decoy payload (%s: %s). Treating '
+            'the parser as validating, not echoing.',
+            word, key, type(exc).__name__, exc,
+        )
         return None
     if not _recoverable(result, ident):
         return None
