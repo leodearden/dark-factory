@@ -1,15 +1,15 @@
 {
-  "swept_at": "2026-08-29T21:00:05.089029+00:00",
+  "swept_at": "2026-08-30T09:20:55.290654+00:00",
   "graphs": [
     "dark_factory",
     "reify"
   ],
-  "scanned": 27012,
-  "population": 7048,
+  "scanned": 27033,
+  "population": 7065,
   "unverifiable": 311,
   "summary": {
     "findings": 192,
-    "rate": 0.02724177071509648,
+    "rate": 0.027176220806794056,
     "by_graph": {
       "dark_factory": 87,
       "reify": 105
@@ -19,15 +19,15 @@
       "subject": 120
     },
     "by_proximity": {
-      "not_computed": 0,
+      "not_computed": 1,
       "one_digit_diff": 106,
       "prefix": 8,
       "similar": 0,
-      "unrelated": 78
+      "unrelated": 77
     },
     "correct_node_present": {
-      "false": 79,
-      "not_computed": 0,
+      "false": 78,
+      "not_computed": 1,
       "true": 113
     },
     "suppressed_by_bare_id": 47,
@@ -2102,9 +2102,9 @@
       "episodes": [
         "5d8745c3-d442-4c5b-afb6-6c2afe434a3b"
       ],
-      "proximity": "unrelated",
-      "nearest_id": "",
-      "correct_node_present": false
+      "proximity": null,
+      "nearest_id": null,
+      "correct_node_present": null
     },
     {
       "edge_uuid": "2488db91-9992-4f02-84f8-c6867a1807d6",

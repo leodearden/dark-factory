@@ -1,7 +1,7 @@
 # Wrong-binding in extracted edges — detection, quantification, cause
 
-**Task 4717** · escalation `esc-4639-1` · swept 2026-08-29T21:00:05Z ·
-branch `task/4717` · sweep code at `794a9e9b42` · `graphiti_core` 0.28.2
+**Task 4717** · escalation `esc-4639-1` · swept 2026-08-30T09:20:55Z ·
+branch `task/4717` · sweep code at `8c7be4ea39` · `graphiti_core` 0.28.2
 
 A *wrong-binding* edge is one whose `fact` is a faithful restatement of its
 source episode, but which is **attached to the wrong entity**. Reading it off
@@ -12,12 +12,48 @@ fact-CONTENT family (a fact asserting more than its episode said), which
 
 Every number below is cited from `report.json` in this directory, which is
 byte-for-byte the stdout of
-`fused-memory/scripts/audit_wrong_binding_edges.py` at `794a9e9b42`. Run
+`fused-memory/scripts/audit_wrong_binding_edges.py` at `8c7be4ea39`. Run
 provenance, including the read-population census, is in `provenance.json`.
 
-**This artifact has been regenerated twice, and a reader comparing against
-the superseded numbers in git history is entitled to know which reads
+**This artifact has been regenerated three times, and a reader comparing
+against the superseded numbers in git history is entitled to know which reads
 changed.**
+
+### Regeneration 3 (`794a9e9b42` → `8c7be4ea39`, 2026-08-30T09:20Z)
+
+A second review pass found that the `not_computed` bucket added in
+regeneration 2 was **still being bypassed on one path**. `_sweep_graph`
+derives the candidate set it measures proximity against as own-project
+referents only (`if not r.project_id`). When a fact names foreign-qualified
+referents *exclusively* that set is empty, so `id_proximity` fell through to
+its totality fallback `('unrelated', '')` and `correct_node_present('')`
+returned `False` — and the finding was published carrying `unrelated` /
+`false` as though both had been **measured**. The columns now stay `None` and
+tally into `not_computed`.
+
+**Measured effect: exactly one row, and no headline number moves.** reify
+`05602754`, object-end `dark_factory:1791`, whose fact names only
+`dark_factory:1799` and `dark_factory:1800`. `by_proximity.unrelated`
+78 → 77 and `correct_node_present.false` 79 → 78, each with the difference
+landing in `not_computed` (0 → 1). `findings` (192), `by_graph`, `by_end`,
+`suppressed_by_bare_id` (47), the family split and the full set of 192
+`(edge_uuid, end)` identities are **unchanged**.
+
+Widening the comparison across projects was considered and rejected: bare-number
+proximity would read 1791/1799 as a `one_digit_diff`, but `correct_node_present`
+would then be asking whether **reify** holds a node for a **dark_factory** id —
+a different question with a meaningless answer, since `read_task_node_ids`
+deliberately harvests no foreign id. Answering cross-project needs a
+cross-project node census this sweep does not read. So the honest report is
+*not measured*, which is what it now says.
+
+**Corpus drift over the same interval was held separable** by running the
+*pre-fix* detector against today's corpus first: `scanned` 27 012 → 27 033
+(dark_factory 11 551 → 11 572; reify 15 461 unchanged) and `population`
+7 048 → 7 065, with **every** finding-level number and all 192 identities
+identical to the superseded run. So the drift moved only the denominators and
+the fix moved only the one row above; neither is confounded with the other.
+The rate is 2.7176 %, still **2.72 %** to the precision published here.
 
 ### Regeneration 2 (`7a64b2a499` → `794a9e9b42`, 2026-08-29T21:00Z)
 
@@ -30,9 +66,10 @@ meaning *not measured*, and `build_report` used to tally that as `unrelated`
 / `false` — publishing a measured cause-attribution result for a column
 nobody computed. Since §3.3's whole argument rests on those two
 distributions, the fold was the wrong direction to fail in. `not_computed`
-is **0** in both breakdowns on this run, which is now an *assertable fact*
-rather than an assumption. `summary.suppressed_by_bare_id` was added; see
-the LOWER BOUND discussion in §2.
+came out **0** in both breakdowns on *that* run — which regeneration 3 then
+showed to be an artefact of the bypass described above, not a clean bill of
+health. `summary.suppressed_by_bare_id` was added; see the LOWER BOUND
+discussion in §2.
 
 *Detection.* `bare_id_present` — the containment backstop that absorbs the
 shared scanner's `#4262` and `task-1836` blind spots — matched any
@@ -177,8 +214,8 @@ Over the **complete live population of both graphs**:
 
 | measure | value |
 |---|---|
-| rows scanned | **27 012** (dark_factory 11 551 + reify 15 461 live `RELATES_TO`) |
-| qualifying population | **7 048** |
+| rows scanned | **27 033** (dark_factory 11 572 + reify 15 461 live `RELATES_TO`) |
+| qualifying population | **7 065** |
 | unverifiable (fact names no task id) | 311 |
 | suppressed by the containment backstop | 47 |
 | **findings** | **192** |
@@ -199,7 +236,7 @@ first-class report key rather than a footnote.
 
 The task description cited 13/111 = 11.7 %. That figure was a **narrow
 pocket** — edges whose subject is a *ruling task* — not the whole corpus.
-**2.72 % is the whole-corpus rate over 7 048 qualifying edges.** Both stand;
+**2.72 % is the whole-corpus rate over 7 065 qualifying edges.** Both stand;
 they measure different denominators. Neither supersedes the other.
 
 **2.72 % is a LOWER BOUND, for two separate reasons.**
@@ -235,7 +272,14 @@ the correctly-named node already exists:
 |---|---|---|
 | `one_digit_diff` | **66** | 40 |
 | `prefix` | 2 | 6 |
-| `unrelated` | 11 | **67** |
+| `unrelated` | 10 | **67** |
+| `not_computed` | — | — |
+
+The cells total 191, not 192. The 192nd is the single `not_computed` row
+(reify `05602754`): its endpoint is foreign-qualified, so neither column is
+defined over this graph's own-project census and neither was measured. It is
+shown as a row rather than dropped, because a crosstab that quietly summed to
+191 would be the same fold this column exists to prevent, one level up.
 
 Two distinct modes fall out:
 
@@ -314,7 +358,7 @@ asyncio.run(m())"
 
 - **114/192 (59 %)** of mis-bound endpoint ids are a *near miss* of an id the
   fact names — 106 one-digit-different at equal length, 8 a strict prefix.
-  Against 1 447 + 2 129 task-shaped nodes — harvested by the corrected
+  Against 1 453 + 2 129 task-shaped nodes — harvested by the corrected
   uuid-ordered node page — the chance baseline is near zero.
 - **113/192 (59 %)** have `correct_node_present = true`: the node the fact
   actually names **already exists** in that graph.
@@ -323,11 +367,14 @@ Both reproduce the planning-time measurement (62.5 % and 64 %) and the two
 superseded runs (58 % and 61 %) within the movement of a live corpus.
 
 **Neither figure is a fold of an unmeasured column.** Both are tallied with
-`not_computed` as a bucket of its own, and `not_computed` is **0** in each —
-so every finding reached the report *enriched*, and "not measured" cannot be
-silently reading here as "measured negative". Before the amendment pass a
-`None` would have tallied as `unrelated` / `false`, i.e. as evidence for
-exactly the conclusion this section draws.
+`not_computed` as a bucket of its own, and `not_computed` is **1** in each —
+one finding whose endpoint is foreign-qualified, so this graph's own-project
+census holds no candidate to measure it against (regeneration 3, above). It
+is named rather than folded, which is the point: both percentages above are
+stated over the full 192, so the single unmeasured row can only *understate*
+them. Before `not_computed` existed, a `None` tallied as `unrelated` /
+`false` — i.e. as evidence for exactly the conclusion this section draws,
+which is the wrong direction for this argument to fail in.
 
 **The canonical specimen is not representative** — because `Task 6164` is
 absent, the `Task 6165` family sits in the 41 % *minority*. A reader
@@ -552,8 +599,8 @@ reaches `graphiti_client.py::GraphitiBackend.ensure_entity_node` through
 `memory_service.py::MemoryService._repair_edge_findings`, which is therefore
 a real production call site. ETA landed on this branch's base as commit
 `b5cb396e19` (2026-08-25), and **task 3672 is `done`**, with
-`done_provenance.commit = 6dba49cf00`, recorded 2026-08-27T08:57Z — two days
-before this artifact's 2026-08-29 regeneration.
+`done_provenance.commit = 6dba49cf00`, recorded 2026-08-27T08:57Z — three days
+before this artifact's 2026-08-30 regeneration.
 
 So the system does not merely *know* about wrong bindings at write time: as
 of ETA it repairs the resolvable ones, under the identity lock, going
@@ -581,7 +628,7 @@ it, and do not read this sweep as proposing it.**
    > **'Exclude mode 2': an OPEN CHECK, not a constraint on future work.**
    > 113/192 (59 %) of these findings already have an existing correct node
    > (recomputed on each regenerated artifact, never carried over — the
-   > ratio has held across three runs); mode 1 (§2) supplies the rest via
+   > ratio has held across four runs); mode 1 (§2) supplies the rest via
    > `ensure_entity_node`. The mode-2 cell (`unrelated` proximity + node
    > present, ~67 edges) contains legitimate cross-task relations, and is
    > precisely where an automated verdict would corrupt good data. **This
@@ -641,8 +688,8 @@ by the recall bound in §2, to an unknown number of edges the shared
 vocabulary cannot see.
 
 **Re-derivation must go through `r.episodes`.** It is populated on **100 % of
-live `RELATES_TO` edges in both graphs** — reify 15 461/15 461, dark_factory
-11 551/11 551, zero null-or-empty — so it is the right handle for recovering
+live `RELATES_TO` edges in both graphs** — re-measured 2026-08-30 over
+reify 15 461/15 461 and dark_factory 11 572/11 572, zero null-or-empty — so it is the right handle for recovering
 what an edge was actually extracted from. Never trust the endpoint node name
 alone.
 
