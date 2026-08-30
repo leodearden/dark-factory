@@ -2002,9 +2002,21 @@ A trailing line.
 _ALIAS_NONE = "Prose that cites no invariant by number anywhere in it.\n"
 
 
-def _pair(number: int, token: str, *, line: int = 1, backticks: int = 0, wrapped: bool = False):
-    """A hand-built alias record, for tests of the RULE rather than the extractor."""
-    return (line, number, token, backticks, wrapped)
+def _pair(
+    number: int, token: str, *, line: int = 1, backticks: int = 0, wrapped: bool = False
+) -> AliasPair:
+    """A hand-built alias record, for tests of the RULE rather than the extractor.
+
+    Returns an :class:`AliasPair`, not a bare tuple: `near_miss_alias_pairs`
+    takes `list[AliasPair]`, and `list` is invariant, so a list of plain
+    5-tuples is not assignable to it however identical the field types are.
+    Equality is unaffected either way — a NamedTuple compares equal to the
+    plain tuple with the same members — so the `== pairs` assertions below
+    read exactly as before.
+    """
+    return AliasPair(
+        line=line, number=number, token=token, backticks=backticks, wrapped=wrapped
+    )
 
 
 def test_invariant_alias_pairs_collects_every_pairing_in_document_order() -> None:
