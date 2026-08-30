@@ -1548,3 +1548,90 @@ class TestTheRejectionReachesADurableJournal:
 
         assert rig.harness.plan_bytes() == before
         assert len(journal_lines(tmp_path)) == 1, 'the record went to the journal'
+
+
+# ---------------------------------------------------------------------------
+# The storm record POINTS AT the journal (task 4744).
+# ---------------------------------------------------------------------------
+
+
+class TestTheStormRecordNamesTheJournal:
+    """A durable artifact an operator cannot FIND is not durable.
+
+    The storm escalation used to close with "identify the leaking caller from
+    the guard's own log lines (grep the orchestrator logs for 'markup guard:')".
+    On this boundary that instruction is unfollowable by construction — the
+    lines go to a per-agent subprocess's stderr — so a correct reader concluded
+    "no evidence" and was wrong. Wiring the journal without repointing the
+    record would move the dead end rather than close it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_detail_names_the_journal_not_the_logs(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(a) The record tells the reader where the answer actually is."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (filed,) = rig.queue.submitted
+        assert f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/plan-tools.jsonl' in filed.detail
+        assert 'orchestrator logs' not in filed.detail, (
+            'the instruction this task measured to be unfollowable must be '
+            'RETIRED, not merely supplemented'
+        )
+        assert 'plans/toolcall-markup-containment-prd.md' in filed.detail, (
+            'the standing PRD pointer stays'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_suggested_action_names_the_journal(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(b) The one line an operator reads first."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (filed,) = rig.queue.submitted
+        assert f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/plan-tools.jsonl' in (
+            filed.suggested_action
+        )
+        assert "guard's log lines" not in filed.suggested_action
+
+    @pytest.mark.asyncio
+    async def test_following_the_records_own_instruction_now_succeeds(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(c) The direct inverse of the measurement that opened this task.
+
+        The lines the burst was made of are actually THERE, one per rejection in
+        that window, each naming the leaking task. Asserting the record's prose
+        without this would pin an instruction that is merely better-worded.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (filed,) = rig.queue.submitted
+        named = markup_journal.journal_path(tmp_path, 'plan-tools')
+        assert str(named.relative_to(tmp_path)) in filed.detail.replace('\\', '/')
+        assert named.exists(), 'the record names a file that is really there'
+
+        lines = journal_lines(tmp_path)
+        assert len(lines) == 2, 'one line per rejection in the window'
+        assert {line['subject_task_id'] for line in lines} == {'test-1'}
+        assert {line['outcome'] for line in lines} == {'rejected'}
