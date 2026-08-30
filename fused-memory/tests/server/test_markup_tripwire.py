@@ -845,6 +845,13 @@ class TestSingleSourceOfTruth:
 # ``test_this_module_spells_no_raw_envelope_literal`` (self-file).
 # ---------------------------------------------------------------------------
 
+#: Needle set shared by both guards below: every ENVELOPE_LITERALS member plus
+#: the two structural prefixes a hand-spelled specimen could use instead of
+#: the enumerated literals. Hoisted to module level so the cross-file and
+#: self-file guards read the SAME construction rather than two that could
+#: silently drift apart.
+_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter ')
+
 
 def test_the_tripwire_source_spells_no_raw_envelope_literal():
     """CROSS-FILE: markup_tripwire.py's own source must carry no raw literal.
@@ -854,9 +861,6 @@ def test_the_tripwire_source_spells_no_raw_envelope_literal():
     would be trivially satisfiable by deleting the explanatory lines instead
     of escaping them.
     """
-    LT = chr(60)
-    needles = (*ENVELOPE_LITERALS, LT + '/', LT + 'parameter ')
-
     source_path = (
         Path(__file__).resolve().parents[2]
         / 'src'
@@ -870,7 +874,7 @@ def test_the_tripwire_source_spells_no_raw_envelope_literal():
 
     hits = {
         needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
-        for needle in needles
+        for needle in _RAW_SENTINEL_NEEDLES
         if needle in source
     }
     assert not hits, (
@@ -887,4 +891,24 @@ def test_the_tripwire_source_spells_no_raw_envelope_literal():
             f'{source_path.name} — escaping must not delete the specimen it '
             'explains.'
         )
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """SELF-FILE (the idiom task 4696 promoted): this test module's own
+    source must never contain a raw envelope literal either — see this
+    module's docstring for why.
+    """
+    source = Path(__file__).read_text(encoding='utf-8')
+    source_lines = source.splitlines()
+
+    hits = {
+        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
+        for needle in _RAW_SENTINEL_NEEDLES
+        if needle in source
+    }
+    assert not hits, (
+        'A raw envelope literal was written into this test file. Spell it '
+        "with the \\x3c escape instead — see this module's docstring for "
+        f'why. Offending needle(s): {hits!r}.'
+    )
 
