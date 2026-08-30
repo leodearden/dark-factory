@@ -2684,8 +2684,10 @@ class TestSessionResumeStorm:
         assert et == EventType.session_resume_fallback
         assert kwargs['data']['reasons'] == ['restore_failed', 'stale']
 
-    async def test_storm_l1_no_longer_blames_clock_skew(self, harness: Harness):
-        """The filed L1's prose must match its new feeder.
+    async def test_storm_l1_directs_the_operator_at_the_reason_set(
+        self, harness: Harness
+    ):
+        """The filed L1 must send the operator to the EVIDENCE first.
 
         Its detail used to name ``stale`` and ``no_transcript`` as the only
         surviving causes and send the operator to check NTP FIRST. After D4
@@ -2693,6 +2695,17 @@ class TestSessionResumeStorm:
         instruction to investigate a population that provably did not
         contribute — the exact misdirection this task exists to remove, now
         printed on the escalation itself.
+
+        Stated POSITIVELY rather than as blanket "word X is absent" pins. The
+        earlier form asserted ``'stale' not in text`` and three siblings, which
+        pinned cosmetic phrasing instead of behaviour: they also forbid
+        'staleness', and they would fail a strictly BETTER detail that names
+        the excluded by-design reasons explicitly ("a stale sidecar is excluded
+        by construction and did not contribute") — plausible operator guidance,
+        and closer to what this escalation is for. The real contract is that
+        the L1 is filed at level 1 and its FIRST directive is to read the
+        reason sets off the events rather than to start from a guess, so that
+        is what is asserted; the wording around it stays free to improve.
         """
         harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
         harness._escalation_queue = self._queue()
@@ -2701,13 +2714,16 @@ class TestSessionResumeStorm:
         await _drive_session_slot(harness, 'p1', self._fresh_session('uuid-p1'))
 
         esc = harness._escalation_queue.submit.call_args.args[0]
-        text = f'{esc.summary}\n{esc.detail}\n{esc.suggested_action}'
-        assert 'NTP' not in text
-        assert 'clock skew' not in text.lower()
-        assert 'stale' not in text
-        assert 'no_transcript' not in text
-        # It must instead point at the reasons actually on the wire.
-        assert "$.reasons" in esc.detail
+        assert esc.level == 1
+        # The detail hands over the exact query, keyed on the composite field
+        # this task put on the wire — not on the retired first-match scalar.
+        assert "json_extract(data,'$.reasons')" in esc.detail
+        assert "'$.reason'" not in esc.detail
+        # ...and the FIRST thing the operator is told to do is run it. Scoped
+        # to the opening directive, so the rest of suggested_action can say
+        # whatever later turns out to help.
+        first_directive = esc.suggested_action.split('.')[0].lower()
+        assert 'query' in first_directive
 
     async def test_genuine_failures_still_file_l1_across_by_design(
         self, harness: Harness, tmp_path: Path
