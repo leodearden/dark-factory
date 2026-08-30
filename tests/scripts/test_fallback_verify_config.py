@@ -647,10 +647,24 @@ FANOUT_CAP_LANDED_ON = datetime.date(2026, 8, 20)
 # NOT acted on here). At the observed green MAXIMUM the five-segment floor is
 # 472.37 + 3310.50 = 3782.87s, already above the 3600s
 # `verify_command_timeout_secs`; adding the yaml's own ~407s of estimates for
-# the three unmeasured segments puts that path at ~4190s. One run has already
-# consumed the full ceiling and been recorded as a false infra_timeout
-# (.worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json, 3600.649s,
-# 2026-08-28T17:25:05Z). This task changes NO budget, NOT the -n cap, and NOT
+# the three unmeasured segments puts that path at ~4190s. At the time of the
+# mine one run had already consumed the full ceiling and been recorded as a
+# false infra_timeout: 3600.649s, started 2026-08-28T17:25:05Z, observed at
+# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json.
+#
+# THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT — the same caveat the
+# repo-root yaml carries beside this finding. A `.task/verify/*.summary.json`
+# is a TRANSIENT, per-attempt artifact, overwritten by the next attempt in its
+# worktree and pruned with that worktree; the numbers are inlined because that
+# is the only durable form the observation has, and the path says where it was
+# read, not where it can be re-read. Re-checked 2026-08-30: that path had
+# already been rewritten by a later, unrelated attempt (rc 1, timed_out FALSE,
+# 2884.15s) while a different worktree showed the same ceiling hit (3605.06s)
+# that day. Re-mine the corpus glob to re-establish the phenomenon; never
+# re-read one path. This is also the reason the guards in this file compare
+# recorded constants and read no corpus at test time.
+#
+# This task changes NO budget, NOT the -n cap, and NOT
 # orchestrator/orchestrator.yaml — it only records the measurement those
 # decisions need.
 MEASURED_FLEET_SEGMENT_SECS = {

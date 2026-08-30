@@ -662,12 +662,29 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #     at orchestrator p90 2552.09  ->  honest green path ~3431   1.05x under 3600
 #     at observed max     3310.50  ->  honest green path ~4190   OVER 3600
 #
-# That last row is not hypothetical. One run has already consumed the full 3600s
-# ceiling and been recorded as a false infra_timeout:
-# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json — timed_out
-# true, rc 1, duration 3600.649s, started 2026-08-28T17:25:05Z. That is the
-# same failure MODE the 1800s ceiling produced and this raise was meant to end;
-# the -n 8 cap moved the suite back up into it.
+# That last row is not hypothetical. At the time of the 4902 mine one run had
+# already consumed the full 3600s ceiling and been recorded as a false
+# infra_timeout: timed_out true, rc 1, duration 3600.649s, started
+# 2026-08-28T17:25:05Z, observed at
+# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json.
+#
+# THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT. A
+# `.task/verify/*.summary.json` is a TRANSIENT, per-attempt artifact — it is
+# OVERWRITTEN by the next attempt in the same worktree and PRUNED with the
+# worktree itself. The numbers are copied here precisely because that is the
+# only durable form this observation has: the path records where it was read,
+# not where it can be re-read. Re-checked 2026-08-30, two days later: that
+# exact path had already been rewritten by a later, unrelated attempt (rc 1,
+# timed_out FALSE, 2884.15s, started 2026-08-30T08:49:51Z) and no longer holds
+# the record above, while a different worktree's attempt showed the same
+# ceiling hit (timed_out true, 3605.06s) that same day. So do NOT re-point
+# these numbers at whatever that path currently contains, and do NOT read a
+# non-matching path as the claim having been false. To re-establish the
+# phenomenon, re-mine the corpus glob
+# (`.worktrees/*/.task/verify/*.orchestrator.summary.json`) — never one path.
+#
+# That is the same failure MODE the 1800s ceiling produced and this raise was
+# meant to end; the -n 8 cap moved the suite back up into it.
 #
 # The remedies — exempting the `orchestrator` prefix from the -n cap, giving
 # orchestrator/orchestrator.yaml its own budget above 3600, or task 3589's
