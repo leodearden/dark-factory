@@ -192,3 +192,145 @@ This is not a footnote — it is the fact that **forces §3 to rest on transcrip
 The result JSONs alone cannot distinguish "correctly declined via the role's own mandated
 protocol" from "could not plan," and every one of the 47 no-plan cells is one of those two
 things.
+
+---
+
+## 3. Decline-consistency: what the 47 no-plan cells actually are
+
+_RAW OBSERVATION — transcript forensics, transcribed with attribution._ The terminal-cause
+classification below cannot be derived from the result JSONs (§2e). It comes from
+`investigation/FINDINGS.md` and its artifacts, and is attributed rather than claimed as this
+record's own recomputation — **except §3e, which this record verified first-hand** because
+the forensic investigation was cut before the cells in question existed.
+
+**A note on the two cuts.** `FINDINGS.md` covers the **51 cells** persisted by ~07:30 BST on
+2026-08-26 (fable 24 / incumbent 27). `FINAL-READOUT.txt` covers the final **53** (fable 26 /
+incumbent 27). The two fable cells added after the cut are both on `reify_task_4026`. Where
+this record quotes a 51-cell figure it says so.
+
+### 3a. Terminal-cause distribution (53 cells, `FINAL-READOUT.txt`)
+
+| terminal cause | fable | incumbent |
+|---|---|---|
+| planned | 2 | 4 |
+| `report_task_already_done` | 15 | 7 |
+| `report_blocking_dependency` | 4 | 10 |
+| `report_false_premise` | 5 | 6 |
+| **TOTAL DECLINES** | **24** | **23** |
+
+**47 of 53 cells — 88.7% — ended in an explicit, server-accepted protocol decline.**
+
+Per `FINDINGS.md` Answer 1, every one of those declines was invoked *after substantive
+investigation* (median 41–98 assistant turns) and returned `status: ok` from the plan-tools
+server. **Zero cells gave up silently. Zero hit turn or budget caps.**
+
+### 3b. Per-fixture terminal causes
+
+`a` = `report_task_already_done`, `b` = `report_blocking_dependency`,
+`f` = `report_false_premise`, `P` = planned.
+
+| fixture | fable | incumbent |
+|---|---|---|
+| `df_task_2260` | `aaf` | `Paf` |
+| `reify_task_12` | `PPb` | `Pbb` |
+| `reify_task_2324` | `aaa` | `aaa` |
+| `reify_task_2531` | `abb` | `Pbb` |
+| `reify_task_2573` | `aab` | `bbb` |
+| `reify_task_2699` | `aaa` | `Paa` |
+| `reify_task_2778` | `aaa` | `bbb` |
+| `reify_task_3883` | `fff` | `fff` |
+| `reify_task_4026` | `af` | `aff` |
+
+Two fixtures are unanimous across all six cells of both arms: `reify_task_2324` (6/6
+already-done) and `reify_task_3883` (6/6 false-premise).
+
+### 3c. Adversarial verification of the decline grounds
+
+Every decline claim was checked against the actual repositories — `/home/leo/src/reify` and
+this repo — by git plumbing, by five adversarial verification agents. Per `FINDINGS.md`
+("The claims are overwhelmingly TRUE"), the grounds were found **essentially all TRUE**:
+
+| fixture | verification result |
+|---|---|
+| `reify_task_2324` | **TRUE** — 16-commit self-tagged "(task 2324, step-N)" series on main, zero of it at base |
+| `reify_task_2699` | **TRUE**, precisely scoped — all 11 selector names on main incl. the required PRD amendment; base has 3/14 |
+| `reify_task_2573` | **BOTH TRUE** — 2590's substrate absent at base; the task's own merge `69b4969f23` on main; live `done_provenance` matches fable's citation exactly |
+| `reify_task_2778` | **BOTH TRUE** — `auto_type_substitution` absent at base, landed next day (`f90423d4fe`). **One minor fable imprecision** (below) |
+| `reify_task_2531` | **TRUE**, with a gradient — 2530's FFI genuinely absent at base, but the needed OCCT primitives existed generically |
+| `reify_task_12` | **TRUE but incomplete** — task 11's merge genuinely reverted in base ancestry, but the base is on a line **not ancestor of main**, so planning-around was the better answer |
+| `df_task_2260` | **ALL TRUE** — task landed via `97059b1dd8`, whose first parent *is* the fixture base (pinned 13 min before landing); both false-premise mechanisms verified at exact `file:line` and **still live on main** |
+| `reify_task_3883` | **TRUE, zero refutations** — `Frame3` resolves nowhere at base; today's main still says `"Frame3" is intentionally absent` |
+| `reify_task_4026` | false-premise **TRUE** (grammar / `NAMED_DIMENSIONS` claims exact; the real implementation hit the same wall and escalated, esc-4026-121) |
+
+**The one recorded imprecision, named rather than smoothed over.** On `reify_task_2778`, a
+fable cell cited a **task/2779 merge-resolution commit** as adjacent supporting evidence.
+The decline's substantive ground was verified true regardless; the citation was simply
+imprecise. It is recorded here because a record claiming "essentially all TRUE" owes its
+reader the exception.
+
+### 3d. Method and provenance
+
+Deterministic `tool_use`-level extraction over all 51 campaign transcripts
+(`investigation/extract_transcripts.py` → `summaries/`), decline payloads captured in
+`claims.txt`, then **7 verification agents**: 5 adversarially checking the architects' claims
+against the live repos by git plumbing only, 1 on harness mechanics, 1 on the γ1 selection
+trial. **No eval cells were re-run; nothing was written outside `investigation/`.**
+
+### 3e. The plan-then-decline outcome class — verified first-hand
+
+**The persisted metric and the forensic terminal cause disagree on exactly two cells.**
+
+| source | fable "planned" | incumbent "planned" |
+|---|---|---|
+| persisted `plan_steps > 0` (53 cells, recomputed) | **3** | **5** |
+| forensic terminal cause (`FINAL-READOUT.txt`) | **2** | **4** |
+
+Both gaps are on **`reify_task_4026`**, and both are the same shape: a cell that built and
+confirmed a complete plan and *then* declined.
+
+- **Incumbent, `reify_task_4026` trial 3 (`e522b1b0`)** — documented at `FINDINGS.md` L31-34.
+  Confirmed a 6-step plan and then called `report_task_already_done` at turn 176.
+- **Fable, `reify_task_4026` trial 2 (`f2f205af`)** — **not covered by the forensic
+  investigation**, whose 51-cell cut predates this cell. This record therefore verified it
+  directly, by extracting the plan-tool call sequence from the cell's own transcript
+  (`~/.claude/projects/-home-leo-src-reify-eval-worktrees-reify-task-4026-run-f2f205af/`).
+  The sequence is:
+
+  ```
+  create_plan → add_plan_step ×6 → add_design_decision ×5 → add_reuse_item ×6
+    → confirm_plan            (assistant event 143)
+    → report_task_already_done (assistant event 166)
+  ```
+
+  **The shapes match exactly.** Both arms produced a plan-then-decline cell, on the same
+  fixture, with the same 6 steps, both terminating in `report_task_already_done`.
+
+The fable cell is if anything the sharper illustration, because it **explicitly repudiates
+its own plan** in the decline payload:
+
+> "The plan confirmed earlier this session predates this discovery and should be
+> disregarded in favor of this provenance report."
+
+Its grounds were substantive and self-verified: task 4026's work is on live main
+(`ef2d452971` adding `SPEED_OF_LIGHT`, `9280967055` adding `BOLTZMANN_CONSTANT`, both
+confirmed ancestors of main), the worktree base `ab0b4c66db` is ~3 months stale, and the
+escalation server independently reported task 4026 `status=done`.
+
+**The consequence, stated plainly: on this band `plan_steps > 0` and "produced a usable
+plan" are different predicates.** A cell can satisfy the metric and still have concluded,
+in its own final act, that the task must not be planned. **Wherever the two disagree, this
+record uses the forensic terminal cause** — so §3's "planned" counts are 2 fable / 4
+incumbent, while §4's planRate (a metric readout, reported in the metric's own terms)
+uses `plan_steps > 0` and is 3 / 5. §6 reports $/usable-plan under **both** denominators
+for this reason.
+
+### 3f. The observation
+
+Both arms recognise moot, blocked and ill-posed tasks at **high and roughly equal rates** —
+24 declines of 26 fable cells, 23 of 27 incumbent — and exit through the **mandated
+plan-tools protocol** rather than failing silently. Their declared grounds were adversarially
+verified true in every checked case, with one minor citation imprecision (§3c). Zero cells
+gave up silently; zero hit turn or budget caps.
+
+_That is the observation. What it means for the admission question is §8's to say, not this
+section's._
