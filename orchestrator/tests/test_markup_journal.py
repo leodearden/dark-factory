@@ -669,3 +669,288 @@ class TestTheLineIsBounded:
             "means \"something was cut\" rather than \"this emitter ran\""
         )
         assert 'journal_overflow' not in line
+
+
+# ---------------------------------------------------------------------------
+# The DISCLOSURE MARKER means what the constants say it means.
+# ---------------------------------------------------------------------------
+
+
+class TestEveryCutIsDisclosed:
+    """``journal_truncated`` is ABSENT on an untouched record — so a consumer
+    reading a line with no marker is entitled to treat every value in it as
+    verbatim. That entitlement is the whole worth of the marker, and it is only
+    as good as the narrowest axis that raises it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_over_long_list_item_is_disclosed_not_only_a_long_list(
+        self, tmp_path
+    ):
+        """The COUNT axis and the LENGTH axis both raise the marker.
+
+        A list short enough to keep every entry but whose entries are each cut
+        to the field cap is still a rewritten value. Reporting only the count
+        axis would hand a consumer a silently shortened item under a line that
+        claims nothing was cut.
+        """
+        sink = build_sink(tmp_path)
+        cap = markup_journal.MARKUP_JOURNAL_MAX_FIELD_CHARS
+
+        await sink(make_fact(recovered_params=['z' * 5_000]))
+
+        (line,) = journal_lines(tmp_path)
+        assert len(line['recovered_params']) == 1, 'the COUNT axis was never hit'
+        assert line['recovered_params'][0] == 'z' * cap, 'a prefix, not a rewrite'
+        assert 'recovered_params' in line[markup_journal.MARKUP_JOURNAL_TRUNCATED_KEY]
+
+    @pytest.mark.asyncio
+    async def test_an_over_long_subject_is_capped_and_disclosed(self, tmp_path):
+        """The ENVELOPE is capped on the same terms as the fact's own fields.
+
+        ``subject_task_id`` comes from the injected thunk — for plan-tools,
+        ``plan.json``'s agent-written ``task_id`` — so nothing upstream bounds
+        it, and it is a FLOOR key: unbounded, it would push even the
+        identity-only line past the byte bound.
+        """
+        sink = build_sink(tmp_path, subject='4744' * 10_000)
+        cap = markup_journal.MARKUP_JOURNAL_MAX_FIELD_CHARS
+
+        await sink(make_fact())
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert len(raw) <= markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES
+        (line,) = journal_lines(tmp_path)
+        assert line['subject_task_id'] == ('4744' * 10_000)[:cap]
+        assert 'subject_task_id' in line[markup_journal.MARKUP_JOURNAL_TRUNCATED_KEY]
+
+    @pytest.mark.asyncio
+    async def test_an_over_long_subject_cannot_burst_the_overflow_floor(self, tmp_path):
+        """Both degradations at once: a sprawling record AND a huge floor key.
+
+        The floor is what the byte bound rests on when everything else has been
+        cut away, so it is MEASURED after it is built rather than assumed to
+        fit.
+        """
+        sink = build_sink(tmp_path, subject='s' * 50_000)
+        sprawl = {f'future_key_{i}': f'value-{i}' for i in range(2_000)}
+
+        await sink(make_fact(**sprawl))
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert raw.count(b'\n') == 1
+        assert len(raw) <= markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES
+        (line,) = journal_lines(tmp_path)
+        assert line[markup_journal.MARKUP_JOURNAL_OVERFLOW_KEY] is True
+        assert line['tool'] == 'add_design_decision', 'still identity-carrying'
+
+
+# ---------------------------------------------------------------------------
+# The IDENTITY ENVELOPE is the journal's own, and cannot be overwritten.
+# ---------------------------------------------------------------------------
+
+
+class TestTheEnvelopeCannotBeShadowed:
+    """Four of the five envelope keys are ``MARKUP_JOURNAL_FLOOR_KEYS``.
+
+    The floor exists to guarantee that a line always says WHO wrote it, WHEN
+    and from WHERE. A middleware record that grew a key named ``server`` or
+    ``ts`` — the middleware owns its own fact vocabulary and has grown keys
+    before — must not be able to overwrite that guarantee from the outside.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fact_key_cannot_displace_the_server_label(self, tmp_path):
+        sink = build_sink(tmp_path, server_label='plan-tools')
+
+        await sink(make_fact(server='NOT-plan-tools'))
+
+        (line,) = journal_lines(tmp_path)
+        assert line['server'] == 'plan-tools', (
+            'the journal names the server it IS, not the one a record claims'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_fact_cannot_forge_the_timestamp_or_the_subject(self, tmp_path):
+        sink = build_sink(tmp_path, subject='4744')
+
+        await sink(make_fact(ts='bogus', subject_task_id='999', pid=1, worktree='/x'))
+
+        (line,) = journal_lines(tmp_path)
+        assert line['subject_task_id'] == '4744'
+        assert line['pid'] == os.getpid()
+        assert line['worktree'] != '/x'
+        assert datetime.fromisoformat(line['ts']).tzinfo is not None, (
+            'the real clock, not the forged value'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_collision_is_logged_rather_than_silently_resolved(
+        self, tmp_path, caplog
+    ):
+        """A name collision means the two vocabularies have started to overlap
+        — an operator should hear about it, not discover it in a diff.
+        """
+        sink = build_sink(tmp_path)
+
+        with caplog.at_level('WARNING'):
+            await sink(make_fact(server='NOT-plan-tools'))
+
+        assert any(
+            'server' in record.getMessage() for record in caplog.records
+        ), 'the shadowed key is named in the warning, not just resolved away'
+
+
+# ---------------------------------------------------------------------------
+# A record is DEGRADED, never dropped — the fail-soft this PRD exists to end.
+# ---------------------------------------------------------------------------
+
+
+class TestAnUnencodableRecordIsStillWritten:
+    """The middleware emits str / None / list-of-str today.
+
+    So did the key count, before the overflow floor was built for a shape it
+    could grow into. A value ``json`` cannot render must cost that ONE FIELD
+    its exact type — never the line, which would leave the event exactly where
+    this module found it: in a stack trace on the stderr nobody retains.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_non_serializable_value_keeps_the_record(self, tmp_path):
+        sink = build_sink(tmp_path)
+
+        assert await sink(make_fact(recovered_params={'rationale'})) is not None
+
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision'
+        assert line['subject_task_id'] == '4744'
+        assert 'rationale' in str(line['recovered_params']), (
+            'rendered, not dropped — the field survives as text'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unencodable_key_falls_to_the_identity_floor(self, tmp_path):
+        """``default=`` covers a value; nothing covers a non-string KEY.
+
+        So the floor catches it, exactly as it catches an over-budget record.
+        """
+        sink = build_sink(tmp_path)
+
+        assert await sink(make_fact(**{'ok': object()}) | {7: 'int key'}) is not None
+
+        (line,) = journal_lines(tmp_path)
+        assert line[markup_journal.MARKUP_JOURNAL_OVERFLOW_KEY] is True
+        for key in markup_journal.MARKUP_JOURNAL_FLOOR_KEYS:
+            assert key in line, f'{key} is identity — the floor must carry it'
+        assert line['tool'] == 'add_design_decision'
+
+
+# ---------------------------------------------------------------------------
+# A SHORT WRITE must not leave an unterminated line for the next appender.
+# ---------------------------------------------------------------------------
+
+
+class TestAShortWriteIsCompleted:
+    """The one corruption shape this format cannot survive.
+
+    ``write(2)`` may report a short count — classically near ENOSPC, or on a
+    large write interrupted by a signal. A partial record carries no trailing
+    newline, so the next process's append concatenates onto it: one unparseable
+    line, two events silently merged, and every consumer here splits on
+    newlines.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_short_write_still_lands_one_complete_line(self, tmp_path, monkeypatch):
+        real_write = os.write
+        calls: list[int] = []
+        armed: set[int] = set()
+
+        def dribble(fd: int, data: bytes) -> int:
+            # Only THIS module's records are short-written, and only until the
+            # record is finished. ``os.write`` is process-global, and a blanket
+            # 16-byte cap on every fd for the length of a test is a far bigger
+            # blast radius than the behaviour under test. A journal line is a
+            # whole JSON object ending in a newline; its REMAINDERS are not, so
+            # the fd stays armed until the last chunk lands.
+            if data.startswith(b'{') and data.endswith(b'\n'):
+                armed.add(fd)
+            if fd not in armed:
+                return real_write(fd, data)
+            calls.append(len(data))
+            written = real_write(fd, data[:16])
+            if written >= len(data):
+                armed.discard(fd)
+            return written
+
+        monkeypatch.setattr(os, 'write', dribble)
+        sink = build_sink(tmp_path)
+
+        assert await sink(make_fact()) is not None
+
+        assert len(calls) > 1, 'the fixture must actually short-write'
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert raw.endswith(b'\n'), 'an unterminated line poisons the next append'
+        assert raw.count(b'\n') == 1
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision', 'nothing was lost in the middle'
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_makes_no_progress_is_contained(self, tmp_path, monkeypatch):
+        """A zero-count write would spin forever — it is an error, not a retry."""
+        real_write = os.write
+        monkeypatch.setattr(
+            os,
+            'write',
+            lambda fd, data: 0 if data.startswith(b'{') else real_write(fd, data),
+        )
+        sink = build_sink(tmp_path)
+
+        assert await sink(make_fact()) is None, 'contained, like any write failure'
+
+
+# ---------------------------------------------------------------------------
+# ONE attribution ladder, shared with the escalation sink on the same boundary.
+# ---------------------------------------------------------------------------
+
+
+class TestTheAttributionLadderIsShared:
+    """The two channels a boundary guard emits through are asserted to name the
+    same subject. Two copies of the ladder could drift in opposite directions
+    while both kept passing their own tests — the INV-5 sibling duplication
+    ``markup_sink``'s own header rules against.
+    """
+
+    def test_the_journal_uses_markup_sinks_ladder(self, tmp_path, monkeypatch):
+        seen: list[str] = []
+        monkeypatch.setattr(
+            markup_sink,
+            'resolve_subject',
+            lambda thunk, worktree, *, what: seen.append(what) or 'stubbed',
+        )
+        sink = build_sink(tmp_path)
+
+        asyncio.run(sink(make_fact()))
+
+        (line,) = journal_lines(tmp_path)
+        assert line['subject_task_id'] == 'stubbed', (
+            'the journal calls the shared helper rather than its own copy'
+        )
+        assert seen == ['journal line'], 'and names its own record kind for the log'
+
+    def test_the_ladder_falls_from_the_thunk_to_the_worktree_to_the_sentinel(self):
+        def boom() -> str:
+            raise RuntimeError('no plan.json yet')
+
+        assert markup_sink.resolve_subject(
+            lambda: '4744', Path('/lanes/4744'), what='record',
+        ) == '4744'
+        assert markup_sink.resolve_subject(
+            lambda: '', Path('/lanes/4744'), what='record',
+        ) == '4744'
+        assert markup_sink.resolve_subject(
+            boom, Path('/lanes/4744'), what='record',
+        ) == '4744', 'a raising thunk falls to the ladder rather than costing the record'
+        assert markup_sink.resolve_subject(
+            boom, Path(worktree_with_no_name()), what='record',
+        ) == markup_sink.MARKUP_UNATTRIBUTED_SUBJECT

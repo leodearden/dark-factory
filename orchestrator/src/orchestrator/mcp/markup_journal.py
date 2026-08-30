@@ -140,8 +140,50 @@ def _encode(entry: dict[str, Any]) -> str:
     round-trips through ``json.loads`` back to the original character, so this
     is lossless rather than sanitisation — a mangled ``pattern`` would destroy
     the one field that says which literal the upstream harness bug emitted.
+
+    ``default=str`` because a value ``json`` cannot serialise must cost that
+    ONE VALUE its exact type, never the whole line. The middleware emits only
+    str / None / list-of-str today, but so was the key-count sprawl the
+    overflow floor already defends against: dropping a record because one field
+    grew an unexpected type is the exact fail-soft this module exists to end.
+    It is not a complete guarantee — a non-string KEY still raises past
+    ``default``, which is why the caller keeps the floor under this too.
     """
-    return json.dumps(entry, sort_keys=True).replace(_LT, _LT_JSON_ESCAPE) + '\n'
+    return (
+        json.dumps(entry, sort_keys=True, default=str).replace(_LT, _LT_JSON_ESCAPE)
+        + '\n'
+    )
+
+
+def _fit(entry: dict[str, Any], budget: int) -> str:
+    """*entry* encoded into at most *budget* bytes, hard-cutting strings to get there.
+
+    The floor under the floor. ``MARKUP_JOURNAL_FLOOR_KEYS`` bounds a record's
+    KEY COUNT but not its VALUE lengths — ``subject_task_id`` comes from an
+    injected thunk (for plan-tools, ``plan.json``'s agent-written ``task_id``)
+    and ``worktree`` from a path, neither of which anything upstream bounds. So
+    the identity-only line is MEASURED after it is built rather than assumed to
+    fit, because a floor line that overruns defeats the very bound that makes
+    the O_APPEND atomicity premise sound.
+
+    Each pass quarters the per-string budget, so it terminates at zero-length
+    values — a line of bare keys, ~100 bytes, still naming the tool and the
+    outcome. Ugly, and still strictly more than the nothing that was written
+    before this journal existed.
+    """
+    line = _encode(entry)
+    if len(line.encode('utf-8')) <= budget:
+        return line
+    cut = MARKUP_JOURNAL_MAX_FIELD_CHARS
+    while cut > 0:
+        cut //= 4
+        line = _encode({
+            key: value[:cut] if isinstance(value, str) else value
+            for key, value in entry.items()
+        })
+        if len(line.encode('utf-8')) <= budget:
+            break
+    return line
 
 
 def _capped(value: Any, trimmed: list[str], name: str) -> Any:
@@ -158,14 +200,36 @@ def _capped(value: Any, trimmed: list[str], name: str) -> Any:
         trimmed.append(name)
         return value[:MARKUP_JOURNAL_MAX_FIELD_CHARS]
     if isinstance(value, (list, tuple)):
+        kept = list(value[:MARKUP_JOURNAL_MAX_LIST_ITEMS])
         items = [
             item[:MARKUP_JOURNAL_MAX_FIELD_CHARS] if isinstance(item, str) else item
-            for item in value[:MARKUP_JOURNAL_MAX_LIST_ITEMS]
+            for item in kept
         ]
-        if len(value) > MARKUP_JOURNAL_MAX_LIST_ITEMS:
+        # BOTH axes are disclosed: a list is cut by its COUNT and each of its
+        # items by its LENGTH, and either cut has to raise the marker. Reporting
+        # only the count axis would let a list that fit item-for-item but whose
+        # items were rewritten pass as untouched — and the constants above say a
+        # missing marker means "nothing was cut", so a consumer would be right
+        # to trust it and wrong about the data.
+        if len(value) > MARKUP_JOURNAL_MAX_LIST_ITEMS or items != kept:
             trimmed.append(name)
         return items
     return value
+
+
+def _scalar(value: Any) -> Any:
+    """*value* as something ``json`` is guaranteed to render, bounded.
+
+    Used only for the identity-only floor, which is reached BY a record that
+    could not be encoded or could not be bounded — so it must not be built out
+    of the same values that just failed. A JSON scalar passes through; anything
+    else becomes its ``str()`` (the same coercion ``_encode``'s ``default``
+    applies, hoisted so the floor cannot depend on it), capped like any other
+    field.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)[:MARKUP_JOURNAL_MAX_FIELD_CHARS]
 
 
 def journal_path(project_root: Path, server_label: str) -> Path:
@@ -229,25 +293,14 @@ def make_fact_journal(
     def _subject() -> str:
         """The attribution ladder, applied per record.
 
-        Same ladder ``markup_sink.make_escalation_sink`` applies: the site's own
-        answer, then the worktree directory name, then an explicit
-        "unattributed" — never ``None`` and never absent, because a consumer
-        must be able to tell "nobody knows" from "that emitter forgot the key".
-
-        A RAISING thunk falls to the same ladder rather than losing the line.
-        Attribution is what this journal is FOR, but a record that says
-        "something leaked from add_design_decision at 16:52:34" is still
-        strictly more than the nothing that was written before it existed.
+        THE SAME ladder ``markup_sink.make_escalation_sink`` applies, because it
+        is literally the same function: the two channels on one boundary are
+        asserted to name the same subject, and two copies of the ladder could
+        drift in opposite directions while both kept passing their own tests.
         """
-        try:
-            resolved = subject_task_id()
-        except Exception:
-            logger.warning(
-                'markup guard: could not attribute the journal line under %s; '
-                'falling back to the worktree name', worktree,
-            )
-            resolved = ''
-        return resolved or worktree.name or markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
+        return markup_sink.resolve_subject(
+            subject_task_id, worktree, what='journal line',
+        )
 
     def append(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
@@ -274,23 +327,70 @@ def make_fact_journal(
 
         path = journal_path(project_root, server_label)
 
-        envelope = {
-            'ts': datetime.fromtimestamp(now(), tz=UTC).isoformat(),
-            'server': server_label,
-            'subject_task_id': _subject(),
-            'worktree': str(worktree),
-            'pid': os.getpid(),
-        }
         trimmed: list[str] = []
-        entry: dict[str, Any] = {
-            **envelope,
-            **{name: _capped(value, trimmed, name) for name, value in record.items()},
+        # THE ENVELOPE IS CAPPED TOO, not just the fact's fields. ``worktree``
+        # is a filesystem path and ``subject_task_id`` comes from the injected
+        # thunk — for plan-tools, ``plan.json``'s AGENT-WRITTEN ``task_id`` —
+        # so neither is bounded by anything upstream, and both are among the
+        # floor keys. An unbounded floor key would push the identity-only line
+        # itself past the byte bound, defeating the bound at exactly the point
+        # it is the last thing standing.
+        envelope = {
+            name: _capped(value, trimmed, name)
+            for name, value in (
+                ('ts', datetime.fromtimestamp(now(), tz=UTC).isoformat()),
+                ('server', server_label),
+                ('subject_task_id', _subject()),
+                ('worktree', str(worktree)),
+                ('pid', os.getpid()),
+            )
         }
+        capped_record = {
+            name: _capped(value, trimmed, name) for name, value in record.items()
+        }
+        # THE ENVELOPE WINS ON COLLISION. Everything but these five keys comes
+        # from the middleware's record, and four of the five are floor keys —
+        # the identity the floor exists to guarantee. A fact that grew a key
+        # named ``server`` or ``ts`` must not be able to overwrite who actually
+        # wrote the line and when, so the merge order puts the journal's own
+        # answer last. The collision is LOGGED rather than silently resolved:
+        # it means the middleware and this envelope have started disagreeing
+        # about a name, which is a fact worth an operator's attention.
+        for name in envelope.keys() & capped_record.keys():
+            logger.warning(
+                'markup guard: the markup fact for %s.%s carries %r, which is '
+                "the journal's own envelope key; keeping the journal's value "
+                'and dropping the fact-supplied one',
+                record.get('tool'), record.get('param'), name,
+            )
+        entry: dict[str, Any] = {**capped_record, **envelope}
         if trimmed:
-            entry[MARKUP_JOURNAL_TRUNCATED_KEY] = sorted(trimmed)
+            entry[MARKUP_JOURNAL_TRUNCATED_KEY] = sorted(set(trimmed))
 
-        line = _encode(entry)
-        if len(line.encode('utf-8')) > MARKUP_JOURNAL_MAX_LINE_BYTES:
+        try:
+            line = _encode(entry)
+            degrade = len(line.encode('utf-8')) > MARKUP_JOURNAL_MAX_LINE_BYTES
+            if degrade:
+                logger.warning(
+                    'markup guard: the journal record for %s.%s exceeded %d '
+                    'bytes; writing the identity-only floor instead',
+                    record.get('tool'), record.get('param'),
+                    MARKUP_JOURNAL_MAX_LINE_BYTES,
+                )
+        except (TypeError, ValueError):
+            # ``default=str`` covers an unserialisable VALUE; this covers what
+            # it cannot — a non-string KEY, or a key set ``sort_keys`` cannot
+            # order. Same disposition as an over-budget record, and for the
+            # same reason: degrade the line, never drop it. Dropping it would
+            # leave the event exactly where this module found it, in a stack
+            # trace on the stderr nobody retains.
+            logger.exception(
+                'markup guard: the journal record for %s.%s could not be '
+                'encoded; writing the identity-only floor instead',
+                record.get('tool'), record.get('param'),
+            )
+            degrade = True
+        if degrade:
             # THE OVERFLOW FLOOR. Per-field caps cannot bound a record that is
             # over budget in its KEY COUNT rather than in any one value — a
             # shape a future middleware could grow — so there has to be a floor
@@ -301,17 +401,18 @@ def make_fact_journal(
             # Dropping it is the exact fail-soft this PRD exists to end: the
             # whole reason this module exists is that these events reached no
             # durable sink at all.
-            logger.warning(
-                'markup guard: the journal record for %s.%s exceeded %d bytes; '
-                'writing the identity-only floor instead',
-                record.get('tool'), record.get('param'),
-                MARKUP_JOURNAL_MAX_LINE_BYTES,
-            )
-            floor = {
-                key: entry[key] for key in MARKUP_JOURNAL_FLOOR_KEYS if key in entry
+            #
+            # Every value is forced to a JSON scalar first, because this branch
+            # is reached BY an unencodable record: a floor built out of the same
+            # values that just failed to encode is no floor at all. And the
+            # result is MEASURED by ``_fit`` rather than assumed to fit.
+            floor: dict[str, Any] = {
+                key: _scalar(entry[key])
+                for key in MARKUP_JOURNAL_FLOOR_KEYS
+                if key in entry
             }
             floor[MARKUP_JOURNAL_OVERFLOW_KEY] = True
-            line = _encode(floor)
+            line = _fit(floor, MARKUP_JOURNAL_MAX_LINE_BYTES)
 
         # ONE ``os.write`` on an O_APPEND fd, and NEVER a read-modify-write.
         #
@@ -323,11 +424,36 @@ def make_fact_journal(
         # seek-and-write atomic with no cross-process lock to take, but that
         # atomicity is guaranteed only for a BOUNDED write — so the record is
         # capped rather than trusted to be small.
+        payload = line.encode('utf-8')
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
-                os.write(fd, line.encode('utf-8'))
+                # THE RETURN VALUE IS NOT IGNORED. ``write(2)`` may report a
+                # SHORT count — classically near ENOSPC, or on a large write
+                # interrupted by a signal — and a partial record has no
+                # trailing newline, so the next appender concatenates onto it
+                # and one unparseable line silently swallows two events. Every
+                # consumer of this file splits on newlines, so that is the one
+                # corruption shape this format cannot survive. Finishing the
+                # remainder is not atomic with the first chunk, but a torn line
+                # that is at least COMPLETE and newline-terminated is legible;
+                # an unterminated one is not.
+                written = 0
+                while written < len(payload):
+                    chunk = os.write(fd, payload[written:])
+                    if chunk <= 0:
+                        raise OSError(
+                            f'wrote {chunk} bytes of {len(payload)} to {path}'
+                        )
+                    if written == 0 and chunk < len(payload):
+                        logger.warning(
+                            'markup guard: short write journalling %s.%s to %s '
+                            '(%d of %d bytes); completing the line',
+                            record.get('tool'), record.get('param'), path,
+                            chunk, len(payload),
+                        )
+                    written += chunk
             finally:
                 os.close(fd)
         except OSError:

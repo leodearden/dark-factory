@@ -192,6 +192,45 @@ def resolve_project_root(worktree: Path) -> Path | None:
     return git_dir.parent
 
 
+def resolve_subject(
+    subject_task_id: Callable[[], str], worktree: Path, *, what: str
+) -> str:
+    """Who this record is attributed to: the site's answer, then a ladder.
+
+    ONE ladder, shared by every channel a boundary guard emits through — the
+    escalation sink below and ``markup_journal.make_fact_journal``. Kept here
+    rather than reimplemented per channel because the two channels' records are
+    asserted to name the SAME subject: two copies of an attribution ladder can
+    drift in opposite directions on one boundary, and a guard whose escalation
+    and whose journal disagree about who leaked is worse than either alone.
+    That sibling duplication is the INV-5 shape this module's own header rules
+    against.
+
+    The rungs, in order: the site's own answer (plan.json's ``task_id`` for
+    plan-tools), then the worktree directory NAME (a task worktree is named for
+    its task), then an explicit ``MARKUP_UNATTRIBUTED_SUBJECT`` — never ``None``
+    and never absent, because a consumer must be able to tell "nobody knows"
+    from "that emitter forgot the key".
+
+    A RAISING thunk falls to the same ladder rather than costing the record.
+    Attribution is what these channels are FOR, but a record that says
+    "something leaked from add_design_decision at 16:52:34" is still strictly
+    more than the nothing that was written before they existed.
+
+    *what* names the record kind in the fallback log line, so an operator
+    reading the warning knows which channel degraded.
+    """
+    try:
+        resolved = subject_task_id()
+    except Exception:
+        logger.warning(
+            'markup guard: could not attribute the %s under %s; falling back '
+            'to the worktree name', what, worktree,
+        )
+        resolved = ''
+    return resolved or worktree.name or MARKUP_UNATTRIBUTED_SUBJECT
+
+
 def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
     """Open ``(Escalation, EscalationQueue)`` for *project_root*, or ``None``.
 
@@ -536,15 +575,7 @@ def make_escalation_sink(
             return fall_back(record, 'the escalation could not be submitted')
 
     def _subject() -> str:
-        try:
-            resolved = subject_task_id()
-        except Exception:
-            logger.warning(
-                'markup guard: could not attribute the record under %s; '
-                'falling back to the worktree name', worktree,
-            )
-            resolved = ''
-        return resolved or worktree.name or MARKUP_UNATTRIBUTED_SUBJECT
+        return resolve_subject(subject_task_id, worktree, what='record')
 
     async def sink(record: dict[str, Any]) -> str | None:
         try:
