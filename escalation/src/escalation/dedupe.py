@@ -51,13 +51,18 @@ __all__ = [
 import hashlib
 import logging
 import math
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from shared.timestamps import parse_timestamp_or_warn
+
+# The casefold/non-word/whitespace transform is NOT owned here — it lives once
+# in the leaf module escalation.canonical, which queue.py also imports for
+# root-cause matching.  Both call sites in this module pin punctuation='strip'
+# (the legacy, deletion-flavoured policy); see _normalize_description.
+from escalation.canonical import canonical_text
 
 # observed_submit_response lives next to the record it re-reads (queue), not
 # here — this module owns fold logic only.  Re-exported by neither module's
@@ -75,9 +80,6 @@ KeyFn = Callable[['Escalation'], Any]
 
 logger = logging.getLogger(__name__)
 
-_NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
-_WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
-
 # Unit separator: never appears in category names or entity IDs, so the join is
 # collision-free without hashing the readable prefix components.
 _FIELD_SEP = '\x1f'
@@ -86,17 +88,19 @@ _FIELD_SEP = '\x1f'
 def _normalize_description(text: str) -> str:
     """Normalise a description string for the empty-affected_ids tiebreak.
 
-    Steps:
-    1. Casefold (Unicode-aware lower-case).
-    2. Strip all non-word, non-whitespace characters (reuses _NON_WORD_PATTERN).
-    3. Collapse multiple whitespace runs to a single space and strip edges.
+    Delegates to the single implementation in :mod:`escalation.canonical`
+    (casefold -> map non-word chars -> collapse whitespace -> strip).
 
-    Reuses _NON_WORD_PATTERN so the normalisation is consistent with
-    summary_dedupe_key's stripping stage.
+    THE ``strip`` POLICY IS PINNED HERE DELIBERATELY and must NOT be changed to
+    the ``separator`` policy the root-cause match site uses.  This function's
+    only consumer is :func:`compute_content_fingerprint`, whose sha256 digests
+    are already persisted across the live recon corpus: under separator
+    semantics every digest changes, so every already-fingerprinted recon finding
+    stops matching its own past self and the whole corpus silently un-dedupes.
+    ``tests/test_dedupe.py::TestNormalisationLiftedToCanonical`` pins four
+    reference digests against exactly that drift.
     """
-    casefolded = text.casefold()
-    stripped = _NON_WORD_PATTERN.sub('', casefolded)
-    return _WHITESPACE_PATTERN.sub(' ', stripped).strip()
+    return canonical_text(text, punctuation='strip')
 
 
 def compute_content_fingerprint(
@@ -410,7 +414,15 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
         >>> summary_dedupe_key("cpu+memory leak")
         ('cpumemory', 'leak')
     """
-    normalised = _NON_WORD_PATTERN.sub('', summary.casefold())
+    # Same single implementation as _normalize_description, and the ``strip``
+    # policy is pinned here for the same reason: these tuples are already
+    # persisted fleet-wide as find_dedupe_parent's key, so a change to the
+    # transform silently re-partitions every existing dedupe cluster.  The
+    # helper's extra whitespace-collapse-and-strip (which the old inline
+    # expression did not do) is absorbed by the .split() below — verified
+    # byte-identical on the five examples above and on all 2796 real summaries
+    # in the live queue.
+    normalised = canonical_text(summary, punctuation='strip')
     tokens = normalised.split()
     return tuple(tokens[:3])
 

@@ -445,7 +445,10 @@ def check_config(config_path: Path | None):
         (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
         for existing names other tooling already greps for.
 
-    Exits 1 if any GENUINELY-unknown key is found, else 0.
+    Exits 1 if any GENUINELY-unknown key is found, or if the file could not be
+    read or parsed at all (a census of nothing is not a clean census); else 0.
+    An EMPTY project YAML is a legitimate clean result — it means "use all
+    defaults" — and still exits 0.
     """
     from orchestrator.config import census_config_keys
 
@@ -464,6 +467,21 @@ def check_config(config_path: Path | None):
             sys.exit(1)
 
     census = census_config_keys(config_path)
+
+    # An empty census has two very different causes.  Fail CLOSED when nothing
+    # could be parsed: the census's own fail-open contract (config.py) makes
+    # `unknown` empty for an unreadable/unparseable file, so printing the
+    # affirmative OK below would tell an operator a config is safe precisely
+    # when it could not be inspected at all.  The ignored/OK sections are both
+    # vacuous in this case, so return before either.
+    if census.parse_error:
+        click.echo(f'Error: {census.parse_error}', err=True)
+        click.echo(
+            'Could not lint this file, so its config keys are UNKNOWN — this is '
+            'NOT a clean result. Fix the file and re-run.',
+            err=True,
+        )
+        sys.exit(1)
 
     # Informational FIRST, and explicitly marked as such: these keys were
     # deliberately excused, so listing them keeps an over-broad glob auditable
@@ -857,7 +875,57 @@ def cancel_verify(request_id: str, config_path: Path | None):
     git_ops = GitOps(config.git, config.project_root)
     pgf = pgid_file(git_ops.worktree_base, request_id)
     failed_pids: list[int] = []
-    rc = cancel_request(pgf, failed_pids_out=failed_pids)
+    killed_pgid: list[int] = []
+    rc = cancel_request(
+        pgf, failed_pids_out=failed_pids, killed_pgid_out=killed_pgid,
+    )
+    # ── task 3186 (PRD δ): CLEAR THE FIXED-KEY HOLDER RENDEZVOUS ────────────
+    # `cancel_request` SIGKILLs the verify-merge tree, which skips that
+    # process's own `finally` — the one that would have called
+    # `remove_lock_holder_pgid`.  The per-request pgid file it removes itself
+    # is harmless when leaked (request ids are uuid4 and never revisited), but
+    # the FIXED key is a different animal: every run overwrites it, and
+    # `GitOps._merge_verify_lease_active` probes it with `killpg(pgid, 0)`.  A
+    # leaked — or, once the pid counter wraps, RECYCLED — entry there reads as
+    # a LIVE holder, and `reset_persistent_merge_worktree` consumes that
+    # predicate FAIL-CLOSED: it raises `MergeVerifyLeaseHeld` and the warm
+    # `_merge-verify` lane is wedged until some later run happens to overwrite
+    # the key.  See verify_cancel.py's stale-file / PID-reuse note for the
+    # measured picture.
+    #
+    # GATED ON IDENTITY, NOT ON rc.  Two facts make an unconditional
+    # `if rc == 0` clear unsafe:
+    #
+    #   * rc == 0 does not mean anything was killed.  Three of `cancel_request`'s
+    #     four return-0 paths never send a signal (absent file, corrupt content,
+    #     `pgid <= 0`), and the absent-file one is the COMMON case — a
+    #     verify-merge that completes normally removes its own per-request pgid
+    #     file in its `finally`, so a cancel racing normal completion (exactly
+    #     the race δ's head teardown creates) kills nothing at all.
+    #   * The key is SHARED.  Its owner writes it only when it won the build-lane
+    #     flock and clears it only in its own `finally` (see the `verify-merge`
+    #     span above), so it routinely names a DIFFERENT, live verify than the
+    #     request being cancelled.
+    #
+    # Clearing it in either of those situations makes the lease read fail-OPEN
+    # (`read_lock_holder_pgid` -> None -> "not held"): the typed
+    # `MergeVerifyLeaseHeld` diagnosis is lost and DF-3071's admission guard
+    # reads `_merge-verify` as IDLE while a verify is live, so the fleet
+    # REDEPLOYS over it instead of deferring — trading the wedged-lane risk
+    # above for a strictly worse one.  So clear only when this cancel actually
+    # swept a pgid AND the key names that same pgid.
+    #
+    # The rc != 0 case is subsumed and stays fail-closed for its own reason: a
+    # LIVE process refused SIGKILL, so it plausibly still holds both lease axes
+    # and `cancel_request` reports no kill.  Same reasoning as its retention of
+    # the per-request pgid file on that path.
+    #
+    # SCOPE: this closes the merge-worker-initiated cancel — the route δ's
+    # head-verify teardown takes for a REMOTE lease.  The `fire_watchdog_kill`
+    # `os._exit(1)` leak (verify_cancel.py's stale-file note) is a different
+    # route and is deliberately NOT addressed here.
+    if killed_pgid and read_lock_holder_pgid(git_ops.worktree_base) == killed_pgid[0]:
+        remove_lock_holder_pgid(git_ops.worktree_base)
     for pid in failed_pids:
         click.echo(
             f'cancel-verify: PermissionError: could not SIGKILL pid {pid} '

@@ -8,33 +8,6 @@ from __future__ import annotations
 
 import re
 
-import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def charts_jsx_body(_client):
-    return _client.get('/static/redux/charts.jsx').text
-
-
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
 # ---------------------------------------------------------------------------
@@ -59,6 +32,17 @@ def charts_jsx_body(_client):
 _LABELS_PROP_RE = re.compile(r'\blabels=\{')
 _LABELS_RE = re.compile(r'labels=\{([^{}]+)\}')
 _VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
+# A stacks prop built by a helper — `stacks={burndownStacks(pb, CP)}` — names
+# its series object as the builder's FIRST argument rather than in inline
+# `values:` entries.  Task 4361 extracted the two status-mix stack literals into
+# burndown_bands.js (so that per-band wiring could be covered behaviourally by
+# node --test instead of by JSX source-text greps), which would otherwise have
+# left both <SA> sites with NO parsed values expressions — silently dropping
+# them out of the pairing sweep below while every test here stayed green. That
+# is coverage loss wearing the costume of success, so the probe learns the new
+# spelling instead. The CONTRACT is unchanged: labels and values must still
+# come off the same series object. Only where the values root is written moved.
+_STACKS_BUILDER_RE = re.compile(r'stacks=\{\s*\w+\(\s*([A-Za-z_$][\w$.]*)\s*[,)]')
 _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
 # Any tag start or end inside an element's attribute list means the element is
 # not flat self-closing, so a regex chunk cannot be attributed to it safely.
@@ -162,6 +146,10 @@ def _chart_sites(src):
         labels_m = _LABELS_RE.search(chunk)
         labels_expr = labels_m.group(1).strip() if labels_m else None
         values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
+        # Plus any helper-built stacks prop, whose series object is the
+        # builder's first argument. Additive, so a site mixing inline `values:`
+        # entries with a builder call is still checked on both.
+        values_exprs += [v.strip() for v in _STACKS_BUILDER_RE.findall(chunk)]
         sites.append({
             'tag': tag,
             'labels_expr': labels_expr,
@@ -364,9 +352,41 @@ class TestVelocitySparkWiring:
         assert re.search(r'deriveVelocitySeries\(pb\.pending', tabs_jsx_body)
 
     def test_status_mix_area_stays_cumulative(self, tabs_jsx_body):
-        """Status-mix StackedArea charts must still use raw values (not derived)."""
-        # The SA stacks for the aggregate view use b.done directly.
-        assert re.search(r"values:\s*b\.done", tabs_jsx_body)
+        """Status-mix StackedArea charts must still use raw values (not derived).
+
+        Was `re.search(r"values:\\s*b\\.done", tabs_jsx_body)` — a source-text
+        grep that task 4361 made unsatisfiable by extracting the stack literals
+        into burndown_bands.js. Repointed rather than deleted, because the
+        CONTRACT is still real: the status-mix bands plot the raw cumulative
+        series, unlike the velocity charts this class otherwise covers, which
+        legitimately derive theirs.
+
+        The contract is now split across two homes, and both halves are
+        covered:
+
+        * WHICH series each band plots — that `done` carries `block.done` and
+          not some neighbour or derivative — is asserted BY IDENTITY for all
+          five bands in dashboard/tests/js/burndown_bands.test.mjs
+          ("each band is sourced from its OWN same-named block field"). That is
+          strictly stronger than the grep it replaces, which only proved the
+          characters `values: b.done` appeared somewhere in the file.
+
+        * WHICH object is handed to the builder at the call site is what
+          remains checkable here, and is what this test asserts: the raw
+          burndown block, not a derived series.
+        """
+        sites = [
+            s for s in _chart_sites(tabs_jsx_body)
+            if s['tag'] == 'SA' and set(s['values_roots']) == {'b'}
+        ]
+        assert len(sites) == 1, (
+            f'expected exactly one aggregate <SA> site, found {len(sites)}'
+        )
+        for expr in sites[0]['values_exprs']:
+            assert 'derive' not in expr and 'velocity' not in expr.lower(), (
+                'the aggregate status-mix chart is plotting a DERIVED series '
+                f'({expr!r}); its bands must stay raw and cumulative.'
+            )
 
     def test_completed_window_tile_stays_cumulative(self, tabs_jsx_body):
         """'Completed (window)' tile spark must remain on raw b.done.

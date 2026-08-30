@@ -84,8 +84,7 @@ watcher. Run once, at session startup, not per cycle:
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-reap
 
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}" \
-  --policy stand-down
+  --name recon-watcher-<project> --policy stand-down
 ```
 
 **Why this watcher takes a lease (task 3994).** `recon-watch/run.sh` `exec`s a hand-launched
@@ -98,19 +97,37 @@ interactive single-owner-per-session shape, exactly like `escalation-watcher`. I
 a supervised, always-on rotation rather than a single-owner actor. The lease name is the one task
 2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
 
-**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
-`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
-`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
-`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the liveness guard
-inert, and a `$$` slug differs on every tool call, so your own later heartbeat/release would be
-refused. `--pid` is optional (the CLI resolves it from `$CLAUDE_PID`) and is an operator override
-only. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that degrades the
-lease to heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that
-would make the lease unreapable forever; pass `--pid "$PPID"` if you want the body's pid to match the
-one in your slug.
+**Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
+defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves the same way. Pass either only
+as a deliberate operator override. Both are derived rather than documented because the token is
+load-bearing on every heartbeat and on the final release, and must not depend on this document
+getting one shell token right (tasks 3994, 4248). It has to be **re-derivable**, not carried: each
+Bash tool call is a fresh `/bin/bash -c`, so a `SLUG=$(...)` captured here would be gone by the next
+call — hence the CLI re-derives it on every verb.
+
+**Never `$$`, and never `$PPID`.** Inside a Claude Code Bash tool call `$$` is the transient
+`/bin/bash -c` wrapper, dead the instant the call returns, which makes the liveness guard inert.
+`$PPID` is not stable across tool calls either (measured: 1430433, then 1471645 on the next call,
+the first already dead), so a slug built on it would not match your own later heartbeat. The
+long-lived `claude` process is `$CLAUDE_PID` — verify with `ps -o comm= -p "$CLAUDE_PID"`, which
+prints `claude`.
+
+If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
+rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
+not invent one, because a synthesized token would be identical for every degraded session and let
+each act on the others' leases. Pass `--slug <stable-token>` to proceed, re-using it on every later
+lease verb — `--pid` does **not** substitute (it is the lease body's liveness pid, not your identity,
+and the heartbeat/release verbs have no `--pid`; only `--slug` is honoured by all three).
+On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
+heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that would
+make the lease unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+- **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
+  user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat returns
+  `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
+  re-derives it.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop. `proceed` is the
   fail-open outcome — a lease-substrate fault is logged loudly and reported as `proceed`, never a
   false `stand-down`, so a lease fault can never block the only consumer of this queue. An acquired
@@ -134,8 +151,12 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
     --id recon-watcher-lease-orphan-<project> --project <project> \
     --text "recon-watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); the 8103 queue has no live closer until it is reclaimed" \
     --escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
-    --session-id "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+    --session-id "recon-watcher-<project>-${CLAUDE_PID:-unknown}"
   ```
+
+  `--session-id` is a best-effort **provenance label** with no ownership semantics — unlike the lease
+  slug, which the CLI owns (above). It is deliberately not fail-loud: a watcher that cannot file a
+  DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Never force-release on this evidence alone: `holder_liveness` is a single-signal pid probe, and a
   dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This guard carries the
@@ -158,12 +179,13 @@ A fresh heartbeat means you **stand down** even when the pid reads as not runnin
 BOTH a dead pid AND a heartbeat past the TTL.
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
-and release it when the session ends. Both verbs **require** the slug you claimed with — a mismatch
-is refused, so no other session can evict your lease or keep a dead one alive:
+and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
+refused, so no other session can evict your lease or keep a dead one alive. You do not pass the slug:
+the CLI derives the same one it derived at claim time, which is what makes the two match:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name recon-watcher-<project>
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` first: `applied` = done; `absent` = no
@@ -243,11 +265,12 @@ observes this one as alive and stands down:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name recon-watcher-<project>
 ```
 
 `result=refused` means your heartbeat did **not** land (you are not the holder) — investigate with
-`lease-show`, don't re-run with `--force`.
+`lease-show`, comparing its `holder_slug` against the `slug=` line your `lease-claim` printed; don't
+re-run with `--force`.
 
 **`result=absent` on a heartbeat means your lease is GONE**, not that the call was a harmless no-op:
 it was reaped after a TTL lapse or force-released by an operator, and you are now draining the 8103
@@ -725,6 +748,28 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   overwriting would delete that row. Your ask still reaches the human through the in-session note
   / afk-digest line this filing accompanies; if you need the cockpit row too, re-file under an id
   that is unique fleet-wide.
+- **`--project`**: the project's **canonical token** — the `memory.project_id` its
+  `dark-factory-orchestrator.yaml` declares. For dark-factory that is **`dark_factory`**, not `df`
+  and not `dark-factory`. The value is normalized at the CLI boundary (case-folded, `-` and `_`
+  equivalent, `df` aliased to `dark_factory`), so a stale spelling can no longer create a hidden
+  partition — but pass the canonical token anyway, so what you type matches what the cockpit shows
+  and no rewrite warning is logged. **The `df-` prefix on ids like `df-esc-3524-1` is part of
+  `--id`, which YOU type**; `write-decision` never derives it from, or rewrites it because of,
+  `--project`. Conflating the two is what produced a three-way split of one project's decisions
+  (41 open dark-factory rows spread across `dark_factory`/`df`/`dark-factory`, each invisible to a
+  reap scoped to either of the others).
+  - **Caveat — check your project's existing rows before trusting the declared token.** Folding
+    merges spellings that differ only by case or separator; only an entry in
+    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
+    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
+    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
+    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
+    project, list the tokens its rows actually carry:
+    ```bash
+    python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
+    ```
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
@@ -805,6 +850,34 @@ visible cockpit row until a human closes it. The reaper never defaults to closin
 over-held decision is a triageable row, a falsely-closed one is invisible. If unstamped open
 records ever reappear, the re-runnable remedy is `scripts/backfill_decision_queue_stamp.py`
 (dry-run by default; `--verify` exits non-zero while any open record still lacks a stamp).
+
+The **project** axis matches on the canonical token (see `--project` above), so **ONE run per
+queue closes every historical spelling** of that project — there is no need to re-run the verb
+once per token (`df`, `dark_factory`, `dark-factory`) as was necessary before. This holds as long
+as the token you pass folds into the same bucket its rows carry, which is not automatic for every
+project — read the `--project` caveat above before assuming a zero-row reap means "nothing to
+close". Folding only ever
+merges spellings of the *same* project; it never merges two different projects (e.g.
+`solar_challenge` and `solar_challenge_platform` stay separate), so this widens what a reap
+closes without ever letting one project's reaper close another's decisions. Note this is
+orthogonal to the queue axis above: canonicalizing the project token does **not** relax the
+cross-queue guard, so a mis-pointed `--escalations-dir` remains just as hazardous as described.
+
+To repair the legacy population — records filed before `write-decision` canonicalized `--project`
+— run the one-shot backfill (dry-run first):
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py \
+  migrate-decision-projects --dry-run   # preview; writes nothing
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py \
+  migrate-decision-projects
+```
+
+It rewrites only the `project` field: `state` and `filed_at` are preserved, so an already-answered
+row is **never** reopened, and a record's id (and its cockpit cross-links) is never rewritten. It
+is idempotent — a re-run once the fleet is clean prints nothing — so it is also the repair tool if
+a record is ever hand-edited. It is fleet-global, so it only needs running once, not once per
+watcher.
 
 Two collision modes exist and must not be conflated:
 

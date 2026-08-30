@@ -16,10 +16,28 @@ geometry/wiring regression that happens to keep the tokens would pass
 silently. That behavioral correctness is already covered by the .mjs suite
 above.
 
-Helpers below (_client, _extract_function_body, _ScriptTagCollector,
-_find_script_position, _assert_script_loads_before) are copied — not
-imported — from test_tab_escalation_analytics.py, per that suite's
-established copy-not-import convention for these cross-file test helpers.
+This file used to carry its own copies of `_client` and
+`_extract_function_body`, per what was then this suite's established
+copy-not-import convention for cross-file test helpers.  Task 3549 retired
+that convention: nine modules held a copy, under two names covering four
+distinct implementations, so a fix to any of them had to be applied nine
+times or not at all — and the one worth making (scoping to a NESTED
+declaration) went unmade for exactly that reason.  `_client` is now the
+module-scoped fixture in conftest.py and `extract_function_body` is imported
+from `_dashboard_helpers`; test_jsx_source_helpers.py owns their contract and
+guards against the copies returning.
+
+That retirement stopped at the two JSX-slicing helpers, DELIBERATELY, and the
+remaining copies are tracked rather than forgotten — read the paragraph above
+as scoped to those two, not as a claim that this file holds no copies.  The
+script-order helpers below (_ScriptTagCollector, _find_script_position,
+_assert_script_loads_before) are still local copies from
+test_tab_escalation_analytics.py, and are copied again in test_index_html.py,
+test_tab_escalations.py and test_tab_memory_evals.py; `_extract_df_data_block`
+stands in three modules; test_charts_axis_labels.py's `_extract_signature`
+re-derives the paren-depth walk `extract_function_body` now owns.  Moving them
+needs test_index_html.py, which task 3549 held no lock on, so it filed
+ticket tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ for the rest.
 """
 
 from __future__ import annotations
@@ -28,15 +46,7 @@ import html.parser
 import re
 
 import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
+from _dashboard_helpers import extract_function_body
 
 
 @pytest.fixture(scope='module')
@@ -47,61 +57,6 @@ def esc_flow_diagram_jsx_response(_client):
 @pytest.fixture(scope='module')
 def esc_flow_diagram_jsx_body(esc_flow_diagram_jsx_response) -> str:
     return esc_flow_diagram_jsx_response.text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client) -> str:
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def tab_analytics_jsx_body(_client) -> str:
-    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalation_analytics.py (itself copied from
-# test_tab_escalations.py) — scopes token-presence checks to a specific
-# function body rather than searching the entire file.
-# ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +326,7 @@ def test_workflow_panel_mounts_lifecycle_flow_diagram_in_slot(tab_analytics_jsx_
     invariants).
     """
     body = tab_analytics_jsx_body
-    panel_body = _extract_function_body(body, 'WorkflowPanel')
-    assert panel_body, 'Could not locate the WorkflowPanel( function body.'
+    panel_body = extract_function_body(body, 'WorkflowPanel')
 
     # (c) regression guard — δ's seam markers must survive this edit.
     assert 'esc-flow-slot' in panel_body, (

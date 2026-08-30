@@ -1923,11 +1923,21 @@ class TestAlarmVerifyHostUnreachable:
         assert esc.category == 'verify_host_unreachable'
 
     def test_category_is_not_halting(self):
-        """category is NOT in {wip_conflict, unmerged_state} (non-halting invariant)."""
+        """category is NOT in {wip_conflict, unmerged_state, stash_failed}.
+
+        The non-halting invariant: an unreachable verify host must not stop the
+        whole merge queue.  The authority for the halting set is the
+        `esc.category in {...}` gate in `Harness._rehydrate_merge_halt` (cited by
+        name, not line number -- harness.py churns and a hand-copied offset goes
+        stale silently).  This assertion previously listed only two of that
+        gate's three members, so it under-specified the invariant it exists to
+        guard.  `test_roles_merge_halt_safety.py` pins the same set from the
+        other direction.
+        """
         eq = _FakeEscalationQueue(open_l1=False)
         self._call(eq, 'host1', 'err', streak=3, duration_s=120.0)
         esc = eq.submitted[0]
-        assert esc.category not in {'wip_conflict', 'unmerged_state'}
+        assert esc.category not in {'wip_conflict', 'unmerged_state', 'stash_failed'}
 
     def test_escalation_task_id_is_per_host_sentinel(self):
         """task_id is the per-host sentinel __verify_host_unreachable__<host>."""

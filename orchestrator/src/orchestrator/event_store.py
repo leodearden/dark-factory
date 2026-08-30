@@ -66,6 +66,21 @@ class EventType(StrEnum):
     # Escalations
     escalation_created = 'escalation_created'
     escalation_resolved = 'escalation_resolved'
+    # Stale-L0 strand swept at startup (task 3172, origin records esc-5189-7
+    # pending 20h58m with a workflow parked on it vs esc-5685-1 pending ~90s).
+    # Emitted by Harness._dismiss_stale_escalations, once per level-0 whose
+    # pending age had already crossed the strand threshold when the restart
+    # sweep closed it.  Keyed on the STRANDED escalation's REAL task_id so the
+    # rows stay joinable against task_completed for that task.
+    # data: {escalation_id, pending_secs, severity, workflow_blocked, category,
+    #        agent_role, resolution_class}
+    #
+    # Why a dedicated member rather than a flag on escalation_resolved: the one
+    # query this task exists to enable is "how many strands did this restart
+    # destroy, and which" — a GROUP BY that must separate a strand from routine
+    # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
+    # it directly; a json_extract discriminator over every resolution would not.
+    stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -97,6 +112,63 @@ class EventType(StrEnum):
     # Both keys are ALWAYS present (None when not narrowed) so the survey's
     # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
     # and can NEVER miscount a narrowed retry as a full green gate.
+    # PLUS one always-present deep merge-ahead key (task 3185, PRD γ):
+    #   chain_items  int, ALWAYS >= 1, NEVER None.  The count, in CHAIN-ITEM
+    #                units, of the items contained in the tree this verify
+    #                actually exercised: the dispatching item is chain item #1
+    #                and each chained successor actually built adds one.
+    #                1 = an ordinary single-item verify (head or
+    #                adjacent speculative); >= 2 = a deep merge-ahead tip
+    #                verify covering that many stacked items.
+    #                DELIBERATELY FRONTIER-INDEPENDENT: an ordinary adjacent
+    #                speculative verify is 1 no matter how many other verifies
+    #                are in flight ahead of it (that height is `depth`'s job,
+    #                below), so under the shipped merge_deep.chain_cap=0 kill
+    #                switch NOTHING can emit >= 2.  That is precisely what
+    #                scripts/merge-deep-canary-predicate.sh:84 depends on --
+    #                it classifies a deep verify as `chain_items >= 2`, and
+    #                that expression is both ζ's "first deep verify observed"
+    #                deploy signal and η1's deep-fail-rate DENOMINATOR.  A
+    #                frontier-inclusive reading would fire it on day one and
+    #                count rounds that chained nothing.  The floor is 1
+    #                rather than 0/None because every merge verify exercises
+    #                at least the item it was created for, so there is no
+    #                "absent" state to represent -- which is what lets a
+    #                reader treat data['chain_items'] as unconditionally
+    #                present and lets the deep-canary predicate count deep
+    #                verifies as `chain_items >= 2`.
+    #                SUPERSEDES reliance on `depth` as a depth signal: a
+    #                firing speculation probe (task 2359) relabels `depth`
+    #                into an attribution fact about a stack that was never
+    #                verified (see ProbePlacement's known-limitation note), so
+    #                probe-era `depth` values are excluded from calibration.
+    #                `chain_items` is derived from the tree that actually ran
+    #                and carries no such caveat.
+    # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
+    # reviewer_comprehensive performance):
+    #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
+    #                build that produced this verify's tree cost.  None
+    #                whenever no chain was built -- i.e. on every event with
+    #                chain_items == 1, which under the shipped chain_cap=0
+    #                kill switch is EVERY event.  Non-None therefore implies
+    #                chain_items >= 2, and the two fields are read together.
+    #                Nullable where chain_items is not, and correctly so: a
+    #                verify that chained nothing paid no build, so there IS a
+    #                genuine "absent" state here and 0 would be a lie rather
+    #                than an absence (whereas every verify exercises at least
+    #                one item, so chain_items has no absent state at all).
+    #                WHY IT EXISTS: the chain build is awaited INLINE on the
+    #                merge worker's dispatch path, so for its whole duration
+    #                _verifier_loop cannot run FINALIZE-HEAD -- an
+    #                already-green head verify can neither finalize nor land,
+    #                and nothing else can dispatch.  That is a per-round
+    #                DISPATCH STALL, not verify time, and the PRD's whole
+    #                justification for deep merge-ahead is throughput, so the
+    #                cost must be measurable before ζ raises the cap.  η1 reads
+    #                it alongside drain-time for exactly that attribution.
+    #                Measured by _deep_chain_placement, not by build_chain, so
+    #                it covers the FULL stall: lane acquisition, the sequential
+    #                merges, and the asyncio.timeout wrapper's overhead.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
@@ -148,8 +220,13 @@ class EventType(StrEnum):
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
-    # merge_sha}.  state is one of MergeOutcome.status values, 'abandoned'
-    # (cancelled future), or 'error' (unexpected exception).
+    # merge_sha, superseded_by, generation, reason, landed_via_chain}.  state
+    # is one of MergeOutcome.status values, 'abandoned' (cancelled future), or
+    # 'error' (unexpected exception).  landed_via_chain is 1 on an item landed
+    # by a deep merge-ahead chain walk and None otherwise (task 3186 δ); it is
+    # what scripts/merge-deep-canary-predicate.sh sums for its items-landed-
+    # per-deep-verify statistic.  (superseded_by/generation/reason had been
+    # emitted but undocumented here; listed now rather than left stale.)
     merge_finalized = 'merge_finalized'
     # Unconditional observability of the generic merge-blocked fall-through in
     # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
@@ -271,6 +348,61 @@ class EventType(StrEnum):
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
+
+    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
+    # _run_slot guard above and then still failed to happen. It closes the
+    # population that was previously journal-only and runs.db-INVISIBLE: an
+    # armed --resume whose transcript the CLI could not resolve exits before it
+    # ever contacts the API, so none of the three events above, and no cost or
+    # cap row, ever recorded that the session was lost.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it. The three events above are emitted by
+    # the _run_slot guard, exactly once per DISPATCH that carried a recovered
+    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
+    # INVOCATION — and a single dispatch invokes several roles — so adding it to
+    # that sum would compare populations counted on different units and silently
+    # inflate the attempt count.
+    #
+    # data.stage splits the two ways an adopted resume dies:
+    #   pre_flight — _invoke corroborated the session against the config dir it
+    #                was about to export as CLAUDE_CONFIG_DIR, found no
+    #                transcript there (and could not rehydrate one from the
+    #                durable archive), and dispatched FRESH instead of arming a
+    #                --resume the CLI would reject. data: {stage, session_id,
+    #                role, restore} — `restore` is the rehydration OUTCOME, one
+    #                of 'disabled' (session_resume.restore_from_archive off),
+    #                'miss' (the archive genuinely holds no entry for that
+    #                session and nothing else — the archive-COVERAGE signal),
+    #                'fault' (the restore raised: archive-root composition OR
+    #                the restore's own I/O, the latter reaching this arm only
+    #                because _invoke calls the helper with strict=True — see
+    #                the restore_outcome vocabulary comment in workflow.py) or
+    #                'published' (restore claimed success yet the CLI-facing
+    #                locator still cannot see it: pathological, unreachable by
+    #                construction, counted rather than assumed away).
+    #   cli        — the resume WAS armed and the CLI rejected it;
+    #                invoke_with_cap_retry silently retried fresh and returned a
+    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #                {stage, session_id, session_ids, role, fallbacks}, where
+    #                `fallbacks` is AgentResult.resume_fallbacks — the count of
+    #                fresh retries this one invocation had to make — and
+    #                `session_ids` are the ids those retries dropped, oldest
+    #                first (`session_id` is the first of them, i.e. the resume
+    #                the orchestrator itself adopted). Emitted ONLY when _invoke
+    #                armed the resume: the shared/ counter also increments for a
+    #                resume its retry loop re-armed internally after a cap hit,
+    #                which a plain fresh dispatch can reach, and counting those
+    #                would inflate the ratio below past 1.
+    #
+    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+    #     FROM events WHERE event_type = 'session_resume_failed'
+    #    GROUP BY stage;
+    # Read it against session_resume (the adopted-resume count) rather than
+    # against the three-event sum: it answers "of the resumes we decided to
+    # make, how many did not survive to the agent?".
+    session_resume_failed = 'session_resume_failed'
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
@@ -477,6 +609,37 @@ class EventType(StrEnum):
     #   in_flight: len(Scheduler._dispatched) at decision time (int)
     #   floor:     config.psi_admission.min_inflight_floor (int)
     dispatch_deferred = 'dispatch_deferred'
+
+    # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at
+    # the END of every tick (including the ones that dispatch nothing) from a
+    # `finally`, so a tick that short-circuits out of the phase loop is
+    # measured too.  Scheduler-scoped: task_id is the dispatched task when the
+    # tick produced an assignment, else None (same shape as
+    # park_eviction_deferred_fm_unavailable).
+    #
+    # EXISTS BECAUSE THE TICK WAS PREVIOUSLY UNINSTRUMENTED.  There was no
+    # perf_counter anywhere in scheduler.py or harness.py and no duration event
+    # of any kind, so a regression that took the tick from seconds to ~14
+    # MINUTES — one uncached full-history `git log` per candidate in the
+    # already-landed gate — ran unnoticed for months and was only ever found by
+    # reconstructing a clock from an unrelated WARNING's cadence.  Dispatch
+    # rate is the orchestrator's headline throughput constraint; it should not
+    # be inferred from log archaeology.
+    #
+    # duration_ms is carried INSIDE data, not as the emit() column kwarg,
+    # because orchestrator/tests/_recording_event_store.py retains only
+    # (event_type, {task_id, data}) — a column-only duration is invisible to
+    # every existing test double.  verify_runner.py's merge_verify event sets
+    # the same precedent.
+    # data keys: {duration_ms, phases, terminal_phase, candidates}
+    #   duration_ms:    whole-tick wall time in ms (int)
+    #   phases:         {phase_label: ms} for each phase that ran (dict);
+    #                   a short-circuiting tick lists only the phases reached
+    #   terminal_phase: label of the phase that ended the tick, or None when
+    #                   the loop ran to completion without dispatching
+    #   candidates:     len(ctx.candidates) at the end of the tick, or None if
+    #                   the tick ended before candidates were built
+    scheduler_tick = 'scheduler_tick'
 
     # Paired (rebase → immediately-following verify) cost record.
     # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.

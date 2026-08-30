@@ -36,18 +36,40 @@ presence check or a ``.source`` check), so it changes no recovery outcome —
 it only makes the field COMPARABLE by ``escalation.pins``.
 
 SCOPE HONESTY on that last point: 3563 shipped the SHAPE contract, NOT
-end-to-end reachability. Two gaps outside its scope still gate the payoff.
-(1) The plan.lock leg of :meth:`TaskGroundTruth._resolve_live_claimant` reads
-``<worktree>/.task/plan.lock`` while the production writer targets the
-``.task-meta`` SIBLING, so on a real orchestrator run that leg can only ever
-find a pre-3563 legacy lock and resolves ``run_id=None`` — i.e. the
-composition branch is INERT in production today (task 4262 relocates the read;
-task 4028 tracks deleting the leg outright if that is the ruling instead).
-(2) The only production ``escalation.pins.classify_pins`` call site still
+end-to-end reachability. Its first gap is now CLOSED — the plan.lock leg of
+:meth:`TaskGroundTruth._resolve_live_claimant` reads the ``.task-meta``
+sibling the production writer targets (task 4028), so on a real orchestrator
+run that leg can find a live 3563-shaped lock and the composition branch is
+REACHABLE rather than inert. One gap outside 3563's scope still gates the
+payoff: the only production ``escalation.pins.classify_pins`` call site still
 passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
-it). Live-vs-dead filer discrimination becomes REACHABLE when those land; what
+it). Live-vs-dead filer discrimination becomes REACHABLE when that lands; what
 3563 delivers is that the identity is now expressible at all, and that the
 bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
+
+Task 3539 added :attr:`RecoveryAction.CONVERT_TO_BLOCKED` and the four
+escalation-pinned stranded rows (f)/(i)/(j)/(k) that map to it. It is a
+LEGIBILITY action, NOT a recovery: it stops a churning ``in-progress`` row and
+names the honest status for "pinned, awaiting a human". The converted task
+KEEPS ITS PIN and does not self-heal — its exit is a human or task 3541's
+``classify_pins`` veto collapse.
+
+That "does not self-heal" property is a statement about a pin OUTSIDE
+``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the APPLIER is what makes it
+unconditionally true: a row pinned only by a merge-remediable escalation would
+be picked straight back up by the blocked-arm upgrade clauses on the next
+sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
+and stays pure and config-free — which is exactly why the scoping lives with
+the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
+new row maps to MARK_DONE); only the silent LEAVE that let the row churn
+forever is replaced. Every CONVERT row is keyed ``TaskStatus.IN_PROGRESS``, so
+conversion is structurally one-shot, and the ``pending`` / ``merge-deferred``
+population stays task 4651's under the 2026-08-24 ownership ruling. This
+module stays PURE and config-free: the observe-before-enforce gate lives in the
+applier (``Harness._reconcile_one_stranded``, behind
+``convert_to_blocked_enforce``), never here.
 """
 
 from __future__ import annotations
@@ -124,6 +146,12 @@ class RecoveryAction(enum.StrEnum):
     MARK_DONE_WITH_PROVENANCE = 'mark_done_with_provenance'
     REVERT_TO_PENDING = 'revert_to_pending'
     RE_FILE_ESCALATION = 're_file_escalation'
+    #: Task 3539 — a LEGIBILITY action, not a recovery.  Move a churning,
+    #: escalation-pinned stranded ``in-progress`` row into the honest resting
+    #: status for "pinned, awaiting a human".  It does NOT mean "recovered":
+    #: the converted row keeps its pin.  See the module docstring's task-3539
+    #: paragraph and the CONVERT rows' comment in ``_RECOVERY``.
+    CONVERT_TO_BLOCKED = 'convert_to_blocked'
     LEAVE = 'leave'
 
 
@@ -537,10 +565,10 @@ class TaskGroundTruth:
            lock's own run_id/session_id/owner_pid, or left ``None`` when any
            component is missing or malformed — see the :class:`Claimant`
            docstring for why a partial composition is never acceptable
-           (task 3563).  That composition is INERT on a real orchestrator run
-           today: this leg reads the legacy lock path, which the production
-           writer no longer targets (see the PATH GAP comment at the read
-           site below, task 4262).
+           (task 3563).  That composition is REACHABLE on a real orchestrator
+           run: this leg reads the ``.task-meta`` root the production writer
+           targets, with no legacy fallback (task 4028 — see the comment at
+           the read site below).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -566,7 +594,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read under *worktree_path*.
+        of its own beyond the plan.lock read, which is addressed at
+        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
+        see the comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -581,20 +611,55 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # PATH GAP — task 4262, deliberately NOT fixed by task 3563 (which
-        # normalises the identity SHAPE, not where the lock is looked up).
-        # No ``meta_root`` here, so this reads the LEGACY
-        # ``<worktree>/.task/plan.lock``, while the production writer
-        # (``TaskWorkflow``, workflow.py:2384-2385) targets the ``.task-meta``
-        # SIBLING and nothing bridges the two: ``ensure_lane_plan_symlink``
-        # (artifacts.py:354-386) relocates plan.json ONLY, and ``_read_path``
-        # has no new-then-old fallback (unlike ``Harness._resolve_recovery_
-        # artifact``). So on a real run this finds at most a PRE-3563 legacy
-        # lock, carrying no ``run_id``, and the composition below resolves to
-        # the fail-safe ``None``. Task 4028 tracks deleting this leg outright
-        # if that is the ruling instead of relocating the read.
+        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
+        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
+        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
+        # ``meta_root_for``, the single owner of that path shape, so neither
+        # side hand-joins ``.task-meta`` (task 4028).
+        #
+        # Deliberately NO legacy fallback: nothing has written
+        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
+        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
+        # would be dead code on arrival, and any legacy lock still on disk
+        # necessarily predates that migration and so fails ``_lock_fresh``
+        # below anyway. Pinned by
+        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        #
+        # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
+        # live-pid lock at this task's resolved meta root is taken to be
+        # *tid*'s, WITHOUT checking that ``session_id`` carries the
+        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
+        # and deliberately not symmetric with that method:
+        #   * The dominant stale-lock case is a crashed PRIOR incarnation of
+        #     the SAME task (a same-task lane reuse preserves the meta root
+        #     precisely because those artifacts are the task's own), and it
+        #     carries a MATCHING prefix — so a prefix gate would not catch
+        #     the case that actually happens.
+        #   * The cross-task case a gate WOULD catch — a warm lane's meta
+        #     root outliving its previous occupant, since it is a sibling of
+        #     the worktree and survives cleanup — is already cleared on every
+        #     different-task acquisition route by
+        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
+        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
+        #     CREATE_ONCE_REATTACH).
+        #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
+        #     cannot positively attribute makes a LIVE task read as
+        #     unclaimed, which is the task-2588 un-claim incident class.
+        #     Mis-attributing the other way only DELAYS recovery.
+        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
+        # task, so the liveness half is nearly always true. Freshness caps the
+        # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
+        # ``plan_lock_mid_run_exception`` already forces fall-through to
+        # recovery mid-run. Pinned (both the attribution and its freshness
+        # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
+        #
+        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
+        # must not be swallowed by the degradation arm below, which exists for
+        # a corrupt lock FILE — not for a mis-derived root.
+        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
         try:
-            lock_data = TaskArtifacts(worktree_path).read_plan_lock()
+            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
@@ -614,8 +679,15 @@ class TaskGroundTruth:
         # passes through as a list/str/number rather than raising. Guard
         # explicitly rather than crashing `.get()` below — same "degrade to
         # no plan-lock claimant" intent as the except block above (task
-        # 2243, W10-θ2 wiring; caught by
-        # test_reconcile_lock_format_variants[non-dict-json]).
+        # 2243, W10-θ2 wiring; caught by test_task_ground_truth.py::
+        # TestDeriveTruthLiveClaimant::
+        # test_non_dict_plan_lock_json_returns_none_not_raise — repointed
+        # from the sweep-level lock-format parametrization in
+        # test_reconcile_stranded.py, whose fixtures stage the lock at the
+        # legacy worktree address this leg deliberately no longer reads; that
+        # parametrization has since collapsed into
+        # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
+        # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
@@ -772,13 +844,68 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # evidence either; same revert-to-pending outcome as (c).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.REVERT_TO_PENDING,
-    # (f) An escalation already open at ANY level (L0/L1/L2 — not just L1)
-    # is the deliberate human/automation-handoff signal — a sweep must never
-    # second-guess it, even with on-main landing evidence (review finding
-    # #1: this used to check level==1 only, so an open L2 slipped through
-    # and still hit row (a)'s auto-flip).
+    # (f)/(i)/(j)/(k) — THE FOUR ESCALATION-PINNED STRANDED ROWS (task 3539).
+    #
+    # An escalation already open at ANY level (L0/L1/L2 — not just L1) is the
+    # deliberate human/automation-handoff signal, and a sweep must never
+    # second-guess it into a mark-done, even with on-main landing evidence
+    # (review finding #1: this used to check level==1 only, so an open L2
+    # slipped through and still hit row (a)'s auto-flip). That veto is
+    # UNCHANGED — none of these rows maps to MARK_DONE_WITH_PROVENANCE.
+    #
+    # What changed is the OTHER half. Row (f) used to map to LEAVE, so the
+    # sweep held SILENTLY and the row churned `in-progress` forever: measured
+    # 39 consecutive `recovery_vetoed` emissions over 10.5h on task 3717,
+    # re-dispatched over and over because `in-progress` is a dispatchable
+    # status. The table now names the honest resting status instead. The
+    # other three branch shapes were never even in the table (they fell
+    # through to the LEAVE default) and churn identically, so all four
+    # convert.
+    #
+    # CONVERT_TO_BLOCKED DOES NOT MEAN "RECOVERED". The converted row arrives
+    # in `blocked` STILL CARRYING ITS PIN; its exit is a human or task 3541's
+    # `classify_pins` veto collapse, never an automatic self-heal from this
+    # table. (Mechanically: `Harness.MERGE_REMEDIABLE_ESC_CATEGORIES` is
+    # {'stranded_blocked'} and `_only_merge_remediable` is an `all(...)`, so a
+    # `task_failure` pin fails both blocked-arm upgrade clauses; and this
+    # table's only BLOCKED row, (g), keys `has_open_escalation=False`.)
+    #
+    # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
+    # every converting row (amendment pass, review finding #3). It holds for a
+    # `task_failure` pin — the measured 3717 population — and NOT for a
+    # `stranded_blocked` one, which `_only_merge_remediable` accepts, so the
+    # next sweep's blocked-arm clauses would move the converted row again
+    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
+    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
+    # at-rest rows reach the conversion; see the scoping clause in
+    # `Harness._reconcile_one_stranded`.
+    #
+    # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
+    # That single fact does two jobs: a converted (`blocked`) task can never
+    # match a CONVERT row again, so conversion is structurally one-shot and
+    # idempotent with no persisted counter; and it keeps this task out of
+    # task 4651's `pending` / `merge-deferred` territory under the 2026-08-24
+    # ownership ruling (gate task 4673 / esc-4673-1). Both properties are
+    # pinned as tests in orchestrator/tests/test_convert_to_blocked.py, not
+    # merely asserted here.
+    #
+    # The applier ships this in LOG MODE behind `convert_to_blocked_enforce`
+    # (config.py, default False) — see Harness._reconcile_one_stranded.
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.ON_MAIN, True, None):
-        RecoveryAction.LEAVE,
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (i) Same shape, branch deleted but a merge marker confirms the landing.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_WITH_MERGE_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (j) Same shape with the branch still off-main. Without the pin this is
+    # row (c)'s REVERT_TO_PENDING; the pin vetoes that re-dispatch, and
+    # before 3539 the veto left the row churning instead of resting.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.EXISTS_OFF_MAIN, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (k) Same shape with the branch gone and no marker — row (d)'s revert,
+    # vetoed identically. Note this row is deploy_phase=None, so the D1
+    # crashed-mid-deploy shape (row (h), DeployPhase.RAN) is untouched.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
     # (g) Stranded 'blocked' with no landing evidence and no escalation
     # already open at any level: blocked discipline forbids a silent
     # blocked->pending revert, so the sweep must re-file an escalation

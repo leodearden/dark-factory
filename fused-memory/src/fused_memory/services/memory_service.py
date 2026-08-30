@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -14,11 +15,11 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import ActiveEdgesError, GraphitiBackend
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -37,6 +38,9 @@ from fused_memory.memory_metadata import (
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
+from fused_memory.middleware.referent_repair_storm_escalator import (
+    emit_referent_repair_storm_escalation,
+)
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
@@ -75,12 +79,20 @@ from fused_memory.services.memory_metadata_census import (
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
 )
+from fused_memory.services.topic_anchor import (
+    _ANCHOR_SCROLL_LIMIT,
+    _MAX_ANCHOR_TOPICS,
+    extract_anchor_topics,
+    resolve_topic_anchor_enabled,
+    select_canonical_payload,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
-from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     ReferentSet,
+    local_referent,
     resolve_referents,
 )
 from fused_memory.utils.task_naming import canonicalize_task_node_name
@@ -94,6 +106,11 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+#: Return type of one ``_reconcile_episode_identity`` sub-pass. Generic so ONE
+#: best-effort guard covers both the six int-returning sweeps and task 3671's
+#: ``ReferentStats``-returning verification pass — see ``_run_pass``.
+_T = TypeVar('_T')
 
 # Per-sub-close timeout used by MemoryService._safe_close (task 2701). A healthy
 # FalkorDB/Qdrant localhost driver teardown completes in well under 1s; 3s gives
@@ -164,6 +181,42 @@ _MEM0_ADD_INFER_PINNED_FALSE = True
 # clear_malformed_empty_memory.py:_CONTENT_KEYS and audit_duplicate_memories.py)
 # rather than importing from scripts/, so the service has no scripts/ dependency.
 _MEM0_CONTENT_KEYS = ('data', 'memory', 'content')
+
+
+def _mem0_content(payload: dict) -> str:
+    """The human-readable text of a RAW Qdrant payload, or ``''``.
+
+    First non-empty string among :data:`_MEM0_CONTENT_KEYS`.  Shared by every
+    caller that turns a raw payload into text — ``get_memory_by_id`` and the
+    topic-anchored pin in :meth:`MemoryService.search` — so the fallback ORDER
+    lives in exactly one place.  A second inline copy of this loop would be a
+    place for the two paths to disagree about which key holds the body (INV-5).
+
+    Note this is the RAW-PAYLOAD path, distinct from the Mem0 *search item*
+    path in ``_search_mem0``: a search item and a scroll payload do not put the
+    text under the same key, which is exactly why guessing one key is wrong.
+    """
+    for key in _MEM0_CONTENT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ''
+
+
+def _mem0_category(meta: dict) -> MemoryCategory | None:
+    """The MemoryCategory a raw Mem0 payload declares, or ``None``.
+
+    ``None`` for an absent key AND for an unrecognised value: a payload's
+    ``category`` is a plain string with no read-time schema enforcement, so an
+    unknown value degrades to "no category" rather than raising mid-search.
+    Shared by ``_search_mem0`` and the topic-anchored pin so both paths agree
+    on what an unrecognised category means (INV-5).
+    """
+    if 'category' not in meta:
+        return None
+    with contextlib.suppress(ValueError):
+        return MemoryCategory(meta['category'])
+    return None
 
 
 def _is_dependency_fact(fact: str | None) -> bool:
@@ -1551,7 +1604,805 @@ class ReconcileStats:
     stale_ttl_edges_invalidated: int = 0
     nodes_resolved: int = 0
     task_names_normalized: int = 0
+    #: The verification sub-pass's findings (task 3671, PRD leaf zeta). A
+    #: STRUCTURED RECORD SET rather than an int, deliberately: zeta's
+    #: postcondition is INV-2 structured-facts-at-failure — "which edge, which
+    #: end, which check, what should it have pointed at" — and a count cannot
+    #: carry any of that, which is exactly why the logger.debug-only int shape
+    #: above is not enough for it. Leaf eta reads the findings off this field.
+    referent_stats: ReferentStats = field(default_factory=lambda: ReferentStats())
+    #: The repair sub-pass's records (task 3672, PRD leaf eta) — what was
+    #: actually DONE about the findings on ``referent_stats``, including the
+    #: two dispositions where the right answer was to do nothing. A structured
+    #: record set for the same reason zeta's is: "we refused to guess at this
+    #: edge end" is a fact an operator has to act on, and no count can carry
+    #: it. Eta is the only WRITING consumer of zeta's detect-only output.
+    repair_stats: ReferentRepairStats = field(
+        default_factory=lambda: ReferentRepairStats()
+    )
     errors: list[str] = field(default_factory=list)
+
+
+#: THE closed vocabulary of verification checks (task 3671, PRD leaf zeta).
+#: The single normative site for the "which check fired" field the PRD's
+#: §Contract requires on every repair record — a check name must be REGISTERED
+#: here, never spelled as a bare string at a call site, or the two consumers
+#: (leaf eta's repair, leaf iota's rate) key off vocabularies that drift.
+#:
+#: The C' post-LLM veto is deliberately NOT a third member. Post-write,
+#: "extracted Task N was merged onto the Task M node" is observationally
+#: IDENTICAL to "an edge about Task M is attached to a Task N node" — which
+#: these two checks already detect. A separate veto mechanism would be two
+#: sites that must agree byte-for-byte, i.e. exactly the INV-5 lockstep
+#: duplication utils/canonical_labels.py exists to prevent. The PRD says so
+#: outright: it "folds in", and is "not a distinct leaf".
+REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReferentFinding:
+    """One edge END that landed on a node the write was not about.
+
+    The structured record INV-2 requires, carrying every field the PRD
+    §Contract names — "edge uuid, old endpoint uuid, new endpoint uuid,
+    referent set, which check fired" — plus what leaf eta needs to act:
+
+    ==========================  ====================================
+    PRD field                   Attribute
+    ==========================  ====================================
+    edge uuid                   :attr:`edge_uuid` (+ :attr:`which_end`)
+    old endpoint uuid           :attr:`old_endpoint_uuid`
+    new endpoint uuid           :attr:`new_endpoint_uuid`
+    referent set                :attr:`referent_set`
+    which check fired           :attr:`check`
+    ==========================  ====================================
+
+    FROZEN, and its collection field is a TUPLE, for the reason
+    :class:`~fused_memory.utils.canonical_labels.Referent` and ``LabelScan``
+    are: a finding is evidence for DESTRUCTIVE edge surgery, and ``frozen=True``
+    blocks attribute rebinding only — a list field would leave
+    ``finding.referent_set.append(...)`` open, letting a consumer quietly widen
+    the set that justified the repair it is about to perform.
+
+    Keyword-only because eleven fields, seven of them strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot.
+
+    ``new_endpoint_uuid is None`` means "the node does not exist yet, or its
+    name keys a duplicate-name group" — leaf eta resolves-or-mints via
+    ``ensure_entity_node``, which handles both identically. It does NOT mean
+    unrepairable; that is :attr:`resolvable`, which zeta defaults to ``False``
+    so "recorded and left alone, never guessed at" is the structural default
+    rather than something every construction site must remember.
+    """
+
+    #: The edge whose endpoint is wrong.
+    edge_uuid: str
+    #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
+    #: the identity of the finding — at most one finding per (edge, end).
+    which_end: str
+    #: Which check fired; one of :data:`REFERENT_CHECKS`.
+    check: str
+    #: The node the edge is attached to today.
+    old_endpoint_uuid: str
+    #: That node's name as this episode's result reported it. Recorded for the
+    #: operator log; the VERDICT is keyed off :attr:`endpoint_referent`, since a
+    #: spelling can have been normalized out from under this string.
+    old_endpoint_name: str
+    #: The parsed referent that name denotes — the thing actually compared.
+    endpoint_referent: Referent
+    #: The declared referent set, as canonical node names, that the endpoint
+    #: was tested against.
+    referent_set: tuple[str, ...]
+    #: The referent the edge SHOULD hang off, when exactly one candidate
+    #: survives. ``None`` whenever :attr:`resolvable` is False.
+    intended_referent: Referent | None = None
+    #: The uuid of :attr:`intended_referent`'s node, when it resolves to
+    #: exactly one live node. See the class docstring for what ``None`` means.
+    new_endpoint_uuid: str | None = None
+    #: Whether a correct target was determined. Defaults False — fail-closed.
+    resolvable: bool = False
+    #: Why not, when :attr:`resolvable` is False. Empty on a resolvable
+    #: finding.
+    reason: str = ''
+
+    def __post_init__(self) -> None:
+        if self.check not in REFERENT_CHECKS:
+            raise ValueError(
+                f'unregistered referent check {self.check!r}; registered checks '
+                f'are {list(REFERENT_CHECKS)}. Add it to '
+                'memory_service.REFERENT_CHECKS rather than recording a finding '
+                'no consumer can key off.'
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """A plain, JSON-safe dict keyed exactly by this record's field names.
+
+        The payload the operator warning carries. Referents render as their
+        canonical ``node_name`` rather than as a dataclass repr, so the log
+        line and any future durable row read as graph names — the same thing
+        an operator would type into a query.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'which_end': self.which_end,
+            'check': self.check,
+            'old_endpoint_uuid': self.old_endpoint_uuid,
+            'old_endpoint_name': self.old_endpoint_name,
+            'endpoint_referent': self.endpoint_referent.node_name,
+            'referent_set': list(self.referent_set),
+            'intended_referent': (
+                self.intended_referent.node_name
+                if self.intended_referent is not None
+                else None
+            ),
+            'new_endpoint_uuid': self.new_endpoint_uuid,
+            'resolvable': self.resolvable,
+            'reason': self.reason,
+        }
+
+def _endpoint_referent(endpoint_name: str, *, group_id: str) -> Referent | None:
+    """The referent an edge ENDPOINT's node name denotes, or ``None``.
+
+    ``None`` for an empty name (the endpoint this episode's result does not
+    name), and for a name that is not a canonical task label at all
+    ('MergeWorker') or merely MENTIONS one ('Task 42 orchestrator' —
+    ``parse_node_name`` is anchored).
+
+    A named function rather than an inline expression so the SOURCE-INVARIANT
+    reclassification cannot be dropped by a later edit that only means to
+    re-order the tuple this feeds: the bare ``parse_node_name`` it replaces read
+    as complete, which is precisely how ζ came to be the one referent path that
+    skipped the rule. See
+    :func:`~fused_memory.utils.referent_resolution.local_referent`.
+    """
+    if not endpoint_name:
+        return None
+    referent = parse_node_name(endpoint_name)
+    if referent is None:
+        return None
+    return local_referent(referent, group_id=group_id)
+
+
+def _candidate_pool(
+    *,
+    referents: frozenset[Referent],
+    cited: frozenset[Referent],
+    endpoint: Referent,
+    ambiguous: frozenset[Referent],
+    source: str,
+) -> frozenset[Referent]:
+    """The evidence rule, before either endpoint is subtracted.
+
+    ``cited & referents``, falling back to the whole of ``referents`` ONLY when
+    the fact says nothing about where this edge belongs. The edge's own fact is
+    the sharpest evidence available about which node THIS edge belongs on, so a
+    citation the declaration corroborates wins; the whole declared set is the
+    fallback for when the fact cites nothing the declaration also names.
+    INTERSECTING rather than unioning is what keeps a repair target from ever
+    originating outside the referent set — an LLM-restated fact naming a task
+    the write never declared itself to be about must not become a target.
+    Fact-scoping is also what keeps mode (iii) repairable: with referents
+    {3074, 3075} the whole-set fallback would see two candidates and abandon a
+    repair the fact unambiguously determines.
+
+    THE CORROBORATION GUARD (``endpoint in cited``) is what makes the fallback
+    safe on the SET-MEMBERSHIP arm, and it is the membership-arm counterpart of
+    the pairing arm's ``cited_declared`` guard — same principle, same
+    fail-closed direction. A fact that NAMES the very node its edge landed on is
+    the strongest possible evidence the attachment is CORRECT, so it must not be
+    read as "the fact is silent, fall back to the declared set". Without the
+    guard the dominant legitimate write shape becomes a repair instruction:
+    ``resolve_referents`` derives ``source='metadata'`` from the write's ambient
+    ``task_id``, and its own docstring names the mismatch as deliberately NOT a
+    conflict — "An agent working on task 3668 legitimately writes memories about
+    Task 2500". With referents {3668} and an edge whose fact reads "Task 2500
+    was completed by the merge worker" hanging off the ``Task 2500`` node, the
+    unguarded fallback yields the sole candidate ``Task 3668`` and hands leaf eta
+    a ``resolvable=True`` instruction to repoint a CORRECT edge onto the task the
+    agent merely happened to be working on — manufacturing the exact
+    misattribution this PRD exists to prevent, and polluting the rate leaf iota
+    samples with a finding that has no observable defect.
+
+    THE CORROBORATION GUARD IS NOT SUFFICIENT ON ITS OWN, and two further vetoes
+    sit beside it because it closes only the SUBSET of that shape where the fact
+    happens to name the endpoint. An LLM-paraphrased fact that restates no task
+    number at all ("the merge worker completed it") is the routine extraction
+    outcome, and on such a fact ``cited`` is empty, so the corroboration guard
+    cannot fire and the unguarded fallback re-manufactures exactly the
+    ``resolvable=True``-onto-the-ambient-task instruction described above.
+
+    VETO 1 — AN AMBIGUOUS ENDPOINT (PRD boundary row "Ambiguous scan | ref routed
+    to ``.ambiguous``; treated as undeclared; recorded, not guessed"). γ routes a
+    number claimed by BOTH a bare own-project mention and a foreign-qualified
+    reference to ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents``, on
+    purpose. ε then drops ``.ambiguous`` from the wire, so a consumer reading only
+    the decoded set sees an ambiguous endpoint as a plain non-member —
+    indistinguishable from a genuine conflation (``_encode_referents``:
+    "AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA").
+    ζ therefore RE-DERIVES the producer's ambiguity set from ``content`` and
+    suppresses the pool for any endpoint in it: an ambiguous reference must be
+    RECORDED and LEFT ALONE, never handed to eta as destructive repair surgery.
+    Tested FIRST, ahead of even the corroboration guard, because it is the
+    strongest "do not touch this" signal available and must hold whatever the
+    fact happens to cite.
+
+    VETO 2 — A ``source='metadata'`` FALLBACK. ``resolve_referents`` ranks ambient
+    ``metadata['task_id']`` ABOVE the content-derived scan, and its own docstring
+    names the resulting mismatch as deliberately NOT a conflict: "An agent working
+    on task 3668 legitimately writes memories about Task 2500". A referent set
+    bridged from the task an agent merely HAPPENS to be dispatched on is not a
+    claim about which node any particular edge belongs on, so it must not become a
+    repair target by default. The whole-declared-set fallback is therefore
+    suppressed for ``source='metadata'``; ``'declared'`` (the caller stated its
+    referents) and ``'derived'`` (they were scanned out of this very content) keep
+    the fallback, because there the declared set genuinely IS evidence about the
+    content. The ``cited & referents`` intersection survives on every source: a
+    fact that names a declared referent is per-EDGE evidence regardless of how the
+    declaration was sourced.
+
+    THE CORROBORATION GUARD IS TESTED FIRST OF THE TWO CITATION RULES, AND THAT
+    ORDER IS LOAD-BEARING — not stylistic.
+    Behind the intersection short-circuit the guard is UNREACHABLE for every
+    fact that cites the endpoint AND some declared referent, which is not an
+    exotic shape but the same legitimate ambient-task write one sentence longer:
+    "Task 2500 was completed as part of task 3668 by the merge worker" cites
+    {2500, 3668}, so ``cited & referents`` is ``{3668}`` — non-empty — and an
+    intersection-first order returns it, re-manufacturing the exact
+    ``resolvable=True``-onto-Task-3668 instruction the paragraph above exists to
+    prevent, on a fact that literally asserts the edge is about Task 2500. A
+    citation of the endpoint therefore suppresses the pool UNCONDITIONALLY:
+    corroboration is not merely a fallback the intersection can outrank, it is a
+    veto. Nothing this test shadows is lost on the pairing arm, which is only
+    reached when ``endpoint_referent not in cited`` — the guard can never fire
+    there, so mode (iii) still resolves through the intersection below.
+
+    Corroborated findings are still RECORDED — they are just recorded with an
+    empty pool, which becomes ``resolvable=False`` plus a reason at the caller.
+    That is this pass's stated postcondition: recorded and left alone, never
+    guessed at.
+
+    Extracted so the rule lives at ONE site that both :func:`_candidate_targets`
+    and :func:`_unresolvable_reason` read. Without it the reason builder would
+    have to RECOMPUTE the pool to explain itself — a second copy that must agree
+    with the first byte-for-byte, which is exactly the INV-5 lockstep
+    duplication this PRD exists to avoid.
+
+    Args:
+        referents: The set the write declared itself to be about.
+        cited: The referents this edge's own fact mentions.
+        endpoint: The referent the flagged endpoint currently parses as — read
+            ONLY to ask whether the fact corroborates it, and whether it was
+            ambiguous. The subtraction of the endpoint from the pool stays in
+            :func:`_candidate_targets`, so this function remains "which referents
+            is there evidence for", not "which targets survive".
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about, as
+            re-derived by :meth:`MemoryService._verify_episode_referents` from
+            ``scan_content(content, group_id=...).ambiguous``. Already through
+            :func:`~fused_memory.utils.referent_resolution.local_referent`, so it
+            compares equal to *endpoint* on a self-qualified spelling.
+        source: The ``ReferentSource`` :func:`_decode_referents` read off the
+            queue payload — one of :data:`REFERENT_SOURCES`. Read ONLY to decide
+            whether the whole-declared-set fallback is licensed (veto 2 above).
+    """
+    if endpoint in ambiguous:
+        # VETO 1. The episode content itself could not say which project's task
+        # this number denotes, so there is nothing here to repair TOWARDS.
+        # Ahead of the corroboration guard deliberately: an ambiguous endpoint is
+        # unrepairable whatever the fact happens to cite.
+        return frozenset()
+    if endpoint in cited:
+        # The fact names the node this edge end is already on. It is evidence
+        # FOR the current attachment, never for repointing it elsewhere, so the
+        # pool is suppressed rather than allowed to nominate a target the fact
+        # does not support.
+        #
+        # FIRST, ahead of the intersection: a fact citing BOTH the endpoint and
+        # a declared referent ("Task 2500 was completed as part of task 3668")
+        # has a non-empty intersection, so testing the intersection first would
+        # short-circuit past this guard entirely and return the ambient task as
+        # a repair target. See the docstring — this is a veto, not a fallback.
+        return frozenset()
+    corroborated_citations = cited & referents
+    if corroborated_citations:
+        return corroborated_citations
+    if source == 'metadata':
+        # VETO 2. The fact cites no declared referent, and the declaration is
+        # only the task this agent happened to be dispatched on — ambient
+        # context, not an assertion about where this edge belongs. Falling back
+        # to it here is what would manufacture the misattribution this PRD
+        # exists to prevent on the dominant legitimate write shape.
+        return frozenset()
+    return referents
+
+
+def _candidate_targets(
+    *,
+    referents: frozenset[Referent],
+    cited: frozenset[Referent],
+    endpoint: Referent,
+    other_endpoint: Referent | None,
+    ambiguous: frozenset[Referent],
+    source: str,
+) -> tuple[Referent, ...]:
+    """Which referent could this misattached edge end correctly point at?
+
+    A pure module-level function — no ``self``, no I/O — so the rule that
+    decides whether leaf eta may perform destructive edge surgery is directly
+    unit-testable in isolation from the walk that drives it.
+
+    The rule, in order:
+
+    1. ``pool = _candidate_pool(...)`` — the fact-cited intersection when it is
+       non-empty; else the whole declared set, UNLESS one of three vetoes
+       empties it: the fact cites the endpoint itself (corroboration), the
+       endpoint referent was AMBIGUOUS in the episode content, or the
+       declaration came from ambient ``source='metadata'`` and the fact cites no
+       declared referent. See that function for why each is load-bearing on the
+       dominant legitimate write shape.
+    2. Subtract *endpoint*, the referent this finding is ABOUT. A "repair" onto
+       the node the edge is already attached to is not a repair — and is not
+       even a harmless no-op, because :meth:`_intended_endpoint_uuid` resolves
+       the CANONICAL name: with a non-canonical endpoint spelling
+       (``'task #3074'``) and a canonical ``'Task 3074'`` node both present it
+       yields a DIFFERENT uuid, and eta would perform real edge surgery on an
+       endpoint that was already correct.
+
+       On the SET-MEMBERSHIP arm this subtraction is provably a NO-OP: the pool
+       is always a subset of ``referents``, and membership fires precisely when
+       the endpoint is NOT in ``referents``, so the endpoint can never be in the
+       pool. It is therefore a STRUCTURAL GUARANTEE at the single site that
+       decides targets rather than a behaviour change on the dominant path —
+       which is the point: a future third check cannot silently reintroduce a
+       self-targeting repair by forgetting to guard for it.
+
+       The invariant is deliberately NOT additionally enforced by a raising
+       ``ReferentFinding.__post_init__`` validator. This pass runs inside an
+       already-committed write's identity-lock critical section, where raising
+       is strictly worse than recording: the write has landed either way, and an
+       exception would destroy the very evidence eta needs.
+    3. Subtract *other_endpoint*. Not defensive ceremony: ``reassign_edge``
+       (graphiti_client.py) explicitly refuses a move that would fold the edge
+       into a self-loop, so a "target" equal to the edge's other end is not a
+       repair eta could perform. This subtraction is precisely what turns the
+       live Task 2519/2520 case — referents {2519}, endpoints (Task 2519,
+       Task 2520), a fact unary about 2519 — into the zero-candidate row the PRD
+       names as explicitly unrepairable.
+    4. Return in a deterministic order.
+
+    Exactly one survivor means the correct target is DETERMINED. Zero or more
+    than one means it is not, and the caller records the finding with
+    ``resolvable=False`` and a reason: RECORDED AND LEFT ALONE — never silently
+    dropped, and never guessed at. That is why
+    :attr:`ReferentFinding.resolvable` defaults to ``False`` rather than
+    ``True``: the fail-closed direction is structural rather than a matter of
+    every construction site remembering to say so.
+
+    Args:
+        referents: The set the write declared itself to be about.
+        cited: The referents this edge's own fact mentions
+            (``scan_content(...).refs``, which already excludes ambiguity).
+        endpoint: The referent the flagged endpoint currently parses as.
+            Non-optional: a finding is only ever built for an endpoint that
+            PARSED, so the flagged referent is always known — encoded in the
+            type rather than accepting a ``None`` no call site can produce.
+        other_endpoint: The referent at the edge's OTHER end, or ``None`` when
+            that end is not a task node at all.
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about.
+            Forwarded verbatim to :func:`_candidate_pool` (veto 1).
+        source: The ``ReferentSource`` the declaration came from. Forwarded
+            verbatim to :func:`_candidate_pool` (veto 2).
+
+    Returns:
+        The surviving candidates, sorted by ``(kind, project_id, number)``.
+        Sorted rather than kept in the caller's first-seen order because the
+        inputs are FROZENSETS, whose iteration order is not stable across
+        processes under hash randomization — and a finding must be stable across
+        runs and diffable in eta's audit.
+    """
+    # `other_endpoint` may be None; None is simply not a member of a
+    # frozenset[Referent], and typeshed types `frozenset.__sub__` as accepting
+    # AbstractSet[_T_co | None], so no explicit `- {None}` branch is needed.
+    pool = _candidate_pool(
+        referents=referents, cited=cited, endpoint=endpoint,
+        ambiguous=ambiguous, source=source,
+    ) - {endpoint, other_endpoint}
+    return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
+
+def _unresolvable_reason(
+    candidates: tuple[Referent, ...],
+    *,
+    pool: frozenset[Referent],
+    cited: frozenset[Referent],
+    endpoint: Referent,
+    other_endpoint: Referent | None,
+    ambiguous: frozenset[Referent],
+    source: str,
+) -> str:
+    """Why :func:`_candidate_targets` could not determine a correct target.
+
+    Carried on the finding so "recorded and left alone" is legible as a REASON
+    rather than as an absence — a reader must be able to tell an unrepairable
+    row from a row nobody looked at, and to tell "the check had nothing to point
+    at but the node it was already on" from "the only target would form a
+    self-loop".
+
+    Args:
+        candidates: What :func:`_candidate_targets` returned.
+        pool: The PRE-subtraction pool from :func:`_candidate_pool`. Membership
+            is tested here rather than inferred from ``other_endpoint is None``
+            precisely so the message stays HONEST when BOTH subtractions apply.
+        cited: The referents this edge's own fact mentions — the same set the
+            pool was computed from, so the corroboration branch reads the SAME
+            input :func:`_candidate_pool` decided on rather than re-deriving it
+            from the empty pool it produced (which is indistinguishable from an
+            empty declared set).
+        endpoint: The referent the flagged endpoint currently parses as.
+        other_endpoint: The referent at the edge's other end, or ``None``.
+        ambiguous: The referents the EPISODE CONTENT was ambiguous about — the
+            same set :func:`_candidate_pool` vetoed on, read here for the SAME
+            reason ``cited`` is: an emptied pool cannot say WHICH veto emptied
+            it, and the three vetoes need three different explanations.
+        source: The ``ReferentSource`` the declaration came from, likewise.
+    """
+    if len(candidates) > 1:
+        return (
+            'more than one candidate target survives '
+            f'({[c.node_name for c in candidates]}) and the edge fact does not '
+            'discriminate between them; recorded, not guessed at'
+        )
+    # Zero candidates. Either `_candidate_pool` returned nothing (the
+    # corroboration branch below), or one of the two subtractions emptied it.
+    #
+    # Ordered FIRST among the zero-candidate branches because corroboration is
+    # the most specific thing that can be said about a finding: when the fact
+    # names the endpoint, "there was no target" is true but uninformative, and
+    # "the fact says this edge belongs where it is" is the reason an operator
+    # (and leaf eta) actually needs. It also cannot be inferred from `pool`,
+    # which the guard deliberately empties.
+    #
+    # AMBIGUITY OUTRANKS CORROBORATION here, mirroring the veto order in
+    # `_candidate_pool`: when the content could not say which project's task the
+    # number denotes, that is the fact about this row an operator (and eta) most
+    # needs, and it holds whatever the edge fact happens to cite.
+    if endpoint in ambiguous:
+        return (
+            f'the endpoint referent {endpoint.node_name!r} was AMBIGUOUS in the '
+            'episode content — claimed by both a bare own-project mention and a '
+            'foreign-qualified reference — so it is treated as undeclared rather '
+            'than as a conflation; recorded, not guessed at'
+        )
+    if endpoint in cited:
+        return (
+            f"the edge's own fact cites {endpoint.node_name!r}, the endpoint it "
+            'landed on, which corroborates the current attachment; the declared '
+            'referent set is not evidence for repointing it, so this is '
+            'recorded, not repaired'
+        )
+    if source == 'metadata' and not pool:
+        # Veto 2. Reached only when neither veto above fired and the fact cited
+        # no declared referent, so the ONLY thing that could have supplied a
+        # target was the whole-declared-set fallback the source suppresses.
+        return (
+            "the write's referent set was bridged from ambient "
+            "metadata['task_id'] rather than declared or derived from the "
+            'content, and this edge\'s fact cites no declared referent; the task '
+            'an agent happens to be dispatched on is not evidence about which '
+            'node this edge belongs on, so this is recorded, not repaired'
+        )
+    if endpoint in pool:
+        return (
+            f'the only candidate target {endpoint.node_name!r} is the node this '
+            'edge end is already attached to, so there is nothing to repoint '
+            'to; recorded, not repaired'
+        )
+    if other_endpoint is not None:
+        # The live Task 2519/2520 row.
+        return (
+            f'the only candidate target {other_endpoint.node_name!r} is this '
+            "edge's other endpoint, so repointing would form the self-loop "
+            'reassign_edge refuses; there is no correct target'
+        )
+    # Defensive: unreachable while the caller no-ops on an empty referent set.
+    # Kept so a future relaxation records a reason rather than an empty string
+    # that reads as "resolvable".
+    return 'no candidate target could be determined from the declared referents'
+
+
+
+@dataclass
+class ReferentStats:
+    """What one ``_verify_episode_referents`` run looked at, and what it found.
+
+    The in-process half of INV-2's structured record: leaf eta reads
+    :attr:`findings` off the return value, inside the same identity-lock
+    critical section, and acts on it. (The process-lifetime half leaf iota
+    reads is ``MemoryService.referent_finding_counts``.)
+
+    The three summary counts are ``@property`` comprehensions over
+    :attr:`findings` rather than fields precisely so they CANNOT drift from the
+    list they summarize — the same property-not-field discipline
+    :attr:`Referent.node_name` follows. A stored count is a second site that
+    must be incremented in lockstep with every append.
+
+    :attr:`endpoints_unresolved` exists so this pass's one blind spot — an edge
+    endpoint uuid that this episode's ``result.nodes`` does not name, so its
+    name is unknown and it cannot be checked at all — is COUNTED rather than
+    silently skipped. A skipped endpoint is a check that did not run, and a
+    verification pass that cannot say how often it declined to look is not a
+    verification pass.
+    """
+
+    edges_scanned: int = 0
+    endpoints_checked: int = 0
+    endpoints_unresolved: int = 0
+    findings: list[ReferentFinding] = field(default_factory=list)
+
+    @property
+    def set_membership_findings(self) -> int:
+        """Findings from the SET MEMBERSHIP check."""
+        return sum(1 for f in self.findings if f.check == 'set-membership')
+
+    @property
+    def pairing_findings(self) -> int:
+        """Findings from the PER-EDGE PAIRING check."""
+        return sum(1 for f in self.findings if f.check == 'per-edge-pairing')
+
+    @property
+    def unresolvable_findings(self) -> int:
+        """Findings recorded with no determinable correct target — left alone."""
+        return sum(1 for f in self.findings if not f.resolvable)
+
+
+#: THE closed vocabulary of repair dispositions (task 3672, PRD leaf eta).
+#: The single normative site for the "what happened to this finding" field on
+#: every repair record — an outcome must be REGISTERED here, never spelled as a
+#: bare string at a call site, or the operator surface and leaf iota's rate key
+#: off vocabularies that drift.
+#:
+#: The four are genuinely different answers to the operator's question, and the
+#: split is load-bearing:
+#:
+#: * ``'repaired'``    — the ensure -> reassign sequence ran. ``moved=False``
+#:   inside this outcome is ``reassign_edge``'s own corroborate-before-acting
+#:   no-op (the edge was ALREADY correct), which is why the streak counts
+#:   ``moved=True`` records rather than this outcome alone.
+#: * ``'unrepairable'``— zeta could not determine a correct target and eta
+#:   REFUSED TO GUESS. Working as designed.
+#: * ``'degenerate'``  — both ends of one edge would land on one node; the edge
+#:   was skipped WHOLE. Also a refusal, which is why it shares
+#:   ``flagged_unrepairable`` with the row above.
+#: * ``'failed'``      — we tried and the backend did not cooperate. An
+#:   INFRASTRUCTURE signal, deliberately not folded into the refusal bucket:
+#:   conflating them would let a FalkorDB outage read as a scanner regression
+#:   in leaf iota's rate, and would feed a false repair-storm streak.
+REFERENT_REPAIR_OUTCOMES: tuple[str, ...] = (
+    'repaired', 'unrepairable', 'degenerate', 'failed',
+)
+
+#: CONSECUTIVE episodes whose repair pass moved at least one edge endpoint
+#: before the INV-4 storm alarm fires (task 3672, PRD leaf eta).
+#:
+#: TEN, which is this leaf's resolution of PRD OPEN QUESTION 1, taking the
+#: PRD's own suggested value. Chosen against the measured base rate: ~0.22% of
+#: live task-mentioning edges carry a conflated endpoint, arriving at random.
+#: Ten consecutive episodes each needing a repair is not that distribution by
+#: any reading, so the threshold trades a vanishing false-positive rate for a
+#: detection delay of at most ten writes — the right side of that trade for an
+#: alarm whose subject is a REGRESSION IN THE PRODUCER, which by definition
+#: persists until someone fixes it.
+#:
+#: A LOWER value would page on ordinary clustering (a burst of writes about one
+#: task family legitimately repairs several times running); a HIGHER one buys
+#: nothing, because the condition does not self-heal.
+_REFERENT_REPAIR_STREAK_THRESHOLD: int = 10
+
+
+def _episode_uuid_of(result: Any) -> str:
+    """The uuid of the episode *result* describes, or ``''`` if unreadable.
+
+    WHY THE EXTRACTION IS DEFENSIVE rather than a plain ``result.episode.uuid``.
+    Its one caller is the EIGHTH sub-pass of ``_reconcile_episode_identity``,
+    which runs AFTER the episode write is already durable —
+    :meth:`MemoryService._reconcile_episode_identity`'s ``_run_pass`` guard
+    exists precisely so a sub-pass failure never fails that committed write.
+    The other seven sub-passes already treat ``result`` as duck-typed. Raising
+    an ``AttributeError`` while merely READING an identifier would forfeit the
+    repair for a reason wholly unrelated to repairing, which is an absurd way
+    to lose it.
+
+    WHAT ``''`` MEANS DOWNSTREAM. Not "no exclusion is needed" but "we could not
+    establish which episode this is, so exclude nothing and refuse more
+    deletions" — the fail-closed direction, consistent with
+    :attr:`ReferentFinding.resolvable` defaulting to ``False``. It flows into
+    :meth:`GraphitiBackend.count_foreign_relationships`, whose ``episode_uuid``
+    argument narrows a delete guard; dropping the exclusion can only ever make
+    that guard STRICTER.
+
+    A non-``str`` uuid is rejected along with an absent one. That is not
+    hypothetical tidiness: a ``MagicMock`` result — the shape most of this
+    module's tests hand it — auto-creates ``.episode.uuid`` as a child mock,
+    and passing that into a Cypher parameter would be a silently wrong query
+    rather than a clean refusal.
+
+    Args:
+        result: Whatever ``graphiti.add_episode`` returned, however malformed.
+
+    Returns:
+        A non-empty ``str`` uuid, or ``''``.
+    """
+    try:
+        uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
+    except Exception:
+        # A property that raises is still a shape we must survive; see above.
+        return ''
+    return uuid if isinstance(uuid, str) and uuid else ''
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReferentRepair:
+    """What eta DID about one :class:`ReferentFinding` — the audit record.
+
+    The eta half of INV-2 structured-facts-at-failure. zeta's finding says
+    "this edge end is wrong and here is what it should point at"; this record
+    says what was then done about it, including the two dispositions where the
+    right answer was to do NOTHING. A dropped finding and a repaired one are
+    indistinguishable to a downstream rate; an ``'unrepairable'`` record is the
+    evidence a human uses to decide the case by hand.
+
+    FROZEN, and its collection field is a TUPLE, for exactly the reason
+    :class:`ReferentFinding` is: this is evidence for DESTRUCTIVE edge surgery,
+    and ``frozen=True`` blocks attribute rebinding only — a list field would
+    leave ``record.summaries_refreshed.append(...)`` open, letting a consumer
+    quietly widen the claim about what this pass actually refreshed. The
+    emptied-node stamp is applied with :func:`dataclasses.replace`, never
+    mutation, for the same reason.
+
+    Keyword-only because twelve fields, seven of them strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot.
+    """
+
+    #: The edge this record is about.
+    edge_uuid: str
+    #: Which end: ``'source'`` or ``'target'``. With :attr:`edge_uuid` this is
+    #: the identity of the finding this record answers.
+    which_end: str
+    #: What happened; one of :data:`REFERENT_REPAIR_OUTCOMES`.
+    outcome: str
+    #: The node the edge end was attached to when the finding was recorded.
+    old_endpoint_uuid: str
+    #: Which zeta check produced the finding, carried through unchanged so a
+    #: reader never has to join this record back to a ``ReferentStats`` to
+    #: learn why the repair happened.
+    check: str
+    #: The node the end now points at. ``''`` when nothing was targeted (every
+    #: outcome other than ``'repaired'``).
+    new_endpoint_uuid: str = ''
+    #: The canonical ``node_name`` of the referent that target denotes. ``''``
+    #: when none — a finding zeta left unresolvable names no intended referent.
+    intended_referent: str = ''
+    #: Whether ``ensure_entity_node`` MINTED the target rather than resolving
+    #: an existing node.
+    minted: bool = False
+    #: Whether ``reassign_edge`` actually moved the endpoint. ``False`` on its
+    #: corroborated no-op arm — the edge was already correct.
+    moved: bool = False
+    #: Node uuids whose summary is known to reflect the post-repair edge set:
+    #: the union of what ``reassign_edge`` reported refreshing itself and what
+    #: eta's backstop then re-refreshed. Says what is true of the GRAPH, not
+    #: what this method happened to call.
+    summaries_refreshed: tuple[str, ...] = ()
+    #: The uuid of an emptied node this pass deleted, when the narrow
+    #: three-condition cleanup fired. ``''`` when nothing was deleted.
+    deleted_emptied_node: str = ''
+    #: Why, for the outcomes that did not repair. Carried VERBATIM from
+    #: ``ReferentFinding.reason`` on the ``'unrepairable'`` arm — the operator
+    #: must see zeta's own explanation, not an eta-authored paraphrase — and
+    #: carrying the exception text on the ``'failed'`` arm.
+    reason: str = ''
+
+    def __post_init__(self) -> None:
+        if self.outcome not in REFERENT_REPAIR_OUTCOMES:
+            raise ValueError(
+                f'unregistered repair outcome {self.outcome!r}; registered '
+                f'outcomes are {list(REFERENT_REPAIR_OUTCOMES)}. Add it to '
+                'memory_service.REFERENT_REPAIR_OUTCOMES rather than recording '
+                'a disposition no consumer can key off.'
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """A plain, JSON-safe dict keyed exactly by this record's field names.
+
+        The payload the operator warning and the storm escalation's detail
+        carry. :attr:`summaries_refreshed` renders as a LIST because a tuple is
+        not JSON, and the escalation detail is serialized.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'which_end': self.which_end,
+            'outcome': self.outcome,
+            'old_endpoint_uuid': self.old_endpoint_uuid,
+            'new_endpoint_uuid': self.new_endpoint_uuid,
+            'intended_referent': self.intended_referent,
+            'check': self.check,
+            'minted': self.minted,
+            'moved': self.moved,
+            'summaries_refreshed': list(self.summaries_refreshed),
+            'deleted_emptied_node': self.deleted_emptied_node,
+            'reason': self.reason,
+        }
+
+
+@dataclass
+class ReferentRepairStats:
+    """What one ``_repair_episode_referents`` run did, and what it declined to do.
+
+    The in-process half of eta's INV-2 record: returned on
+    ``ReconcileStats.repair_stats`` and carried verbatim into the repair-storm
+    escalation's detail, so the alarm ships the EVIDENCE rather than a count.
+
+    Every summary count is a ``@property`` comprehension over :attr:`repairs`
+    rather than a field, precisely so it CANNOT drift from the list it
+    summarizes — the same property-not-field discipline
+    :class:`ReferentStats` follows. A stored count is a second site that must
+    be incremented in lockstep with every append.
+    """
+
+    repairs: list[ReferentRepair] = field(default_factory=list)
+
+    @property
+    def repaired(self) -> int:
+        """Endpoints this pass actually MOVED.
+
+        ``moved=True`` specifically, not merely ``outcome == 'repaired'``: a
+        ``moved=False`` result is ``reassign_edge``'s corroborate-before-acting
+        no-op, meaning the edge was already correct. Counting it would make the
+        INV-4 storm streak fire on a graph that needed no repairs at all.
+        """
+        return sum(
+            1 for r in self.repairs if r.outcome == 'repaired' and r.moved
+        )
+
+    @property
+    def flagged_unrepairable(self) -> int:
+        """Findings RECORDED AND LEFT ALONE — the NEVER GUESS disposition.
+
+        Deliberately folds ``'unrepairable'`` and ``'degenerate'`` into ONE
+        bucket: the task's NEVER GUESS rule assigns both the same disposition
+        (recorded, not acted on), so the operator reads one number for "we
+        refused to act". ``'failed'`` is excluded on purpose — see
+        :data:`REFERENT_REPAIR_OUTCOMES`.
+        """
+        return sum(
+            1 for r in self.repairs
+            if r.outcome in ('unrepairable', 'degenerate')
+        )
+
+    @property
+    def degenerate_edges(self) -> int:
+        """EDGES skipped whole, not records — a degenerate edge yields one
+        record per end, and the operator's question is how many edges."""
+        return len({r.edge_uuid for r in self.repairs if r.outcome == 'degenerate'})
+
+    @property
+    def failed(self) -> int:
+        """Findings whose repair was ATTEMPTED and did not complete."""
+        return sum(1 for r in self.repairs if r.outcome == 'failed')
+
+    @property
+    def nodes_minted(self) -> int:
+        """Repair targets ``ensure_entity_node`` had to create."""
+        return sum(1 for r in self.repairs if r.minted)
+
+    @property
+    def nodes_deleted(self) -> int:
+        """DISTINCT emptied nodes the cleanup phase deleted.
+
+        Distinct, because two repairs moving endpoints off the same node stamp
+        that one deletion onto both records.
+        """
+        return len({
+            r.deleted_emptied_node for r in self.repairs if r.deleted_emptied_node
+        })
 
 
 class DescendantScan(NamedTuple):
@@ -1618,6 +2469,53 @@ class MemoryService:
         # Bounded by that four-member closed vocabulary, so unlike the per-agent
         # storm counters above it needs no pruning.
         self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
+        # INV-4 storm escape for the verification sub-pass (task 3671, PRD leaf
+        # zeta), and leaf iota's read side. Copies the shape directly above for
+        # the same stated reasons: constructed UNCONDITIONALLY — never obtained
+        # from `_write_journal` or the ReconciliationHarness — so it does not go
+        # dark in exactly the degraded configuration where a finding storm is
+        # least likely to be noticed any other way; and bounded by a closed
+        # vocabulary, so unlike the per-agent storm counters above it needs no
+        # pruning.
+        #
+        # Keyed off REFERENT_CHECKS so the check vocabulary lives at ONE site
+        # and a third check cannot escape the counter. The extra 'unresolvable'
+        # bucket is a SECOND, ORTHOGONAL axis (whether a finding can be acted on)
+        # rather than a third check, so the buckets deliberately do not sum to
+        # the finding total.
+        self._referent_finding_counts: dict[str, int] = dict.fromkeys(
+            (*REFERENT_CHECKS, 'unresolvable'), 0,
+        )
+        # INV-4 storm escape for the REPAIR sub-pass (task 3672, PRD leaf eta):
+        # the counter half of the alarm whose fire half is
+        # `middleware/referent_repair_storm_escalator`. Both dicts are
+        # constructed UNCONDITIONALLY, for the reason the two counters above
+        # give and which applies with more force here: this is the escape hatch
+        # for a pass that WRITES to the graph, and an alarm sourced from
+        # `_write_journal` or the ReconciliationHarness would go dark in exactly
+        # the degraded configuration where a repair storm is least likely to be
+        # noticed any other way.
+        #
+        # `_referent_repair_streaks` maps group_id -> CONSECUTIVE episodes whose
+        # repair pass moved at least one endpoint. Per group_id because the
+        # escalation queue is per-project: a regression in one project's graph
+        # must not be masked by another project's clean writes, which is exactly
+        # what a single global streak would do (any interleaved clean project
+        # would reset it, and the alarm would be unreachable under concurrency).
+        #
+        # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
+        # there are a handful — so unlike the per-agent mem0 storm counters
+        # above it needs no pruning; there is no unbounded key space to leak.
+        self._referent_repair_streaks: dict[str, int] = {}
+        # Process-lifetime totals, monotonic and never reset, keyed by a closed
+        # five-member vocabulary so a reader never distinguishes "zero" from
+        # "absent". Deliberately SEPARATE from the streaks: the streak is a live
+        # gauge that resets on a clean pass, these are counters a reader samples
+        # and differences (the uptime-baseline convention above).
+        self._referent_repair_counts: dict[str, int] = dict.fromkeys(
+            ('repaired', 'flagged_unrepairable', 'failed',
+             'nodes_minted', 'nodes_deleted'), 0,
+        )
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -2616,10 +3514,1253 @@ class MemoryService:
             )
         return fixed
 
+    async def _verify_episode_referents(
+        self, result: Any, *, group_id: str, referents: ReferentSet,
+        content: str = '', referent_source: str = 'derived',
+    ) -> ReferentStats:
+        """Verify each edge hangs off a node this write is actually ABOUT.
+
+        The write-time verification sub-pass (task 3671, PRD leaf zeta). Leaf
+        gamma resolves WHICH referents a write is about and leaf epsilon threads
+        that set through the durable queue to ``_execute_graphiti_write``; this
+        pass closes the loop by walking the committed episode's edges and asking,
+        per endpoint, whether the node the edge landed on is one of them.
+
+        DETECTS AND RECORDS ONLY — it performs no writes of any kind. The repair
+        (``ensure_entity_node`` -> ``reassign_edge`` -> ``refresh_entity_summary``)
+        and the repair-storm streak escalation are leaf ETA's; this pass's output
+        is the structured evidence eta acts on. A finding whose correct target
+        cannot be determined is RECORDED and LEFT ALONE, never guessed at.
+
+        RUNS LAST in ``_reconcile_episode_identity``, and that ordering is
+        load-bearing in one direction: any repair eta performs, and the
+        ``new_endpoint_uuid`` this pass resolves, must describe POST-normalization
+        topology. Minting a 'Task N' node before ``_normalize_task_node_names``
+        ran would create exactly the duplicate that pass exists to collapse.
+
+        The DETECTION verdict, by contrast, is deliberately invariant across that
+        normalization, because endpoint names are keyed through
+        :func:`~fused_memory.utils.canonical_labels.parse_node_name` rather than
+        compared as raw strings: ``parse_node_name('task #3127')`` and
+        ``parse_node_name('Task 3127')`` yield the IDENTICAL frozen
+        :class:`Referent`. That is what makes the in-memory ``result.nodes`` names
+        sufficient even though a rename or merge may have just moved out from
+        under them — and it is why this pass costs zero extra backend round-trips
+        on the clean path, rather than one ``get_node_text`` per endpoint
+        serialized inside the per-group identity lock.
+
+        Runs INSIDE ``_identity_lock_for`` (see ``_execute_graphiti_write``), so
+        no wrongly-attached state is ever externally visible between the write
+        and its verification.
+
+        THE C' POST-LLM VETO FOLDS IN HERE; it is not a second mechanism, and its
+        absence is not an oversight. Post-write, "extracted Task N was merged onto
+        the Task M node" is observationally IDENTICAL to "an edge about Task M is
+        attached to a Task N node" — which the checks below already detect. A
+        separate veto would be two sites that must agree byte-for-byte, the INV-5
+        lockstep duplication utils/canonical_labels.py exists to prevent. The PRD
+        says so outright: it is "not a distinct leaf".
+
+        SET MEMBERSHIP: an endpoint whose parsed referent is not in *referents* is
+        a node this write never declared itself to be about. This catches the
+        dominant measured live shape, whose defining signature is that the
+        landed-on number is never named by the fact at all.
+
+        PER-EDGE PAIRING: if the edge's own FACT cites at least one task
+        referent and the endpoint's referent is not among them, the fact talks
+        about ``Task M`` while the edge landed on ``Task N``. This is what
+        catches mode (iii), where BOTH numbers are legitimately declared and
+        membership therefore cannot fire — the live case being an episode that
+        minted 'Task 3074' and 'Task 3075' 60us apart. Resolved decision 7:
+        neither check alone is sufficient, so both run.
+
+        The two are ORDERED, not additive. Membership is evaluated first and
+        wins the label, so an endpoint failing both is reported exactly ONCE.
+
+        RESOLVABILITY is decided by :func:`_candidate_targets`, whose rule
+        reproduces every row of the PRD's boundary-test sketch. Exactly one
+        surviving candidate means the correct target is determined; zero or more
+        than one means it is not, and the finding is recorded with
+        ``resolvable=False`` and a reason rather than dropped or guessed at.
+
+        AMBIGUITY IS RE-DERIVED HERE, NOT READ OFF THE WIRE, and that is by
+        epsilon's explicit instruction (``_encode_referents``: "AMBIGUITY IS
+        DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA"). Gamma routes
+        a number claimed by BOTH a bare own-project mention and a
+        foreign-qualified reference in the same content to
+        ``LabelScan.ambiguous`` and EXCLUDES it from ``.referents`` — "recorded,
+        not guessed" — and epsilon's two-key blob carries only ``.source`` and
+        ``.refs``. A consumer reading the decoded set alone therefore cannot tell
+        an AMBIGUOUS endpoint from a genuine conflation: both are simply
+        non-members. Since ``.ambiguous`` is
+        ``scan_content(content, group_id=group_id).ambiguous`` verbatim on every
+        precedence path — a pure function of ``(content, group_id)``, independent
+        of source — this pass recovers the producer's exact set from
+        ``payload['content']``, which ``_execute_graphiti_write`` already holds.
+        An endpoint in that set is still DETECTED and RECORDED (it really is
+        outside the declared set), but never made ``resolvable``: the PRD's
+        boundary row is "treated as undeclared; recorded, not guessed". The
+        veto itself lives in :func:`_candidate_pool` beside its two siblings, so
+        all three read at ONE site (INV-5).
+
+        The re-derivation is a SECOND SCAN SITE, which gamma's own comment flags
+        as the kind of lockstep duplication canonical_labels exists to prevent.
+        Carrying ``'ambiguous'`` as a third wire key is the better long-term
+        shape and is epsilon's filed follow-up; it is not done here because it
+        would widen a frozen contract every test in
+        tests/test_referent_queue_threading.py pins. Scanned ONCE per episode,
+        after the edgeless early-out, so the clean path pays for it only when
+        there is something to check.
+
+        An EMPTY *referents* makes the whole pass a no-op, honouring the contract
+        ``resolve_referents`` publishes in its own docstring ("an EMPTY
+        ``.referents`` carries nothing to test membership against, so a downstream
+        verifier must no-op on it regardless of ``.source``") and the PRD's
+        ``source='none'`` boundary row ("no repair attempted").
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                AddEpisodeResults object). ``None``, edgeless, and
+                missing-attribute results are all handled the same way the
+                sibling post-write sweeps handle them.
+            group_id: The project graph this episode was written to.
+            referents: The referent set leaf epsilon decoded off the queue
+                payload — what this write DECLARED itself to be about.
+            content: The episode body, threaded from ``payload['content']``, so
+                this pass can RE-DERIVE the producer's ambiguity set (see the
+                AMBIGUITY paragraph above). Defaults to ``''`` — no content, no
+                ambiguity — which is the pre-threading behaviour exactly.
+            referent_source: The ``ReferentSource`` leaf epsilon decoded
+                alongside *referents*, one of :data:`REFERENT_SOURCES`. Read only
+                by :func:`_candidate_pool`, to decide whether the
+                whole-declared-set fallback is licensed. Defaults to
+                ``'derived'``, the source on which that rule is unchanged.
+
+        Returns:
+            A :class:`ReferentStats` recording what was walked and every finding.
+            All-zero with no findings means "every checkable endpoint agreed".
+        """
+        stats = ReferentStats()
+        if result is None or not referents:
+            return stats
+        # The `edges or entity_edges` idiom every sibling post-write sweep in
+        # this file uses (2378, 2518, 2621, 2795, 3832, 3871). Reading `edges`
+        # alone would make this pass a silent, TOTAL no-op on a result that
+        # exposes only `entity_edges` -- a shape the other six still walk, and
+        # one this method's own docstring promises parity on.
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return stats
+
+        # The producer's ambiguity set, re-derived from the episode body — see
+        # the AMBIGUITY paragraph above for why it is re-derived rather than read
+        # off the wire. THROUGH `local_referent`, for the same reason the
+        # endpoint parse below is: `scan_content` preserves the qualifier it
+        # read, so a self-qualified ambiguous mention ('dark_factory:2500') would
+        # otherwise compare unequal to the locally-classified endpoint referent
+        # and the veto would silently miss.
+        #
+        # PERMISSIVE mode (no `known_project_ids`), matching gamma's own choice —
+        # the producer scanned in that mode too, and this must recover the
+        # producer's set, not a differently-parameterized one.
+        ambiguous = frozenset(
+            local_referent(ref, group_id=group_id)
+            for ref in scan_content(content, group_id=group_id).ambiguous
+        ) if content else frozenset()
+
+        # The episode's own node names, which is all the detection needs — see
+        # the parse_node_name invariance note above. Same defensive
+        # `getattr(..., '') or ''` idiom the sibling sweeps use, since a mocked
+        # or partially-populated result must degrade rather than raise inside an
+        # already-committed write's critical section.
+        names_by_uuid: dict[str, str] = {}
+        for node in getattr(result, 'nodes', None) or []:
+            node_uuid = getattr(node, 'uuid', '') or ''
+            node_name = getattr(node, 'name', '') or ''
+            if node_uuid and node_name:
+                names_by_uuid[node_uuid] = node_name
+
+        # Membership is tested on Referent OBJECTS (frozen => hashable, equality
+        # on the (kind, project_id, number) triple), never on rendered names.
+        # `referent_names` is the human-readable rendering carried on the record.
+        referent_set = frozenset(referents)
+        referent_names = tuple(r.node_name for r in referents)
+
+        for edge in edges:
+            stats.edges_scanned += 1
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            # Scanned ONCE per edge, not once per endpoint. The FACT is what
+            # pairing reads — not the episode content — because the fact is the
+            # per-edge assertion whose subject must match the endpoint it landed
+            # on; the episode body is about the write as a whole and cannot
+            # discriminate between two edges of the same episode.
+            #
+            # PERMISSIVE mode (no `known_project_ids`), matching the choice
+            # gamma made and documented in `resolve_referents`. Threading
+            # `self._known_projects` here would fork that decision mid-PRD, and
+            # would DROP a foreign reference the fact genuinely makes — turning
+            # a true negative into a false pairing finding.
+            #
+            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
+            # is filtered out here: an ambiguous reference is deliberately
+            # invisible to this check rather than evidence for it.
+            cited = frozenset(
+                scan_content(
+                    getattr(edge, 'fact', '') or '', group_id=group_id,
+                ).refs
+            )
+            # The referents this edge's fact names that the write also DECLARED
+            # itself to be about — i.e. the concrete alternatives this edge
+            # could actually belong on. Computed once per edge, beside `cited`,
+            # because both endpoints test against it.
+            cited_declared = cited & referent_set
+            # BOTH ends are resolved before EITHER is checked: the candidate
+            # rule needs the OTHER end's referent (a target equal to it would be
+            # the self-loop `reassign_edge` refuses), which is only knowable once
+            # both names are parsed.
+            ends: list[tuple[str, str, str, Referent | None]] = []
+            for which_end, attr in (
+                ('source', 'source_node_uuid'), ('target', 'target_node_uuid'),
+            ):
+                endpoint_uuid = getattr(edge, attr, '') or ''
+                endpoint_name = names_by_uuid.get(endpoint_uuid, '')
+                if not endpoint_name:
+                    # This episode's result does not name the node this edge end
+                    # points at, so its name is unknown and it cannot be checked.
+                    # COUNTED rather than skipped silently: a check that did not
+                    # run is not a check that passed.
+                    stats.endpoints_unresolved += 1
+                # THROUGH `local_referent`, never a bare `parse_node_name`.
+                # The parser preserves the qualifier it read, so in group
+                # 'dark_factory' an endpoint node named 'dark_factory:3127'
+                # parses FOREIGN while `scan_content` and `resolve_referents`
+                # both answer the LOCAL 'Task 3127' for that same spelling.
+                # Comparing the two directly made a self-qualified endpoint
+                # unequal to the very referent the write DECLARED itself to be
+                # about: set-membership fired, and the corroboration veto could
+                # not save it either, because `endpoint in cited` compares a
+                # foreign-qualified endpoint against a locally-classified
+                # citation. The self-qualified reclassification is
+                # SOURCE-INVARIANT by contract (referent_resolution's module
+                # docstring) and this is its fourth consumer.
+                ends.append((
+                    which_end,
+                    endpoint_uuid,
+                    endpoint_name,
+                    _endpoint_referent(endpoint_name, group_id=group_id),
+                ))
+
+            for index, end in enumerate(ends):
+                which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
+                if endpoint_referent is None:
+                    # Unresolvable (counted above), not a task label at all
+                    # ('MergeWorker'), or a name that merely MENTIONS one
+                    # ('Task 42 orchestrator' — parse_node_name is anchored).
+                    continue
+                stats.endpoints_checked += 1
+                # `1 - index` is the other end of a two-element list.
+                other_referent = ends[1 - index][3]
+                # ORDERED, NOT ADDITIVE. Membership is evaluated FIRST and
+                # wins the label, so an endpoint failing BOTH checks reports the
+                # stronger, more specific signal exactly once. Two findings
+                # naming the same (edge_uuid, which_end) would hand eta two
+                # repair instructions for one edge end that it would have to
+                # reconcile before acting, and would double-count in iota's
+                # rate. "Both checks run" is a coverage claim, not a licence to
+                # emit two findings for one wrong endpoint.
+                #
+                # `if cited_declared` on the pairing arm is LOAD-BEARING, not a
+                # micro-optimization: a fact citing no task number is
+                # UNINFORMATIVE about which node its edge belongs on, never
+                # contradictory (resolved decision 8; gamma's
+                # `_conflicting_referents` choice 4, one level down). A scanner
+                # blind spot — bare digits, a reference by title, a hard-wrapped
+                # qualified ref — must never manufacture evidence for
+                # destructive edge surgery.
+                #
+                # The guard is the DECLARATION-CORROBORATED citation, not merely
+                # a non-empty one, because per-edge pairing is a discriminator
+                # AMONG DECLARED REFERENTS (resolved decision 7; the PRD's mode
+                # (iii) row repairs to `Task 3075`, itself declared) — not a
+                # general "does the fact mention some other number" test. Two
+                # consequences make that fail-closed. An endpoint reaching this
+                # arm is itself declared (membership passed), so it ALREADY
+                # satisfies the PRD's first postcondition; and a citation
+                # outside the declared set can never become a target anyway
+                # (`_candidate_pool`'s intersection rule forbids it). Firing
+                # there would emit a finding unactionable BY CONSTRUCTION —
+                # polluting the rate leaf iota samples and raising an operator
+                # WARNING for an endpoint with no observable defect. Same
+                # rationale as the empty-scan guard it subsumes (non-empty
+                # `cited_declared` implies non-empty `cited`), one step out.
+                #
+                # Because this arm is only reached when the endpoint's referent
+                # IS declared and is NOT cited, a non-empty `cited_declared`
+                # necessarily names a DIFFERENT declared referent — exactly the
+                # mode (iii) shape. It also means the pool on this arm is
+                # `cited & referents`, which never contains the endpoint, so
+                # `_candidate_targets`' endpoint subtraction is now unreachable
+                # from EITHER arm. It is retained deliberately as a structural
+                # invariant at the single site that decides targets, so a future
+                # third check cannot reintroduce a self-targeting repair.
+                #
+                # The MEMBERSHIP arm carries the SAME fail-closed principle, but
+                # one layer down, in `_candidate_pool`: a fact that cites the
+                # endpoint it landed on corroborates that attachment, so it never
+                # falls back to the declared set for a target. That guard lives
+                # with the evidence rule rather than here so both arms read ONE
+                # site (INV-5) — see `_candidate_pool` for why the dominant
+                # `source='metadata'` write shape depends on it.
+                if endpoint_referent not in referent_set:
+                    check = 'set-membership'
+                elif cited_declared and endpoint_referent not in cited:
+                    check = 'per-edge-pairing'
+                else:
+                    continue
+
+                candidates = _candidate_targets(
+                    referents=referent_set,
+                    cited=cited,
+                    endpoint=endpoint_referent,
+                    other_endpoint=other_referent,
+                    ambiguous=ambiguous,
+                    source=referent_source,
+                )
+                resolvable = len(candidates) == 1
+                stats.findings.append(ReferentFinding(
+                    edge_uuid=edge_uuid,
+                    which_end=which_end,
+                    check=check,
+                    old_endpoint_uuid=endpoint_uuid,
+                    old_endpoint_name=endpoint_name,
+                    endpoint_referent=endpoint_referent,
+                    referent_set=referent_names,
+                    intended_referent=candidates[0] if resolvable else None,
+                    resolvable=resolvable,
+                    reason='' if resolvable else _unresolvable_reason(
+                        candidates,
+                        pool=_candidate_pool(
+                            referents=referent_set, cited=cited,
+                            endpoint=endpoint_referent,
+                            ambiguous=ambiguous, source=referent_source,
+                        ),
+                        cited=cited,
+                        endpoint=endpoint_referent,
+                        other_endpoint=other_referent,
+                        ambiguous=ambiguous,
+                        source=referent_source,
+                    ),
+                ))
+
+        # SECOND PASS, deliberately: the lookup below is deferred to the
+        # findings alone so the ~99.8% clean path issues ZERO extra queries
+        # inside the per-group identity lock. One query per DISTINCT intended
+        # referent, cached for this call.
+        uuid_by_name: dict[str, str | None] = {}
+        for index, finding in enumerate(stats.findings):
+            if finding.intended_referent is None:
+                continue
+            name = finding.intended_referent.node_name
+            if name not in uuid_by_name:
+                uuid_by_name[name] = await self._intended_endpoint_uuid(
+                    name, group_id=group_id,
+                )
+            # `dataclasses.replace`, never mutation: the record is frozen
+            # because it is evidence for destructive edge surgery.
+            stats.findings[index] = dataclasses.replace(
+                finding, new_endpoint_uuid=uuid_by_name[name],
+            )
+
+        for finding in stats.findings:
+            # The two INV-2 surfaces no consumer has to parse a log for: the
+            # process-lifetime counter leaf iota reads, and the return value
+            # leaf eta reads in-process inside this same critical section.
+            self._referent_finding_counts[finding.check] += 1
+            if not finding.resolvable:
+                self._referent_finding_counts['unresolvable'] += 1
+            # WARNING, not DEBUG. The task calls out today's `logger.debug`-only
+            # ReconcileStats shape as unacceptable here, and a misattached edge
+            # is a correctness defect an operator should see. This line is the
+            # OPERATOR surface ONLY — it carries the structured payload for
+            # legibility, but nothing parses it.
+            logger.warning(
+                'Referent verification finding: %s', finding.to_dict(),
+            )
+
+        return stats
+
+    async def _intended_endpoint_uuid(
+        self, name: str, *, group_id: str
+    ) -> str | None:
+        """The uuid of the node *name* denotes, or ``None`` — never a write.
+
+        ``get_nodes_by_exact_name`` SPECIFICALLY, because it is documented
+        ``ro_query``-only and never raises on zero-or-many. zeta detects and must
+        not write, which rules out ``ensure_entity_node`` (MINTS) and
+        ``_resolve_or_create_entity`` (COLLAPSES) despite both being available
+        and both being what leaf eta will use.
+
+        ``len(rows) != 1`` yields ``None``, collapsing ABSENT and
+        DUPLICATE-NAME-GROUP to the same answer on purpose: the PRD measured 38
+        live name keys carrying more than one node, and zeta picking a survivor
+        from such a group would pre-empt the identity-lock-held collapse that is
+        ``_resolve_or_create_entity``'s job — while eta's ``ensure_entity_node``
+        handles both cases identically anyway. ``None`` therefore means "eta
+        resolves-or-mints", NEVER "unrepairable"; that is
+        :attr:`ReferentFinding.resolvable`.
+
+        Best-effort, mirroring ``_normalize_task_node_names``: a transient
+        backend error degrades the uuid to ``None`` rather than losing the
+        finding. Detection is the primary result and the uuid is an audit
+        convenience, so a lookup failure must not cost the evidence.
+        """
+        try:
+            rows = await self.graphiti.get_nodes_by_exact_name(
+                name, group_id=group_id,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.warning(
+                'Failed to resolve intended referent %r to a node uuid during '
+                'referent verification; recording the finding without one',
+                name, exc_info=True,
+            )
+            return None
+        return rows[0]['uuid'] if len(rows) == 1 else None
+
+    async def _repair_episode_referents(
+        self, stats: ReferentStats, *, group_id: str, episode_uuid: str = ''
+    ) -> ReferentRepairStats:
+        """REPAIR the edge endpoints leaf zeta found on the wrong node.
+
+        The write-time repair sub-pass (task 3672, PRD leaf eta). zeta
+        (``_verify_episode_referents``) detects and records; this pass is the
+        only WRITER, and it acts on nothing but zeta's structured findings — it
+        re-derives no verdict of its own. Per resolvable finding:
+
+        1. ``ensure_entity_node(intended.node_name)`` — resolve-or-mint the
+           node the edge should hang off.
+        2. ``reassign_edge(edge_uuid, <that uuid>, which_end=...)`` — move the
+           one endpoint, losslessly and atomically.
+        3. ``refresh_entity_summary`` as a BACKSTOP over step 2's own internal
+           refresh (see the loop body).
+
+        ALPHA LOCK CONTRACT. ``ensure_entity_node``'s docstring states that
+        callers MUST hold ``_identity_lock_for(group_id)`` — it performs no
+        locking of its own, and a concurrent same-group writer between its
+        resolve and its mint produces exactly the duplicate-name pair the
+        identity gate exists to prevent. This pass satisfies that by PLACEMENT:
+        it runs inside ``_reconcile_episode_identity``, whose whole chain
+        ``_execute_graphiti_write`` wraps in ``async with
+        self.graphiti._identity_lock_for(payload['group_id'])``. That placement
+        is load-bearing, not incidental — moving this pass out of the chain, or
+        calling it from anywhere that does not already hold the lock, would
+        reintroduce the race alpha's contract forbids.
+
+        ``ensure_entity_node`` IS CALLED UNCONDITIONALLY, for every resolvable
+        finding, and ITS RETURN — never ``finding.new_endpoint_uuid`` — is the
+        uuid handed to ``reassign_edge``. Three reasons:
+
+        * It is IDEMPOTENT: once the node exists, every later call takes the
+          resolve path and mints nothing. A branch on ``new_endpoint_uuid is
+          None`` would buy no round-trips worth having and would create a
+          SECOND site that can disagree about what the edge should point at.
+        * zeta returns ``None`` for BOTH "absent" and "duplicate-name group"
+          (``_intended_endpoint_uuid``: ``len(rows) != 1`` yields ``None``, so
+          zeta never pre-empts the identity-lock-held collapse), and
+          ``ensure_entity_node`` handles the two identically — it
+          resolves-or-collapses-or-mints through ``_resolve_or_create_entity``.
+          Branching would have to re-derive the distinction zeta explicitly
+          declined to make.
+        * It re-reads from the graph under the lock, so the target is
+          corroborated at WRITE time rather than taken from a lookup made a few
+          statements earlier. zeta's ``new_endpoint_uuid`` is demoted to what
+          its own docstring already calls it: an audit convenience.
+
+        INV-3 CORROBORATE-BEFORE-ACTING is preserved by DELEGATION, not by a
+        second check here. ``reassign_edge`` re-reads BOTH endpoints from
+        topology (a directed MATCH) and returns ``moved=False`` without issuing
+        any write when the end already points at the target — so its report
+        outranks zeta's in-memory snapshot, and the record's
+        ``old_endpoint_uuid`` is read back from it rather than copied from the
+        finding. This pass must therefore never pre-read or second-guess an
+        endpoint itself: a second read would be a second answer that can
+        disagree with the one the write actually used.
+
+        WHY THE PASS NEEDS THE EPISODE'S IDENTITY. The emptied-node cleanup's
+        guard claims to distinguish "the node was MINTED by this very episode
+        out of the mis-resolved reference alone" from "the project GENUINELY
+        OWNS the task". Until it was given ``episode_uuid`` it had no datum
+        capable of making that distinction — it inferred mintedness from
+        valid-edge emptiness, which is a different and much weaker proposition
+        (see :meth:`_cleanup_emptied_nodes`, condition 4). The identifier is
+        threaded straight down to that guard and used nowhere else.
+
+        ``episode_uuid`` is KEYWORD-ONLY and DEFAULTED so the parameter is
+        purely additive: existing direct callers are unaffected, and anything
+        that forgets to pass it degrades to the STRICT, more-conservative
+        predicate rather than a looser one. ``''`` does not mean "no exclusion
+        is needed"; it means "we could not establish which episode this is, so
+        exclude nothing and refuse more deletions" — the fail-closed direction,
+        consistent with :attr:`ReferentFinding.resolvable` defaulting to
+        ``False``. See :func:`_episode_uuid_of` for how the chain extracts it.
+
+        Args:
+            stats: zeta's ``ReferentStats`` for this episode, consumed verbatim.
+            group_id: The project graph, which is also the project_id.
+            episode_uuid: UUID of the episode whose write is in flight, used
+                ONLY by the emptied-node cleanup's fourth condition. ``''``
+                (the default) is the fail-closed value.
+
+        Returns:
+            A ``ReferentRepairStats`` carrying one record per finding —
+            including the ones deliberately left alone.
+        """
+        repair_stats = ReferentRepairStats()
+
+        # Grouped by edge FIRST, so the degenerate predicate is evaluated once
+        # per edge BEFORE any backend call for that edge. dict preserves
+        # insertion order, so findings are still processed in zeta's order.
+        findings_by_edge: dict[str, list[ReferentFinding]] = {}
+        for finding in stats.findings:
+            findings_by_edge.setdefault(finding.edge_uuid, []).append(finding)
+
+        # uuid -> the name this episode's result reported for that node, the
+        # only thing the cleanup's canonical-label guard has to parse. Keyed by
+        # the FINDING's uuid: when `reassign_edge`'s topology re-read disagrees
+        # with it, we have no name for the node that actually lost the edge,
+        # and no name means no deletion (fail closed).
+        endpoint_names: dict[str, str] = {
+            f.old_endpoint_uuid: f.old_endpoint_name for f in stats.findings
+        }
+
+        for edge_uuid, edge_findings in findings_by_edge.items():
+            if self._is_degenerate_edge(edge_findings):
+                # Skip the edge WHOLE — never half-move it. One warning naming
+                # the edge and BOTH endpoint node uuids, because "which edge,
+                # which nodes" is the whole of what a human needs to decide
+                # this case by hand (NEVER GUESS: recorded, left alone).
+                logger.warning(
+                    'Referent repair: skipping degenerate edge %s WHOLE — both '
+                    'ends would sit on one node (endpoints %s); repairing '
+                    'either end alone would leave the edge half-attributed, '
+                    'and repairing both would fold it into a self-referential '
+                    'RELATES_TO. Recorded and left alone: %s',
+                    edge_uuid,
+                    sorted({f.old_endpoint_uuid for f in edge_findings}),
+                    [f.to_dict() for f in edge_findings],
+                )
+                for finding in edge_findings:
+                    repair_stats.repairs.append(ReferentRepair(
+                        edge_uuid=finding.edge_uuid,
+                        which_end=finding.which_end,
+                        outcome='degenerate',
+                        old_endpoint_uuid=finding.old_endpoint_uuid,
+                        check=finding.check,
+                        reason=(
+                            'both ends of this edge would sit on one node; '
+                            'skipped whole rather than half-moved'
+                        ),
+                    ))
+                continue
+
+            await self._repair_edge_findings(
+                edge_findings, repair_stats, group_id=group_id,
+            )
+
+        await self._cleanup_emptied_nodes(
+            repair_stats, endpoint_names,
+            group_id=group_id, episode_uuid=episode_uuid,
+        )
+
+        streak = self._record_referent_repair_pass(
+            stats, repair_stats, group_id=group_id,
+        )
+        if streak is not None and streak >= _REFERENT_REPAIR_STREAK_THRESHOLD:
+            await self._escalate_referent_repair_storm(
+                repair_stats, group_id=group_id, streak=streak,
+            )
+
+        return repair_stats
+
+    def _record_referent_repair_pass(
+        self,
+        stats: ReferentStats,
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+    ) -> int | None:
+        """Fold one completed repair pass into the INV-4 escape hatch.
+
+        Two independent things, deliberately kept apart:
+
+        THE PROCESS-LIFETIME TOTALS accumulate unconditionally — monotonic
+        counters leaf iota samples and differences.
+
+        THE PER-GROUP STREAK counts CONSECUTIVE EPISODES that needed a repair,
+        and its update rule is a three-way branch, not a two-way one:
+
+        * ``repaired >= 1`` -> ``+1``, by exactly one however many endpoints
+          moved. The streak's unit is the EPISODE; the per-episode repair count
+          rides separately in :attr:`ReferentRepairStats.repaired` and is
+          carried into the escalation's evidence. Making the increment
+          proportional would let a single wide episode breach the threshold on
+          its own, which is precisely the "one bad write" case this alarm is
+          not for.
+        * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
+          HEALTH SIGNAL: we looked at this episode's edge endpoints and none
+          needed moving.
+        * zero repairs and ``endpoints_checked == 0`` -> UNCHANGED, and the key
+          is not even created.
+
+        THE ASYMMETRY IS THE POINT, and it is copied from
+        ``MergeWorker._record_runner_recovered``, which pops a host's
+        unavailability entry only on a SUCCESSFUL probe — never on the mere
+        absence of a failure. Here the analogue of "no failure observed" is an
+        episode that declared no referents, produced no edges, or yielded no
+        findings: the pass ran, looked at nothing, and returned. That is no
+        evidence of health, and clearing the streak on it would make the alarm
+        structurally UNREACHABLE — the measured base rate is ~0.22% of live
+        task-mentioning edges, so the overwhelming majority of episodes check
+        nothing, and any one of them interleaved between two repairs would zero
+        a streak that can then never reach ten.
+
+        Only ``repaired`` (``outcome == 'repaired' and moved``) counts toward
+        the streak. A ``moved=False`` result is ``reassign_edge``'s
+        corroborate-before-acting no-op — the edge was ALREADY correct — and
+        ``'unrepairable'``/``'degenerate'``/``'failed'`` are a refusal, a
+        refusal, and an infrastructure fault respectively. None of the four is
+        evidence that the resolver is producing wrong endpoints, and counting
+        any of them would let a FalkorDB outage page as a scanner regression.
+
+        Returns:
+            The group's streak AFTER the increment, when this pass incremented
+            it — i.e. the reading the storm gate thresholds. ``None`` on the
+            other two arms. Returning the value rather than having the caller
+            re-read the dict is what keeps the gate from firing on a pass that
+            merely LEFT a breached streak in place: an episode that checked
+            nothing performs no repair, so it must not re-page an alarm it
+            produced no evidence for.
+        """
+        self._referent_repair_counts['repaired'] += repair_stats.repaired
+        self._referent_repair_counts['flagged_unrepairable'] += (
+            repair_stats.flagged_unrepairable
+        )
+        self._referent_repair_counts['failed'] += repair_stats.failed
+        self._referent_repair_counts['nodes_minted'] += repair_stats.nodes_minted
+        self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
+
+        if repair_stats.repaired:
+            streak = self._referent_repair_streaks.get(group_id, 0) + 1
+            self._referent_repair_streaks[group_id] = streak
+            return streak
+        if stats.endpoints_checked:
+            self._referent_repair_streaks[group_id] = 0
+        return None
+
+    async def _escalate_referent_repair_storm(
+        self,
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+        streak: int,
+    ) -> None:
+        """Fire the INV-4 repair-storm alarm for *group_id*.
+
+        THE PREDICATE IS ``streak >= threshold``, NOT ``==``, and the caller
+        spells it inline. Every subsequent breach re-enters here; collapsing a
+        sustained storm to ONE operator entry is the ESCALATOR's job, via its
+        pending-anchor dedupe fold. That is the same division of labour
+        ``merge_liveness`` uses — ``_record_runner_unavailable`` returns
+        ``streak >= threshold`` on every episode and the filing side folds — and
+        it is the robust arrangement: a counter that fired only on the exact
+        boundary would go permanently silent if one breach were ever missed
+        (a filing failure, a restart, a config change to the threshold), and
+        nothing downstream would notice the alarm had been disarmed.
+
+        ``orchestrator.critical_gate.critical_filing_gate`` is the canonical
+        spelling of this predicate and is deliberately NOT imported: fused-memory
+        depends on ``dark-factory-shared`` only, and the sole orchestrator
+        imports anywhere under ``fused_memory/`` are lazy, optional and confined
+        to ``reconciliation/sandbox_guard.py``. Taking a hard dependency on the
+        orchestrator package to reuse a one-line comparison would invert that
+        layering for no gain. INV-5's no-lockstep-duplication concern does not
+        bite here either, because ``>=`` is not a VOCABULARY — there is nothing
+        two sites must agree byte-for-byte about, unlike
+        :data:`REFERENT_REPAIR_OUTCOMES` above, which is exactly why that one
+        does live at a single normative site.
+
+        ``asyncio.to_thread`` IS LOAD-BEARING — do not re-inline the escalation
+        hop. ``EscalationQueue`` construction, its queue-directory scan and its
+        fsync-flushed write are blocking filesystem I/O; called directly from
+        this coroutine they would run ON the event loop and stall every other
+        concurrent memory write for their duration. That warning and its
+        precedent are already recorded on ``_check_memory_metadata`` in this
+        file ("ASYNC ON PURPOSE — do not re-inline the escalation hop"), and the
+        ported module (``middleware/candidate_key_escalation``) carries its
+        never-raise contract over but not its synchronous-caller assumption.
+        It is AWAITED rather than fire-and-forgotten so the call can never
+        outlive the write or be dropped by task GC.
+
+        The per-group IDENTITY LOCK IS STILL HELD across that hop, which is
+        accepted rather than overlooked. It is tolerable because this path runs
+        only at ``streak >= 10`` — an already-anomalous condition, not the
+        steady state — and because it folds to a single ``get_by_task`` read
+        the moment one escalation is open, so a sustained storm does not
+        repeatedly pay for a full filing.
+
+        PROJECT ROOT resolution is ``self._known_projects[group_id]`` and has NO
+        FALLBACK. graphiti's ``group_id`` IS the ``project_id`` (models/scope.py),
+        so that map is the correct and only answer. Falling back to
+        ``config.taskmaster.project_root`` is explicitly forbidden by the mem0
+        storm escalator's docstring and for the reason it gives: that field
+        defaults to ``'.'``, so the fallback files into the SERVER'S CWD, where
+        no operator is watching, and reports success doing it — a silent
+        misfile is strictly worse than a logged refusal, because it also
+        destroys the evidence that the alarm ever fired.
+
+        NEVER RAISES a generic exception. The repairs this is complaining about
+        have already committed to the graph, and this runs inside the reconcile
+        chain of an episode whose write is already durable — failing that chain
+        because the COMPLAINT about it failed would turn a heads-up into an
+        outage. Belt to the escalator's own never-raise braces, matching the
+        guard discipline every best-effort hop in this file uses;
+        ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` still
+        propagate.
+        """
+        project_root = self._known_projects.get(group_id)
+        if not project_root:
+            # A REFUSAL, never a guess. Structured so the operator who finds
+            # this line has everything the escalation would have carried.
+            logger.warning(
+                'referent repair storm in group_id=%r (streak=%d, threshold=%d, '
+                '%d repair(s) this episode) could NOT be escalated: the group '
+                'is absent from `_known_projects`, so no project queue can be '
+                'resolved. Not falling back to config.taskmaster.project_root '
+                '(it defaults to the server cwd, where nobody is watching). '
+                'Repairs continue. Records: %s',
+                group_id, streak, _REFERENT_REPAIR_STREAK_THRESHOLD,
+                repair_stats.repaired,
+                [r.to_dict() for r in repair_stats.repairs],
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                emit_referent_repair_storm_escalation,
+                project_root,
+                project_id=group_id,
+                streak=streak,
+                threshold=_REFERENT_REPAIR_STREAK_THRESHOLD,
+                repairs=repair_stats.repaired,
+                records=[r.to_dict() for r in repair_stats.repairs],
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.warning(
+                'referent repair storm alarm for group_id=%r (streak=%d) could '
+                'not be filed; the repairs themselves already committed and are '
+                'unaffected',
+                group_id, streak, exc_info=True,
+            )
+
+    async def _cleanup_emptied_nodes(
+        self,
+        repair_stats: ReferentRepairStats,
+        endpoint_names: Mapping[str, str],
+        *,
+        group_id: str,
+        episode_uuid: str = '',
+    ) -> None:
+        """Delete the nodes THIS PASS emptied — under four conditions, all required.
+
+        Runs AFTER every reassignment for the episode, because a node is only
+        empty once every edge that was going to leave it has left.
+
+        THE TWO SITUATIONS THE NODE CAN BE IN, and why the guard is this narrow:
+
+        * The project GENUINELY OWNS the task. The node keeps its pre-existing
+          edges after the repair, so the emptiness check fails and it is never
+          touched. Deleting a real task entity to fix an attribution error
+          would be a far more damaging bug than the one being fixed.
+        * The node was MINTED by this very episode out of the mis-resolved
+          reference alone. The repair leaves it edgeless and semantically
+          wrong, and it would otherwise persist as a phantom entity that future
+          writes keep re-colliding with — leaving the fix only half-working
+          and, per the PRD's "coupling" section, keeping the duplicate-name key
+          that disables ``dedup_helpers``' deterministic exact-match protection.
+
+        THE FOUR CONDITIONS, in the order they are evaluated — the two free
+        local checks first, then the cheap typed query, then the new untyped
+        degree query, so the ~99.8% clean path pays nothing extra inside the
+        identity lock:
+
+        1. This pass moved at least one endpoint OFF the node — an
+           ``outcome='repaired'`` record with ``moved=True``. A ``moved=False``
+           no-op emptied nothing, so it is not even a candidate and neither
+           query is issued for it. The node that GAINED the edge is never a
+           candidate either; deleting the repair target would undo the repair.
+        2. Its name parses as a canonical task label —
+           :func:`~fused_memory.utils.canonical_labels.parse_node_name`, the
+           single normative label vocabulary (PRD leaf beta), reused here
+           rather than respelled as a regex at the delete site. That function
+           is ANCHORED by design, so a node merely MENTIONING a task
+           ('Task 42 orchestrator') returns ``None`` and survives. This is the
+           guard where a drifting pattern would delete a real entity, which is
+           exactly the duplication INV-5 exists to prevent.
+        3. ``get_valid_edges_for_node`` returns empty.
+        4. :meth:`GraphitiBackend.count_foreign_relationships` returns 0 — the
+           node has NO relationship of ANY type or validity other than THIS
+           episode's own ``MENTIONS`` link.
+
+        WHY CONDITION 4 EXISTS, AND WHAT CONDITION 3 ALONE COULD NOT
+        DISTINGUISH. Conditions 1-3 do not test the proposition this guard's
+        stated intent claims, and the gap is a confirmed data-loss defect, not
+        a theoretical one:
+
+        * ``get_valid_edges_for_node`` is ``MATCH (n:Entity {uuid:$uuid})
+          -[e:RELATES_TO]-() WHERE e.invalid_at IS NULL``. It sees ONLY
+          currently-valid ``RELATES_TO``, and is blind both to INVALIDATED
+          ``RELATES_TO`` history and to ``MENTIONS`` from Episodic nodes.
+        * ``delete_entity_node`` issues a bare ``MATCH (n:Entity {uuid:$uuid})
+          DETACH DELETE n``, destroying EVERY relationship — all of the above
+          included.
+        * ``parse_node_name`` cannot help, because a genuine ``Task N`` node
+          passes it BY CONSTRUCTION: it is exactly a canonical task label.
+
+        The exposure is reachable inside ONE critical section.
+        :meth:`_invalidate_stale_superseded_ttl_edges` is sub-pass FOUR of the
+        same ``_reconcile_episode_identity`` chain and exists precisely to
+        invalidate same-subject superseded edges; this cleanup is sub-pass
+        EIGHT. So a real, project-owned ``Task N`` node whose facts were
+        TTL-invalidated at pass 4 reads as "empty" at pass 8 the moment this
+        pass moves its one remaining valid edge away — and would be
+        irreversibly deleted with its full temporal history.
+
+        WHAT ``force=False`` DOES AND DOES NOT SUPPLY. The delete goes through
+        :meth:`GraphitiBackend.delete_entity` with ``force=False``, never the
+        lower-level ``delete_entity_node``, and that argument still guards a
+        genuine RACE on VALID edges — a node that gains a live edge between our
+        read and the delete — turning the lost race into an
+        ``ActiveEdgesError`` refusal. That is worth keeping.
+
+        It is NOT, however, "a second, INDEPENDENT check" of the emptiness this
+        cleanup is predicated on, as this docstring previously claimed:
+        ``delete_entity`` re-checks by calling ``get_valid_edges_for_node`` —
+        the SAME query — so it is blind to exactly what condition 4 exists to
+        see. A same-query recheck cannot see what the first query missed.
+        Condition 4 is the only thing standing between this cleanup and
+        destroying a real entity's temporal history.
+
+        ``delete_entity_node`` issues a bare DETACH DELETE with no edge guard
+        and no neighbour refresh, so using it would mean re-implementing both.
+
+        CONDITION 4 IS THE CONSERVATIVE DIRECTION BY CONSTRUCTION. Its two
+        imprecisions both only ever REFUSE a delete: an undirected self-loop
+        double-counts, and an unresolved ``episode_uuid`` of ``''`` drops the
+        exclusion entirely (see :func:`_episode_uuid_of`). If it ever fires
+        more often than expected, the correct response is to INVESTIGATE THE
+        NODE — something is attached to it that nobody expected — never to
+        relax the predicate.
+
+        The stamp back onto the matching records uses
+        :func:`dataclasses.replace`, never mutation — the record is frozen
+        because it is evidence for destructive edge surgery.
+        """
+        candidates: list[str] = []
+        for record in repair_stats.repairs:
+            if record.outcome != 'repaired' or not record.moved:
+                continue
+            uuid = record.old_endpoint_uuid
+            if uuid in candidates:
+                continue
+            name = endpoint_names.get(uuid, '')
+            if not name or parse_node_name(name) is None:
+                continue
+            candidates.append(uuid)
+
+        for uuid in candidates:
+            try:
+                remaining = await self.graphiti.get_valid_edges_for_node(
+                    uuid, group_id=group_id,
+                )
+                if remaining:
+                    continue
+                # CONDITION 4, and the only thing standing between this cleanup
+                # and destroying a real entity's temporal history. Runs LAST
+                # because it is the most expensive: an untyped degree query,
+                # issued only for candidates that already passed the two free
+                # local checks and the cheap typed one.
+                foreign = await self.graphiti.count_foreign_relationships(
+                    uuid, group_id=group_id, episode_uuid=episode_uuid,
+                )
+                if foreign:
+                    logger.info(
+                        'Referent repair: not deleting emptied node %s — it '
+                        'still has %d relationship(s) that a DETACH DELETE '
+                        'would destroy (invalidated RELATES_TO history, or '
+                        'MENTIONS from an episode other than %r). The endpoint '
+                        'move stands; the node does too',
+                        uuid, foreign, episode_uuid,
+                    )
+                    continue
+                await self.graphiti.delete_entity(
+                    uuid, group_id=group_id, force=False,
+                )
+            except ActiveEdgesError:
+                # A LOST RACE, not a failure: the node gained an edge between
+                # our read and the delete, and force=False refused. Exactly
+                # what that argument is for. INFO, because the outcome is
+                # correct — the node is still there and still has an edge.
+                logger.info(
+                    'Referent repair: not deleting emptied node %s — it '
+                    'gained a valid edge between the emptiness check and the '
+                    'delete, and delete_entity(force=False) refused',
+                    uuid,
+                )
+                continue
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # PER-CANDIDATE, and guarded SEPARATELY from the reassignments
+                # above rather than sharing the outer `_run_pass`. `_run_pass`
+                # substitutes an EMPTY ReferentRepairStats on a raise, which
+                # would discard the structured record of every reassignment
+                # that had ALREADY COMMITTED to the graph — reporting zero
+                # repairs for an episode that performed several. That is the
+                # exact silent-degradation shape INV-2 and the
+                # no-silent-fail-soft invariant rule out. Cleanup is
+                # opportunistic hygiene; the reassignment is the correctness
+                # fix, and their failure domains must not be shared.
+                #
+                # Per-candidate so one node whose emptiness cannot be read does
+                # not strand every other phantom node behind it.
+                logger.warning(
+                    'Referent repair: emptied-node cleanup failed for node %s; '
+                    'the endpoint move(s) that emptied it already committed '
+                    'and stand, but the node may remain as a phantom entity',
+                    uuid, exc_info=True,
+                )
+                continue
+            logger.info(
+                'Referent repair: deleted emptied node %s (%r) — this pass '
+                'moved its last edge off it',
+                uuid, endpoint_names.get(uuid, ''),
+            )
+            for index, record in enumerate(repair_stats.repairs):
+                if (
+                    record.outcome == 'repaired' and record.moved
+                    and record.old_endpoint_uuid == uuid
+                ):
+                    repair_stats.repairs[index] = dataclasses.replace(
+                        record, deleted_emptied_node=uuid,
+                    )
+
+    @staticmethod
+    def _is_degenerate_edge(findings: list[ReferentFinding]) -> bool:
+        """Would repairing this edge's findings fold it into a self-loop?
+
+        ONE predicate, evaluated once per edge BEFORE any backend call for that
+        edge — deliberately NOT an ``except ValueError`` around
+        ``reassign_edge``. That primitive does refuse a move whose new endpoint
+        equals the endpoint left in place, but by the time it raises, the FIRST
+        end has already committed: the half-attributed edge the rule exists to
+        prevent has already happened, and the exception arrives too late to be
+        a guard. Deciding before any write is the only formulation that can
+        "skip the edge whole".
+
+        Two shapes, both reachable, both producing the identical outcome:
+
+        LITERAL — two findings share an ``old_endpoint_uuid``. Both ends
+        already sit on the node being repaired away from, i.e. a self-loop on
+        the wrong node. Not hypothetical:
+        :meth:`GraphitiBackend.get_valid_edges_for_node`'s own docstring
+        documents that an A->A ``RELATES_TO`` edge exists in this graph and
+        double-matches its undirected query.
+
+        PROJECTED — two RESOLVABLE findings share an ``intended_referent``. The
+        two moves would converge both ends onto one node. Equally reachable
+        through zeta's rules: ``_candidate_targets`` subtracts ``endpoint`` and
+        ``other_endpoint``, neither of which removes a THIRD referent that both
+        ends would legitimately move onto. This is the SAME predicate evaluated
+        on post-repair endpoints, which is why it lives here as one extra
+        comparison rather than as a second guard that could drift.
+
+        Comparing the intended ``node_name`` rather than a resolved uuid is
+        equivalent and available BEFORE the mint: ``ensure_entity_node`` keys
+        on the NAME, so two findings converge on one node exactly when their
+        referents render the same ``node_name``.
+
+        THE COMPARISON IS ON THE RENDERED NAME, NOT ON THE ``Referent``.
+        Those are not the same test. :attr:`Referent.node_name` returns
+        ``f'{project_id}:{number}'` whenever ``project_id`` is non-empty,
+        IGNORING ``kind`` entirely — so two ``Referent``s differing only in
+        ``kind`` render the SAME node name while comparing unequal as frozen
+        dataclasses. Comparing the objects would therefore miss a convergence
+        the mint will then actually perform. It happens to be unobservable
+        today only because ``canonical_labels._KIND_LABELS`` has exactly one
+        entry, and this is a pre-write safety gate for destructive edge
+        surgery — the post-hoc ``reassign_edge`` ValueError arrives too late to
+        substitute for it — so it must not silently depend on that.
+
+        Resolvable findings only, on the projected arm: a finding eta will
+        never act on cannot converge with anything.
+        """
+        if len(findings) < 2:
+            return False
+        endpoints = [f.old_endpoint_uuid for f in findings]
+        if len(set(endpoints)) < len(endpoints):
+            return True
+        targets = [
+            f.intended_referent.node_name for f in findings
+            if f.resolvable and f.intended_referent is not None
+        ]
+        return len(set(targets)) < len(targets)
+
+    async def _repair_edge_findings(
+        self,
+        findings: list[ReferentFinding],
+        repair_stats: ReferentRepairStats,
+        *,
+        group_id: str,
+    ) -> None:
+        """Run the repair sequence for one non-degenerate edge's findings.
+
+        Split out from :meth:`_repair_episode_referents` so the pre-write
+        degenerate predicate reads as a gate on the whole edge rather than as
+        another branch inside the per-finding loop.
+
+        TWO GUARDS PER FINDING, NOT ONE, split at the commit point. The first
+        wraps ``ensure_entity_node`` + ``reassign_edge`` — everything that can
+        fail with NOTHING written — and its ``except`` records ``'failed'``.
+        The second wraps only the post-write summary backstop, whose failures
+        cannot un-write the move that already landed and therefore must not be
+        able to book it as ``'failed'``. Sharing one ``except`` across the
+        commit point is what would let a cosmetic post-write problem report an
+        episode's real repair as an infrastructure fault that did nothing.
+        """
+        for finding in findings:
+            intended = finding.intended_referent
+            if not finding.resolvable or intended is None:
+                # NEVER GUESS, as the STRUCTURAL default rather than a branch
+                # this pass chose to add. `ReferentFinding.resolvable` already
+                # DEFAULTS to False — zeta made fail-closed structural, so a
+                # finding is unrepairable unless something positively
+                # determined a target — and this arm is what honours it.
+                #
+                # The PRD's boundary row, verbatim: "Unary fact, no correct
+                # target: flagged, recorded, left unrepaired". Its live case is
+                # the fact "Umbrella task 2519 was filed and then cancelled to
+                # avoid orphaning its vector" sitting on the `Task 2520` node —
+                # the fact names exactly ONE task and it is not the one the
+                # edge landed on, so there is no second candidate to move it
+                # to and any target eta picked would be invented.
+                #
+                # The RECORD EXISTING AT ALL is the point. A dropped finding
+                # and a repaired one are indistinguishable to leaf iota's rate
+                # and to an operator reading the audit; an 'unrepairable'
+                # record carrying zeta's own `reason` is the evidence a human
+                # uses to decide the case by hand. The reason is copied
+                # VERBATIM rather than paraphrased — a paraphrase is a second
+                # site that can drift from the rule that actually fired.
+                #
+                # `intended is None` is folded in here rather than crashed on:
+                # zeta forbids that shape (a resolvable finding always names a
+                # referent) but the TYPE permits it, and fail-closed means an
+                # impossible shape becomes a refusal, never a guess.
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='unrepairable',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    reason=finding.reason,
+                ))
+                continue
+
+            # PER-FINDING containment, not per-pass: each finding names a
+            # distinct (edge, end), so one failure carries NO information about
+            # the others, and aborting the batch would leave the graph in a
+            # state neither zeta's findings nor eta's records describe. A batch
+            # of independent edge repairs must be able to make partial
+            # progress.
+            #
+            # `'failed'` is a THIRD disposition, distinct from BOTH
+            # `'repaired'` and `'unrepairable'`: unrepairable means we REFUSED
+            # TO GUESS, failed means we TRIED and the backend did not
+            # cooperate. Conflating them would let a FalkorDB outage read as a
+            # scanner regression in leaf iota's rate, and would feed a false
+            # repair-storm streak whose whole claim is that the scanner or the
+            # resolver has REGRESSED.
+            try:
+                target_uuid = await self.graphiti.ensure_entity_node(
+                    intended.node_name, group_id=group_id,
+                )
+                result = await self.graphiti.reassign_edge(
+                    finding.edge_uuid, target_uuid,
+                    which_end=finding.which_end, group_id=group_id,
+                )
+                moved = bool(result.get('moved'))
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                logger.warning(
+                    'Referent repair FAILED for one edge end; it is left '
+                    'unrepaired and recorded as such (%s): %s',
+                    exc, finding.to_dict(), exc_info=True,
+                )
+                repair_stats.repairs.append(ReferentRepair(
+                    edge_uuid=finding.edge_uuid,
+                    which_end=finding.which_end,
+                    outcome='failed',
+                    old_endpoint_uuid=finding.old_endpoint_uuid,
+                    check=finding.check,
+                    intended_referent=intended.node_name,
+                    reason=f'{type(exc).__name__}: {exc}',
+                ))
+                continue
+
+            # STEP 3 SITS OUTSIDE THE WRITE GUARD, in its own, deliberately.
+            # By here the endpoint move has ALREADY COMMITTED to the graph, so
+            # the two steps' failures mean opposite things and must not share
+            # an `except`: a raise from the backstop caught by the write guard
+            # above would record `outcome='failed'` with `moved` never set —
+            # a committed repair booked as an infrastructure failure that did
+            # nothing. That would un-count it in `ReferentRepairStats.repaired`,
+            # suppress its `_referent_repair_streaks` increment, and drop the
+            # emptied node from `_cleanup_emptied_nodes` candidacy: the exact
+            # "report zero repairs for an episode that performed one" shape
+            # that `_backstop_endpoint_summaries` and the cleanup's own
+            # independent guard both already exist to rule out. Same reasoning,
+            # same remedy, third site.
+            #
+            # `_backstop_endpoint_summaries` swallows per node, so only a
+            # malformed `result` reaches this arm — and when it does, the
+            # fallback reports what `reassign_edge` said IT refreshed, read
+            # totally so the recovery path cannot itself raise.
+            refreshed: tuple[str, ...] = ()
+            if moved:
+                try:
+                    refreshed = await self._backstop_endpoint_summaries(
+                        result, group_id=group_id,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    logger.warning(
+                        'Referent repair: the backstop summary refresh failed '
+                        'wholesale for edge %s; the endpoint move already '
+                        'committed and STANDS, and is recorded as a repair. '
+                        'Only the summary regeneration is in doubt',
+                        finding.edge_uuid, exc_info=True,
+                    )
+                    reported = (
+                        result.get('refreshed_nodes')
+                        if isinstance(result, dict) else None
+                    )
+                    refreshed = (
+                        tuple(reported)
+                        if isinstance(reported, (list, tuple)) else ()
+                    )
+            repair_stats.repairs.append(ReferentRepair(
+                edge_uuid=finding.edge_uuid,
+                which_end=finding.which_end,
+                outcome='repaired',
+                # From reassign_edge's topology re-read, NOT from the finding.
+                old_endpoint_uuid=result.get(
+                    'old_endpoint_uuid', finding.old_endpoint_uuid,
+                ),
+                check=finding.check,
+                new_endpoint_uuid=target_uuid,
+                intended_referent=intended.node_name,
+                # zeta found no single pre-existing node keyed by this name
+                # moments earlier under this same lock, so ensure_entity_node
+                # took its mint-or-collapse path. The two are deliberately not
+                # distinguished here — zeta collapses them to one `None` on
+                # purpose, and telling them apart would cost a second query
+                # inside the identity lock to sharpen a telemetry count.
+                minted=finding.new_endpoint_uuid is None,
+                moved=moved,
+                summaries_refreshed=refreshed,
+            ))
+
+    async def _backstop_endpoint_summaries(
+        self, result: dict[str, Any], *, group_id: str
+    ) -> tuple[str, ...]:
+        """Step 3 of the repair sequence — a BACKSTOP, not a third unconditional call.
+
+        ``reassign_edge`` already refreshes the two AFFECTED endpoint summaries
+        after a real move (the OLD endpoint, which lost the edge, and the NEW
+        one, which gained it) — but per-node try/except that LOGS AND SWALLOWS,
+        reporting only what actually succeeded in ``refreshed_nodes``. That
+        leaves the two naive options both wrong:
+
+        * An unconditional third call DOUBLES the summary regeneration on the
+          ~100% happy path, inside the per-group identity lock where every
+          extra round-trip serializes same-group writes.
+        * Omitting step 3 entirely leaves the PRD's stated user-observable
+          signal — "the ``Task N±1`` summary no longer contains it" — silently
+          degradable whenever that swallowed exception fires.
+
+        Reading ``refreshed_nodes`` and re-refreshing only the REMAINDER is the
+        only formulation that makes the signal a guarantee at zero happy-path
+        cost: it is the primitive's own report of what it actually achieved,
+        and it is the only way to tell the two apart from out here.
+
+        Per-node try/except that logs and swallows a generic ``Exception``: the
+        topology move has ALREADY COMMITTED by the time this runs, so a failed
+        summary regeneration must never un-count the repair — that would report
+        zero repairs for an episode that performed one, the exact
+        silent-degradation shape INV-2 rules out.
+        ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate.
+
+        :meth:`GraphitiBackend.set_entity_summary` (task 2057) remains the
+        documented MANUAL escape hatch for a stale sentence still carried by a
+        genuinely VALID edge, and is deliberately never invoked from here:
+        overwriting a summary verbatim is not a decision a write-time pass may
+        take unattended.
+
+        Returns:
+            The union of what ``reassign_edge`` reported refreshing and what
+            this backstop then refreshed — what is true of the GRAPH, not what
+            was called.
+        """
+        already = list(result.get('refreshed_nodes') or ())
+        affected = [
+            result.get('old_endpoint_uuid'), result.get('new_endpoint_uuid'),
+        ]
+        refreshed = list(already)
+        for node_uuid in affected:
+            if not node_uuid or node_uuid in refreshed:
+                continue
+            try:
+                await self.graphiti.refresh_entity_summary(
+                    node_uuid, group_id=group_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.warning(
+                    'Referent repair: backstop summary refresh failed for node '
+                    '%s (edge %s); the endpoint move already committed and '
+                    'stands, but that node\'s summary may still name the '
+                    'referent the edge no longer hangs off',
+                    node_uuid, result.get('uuid'), exc_info=True,
+                )
+                continue
+            refreshed.append(node_uuid)
+        return tuple(refreshed)
     async def _reconcile_episode_identity(
-        self, result: Any, *, group_id: str
+        self, result: Any, *, group_id: str, referents: ReferentSet = (),
+        content: str = '', referent_source: str = 'derived',
     ) -> ReconcileStats:
-        """Fold the six post-write identity/dedup sweeps into one call.
+        """Fold the eight post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -2644,11 +4785,51 @@ class MemoryService:
         it is the mirror-image, under-invalidation-direction counterpart of
         the sibling-restore pass.
 
+        ``_verify_episode_referents`` (task 3671, PRD leaf zeta) runs LAST,
+        after ``_normalize_task_node_names``, and that ordering is load-bearing:
+        it keys on the canonical ``Task N`` names the normalization pass
+        produces, and the ``new_endpoint_uuid`` it resolves — plus any repair
+        leaf eta performs off its findings — must describe POST-normalization
+        topology. Minting a ``Task N`` node before normalization ran would
+        create exactly the duplicate that pass exists to collapse. (Should task
+        3335's cross-project split ever land, zeta must run after that too, for
+        the same reason.) It is also the one sub-pass that performs no writes:
+        it DETECTS and records, and its ``ReferentStats`` is the structured
+        evidence eta acts on.
+
+        ``_repair_episode_referents`` (task 3672, PRD leaf eta) is the EIGHTH
+        and last, and the ONLY WRITING CONSUMER of zeta's detect-only output —
+        it re-derives no verdict of its own, acting on nothing but the findings
+        handed to it. Its placement after zeta is a data dependency (it takes
+        zeta's ``ReferentStats`` as its argument), and its placement after
+        ``_normalize_task_node_names`` is load-bearing in the SAME direction
+        zeta's is, only more so: eta MINTS ``Task N`` nodes and REPOINTS edges
+        onto them, so minting before normalization ran would create exactly the
+        duplicate-name pair that pass exists to collapse — the repair would
+        introduce the disease it was called to cure.
+
+        Running inside this chain is also what satisfies alpha's
+        ``ensure_entity_node`` LOCK CONTRACT: ``_execute_graphiti_write`` wraps
+        this whole call in ``async with _identity_lock_for(group_id)``, and eta
+        performs no locking of its own. That placement is load-bearing, not
+        incidental.
+
+        One repair shape is deliberately NOT automated: a stale sentence still
+        carried by a genuinely VALID edge. ``refresh_entity_summary`` regenerates
+        a summary from the edges that remain, so it cannot remove a sentence
+        whose edge is correct; ``GraphitiBackend.set_entity_summary`` (task 2057)
+        stays the documented MANUAL escape hatch for that case. Overwriting a
+        summary verbatim is not a decision a write-time pass may take unattended.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
-        ``ReconcileStats.errors`` (leaving its count at 0), and the
-        remaining sub-passes still run — a single sub-pass failure must
-        never fail the already-committed episode write.
+        ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
+        the six int passes, an empty ``ReferentStats`` for zeta, an empty
+        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        run — a single sub-pass failure must never fail the already-committed
+        episode write. That guarantee is worth most at eta, the one pass that
+        WRITES: its failure is the likeliest to be real, and it arrives after
+        the episode is already durable.
         ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` are never
         swallowed; they propagate immediately and skip any later sub-passes.
 
@@ -2657,14 +4838,27 @@ class MemoryService:
                 AddEpisodeResults object), forwarded verbatim to every
                 sub-pass.
             group_id: The project graph this episode was written to.
+            referents: The referent set the write DECLARED itself to be about,
+                forwarded to the verification sub-pass. Defaults to empty, which
+                makes that pass a no-op — so every caller predating task 3671 is
+                unchanged.
 
         Returns:
-            A ReconcileStats aggregating every sub-pass's count (and any
-            per-sub-pass failure labels).
+            A ReconcileStats aggregating every sub-pass's count, the
+            verification pass's findings, the repair pass's structured records,
+            and any per-sub-pass failure labels.
         """
         stats = ReconcileStats()
 
-        async def _run_pass(label: str, coro: Any) -> int:
+        async def _run_pass(label: str, coro: Awaitable[_T], default: _T) -> _T:
+            # ONE best-effort guard, not two. Task 3671's verification sub-pass
+            # is the first to return a dataclass rather than an int, so the
+            # caller supplies the DEFAULT its own type demands — a parallel
+            # object-returning guard would duplicate the swallow/propagate rule
+            # at two sites that must stay identical (the INV-5 lockstep
+            # duplication this PRD exists to push back on), and returning `0`
+            # where a ReferentStats belongs would blow up every consumer on
+            # exactly the error path this guard exists to survive.
             try:
                 return await coro
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -2679,31 +4873,63 @@ class MemoryService:
                     label,
                 )
                 stats.errors.append(label)
-                return 0
+                return default
 
         stats.edges_deduped = await _run_pass(
             '_dedup_episode_edges',
             self._dedup_episode_edges(result, group_id=group_id),
+            0,
         )
         stats.dependency_edges_restored = await _run_pass(
             '_restore_superseded_dependency_edges',
             self._restore_superseded_dependency_edges(result, group_id=group_id),
+            0,
         )
         stats.sibling_edges_restored = await _run_pass(
             '_restore_falsely_superseded_sibling_edges',
             self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+            0,
         )
         stats.stale_ttl_edges_invalidated = await _run_pass(
             '_invalidate_stale_superseded_ttl_edges',
             self._invalidate_stale_superseded_ttl_edges(result, group_id=group_id),
+            0,
         )
         stats.nodes_resolved = await _run_pass(
             '_dedup_episode_nodes',
             self._dedup_episode_nodes(result, group_id=group_id),
+            0,
         )
         stats.task_names_normalized = await _run_pass(
             '_normalize_task_node_names',
             self._normalize_task_node_names(result, group_id=group_id),
+            0,
+        )
+        stats.referent_stats = await _run_pass(
+            '_verify_episode_referents',
+            self._verify_episode_referents(
+                result, group_id=group_id, referents=referents,
+                content=content, referent_source=referent_source,
+            ),
+            ReferentStats(),
+        )
+        # EIGHTH, and constructed sequentially rather than alongside the seven
+        # above, because the coroutine's ARGUMENT is zeta's result: eta consumes
+        # `stats.referent_stats`, which does not exist until the line above has
+        # awaited. That data dependency is the whole ordering constraint, and
+        # writing it this way makes it un-reorderable by accident.
+        #
+        # `stats.referent_stats` is passed even on zeta's failure path, where
+        # `_run_pass` substituted an empty `ReferentStats` — eta then walks no
+        # findings and no-ops, which is the correct degradation: a repair pass
+        # must never act on evidence its detector failed to produce.
+        stats.repair_stats = await _run_pass(
+            '_repair_episode_referents',
+            self._repair_episode_referents(
+                stats.referent_stats, group_id=group_id,
+                episode_uuid=_episode_uuid_of(result),
+            ),
+            ReferentRepairStats(),
         )
         return stats
 
@@ -2748,6 +4974,84 @@ class MemoryService:
         """
         return dict(self._referent_source_counts)
 
+    def referent_finding_counts(self) -> dict[str, int]:
+        """How many verification findings each check has produced, ever.
+
+        The read side of ``_referent_finding_counts`` and the INV-4 storm escape
+        for the verification sub-pass (task 3671, PRD leaf zeta) — and the
+        surface leaf IOTA reads to turn findings into a rate. Deliberately
+        mirrors :meth:`referent_source_counts` rather than inventing a second
+        idiom in this file.
+
+        THE BUCKETS ARE TWO ORTHOGONAL AXES, NOT A PARTITION.
+        ``'set-membership'`` and ``'per-edge-pairing'`` answer "which check
+        fired" and do partition the findings between them (they are ordered, so
+        an endpoint failing both is counted once, under membership).
+        ``'unresolvable'`` answers the independent question "could a correct
+        target be determined at all", and increments ALONGSIDE whichever check
+        fired. So the three counts intentionally do not sum to the finding
+        total, and ``unresolvable`` is a numerator over the other two, not a
+        third category.
+
+        Every bucket exists from construction, so a reader never has to
+        distinguish "zero" from "absent". Returns a COPY, so a caller cannot
+        mutate the escape hatch's own state. Process-lifetime totals, never
+        reset — a monotonic counter a reader samples and differences, matching
+        the convention above.
+        """
+        return dict(self._referent_finding_counts)
+
+    def referent_repair_counts(self) -> dict[str, Any]:
+        """What the REPAIR sub-pass has done, ever, plus its live streaks.
+
+        The read side of ``_referent_repair_counts`` / ``_referent_repair_streaks``
+        and the INV-4 storm escape for the repair sub-pass (task 3672, PRD leaf
+        eta) — the third in the series, following
+        :meth:`referent_source_counts` and :meth:`referent_finding_counts`
+        rather than inventing a fourth idiom in this file.
+
+        IT DOES NOT MIRROR THEIR RETURN TYPE, and a caller must not assume it
+        does.  Both siblings return ``dict[str, int]``; this returns
+        ``dict[str, Any]``, because the repair sub-pass is the only one of the
+        three that has a GAUGE to report as well as counters, and eta specifies
+        its read side as ONE accessor carrying both.  Two consequences a
+        consumer has to know, because they are the ones that bite:
+
+        - ``sum(counts.values())``, and "emit every key as a gauge", work on
+          both siblings and BREAK here: ``'streaks'`` is a nested
+          ``dict[str, int]``, not an int.  Read the totals as
+          ``{k: v for k, v in counts.items() if k != 'streaks'}`` and iterate
+          the gauge separately.
+        - ``'streaks'`` shares the flat key space with the outcome buckets, so
+          the name is RESERVED.  A future sixth bucket called 'streaks' would
+          silently shadow the gauge rather than collide loudly.
+
+        THE FIVE TOTALS ARE PROCESS-LIFETIME AND MONOTONIC, never reset: a
+        reader samples and differences them. They partition eta's dispositions
+        the way :data:`REFERENT_REPAIR_OUTCOMES` describes —
+        ``flagged_unrepairable`` folds the two REFUSALS ('unrepairable',
+        'degenerate') while ``failed`` stays separate, because conflating an
+        infrastructure fault with a refusal would let a FalkorDB outage read as
+        a scanner regression in leaf iota's rate. ``repaired`` counts endpoints
+        actually MOVED, so it is a strict measure of what changed in the graph.
+
+        ``'streaks'`` IS A GAUGE, NOT A COUNTER, and the only entry here that
+        can go DOWN: group_id -> consecutive episodes whose repair pass moved
+        something, cleared by a pass that looked and found nothing. It is the
+        value the storm gate thresholds, exposed so an operator can see how
+        close a project is to the alarm rather than only learning at the breach.
+        A group appears only once a pass has produced evidence about it, so an
+        absent key means "no repair pass has drawn a conclusion here yet" —
+        distinct from a present ``0``, which means "checked, clean".
+
+        Returns a COPY at BOTH levels — the nested streaks dict included — so a
+        caller cannot mutate the escape hatch's own state. A read-only escape
+        hatch a consumer can write through is not an escape hatch.
+        """
+        counts: dict[str, Any] = dict(self._referent_repair_counts)
+        counts['streaks'] = dict(self._referent_repair_streaks)
+        return counts
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -2770,12 +5074,12 @@ class MemoryService:
         # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
         # row written before this feature executes byte-identically to today.
         #
-        # `referents` is the value leaf zeta will hand to
-        # `_verify_episode_referents(result, group_id=..., referents=referents)`
-        # INSIDE the identity-lock critical section below — deliberately inside,
-        # so no wrongly-attached state is ever externally visible between the
-        # write and its verification. Nothing else in this method changes, which
-        # is what keeps an old-format row byte-identical.
+        # `referents` is handed to `_reconcile_episode_identity` below, which
+        # forwards it to leaf zeta's `_verify_episode_referents` (task 3671) as
+        # the LAST sub-pass — INSIDE the identity-lock critical section,
+        # deliberately, so no wrongly-attached state is ever externally visible
+        # between the write and its verification. Nothing the BACKEND sees
+        # changes, which is what keeps an old-format row byte-identical.
         referents: ReferentSet
         referents, referent_source = _decode_referents(payload)
         # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
@@ -2825,9 +5129,6 @@ class MemoryService:
                 # That resolves epsilon's half of PRD open question 2 (which
                 # suggested `write_ops.params`) without pre-empting iota's
                 # read-path choice.
-                #
-                # `len(referents)` is also what keeps the decoded set a live
-                # local rather than dead code until leaf zeta lands.
                 payload={
                     'content': payload['content'][:200],
                     'group_id': payload.get('group_id'),
@@ -2847,7 +5148,17 @@ class MemoryService:
                 ),
             )
             reconcile_stats = await self._reconcile_episode_identity(
-                result, group_id=payload['group_id'],
+                result, group_id=payload['group_id'], referents=referents,
+                # BOTH halves of what zeta needs beyond the decoded set:
+                # `content` so it can re-derive the producer's ambiguity set
+                # (epsilon drops `.ambiguous` from the wire on purpose), and
+                # `referent_source` so an ambient `metadata['task_id']`
+                # declaration is never mistaken for evidence about which node an
+                # edge belongs on. The FULL content, not the 200-char journal
+                # excerpt above -- a truncated body would silently lose the
+                # second half of an ambiguity pair.
+                content=payload['content'],
+                referent_source=referent_source,
             )
             logger.debug(
                 'Reconciled episode identity for group_id=%r: %r',
@@ -3914,6 +6225,7 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         include_planned: bool = False,
+        anchor_topics: bool = True,
     ) -> list[MemoryResult]:
         """Unified search across both stores with automatic fan-out.
 
@@ -3944,6 +6256,41 @@ class MemoryService:
         ``degraded`` / ``failed_stores`` / ``failure_diagnostics`` and
         per-store error absorption are unchanged: a store that raises or times
         out is absorbed, and the surviving store's results are still returned.
+
+        ``anchor_topics`` (task 3111).  Topic-anchored recall is a PROMOTION,
+        not an addition: the returned window stays exactly ``limit`` long, so
+        each pinned canonical evicts the lowest-ranked genuine hit.  That trade
+        is right for an AGENT-FACING read, where surfacing a cluster's
+        canonical is worth one marginal tail result, and WRONG for a
+        correctness-critical machine consumer that treats the window as a
+        candidate set.  Pass ``anchor_topics=False`` from any caller which:
+
+          - thresholds or post-filters the window and would silently lose a
+            genuine candidate to displacement — the procedural_knowledge
+            near-duplicate WRITE guard (``server/tools.py``, which searches at
+            ``limit=5``) is the sharp case.  A pinned canonical deliberately
+            carries NO ``metadata['store_score']`` (see the score contract
+            below), so it can never qualify in ``find_near_duplicate_memory``:
+            every pin is a candidate slot spent on a record the guard must
+            ignore, shrinking an effective 5-candidate set toward 2 on exactly
+            the consolidated topics the guard exists to protect.
+          - is an IDEMPOTENCY check, where a displaced prior record reads as
+            "absent" and causes a duplicate WRITE
+            (``reconciliation/mem0_dedup.find_prior_memories``).
+          - sweeps for markers, where a displaced marker is silently "not
+            swept this cycle"
+            (``reconciliation/stages/task_knowledge_sync._query_stage2_flags``).
+
+        The default stays ``True`` because the agent-facing seams are the
+        majority of call sites and are the ones this task exists to fix; the
+        flag is an explicit OPT-OUT so a future machine consumer that forgets
+        it degrades to today's already-shipped behaviour rather than to a
+        silent correctness bug.  The pin is NOT relocated to the MCP boundary:
+        a non-suppressing pin is contractually placed at this seam (task 3111
+        scope note) so that ``stores=['mem0']`` / category-scoped agent
+        searches are anchored too, unlike the SUPPRESSING grouped read, which
+        PRD V2 bars from this seam precisely because it would blind these same
+        machine consumers with no way to opt out.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
@@ -4042,6 +6389,228 @@ class MemoryService:
                 for r in results:
                     if r.source_store == SourceStore.graphiti and r.category is None:
                         r.category = inferred
+
+        # ---- Topic-anchored canonical pin (task 3111) -------------------
+        # PLACEMENT IS LOAD-BEARING, in both directions:
+        #   * AFTER the category filter above, because that comprehension
+        #     REBINDS `results`, and a pinned mem0 row whose category fell
+        #     outside `cat_set` would simply be dropped there (only Graphiti
+        #     rows with category None get the escape hatch).
+        #   * AFTER the sort at the top of this tail, because `sort_key` orders
+        #     by -relevance_score and every RRF score is <= 1/61 — a pin with
+        #     no synthetic score could not survive a re-sort, and giving it one
+        #     is forbidden (see the store_score contract below).
+        #   * BEFORE `final = results[:limit]`, so the pinned record lands
+        #     INSIDE the returned window and the limit contract is preserved by
+        #     construction rather than by arithmetic.
+        # GATE: read LIVE off the shared config object on every call, never
+        # captured at construction — that live read is what makes the knob
+        # genuinely green-tier hot-reloadable (config/reload.py's reload-safety
+        # rule); a construction-captured value would not observe an in-place
+        # reload and would have to stay restart-only.
+        # GATE 1 (per-call): `anchor_topics=False` is the caller asserting it
+        # reads this window as a CANDIDATE SET, not as a presentation — see the
+        # docstring.  Checked FIRST and cheaply, so an opted-out caller pays
+        # neither the config read nor the harvest.  Gate 2 is the live,
+        # green-tier config knob.
+        if anchor_topics and resolve_topic_anchor_enabled(self):
+            try:
+                # HARVEST FROM THE WINDOW THE CALLER WILL ACTUALLY SEE, not from the
+                # full merged list.  `results` here still holds every merged hit, and
+                # the slice to `limit` happens below — so harvesting from all of it
+                # would let a topic carried ONLY by an out-of-window record pull in a
+                # canonical that then DISPLACES an in-window record the caller would
+                # otherwise have been shown.  That inverts the contract both
+                # agent-facing docstrings state ("finding any member of a consolidated
+                # cluster also surfaces that topic's canonical"): the agent would pay
+                # the displacement for a cluster it never found a member of.  It also
+                # spends a Qdrant round-trip per invisible topic on the hot path.
+                # NAMED `topics_to_anchor`, not `anchor_topics`: the latter is now
+                # the boolean OPT-OUT PARAMETER of this method, and reusing it here
+                # would shadow it — silently making the gate above unreachable to any
+                # later read of the flag within this block.
+                topics_to_anchor = extract_anchor_topics(
+                    results[:limit], max_topics=_MAX_ANCHOR_TOPICS
+                )
+                # FAN OUT, don't serialize.  The lookups are fully independent reads
+                # (`pinned_ids` is a post-hoc dedup and `pin_at` is pure ordering —
+                # neither is an input to any lookup), and this seam is the hottest read
+                # path in the system: every agent search runs it.  (The
+                # procedural_knowledge near-dup pre-check does NOT — it opts out via
+                # `anchor_topics=False` — so it pays none of this.)  Serialized,
+                # the cap would add up to
+                # _MAX_ANCHOR_TOPICS round-trips of latency instead of one round-trip's
+                # worth.  No semaphore, unlike grouped_read._bounded_gather: that
+                # module's fan-out is sized by the CALLER's result list (up to the
+                # search tool's 1000-hit clamp), whereas this one is bounded at 3 by
+                # _MAX_ANCHOR_TOPICS before it starts.
+                payload_sets = await gather_collect(
+                    self.get_memories_by_metadata(
+                        project_id,
+                        {'topic': topic, 'canonical': True},
+                        limit=_ANCHOR_SCROLL_LIMIT,
+                    )
+                    for topic in topics_to_anchor
+                )
+                for payloads in payload_sets:
+                    # gather_collect CAPTURES per-item exceptions rather than raising
+                    # (its documented Pass-2 "caller classifies" contract).  Re-raise
+                    # the first so the two-tier band below classifies a fan-out failure
+                    # exactly as it classified a sequential await: a wiring bug stays
+                    # loud, a backend fault still fails open.
+                    if isinstance(payloads, Exception):
+                        raise payloads
+
+                # BUILD INTO A LOCAL COPY and rebind only on FULL success, so the
+                # fail-open below can honestly promise the un-pinned list.  Mutating
+                # `results` in place would leave the first topic's pin applied when the
+                # second one raised — a partially-transformed list is not the "returning
+                # un-pinned results" the WARNING claims.
+                pinned = list(results)
+                # Two distinct topics can legitimately resolve to the SAME canonical, so
+                # pinned ids are tracked across the loop: without this the second topic
+                # would pin an already-pinned record a second time.
+                pinned_ids: set[str] = set()
+                # Flags are applied only once the whole loop has succeeded: setting
+                # `topic_anchored` on a moved result mutates an object SHARED with
+                # `results`, so an eager write would survive the fail-open rebind and
+                # leak a half-applied pin into the "untouched" list.
+                to_flag: list[MemoryResult] = []
+                # Pins accumulate in TOPIC-RANK order: each lands just after the
+                # previously-pinned ones rather than at index 0, so the canonical of the
+                # highest-ranked topic stays ahead of the next topic's.  A plain
+                # insert(0) would emit them in reverse.  Every slot in [0, pin_at) is a
+                # pin whose id is already in `pinned_ids`, so the move-to-front branch
+                # below can only ever find `existing >= pin_at` and its pop cannot
+                # disturb them.
+                pin_at = 0
+                for payloads in payload_sets:
+                    canonical = select_canonical_payload(
+                        payloads,
+                        allowed_categories=set(categories) if categories else None,
+                        include_planned=include_planned,
+                    )
+                    if canonical is None:
+                        continue
+                    canonical_id = canonical.get('id', '')
+                    if canonical_id in pinned_ids:
+                        continue
+                    pinned_ids.add(canonical_id)
+
+                    # MOVE, don't rebuild, when the canonical is already among the
+                    # cosine results — which is the measured inversion itself: it IS a
+                    # genuine match, just the worst one in its own cluster, so it sits
+                    # at the bottom of the window or just outside it.  Its
+                    # relevance_score and its metadata (including the real
+                    # metadata['store_score'] cosine `_search_mem0` stamped) are honest
+                    # measurements; replacing them with a freshly-built zero-scored
+                    # result would destroy signal every score-reading consumer depends
+                    # on, the near-duplicate write guard first among them.  Only the
+                    # ORDER changes, plus the topic_anchored flag.
+                    existing = next(
+                        (i for i, r in enumerate(pinned) if r.id == canonical_id), None
+                    )
+                    if existing is not None:
+                        moved = pinned.pop(existing)
+                        to_flag.append(moved)
+                        pinned.insert(pin_at, moved)
+                        pin_at += 1
+                        continue
+
+                    payload_meta = canonical.get('metadata') or {}
+                    # WIRE SHAPE: partition the raw payload and put only the CUSTOM half
+                    # on the wire, exactly as grouped_read._promoted_parent does for the
+                    # structurally identical raw-payload -> search-hit conversion.
+                    # split_managed_metadata is the DECIDED HOME for that partition
+                    # (INV-5), so this reuses it rather than re-deriving the key set.
+                    # Forwarding the raw payload would give ONE canonical two different
+                    # wire shapes depending on how it was reached — pinned vs. direct
+                    # hit — leaking hash/user_id/role to the MCP consumer and emitting
+                    # the body text TWICE (once as `content`, once as metadata['data']),
+                    # which also works against this arm's measured 1070 tokens/query on
+                    # the hottest read path in the system.
+                    #
+                    # `content` still reads the RAW payload: 'data' is a mem0-MANAGED
+                    # key, so it lands in `managed`, never in the custom half that goes
+                    # on the wire.  `created_at` comes off the scroll dict's top-level
+                    # key — get_memories_by_metadata's documented return shape — which
+                    # scroll_by_metadata lifts from that same managed payload key.
+                    managed, custom = split_managed_metadata(dict(payload_meta))
+                    created_at = canonical.get('created_at')
+                    if not isinstance(created_at, str):
+                        created_at = managed.get('created_at')
+                    # SCORE CONTRACT: the injected anchor must never gain a
+                    # 'store_score' — note the split above cannot introduce one,
+                    # since a raw scroll payload has no such key and only
+                    # _search_mem0 ever stamps it.  The
+                    # write-time near-duplicate guard reads the cosine from
+                    # metadata['store_score'] and qualifies on `>= threshold`
+                    # (near_duplicate_guard.find_near_duplicate_memory :114-121, via
+                    # _cosine_of :71-84); a MISSING cosine means "not comparable" and can
+                    # never qualify at any threshold, while a synthetic one would
+                    # hard-block EVERY procedural_knowledge write on a consolidated
+                    # topic — turning a retrieval fix into a write outage on precisely
+                    # the topics it exists to help.  relevance_score is NOT the cosine
+                    # since task 3658 (it is an ordinal RRF value, rank-1 ~ 0.0164), so
+                    # setting it is not a substitute either.  The pin is by ORDER ONLY.
+                    #
+                    # Order alone SUFFICES because nothing downstream re-sorts it: the
+                    # sort in this method already ran, above, and the only other
+                    # transform between here and the agent —
+                    # grouped_read.group_search_results at the MCP boundary — is
+                    # append-only, with no sort() and no truncation of its own.  A
+                    # record placed at index 0 here is still at index 0 when the agent
+                    # reads it.  (Its one way to lose slot 0 is _suppress_child folding
+                    # a CHILD-shaped hit into its parent, which is why
+                    # select_canonical_payload excludes child-shaped payloads outright
+                    # rather than trusting writes to be well-formed.)
+                    pinned.insert(pin_at, MemoryResult(
+                        id=canonical_id,
+                        content=_mem0_content(payload_meta),
+                        category=_mem0_category(custom),
+                        source_store=SourceStore.mem0,
+                        relevance_score=0.0,
+                        metadata=custom,
+                        created_at=created_at if isinstance(created_at, str) else None,
+                        topic_anchored=True,
+                    ))
+                    pin_at += 1
+
+                # COMMIT POINT.  Nothing above this line has touched `results` or any
+                # object reachable from it, so every `raise` between here and the `try`
+                # leaves the un-pinned list exactly as the sort/filter tail produced it.
+                for result in to_flag:
+                    result.topic_anchored = True
+                results = pinned
+            except (TypeError, AttributeError, NameError):
+                # A wiring/programming bug — e.g. a future signature change to
+                # get_memories_by_metadata or to the topic_anchor selectors —
+                # rather than a transient backend failure.  Re-raise so it
+                # surfaces loudly with a traceback instead of being absorbed
+                # into fail-open, which would quietly leave the transform inert
+                # in production behind nothing but a WARNING log.  Same two-tier
+                # idiom as the near-duplicate pre-check in server/tools.py.
+                raise
+            except Exception:
+                # FAIL-OPEN. Anchoring is a retrieval ENRICHMENT, so a failure
+                # to enrich must never become a failure to RETRIEVE.  This seam
+                # is shared by every MemoryService.search call site, so without
+                # this one Qdrant read timeout would break every search in the
+                # system — and get_memories_by_metadata genuinely PROPAGATES a
+                # TimeoutError (unlike Mem0Backend.search, which swallows into
+                # {}), so that is a live path, not a hypothetical.
+                #
+                # `results` is left exactly as the sort/filter tail produced it
+                # — including its ORDER and every result's topic_anchored flag —
+                # because the pins are built into a local copy and both the copy
+                # and the flags are committed in one step at the end of the
+                # `try`.  An ALL-OR-NOTHING pin, not a partial one: a list
+                # carrying the first topic's pin and not the second's would be a
+                # third state neither this WARNING nor any caller expects.
+                logger.warning(
+                    'topic-anchored recall failed; returning un-pinned results',
+                    exc_info=True,
+                )
 
         degraded = bool(failed_stores)
         final = results[:limit]
@@ -4208,10 +6777,7 @@ class MemoryService:
             if meta.get('planned') is True and not include_planned:
                 continue
 
-            category = None
-            if 'category' in meta:
-                with contextlib.suppress(ValueError):
-                    category = MemoryCategory(meta['category'])
+            category = _mem0_category(meta)
 
             # Rank over SURVIVORS only (task 3658) — a result skipped above must
             # not consume a rank, since RRF maps rank directly to score.
@@ -4682,13 +7248,7 @@ class MemoryService:
         payload = await self.mem0.get_point_by_id(memory_id, scope)
         if payload is None:
             return None
-        content = ''
-        for key in _MEM0_CONTENT_KEYS:
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                content = value
-                break
-        return {'id': memory_id, 'content': content, 'metadata': payload}
+        return {'id': memory_id, 'content': _mem0_content(payload), 'metadata': payload}
 
     async def get_mem0_deletion_tombstone(
         self,

@@ -25,6 +25,15 @@ label would let a healthy root's success clear a broken root's streak and
 re-arm its opening WARNING every poll cycle. ``fetch_external_statuses`` is
 parameterized by a ``deps`` list rather than a root, so its fixed label is
 already a correct single key.
+
+Caching: ``fetch_tasks`` and ``fetch_statuses`` are both cached, at
+deliberately different TTLs (20 s and 5 s). ``fetch_tasks``'s key is the pair
+**(project_root, narrowing)** rather than the root alone — see
+:func:`_fetch_tasks_cache_key`. Four of its five callers need the whole tree
+while ``active_tasks`` narrows, so a root-only key would let one caller's
+status-filtered result be served to the others for up to the TTL window.
+``fetch_statuses`` takes no narrowing arguments, so the root alone IS its
+whole key. ``fetch_external_statuses`` is uncached and returns live data.
 """
 
 from __future__ import annotations
@@ -71,15 +80,137 @@ from dashboard.data.utils import resolve_now
 # this inner cache.  Worst-case combined staleness ≈ caller TTL + inner TTL
 # ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
 # monitoring view where brief staleness is preferable to MCP hammering.
+DEFAULT_PER_CALL_TIMEOUT = 2.0
+"""Per-HTTP-request budget for every ``fetch_tasks`` MCP call.
+
+Deliberately shares its public name with
+:data:`dashboard.data.task_runtime.DEFAULT_PER_CALL_TIMEOUT` so the idiom is
+recognisable across probe callers, and is the single source of the
+per-request term that ``active_tasks``'s whole-handler budget invariant
+reads (it must never be restated as a literal there).
+
+Strictly tighter than :func:`dashboard.data.memory.mcp_tool_call`'s own 10 s
+default: this seam only ever narrows a budget, never widens one.
+"""
+
 _FETCH_TASKS_TTL_SECONDS = 20.0
 _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
 )
 
+# Negative (offline-marker) cache.  ``cache_ok`` on the positive cache stores
+# successes ONLY, which made failure the expensive path: a healthy root rides
+# the 20 s TTL while a broken one re-walks its whole tree on every UI poll.
+#
+# 5.0 s is picked against the two real clocks either side of it:
+#   * SHORTER than _FETCH_TASKS_TTL_SECONDS (20 s), so an outage is re-probed
+#     several times per positive-cache window and recovery is noticed quickly;
+#   * LONGER than data.js's POLL_INTERVAL_MS (3 s), so a broken root costs at
+#     most one tree-walk attempt per two polls instead of one per poll.
+#
+# A SECOND TTLCache instance rather than a change to TTLCache itself: the
+# class carries exactly one TTL per instance and sits on eight other call
+# sites, so parameterising it would be the larger and less obviously correct
+# change.  No mcp_fanout change is required.
+#
+# The two caches CAN both hold a fresh entry for one key, so the read order
+# between them is load-bearing.  The negative lookup sits outside the positive
+# cache's per-key lock, and ``TTLCache`` documents that a ``cache_ok``-rejected
+# value stores nothing and lets "the next lock-queued waiter run its own
+# refresh in turn" — so with two concurrent callers for the same key (the
+# routine case: app._load_task_cards, data.orchestrator, data.merge_queue and
+# data.burndown all fetch the same unnarrowed key on the same poll) waiter A's
+# failure can write a 5 s marker while waiter B's success writes a 20 s
+# positive entry.  ``fetch_tasks`` therefore prefers a fresh POSITIVE entry
+# over a fresh marker: a demonstrated success outranks a retry-suppression
+# hint, and serving the marker there would put a false offline banner over
+# rows that had already loaded.  Both caches share
+# :func:`_fetch_tasks_cache_key`, so a recovered root also repopulates the
+# positive cache on its next attempt.
+_FETCH_TASKS_NEGATIVE_TTL_SECONDS = 5.0
+_fetch_tasks_negative_cache: TTLCache[dict] = TTLCache(
+    ttl_seconds=lambda: _FETCH_TASKS_NEGATIVE_TTL_SECONDS
+)
+
+
+# ---------------------------------------------------------------------------
+# Per-project_root TTL cache for fetch_statuses
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS.  ``fetch_statuses`` was the one per-project MCP call in the
+# post-narrowing design with no cache, and ``active_tasks._shape_one_project``
+# issues it UNCONDITIONALLY (it is ``_resolve_deps``' only bounded fallback,
+# not merely done_count's source).  Because BOTH ``/api/v2/dashboard/tasks``
+# and ``/api/v2/dashboard/scheduler`` route through
+# ``collect_tasks_with_counts``, and ``data.js`` polls both every 3 s, that
+# meant two full-population ``get_statuses`` reads per root per poll — on a
+# nine-root config ~360 uncached status reads a minute.  The narrowing cut
+# wire BYTES dramatically and would have raised backend QUERY count, which
+# cuts against this change's own goal of bounding dashboard->MCP cost.
+#
+# 5.0 s is picked against the same two clocks as the negative cache above:
+#   * STRICTLY SHORTER than _FETCH_TASKS_TTL_SECONDS (20 s), so the status map
+#     is always the fresher half of any row+map pair (done_count can be newer
+#     than the rows, never staler) — see fetch_tasks' "Data consistency" note;
+#   * LONGER than data.js's POLL_INTERVAL_MS (3 s), so the two endpoints'
+#     duplicate read within one poll collapses to one call, and consecutive
+#     polls of one endpoint collapse too.
+#
+# NO negative cache, deliberately, unlike fetch_tasks: a failed get_statuses
+# costs one bounded DEFAULT_PER_CALL_TIMEOUT per URL rather than a full
+# tree-walk, so failure is not the expensive path here; and its offline marker
+# is what puts a root in TASKS_COUNT_UNKNOWN_PROJECTS, a user-visible
+# degradation that should clear on the first poll after recovery rather than
+# up to 5 s later.
+_FETCH_STATUSES_TTL_SECONDS = 5.0
+_fetch_statuses_cache: TTLCache[dict] = TTLCache(
+    ttl_seconds=lambda: _FETCH_STATUSES_TTL_SECONDS
+)
+
 
 def _fetch_tasks_cache_clear() -> None:
-    """Clear the per-project_root fetch_tasks TTL cache (test/admin hook)."""
+    """Clear BOTH fetch_tasks TTL caches, positive and negative (test/admin hook)."""
     _fetch_tasks_cache.clear()
+    _fetch_tasks_negative_cache.clear()
+
+
+def _fetch_statuses_cache_clear() -> None:
+    """Clear the fetch_statuses TTL cache (test/admin hook).
+
+    Deliberately NOT folded into :func:`_fetch_tasks_cache_clear`: that hook's
+    contract ("both fetch_tasks caches") is asserted by name in the suite, and
+    a caller clearing one seam should not silently reach into the other.
+    """
+    _fetch_statuses_cache.clear()
+
+
+def _fetch_tasks_cache_key(
+    project_root_str: str,
+    statuses: list[str] | None,
+    page_size: int | None,
+    offset: int,
+) -> str:
+    """Compose the ``_fetch_tasks_cache`` key for one (root, narrowing) pair.
+
+    The key must cover the narrowing arguments, not just the root: only ONE
+    of ``fetch_tasks``' five callers narrows, so a root-only key would let
+    ``active_tasks``' status-filtered entry be served to the four full-tree
+    callers (``app._load_task_cards``, ``data.orchestrator``,
+    ``data.merge_queue``, ``data.burndown``) — silently truncating them for
+    up to the TTL window, and doing so non-deterministically depending on
+    which caller raced in first.
+
+    ``statuses=None`` renders as ``*`` and is therefore distinct from
+    ``statuses=[]``, which renders as the empty string: the tool treats them
+    as opposite requests (whole tree vs no tasks at all), so collapsing them
+    onto one key would serve an empty list as if it were the full tree.
+
+    A ``\x1f`` (ASCII unit separator) delimits the statuses so a status
+    string containing the field separators cannot forge another key.
+    """
+    statuses_part = '*' if statuses is None else '\x1f'.join(statuses)
+    page_part = '*' if page_size is None else str(page_size)
+    return f'{project_root_str}|s={statuses_part}|p={page_part}|o={offset}'
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -188,17 +319,41 @@ async def fetch_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: str | bytes | os.PathLike[str],
+    *,
+    statuses: list[str] | None = None,
+    page_size: int | None = None,
+    offset: int = 0,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the dashboard-shaped task list for *project_root* via MCP.
 
     Returns a ``list[dict]`` on success, or an offline marker
     ``{'offline': True, 'error': str}`` if every configured server fails.
 
-    Results are cached per *project_root* for ``_FETCH_TASKS_TTL_SECONDS``
-    (~20 s) to avoid hammering the MCP server on every render.  All statuses
-    (including done tasks and their completed timestamps) are cached unchanged.
-    Offline/error markers are never cached so a transient failure does not pin
-    empty results for the TTL window.
+    Results are cached per **(project_root, narrowing)** — see
+    :func:`_fetch_tasks_cache_key` — for ``_FETCH_TASKS_TTL_SECONDS`` (~20 s)
+    to avoid hammering the MCP server on every render.  Whatever a given
+    narrowing returns is cached unchanged, and an unnarrowed entry and a
+    narrowed entry for the same root are INDEPENDENT — which is what keeps a
+    narrowed read from serving a status-filtered subset to the full-tree
+    callers.  Offline/error markers are never cached so a transient failure
+    does not pin empty results for the TTL window.
+
+    The key space is NOT a small fixed set, and this docstring previously
+    claimed it was.  ``active_tasks``' terminal-window call passes
+    ``offset=max(0, n_terminal - window)``, computed from a live task count
+    that grows every time a task completes, so a fresh key is minted on every
+    completion (``...|p=400|o=3601``, then ``o=3602``, ...).  Each retired key
+    held a 400-row list — rows carrying description/details/metadata — plus an
+    ``asyncio.Lock``, forever (task 3857 review).
+
+    Quantizing the offset does NOT fix this and was rejected: ``n_terminal``
+    grows monotonically, so quantized offsets do too — that slows the leak by
+    the quantum, it does not bound it.  ``TTLCache`` now evicts entries past
+    a multiple of the TTL (see :meth:`TTLCache._evict_expired`), which bounds
+    the resident set to "keys requested within the eviction horizon" no matter
+    how many distinct keys are ever used.  That is the real invariant, it lives
+    where the store lives, and it holds for every ``TTLCache`` caller.
 
     **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
     every call, so list-level mutations (``result.clear()``, ``result.append()``)
@@ -215,19 +370,82 @@ async def fetch_tasks(
     a fresh attempt is made.  This delays outage detection by up to ~20 s —
     intentional for a monitoring view (stale data preferable to a blank tab).
 
-    **Data consistency:** ``fetch_statuses`` is uncached and returns live data;
-    callers that combine a cached task tree (this function) with a live status
-    map (``fetch_statuses``) in the same render may observe transiently
-    inconsistent rows for up to ~20 s (e.g. a task listed as in-progress in
-    the tree but already done per the status map).  The pre-existing 10 s
-    caller caches had this property at a narrower window; the 20 s inner cache
-    widens it uniformly across all callers.
+    **Negative caching:** once that entry does expire and the attempt fails,
+    the resulting offline marker is held for
+    ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS`` (~5 s) under the SAME key, so a
+    broken root stops being the expensive path.  The marker is still returned
+    to every caller in the window — the retry is suppressed, the degradation
+    signal is not — and the negative entry is per (project_root, narrowing),
+    so one failing read never blinds a healthy sibling root or a differently
+    narrowed read of the same root.  A fresh POSITIVE entry outranks the
+    marker, so a success that raced a failure is served rather than shadowed;
+    the marker still suppresses the retry either way.
+
+    **Data consistency:** ``fetch_statuses`` is cached too, but at a much
+    shorter TTL (``_FETCH_STATUSES_TTL_SECONDS``, ~5 s), so callers that
+    combine a cached task tree (this function) with a status map in the same
+    render may observe transiently inconsistent rows for up to ~20 s (e.g. a
+    task listed as in-progress in the tree but already done per the status
+    map).  The status map is the FRESHER of the two by construction — its TTL
+    is strictly shorter — so the skew never runs the other way.  The
+    pre-existing 10 s caller caches had this property at a narrower window;
+    the 20 s inner cache widens it uniformly across all callers.
+
+    **Server-side narrowing.** *statuses*, *page_size* and *offset* are
+    forwarded to the ``get_tasks`` MCP tool. Each is added to the arguments
+    dict only when actually requested, so a caller that narrows nothing sends
+    a dict byte-identical to the pre-narrowing shape — the four full-tree
+    callers (``app._load_task_cards``, ``data.orchestrator``,
+    ``data.merge_queue``, ``data.burndown``) are unaffected.
+
+    What the substrate does with each, established by tracing
+    ``server/tools.py::get_tasks`` → ``TaskInterceptor.get_tasks`` →
+    ``SqliteTaskBackend._get_tasks_internal`` for task 3857:
+
+    * *statuses* is a REAL server-side row filter — it becomes
+      ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with it cuts
+      backend work, not just wire bytes. ``None`` (the default) means "no
+      filter"; an EMPTY LIST is a valid, distinct "return nothing" request and
+      is therefore sent rather than dropped. A bare string is rejected
+      server-side with a ``ValidationError``.
+    * *page_size*/*offset* are a POST-FETCH in-memory slice in the tool body,
+      over a list already ordered by ascending ``id``. They cut wire bytes but
+      not backend work, and ascending id is their only ordering key — which is
+      why reaching the high-id end requires a computed *offset* rather than a
+      ``LIMIT``. *offset* is meaningless on its own and is omitted from the
+      wire unless *page_size* is set.
+
+    Two substrate gaps bound what any caller here can do, and are recorded as
+    fused-memory-side follow-up rather than faked client-side: ``get_tasks``
+    offers NO field/column projection (the backend is a hardcoded
+    ``SELECT *`` feeding a fixed 14-key row, so the heavy
+    ``description``/``details``/``testStrategy``/``metadata`` fields cannot be
+    dropped from the dashboard), and NO ``ORDER BY updated_at`` (so "the N
+    most recently updated" is not expressible server-side).
+
+    **Per-request budget.** *timeout* is threaded into
+    :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the
+    authority: it is a PER-HTTP-REQUEST budget bounding connect/read/write and
+    pool acquisition, NOT a whole-operation bound. A cold session performs
+    three posts (``initialize``, ``notifications/initialized``,
+    ``tools/call``), so the worst case here is roughly ``3 * timeout`` plus
+    the server's think time — and that is before the fan-out tries a second
+    URL. A caller needing a hard bound must still wrap this in
+    ``asyncio.wait_for``; ``active_tasks.collect_tasks_with_counts`` does, and
+    the two layers are complementary rather than redundant.
     """
     project_root_str = str(project_root)
 
+    arguments: dict = {'project_root': project_root_str}
+    if statuses is not None:
+        arguments['statuses'] = statuses
+    if page_size is not None:
+        arguments['page_size'] = page_size
+        arguments['offset'] = offset
+
     async def _call(url: str) -> list[dict]:
         result = await mcp_tool_call(
-            client, url, 'get_tasks', {'project_root': project_root_str},
+            client, url, 'get_tasks', arguments, timeout=timeout,
         )
         if 'error' in result and 'tasks' not in result:
             raise ValueError(str(result.get('error')))
@@ -248,10 +466,40 @@ async def fetch_tasks(
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
+    key = _fetch_tasks_cache_key(project_root_str, statuses, page_size, offset)
+
+    # A fresh negative entry short-circuits the attempt.  The marker is still
+    # RETURNED, so degradation stays exactly as visible to the caller as it was
+    # before — only the retry is suppressed.
+    #
+    # UNLESS a fresh positive entry also exists (see the negative-cache note
+    # above: a concurrent failure+success pair leaves both fresh).  Then fall
+    # through and serve the data: the marker exists to suppress a RETRY, not to
+    # withhold a result already in hand, and reporting a root offline while
+    # holding fresh rows for it is the false-banner failure this whole seam is
+    # meant to avoid.  Falling through costs no MCP call — ``get_or_refresh``
+    # returns the same fresh entry this check just saw.  If it expires in the
+    # gap the worst case is one extra attempt, which is strictly better than a
+    # wrong answer.
+    suppressed = _fetch_tasks_negative_cache.get_fresh(key)
+    if suppressed is not None and _fetch_tasks_cache.get_fresh(key) is None:
+        return suppressed
+
     result = await _fetch_tasks_cache.get_or_refresh(
-        project_root_str, _refresh, cache_ok=lambda v: isinstance(v, list),
+        key, _refresh, cache_ok=lambda v: isinstance(v, list),
     )
-    return list(result) if isinstance(result, list) else result
+    if not isinstance(result, list):
+        # Record the offline marker.  ``get_or_refresh`` is the store path
+        # because ``TTLCache`` exposes no bare setter and this needs no
+        # ``mcp_fanout`` change; the default always-true ``cache_ok`` keeps it,
+        # and its per-key lock makes a concurrent second failure reuse the
+        # first marker rather than race it.
+        async def _mark() -> dict:
+            return result
+
+        await _fetch_tasks_negative_cache.get_or_refresh(key, _mark)
+        return result
+    return list(result)
 
 
 async def fetch_external_statuses(
@@ -294,6 +542,8 @@ async def fetch_statuses(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: str | bytes | os.PathLike[str],
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> Mapping[Any, Any]:
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
@@ -309,12 +559,37 @@ async def fetch_statuses(
     this note lives on ``collect_done_counts``; keep the two in step.)
 
     Returns ``{'offline': True, 'error': str}`` if every server fails.
+
+    **Caching.** Successful reads are held for
+    ``_FETCH_STATUSES_TTL_SECONDS`` (~5 s) in a per-``project_root`` TTL cache
+    — see that constant for why this call, of all of them, needs one and why
+    5 s is the number.  The key is the root ALONE: unlike ``fetch_tasks`` this
+    function takes no narrowing arguments, so there is no second dimension to
+    collapse.  *timeout* is deliberately NOT part of the key — it is a
+    per-request budget, not a narrowing argument, so two callers passing
+    different budgets are asking for the identical map and either may serve
+    the other.  Offline markers are NOT cached (``cache_ok``), so a broken
+    root is re-probed on every poll and recovery is noticed immediately.  The
+    returned mapping is a shallow COPY, so a caller mutating it cannot poison
+    the entry for the next one.
+
+    **Per-request budget.** *timeout* is threaded into
+    :func:`dashboard.data.memory.mcp_tool_call` exactly as ``fetch_tasks``
+    threads its own, and shares ``fetch_tasks``'s default so the two agree by
+    construction.  This is not decoration: ``get_statuses`` is one of the
+    three calls enumerated in ``active_tasks._PER_PROJECT_MCP_CALLS``, whose
+    budget invariant (``DEFAULT_PER_CALL_TIMEOUT * 3 <=
+    _TASKS_PER_PROJECT_BUDGET``) is only a true statement about the shipped
+    system if every enumerated call actually carries the term.  Left on
+    ``mcp_tool_call``'s 10 s default, this one call could alone exceed the
+    per-project budget the arithmetic claims to bound.
     """
     project_root_str = str(project_root)
 
     async def _call(url: str) -> dict[int, str]:
         result = await mcp_tool_call(
             client, url, 'get_statuses', {'project_root': project_root_str},
+            timeout=timeout,
         )
         if 'error' in result and 'statuses' not in result:
             raise ValueError(str(result.get('error')))
@@ -328,9 +603,17 @@ async def fetch_statuses(
                 continue
         return out
 
-    return await first_success(
-        config.fused_memory_urls,
-        _call,
-        log_label=fanout_label('fetch_statuses', project_root_str),
-        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+    async def _refresh() -> dict:
+        return await first_success(
+            config.fused_memory_urls,
+            _call,
+            log_label=fanout_label('fetch_statuses', project_root_str),
+            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+        )
+
+    result = await _fetch_statuses_cache.get_or_refresh(
+        project_root_str,
+        _refresh,
+        cache_ok=lambda v: isinstance(v, dict) and not v.get('offline'),
     )
+    return dict(result) if isinstance(result, dict) else result

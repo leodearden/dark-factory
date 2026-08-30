@@ -15,51 +15,14 @@ from __future__ import annotations
 
 import html.parser
 import re
+from typing import NamedTuple
 
 import pytest
-from starlette.testclient import TestClient
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def tab_escalations_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalations.jsx').text
 
 
 @pytest.fixture(scope='module')
@@ -84,11 +47,8 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     POSITION also matters, callers additionally anchor to the accessing
     expression (`lim.alpha`, `storm.alarm_count`, ...) rather than the bare
     name.
-
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_memory_evals_jsx_body)
+    return strip_js_comments(tab_memory_evals_jsx_body)
 
 
 @pytest.fixture(scope='module')
@@ -121,11 +81,8 @@ def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
     it, so a whole-file grep for a parity state is satisfied by a MENTION in
     the comment above the table.  `alarmed_open` and `clear` were once
     asserted present by exactly such a grep, matching only prose.
-
-    Safe to strip naively for the same reason: no `//` inside a string
-    literal and no regex literals in the source.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', memory_evals_fmt_js_body)
+    return strip_js_comments(memory_evals_fmt_js_body)
 
 
 # ---------------------------------------------------------------------------
@@ -166,47 +123,6 @@ def _extract_df_data_block(src: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +182,83 @@ def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
                 [p.strip() for p in params_text.split(',') if p.strip()],
             )
     return best
+
+
+# ---------------------------------------------------------------------------
+# Helper: find the JSX opening tag that contains a given attribute
+# ---------------------------------------------------------------------------
+
+
+def _jsx_open_tag_end(src: str, start: int) -> int:
+    """Return the index of the ``>`` closing the opening tag that begins at ``start``.
+
+    ``-1`` when ``start`` does not begin one.  Quote- and brace-aware, which is
+    the whole point: a ``>`` or ``<`` inside an attribute EXPRESSION
+    (``onClick={() => ...}``, ``aria-label={points > 1 ? ... : ...}``) or inside
+    a string/template literal is an operator, not the end of the tag.
+    """
+    depth = 0  # brace depth inside attribute expressions
+    quote = ''  # active string/template delimiter
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = ''
+        elif c in '"\'`':
+            quote = c
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return -1  # started inside an expression, not at a tag
+        elif depth == 0:
+            if c == '>':
+                return i
+            if c == '<':
+                return -1  # a new tag opened first, so this was not one
+        i += 1
+    return -1
+
+
+def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
+    """Return the text of the single JSX opening tag containing ``needle``.
+
+    ``None`` when ``needle`` is absent or sits outside any opening tag.  Only
+    the FIRST occurrence of ``needle`` is considered; callers pass a unique
+    anchor (a ``data-testid=``).
+
+    WHY A WALK AND NOT A REGEX SPAN.  The obvious spelling —
+    ``<[^<>]*<needle>[^<>]*>`` — matches an opening tag only while no attribute
+    expression inside it contains a bare ``<`` or ``>``.  That is a documented
+    false-FAILURE trap, not a theoretical one: measured on the shipped
+    drawn-chart tag, adding an ordinary ``onClick={() => onNavigate(m)}`` or
+    ``aria-label={points > 1 ? ... : ...}`` makes the search return ``None``,
+    so the test fails claiming the element is GONE — against behaviourally
+    correct code.  The previous spelling pushed that onto future authors as a
+    style rule ("hoist comparisons into locals"); this walks the tag instead,
+    the way ``extract_function_body`` and ``_enclosing_function`` already walk
+    braces rather than spanning them.
+
+    Confinement to ONE opening tag is preserved, and is what gives callers
+    their meaning: a mention in a neighbouring element cannot satisfy a check
+    made against the returned text.  Attribute ORDER is not constrained — the
+    tag is taken whole, from its ``<`` to its matching ``>``.
+    """
+    idx = src.find(needle)
+    if idx == -1:
+        return None
+    # Innermost first: the closest tag start before the needle whose span
+    # actually reaches past it.
+    for m in reversed(list(re.finditer(r'<[A-Za-z_$/]', src[:idx]))):
+        end = _jsx_open_tag_end(src, m.start())
+        if end >= idx + len(needle):
+            return src[m.start() : end + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1231,13 +1224,23 @@ _FORBIDDEN_PATTERNS: tuple[
         0,
     ),
     (
-        # Consumed at TWO render sites (the gap-suppression test and the
+        # Consumed at TWO render sites (the holed-trend test and the
         # empty-series one).  Tabling it also collapses a spelling that was
         # written out twice and could have been hardened in only one place.
+        #
+        # The `(?![^\n]*\bgaps\b)` lookahead this pattern used to carry is GONE
+        # (task 3490).  It existed to spare the one legitimate inline spelling
+        # of the OLD suppression gate, `{Chart && ... gaps ...}`, back when a
+        # hole vetoed the chart.  Option (b) retired that veto: a holed series
+        # is now DRAWN by the hole-aware primitive, the gate is a named
+        # `plottable` local, and no inline `{Chart &&` render guard is
+        # legitimate any more — one that mentions `gaps` least of all, since it
+        # would be the retired veto itself.  Keeping the lookahead would have
+        # left exactly the resuppression it was written to permit unguarded.
         'no chart render site is gated on Chart alone',
         (
             (
-                r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)',
+                r'\{\s*Chart\s*(?:\?|&&)',
                 'a bare `Chart` gate',
                 '{Chart && <Chart values={trend.values} labels={trend.labels} />}',
             ),
@@ -1699,8 +1702,7 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
         'spelling if the producer renamed the state.'
     )
 
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    badge_body = extract_function_body(code, 'verdictBadge')
     labels = _return_label_exprs(badge_body)
     assert labels, 'verdictBadge returns no `label`.'
     for expr in labels:
@@ -1856,8 +1858,7 @@ def test_unknown_verdict_is_visibly_unrenderable(
     # un-say it, and the composed label would then assert both halves of the
     # distinction at once ("no verdict · unrecognised verdict" — absent in the
     # first clause, present-but-unreadable in the second).
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    badge_body = extract_function_body(code, 'verdictBadge')
     assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
     assert assigned, 'verdictBadge assigns no literal `base` label.'
     absent = assigned[0]  # the seed, in force until a verdict is recognised
@@ -1942,8 +1943,11 @@ def test_verdict_badges_driven_by_persisted_verdict(
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = _extract_function_body(fmt_code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    # The call is kept for its EXISTENCE check alone — `extract_function_body`
+    # raises if `verdictBadge` is renamed or removed (task 3549), which is what
+    # the node tests named below depend on and what the discarded body used to
+    # be asserted truthy for.
+    extract_function_body(fmt_code, 'verdictBadge')
     # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
     #     verdict-derived label — now lives in
     #     `test_parity_vocabulary_fully_covered`, asserted structurally over
@@ -2138,13 +2142,7 @@ def test_no_client_side_alarm_derivation(
     #     characters that appear in prose (an `->` arrow, a "<Chart" reference)
     #     are not comparisons, and failing on them would push the next author
     #     to reword a correct comment rather than fix real code.
-    badge_body = _extract_function_body(code, 'verdictBadge')
-    assert badge_body, (
-        'could not extract the verdictBadge body from memory_evals_fmt.js. '
-        'This assertion is the anti-vacuity guard for everything below it: if '
-        'verdictBadge moves again, FOLLOW it here rather than deleting this '
-        'check, or the ordering-operator scan silently stops scanning anything.'
-    )
+    badge_body = extract_function_body(code, 'verdictBadge')
     assert 'parity' in badge_body, (
         'verdictBadge must read `parity` — the server-derived display state.'
     )
@@ -2199,33 +2197,165 @@ def test_no_client_side_alarm_derivation(
             )
 
 
-def test_trend_holes_are_never_handed_to_a_chart_primitive(
+# ---------------------------------------------------------------------------
+# Helper: derive the trend cell's chart gate out of MemoryEvalMetricRow
+# ---------------------------------------------------------------------------
+
+
+class _TrendGate(NamedTuple):
+    """The locals the trend chart's gate is built from, plus the gate's own text.
+
+    ``points``     — the series length: ``const points = (trend.values || []).length``
+    ``plotted``    — the drawable-sample count: ``const plotted = points - gaps``
+    ``gate``       — the gate: ``const plottable = Chart && plotted > 0 && ...``
+    ``gate_decl``  — that gate declaration's full source text, for callers that
+                     need to assert what ELSE it consumes (e.g. the mismatch local).
+    """
+
+    points: str
+    plotted: str
+    gate: str
+    gate_decl: str
+
+
+def _derive_trend_gate(row_body: str) -> _TrendGate:
+    """Walk ``points -> plotted -> gate`` in MemoryEvalMetricRow, asserting each hop.
+
+    ONE derivation, shared by both trend tests, because the two must not drift
+    apart on what "the gate" means — between them they are the only thing
+    standing between an unrenderable series and a blank 26px box.  That
+    agreement used to be prose in two docstrings, and the copies had ALREADY
+    diverged: one required the ``const <name> = ...gaps...;`` candidate to name
+    the series-length local before accepting it, the other took the first
+    candidate and only then asserted it did.  Measured, not argued: inserting an
+    unrelated ``const gapPct = gaps * 100;`` above ``const plotted = points -
+    gaps;`` passed the first test and failed the second, with a message blaming
+    ``plotted`` for something ``gapPct`` had done.  Structure, not comments, is
+    what keeps them identical now.
+
+    The surviving rule is the stricter of the two: among the ``gaps``-consuming
+    declarations that are neither ``gaps`` itself nor the gate, the drawable
+    count is the one that ALSO consumes the series length.  When no candidate
+    qualifies, the rejected ones are named in the failure so an author is not
+    left guessing which declaration the assertion was looking at.
+
+    Every assertion lives here rather than at the call sites, so a caller cannot
+    accidentally accept a shape its sibling rejects.
+    """
+    points_decl = re.search(
+        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
+    )
+    assert points_decl is not None, (
+        'MemoryEvalMetricRow never measures the length of `trend.values`, so it '
+        'can neither tell an empty series from a populated one nor subtract the '
+        'gap count from it to learn how many samples the primitive will actually '
+        'draw. `trendGaps([])` is 0, so the gap count alone passes a no-runs '
+        'metric straight to a chart primitive that renders nothing.'
+    )
+    points_local = points_decl.group(1)
+
+    # The drawable count: a plain arithmetic local (NOT the gate itself, hence
+    # the `Chart` exclusion) combining the series length and the gap count.
+    candidates = [
+        decl
+        for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bgaps\b[^;\n]*;', row_body)
+        if decl.group(1) != 'gaps' and not re.search(r'\bChart\b', decl.group(0))
+    ]
+    plotted_decl = next(
+        (
+            decl
+            for decl in candidates
+            if re.search(r'\b' + re.escape(points_local) + r'\b', decl.group(0))
+        ),
+        None,
+    )
+    assert plotted_decl is not None, (
+        'MemoryEvalMetricRow never derives the DRAWABLE-sample count. The chart '
+        'is gated on how many samples the primitive will draw, so a '
+        f'`const plotted = {points_local} - gaps;` local (any name, but not '
+        '`gaps` and not the gate itself) must exist. Without it the gate is '
+        'either back to a zero-hole veto or blind to an all-hole series. '
+        + (
+            'Rejected candidates, none of which consume the series-length local '
+            f'`{points_local}`: {[d.group(0).strip() for d in candidates]!r}.'
+            if candidates
+            else 'No `const <name> = ...gaps...;` declaration exists at all.'
+        )
+    )
+    plotted_local = plotted_decl.group(1)
+
+    gate_decl = None
+    for decl in re.finditer(r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*;', row_body):
+        if not re.search(r'\b' + re.escape(plotted_local) + r'\b', decl.group(0)):
+            continue
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', row_body):
+            gate_decl = decl
+            break
+    assert gate_decl is not None, (
+        'the `<Chart ...>` render site is not gated on the drawable-sample count '
+        f'`{plotted_local}`. Expected a single-line '
+        f'`const plottable = Chart && {plotted_local} > 0 && ...;` whose local '
+        'reaches a `{<local>` JSX position. Neither an empty series nor an '
+        'all-hole one may reach a primitive: sparkPaths returns an empty line, '
+        'Sparkline/StepSpark return null, and the cell renders a blank 26px box. '
+        f'The empty series is excluded TRANSITIVELY — {points_local} -> '
+        f'{plotted_local} -> gate — not by a direct `{points_local} > 0` term.'
+    )
+
+    return _TrendGate(
+        points=points_local,
+        plotted=plotted_local,
+        gate=gate_decl.group(1),
+        gate_decl=gate_decl.group(0),
+    )
+
+
+def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A series containing a hole must NOT be drawn — charts.jsx cannot
-    represent one, so drawing it fabricates a measurement.
+    """A series containing a hole IS drawn, with its missing samples disclosed
+    alongside it.  The chart is gated on AT LEAST ONE DRAWABLE SAMPLE, never on
+    zero holes.
 
-    The defect: charts.jsx's `Sparkline` (:42-53) and `StepSpark` (:66-90) do
-    plain arithmetic with no null handling — `Math.max(...values, 1)`,
-    `Math.min(...values, 0)`, `y = height - ((v - min) / range) * height` — in
-    which a `null` coerces to 0.  A hole handed to them is therefore drawn as a
-    REAL point at the chart floor, joined by a line segment to its neighbours
-    and indistinguishable from a measured regression to zero.  For a
-    `proportion` metric sitting at 0.95 that reads as a plunge and recovery
-    that never happened.
+    HISTORY: this test previously pinned the opposite invariant — a holed
+    series was suppressed entirely.  Its sole justification was that charts.jsx
+    could not REPRESENT a hole: `Sparkline` and `StepSpark` did plain
+    arithmetic with no null handling, so a `null` coerced to 0 and was drawn as
+    a real point at the chart floor, joined to its neighbours — for a
+    `proportion` metric sitting at 0.95, a plunge and recovery that never
+    happened.  Task 3436 removed that limitation: the scale/path math moved to
+    spark_path.js, which excludes non-finite samples from the extrema, keeps
+    index-based x positions so the axis does not shift, and emits separate
+    M-started subpaths so the line is genuinely discontinuous across a hole.
 
-    That directly contradicts this file's own `dash()` invariant — "Missing
-    scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
-    measured zero".  The trend column was the one place it was violated.
+    DECISION (task 3490): with the primitive hole-aware, the suppression was a
+    workaround for a fixed defect, so it is retired.  Three facts settled it.
+    The trend window is 90 runs (memory_evals.py `_TREND_RUN_CAP`), so
+    suppressing on any hole discards up to 89 real measurements to avoid
+    disclosing 1 missing one — itself a silent degradation.  The dominant
+    real-world source of a hole is a metric INTRODUCED MID-WINDOW
+    (memory_evals.py: "a legitimate shape"), so suppression withheld the chart
+    for a newly-added metric until the entire window rolled over, exactly when
+    an operator most wants the shape.  And a fraction-of-holes threshold was
+    rejected outright: this file consumes the server's judgments and never
+    re-derives them, and no server field authorises a draw/suppress fraction.
 
-    The fix is suppression, not compaction: the array is still passed through
-    verbatim (guarded above), but a series the primitive cannot represent is
-    not drawn at all.
+    What replaced the old invariant is NOT "no gate".  `gaps === 0` was
+    silently doing double duty as the ALL-HOLE guard: a series of nothing but
+    holes yields an empty path, both primitives `return null`, and the cell
+    renders a blank 26px box — the failure
+    test_empty_trend_is_a_named_state_not_an_empty_chart_box exists to prevent.
+    So the gate now counts what will actually be DRAWN
+    (`plotted = points - gaps`) and requires at least one.
     """
     code = tab_memory_evals_jsx_code
 
-    # (iv) hole DETECTION must still exist and still run — the fix is to act on
-    #      the count, not to stop counting.
+    row_body = extract_function_body(code, 'MemoryEvalMetricRow')
+    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+
+    # (iv) hole DETECTION must still exist and still run.  UNCHANGED by the
+    #      decision, and required MORE than before: the count is now both the
+    #      operator-facing disclosure and an input to the chart gate.
     assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
         'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
         'memory_evals_fmt.js (task 3481) so node can execute it. Two '
@@ -2246,164 +2376,220 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
         'ignoring the count is the defect this test exists to prevent.'
     )
 
-    # (ii) the gap count must participate in the guard on the <Chart render
-    #      site.  Two spellings are accepted — an inline `Chart && !gaps`, or a
-    #      named local (`plottable` / `hasGaps` / ...) combining both — because
-    #      the invariant is "the count gates the chart", not one exact phrasing.
+    # (ii') the gap count must still reach the `<Chart ...>` render site — but
+    #       now as the SUBTRAHEND that yields the drawable-sample count, not as
+    #       a zero-equality veto.  Derived in two hops so the gate's meaning is
+    #       readable from the source: a count local that consumes both the
+    #       series length and the gap count, then a gate that consumes `Chart`
+    #       and that count and reaches a `{<local>` JSX position.
     #
-    #      KEPT DELIBERATELY, against a review suggestion to delete this block
-    #      as identifier-spelling introspection covered by the `bare` negative
-    #      check below.  Measured, not argued: regressing the JSX to
-    #      `const plottable = Chart;` (gate removed, holed series reaches the
-    #      primitive) fails HERE and `bare` passes it — `bare` only matches the
-    #      literal `{Chart &&` / `{Chart ?` spelling, so any named local evades
-    #      it entirely.  The two are not redundant: this is the only POSITIVE
-    #      check that a gate exists at all, and deleting it silently reopens
-    #      the defect 5ad120a0b3 fixed (charts.jsx coerces null to 0 and draws
-    #      a fabricated plunge to the chart floor; see task 3436).
+    #       KEPT DELIBERATELY, against a review suggestion to delete this block
+    #       as identifier-spelling introspection covered by the `bare` negative
+    #       check below.  Measured, not argued: regressing the JSX to
+    #       `const plottable = Chart;` (gate removed, an all-hole series reaches
+    #       the primitive) fails HERE and `bare` passes it — `bare` only matches
+    #       the literal `{Chart &&` / `{Chart ?` spelling, so any named local
+    #       evades it entirely.  The two are not redundant: this is the only
+    #       POSITIVE check that a gate exists at all, and deleting it lets the
+    #       cell hand a series of nothing but holes to a primitive that returns
+    #       null, leaving the blank 26px box.
     #
-    #      Read over COMMENT-STRIPPED source, like every other presence grep in
-    #      this file — the .jsx prose discusses this very gate, so on the raw
-    #      body a sentence describing it would have been able to answer it.
-    #      Deliberately NOT in `_PRESENCE_CONTRACTS`: the two spellings are
-    #      alternatives joined by `or`, so exactly one matches at a time, and
-    #      that table's first arm requires every pattern to match today.
-    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', code)
-    via_local = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', code
-    ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', code):
-            via_local = decl.group(1)
-            break
-    assert inline or via_local, (
-        'the `<Chart ...>` render site is not gated on the gap count. A holed '
-        'series must not reach a charts.jsx primitive: declare e.g. '
-        '`const plottable = Chart && gaps === 0;` and render the chart only '
-        'when it holds.'
+    #       Derived through the SHARED `_derive_trend_gate` walk — the same call
+    #       test_empty_trend_is_a_named_state_not_an_empty_chart_box makes, so
+    #       "the two tests derive the gate the same way" is structural rather
+    #       than a promise in two docstrings.
+    gate = _derive_trend_gate(row_body)
+
+    # (ii'-negative) the RETIRED suppression must be gone. Without this,
+    #                leaving `gaps === 0` in the gate would keep the old
+    #                behaviour while every other assertion above passed.
+    suppression = re.search(r'\bgaps\s*(?:===?)\s*0|!\s*gaps\b', code)
+    assert suppression is None, (
+        f'a zero-gap veto survives: {suppression.group(0)!r}. Task 3490 '
+        'retired it — a holed series is DRAWN by the hole-aware primitive and '
+        f'its gaps disclosed. The gate is `{gate.plotted} > 0` (at least one '
+        'drawable sample), never "no holes at all".'
     )
 
-    # ...and the bare `Chart` guard must be gone, so no path reaches the
-    # primitive without the gap check.
-    for gate, what, flags in _forbidden_patterns(
+    # ...and no path may reach the primitive around the named gate. `<Chart `
+    # (the element itself) and `!Chart` (the no-kind arm) do not match this;
+    # only an inline `{Chart &&` / `{Chart ?` render guard does, and such a
+    # guard would hand an ALL-HOLE series to a primitive that returns null.
+    for pattern, what, flags in _forbidden_patterns(
         'no chart render site is gated on Chart alone'
     ):
-        bare = re.search(gate, code, flags)
+        bare = re.search(pattern, code, flags)
         assert bare is None, (
-            f'a chart render site is still guarded by `Chart` alone ({what}): '
-            f'{bare.group(0)!r} — a holed series would reach the primitive '
-            'through it.'
+            f'a chart render site is guarded by `Chart` alone ({what}): '
+            f'{bare.group(0)!r} — it bypasses the `{gate.gate}` gate, so a '
+            'series in which nothing was measured would reach the primitive '
+            'and render a blank box.'
         )
 
-    # (iii) a suppressed series must still DISCLOSE its gap count — silently
-    #       withholding the sparkline would read as a render bug.  Asserted
-    #       structurally (the `gaps` local reaches a JSX render position in
-    #       comment-stripped source) rather than as operator-facing copy:
-    #       pinning the sentence would fail the suite on any rewording while
-    #       proving nothing extra about the branch, which is the rule this
+    # (iii) a DRAWN holed series must still DISCLOSE how many samples are
+    #       missing — a line with unexplained breaks in it reads as a render
+    #       bug.  Asserted structurally (the `gaps` local reaches a JSX render
+    #       position in comment-stripped source) rather than as operator-facing
+    #       copy: pinning the sentence would fail the suite on any rewording
+    #       while proving nothing extra about the branch, which is the rule this
     #       file states at lines 1134-1138 and 1203-1211.
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count is computed but never reaches render position. A '
-        'holed series must disclose how many samples are missing — the '
-        'operator still gets value, current_value, n, denominator, direction '
-        'and the verdict badge, and only the sparkline is withheld.'
+        'holed series is now drawn, so the count is the ONLY thing that '
+        'explains the breaks in the line — the operator still gets value, '
+        'current_value, n, denominator, direction and the verdict badge, but '
+        'nothing would say how many runs produced no sample.'
+    )
+
+    # (iii-b) ...and the disclosure must also reach the DRAWN ARM ITSELF, in
+    #         that element's own opening tag, so the breaks are explained where
+    #         they appear (on hover) and not only in the footer below.
+    #
+    #         Matched on the WHOLE opening tag, taken from its `<` to its
+    #         matching `>` by `_jsx_open_tag_containing`, rather than by a
+    #         directional `gaps ... <testid>` window.  A one-sided window would
+    #         encode JSX attribute ORDER, which is not behaviour: reordering to
+    #         `<div style={...} data-testid="..." title={gaps ? ... : span}>`
+    #         renders identically yet would fail a before-the-testid regex.  The
+    #         walk still confines the match to a SINGLE opening tag, so a `gaps`
+    #         mention in a neighbouring element cannot satisfy it — that
+    #         confinement is what gives the assertion its meaning — but unlike
+    #         the `<[^<>]*...>` span it was spelled with before, it does not
+    #         mistake a `<`/`>` OPERATOR inside an attribute expression for the
+    #         end of the tag (see that helper's docstring for the measurement).
+    tag = _jsx_open_tag_containing(row_body, 'data-testid="memory-eval-trend-chart"')
+    assert tag is not None, (
+        'no opening tag carries `data-testid="memory-eval-trend-chart"` — the '
+        'drawn-chart arm is gone. This assertion is also the vacuity guard for '
+        'the one below, which would otherwise pass trivially.'
+    )
+    assert re.search(r'\bgaps\b', tag), (
+        'the drawn-chart element does not consume `gaps` in its own opening '
+        'tag. The sparkline is drawn with a break at every missing sample; '
+        'without the count in that element\'s `title=`, an operator hovering '
+        'the broken line gets no account of why it is broken. Attribute ORDER '
+        'inside the tag is deliberately NOT constrained.'
     )
 
 
 def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     tab_memory_evals_jsx_code: str,
 ) -> None:
-    """A metric with NO runs is a third suppression state, not a chart.
+    """A series a primitive would render as NOTHING is a named state, not a
+    chart.
 
-    The defect: `trendGaps([])` counts zero holes in zero samples, so the
-    `Chart && gaps === 0` gate is TRUE for a metric that has never been
-    measured.  The empty series is then handed to a charts.jsx primitive —
+    The original defect: `trendGaps([])` counts zero holes in zero samples, so
+    the old `Chart && gaps === 0` gate was TRUE for a metric that had never
+    been measured.  The empty series was handed to a charts.jsx primitive —
     and both `Sparkline` (charts.jsx:58) and its `StepSpark` twin `return null`
-    on a zero-length array.  The cell therefore renders an empty 26px <div>
-    plus a "0 pts" footer: a blank box that is indistinguishable from a
-    rendering bug, which is precisely the failure mode the gap-suppression
-    path already exists to avoid.  The deliberate 'no runs' text the row
-    ALREADY computes reaches only a `title=` on that invisible div, so the
-    state is never stated in the open.
+    on a zero-length array.  The cell therefore rendered an empty 26px <div>
+    plus a "0 pts" footer: a blank box indistinguishable from a rendering bug.
+    The deliberate 'no runs' text the row ALREADY computes reached only a
+    `title=` on that invisible div, so the state was never stated in the open.
+
+    Task 3490 widened the blast radius of that defect and this test with it.
+    Now that a holed series is DRAWN (the primitive became hole-aware in 3436),
+    an ALL-HOLE series — one that ran but in which no run produced a sample —
+    reaches the same dead end: an empty path, `return null`, blank box.  So the
+    gate stopped meaning "no holes" and started meaning "at least one sample
+    the primitive will actually draw", and the empty series is now excluded
+    TRANSITIVELY through that count rather than by its own `points > 0` term.
+
+    This test therefore derives the gate through ``_derive_trend_gate``, the
+    same call its sibling
+    test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed makes.  That
+    pairing is deliberate and load-bearing: the two tests must not drift apart
+    on what "the gate" means, because between them they are the only thing
+    standing between an unrenderable series and a blank box.  It is one shared
+    walk rather than two matching copies because the copies had already
+    diverged — the helper's docstring records the measurement.
 
     Asserted on structure and on `data-testid` values, never on copy: a
     rewording keeps this green, deleting a state does not.
     """
     code = tab_memory_evals_jsx_code
 
-    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
-    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
+    row_body = extract_function_body(code, 'MemoryEvalMetricRow')
 
-    # (a) something must MEASURE the series length. Nothing did.
-    points_decl = re.search(
-        r'const\s+(\w+)\s*=\s*[^;\n]*trend\.values[^;\n]*\.length', row_body
-    )
-    assert points_decl is not None, (
-        'MemoryEvalMetricRow never measures the length of `trend.values`, so '
-        'it cannot tell an empty series from a populated one. `trendGaps([])` '
-        'is 0, so the gap check alone passes a no-runs metric straight to a '
-        'chart primitive that renders nothing.'
-    )
-    points_local = points_decl.group(1)
-
-    # (b) the chart gate must CONSUME that measurement. Re-derived exactly as
-    #     test_trend_holes_are_never_handed_to_a_chart_primitive derives it, so
-    #     the two tests cannot drift apart on what "the gate" means.
-    gate_decl = None
-    for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', code
-    ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', code):
-            gate_decl = decl
-            break
-    assert gate_decl is not None, (
-        'no single-line `const <name> = ...Chart...gaps...;` gate whose local '
-        'reaches a `{<local>` JSX position — see '
-        'test_trend_holes_are_never_handed_to_a_chart_primitive, which derives '
-        'the gate the same way.'
-    )
-    assert re.search(r'\b' + re.escape(points_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume the '
-        f'series-length local `{points_local}`. An empty series must never '
-        'reach a charts.jsx primitive: both Sparkline and StepSpark return '
-        'null for a zero-length array, leaving a blank 26px box.'
-    )
+    # (a)+(b) the series length must be MEASURED, and the chart gate must
+    #     CONSUME that measurement — now TRANSITIVELY, through the
+    #     drawable-sample count, since the gate no longer names `points`
+    #     directly (gaps <= points always, so `plotted > 0` implies `points > 0`
+    #     and restating it would leave a dead conjunct).
+    #
+    #     Both hops come from the SHARED `_derive_trend_gate` walk, the same
+    #     call test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed
+    #     makes.  One derivation, so the two tests cannot drift apart on what
+    #     "the gate" means — which they had already begun to do while the rule
+    #     was only stated in prose (see that helper's docstring).
+    gate = _derive_trend_gate(row_body)
+    points_local, plotted_local = gate.points, gate.plotted
 
     # (c) FIVE structurally distinct trend states. A separate no-runs arm is
-    #     required rather than folding it into the gap message because
-    #     "no chart — 0 of 0 runs produced no sample" is a nonsense sentence
-    #     that reads as a bug — the very failure this suppression path exists
-    #     to prevent.  A separate mismatch arm is required for the same reason,
-    #     one payload shape further out: labels and values are PARALLEL arrays
-    #     (memory_evals.py:955,993), so a disagreement makes every other
-    #     sentence this cell could produce untrustworthy.
+    #     required rather than folding it into the all-gaps message because
+    #     "none of the 0 runs produced a sample" is a nonsense sentence that
+    #     reads as a bug — the very failure this state inventory exists to
+    #     prevent.  The two must stay separate for a second reason as well:
+    #     "no runs yet — nothing to chart" and "none of the 90 runs produced a
+    #     sample" are DIFFERENT FACTS about the metric, and collapsing them
+    #     would tell an operator that a measured-but-empty metric had never
+    #     run.  A separate mismatch arm is required one payload shape further
+    #     out: labels and values are PARALLEL arrays (memory_evals.py:955,993),
+    #     so a disagreement makes every other sentence this cell could produce
+    #     untrustworthy.
+    #
+    #     `memory-eval-trend-gaps` was RENAMED to `memory-eval-trend-all-gaps`
+    #     (task 3490) because its meaning NARROWED, from "the series has at
+    #     least one hole" to "the series has nothing but holes" — a different
+    #     predicate over a different population. Keeping the old id would let a
+    #     test that means the old thing pass green against the new thing.
     testids = (
         'memory-eval-trend-chart',
         'memory-eval-trend-no-kind',
         'memory-eval-trend-mismatch',
         'memory-eval-trend-no-runs',
-        'memory-eval-trend-gaps',
+        'memory-eval-trend-all-gaps',
     )
     assert len(set(testids)) == len(testids), 'the five trend testids must be distinct.'
     for testid in testids:
         assert f'data-testid="{testid}"' in code, (
             f'the trend cell must render a `data-testid="{testid}"` arm. The '
-            'five states — drawn chart, unrenderable kind, labels/values length '
-            'disagreement, no runs yet, and holed series — must be structurally '
-            'distinguishable, so a rewording cannot silently collapse two of '
-            'them into one.'
+            'five states — drawn chart (INCLUDING a holed series, drawn by the '
+            'hole-aware primitive with its gaps disclosed), unrenderable kind, '
+            'labels/values length disagreement, no runs yet, and not one run '
+            'produced a sample — must be structurally distinguishable, so a '
+            'rewording cannot silently collapse two of them into one.'
         )
+
+    # (c2) the all-gaps arm must be reachable ONLY when the drawable count is
+    #      zero. Without this the arm becomes dead code the moment the gate
+    #      changed: it sits last in the else-chain, so nothing else in the
+    #      source ties it to the predicate it claims to state.
+    assert re.search(
+        re.escape(plotted_local)
+        + r'[\s\S]{0,400}?data-testid="memory-eval-trend-all-gaps"',
+        row_body,
+    ), (
+        f'`{plotted_local}` does not gate the '
+        '`data-testid="memory-eval-trend-all-gaps"` arm. That arm now means '
+        'the series exists but NOT ONE run produced a sample — the one shape '
+        'the hole-aware primitive still cannot draw — so the drawable-sample '
+        'count is what must select it.'
+    )
 
     # (d) the existing guards must SURVIVE, re-asserted here so a later
     #     refactor to a `trendState()` discriminator cannot quietly drop them.
-    for gate, what, flags in _forbidden_patterns(
+    #     The `gaps` lookahead is gone (mirroring the sibling test): holes no
+    #     longer veto the chart, so ANY inline `{Chart &&` / `{Chart ?` render
+    #     guard is a bypass of the named gate.
+    for pattern, what, flags in _forbidden_patterns(
         'no chart render site is gated on Chart alone'
     ):
-        bare = re.search(gate, code, flags)
+        bare = re.search(pattern, code, flags)
         assert bare is None, (
             f'a chart render site is guarded by `Chart` alone ({what}): '
-            f'{bare.group(0)!r} — a holed OR empty series would reach the '
-            'primitive through it.'
+            f'{bare.group(0)!r} — an all-hole OR empty series would reach the '
+            'primitive through it and render a blank 26px box.'
         )
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count must still reach a render position — adding the '
@@ -2441,8 +2627,8 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
         'and nothing this cell says about the series would be trustworthy.'
     )
     mismatch_local = mismatch_decl.group(1)
-    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate_decl.group(0)), (
-        f'the chart gate {gate_decl.group(0).strip()!r} does not consume '
+    assert re.search(r'\b' + re.escape(mismatch_local) + r'\b', gate.gate_decl), (
+        f'the chart gate {gate.gate_decl.strip()!r} does not consume '
         f'`{mismatch_local}`, so a malformed series is still drawn — against a '
         'title derived from the other, differently-sized array.'
     )
@@ -2652,8 +2838,7 @@ def test_limits_provenance_rendered(
     # LimitsProvenance must early-return its own element when `ev.limits` is
     # falsy.  Pinning the operator-facing sentence would fail the suite on any
     # rewording while proving nothing extra about the branch.
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
+    prov_body = extract_function_body(code, 'LimitsProvenance')
     # The local's NAME is derived from the `ev.limits` read rather than pinned,
     # so renaming `lim` is not a test failure; what must hold is that whatever
     # it is called gates the early return.
@@ -2740,8 +2925,7 @@ def test_limits_provenance_open_state_is_per_eval(
     """
     code = tab_memory_evals_jsx_code
 
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
+    prov_body = extract_function_body(code, 'LimitsProvenance')
 
     # (a) the `open=` attribute is a bare identifier, not a call.
     open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
@@ -3004,8 +3188,7 @@ def test_tabs_jsx_memory_tab_renders_evals_section(
     )
 
     # (c) rendered inside MemoryTab and nowhere else; NOT a DF_TABS entry.
-    memory_tab_body = _extract_function_body(body, 'MemoryTab')
-    assert memory_tab_body, 'could not extract the MemoryTab body.'
+    memory_tab_body = extract_function_body(body, 'MemoryTab')
     assert '<MemoryEvalsSection' in memory_tab_body, (
         'MemoryTab must render <MemoryEvalsSection ... /> (PRD DD3: the eval '
         'view lives with the memory panels).'

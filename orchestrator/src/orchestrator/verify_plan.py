@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
@@ -447,12 +447,12 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
 
 
-def _marker_deselecting_expression(
-    mc: ModuleConfig,
-    collectable_tests: list[str],
+def deselecting_expression_for_command(
+    test_command: str | None,
+    targets: Sequence[str],
     worktree_reader: Callable[[str], str | None],
 ) -> str | None:
-    """The module's effective ``-m`` expression when it provably deselects EVERY target.
+    """*test_command*'s effective ``-m`` expression when it provably deselects EVERY target.
 
     Returns None — "keep today's FILE_SCOPED behaviour" — for every other case,
     including any unreadable file or unparseable expression. See
@@ -460,9 +460,23 @@ def _marker_deselecting_expression(
     both reads go through the SAME injected *worktree_reader*, so this function
     introduces no filesystem access of its own.
 
+    SHARED BY BOTH ARMS (task 3513): the module arm passes ``mc.test_command``
+    plus that module's touched COLLECTABLE_TEST files
+    (:func:`_derive_module_runs` arm 4a, task 3494); the fallback arm passes the
+    ALREADY-EXECUTED fallback command plus its resolved file targets
+    (:func:`widen_fallback_for_marker_deselection`). Keeping ONE implementation
+    of "which commands are refused" and "where the ini file is looked for" is
+    load-bearing: were the two arms to answer differently, the arm with the
+    weaker guards would over-fire on a config its command never applies.
+
+    *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
+    while the command's own targets may be cwd-relative — only the CONFIG path
+    below follows the command's ``cwd_rel``. A caller holding cwd-relative
+    targets must resolve them first.
+
     WHERE the ini file is looked for: pytest reads ``addopts`` from its
-    ROOTDIR, which follows the command's effective cwd — NOT from
-    ``mc.prefix``. The two come apart in this very repo: the ``scripts`` and
+    ROOTDIR, which follows the command's effective cwd — NOT from any module
+    prefix. The two come apart in this very repo: the ``scripts`` and
     ``tests/scripts`` modules both run ``uv run --project shared pytest
     tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
     ``scripts/pyproject.toml`` would never be the config pytest actually
@@ -473,8 +487,8 @@ def _marker_deselecting_expression(
     Three guards REFUSE rather than guess. Each is fail-safe — no widening,
     i.e. exactly the pre-3494 FILE_SCOPED behaviour:
 
-    1. a ``test_command`` that does not parse as PYTEST at all (``npm test``,
-       a shell script): the module's ``addopts`` describe a suite this command
+    1. a *test_command* that does not parse as PYTEST at all (``npm test``,
+       a shell script): a pyproject's ``addopts`` describe a suite this command
        never invokes, so consulting them would widen on a false premise;
     2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
        chain): neither the effective cwd nor which invocation gets scoped is
@@ -486,9 +500,9 @@ def _marker_deselecting_expression(
        ``tox.ini`` addopts are invisible here, so a module configured that way
        simply never widens. A deliberate UNDER-fire, never an over-fire.
     """
-    if not mc.test_command:
+    if not test_command:
         return None
-    parsed = parse_config_command(mc.test_command)
+    parsed = parse_config_command(test_command)
     if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
         return None
     cwd_rel = parsed.cwd_rel
@@ -496,11 +510,113 @@ def _marker_deselecting_expression(
         'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
     )
     return deselecting_expression_for_targets(
-        collectable_tests,
+        targets,
         worktree_reader(config_path),
-        mc.test_command,
+        test_command,
         worktree_reader,
     )
+
+
+def widen_fallback_for_marker_deselection(
+    fallback: ModuleConfig,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[ModuleConfig, str | None]:
+    """Widen an EXECUTED fallback config whose file-scoped pytest run is fully deselected.
+
+    Returns ``(config, reason)``: the input *fallback* unchanged and a ``None``
+    reason whenever no widening is proven — the one-directional fail-safe task
+    3494 established, here closing its twin arm (task 3513).
+
+    WHAT IT IS GIVEN: the ALREADY-EXECUTED fallback ``ModuleConfig``, i.e. the
+    output of ``verify._build_fallback_config`` after ``_apply_cargo_scope``.
+    That is the whole point of the layering. :func:`_derive_fallback_runs` is a
+    pure DECISION function that cannot see the subproject rescoping
+    ``_build_fallback_config`` performs (its own "Fidelity caveat" paragraph),
+    so a probe there could read a ``pyproject.toml`` the executed command never
+    applies — the OVER-fire task 3494 forbids. Here the command's OWN SHAPE
+    decides, and the rescoping has already happened.
+
+    That is also where the feared over-fire is closed STRUCTURALLY rather than
+    by re-deriving "would ``_build_fallback_config`` rescope?" (which would
+    duplicate ``_single_subproject_prefix`` / ``_root_plus_single_subproject_prefix``
+    — a second copy of a filesystem decision, free to drift). Each guard below
+    refuses a shape whose rootdir or scoping is not recoverable from the string:
+
+    * ``test_command is None`` — the "no collectable tests" branch produced no
+      pytest run at all, so there is nothing to widen;
+    * NOT ``ToolKind.PYTEST`` — a pyproject's ``addopts`` describe a suite this
+      command never invokes;
+    * ``parsed.raw is not None`` — a raw-retained command (the task-2368 mixed
+      root+subproject chain, every ``uv run --extra ... pytest`` shape) hides
+      BOTH its effective rootdir and which clause the scoping applied to;
+    * ``not parsed.targets`` — a configured suite runs VERBATIM and unscoped
+      (``_build_fallback_config`` never file-scopes one), so it has no targets
+      to drop and cannot be the zero-collecting shape.
+
+    A directory target needs no guard of its own: ``verify._worktree_reader`` is
+    ``is_file()``-guarded and answers None for a directory, and
+    :func:`deselecting_expression_for_command` refuses any target it cannot
+    read. The conftest branch's directory targets are therefore unprovable, and
+    unprovable means unchanged.
+
+    THE REMEDY is the same as arm 4a's: ``replace(parsed, targets=())`` — the
+    unscope operation, whose two rendered forms are ``'pytest'`` and
+    ``'cd <sub> && uv run pytest'`` — re-rendered rather than hand-built, so
+    every other flag the executed command carries survives verbatim. Only
+    ``test_command`` moves; ``lint_command``/``type_check_command`` are
+    untouched, marker deselection being a pytest-only concern.
+
+    It is WIDENING, not SKIPPING, for the reason task 3494 chose the same: the
+    task-1852 SKIP precedent applies where there is NO suite at all to run,
+    whereas the proof that an ``-m`` expression exists at this rootdir is
+    itself evidence of a real marker-partitioned suite. Skipping would convert
+    a false RED into a silent no-coverage GREEN.
+
+    It is DEGRADATION, so it says so. The widened run applies the SAME
+    ``addopts``, which means the very files that triggered it remain deselected
+    and go UNRUN — the widening buys a run of the suite's OTHER tests, not
+    coverage of the changed lines. ``ScopeKind.FULL_SUITE`` forbids
+    ``scoped_targets`` (``PlannedRun``'s invariant), so the returned reason is
+    the only channel that can record which files went unexecuted, and it names
+    them explicitly rather than reading as "the change was verified".
+
+    RESIDUAL RISK, documented rather than hidden: if the widened suite ALSO
+    collects zero items, rc=5 remains a genuine RED. ``verify_classify
+    ._classify_opaque`` is deliberately untouched by this task — it carries the
+    task-1852 invariant verbatim and must stay RED for a target that vanished
+    for any other reason.
+    """
+    if not fallback.test_command:
+        return fallback, None
+    parsed = parse_config_command(fallback.test_command)
+    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+        return fallback, None
+    if not parsed.targets:
+        return fallback, None
+
+    # The executed command's targets are relative to ITS cwd, while
+    # *worktree_reader* reads worktree-root-relative paths. Resolve before
+    # probing, and reuse the resolved list in the reason so an operator sees the
+    # same paths the rest of the plan record uses.
+    cwd_rel = parsed.cwd_rel
+    resolved = [
+        t if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/{t}'
+        for t in parsed.targets
+    ]
+    deselecting = deselecting_expression_for_command(
+        fallback.test_command, resolved, worktree_reader,
+    )
+    if deselecting is None:
+        return fallback, None
+
+    unrun = ', '.join(resolved)
+    reason = (
+        f'pytest: touched test file(s) {unrun} are ALL deselected by the effective '
+        f'-m {deselecting!r} — fallback full suite instead of a zero-collecting '
+        f'file-scoped run (rc=5); those file(s) stay deselected in this run too '
+        f'and are NOT executed by it'
+    )
+    return replace(fallback, test_command=render(replace(parsed, targets=()))), reason
 
 
 def _derive_module_runs(
@@ -578,7 +694,7 @@ def _derive_module_runs(
     ModuleConfig — through the same content-cached reader used above, so a
     target already read for STRUCTURAL detection costs nothing further — and
     ZERO target reads for a module that declares no ``-m`` expression at all.
-    See :func:`_marker_deselecting_expression` for where that ini file is
+    See :func:`deselecting_expression_for_command` for where that ini file is
     looked for and which commands are refused outright.
 
     The widened run applies the SAME addopts, so the touched file(s) remain
@@ -589,8 +705,14 @@ def _derive_module_runs(
     is degradation, so the emitted ``reason`` names the still-unrun file(s)
     explicitly rather than reading as "the change was verified".
 
-    The TWIN of this arm in :func:`_derive_fallback_runs` is deliberately NOT
-    wired — see that function's own paragraph for why.
+    The TWIN of this arm lives in :func:`_derive_fallback_runs`, and is closed
+    (task 3513) one layer down rather than in that decision function — by
+    :func:`widen_fallback_for_marker_deselection`, against the ALREADY-EXECUTED
+    fallback config. Both arms share this arm's probe,
+    :func:`deselecting_expression_for_command`, so the two can never disagree
+    about which commands are refused or where the ini file is looked for. See
+    that function's own paragraph for why the fallback arm needs the extra
+    layer.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -708,7 +830,9 @@ def _derive_module_runs(
                 )
             runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
         elif collectable_tests:
-            deselecting = _marker_deselecting_expression(mc, collectable_tests, worktree_reader)
+            deselecting = deselecting_expression_for_command(
+                mc.test_command, collectable_tests, worktree_reader,
+            )
             if deselecting is not None:
                 test_cmd = parse_config_command(mc.test_command)
                 # The widened run applies the SAME addopts, so the very files
@@ -755,6 +879,67 @@ def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     to the broad merge gate.
     """
     return config is not None and config.merge_verify_breadth == 'full'
+
+
+def effective_merge_module_configs(
+    config: OrchestratorConfig | None,
+    module_configs: list[ModuleConfig],
+) -> list[ModuleConfig]:
+    """The module set a MERGE-role verify actually covers.
+
+    Under ``merge_verify_breadth='full'`` a merge verify executes EVERY
+    registered module, not just the ones the merging task happened to touch —
+    so *this*, not the caller's task-scoped list, is the set every downstream
+    consumer must reason against. Flake-ledger PRD §8.2 / task 3787 (γ).
+
+    ORDERING INVARIANT (INV-5). Call this ONCE, at the merge-request boundary
+    in ``merge_queue._run_post_merge_verify``, ahead of both
+    ``build_merge_verify_spec`` and every ``LocalRunner(...)`` construction.
+    The local runner, the wire spec (and hence the remote's reconstruction of
+    it in ``verify_runner.run_merge_verify_on_worktree``) and the merge-flake
+    suppression gate then receive the IDENTICAL set BY CONSTRUCTION, rather
+    than by an assertion that two sites independently agree. The parenthetical
+    REMOTE leg was only made true by task 4536, which installs the spec's set
+    as that reconstructed config's registry — see
+    ``verify_runner.run_merge_verify_on_worktree``; until then it was
+    aspirational. Before this helper the expansion was
+    reimplemented inline at two sites inside
+    ``run_scoped_verification``, each rebinding a local that never propagated
+    out: the run executed the full registry while the suppression gate still
+    mapped failing node-ids against the task's own modules, so a red in an
+    untouched module mapped to no known subproject and the gate answered
+    "unconfirmable" — inverted exactly where it mattered most (PRD §3.1).
+
+    IDEMPOTENT: ``f(cfg, f(cfg, xs)) == f(cfg, xs)``. The full-breadth branch
+    ignores its input entirely (bar the empty-registry fallback) and the
+    scoped branch is the identity, so re-applying it to an already-resolved
+    set is a value-preserving no-op. That is what lets the surviving call
+    inside ``run_scoped_verification`` stay in place once the boundary has
+    already resolved the set.
+
+    WHOSE REGISTRY the full-breadth branch reads depends on the path, and both
+    answers are the dispatching side's by construction — which is which, and
+    why there is deliberately no third answer, is documented once at
+    ``verify_runner.run_merge_verify_on_worktree`` (task 4536).
+
+    The empty-registry fallback is a deliberate SAFE DEGRADE: a project with
+    no registered modules returns the passed set rather than ``[]``, so the
+    broad gate degrades to today's scoped coverage instead of silently
+    verifying nothing at the very breadth that exists to verify everything.
+    Post-4536 it also serves direct-instantiated configs in tests/evals, which
+    never run discovery and whose registry is therefore empty; a zero-module
+    SPEC installs ``{}`` deliberately (the documented "discovery ran and found
+    no subprojects" value), routing that case to the INV-1 global gate.
+
+    Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
+    from ``config`` here, so there stays exactly one breadth predicate in the
+    tree (and a ``None`` config keeps degrading to the shipped 'scoped'
+    default instead of raising).
+    """
+    if not _merge_breadth_is_full(config):
+        return module_configs
+    assert config is not None  # narrowed by _merge_breadth_is_full
+    return list(config.module_configs_or_empty.values()) or module_configs
 
 
 def _derive_full_suite_runs(
@@ -864,25 +1049,33 @@ def _derive_fallback_runs(
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
 
-    MARKER DESELECTION (task 3494) is deliberately NOT wired here, so this
-    branch knowingly retains the pre-3494 behaviour. The bare-default
-    ``collectable_tests`` branch below has the identical "the path says
-    collectable, pytest collects zero" failure mode whenever the repo root
-    carries an ``addopts = "-m 'not X'"`` and the diff touches only
-    X-marked test files — it will still plan a zero-collecting FILE_SCOPED run
-    that rc=5-REDs. It is left open for two reasons. (i) SOUNDNESS: this branch
-    fires only when there are NO registered module_configs, and the "Fidelity
-    caveat" above is exactly why — the run this function records is not
-    necessarily the run that executes. ``_build_fallback_config`` may rescope a
-    fallback diff into a subproject (``cd <sub> && uv run pytest ...``), which
-    moves pytest's rootdir and therefore which ``addopts`` apply, so a probe
-    reading the ROOT ``pyproject.toml`` here could widen on a config the
-    executed command never sees — an over-fire, the one direction task 3494
-    forbids. (ii) REACH: the module path covers every subproject registered in
-    this repo, so the residual exposure is a project with a marker-partitioned
-    root suite and no ``orchestrator.yaml`` anywhere. Closing it properly needs
-    the executed-config reconciliation :func:`_executed_fallback_plan` performs,
-    which is a different layer than this decision function.
+    MARKER DESELECTION (task 3494's twin, CLOSED by task 3513) is still not
+    wired HERE, and deliberately so — but the gap it left is closed one layer
+    down. The bare-default ``collectable_tests`` branch below has the identical
+    "the path says collectable, pytest collects zero" failure mode whenever the
+    repo root carries an ``addopts = "-m 'not X'"`` and the diff touches only
+    X-marked test files, so this function's own raw return value still reads
+    FILE_SCOPED for exactly that shape.
+
+    WHY NOT HERE: the "Fidelity caveat" above. This branch fires only when
+    there are NO registered module_configs, and the run this function records
+    is not necessarily the run that executes — ``_build_fallback_config`` may
+    rescope a fallback diff into a subproject (``cd <sub> && uv run pytest
+    ...``), which moves pytest's rootdir and therefore which ``addopts`` apply.
+    A probe reading the ROOT ``pyproject.toml`` here could widen on a config
+    the executed command never sees: an over-fire, the one direction task 3494
+    forbids.
+
+    WHERE IT IS CLOSED: :func:`widen_fallback_for_marker_deselection`, called
+    from ``verify.run_scoped_verification``'s fallback branch immediately after
+    ``_build_fallback_config`` + ``_apply_cargo_scope``. By then the rescoping
+    has already happened, so the EXECUTED command's own shape decides and the
+    over-fire above is structurally impossible. It rewrites the ``ModuleConfig``
+    that is about to run (this branch executes the config, not the plan — see
+    the paragraph below), and ``verify._executed_fallback_plan``'s
+    ``pytest_reason`` keyword reconciles the record to match, so what a
+    consumer of ``VerifyResult.plan`` sees is FULL_SUITE even though this
+    function decided FILE_SCOPED.
 
     This caveat describes THIS function's raw return value only. Its caller
     in :func:`run_scoped_verification` reconciles this gap before attaching

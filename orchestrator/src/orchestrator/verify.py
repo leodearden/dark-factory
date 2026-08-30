@@ -16,11 +16,11 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
@@ -3319,6 +3319,34 @@ class VerifyResult:
     # test_verify_merge_cli_wrapper_transparency). Folded in here to clear a
     # preexisting main red introduced by task 1802.
     duration_secs: float = field(default=0.0, compare=False)
+    # Task 3789 (ε): the discriminator's observation about a failing merge verify —
+    # `confirm_isolated_rerun_verdict`'s FlakeSuppression, attached by
+    # `apply_merge_flake_suppression` on BOTH branches (suppressed and not), and
+    # consumed ONLY on the dispatcher by `flake_recorder.record_merge_flake_suppression`.
+    # None = no discriminator ran (every non-merge-gate result, and an OLDER remote
+    # whose wire payload simply omits the key — boundary row B13).
+    #
+    # THE ONE FIELD THAT DEVIATES from the `contention`/`plan`/`failing_test_ids`
+    # "plain JSON-native, never a nested dataclass" rule above, deliberately: PRD §8
+    # specifies a TYPED carrier and the recorder consumes a `FlakeSuppression`, not a
+    # dict, so a bare dict would make this annotation a lie on exactly the deserialized
+    # path the field exists to serve.
+    #
+    # The rule's usual consequence still does not bite, because only HALF the codec is
+    # generic in the problematic direction: `result_to_dict` is `dataclasses.asdict`,
+    # which flattens the nested dataclass (and `json.dumps` flattens its StrEnums to
+    # their values and the tuple to an array), so the WRITE half needs no change. Only
+    # `result_from_dict` — a bare `VerifyResult(**d)` — needs the reconstruction hook,
+    # and it has exactly one: `flake_ledger.flake_suppression_from_wire`, mirroring
+    # `MergeVerifySpec.from_dict`'s optional nested `global_verify_command`.
+    #
+    # compare=False, for the identical reason spelled out for `duration_secs` above:
+    # `FlakeSuppression.observed_at` is a wall-clock stamp taken at observation, so two
+    # independent runs of the same logical verification carry different values. Since
+    # §5.5 requires attaching the observation on the NON-suppressed branch too, without
+    # compare=False a failing CLI verify that produced an `unconfirmable` observation
+    # would break test_cli test_verify_merge_cli_wrapper_transparency.
+    flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -6075,6 +6103,8 @@ _FALLBACK_TOOLKIND_BY_ATTR: dict[str, ToolKind] = {
 def _executed_fallback_plan(
     plan: verify_plan.VerifyPlan,
     fallback: ModuleConfig,
+    *,
+    pytest_reason: str | None = None,
 ) -> verify_plan.VerifyPlan:
     """Rebuild *plan* (``derive_verify_plan``'s fallback-branch DECISION record)
     into the EXECUTED plan, using *fallback* — the ``ModuleConfig``
@@ -6111,6 +6141,24 @@ def _executed_fallback_plan(
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
 
+    *pytest_reason* is the ONE exception, and it exists because the fallback
+    branch's WHY genuinely changed at the execution layer (task 3513). When
+    ``verify_plan.widen_fallback_for_marker_deselection`` proves the decision's
+    file-scoped pytest run would collect zero items, the call site drops the
+    file targets from the ModuleConfig that is about to EXECUTE; passing that
+    function's reason here rebuilds the pytest slot as
+    ``FULL_SUITE``/``scoped_targets=()`` (``PlannedRun``'s invariant) so the
+    record matches. Without it the plan would still read FILE_SCOPED to files
+    the executed command no longer names — the very intent-vs-execution gap
+    this reconciliation exists to close.
+
+    It is an explicit keyword rather than re-derived from *fallback* because
+    after widening a ``test_command == 'pytest'`` is byte-identical to an
+    un-widened bare default suite: this layer cannot tell the two apart and
+    would have to re-run the probe, which is both a second read and a second
+    chance to disagree with what actually executed. Omitted (the default), this
+    function's output is byte-identical to its pre-3513 behaviour.
+
     A run with no recognised tool prefix — ``_derive_fallback_runs``'s single
     "no .py files touched" SKIPPED run, returned when *plan* was derived from
     an ``existing_files`` list with zero ``.py`` files (e.g. a diff touching
@@ -6136,6 +6184,16 @@ def _executed_fallback_plan(
             if executed_cmd_str is not None
             else None
         )
+        if pytest_reason is not None and attr == 'test_command':
+            executed_runs.append(replace(
+                run,
+                module_prefix=fallback.prefix,
+                cmd=cmd,
+                scope_kind=verify_plan.ScopeKind.FULL_SUITE,
+                reason=pytest_reason,
+                scoped_targets=(),
+            ))
+            continue
         executed_runs.append(replace(run, module_prefix=fallback.prefix, cmd=cmd))
     return replace(plan, runs=tuple(executed_runs))
 
@@ -6148,6 +6206,7 @@ def _safe_derive_verify_plan_dict(
     *,
     role: Literal['merge', 'task'],
     executed_fallback: ModuleConfig | None = None,
+    fallback_pytest_reason: str | None = None,
 ) -> dict | None:
     """Best-effort executed-plan dict for ``VerifyResult.plan``.
 
@@ -6161,7 +6220,12 @@ def _safe_derive_verify_plan_dict(
     already-executed ``ModuleConfig``), the derived DECISION plan is folded
     through :func:`_executed_fallback_plan` first, so the returned dict
     records what actually ran (module_prefix + rendered command) rather than
-    the idealized flat ``'__fallback__'`` decision alone. A bug in the
+    the idealized flat ``'__fallback__'`` decision alone.
+    *fallback_pytest_reason* rides along on that same path (and only that
+    path — it is meaningless without an *executed_fallback* to reconcile
+    against): it is ``widen_fallback_for_marker_deselection``'s reason, which
+    :func:`_executed_fallback_plan` needs in order to record a marker-deselection
+    widening the executed config already applied. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge, or a future change to ``_verify_cmd_to_dict``/``to_dict``
     — must never fail an otherwise-passing verify attempt just because its
@@ -6174,7 +6238,9 @@ def _safe_derive_verify_plan_dict(
             existing_files, module_configs, config, worktree_reader, role=role,
         )
         if executed_fallback is not None:
-            plan = _executed_fallback_plan(plan, executed_fallback)
+            plan = _executed_fallback_plan(
+                plan, executed_fallback, pytest_reason=fallback_pytest_reason,
+            )
         return plan.to_dict()
     except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
         logger.warning(
@@ -6271,7 +6337,28 @@ def _reverse_dependency_module_configs(
         if dependent in already_scoped:
             continue
         base = config.module_configs_or_empty.get(dependent)
-        if base is None or not base.test_command:
+        if base is None:
+            # The map named a dependent this config's registry does not
+            # register, so there is no base command to narrow. Log rather
+            # than drop silently (amendment, review suggestion 1) — the
+            # silent-coverage-loss shape task 2607 exists to prevent.
+            # Two ways to land here: (1) a stale _REVERSE_TEST_DEPENDENTS
+            # entry naming a package this project doesn't have; (2) the
+            # CLI/remote merge leg under merge_verify_breadth='scoped',
+            # where verify_runner.run_merge_verify_on_worktree installs the
+            # dispatcher's spec set as the registry (task 4536) and that set
+            # is exactly `already_scoped` — see that function's KNOWN
+            # CONSEQUENCE note for why the trade is deliberate.
+            logger.warning(
+                'Reverse-dependency widening: %s is a mapped dependent of the '
+                'changed files but is absent from this config\'s module registry '
+                '(registered: %s) — skipping widening for this dependent; its '
+                '%d coupled test file(s) are NOT covered by this run',
+                dependent, sorted(config.module_configs_or_empty) or '<none>',
+                len(coupled),
+            )
+            continue
+        if not base.test_command:
             continue
         scoped_test_command = _scope_to_keyword(base.test_command, 'pytest', coupled)
         if scoped_test_command == base.test_command:
@@ -6400,7 +6487,9 @@ async def run_scoped_verification(
             # bypassed-scoping path executes, not WHETHER it executes.
             # role=='merge' + breadth=='full' replaces the single OPAQUE
             # global command below with a per-module full-suite fan-out
-            # across every REGISTERED module (config.module_configs_or_empty),
+            # across every REGISTERED module (config.module_configs_or_empty
+            # — whose registry that is on each leg:
+            # see verify_runner.run_merge_verify_on_worktree, task 4536),
             # reusing the SAME _derive_full_suite_runs /
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
@@ -6415,7 +6504,23 @@ async def run_scoped_verification(
             # fork — breadth is merge-role-gated only, so that call stays on
             # the legacy path unconditionally regardless of the knob.
             if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-                registered_modules = list(config.module_configs_or_empty.values()) or module_configs
+                # The expansion itself lives in
+                # verify_plan.effective_merge_module_configs (flake-ledger PRD
+                # §8.2 / task 3787 γ) — ONE implementation of "the effective
+                # merge module set" in the tree, shared with the merge-request
+                # boundary in merge_queue._run_post_merge_verify so the local
+                # runner, the wire spec and the merge-flake suppression gate
+                # all reason against the identical set BY CONSTRUCTION
+                # (INV-5). The enclosing breadth guard stays: it gates this
+                # whole per-module fan-out branch, not just the module set.
+                # The call is IDEMPOTENT, so on the merge path — where the
+                # boundary has already resolved the set — it is a
+                # value-preserving no-op, while every other caller (CLI,
+                # tests, the remote in-worktree path) still gets the real
+                # expansion here.
+                registered_modules = verify_plan.effective_merge_module_configs(
+                    config, module_configs,
+                )
                 if registered_modules:
                     plan = verify_plan.VerifyPlan(runs=tuple(
                         run
@@ -6486,8 +6591,31 @@ async def run_scoped_verification(
             # direct-instantiated config in most unit tests) falls back to
             # the passed module_configs unchanged — degrades safely rather
             # than silently verifying nothing.
-            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-                module_configs = list(config.module_configs_or_empty.values()) or module_configs
+            #
+            # THIS is the site dark_factory's production merge gate actually
+            # takes: dark-factory-orchestrator.yaml sets
+            # merge_verify_breadth: "full" but leaves merge_verify_workspace
+            # at its False default, so the force_workspace fan-out above is
+            # NOT the live routing. Whose registry the read here is on each
+            # leg: see verify_runner.run_merge_verify_on_worktree, task 4536.
+            #
+            # The expansion lives in verify_plan.effective_merge_module_configs
+            # (flake-ledger PRD §8.2 / task 3787 γ), which also owns the
+            # breadth predicate and is the IDENTITY at breadth='scoped' — so
+            # the guard here narrows to the role only. That helper is the ONE
+            # implementation of "the effective merge module set": the
+            # merge-request boundary (merge_queue._run_post_merge_verify)
+            # resolves it once up front and hands the SAME set to the local
+            # runner, the wire spec and the merge-flake suppression gate, so
+            # local and remote agree BY CONSTRUCTION rather than by two sites
+            # being asserted to match (INV-5). The call is IDEMPOTENT, which
+            # is what makes it a value-preserving no-op on that already-
+            # resolved merge path while still being the real expansion for
+            # every other caller (CLI, tests, the remote in-worktree path).
+            if role == 'merge':
+                module_configs = verify_plan.effective_merge_module_configs(
+                    config, module_configs,
+                )
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
                 # Filter to files that still exist — tasks may delete files as part of their work
@@ -6795,6 +6923,28 @@ async def run_scoped_verification(
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
+                # MARKER DESELECTION (task 3513, the task-3494 twin): widen a
+                # file-scoped pytest command whose every target is provably
+                # deselected by the effective `-m`, BEFORE it executes. It must
+                # happen here and not in _derive_fallback_runs: that pure
+                # decision function cannot see the subproject rescoping
+                # _build_fallback_config performs, whereas `fallback` IS the
+                # rescoped result — so the command's own shape decides. One
+                # reader serves both this probe and the plan derivation below.
+                fallback_reader = _worktree_reader(worktree)
+                fallback, fallback_pytest_reason = (
+                    verify_plan.widen_fallback_for_marker_deselection(
+                        fallback, fallback_reader,
+                    )
+                )
+                if fallback_pytest_reason is not None:
+                    # Loud over silent: this is DEGRADATION (the widened run
+                    # applies the same addopts, so the trigger files stay
+                    # deselected and unrun), not a free coverage upgrade.
+                    logger.warning(
+                        'Fallback pytest widened to %r — %s',
+                        fallback.test_command, fallback_pytest_reason,
+                    )
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
                 # Plan-authoritative execution (task κ,
                 # verify-scope-inversion-prd.md): derive_verify_plan's
@@ -6816,8 +6966,9 @@ async def run_scoped_verification(
                 # the _build_fallback_config call site) — unchanged from
                 # before this task.
                 plan_dict = _safe_derive_verify_plan_dict(
-                    existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                    existing_files, module_configs, config, fallback_reader, role=role,
                     executed_fallback=fallback,
+                    fallback_pytest_reason=fallback_pytest_reason,
                 )
                 if plan_dict is not None:
                     logger.info('Verify plan: %s', plan_dict)
@@ -8563,52 +8714,58 @@ async def confirm_merge_verify_flake_suppressible(
     *,
     worktree: Path,
     module_configs: list[ModuleConfig],
-) -> list[str] | None:
+) -> FlakeSuppression:
     """THIN WRAPPER: is *failing_result* a suppressible CPU-starvation flake?
 
     Holds NO re-run logic of its own. It asks THE discriminator —
     :func:`confirm_isolated_rerun_verdict` with ``call_site='merge_gate'`` —
-    and maps the returned verdict onto this gate's long-standing
-    ``list[str] | None`` contract. Everything substantive (the node-id ->
-    subproject mapping rules and their ambiguity handling, *module_configs*
+    and returns its observation UNCHANGED. Everything substantive (the node-id
+    -> subproject mapping rules and their ambiguity handling, *module_configs*
     provenance, the SAME-TREE / forced-serial / generous-timeout re-run
     composition, and this site's calibration in ``_CALL_SITE_POLICY``) is
     documented THERE, so it is stated once: two gates asking the same question
     through one implementation cannot drift into two different notions of
     "passes in isolation" (PRD §8.1, INV-5).
 
-    Returns the examined node-id list ONLY on ``passes_in_isolation`` — every
-    named failing test demonstrably PASSED on a scoped + forced-serial +
-    generous-timeout isolated re-run in the GIVEN merge *worktree* at the merge
-    SHA (INV-3: the exact tree being gated; no ``git worktree add``/``remove``,
-    no cleanup ``finally``). Single-shot per node-id group (PRD §5.1), not the
-    sweep's 2-attempt loop — the merge_gate policy's engine.
+    It survives as a function, rather than being inlined into its one caller,
+    because it is the merge gate's NAMED entry point — the exact role
+    :func:`_main_probe_failure_is_isolated_flake` plays for the probe — and it
+    is where ``call_site=FlakeCallSite.merge_gate`` is bound, once.
 
-    Returns ``None`` for EVERY other verdict — ``fails_in_isolation`` and BOTH
-    flavours of ``unconfirmable`` alike (no recoverable node-id from an
-    opaque/lint/type failure; a node-id mapping to no given subproject; an
-    infra-sentinel re-run category, which is never trusted as confirmation).
-    That collapse is deliberate: it is what makes the extraction provably
-    behaviour-preserving here. Fail CLOSED — never mask a REAL red — and NEVER
-    raise, because the merge path (merge_queue.py) has no ``VerifyInfraError``
-    handler and an uncaught raise there stalls the merge queue; the
-    discriminator's INV-1 owns that guarantee now (an unexpected exception
-    becomes ``fails_in_isolation``, which lands here as ``None``). The finer
-    ``unconfirmable`` distinction is visible to the discriminator's consumers
-    and deliberately invisible to this one — widening this return type is task
-    γ's work, not this extraction's.
+    ``passes_in_isolation`` means every named failing test demonstrably PASSED
+    on a scoped + forced-serial + generous-timeout isolated re-run in the GIVEN
+    merge *worktree* at the merge SHA (INV-3: the exact tree being gated; no
+    ``git worktree add``/``remove``, no cleanup ``finally``). Single-shot per
+    node-id group (PRD §5.1), not the sweep's 2-attempt loop — the merge_gate
+    policy's engine.
+
+    The verdict is returned WHOLE (task ε). β mapped every non-suppressing
+    verdict onto a shared ``None``, which made the extraction provably
+    behaviour-preserving but discarded the observation at exactly the point it
+    became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
+    (we could not tell — no recoverable node-id from an opaque/lint/type
+    failure; a node-id mapping to no given subproject; an infra-sentinel re-run
+    category, which is never trusted as confirmation) are different facts, and
+    θ's class-1 health check is an unconfirmable RATE that cannot be computed
+    from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
+    suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
+    unchanged; what changes is that the reason now reaches the dispatcher's
+    recorder instead of being dropped here.
+
+    Fail CLOSED — never mask a REAL red — and NEVER raise, because the merge
+    path (merge_queue.py) has no ``VerifyInfraError`` handler and an uncaught
+    raise there stalls the merge queue; the discriminator's INV-1 owns that
+    guarantee (an unexpected exception becomes ``fails_in_isolation``, which is
+    "merge stays red" rather than "we could not tell").
 
     Empty *module_configs* / files-not-on-disk (unit-test fakes) naturally map
-    nothing -> ``None``, which keeps existing ``LocalRunner.run_merge_verify``
-    tests byte-identical.
+    nothing -> ``unconfirmable``, which suppresses nothing and so keeps existing
+    ``LocalRunner.run_merge_verify`` tests byte-identical in outcome.
     """
-    suppression = await confirm_isolated_rerun_verdict(
+    return await confirm_isolated_rerun_verdict(
         worktree, config, module_configs, failing_result,
         call_site=FlakeCallSite.merge_gate,
     )
-    if suppression.verdict is FlakeVerdict.passes_in_isolation:
-        return list(suppression.test_ids)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -8743,33 +8900,6 @@ def _merge_flake_suppressed_pass(
     )
 
 
-def _emit_merge_flake_suppressed(
-    event_store: 'EventStore | None',
-    task_id: str | None,
-    merge_sha: str,
-    node_ids: list[str],
-) -> None:
-    """Emit the INV-2 structured suppression fact. None-safe (skips on None).
-
-    ``EventType`` is imported lazily to avoid any import-order coupling on this
-    central module (event_store.py has no reverse dependency on verify.py, but
-    the lazy import keeps it that way by construction).
-    """
-    if event_store is None:
-        return
-    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
-
-    event_store.emit(
-        EventType.merge_flake_suppressed,
-        task_id=task_id,
-        data={
-            'node_ids': node_ids,
-            'merge_sha': merge_sha,
-            'measured_at': datetime.now(UTC).isoformat(),
-        },
-    )
-
-
 def _emit_trivial_pass_escalated(
     event_store: 'EventStore | None',
     task_id: str | None,
@@ -8785,7 +8915,8 @@ def _emit_trivial_pass_escalated(
     ``reason`` ∈ {no_source_files, empty_existing_files, empty_command_set}.
 
     ``EventType`` is imported lazily to avoid any import-order coupling on this
-    central module (mirrors :func:`_emit_merge_flake_suppressed`).  The remote
+    central module (mirrors ``flake_recorder._emit_merge_flake_suppressed``,
+    which task ε moved out of this module onto the dispatcher).  The remote
     in-worktree LocalRunner leaves *event_store* None (it cannot reach the
     dispatching store), so only the dispatch-side event is local — the
     correctness fix still applies remotely.
@@ -8806,130 +8937,85 @@ def _emit_trivial_pass_escalated(
     )
 
 
-#: Module-global suppression counter (INV-4 storm detector). Bumped ONLY on a
-#: suppression; reset to 0 only once the window (threshold) is reached and the
-#: storm escalation decision is made. A clean, non-suppressed merge-verify does
-#: NOT reset it, so this is a CUMULATIVE count of suppressions since the last
-#: reset — NOT a count of back-to-back (consecutive) merges. A count-window
-#: detector; time-windowing is a sanctioned PRD §9 follow-up.
-_merge_flake_suppression_streak = 0
-
-#: Suppressions per window before the born-at-L2 storm escalation fires. A
-#: tunable (PRD §9): chronic suppression means α is repeatedly masking reds —
-#: a fleet-health "someone must look now" condition.
-_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
-
-#: Fixed dedup sentinel task_id for the storm escalation — the signal is a
-#: global fleet-health condition, not tied to any one merge task.
-_MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
-
-
-def _bump_suppression_streak_and_maybe_escalate(
-    escalation_queue: Any, task_id: str | None, merge_sha: str,
-) -> None:
-    """Advance the suppression streak; file a born-at-L2 storm escalation at
-    the threshold, then reset the counter (INV-4).
-
-    Modeled on ``merge_queue._alarm_verify_worktree_contention``: a born-at-L2
-    escalation (``severity='critical'``, ``level=2``,
-    ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
-    prefix marks it a harness sentinel so the escalation server never downgrades
-    the critical severity) that routes straight to a human, bypassing the
-    auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
-    storm files at most one open critical per window.
-
-    The window resets to 0 whenever the threshold is reached — on submit, on a
-    dedup-skip, AND on a ``None`` queue — so the counter can never grow
-    unbounded and each fresh window makes an independent escalation decision.
-    None-safe: with no queue there is nothing to file into, so it resets and
-    returns (the CLI / remote paths that pass ``escalation_queue=None`` are not
-    the CPU-starvation target this gate addresses — see the α scope fence).
-    """
-    global _merge_flake_suppression_streak
-    _merge_flake_suppression_streak += 1
-    if _merge_flake_suppression_streak < _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD:
-        return
-
-    # Window reached: make the escalation decision once, then reset regardless.
-    _merge_flake_suppression_streak = 0
-    if escalation_queue is None:
-        return
-
-    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
-
-    sentinel = _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
-    # Dedup: don't re-alarm while an open L2 already exists for the storm
-    # sentinel (has_open_l1 is hardcoded to level=1, so get_by_task is used).
-    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
-        return
-
-    summary = (
-        'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate '
-        f'has suppressed {_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify '
-        'reds since the last reset'
-    )
-    detail = (
-        f'The role=merge isolated-rerun-confirm gate (verify.'
-        f'apply_merge_flake_suppression) has suppressed '
-        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify failures as '
-        f'CPU-starvation flakes since the counter was last reset — a CUMULATIVE '
-        f'count, NOT necessarily back-to-back merges (a clean merge-verify does '
-        f'not reset the counter). Most recent merge SHA: {merge_sha}, task_id: '
-        f'{task_id}. Each suppression means a merge-verify red passed on isolated '
-        're-run — but a sustained rate of suppressions indicates either chronic '
-        'host CPU starvation or a genuinely flaky test that is being repeatedly '
-        'masked. Investigate before the gate hides a real regression.'
-    )
-    esc = Escalation(
-        id=escalation_queue.make_id(sentinel),
-        task_id=sentinel,
-        agent_role='orchestrator-merge-flake-monitor',
-        severity='critical',
-        level=2,
-        category='merge_flake_suppression_storm',
-        summary=summary,
-        detail=detail,
-        suggested_action=(
-            'Inspect merge-flake-suppressed events (EventType.merge_flake_suppressed) '
-            'and host CPU load. Confirm the suppressed tests are load flakes, not a '
-            'masked regression; if a specific test is chronically flaky, de-flake or '
-            'quarantine it.'
-        ),
-    )
-    escalation_queue.submit(esc)
-
-
 async def apply_merge_flake_suppression(
     failing_result: VerifyResult,
     *,
     worktree: Path,
     config: 'OrchestratorConfig',
     module_configs: list[ModuleConfig],
-    merge_sha: str,
-    event_store: 'EventStore | None' = None,
-    escalation_queue: Any = None,
-    task_id: str | None = None,
     _confirm=confirm_merge_verify_flake_suppressible,
 ) -> VerifyResult:
-    """Merge-verify result handler: suppress a confirmed CPU-starvation flake.
+    """Merge-verify result handler: OBSERVE a red, ATTACH the observation.
 
     THE hook ``LocalRunner.run_merge_verify`` calls on its ``not scoped.passed``
-    branch (PRD task α). Runs the pure gate *_confirm*; on a confirmed flake it
-    emits the INV-2 fact, bumps the INV-4 storm streak, and returns a PASSED
-    VerifyResult (category ``merge_flake_suppressed``) so the merge proceeds
-    into the unscoped typecheck gate. On a non-confirmation it returns
-    *failing_result* UNCHANGED (merge stays red; no fact, streak untouched).
+    branch (PRD task α). Runs the pure gate *_confirm* and returns a
+    ``VerifyResult`` carrying its ``FlakeSuppression`` on BOTH branches: a
+    PASSED result (category ``merge_flake_suppressed``) on
+    ``passes_in_isolation``, so the merge proceeds into the unscoped typecheck
+    gate; otherwise *failing_result* with the observation attached (merge stays
+    red).
+
+    IT PERFORMS NO SIDE-EFFECT (task ε). The ``merge_flake_suppressed`` emit and
+    the INV-4 storm-streak bump used to happen HERE, inline, and that was the
+    defect: this function runs wherever the WORKTREE is, and on the remote path
+    that host has no event store and its own module-global streak counter — so
+    the fact was dropped and the storm detector silently disarmed exactly where
+    load is highest. Both now happen on the DISPATCHER, in
+    ``flake_recorder.record_merge_flake_suppression``, driven off the attached
+    observation. Keeping ``event_store``/``escalation_queue``/``merge_sha``/
+    ``task_id`` OUT of this signature is what makes that structural.
+
+    §5.5 — record the OBSERVATION, not the remedy: the observation is attached
+    on the non-suppressed branch too, so a ``fails_in_isolation`` or
+    ``unconfirmable`` verdict still reaches the ledger. Only
+    ``passes_in_isolation`` changes the VERDICT.
+
+    Shaping the suppressed pass stays here rather than moving to the recorder:
+    that is the GATE's judgement about the merge, not a record of anything.
 
     Never raises: the pure gate is itself fail-closed and non-raising, and the
-    fact/streak side-effects are None-safe — an uncaught raise here would stall
-    the merge queue (merge_queue.py has no VerifyInfraError handler). *_confirm*
-    is injectable for testing.
+    ``_is_attachable`` guard below covers BOTH branches' ``replace`` calls — an
+    uncaught raise here would stall the merge queue (merge_queue.py has no
+    VerifyInfraError handler). *_confirm* is injectable for testing.
     """
-    ids = await _confirm(
+    suppression = await _confirm(
         config, failing_result, worktree=worktree, module_configs=module_configs,
     )
-    if not ids:
+    # ONE guard, checked before either branch, because BOTH of them reach
+    # `dataclasses.replace` — the suppressed branch via `_merge_flake_suppressed_pass`
+    # and the non-suppressed branch directly.  Guarding only the second (as this
+    # originally did) left the never-raise claim above half-true: the exact
+    # non-dataclass input it defended against still raised `TypeError` one branch over.
+    if not _is_attachable(failing_result):
+        logger.warning(
+            'apply_merge_flake_suppression: cannot attach a %s observation to a '
+            '%s (not a VerifyResult dataclass); returning the verdict unchanged',
+            getattr(suppression.verdict, 'value', suppression.verdict),
+            type(failing_result).__name__,
+        )
         return failing_result
-    _emit_merge_flake_suppressed(event_store, task_id, merge_sha, ids)
-    _bump_suppression_streak_and_maybe_escalate(escalation_queue, task_id, merge_sha)
-    return _merge_flake_suppressed_pass(failing_result, ids)
+    if suppression.verdict is FlakeVerdict.passes_in_isolation:
+        return replace(
+            _merge_flake_suppressed_pass(failing_result, list(suppression.test_ids)),
+            flake_suppression=suppression,
+        )
+    return replace(failing_result, flake_suppression=suppression)
+
+
+def _is_attachable(result: object) -> bool:
+    """True iff *result* is a dataclass INSTANCE, so ``dataclasses.replace`` is safe.
+
+    ``replace`` raises ``TypeError`` on anything else (including a dataclass CLASS,
+    hence the ``isinstance(..., type)`` arm).  Degrading instead of raising is the
+    point: the caller is holding a real verdict, and the only thing being added is a
+    record of WHY.  Raising would convert a legible 'Verification failed' outcome into
+    an opaque 'Merge worker error: replace() should be called on dataclass instances'
+    — trading the caller's verdict for a bookkeeping crash, and violating
+    ``apply_merge_flake_suppression``'s never-raise contract (merge_queue.py has no
+    VerifyInfraError handler).
+
+    Same discipline as ``VerifyRunnerPool.dispatch``'s guard on the runner re-stamp:
+    an observation is evidence ABOUT a verdict and must never be able to destroy the
+    verdict it describes.
+    """
+    return is_dataclass(result) and not isinstance(result, type)

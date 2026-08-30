@@ -1202,6 +1202,49 @@ def _capped_mining_result(*, stop_reason, max_batches, batches=2):
     )
 
 
+def _storm_capped_mining_result():
+    """A capped run whose second batch is a storm. Mirrors the exact fixture
+    shape already pinned by test_mine_to_saturation_storm_batch_never_counts_as_saturated
+    (:352-389: total=10, succeeded=4, failed=6, status="failure") so this is
+    provably a shape mine_to_saturation really produces, not an invented one.
+    Batch 0 is healthy (10/10 coded); batch 1 is a storm (6 of 10 digests
+    failed to parse and so contributed no signal). drawn = 20, coded = 14."""
+    return mod.MiningResult(
+        records=[],
+        batch_stats=[
+            mod.BatchStats(
+                index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
+                saturated=False, status="ok",
+            ),
+            mod.BatchStats(
+                index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
+                saturated=False, status="failure",
+            ),
+        ],
+        stop_reason="capped",
+        max_batches=2,
+    )
+
+
+def _coverage_line(report):
+    """Isolate the single "- coverage:" line inside "## Saturation" from the
+    rest of the section. The per-batch bullets rendered below it already
+    contain digit-bearing substrings like "total=10 ... succeeded=4", so
+    asserting against the whole section (the same trap
+    test_render_report_capped_run_names_cap_and_partial_coverage's own
+    precision comment below calls out for the bare cap digit) would pass
+    even against unfixed code and prove nothing. Assert only against what
+    this returns."""
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    coverage_lines = [
+        line for line in saturation_section.splitlines() if line.strip().startswith("- coverage:")
+    ]
+    assert len(coverage_lines) == 1, (
+        f"expected exactly one '- coverage:' line, found {coverage_lines!r}"
+    )
+    return coverage_lines[0]
+
+
 def _render(**overrides):
     # Annotated for the same reason as _run_census_kwargs: a heterogeneous
     # dict whose inferred value union would otherwise be re-reported once per
@@ -1237,6 +1280,64 @@ def test_render_report_capped_run_names_cap_and_partial_coverage():
     # A capped report must be unreadable as full coverage.
     assert "partial" in lowered
     assert "not mined" in lowered
+
+
+def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
+    # A storm batch's `total` counts digests DRAWN into the batch, including
+    # ones that failed to code and so contributed zero signal to the
+    # codebook (coder.code_digests, PRD §8.6). This is the ONE line whose
+    # documented job (render_report's docstring, "NO SILENT CAPS") is that a
+    # bounded run is never read as fuller coverage than it actually was --
+    # so it must lead with what was CODED (succeeded), not merely what was
+    # DRAWN (total).
+    report = _render(mining_result=_storm_capped_mining_result())
+
+    coverage_line = _coverage_line(report)
+    # One ordered-substring assertion, not separate bare-digit checks: two
+    # independent "14 in line" / "20 in line" checks would both still pass
+    # against a transposed rendering ("coded 20 of 14 ... drawn") -- exactly
+    # the off-by-field regression this test exists to catch.
+    assert "coded 14 of 20 session digest(s) drawn" in coverage_line, (
+        "digests actually coded (10 healthy + 4 from the storm) must lead, "
+        "with the drawn count still present alongside it, labelled as drawn"
+    )
+    assert "mined 20 session digest(s)" not in coverage_line, (
+        "the buggy rendering reported the drawn count as though all 20 had "
+        "been coded -- this must no longer render"
+    )
+
+
+def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fell_short():
+    # The storm's shortfall must be LOUD on the coverage line itself, not
+    # merely inferable by subtracting the per-batch bullets rendered below
+    # it -- an operator deciding whether to roll last_census_at back reads
+    # THIS line, and it is the one line whose job is the coverage claim.
+    report = _render(mining_result=_storm_capped_mining_result())
+
+    coverage_line = _coverage_line(report)
+    lowered = coverage_line.lower()
+    assert "6" in coverage_line, "the 6 digests that failed to code must be named"
+    assert "failed to code" in lowered
+    assert "no signal" in lowered, "the shortfall must say these digests contributed nothing"
+
+
+def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_digest_coded():
+    # A healthy capped run must not grow noise it has to explain away -- a
+    # line trained to be ignored is a line that will be ignored on the run
+    # that matters. This is the branch guard for the shortfall clause: it
+    # must render ONLY when coding actually fell short of what was drawn.
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
+    )
+
+    coverage_line = _coverage_line(report)
+    lowered = coverage_line.lower()
+    assert "failed to code" not in lowered
+    assert "no signal" not in lowered
+    # Not a bare "0" check (a healthy run's line legitimately contains "20",
+    # which itself contains "0") -- assert the shortfall-clause SHAPE is
+    # absent, not merely that some unrelated digit is.
+    assert "0 digest" not in coverage_line, "a healthy run must not render a 0-failure clause"
 
 
 def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
@@ -1994,6 +2095,92 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     assert "storm" in report_text.lower(), "the report's cost note must call out degraded data"
 
+    # LOCK, not RED: pins an asymmetry that is already correct today, so it
+    # is tempting to "clean up" once the coverage line (above) starts
+    # reporting `succeeded` instead of `total` -- doing so would silently
+    # UNDER-report real spend. The coverage line answers "how much signal
+    # did this run gather?" (succeeded is correct there). The cost note
+    # answers "what did this run bill?" (total is correct here):
+    # coder.code_digests calls code_digest once per digest, each in its own
+    # try/except, so a digest that fails to parse has ALREADY spent its
+    # invoke call by the time it's counted as failed. Derived from the
+    # fixture, not hardcoded, so this survives a batch resize.
+    cost_section = report_text.split("## Cost", 1)[1]
+    assert f"miner={len(batch)}" in cost_section, (
+        "the cost note must count every digest DRAWN into the batch "
+        "(including the 2 that failed to parse), not just the ones that "
+        "coded successfully -- they already burned their invoke call"
+    )
+
+    # This run passed no max_batches, so it is uncapped: mine_to_saturation
+    # exhausts the single-batch source rather than hitting an operator cap.
+    # render_report's entire capped-coverage block -- including the step-4
+    # shortfall clause -- is gated on `mining_result.max_batches is not
+    # None` and so renders NOTHING on this path. Asserting the shortfall
+    # clause fired here would be a false premise about an uncapped run;
+    # assert instead what this path actually renders (nothing), rather than
+    # adding a cap this test never passed just to force it to appear.
+    assert outcome.stop_reason == "exhausted"
+    # Scoped to the Saturation section, not the whole report: synthesis_md,
+    # matrix_md and the cost note are assembled elsewhere by other fakes, so
+    # a whole-report check would fail this storm-detection test for reasons
+    # that have nothing to do with storms or capped coverage.
+    saturation_section = report_text.split("## Saturation", 1)[1].split("##", 1)[0]
+    assert "- coverage:" not in saturation_section
+
+
+def test_run_census_storm_batch_capped_reports_coded_of_drawn_end_to_end(tmp_path):
+    # Amendment: every render_report-level test above drives the coded/drawn
+    # split against a HAND-BUILT MiningResult (_storm_capped_mining_result),
+    # so BatchStats.succeeded/total are asserted by construction, never
+    # observed coming out of a real coding run. This drives the same storm
+    # shape as test_run_census_storm_batch_is_logged_and_noted_in_report
+    # above (2 of the batch's 3 digests fail to parse) through the real
+    # coder.code_digests pipeline, but with max_batches=1 so the
+    # capped-coverage branch (not just the uncapped cost note) renders.
+    batch = [
+        _hand_digest("bad-1", "x"),
+        _hand_digest("bad-2", "y"),
+        _hand_digest("dup-1", "z"),
+    ]
+
+    def storm_invoke(prompt, model):
+        if "bad-1" in prompt or "bad-2" in prompt:
+            return "not valid JSON -- this coding call fails to parse"
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(storm_invoke),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+        max_batches=1,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    # The cap check fires right after the one batch is coded, before the
+    # (now-empty) source is ever polled again -- "capped", not "exhausted".
+    assert outcome.stop_reason == "capped"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    coverage_line = _coverage_line(report_text)
+    assert "coded 1 of 3 session digest(s) drawn" in coverage_line, (
+        "only dup-1 coded successfully; bad-1 and bad-2 failed to parse -- "
+        "this count must come from a real coder.code_digests run, not a "
+        "hand-built BatchStats fixture"
+    )
+    lowered = coverage_line.lower()
+    assert "2 digest(s) failed to code" in lowered, (
+        "the 2 digests that failed to parse must be named as a shortfall on "
+        "this line, not just inferable from the per-batch bullet below it"
+    )
+    assert "no signal" in lowered
+
 
 # ---------------------------------------------------------------------------
 # task 3280 step-9: RED — run_census(max_batches=) threads the operator batch
@@ -2592,6 +2779,103 @@ def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tm
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.dry_run is None
     assert list(tmp_path.glob("*-payloads.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# task 4084 SECONDARY item: INTEGRATION/CHARACTERIZATION — EXPECTED TO PASS ON
+# FIRST RUN once the coverage-line fix above has landed; closes a named
+# coverage gap rather than driving a behaviour change. test_main_cost_control_
+# flags_thread_into_run_census (below) monkeypatches run_census away and
+# asserts only argv threading, so the CHAIN this task names -- a capped
+# mining run changes what the verify cap defers, which changes the dry-run
+# payload count -- has never been exercised through the real pipeline.
+# ---------------------------------------------------------------------------
+
+def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, caplog):
+    # Assembled entirely from the existing single-flag precedents' fixtures
+    # (max_batches: test_run_census_max_batches_caps_mining_and_reports_it;
+    # max_verify_clusters: test_run_census_max_verify_clusters_defers_the_
+    # rest_as_pending_candidates; dry_run_payloads_path: test_run_census_
+    # dry_run_filing_writes_payloads_and_files_nothing) -- no new fakes, no
+    # new fixtures.
+    source = _TrackingBatchSource([_happy_batch(f"b{i}") for i in range(3)])
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    fake_verify_fn = _make_fake_verify_fn(
+        verified_titles={"Silent no-op subagent contract"},
+        rejected_titles={"Spurious pattern"},
+    )
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=source,
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_poison("submit_fn"),  # dry run -- must never be reached
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=_make_fake_commit(),
+        max_batches=1,
+        max_verify_clusters=1,
+        dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # (a) mining stopped at the cap -- batches 1 and 2 never consumed.
+    assert outcome.stop_reason == "capped"
+    assert source.pulled == [0]
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    lowered = report_text.lower()
+
+    # (b) the capped coverage line reports the CODED count for the one mined
+    # batch (steps 2/4 above, now observed through the real pipeline rather
+    # than a hand-built MiningResult), and the PARTIAL / never-re-enumerated
+    # disclosures still fire. _happy_batch's 3 digests all code successfully
+    # (none configured to fail to parse), so coded == drawn == 3 here -- no
+    # shortfall clause is expected from THIS combination; step-5's extension
+    # of the storm test already locks that clause separately.
+    coverage_line = _coverage_line(report_text)
+    assert "coded 3 of 3" in coverage_line
+    assert "operator batch cap = 1" in coverage_line
+    assert "failed to code" not in coverage_line.lower()
+    assert "partial" in lowered
+    assert "never re-enumerated" in lowered
+
+    # (c) the verify cap bit only on the clusters capped mining actually
+    # produced. A single _happy_batch always yields exactly two novel
+    # clusters ("Silent no-op subagent contract", "Spurious pattern" --
+    # mirrors test_run_census_max_batches_caps_mining_and_reports_it, which
+    # relies on the same two-cluster shape), so max_verify_clusters=1 (< 2)
+    # really does defer one of them: this is not the "fewer novel clusters
+    # than the cap" case.
+    assert len(fake_verify_fn.calls) == 1
+    verified_clusters = fake_verify_fn.calls[0]["clusters"]
+    assert len(verified_clusters) == 1, "the verify cap must bound what was SENT to verify_fn"
+    assert verified_clusters[0]["title"] == "Silent no-op subagent contract", "first in mining order"
+
+    assert "## Verification" in report_text
+    verification_section = report_text.split("## Verification", 1)[1].split("##", 1)[0]
+    verification_lowered = verification_section.lower()
+    assert "verified 1 of 2 novel clusters" in verification_lowered
+    assert "1 deferred" in verification_lowered
+    assert "pending candidate" in verification_lowered
+
+    # (d) capped mining -> verify cap -> dry-run payload count: the exact
+    # chain this task named. Only the cluster that both survived the verify
+    # cap AND was actually verified ("Silent no-op subagent contract") is
+    # filed; "Spurious pattern" was DEFERRED by the cap (never sent to
+    # verify_fn at all), not rejected, so it must not appear as a payload.
+    assert payloads_path.exists()
+    payloads = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert len(payloads) == 1
+    assert "Silent no-op subagent contract" in payloads[0]["title"]
+
+    # (e) census-state still advanced under three caps at once, so the
+    # report's re-anchor claim ("NOT PICKED UP LATER") stays honest.
+    assert kwargs["census_state_path"].exists()
+    assert outcome.status == "done"
 
 
 # ---------------------------------------------------------------------------

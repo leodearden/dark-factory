@@ -2,11 +2,13 @@
 
 import logging
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 from _fm_helpers import make_8df8_scenario, pydantic_spec
+from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
@@ -1188,6 +1190,140 @@ async def test_blocked_routes_update_through_task_interceptor_when_wired(
     hints_actions = [a for a in result.get('actions', []) if a['type'] == 'hints_attached']
     assert len(hints_actions) == 1, (
         f'Expected exactly one hints_attached action, got: {result.get("actions", [])}'
+    )
+
+
+# ── task-3581: the hints-attach write must UNION, not clobber, memory_hints ──
+#
+# DF-3260: _on_task_blocked attaches generated hints onto a row that may
+# already carry human-authored memory_hints. It passed neither metadata_mode
+# nor append, so the write resolved to the default 'merge' — shallow
+# last-write-wins — and the whole authored memory_hints key was replaced by
+# the generated {entities: [...], queries: ['resolution for: <title>']} stub.
+
+# The authored hints DF task 3260 was carrying before the clobber.
+_DF3260_AUTHORED_METADATA = {
+    'memory_hints': {
+        'entities': ['Task 3113', 'Task 3146'],
+        'queries': ['metadata.files scope recon boundary'],
+    },
+}
+
+
+def _resolved_mode_of(call_kwargs: dict) -> str:
+    """Resolve the merge mode the captured update_task call actually requests.
+
+    Goes through the REAL backend resolver rather than string-matching a
+    kwarg, so the assertion is spelling-agnostic: metadata_mode='additive'
+    and a bare append=True both resolve to 'additive', while the pre-fix
+    no-mode-argument call resolves to 'merge'.
+    """
+    from fused_memory.backends.sqlite_task_backend import _resolve_metadata_mode
+    return _resolve_metadata_mode(
+        call_kwargs.get('metadata_mode'),
+        call_kwargs.get('append'),
+        metadata_present=call_kwargs.get('metadata') is not None,
+    )
+
+
+async def _capture_blocked_hints_write(reconciler, mock_memory_service, *, via_interceptor):
+    """Drive _on_task_blocked through the hints-attach branch and return the
+    kwargs of whichever update_task call it made."""
+    mock_memory_service.search = AsyncMock(return_value=[
+        MemoryResult(
+            id='1', content='blocker info', source_store=SourceStore.mem0,
+            entities=['EntityA'],
+        ),
+    ])
+    if via_interceptor:
+        mock_interceptor = AsyncMock()
+        mock_interceptor.update_task = AsyncMock(return_value={'success': True})
+        reconciler.task_interceptor = mock_interceptor
+        target = mock_interceptor
+    else:
+        assert reconciler.task_interceptor is None, (
+            'fallback-branch test requires an unwired interceptor'
+        )
+        target = reconciler.taskmaster
+
+    await reconciler.reconcile_task(
+        task_id='42', transition='blocked',
+        project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '42', 'title': 'Blocked task', 'status': 'in-progress'},
+    )
+    target.update_task.assert_called_once()
+    return target.update_task.call_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('via_interceptor', [True, False], ids=['interceptor', 'fallback'])
+async def test_on_task_blocked_hints_write_uses_additive_mode(
+    reconciler, mock_memory_service, mock_taskmaster, via_interceptor,
+):
+    """The _on_task_blocked hints-attach write must request ADDITIVE merge
+    semantics on BOTH branches — the wired-interceptor one and the direct
+    taskmaster fallback (task 3581).
+
+    Both branches are separately reachable, so a fix applied to only one of
+    them leaves the DF-3260 clobber live on the other."""
+    call_kwargs = await _capture_blocked_hints_write(
+        reconciler, mock_memory_service, via_interceptor=via_interceptor,
+    )
+    mode = _resolved_mode_of(call_kwargs)
+    assert mode == 'additive', (
+        f"the hints-attach write must request additive (union) merge; it resolves "
+        f"to {mode!r}. Pass metadata_mode='additive' (or append=True) — under the "
+        f"default 'merge' the authored memory_hints key is overwritten wholesale "
+        f"(DF-3260). Captured kwargs: "
+        f"{ {k: v for k, v in call_kwargs.items() if k != 'metadata'} }"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('via_interceptor', [True, False], ids=['interceptor', 'fallback'])
+async def test_on_task_blocked_preserves_authored_memory_hints(
+    reconciler, mock_memory_service, mock_taskmaster, via_interceptor,
+):
+    """The behavioural DF-3260 reproduction: run the captured hints-attach
+    payload through the REAL _merge_metadata using the mode the call actually
+    requests, against a row already carrying human-authored memory_hints.
+
+    The authored entities and query must SURVIVE alongside the generated
+    'resolution for: <title>' stub — union, not replacement. This is the
+    assertion that would have caught the original incident, and one that a
+    future call-site regression cannot slip past by keeping a kwarg while
+    changing its value."""
+    import json as _json
+
+    from fused_memory.backends.sqlite_task_backend import _merge_metadata
+
+    call_kwargs = await _capture_blocked_hints_write(
+        reconciler, mock_memory_service, via_interceptor=via_interceptor,
+    )
+
+    merged = _json.loads(_merge_metadata(
+        _json.dumps(_DF3260_AUTHORED_METADATA),
+        call_kwargs['metadata'],
+        mode=_resolved_mode_of(call_kwargs),
+    ))
+    hints = merged['memory_hints']
+
+    authored = _DF3260_AUTHORED_METADATA['memory_hints']
+    for entity in authored['entities']:
+        assert entity in hints['entities'], (
+            f'authored memory_hints entity {entity!r} was CLOBBERED by the '
+            f'hints-attach write (DF-3260): {merged}'
+        )
+    assert authored['queries'][0] in hints['queries'], (
+        f'authored memory_hints query was CLOBBERED by the hints-attach '
+        f'write (DF-3260): {merged}'
+    )
+    # ...and the generated stub still lands alongside it.
+    assert 'resolution for: Blocked task' in hints['queries'], (
+        f'generated resolution query must still be attached: {merged}'
+    )
+    assert 'EntityA' in hints['entities'], (
+        f'generated entity must still be attached: {merged}'
     )
 
 
@@ -4035,16 +4171,48 @@ def _verify_rows(actions: list[dict]) -> list[dict]:
     ]
 
 
-async def _run_done_transition(reconciler, task_id: str = '1') -> dict:
+async def _run_done_transition(
+    reconciler, task_id: str = '1', project_root: str = '/tmp/test',
+) -> dict:
     """Drive a done-transition through the sparse-knowledge verify branch.
 
     mock_memory_service.search defaults to [], so len(related) < 2 and the
     verification branch opens with no extra setup.
+
+    ``project_root`` is overridable (task 4722) because it is now the root the
+    verifier actually verifies against: tests driving a REAL CodebaseVerifier
+    need a real checkout here, and the fail-closed refusal test needs a root
+    that is deliberately NOT one.  The '/tmp/test' default keeps every
+    mocked-verifier caller unchanged.
     """
     return await reconciler.reconcile_task(
         task_id=task_id, transition='done', project_id='test-project',
-        project_root='/tmp/test',
+        project_root=project_root,
         task_before={'id': task_id, 'title': 'Test', 'status': 'in-progress'},
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_passes_scope_project_root_as_codebase_root(reconciler):
+    """The verifier is pointed at the TASK's project root, not the global one.
+
+    Task 4722 / PRD D3.  ``reconcile_task`` already validates the root and
+    builds a ``ProjectScope`` from it; ``_on_task_done`` hands that same value
+    to ``verify()``, making the caller's scope the single root authority
+    (INV-9).  Before this, every project's claims were verified against the
+    process-global ``explore_codebase_root`` — and 58% of historical gate
+    openings were for non-dark_factory projects.
+    """
+    project_root = '/tmp/some-other-project'
+    assert project_root != reconciler.config.explore_codebase_root
+
+    await _run_done_transition(reconciler, project_root=project_root)
+
+    reconciler.verifier.verify.assert_awaited_once()
+    call_kwargs = reconciler.verifier.verify.call_args.kwargs
+    assert call_kwargs['codebase_root'] == Path(project_root), (
+        f'Expected codebase_root={project_root!r}, got '
+        f'{call_kwargs.get("codebase_root")!r}'
     )
 
 
@@ -4283,7 +4451,7 @@ class TestVerificationFailureAudit:
 
     @pytest.mark.asyncio
     async def test_cli_failure_token_survives_end_to_end_into_the_journal(
-        self, reconciler, journal, config
+        self, reconciler, journal, config, tmp_path
     ):
         """Anti-regression for the WHOLE chain, with no VerificationResult hand-built.
 
@@ -4295,6 +4463,12 @@ class TestVerificationFailureAudit:
         """
         reconciler.verifier = CodebaseVerifier(config.reconciliation)
 
+        # A real checkout-shaped root (task 4722): the verifier now refuses an
+        # unusable root BEFORE spawning an agent, so driving this through the
+        # old '/tmp/test' default would flip the token under test to
+        # 'codebase_root_unresolved' and stop exercising the CLI chain at all.
+        real_root = make_git_root(tmp_path, 'checkout')
+
         with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
             agent = AsyncMock()
             agent.run = AsyncMock(return_value=(
@@ -4303,7 +4477,7 @@ class TestVerificationFailureAudit:
             ))
             MockAgentLoop.return_value = agent
 
-            await _run_done_transition(reconciler)
+            await _run_done_transition(reconciler, project_root=str(real_root))
 
         runs = await journal.get_recent_runs('test-project', limit=1)
         actions = await journal.get_run_actions(runs[0].id)
@@ -4319,6 +4493,84 @@ class TestVerificationFailureAudit:
         assert rows[0]['detail'].get('failure_token') == 'cli_output_unparseable', (
             f'Expected the specific CLI origin to survive into the journal, got '
             f'{rows[0]["detail"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_root_is_audited_and_writes_no_memory(
+        self, reconciler, journal, config, mock_memory_service, tmp_path
+    ):
+        """A wrong/unresolvable root can never produce a verdict-bearing write.
+
+        The end-to-end invariant the PRD (D4) pins by test.  A REAL
+        CodebaseVerifier is installed and only AgentLoop is patched, so the
+        refusal has to travel verify.py -> targeted.py -> SQLite exactly the
+        way a genuine CLI failure does.  The point is that the refusal is a
+        first-class AUDITED outcome — not a swallowed no-op, and not the
+        generic 'error' row an exception would leave — while producing no
+        verification memory at all: an agent pointed at the wrong tree finds
+        nothing and would otherwise report `contradicted` against completed
+        work.
+        """
+        reconciler.verifier = CodebaseVerifier(config.reconciliation)
+
+        # An absolute path (require_project_root only validates SHAPE) that is
+        # a real directory but NOT a checkout — the shape that reaches the
+        # verifier today.
+        bad_root = tmp_path / 'not-a-checkout'
+        bad_root.mkdir()
+
+        with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+            result = await _run_done_transition(reconciler, project_root=str(bad_root))
+
+            MockAgentLoop.assert_not_called()
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+
+        outcome_rows = [
+            a for a in _verify_rows(actions) if a['operation'] != 'post_verify_error'
+        ]
+        assert len(outcome_rows) == 1, (
+            f'Expected exactly one verify/codebase outcome row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert outcome_rows[0]['operation'] == 'agent_failed', (
+            f'Expected operation=agent_failed but got {outcome_rows[0]["operation"]!r}'
+        )
+        assert outcome_rows[0]['detail'].get('failure_token') == 'codebase_root_unresolved', (
+            f'Expected the refusal token in detail, got {outcome_rows[0]["detail"]!r}'
+        )
+
+        # Not a verdict, and not the generic exception row.
+        assert not [
+            a for a in _verify_rows(actions)
+            if a['operation'] in ('contradicted', 'confirmed', 'error')
+        ], (
+            f'A refused root is neither a verdict nor a verifier exception, got '
+            f'{[(a["operation"]) for a in _verify_rows(actions)]}'
+        )
+
+        # No verdict-bearing memory write.  The fast-path completion echo still
+        # fires and is explicitly allowed, so the filter is on the metadata
+        # that marks a write as carrying a verification verdict.
+        verdict_writes = [
+            c for c in mock_memory_service.add_memory.call_args_list
+            if 'verification_verdict' in (c.kwargs.get('metadata') or {})
+        ]
+        assert not verdict_writes, (
+            f'A refused root must not write a verification memory, got '
+            f'{[c.kwargs.get("metadata") for c in verdict_writes]}'
+        )
+
+        failed_actions = [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_agent_failed'
+        ]
+        assert len(failed_actions) == 1, (
+            f'Expected a verification_agent_failed action, got {result.get("actions")}'
+        )
+        assert failed_actions[0].get('failure_token') == 'codebase_root_unresolved', (
+            f'Expected the token on the action, got {failed_actions[0]!r}'
         )
 
     @pytest.mark.asyncio

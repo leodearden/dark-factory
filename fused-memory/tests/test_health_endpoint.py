@@ -1,4 +1,4 @@
-"""Tests for the /health endpoint, ServerConfig, and memory/search/episodes validation."""
+"""Tests for the /health and /alive endpoints, ServerConfig, and memory/search/episodes validation."""
 
 import warnings
 from unittest.mock import AsyncMock, MagicMock
@@ -65,6 +65,116 @@ def test_health_post_not_allowed(health_app):
     client = TestClient(health_app)
     resp = client.post('/health')
     assert resp.status_code == 405
+
+
+# ------------------------------------------------------------------
+# /alive: zero-I/O LIVENESS route, distinct from /health's READINESS
+# (task 3765)
+#
+# The watchdog's KILL decision (scripts/orchestrator-watchdog.py's
+# _fused_memory_liveness_verdict) fetches /alive, not /health: /health awaits
+# two sequential backing-store round-trips, which makes it a LOAD measurement
+# and manufactures a false "wedged" verdict whenever FalkorDB/Qdrant is slow.
+# /alive is served by the SAME asyncio loop, so a genuinely hung loop still
+# fails to answer it and is still killed (the task-1731/2713 intent survives).
+# ------------------------------------------------------------------
+
+
+_EXPECTED_ALIVE_BODY = {'status': 'alive'}
+
+
+def test_alive_returns_200_constant_body(health_app):
+    """GET /alive returns 200 with an EXACT constant body.
+
+    The whole dict is pinned with == (not a subset match) on purpose: any
+    dynamic field — timestamp, uptime, version, request counter — is an
+    invitation for a future edit to read state, and reading state is how a
+    liveness probe degrades back into the load measurement /health already is.
+    """
+    client = TestClient(health_app)
+    resp = client.get('/alive')
+    assert resp.status_code == 200
+    assert resp.json() == _EXPECTED_ALIVE_BODY
+
+
+def test_alive_issues_zero_backing_store_calls():
+    """THE CONTRACT: serving /alive touches NEITHER backing store nor the harness.
+
+    The defect being fixed is structural, not temporal — a handler that still
+    calls the stores but happens to be fast today regresses silently the moment
+    the stores or the loop are loaded. So this asserts zero calls rather than a
+    wall-clock bound. ``mock_calls`` records CHILD calls, so one equality
+    against [] covers graphiti.list_graphs, mem0.list_projects, and any future
+    store touch without enumerating them.
+
+    The /health contrast on the SAME app is the teeth of the assertion: without
+    it, the zero-call check would pass vacuously against a 404 from an
+    unregistered or mis-spelled route.
+    """
+    mock_service = _make_mock_service()
+    harness = MagicMock()
+    harness.recon_busy_snapshot.return_value = []
+    app = create_mcp_server(
+        mock_service,
+        reconciliation_harness=harness,  # type: ignore[arg-type]
+    ).streamable_http_app()
+    client = TestClient(app)
+
+    # Reset AFTER construction — building the server may legitimately touch
+    # either mock; only what the REQUEST does is under test here.
+    mock_service.reset_mock()
+    harness.reset_mock()
+
+    resp = client.get('/alive')
+    assert resp.status_code == 200
+    assert resp.json() == _EXPECTED_ALIVE_BODY
+    assert mock_service.mock_calls == [], (
+        'GET /alive must issue ZERO backing-store calls; got: '
+        f'{mock_service.mock_calls!r}'
+    )
+    harness.recon_busy_snapshot.assert_not_called()
+
+    # Teeth: the same app's /health DOES touch both — proving the route was
+    # really served and the mocks really record.
+    mock_service.reset_mock()
+    harness.reset_mock()
+    assert client.get('/health').status_code == 200
+    assert mock_service.mock_calls != [], (
+        'sanity check failed: /health recorded no backing-store calls, so the '
+        'zero-call assertion above proves nothing'
+    )
+    harness.recon_busy_snapshot.assert_called()
+
+
+def test_alive_post_not_allowed(health_app):
+    """POST /alive should be rejected (405) — pins methods=['GET'] only."""
+    client = TestClient(health_app)
+    resp = client.post('/alive')
+    assert resp.status_code == 405
+
+
+def test_alive_answers_while_health_is_degraded():
+    """USER-OBSERVABLE SIGNAL: a degraded backing store is invisible to /alive.
+
+    With FalkorDB unreachable, /health correctly reports 503 / graphiti=False
+    (READINESS), while /alive still answers 200 with its constant body
+    (ALIVENESS) — the event loop is serving fine. This is exactly the case
+    that used to read as a false "wedged" verdict and get fused-memory killed.
+    """
+    mock_service = _make_mock_service()
+    mock_service.graphiti.list_graphs = AsyncMock(
+        side_effect=ConnectionError('falkordb unreachable')
+    )
+    app = create_mcp_server(mock_service).streamable_http_app()
+    client = TestClient(app)
+
+    health_resp = client.get('/health')
+    assert health_resp.status_code == 503
+    assert health_resp.json()['graphiti'] is False
+
+    alive_resp = client.get('/alive')
+    assert alive_resp.status_code == 200
+    assert alive_resp.json() == _EXPECTED_ALIVE_BODY
 
 
 # ------------------------------------------------------------------

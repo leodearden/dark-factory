@@ -18,6 +18,11 @@ from typing import Any, TypedDict
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
+
+# escalation.canonical is a LEAF (zero intra-package imports), which is what
+# makes this import legal at all: dedupe.py imports THIS module at module level,
+# so queue.py can never import dedupe.py, where the transform used to live.
+from escalation.canonical import canonical_root_cause
 from escalation.classify import default_resolution_class_for_resolver
 
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
@@ -55,8 +60,13 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     GLOB INVISIBILITY:
     The sidecar ends in ``.lock`` and does NOT match the ``esc-*.json`` glob
     used by get_pending / get_by_task / make_id / iter_all_escalation_paths.
-    Lock files are intentionally never deleted or renamed (stable inode);
-    accumulation at current queue volumes is acceptable.
+    It is never RENAMED or replaced — that is the stable-inode contract above
+    (task 1609) and the whole reason the sidecar exists.  It IS unlinked, in
+    exactly one place: ``sweep.reap_orphan_locks``, the server-start pass that
+    stops the root accumulating a sidecar per dead id.  That pass only ever
+    touches a DEAD id — one whose record is absent from both the queue root and
+    the archive — and ``make_id``'s monotonic durable counter can never re-mint
+    such an id, so no future writer can want the inode it removes.
 
     Usage::
 
@@ -84,6 +94,13 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
 # rather than evicted piecemeal (simple, and negative-cache staleness is
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
+
+# Suffix marking a durable per-task_id sequence counter, ``esc-{task_id}.seq``.
+# TWO coupled consumers, which is why it is a shared constant rather than a
+# literal at either site: ``make_id`` NAMES the counter with it, and
+# ``sweep.reap_orphan_locks`` uses it as its never-reap guard (a counter has no
+# ``.json`` record, so it would otherwise look permanently orphaned).
+SEQ_COUNTER_SUFFIX = '.seq'
 
 # Hard cap on the NUMBER of Escalation.amendments entries (see add_members_to_l2,
 # the SOLE writer and sole trimmer).  Worst case is repeated folds of one cluster
@@ -123,6 +140,20 @@ _MAX_AMENDMENT_LINE_CHARS = 300
 _MAX_AMENDMENT_DETAIL_CHARS = 1200
 _MAX_AMENDMENT_OPTIONS = 6
 
+# Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
+# pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
+# Same sole-writer/sole-trimmer, oldest-shed, count-every-drop policy as
+# `_MAX_AMENDMENTS` above, and sized against the same post-canonicalisation fold
+# rate; each entry is one elided LINE (a dedup key), so the whole list is bounded
+# by 20 * ~370 chars ~= 7 KB.
+# DELIBERATELY WELL ABOVE the server's over-fold alarm threshold
+# (`_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5`): the cap must never be what
+# decides whether the signal fires, or a tighter cap would silently mute the
+# very alarm it is meant to feed.  Past the cap the count keeps climbing in
+# `root_cause_variants_truncated`, so the TRUE distinct total
+# (`len(list) + truncated`) never plateaus.
+_MAX_ROOT_CAUSE_VARIANTS = 20
+
 
 class AmendmentOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.add_members_to_l2` call did to ``amendments``.
@@ -149,6 +180,16 @@ class AmendmentOutcome(TypedDict):
 
     recorded: bool  # THIS call appended an amendment
     dropped: int    # entries THIS call shed at the _MAX_AMENDMENTS cap
+    # THIS call added a previously-unseen PRE-canonical root_cause spelling
+    # (task 3998).  Same TOCTOU argument as `recorded`: "is this spelling new to
+    # the record" is only answerable against the record as it is INSIDE the lock.
+    variant_added: bool
+    # The record's TRUE distinct-spelling total AFTER this call —
+    # `len(root_cause_variants) + root_cause_variants_truncated`, NOT the list
+    # length, so it keeps climbing past `_MAX_ROOT_CAUSE_VARIANTS` instead of
+    # plateauing exactly when a runaway makes it matter.  This is what the
+    # server's over-fold threshold crossing is tested against.
+    variants: int
 
 
 def _elide(text: str, limit: int) -> tuple[str, int]:
@@ -226,11 +267,25 @@ def _framing_view(a: Amendment) -> tuple[str, str, str, list[str]]:
     ``timestamp`` likewise: the queue stamps it, so it always differs and would
     defeat the comparison entirely.
 
-    ``root_cause`` is compared STRIPPED because the create path stores
-    ``root_cause.strip()`` on the record itself and
-    ``find_pending_l2_by_root_cause`` matches on that stripped key — a fold
-    differing only in surrounding whitespace found this very L2 BY that key, so
-    treating it as new framing would contradict the lookup that routed it here.
+    ``root_cause`` is compared RAW-STRIPPED — deliberately NOT canonicalised,
+    even though ``find_pending_l2_by_root_cause`` now matches canonically (task
+    3998).  Canonicalising here would suppress exactly the record the system
+    needs: a fold whose root_cause differs only in case/whitespace/punctuation is
+    a re-SPELLING of the cause, and that pre-canonical spelling is the ONLY
+    evidence that canonicalisation folded it.  It must therefore read as NEW
+    framing and be recorded (the entry lands in ``Amendment.root_cause``, which
+    is documented as the pre-canonical incoming root cause, and feeds the
+    over-fold detector's distinct-variant count).  Treating it as a repeat would
+    make an over-fold — distinct causes silently merged under one canonical key —
+    unobservable, which is the failure mode canonicalisation introduces.
+
+    The cost is amendment-cap churn from trivial re-spellings; that is bounded by
+    ``_MAX_AMENDMENTS``, counted in ``amendments_truncated``, and was budgeted:
+    that constant is sized against the post-canonicalisation fold rate.
+
+    ``.strip()`` (rather than nothing) is kept because the create path stores
+    ``root_cause.strip()`` on the record itself, so comparing unstripped text
+    against a stripped field would report new framing for a pure no-op.
     """
     return (
         a.get('root_cause', '').strip(),
@@ -1006,20 +1061,64 @@ class EscalationQueue:
     def find_pending_l2_by_root_cause(self, root_cause: str) -> str | None:
         """Return the id of the oldest pending L2 escalation whose root_cause matches.
 
+        Matching is on the CANONICAL FORM, not the raw string (task 3998).  Two
+        promotes describing one cause but spelled differently — differing only in
+        case, in whitespace runs or in punctuation — used to mint two L2s for one
+        incident; they now fold into the first.
+
+        THE CALLER CONTRACT WIDENED WITH THAT CHANGE, and a RESOLVE-by-key caller
+        must account for it.  This used to answer "the pending L2 filed under
+        EXACTLY this key"; it now answers "the OLDEST pending L2 whose key is
+        CANONICALLY EQUAL to this one" — which is what the fold path wants, but is
+        strictly weaker than identity.  The one resolve-by-root-cause site in the
+        repo, ``orchestrator.harness.Harness._resolve_watcher_outage_l2``, feeds
+        the returned id straight into ``resolve(..., 'watcher recovered')``, so a
+        pending L2 filed under a case- or trailing-punctuation variant of
+        ``watcher_supervisor_down`` (``WATCHER_SUPERVISOR_DOWN``,
+        ``watcher_supervisor_down.``) would be auto-resolved by a supervisor that
+        never filed it.  Unrealised today — that constant has a single spelling in
+        the repo and the live corpus holds no variant of it, and the plausible
+        hyphenated re-spelling ``watcher-supervisor-down`` does NOT fold anyway
+        (``_`` is a word character and survives, ``-`` becomes a separator, so the
+        two canonicalise apart) — but the widening is real.  A caller that wants
+        IDENTITY rather than a fold must re-check ``esc.root_cause`` against its
+        own key on the returned record; this function deliberately grows no
+        exact-match mode, because one matcher with one policy is the whole point
+        (INV-5).
+
         Algorithm:
-        1. Strip *root_cause*; return None immediately for empty/whitespace-only input
-           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s convention).
+        1. Canonicalise *root_cause* via
+           :func:`escalation.canonical.canonical_root_cause` — THE single
+           canonicalisation site, shared with dedupe's two normalisation
+           consumers.  Return None immediately when the CANONICAL form is empty
+           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s
+           convention).  Note this is stricter than ``.strip()``: an
+           all-punctuation key like ``'::'`` survives stripping but canonicalises
+           to nothing, and such a key can never identify a cluster.
         2. Iterate ``self.get_pending()``, filtering to ``level == 2`` and
-           ``esc.root_cause.strip() == candidate``.
+           ``canonical_root_cause(esc.root_cause) == candidate``.  BOTH SIDES are
+           canonicalised at compare time; the record's own ``root_cause`` is
+           stored and displayed VERBATIM and is never overwritten with the
+           canonical form — an L2's framing is human-facing and immutable, and a
+           persisted derived value could silently desynchronise from the function
+           that derives it.
         3. Among matches, return the id of the entry with the OLDEST timestamp
            (ISO 8601 string comparison; malformed timestamps fall back to
            ``datetime.min`` so they sort first — never silently lost).
+
+        PUNCTUATION IS A SEPARATOR, NOT DELETED (``a.b`` -> ``a b``): root_cause
+        keys are delimiter-dense identity strings — 69% of the distinct live keys
+        carry a digit adjacent to a separator (task ids, SHA prefixes, dates) —
+        so deleting the separator would glue ``risk:3184`` onto ``risk:318:4``
+        and silently merge two distinct incidents into one L2.  The full
+        measurement and the asymmetric-cost argument are in
+        :mod:`escalation.canonical`'s docstring.
 
         Cost: O(N) over pending escalations, where N is the current queue depth.
         Acceptable at current escalation rates; mirrors the existing
         ``find_dedupe_parent`` O(N) pattern in dedupe.py.
         """
-        candidate = root_cause.strip()
+        candidate = canonical_root_cause(root_cause)
         if not candidate:
             return None
 
@@ -1029,7 +1128,7 @@ class EscalationQueue:
         for esc in self.get_pending():
             if esc.level != 2:
                 continue
-            if esc.root_cause.strip() != candidate:
+            if canonical_root_cause(esc.root_cause) != candidate:
                 continue
             # Parse timestamp; fall back to datetime.min on bad input so malformed
             # entries are treated as oldest (never silently dropped). Emits a WARNING
@@ -1140,16 +1239,35 @@ class EscalationQueue:
         when *escalation_id* is not found in the queue root (unknown id or
         archived).
 
-        Pass *outcome* to learn what this call did to ``amendments`` — whether
-        it recorded one, and how many it shed — as computed HERE, inside the
-        lock, rather than inferred by a caller from a racy pre-read.  See
-        :class:`AmendmentOutcome`.  It is filled on every return path.
+        **Distinct root-cause spellings are tracked (task 3998).**  Since the
+        pending-L2 lookup matches on the CANONICAL form, a fold can arrive
+        spelled differently from the record's own ``root_cause``.  Every such
+        PRE-canonical spelling is accumulated in ``esc.root_cause_variants``
+        (the record's own spelling seeded first), because canonicalisation's
+        failure mode is OVER-folding — distinct causes silently merged under one
+        canonical key — and the set of mutually-distinct spellings one cluster
+        has been addressed by is that failure's only observable signature.  This
+        method is the SOLE writer and sole trimmer: the list is oldest-shed at
+        ``_MAX_ROOT_CAUSE_VARIANTS`` with every drop counted in
+        ``root_cause_variants_truncated``, so the TRUE distinct count
+        (``len(variants) + truncated``) stays readable from the record and never
+        plateaus.  It lands in the SAME single ``_rewrite`` as everything else
+        above.
+
+        Pass *outcome* to learn what this call did to ``amendments`` and to
+        ``root_cause_variants`` — whether it recorded an amendment, how many it
+        shed, whether it added a new spelling, and the running distinct total —
+        as computed HERE, inside the lock, rather than inferred by a caller from
+        a racy pre-read.  See :class:`AmendmentOutcome`.  It is filled on every
+        return path.
         """
         # Defaults FIRST: the two early returns below leave them as-is, so the
         # caller's dict is complete no matter which path this call takes.
         if outcome is not None:
             outcome['recorded'] = False
             outcome['dropped'] = 0
+            outcome['variant_added'] = False
+            outcome['variants'] = 0
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
             if not path.exists():
@@ -1184,6 +1302,56 @@ class EscalationQueue:
             # write path, no new durability story.
             amendment_recorded = False
             dropped_entries = 0
+
+            # Track the DISTINCT pre-canonical root_cause spellings this cluster
+            # has been addressed by (task 3998).  Canonicalising the match makes
+            # more promotes fold BY DESIGN, so the failure it introduces is
+            # OVER-folding — distinct causes silently merged under one canonical
+            # key — and this list is that failure's only observable signature.
+            # Written in the SAME critical section and folded into the SAME
+            # single _rewrite as the member append and the amendment: no second
+            # write path, no new durability story, and cross-process
+            # union-preservation is inherited from the lock rather than
+            # re-established.
+            variant_added = False
+            # STRIPPED, exactly as `_framing_view` compares root_cause and as the
+            # create path stores it: a key differing only in surrounding
+            # whitespace was folded by the lookup even BEFORE canonicalisation,
+            # so it is not a distinct SPELLING and carries no over-fold
+            # information.  Recording it would also contradict the pinned
+            # contract that such a fold is a no-op (no spurious `updated_at`
+            # bump, hence no spurious re-assess trigger).
+            incoming_variant = root_cause.strip()
+            if incoming_variant:
+                # Seed the record's OWN spelling first, so the count reflects
+                # every spelling the cluster has EVER been addressed by rather
+                # than only the post-mint ones.
+                if not esc.root_cause_variants and esc.root_cause.strip():
+                    seeded, _ = _elide(esc.root_cause.strip(), _MAX_AMENDMENT_LINE_CHARS)
+                    esc.root_cause_variants.append(seeded)
+                # Elide through the SAME helper as amendment fields, so an
+                # over-long spelling is capped with the in-band marker rather
+                # than silently truncated — and so the comparison below is
+                # against the STORED form, exactly as _is_repeat_framing does.
+                incoming, _ = _elide(incoming_variant, _MAX_AMENDMENT_LINE_CHARS)
+                if incoming not in esc.root_cause_variants:
+                    esc.root_cause_variants.append(incoming)
+                    variant_added = True
+                    if len(esc.root_cause_variants) > _MAX_ROOT_CAUSE_VARIANTS:
+                        shed = len(esc.root_cause_variants) - _MAX_ROOT_CAUSE_VARIANTS
+                        del esc.root_cause_variants[:shed]
+                        esc.root_cause_variants_truncated += shed
+                        logger.warning(
+                            'add_members_to_l2: %s shed %d oldest root_cause '
+                            'variant(s) at the _MAX_ROOT_CAUSE_VARIANTS=%d cap '
+                            '(running total truncated=%d); the TRUE distinct '
+                            'count is still len(variants)+truncated=%d',
+                            escalation_id, shed, _MAX_ROOT_CAUSE_VARIANTS,
+                            esc.root_cause_variants_truncated,
+                            len(esc.root_cause_variants)
+                            + esc.root_cause_variants_truncated,
+                        )
+
             if incoming_framing:
                 candidate, chars_elided = _build_amendment(
                     root_cause=root_cause, summary=summary, evidence=evidence,
@@ -1227,7 +1395,10 @@ class EscalationQueue:
                             esc.amendments_truncated,
                         )
 
-            if appended or severity_changed or amendment_recorded:
+            # A new variant is a real content change, so it joins the existing
+            # write condition rather than getting a write of its own — a fold
+            # that ONLY re-spells the cause must still be durable.
+            if appended or severity_changed or amendment_recorded or variant_added:
                 esc.members.extend(appended)
                 esc.severity = new_severity
                 # Bump the "changed since triaged" signal — a member append, a
@@ -1247,6 +1418,13 @@ class EscalationQueue:
             if outcome is not None:
                 outcome['recorded'] = amendment_recorded
                 outcome['dropped'] = dropped_entries
+                outcome['variant_added'] = variant_added
+                # The TRUE distinct total, not the list length: past the cap the
+                # list stops growing, and reporting its length would make the
+                # over-fold signal plateau exactly when it matters most.
+                outcome['variants'] = (
+                    len(esc.root_cause_variants) + esc.root_cause_variants_truncated
+                )
             return esc
 
     def stamp_triage(
@@ -1523,12 +1701,40 @@ class EscalationQueue:
                 'file remains in queue_dir'
             )
 
-    def dismiss_all_pending(self, resolution: str) -> int:
+    def dismiss_all_pending(
+        self,
+        resolution: str,
+        *,
+        strand_age_secs: float | None = None,
+        now: datetime | None = None,
+    ) -> int:
         """Dismiss all pending L0 escalations with the given resolution message.
 
         Level-1 escalations are PRESERVED — they represent steward→human work
         that must survive orchestrator restart and require human attention.
         Only level-0 (agent→steward) escalations are dismissed.
+
+        Every dismissed record's resolution gains a structured
+        ``[pending_secs=<n> severity=<s>]`` suffix recording how long it had
+        been waiting when the sweep closed it (task 3172).  Before this, one
+        fixed string was written to every record, so a level-0 that had been
+        pending 20h58m with a workflow parked on it (esc-5189-7) and one
+        pending ~90s (esc-5685-1) were indistinguishable afterwards.
+
+        ``strand_age_secs``: opt-in threshold, in seconds.  A level-0 that had
+        been pending at least this long is stamped
+        ``resolution_class='stale-strand'`` — a distinct, non-benign class
+        (models.RESOLUTION_CLASSES) that keeps the strand auditable.  Records
+        below the threshold are left unstamped, so
+        ``default_resolution_class_for_resolver('auto-dismissed')`` keeps
+        stamping them ``'benign'`` exactly as before.  When *None* (the
+        default) NO record is stamped ``'stale-strand'``, making the
+        classification behaviour identical to the pre-3172 sweep for any
+        caller that does not opt in; only the age suffix is new.
+
+        ``now``: injectable clock for tests.  Read ONCE and hoisted out of the
+        loop, mirroring ``Harness._reap_orphan_l0_escalations``, so every
+        record in one sweep is aged against the same instant.
 
         Returns the number of escalations where resolve() returned non-None.
         In the common single-writer case this equals the number actually dismissed.
@@ -1536,18 +1742,58 @@ class EscalationQueue:
         get_pending() and resolve()), resolve() is a no-op but still returns the
         existing escalation, so the count may include those no-ops.  The counter
         is best read as "attempted dismissals, including no-ops for concurrent
-        resolutions".  This function is single-writer in practice.
+        resolutions".  This function is single-writer in practice.  The count
+        does NOT distinguish the three per-record outcomes — age-annotated,
+        strand-stamped, or ``pending_secs=unknown`` for a record whose
+        timestamp would not parse; a caller that needs that detail reads the
+        resolved records themselves.
         """
         pending = self.get_pending()
+        now = now or datetime.now(UTC)
         count = 0
+        strands = 0
         for esc in (e for e in pending if e.level == 0):
             try:
-                if self.resolve(esc.id, resolution, dismiss=True, resolved_by='auto-dismissed') is not None:
+                # fallback=datetime.max: an unparseable timestamp sorts as
+                # NEWEST, never as infinitely stale (the dedupe.py sentinel
+                # rationale).  A corrupt record must not be promoted to
+                # 'stale-strand' by the sentinel alone.  parse_timestamp_or_warn
+                # stamps a naive timestamp UTC and logs a WARNING naming this
+                # escalation on failure — loud, not a silent skip.
+                parsed, ok = parse_timestamp_or_warn(
+                    esc.timestamp,
+                    fallback=datetime.max.replace(tzinfo=UTC),
+                    context=f'dismiss_all_pending:{esc.id}',
+                )
+                # An unknowable age claims no age and is never a strand; the
+                # record is still dismissed — clearing stale L0s at startup
+                # stays correct regardless of one bad timestamp.
+                if ok:
+                    age_secs = (now - parsed.astimezone(UTC)).total_seconds()
+                    is_strand = strand_age_secs is not None and age_secs >= strand_age_secs
+                    per_record = (
+                        f'{resolution} [pending_secs={age_secs:.0f} severity={esc.severity}]'
+                    )
+                else:
+                    is_strand = False
+                    per_record = f'{resolution} [pending_secs=unknown severity={esc.severity}]'
+                resolved = self.resolve(
+                    esc.id,
+                    per_record,
+                    dismiss=True,
+                    resolved_by='auto-dismissed',
+                    resolution_class='stale-strand' if is_strand else None,
+                )
+                if resolved is not None:
                     count += 1
+                    strands += int(is_strand)
             except Exception as e:
                 logger.warning(f'Failed to dismiss escalation {esc.id}: {e}')
         if count:
-            logger.info(f'Dismissed {count} stale L0 escalation(s): {resolution[:100]}')
+            logger.info(
+                f'Dismissed {count} stale L0 escalation(s) '
+                f'({strands} stale-strand): {resolution[:100]}'
+            )
         return count
 
     def _write_seq_counter(self, path: Path, value: int) -> None:
@@ -1692,7 +1938,7 @@ class EscalationQueue:
         stable ``esc-{task_id}.seq.json.lock`` sidecar inode and never
         observe the same counter value.
         """
-        counter_id = f'esc-{task_id}.seq'
+        counter_id = f'esc-{task_id}{SEQ_COUNTER_SUFFIX}'
         counter_path = self.queue_dir / counter_id
         with escalation_id_lock(self.queue_dir, counter_id):
             current = 0

@@ -507,14 +507,18 @@ async def write_cycle_summary(
     and swallows the failure, so neither a missing ledger nor a Mem0 outage
     can mask (or be masked by) the other's outcome, and neither can ever
     raise out of this function. This matters in practice: Stage 3's
-    cycle-summary presence check (``prompts/stage3.py``) reads only the Mem0
-    mirror, never the ledger (see the "Known gap" comment there) — if the
-    mirror also went dark whenever the ledger was absent (e.g. a
-    deliberately-disabled ``recon_ledger_enabled=False``, a supported
-    non-default config), Stage 3 would false-report "summary missing" every
-    cycle with no fallback signal. (Reviewer finding robustness, task 2229
-    amendment pass.) The return value reflects ONLY the authoritative ledger
-    upsert.
+    cycle-summary presence check (``prompts/stage3.py``) reads the ledger as
+    PRIMARY (since task 2437) but falls back to the Mem0 mirror whenever that
+    read is INCONCLUSIVE — which is exactly what ``ledger_available: false``
+    reports on a deliberately-disabled ``recon_ledger_enabled=False``, a
+    supported non-default config. If the mirror also went dark whenever the
+    ledger was absent, that documented fallback would have nothing to read and
+    Stage 3 would false-report "summary missing" every cycle. (Reviewer
+    finding robustness, task 2229 amendment pass; corrected task 4186 — the
+    prior text claimed Stage 3 "reads only the Mem0 mirror, never the ledger",
+    which has not been true since 2437 and no longer matches the "Known gap"
+    comment it cited, which no longer exists.) The return value reflects ONLY
+    the authoritative ledger upsert.
 
     Args:
         memory_service: Service that may expose a ``recon_ledger``

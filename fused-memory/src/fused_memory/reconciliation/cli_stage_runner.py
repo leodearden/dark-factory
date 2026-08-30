@@ -96,6 +96,28 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
 ]
 
+# Recon-report tools that write to the reconciliation JOURNAL (disallowed in
+# Stage 3 only).
+# task 3065: repair_memory_citation is the second recon-report tool that writes
+# past in-process ReconReportState — it rewrites the durable `runs.stage_reports`
+# blob of an ALREADY-COMPLETED run, to re-point or drop a cited memory id that no
+# longer resolves. It is a SEPARATE sublist from the ledger writes above because
+# the journal is not the ledger: same class of hazard, different store, and
+# keeping them distinct keeps each name honest and each stage's grant
+# independently adjustable.
+#
+# Denied in Stage 3 alone. Stage 3 (integrity_check) is read-only by contract AND
+# is the stage that DETECTS a dangling cross-run citation; letting it also repair
+# would break that contract and collapse detect-and-repair into one unaccountable
+# actor. Stage 1 keeps it because Stage 1 is where a supersession deletes the
+# predecessor memory — i.e. where cross-run citations become dangling in the
+# first place — and it is already citation_verifier's own caller, so repair-at-
+# source belongs there. Stage 2 keeps it because Stage 2 is the remediation stage
+# whose blocked repair attempt originated this task.
+DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
+    'mcp__recon-report__repair_memory_citation',
+]
+
 # Escalation READ tools (disallowed in every stage — task 3163,
 # plans/escalation-store-ambiguity-prd.md task α).
 #
@@ -171,6 +193,7 @@ STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_RECON_REPORT_JOURNAL_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_BUILTIN
 )
@@ -182,6 +205,17 @@ STAGE3_DISALLOWED = (
 # CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
 # recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
 # Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
+# CARVE-OUT (task 3065): repair_memory_citation is the SECOND such exception — the first
+# recon-report tool that writes to the reconciliation JOURNAL, rewriting the durable
+# `runs.stage_reports` blob of an already-completed run to re-point or drop a cited
+# memory id that no longer resolves. It is denied in Stage 3 ONLY (via
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES above), because Stage 3 is read-only by contract
+# and is the stage that DETECTS dangling citations — detect and repair must not be the
+# same actor. Stage 1 keeps it (Stage 1's supersessions are what strand the citation in
+# the first place, and it already calls citation_verifier); Stage 2 keeps it (it is the
+# remediation stage whose blocked attempt originated the task). The two carve-outs stay
+# on separate sublists on purpose: the ledger and the journal are different stores, and a
+# single list named for one of them would lie about the other.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
@@ -429,6 +463,12 @@ async def run_stage_via_cli(
     call sites keep today's behavior. BaseStage.run mints/persists the session
     before calling here (mint-before-spawn); this runner stays generic.
 
+    ``config_dir`` is ALSO the sandbox grant (task 4003), not merely a CLI env
+    var: when confinement is on, ``config_dir.path`` is appended to the writable
+    extras so the CLI can actually write the transcript inside it. Setting
+    ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
+    where to write and then denied the write, silently.
+
     ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
     forwarded straight to ``invoke_with_cap_retry`` for the startup
     adopt-and-resume path: when set, the stage subprocess ``--resume``s an
@@ -454,12 +494,63 @@ async def run_stage_via_cli(
     # Fail-CLOSED: if confinement is requested but no backend is available,
     # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
     # run an unconfined agent when confinement is explicitly enabled).
+    #
+    # The PER-RUN config dir is granted as a computed writable extra (task 4003).
+    # Without it the CLI cannot write its session JSONL: from task 2744
+    # (2026-07-18) until 2026-08-11 the recon config dir lived under
+    # `recon_config_base_dir(data_dir)` — neither /tmp nor <cwd>/.task, i.e.
+    # outside every writable root either backend grants — so every recon stage
+    # silently produced zero transcripts, the liveness watchdog went inert
+    # (count_transcript_turns returned None) and every cap-retry force-freshed
+    # instead of resuming.
+    #
+    # It is the PER-RUN dir that is granted, NEVER `recon_config_base_dir(...)`:
+    # the base is the root under which EVERY run's `claude-config-<run_id>` (and
+    # its `.credentials.json`) lives, so granting it would hand every recon stage
+    # write access to every other run's OAuth credentials — a capability that
+    # does not exist today. (PRD open question 5 / D7, decided under task 4003's
+    # Amendment finding 1.) The append is deliberate: operator-configured
+    # `sandbox_recon_writable_extras` must survive, never be replaced.
+    #
+    # `TaskConfigDir.__init__` has already mkdir'ed the path by the time
+    # `BaseStage.run` reaches here, which is load-bearing: `landlock_exec._add_path`
+    # returns SILENTLY for a non-existent dir, so a grant issued before creation
+    # would be vacuous.
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None
     if config.sandbox_recon_agents:
+        writable_extras = list(config.sandbox_recon_writable_extras)
+        if config_dir is not None:
+            writable_extras.append(str(config_dir.path))
+        else:
+            # The ONE configuration that bypasses the containment guard, so it
+            # must not be silent. With no config_dir there is nothing to grant
+            # and nothing to verify, and the CLI falls back to the process
+            # default ~/.claude — which NEITHER backend makes writable. That is
+            # the identical silent-transcript-loss shape this grant exists to
+            # end, merely arrived at from the other direction. Unreachable in
+            # production today (BaseStage.run always mints a TaskConfigDir), but
+            # nothing in this runner enforces that and the module's docstrings
+            # now advertise the invariant as machine-checked — so say so rather
+            # than let a future caller rediscover it by three weeks of silence.
+            logger.warning(
+                'Reconciliation sandboxing is ON but this stage was given no '
+                'config_dir: the CLI will fall back to the process-default '
+                '~/.claude, which is NOT in the sandbox writable set, so it can '
+                'write no session transcript (count_transcript_turns -> None, '
+                'liveness watchdog inert, every cap-retry force-freshes). The '
+                'containment check is skipped for this invocation because there '
+                'is no path to check. Pass a TaskConfigDir (BaseStage.run does) '
+                'or set reconciliation.sandbox_recon_agents=false.',
+            )
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
-                list(config.sandbox_recon_writable_extras),
+                writable_extras,
+                # Hand the dir back to the guard so the grant above is VERIFIED,
+                # not merely intended: if a future edit drops the append, the
+                # guard fails closed instead of launching a stage that can never
+                # write a transcript. Policy here, verification there.
+                config_dir=config_dir.path if config_dir is not None else None,
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(

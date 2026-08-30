@@ -1,12 +1,21 @@
-"""Unit tests for the MCP-markup write tripwire (task 3141).
+"""Unit tests for :mod:`fused_memory.server.markup_tripwire` (tasks 3141, 4458).
 
-Covers the pure matchers, the structured block builder, the rolling-window
-storm counter (with an injected clock — no sleeping) and the best-effort
-escalation emitter in
-:mod:`fused_memory.server.markup_tripwire`.
+Covers what that module still owns: the re-exported pattern list and its
+same-file drift guard, the re-exported override lifecycle, and the best-effort
+storm escalation emitter.
 
-Boundary/wiring tests for the four MCP write tools live in the sibling
-``test_markup_tripwire_gate.py``.
+The matchers, the rejection-block builder and the rolling-window counter were
+deleted in task 4458 together with the four in-line write gates they served —
+the containment moved to the dispatch boundary
+(:mod:`fused_memory.server.markup_guard`), and keeping a second working markup
+mechanism alive behind its own tests is the duplicate-implementation invitation
+INV-5 forbids. Their behaviour is now pinned where it is actually reachable:
+``test_markup_tripwire_gate.py`` asserts, per tool, that an UNGUARDED server no
+longer refuses a leaked write while a guarded one does.
+
+Boundary/wiring tests for the MCP write tools live in that sibling file;
+``tests/test_markup_guard_fused_memory.py`` covers the boundary guard itself,
+including the residue emitter this module also hosts.
 """
 
 from __future__ import annotations
@@ -15,16 +24,13 @@ import json
 
 import pytest
 from shared import toolcall_markup
+from shared.mcp_markup_middleware import OUTCOMES
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
     MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
-    MarkupStormCounter,
-    build_markup_block,
     emit_markup_storm_escalation,
-    find_markup_pattern,
-    find_markup_violation,
     markup_override_requested,
     strip_markup_override,
 )
@@ -33,27 +39,21 @@ _STORM = {
     'count': 4,
     'threshold': 3,
     'window_seconds': 3600.0,
-    'projects': ['/project-a', '/project-b'],
     'hint': 'the leak is active; DF 3083 owns the root cause',
 }
 
-
-class _FakeClock:
-    """A mutable, list-free monotonic stand-in for ``time.time``.
-
-    Injected via MarkupStormCounter(time_provider=...) so window behaviour is
-    asserted by ADVANCING the clock rather than by sleeping — a wall-clock test
-    of a 3600s window would either be unrunnable or flaky.
-    """
-
-    def __init__(self, start: float = 1_000.0) -> None:
-        self.now = start
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
+#: The shape the ONE live producer actually sends — ``project``/``outcome``,
+#: singular, no ``projects``. ``shared.mcp_markup_middleware`` enumerates its
+#: storm outcomes in ``OUTCOMES`` and records one for each of them, so every
+#: one arrives at this filer and it may hardcode none of them.
+_REJECTED_STORM = {
+    'count': 3,
+    'threshold': 3,
+    'window_seconds': 3600.0,
+    'outcome': 'rejected',
+    'project': '/project-a',
+}
+_REPAIRED_STORM = {**_REJECTED_STORM, 'outcome': 'repaired'}
 
 
 # ---------------------------------------------------------------------------
@@ -88,404 +88,6 @@ def test_pattern_list_is_an_immutable_tuple():
     assert isinstance(MCP_MARKUP_PATTERNS, tuple), (
         f'Expected a tuple, got {type(MCP_MARKUP_PATTERNS)}'
     )
-
-
-class TestFindMarkupPattern:
-    """The single-text matcher: first matching literal by position, else None."""
-
-    def test_matches_each_canonical_pattern(self):
-        """Each of the three literals is detected and returned verbatim.
-
-        The matched literal is echoed back (rather than a bare bool) so the
-        rejection can name WHICH pattern tripped — INV-1.
-        """
-        for pattern in _CANONICAL_PATTERNS:
-            text = f'some prose then {pattern} and a tail'
-            assert find_markup_pattern(text) == pattern, (
-                f'Expected {pattern!r} to be detected in {text!r}'
-            )
-
-    def test_matches_a_bare_pattern_with_no_surrounding_prose(self):
-        for pattern in _CANONICAL_PATTERNS:
-            assert find_markup_pattern(pattern) == pattern
-
-    def test_returns_first_match_by_position_not_list_order(self):
-        """With several patterns present, the EARLIEST in the text wins.
-
-        ``</invoke>`` is last in MCP_MARKUP_PATTERNS but first in this text, so
-        a naive "iterate the list, return the first that appears" impl would
-        report ``</content>`` instead and mislead the caller about where the
-        leak starts.
-        """
-        text = 'head </invoke> middle </content> tail'
-        assert find_markup_pattern(text) == '</invoke>'
-
-        # And the mirror case, so the assertion above cannot pass by accident.
-        text_reversed = 'head </content> middle </invoke> tail'
-        assert find_markup_pattern(text_reversed) == '</content>'
-
-    def test_returns_first_match_by_position_across_all_three(self):
-        text = 'a <parameter name="x"> b </content> c </invoke> d'
-        assert find_markup_pattern(text) == '<parameter name='
-
-    def test_returns_none_for_clean_prose(self):
-        assert find_markup_pattern('a perfectly ordinary sentence about tasks') is None
-
-    def test_returns_none_for_similar_but_non_matching_markup(self):
-        """Nearby-but-different markup does not trip the guard."""
-        assert find_markup_pattern('<content> and <invoke> and <parameter>') is None
-
-    def test_matching_is_case_sensitive(self):
-        """Uppercase variants do NOT match — the harness emits lowercase tags.
-
-        Case-folding would widen the guard to prose that shouts the tag name
-        without buying any real recall: no observed specimen is uppercased.
-        """
-        assert find_markup_pattern('a leaked </INVOKE> tail') is None
-        assert find_markup_pattern('a leaked </CONTENT> tail') is None
-        assert find_markup_pattern('a leaked <PARAMETER NAME=') is None
-
-    def test_returns_none_for_none_input(self):
-        """None passes through without raising — callers hand us raw handler args."""
-        assert find_markup_pattern(None) is None
-
-    def test_returns_none_for_empty_string(self):
-        assert find_markup_pattern('') is None
-
-    def test_returns_none_for_non_str_input(self):
-        """Non-str input never raises — an optional handler arg may be anything."""
-        for value in (123, 4.5, True, [], {}, object()):
-            assert find_markup_pattern(value) is None, f'Expected None for {value!r}'
-
-
-class TestFindMarkupViolation:
-    """The multi-field matcher: (field_name, matched_pattern) or None."""
-
-    def test_returns_field_and_pattern_for_a_single_violating_field(self):
-        result = find_markup_violation({'description': 'leaked </invoke> here'})
-        assert result == ('description', '</invoke>')
-
-    def test_returns_first_violating_field_in_insertion_order(self):
-        """Dict insertion order decides, so call sites control reporting priority.
-
-        Both fields are dirty; ``title`` was inserted first, so it is named.
-        """
-        fields = {
-            'title': 'title with </content> in it',
-            'description': 'description with </invoke> in it',
-        }
-        assert find_markup_violation(fields) == ('title', '</content>')
-
-    def test_skips_clean_fields_to_reach_the_violating_one(self):
-        fields = {
-            'title': 'a clean title',
-            'description': 'also clean',
-            'details': 'dirty <parameter name="priority">',
-            'prompt': 'clean too',
-        }
-        assert find_markup_violation(fields) == ('details', '<parameter name=')
-
-    def test_returns_none_when_every_field_is_clean(self):
-        fields = {
-            'title': 'a clean title',
-            'description': 'a clean description',
-            'details': 'clean details',
-            'prompt': 'a clean prompt',
-        }
-        assert find_markup_violation(fields) is None
-
-    def test_returns_none_for_empty_and_none_field_values(self):
-        """Absent/empty optional fields are not violations and never raise."""
-        assert find_markup_violation({'title': None, 'description': '', 'details': None}) is None
-
-    def test_returns_none_for_an_empty_field_map(self):
-        assert find_markup_violation({}) is None
-
-    def test_ignores_non_str_field_values(self):
-        """A non-str value (e.g. a dict metadata blob) is skipped, not coerced."""
-        fields = {'title': 12345, 'description': ['</invoke>'], 'details': 'clean'}
-        assert find_markup_violation(fields) is None
-
-
-class TestBuildMarkupBlock:
-    """The structured rejection dict returned to the caller (INV-1).
-
-    The write has already been refused by the time this runs; this dict is the
-    ONLY machine-readable account of why, so it must name the matched pattern,
-    the field it was found in, and the remediation — an agent that only reads
-    the MCP response (never the logs) has to be able to fix its own write.
-    """
-
-    def test_carries_the_stable_error_identifiers(self):
-        block = build_markup_block('claude-task-1', 'content', '</invoke>', 'a </invoke> b')
-        assert block['error'] == 'mcp_markup_write_blocked'
-        assert block['error_type'] == 'McpEnvelopeMarkupWriteRejected'
-
-    def test_echoes_agent_id_field_and_matched_pattern(self):
-        """The caller is told WHICH pattern tripped and WHERE, not just that one did."""
-        block = build_markup_block(
-            'claude-task-3141', 'description', '<parameter name=', 'x <parameter name="p"> y'
-        )
-        assert block['agent_id'] == 'claude-task-3141'
-        assert block['field'] == 'description'
-        assert block['matched_pattern'] == '<parameter name='
-
-    def test_tolerates_a_none_agent_id(self):
-        """agent_id is optional at some boundaries — it is echoed as-is, not coerced."""
-        block = build_markup_block(None, 'content', '</content>', 'a </content> b')
-        assert block['agent_id'] is None
-
-    def test_content_excerpt_is_the_untruncated_text_when_short(self):
-        text = 'short leaked </invoke> body'
-        block = build_markup_block('a', 'content', '</invoke>', text)
-        assert block['content_excerpt'] == text
-
-    def test_content_excerpt_truncates_at_200_chars(self):
-        """A leaked envelope tail can drag a huge body along; the excerpt is bounded."""
-        text = 'x' * 500 + '</invoke>'
-        block = build_markup_block('a', 'content', '</invoke>', text)
-        assert block['content_excerpt'] == text[:200]
-        assert len(block['content_excerpt']) == 200
-
-    def test_hint_routes_to_the_live_owner_and_names_the_override_key(self):
-        """Both the reporting pointer and the escape hatch are discoverable here.
-
-        The pointer must name the LIVE owner. DF 3083 delivered the root cause
-        but is done and closed to appends -- its metadata is structurally
-        unwritable, since update_task refuses any metadata payload on a task
-        carrying done_provenance -- so recurrences reported there are inert.
-        Asserting merely that '3083' appears is too weak: the old hint said
-        "report a recurrence there" and the new one says the opposite, and both
-        contain the string. Pin the successor PRD path instead, and require the
-        hint to say 3083 is closed. MARKUP_OVERRIDE_KEY is how a caller quoting
-        the markup on purpose gets its write through.
-        """
-        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
-        hint = block['hint']
-        assert hint
-        assert 'toolcall-markup-containment-prd.md' in hint, (
-            f'hint must route recurrences at the live successor PRD: {hint!r}'
-        )
-        assert 'CLOSED' in hint, f'hint must say 3083 is closed to appends: {hint!r}'
-        assert MARKUP_OVERRIDE_KEY in hint, f'hint must name the override key: {hint!r}'
-
-    def test_storm_key_is_absent_when_no_storm_fired(self):
-        """Below threshold the dict carries no 'storm' key at all — not a None value.
-
-        A present-but-null key would read to a caller as "a storm was evaluated
-        and there was none", which is indistinguishable from the ordinary case
-        and invites `if 'storm' in block` bugs.
-        """
-        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
-        assert 'storm' not in block
-
-    def test_storm_key_is_absent_when_storm_is_explicitly_none(self):
-        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b', storm=None)
-        assert 'storm' not in block
-
-    def test_storm_block_is_echoed_verbatim_when_supplied(self):
-        """The storm summary reaches the caller, not only the logs (INV-4)."""
-        storm = {
-            'count': 3,
-            'threshold': 3,
-            'window_seconds': 3600.0,
-            'hint': 'the leak is active; see DF 3083',
-        }
-        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b', storm=storm)
-        assert block['storm'] == storm
-
-    def test_block_is_a_flat_json_serializable_dict(self):
-        """Mirrors build_near_duplicate_block: a flat dict an MCP client can render."""
-        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
-        assert isinstance(block, dict)
-        json.dumps(block)  # raises TypeError if a non-serializable value slipped in
-
-
-class TestMarkupStormCounter:
-    """Rolling-window burst detector (INV-4).
-
-    A single rejection is a bounced write; a BURST means the serialization leak
-    is actively running, which is the condition worth escalating. Every test
-    here drives an injected clock — no sleeping, no wall-clock dependence.
-    """
-
-    def test_returns_none_below_threshold(self):
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
-        assert counter.record() is None
-        assert counter.record() is None
-
-    def test_fires_on_the_record_that_reaches_threshold(self):
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
-        counter.record()
-        counter.record()
-        storm = counter.record()
-        assert storm is not None
-        assert storm['count'] == 3
-        assert storm['threshold'] == 3
-        assert storm['window_seconds'] == 100.0
-
-    def test_storm_hint_routes_to_the_live_owner(self):
-        """The burst summary points at the LIVE owner of the leak, not at itself.
-
-        Not at DF 3083 either: it is done and closed to appends, so a burst
-        attached there is inert. See the sibling hint test for why asserting
-        only that '3083' appears cannot tell the two routings apart.
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
-        storm = counter.record()
-        assert storm is not None
-        assert storm['hint']
-        assert 'toolcall-markup-containment-prd.md' in storm['hint'], (
-            f"storm hint must route at the live successor PRD: {storm['hint']!r}"
-        )
-
-    def test_reports_the_distinct_projects_seen_in_the_window(self):
-        """The burst is ATTRIBUTED, not pinned on whichever write crossed the line.
-
-        One server instance serves every known project, so a bare count would let
-        the caller escalate into the queue of the project that merely happened to
-        be last — naming it as the leaker while the project actually leaking got
-        nothing (and, because the rate limit is shared, no second chance until the
-        window rolled over). Mirrors the 'projects' key of
-        harness._record_placeholder_finding_drop.
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
-        counter.record('/project-a')
-        counter.record('/project-a')
-        storm = counter.record('/project-b')
-        assert storm is not None
-        assert storm['count'] == 3
-        assert storm['projects'] == ['/project-a', '/project-b'], f'got: {storm!r}'
-
-    def test_projects_are_sorted_and_deduplicated(self):
-        """A repeated label appears once — this is a project SET, not a tally."""
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=4, window_seconds=100.0, time_provider=clock)
-        counter.record('/z')
-        counter.record('/a')
-        counter.record('/z')
-        storm = counter.record('/a')
-        assert storm is not None
-        assert storm['projects'] == ['/a', '/z'], f'got: {storm!r}'
-
-    def test_unlabelled_events_count_toward_the_burst_but_are_not_named(self):
-        """add_memory on an unknown project resolves no root; it is still a rejection.
-
-        Such an event must still push the counter toward the threshold — it is a
-        real leaked write — but there is no queue to escalate it into, so it must
-        not appear in `projects` (and must not crash `sorted` by mixing None in).
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
-        counter.record(None)
-        counter.record(None)
-        storm = counter.record('/project-a')
-        assert storm is not None
-        assert storm['count'] == 3, f'unlabelled rejections must still count: {storm!r}'
-        assert storm['projects'] == ['/project-a'], f'got: {storm!r}'
-
-    def test_projects_reflects_only_the_unpruned_window(self):
-        """A project whose rejections aged out is no longer part of the burst."""
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        counter.record('/stale')
-        clock.advance(150.0)
-        counter.record('/live')
-        storm = counter.record('/live')
-        assert storm is not None
-        assert storm['projects'] == ['/live'], f'stale project must be pruned: {storm!r}'
-
-    def test_rate_limited_to_one_fire_per_window(self):
-        """Further rejections inside the same window return None.
-
-        Without this a leak emitting hundreds of writes would file hundreds of
-        escalations for one incident.
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        counter.record()
-        assert counter.record() is not None  # fires
-        clock.advance(1.0)
-        assert counter.record() is None
-        clock.advance(1.0)
-        assert counter.record() is None
-
-    def test_can_fire_again_after_the_window_elapses(self):
-        """The rate limit expires with the window — a second incident still alarms."""
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        counter.record()
-        assert counter.record() is not None
-
-        # Move past both the rate-limit window and the event window, then
-        # re-trip from scratch.
-        clock.advance(200.0)
-        assert counter.record() is None  # window pruned; only 1 event
-        assert counter.record() is not None
-
-    def test_a_slow_trickle_never_fires(self):
-        """Events older than window_seconds are pruned, so a trickle is not a storm.
-
-        Ten rejections spread far enough apart never accumulate to a threshold of
-        3 — this is the whole point of a rolling WINDOW rather than a total count.
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
-        for _ in range(10):
-            assert counter.record() is None
-            clock.advance(150.0)
-
-    def test_events_exactly_at_the_window_edge_are_pruned(self):
-        """A window is a half-open interval — an event aged exactly window_seconds is out.
-
-        Pins the boundary so a future `<=`/`<` edit cannot silently shift when a
-        storm fires.
-        """
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        counter.record()
-        clock.advance(100.0)
-        assert counter.record() is None
-
-    def test_module_defaults_are_the_documented_constants(self):
-        """The no-arg counter uses the module's own threshold/window."""
-        clock = _FakeClock()
-        counter = MarkupStormCounter(time_provider=clock)
-        for _ in range(markup_tripwire._MARKUP_STORM_THRESHOLD - 1):
-            assert counter.record() is None
-        storm = counter.record()
-        assert storm is not None
-        assert storm['threshold'] == markup_tripwire._MARKUP_STORM_THRESHOLD
-        assert storm['window_seconds'] == markup_tripwire._MARKUP_STORM_WINDOW_SECONDS
-
-    def test_default_threshold_and_window_values(self):
-        assert markup_tripwire._MARKUP_STORM_THRESHOLD == 3
-        assert markup_tripwire._MARKUP_STORM_WINDOW_SECONDS == 3600.0
-
-    def test_defaults_to_wall_clock_when_no_provider_is_injected(self):
-        """The production path needs no argument — time.time is the default."""
-        counter = MarkupStormCounter(threshold=1, window_seconds=100.0)
-        assert counter.record() is not None
-
-    def test_counters_do_not_share_state(self):
-        """Per-instance state, so one create_mcp_server cannot bleed into another."""
-        clock = _FakeClock()
-        first = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        second = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
-        first.record()
-        # `second` has seen exactly one event of its own, so it must not fire.
-        assert second.record() is None
-        assert first.record() is not None
-
-    def test_storm_summary_is_json_serializable(self):
-        clock = _FakeClock()
-        counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
-        storm = counter.record()
-        json.dumps(storm)
 
 
 class TestMarkupOverrideRequested:
@@ -672,10 +274,363 @@ class TestEmitMarkupStormEscalation:
         assert '3083' in routing_text, (
             f'must still name DF 3083, as the closed predecessor: {payload!r}'
         )
-        assert 'rejected_writes_in_window=4' in detail, f'must state the count: {detail!r}'
+        # The count's key is outcome-NEUTRAL and static (task 4505): this one
+        # filer serves all three of the middleware's outcomes, and a key naming
+        # one of them contradicts its own content on the other two. Static, and
+        # not interpolated from the outcome, because greppability across records
+        # is the one property an operator relies on — which is also why it is
+        # `count=`, the spelling the sibling filer for this same record kind
+        # already uses (`_markup_storm_detail` in orchestrator/mcp/plan_tools.py):
+        # one number, one grep, both boundary guards. Anchored on both sides so
+        # neither the old `rejected_writes_in_window=4` nor a `dedupe_count=4`
+        # can satisfy it by substring.
+        assert '\ncount=4\n' in detail, f'must state the count: {detail!r}'
+        assert 'outcome=' in detail, (
+            f'the count is a count of ONE outcome; name it: {detail!r}'
+        )
         assert 'window_seconds=3600.0' in detail, f'must state the window: {detail!r}'
-        assert "projects_in_window=['/project-a', '/project-b']" in detail, (
-            f'must name every project the burst spanned: {detail!r}'
+        # A burst cannot span projects (task 4505): the live producer keys one
+        # StormCounter per (project, outcome) pair, so the window holds one
+        # project's events and the count needs no cross-project qualifier. The
+        # `projects_in_window=` line this replaces was dead — no live producer
+        # ever emitted the `projects` key it read, so it rendered `None` on
+        # every record filed since 4458 landed.
+        assert 'projects_in_window' not in detail, (
+            f'the count cannot span projects, so it must not be hedged: {detail!r}'
+        )
+
+    # -- outcome fidelity (task 4505) -----------------------------------
+    #
+    # Every outcome in shared.mcp_markup_middleware.OUTCOMES reaches this ONE
+    # filer, because MarkupGuardMiddleware records a storm for each of them.
+    # The rule, its history and the stem-vs-'rejected' trap are stated ONCE, on
+    # test_each_outcome_names_itself_and_no_other below; the tests around it pin
+    # halves of that rule and deliberately do not restate it.
+
+    @staticmethod
+    def _filed(tmp_path, storm) -> dict:
+        """File *storm* and read the single record back off disk."""
+        esc_id = emit_markup_storm_escalation(str(tmp_path), storm)
+        assert esc_id is not None
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        return payload
+
+    @pytest.mark.parametrize('outcome', OUTCOMES)
+    def test_each_outcome_names_itself_and_no_other(self, tmp_path, outcome):
+        """The headline, over EVERY outcome the middleware can send.
+
+        Parameterised off ``shared.mcp_markup_middleware.OUTCOMES`` rather than
+        re-spelling the three words here, so an outcome added there arrives with
+        a test rather than with a silently unasserted record. The earlier
+        revision pinned two of the three, and the one it left out is the one
+        that matters most at this filer's live call site: ``install_markup_guard``
+        refuses any policy but ``REJECT_WITH_REPAIR``, so ``repaired`` cannot
+        fire here at all while ``unrepairable`` — the burst that LOSES the
+        caller's data — can. 'unrepairable' also carries no 'reject' stem, so
+        the stem needle below would not have caught it being mislabelled.
+
+        The record must name its OWN outcome in the summary and no other
+        outcome anywhere an operator reads, because a record naming an outcome
+        the burst did not have states a number the triager cannot reproduce
+        from their own journal — the same defect as stating a count the burst
+        did not have. Before task 4505 every record said 'rejected', so a burst
+        of REPAIRS (calls that all SUCCEEDED) was filed as N rejections that
+        never happened.
+
+        All THREE operator-facing fields are scanned, not just the count's
+        label, because each is read by a different consumer and the false claim
+        reached all three: the summary said "MCP write(s) rejected", the
+        detail's attach-instruction said "from the rejection responses", and
+        ``suggested_action`` said "from the rejection logs".
+
+        ``suggested_action`` is NOT a low-visibility afterthought. It sits in
+        the same read-tier as the summary: ``escalation.server`` lists it in
+        ``_COMPACT_ESCALATION_FIELDS`` beside ``summary`` and carries both into
+        ``_COMPACT_PENDING_FIELDS``, while ``detail`` is dropped BY NAME as "the
+        unbounded free-text field that motivated compact mode". So the L1
+        escalation watcher and get_pending_escalations(compact=True) read this
+        field having never seen the detail.
+
+        THE NEEDLE IS THE STEM 'reject', NOT 'rejected'. Do not "simplify" it
+        back: the defective text read "the rejection logs", and 'rejected' is
+        NOT a substring of 'rejection' (r-e-j-e-c-t-e-d vs r-e-j-e-c-t-i-o-n),
+        so the narrower needle passes over defective text and guards nothing.
+        The stem is applied only to outcomes that do not carry it themselves,
+        which is why it is derived from *outcome* rather than hardcoded.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            storm = {**_REJECTED_STORM, 'outcome': outcome}
+            assert emit_markup_storm_escalation(str(tmp_path), storm) is None
+            return
+
+        payload = self._filed(tmp_path, {**_REJECTED_STORM, 'outcome': outcome})
+
+        assert outcome in payload['summary'], (
+            f"must name the burst's own outcome: {payload['summary']!r}"
+        )
+        compact_plus_detail = (
+            f'{payload["summary"]}\n{payload["detail"]}\n{payload["suggested_action"]}'
+        )
+        for other in OUTCOMES:
+            if other == outcome:
+                continue
+            assert other not in compact_plus_detail, (
+                f'this burst was {outcome!r}, so no field may describe it as '
+                f'{other!r} — a triager grepping their journal for {other!r} '
+                f'finds nothing: {compact_plus_detail!r}'
+            )
+        if 'reject' not in outcome:
+            assert 'reject' not in compact_plus_detail.lower(), (
+                f'nothing was rejected in a {outcome!r} burst, in any spelling '
+                f'("rejection", "rejections"): {compact_plus_detail!r}'
+            )
+
+    def test_a_rejected_burst_still_reads_as_rejected(self, tmp_path):
+        """The other half, so (a) cannot be satisfied by dropping the outcome
+        word altogether. Rejections are still the common case and must still be
+        named as rejections.
+
+        The count is asserted as an EXACT LABELLED substring: a bare `'3' in
+        summary` is vacuous here, because 'window_seconds=3600.0' and the
+        routing text both carry a 3.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        payload = self._filed(tmp_path, _REJECTED_STORM)
+
+        assert '3 MCP write(s) rejected' in payload['summary'], (
+            f'a rejected burst must still read as rejected: {payload["summary"]!r}'
+        )
+
+    def test_a_second_burst_with_a_different_outcome_folds_in_and_says_so(
+        self, tmp_path, caplog
+    ):
+        """Outcome fidelity has to survive the dedup, which is outcome-AGNOSTIC.
+
+        Every burst for a project files under ONE anchor whatever its outcome —
+        ``markup_guard`` passes the same one for all three — so the FIRST
+        burst's record is the only one an operator sees until they resolve it.
+        That is deliberate (one open record per running leak, not one per
+        outcome), but left undisclosed it re-opens this task's own defect from
+        the other side: the surviving record names ``repaired`` while the burst
+        that followed it — possibly ``unrepairable``, the outcome that LOSES
+        caller data — is named nowhere at all.
+
+        The chosen behaviour, pinned here in full: the record still holds one
+        open escalation, it DISCLOSES that its outcome and count are the first
+        burst's rather than a running total, and a fold whose outcome differs is
+        logged at ERROR naming the suppressed outcome — under the same
+        ``markup_guard_storm`` token the record's own remedy tells the triager
+        to grep, so the burst the queue does not name is still findable beside
+        the one it does.
+
+        Keying the dedup on (anchor, outcome) instead would need
+        ``markup_guard``'s sink, which this task does not hold.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        first = emit_markup_storm_escalation(str(tmp_path), _REPAIRED_STORM)
+        with caplog.at_level('ERROR', logger='fused_memory.server.markup_tripwire'):
+            second = emit_markup_storm_escalation(
+                str(tmp_path), {**_REJECTED_STORM, 'count': 7}
+            )
+
+        # (a) The dedup is unchanged — one open record per running leak.
+        assert second == first, f'expected a fold; got {first!r} then {second!r}'
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one record: {files!r}'
+
+        # (b) The surviving record still names the first burst, and SAYS that is
+        # what it is naming — in the summary, the only field a compact consumer
+        # is projected.
+        summary = json.loads(files[0].read_text())['summary']
+        assert '3 MCP write(s) repaired' in summary, (
+            f"the open record still describes the burst it was filed for: {summary!r}"
+        )
+        assert 'FIRST burst observed' in summary, (
+            f'a record that names one outcome while folding others in must say '
+            f'so where the L1 watcher reads it: {summary!r}'
+        )
+
+        # (c) The folded burst is not silent. Asserted as labelled substrings:
+        # a bare `'7' in errors` would also be satisfied by a digit in the
+        # interpolated tmp_path, and `'rejected' in errors` by the repr of the
+        # storm dict alone, which would pass with the sentence deleted.
+        errors = '\n'.join(
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.server.markup_tripwire'
+            and r.levelname == 'ERROR'
+        )
+        assert 'markup_guard_storm SUPPRESSED' in errors, (
+            f'the queue names one outcome, so the other must reach the operator '
+            f"here — under the token the record itself says to grep: {errors!r}"
+        )
+        assert "this 'rejected' burst of 7 write(s)" in errors, (
+            f'the suppressed burst must be named with its own outcome and '
+            f'count, not merely counted: {errors!r}'
+        )
+        assert f'{first} is already open' in errors, (
+            f'name the record it folded into, or the operator cannot resolve '
+            f'the thing suppressing it: {errors!r}'
+        )
+
+    def test_the_summary_alone_answers_how_many_of_what_for_whom(self, tmp_path):
+        """Asserted against the SUMMARY ONLY — never the detail — because that
+        is all a compact consumer is given.
+
+        `escalation.server` projects `summary` into both
+        `_COMPACT_ESCALATION_FIELDS` and `_COMPACT_PENDING_FIELDS` and
+        explicitly DROPS `detail` as "the unbounded free-text field that
+        motivated compact mode". So the L1 escalation watcher and
+        get_pending_escalations(compact=True) see the summary and nothing else:
+        a qualifier that lives only in the detail is structurally unreadable.
+        That is the whole reason this task exists — esc-markup-tripwire-6 was
+        triaged off a summary that answered 'how many' with a number pooled
+        across two projects and named no scope at all.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        summary = self._filed(tmp_path, _REJECTED_STORM)['summary']
+
+        # how many, and of what — one labelled substring, so neither can be
+        # dropped without failing here.
+        assert '3 MCP write(s) rejected' in summary, (
+            f'the summary must carry the count and the outcome: {summary!r}'
+        )
+        # for whom.
+        assert 'in this project' in summary, (
+            f"the summary must scope the count to this project's own "
+            f'contribution: {summary!r}'
+        )
+
+    def test_the_record_points_at_log_lines_that_actually_exist(self, tmp_path):
+        """The record's whole remedy is "go reproduce this from your own logs",
+        so its grep hints have to name tokens a real emitter actually writes.
+
+        Outcome-independent — a dead pointer is dead for every outcome — so this
+        files the rejected fixture.
+
+        'markup_tripwire_storm' MATCHES NOTHING. `grep -rn markup_tripwire_storm
+        --include=*.py .` over the repo returns exactly one hit: the instruction
+        itself, in markup_tripwire.py. A triager who follows it greps for a
+        token no emitter has ever written and finds zero lines — which is
+        indistinguishable from "the leak stopped", the one conclusion this
+        record exists to prevent.
+
+        'markup_guard_storm' is the real token, logged by BOTH live producers:
+        `MarkupGuardMiddleware._record_storm`'s own line and
+        `markup_guard._escalation_sink`. The per-call companion line is
+        `markup guard: <outcome> tool=... agent_id=... project=...`, written by
+        the same middleware. The sibling filer already gets this right —
+        `plan_tools._markup_storm_detail` points operators at 'markup guard:'
+        and 'markup_guard_storm' — so the correct text is precedent here, not
+        invention.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
+            return
+
+        payload = self._filed(tmp_path, _REJECTED_STORM)
+        pointers = f'{payload["detail"]}\n{payload["suggested_action"]}'
+
+        assert 'markup_tripwire_storm' not in pointers, (
+            f'that token has no emitter anywhere in the repo — its only '
+            f'occurrence is this instruction, so the grep it prescribes '
+            f'returns nothing: {pointers!r}'
+        )
+        assert 'markup_guard_storm' in pointers, (
+            f'the record must name the token its own producers actually log '
+            f'(MarkupGuardMiddleware._record_storm and '
+            f'markup_guard._escalation_sink): {pointers!r}'
+        )
+
+    def test_a_storm_of_unknown_outcome_claims_no_outcome_it_did_not_measure(
+        self, tmp_path
+    ):
+        """Degenerate and legacy shapes must keep working — and must not be
+        relabelled 'rejected' on the way.
+
+        Both cases are live: `{}` is what test_tolerates_a_storm_dict_missing_keys
+        files, and `{'count': 9}` is the squatter that
+        tests/test_markup_guard_fused_memory.py files to reproduce the anchor
+        squat. Absent is not zero and absent is not 'rejected'; equally, the
+        outcome slot must not render the bare string 'None', which is a
+        confident claim about something never measured. Trading a false
+        'rejected' for either is the same class of defect this task closes.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        for storm in ({}, {'count': 9}):
+            queue_root = tmp_path / f'root-{len(storm)}'
+            queue_root.mkdir()
+
+            payload = self._filed(queue_root, storm)
+
+            # Still filed and still routable — this is when an operator needs it
+            # most, so a missing number may not degrade the record's usefulness.
+            assert payload['category'] == 'mcp_markup_write_storm'
+            assert 'toolcall-markup-containment-prd.md' in payload['detail'], (
+                f'must still route at the live successor PRD: {payload!r}'
+            )
+            summary = payload['summary']
+            assert 'rejected' not in summary, (
+                f'no outcome was measured, so none may be claimed: {summary!r}'
+            )
+            # Positional, not a bare `'None' not in summary`: an absent count
+            # and window legitimately render None elsewhere in this sentence.
+            assert 'write(s) None' not in summary, (
+                f"the outcome slot must not read 'None': {summary!r}"
+            )
+
+            # The DETAIL, which the earlier revision left unasserted for this
+            # shape. Its numbers block honestly renders `outcome=None`, but the
+            # prose beside it used to point AT that line — "the outcome above
+            # states what it did with them" — sending the triager to a value
+            # that states nothing. Absent has to read as absent in the sentence
+            # as well as in the key.
+            detail = payload['detail']
+            assert '\noutcome=None\n' in detail, (
+                f'the empty outcome slot must still be shown, not hidden: {detail!r}'
+            )
+            assert 'names what the guard did' not in detail, (
+                f'no sentence may point at the outcome line as though it named '
+                f'something, when what it names is None: {detail!r}'
+            )
+            assert 'no outcome was recorded' in detail, (
+                f'the prose must say the outcome is missing and where to find '
+                f'it, not leave a dangling pointer: {detail!r}'
+            )
+            assert 'reject' not in detail.lower(), (
+                f'nothing was measured as rejected here, so the detail may not '
+                f'describe the burst as rejections: {detail!r}'
+            )
+
+        # The same rule on the THIRD compact-projected field. Without it the
+        # neutral-outcome guarantee holds on summary and detail and silently
+        # lapses on suggested_action, which is exactly how the surviving "the
+        # rejection logs" sentence went unnoticed. The stem, not 'rejected',
+        # for the reason recorded on test_each_outcome_names_itself_and_no_other.
+        #
+        # Hoisted OUT of the loop on purpose: this field interpolates nothing
+        # from the storm, so it is byte-identical for both shapes and asserting
+        # it per shape reads as coverage it does not add. For the same reason
+        # there is no `'None' not in suggested` here — with no interpolation
+        # that string can only appear if someone types it, so the assertion
+        # could never fail.
+        suggested = payload['suggested_action']
+        assert 'reject' not in suggested.lower(), (
+            f'no outcome was measured, so the remedy may not send the triager '
+            f'to rejection logs for a burst that may contain no rejection at '
+            f'all: {suggested!r}'
         )
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
@@ -776,6 +731,81 @@ class TestEmitMarkupStormEscalation:
         assert 'toolcall-markup-containment-prd.md' in payload['detail'], (
             f'must still route at the live successor PRD: {payload!r}'
         )
+
+    # -- the anchor parameter (task 4458) -------------------------------
+
+    def test_the_default_anchor_is_unchanged(self, tmp_path):
+        """Callers that do not pass an anchor must behave exactly as before.
+
+        The in-line write-time gate still calls this with two positional
+        arguments, so a default drift here would silently re-point its records.
+        """
+        esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+        payload = json.loads(next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text())
+        assert payload['task_id'] == 'markup-tripwire'
+        assert 'markup-tripwire' in str(esc_id)
+
+    def test_an_explicit_anchor_lands_in_both_the_task_id_and_the_id(self, tmp_path):
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        esc_id = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert esc_id is not None
+        assert 'markup-guard' in esc_id, f'unexpected id shape: {esc_id!r}'
+        payload = json.loads(next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text())
+        assert payload['task_id'] == 'markup-guard'
+        # Everything else is unchanged: this is a parameterisation of the ONE
+        # filer, not a second one (INV-5).
+        assert payload['category'] == 'mcp_markup_write_storm'
+        assert payload['level'] == 1
+        assert 'toolcall-markup-containment-prd.md' in payload['summary']
+
+    def test_the_dedup_lookup_keys_on_the_SAME_anchor_that_is_filed(self, tmp_path):
+        """The measured defect this parameter exists to fix.
+
+        The L1 escalation watcher files its own cluster records under the
+        'markup-tripwire' anchor and so SQUATS it — measured: the tripwire filed
+        nothing 2026-08-16..2026-08-19 while 41 rejections occurred, and all 17
+        records sat at dedupe_count 0. A filer that deduped against a squatted
+        anchor is suppressed indefinitely, which is silence that reads as calm.
+
+        So an explicit anchor must dedupe against ITSELF only: an open record on
+        a DIFFERENT anchor must not suppress it.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        squatter = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        guard = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert squatter is not None
+        assert guard is not None
+        assert guard != squatter, 'an open record on another anchor must not suppress this one'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 2
+
+    def test_two_bursts_on_one_explicit_anchor_still_dedupe(self, tmp_path):
+        """The dedup itself must survive the parameterisation, or a leak running
+        for hours files one record per window forever."""
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        first = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+        second = emit_markup_storm_escalation(
+            str(tmp_path), _STORM, anchor_task_id='markup-guard'
+        )
+
+        assert first is not None
+        assert second == first, f'expected dedup; got first={first!r} second={second!r}'
+        assert len(list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))) == 1
 
 
 # ---------------------------------------------------------------------------

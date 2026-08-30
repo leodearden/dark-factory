@@ -1662,8 +1662,18 @@ class TestUpdateTaskMetadataSerialization:
         """Explicit metadata_mode beats append=True (metadata_mode > append precedence).
 
         If both append=True and metadata_mode='merge' are supplied, the explicit
-        metadata_mode='merge' must win — mirroring the backend _resolve_metadata_mode
-        precedence: metadata_mode > append > default.
+        metadata_mode='merge' must win — the scheduler resolves client-side and
+        sends metadata_mode='merge' with no append on the wire.
+
+        NB (task 3581): this no longer "mirrors" the backend for THIS cell. The
+        backend's _resolve_metadata_mode precedence is metadata_mode > append >
+        default with one carve-out — metadata_mode='merge' alongside append=True
+        on a metadata write is now REJECTED as a contradiction, because silently
+        resolving it to 'merge' shallow-overwrote nested keys (a whole
+        memory_hints blob). The wire assertions below stay valid precisely
+        because the scheduler never forwards `append`, so the conflicting pair
+        never reaches the backend guard; but the client-side resolution is the
+        same silent-preference defect one layer up and is filed as follow-up.
         """
         captured_args: list[dict] = []
 

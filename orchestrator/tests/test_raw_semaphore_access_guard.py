@@ -31,6 +31,18 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard AST-parses every *.py under orchestrator/src/orchestrator/ via
+# rglob. Not individually reproduced under load; marked because it is
+# structurally identical to the three members that crashed.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
 
 _GUARDED_ATTRS = {'_speculation_slot', '_merge_ahead_cap'}

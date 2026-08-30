@@ -40,6 +40,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import (
+    LIVE_CLAIMANT,
+    claimant_row,
+    wire_scheduler_liveness_mock,
+)
 from escalation.action_effects import ACTION_EFFECTS, ANY, effect_for
 from escalation.models import Escalation
 
@@ -52,6 +57,7 @@ from orchestrator.task_status import is_infra_held  # noqa: F401
 
 _BASE_SHA = 'a' * 40  # branch_base_sha in metadata — non-degenerate-branch fixtures
 _TIP_SHA = 'b' * 40   # tip SHA different from base -> non-degenerate
+
 
 
 @pytest.fixture
@@ -75,10 +81,21 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
         h = Harness(mock_orch_config)
 
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': 'task', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # B2/B6 drive _revert_in_progress_if_no_live_claimant /
@@ -98,6 +115,30 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     # _merge_worker stays None — unhalt branch skipped in all tests here.
     return h
+
+
+def _liveness_row(task_id: str, status: str, *, live: bool) -> dict:
+    """A task row carrying the claimant columns the task-3540 resume fork reads.
+
+    ``harness.py::Harness._resume_repend_liveness`` folds
+    ``scheduler.is_actively_held`` (wired real by
+    ``wire_scheduler_liveness_mock`` above, so False unless a test dispatches
+    or locks the id) with ``shared.task_claimant.has_live_claimant`` over these
+    columns.
+
+    A thin ``live``-flavoured adapter over ``_orch_helpers.claimant_row`` — the
+    SHARED builder this suite, ``test_cascade_unblock.py`` and
+    ``test_resume_claimant_liveness.py`` all use, so the heartbeat ages (and
+    the TTL they derive from) cannot drift apart between them.
+
+    ``live=False`` means NO claimant at all — the stranded shape B2 is about.
+    """
+    return claimant_row(
+        status,
+        task_id=task_id,
+        claimant=LIVE_CLAIMANT if live else None,
+        heartbeat='fresh' if live else None,
+    )
 
 
 def _make_esc(
@@ -321,21 +362,34 @@ class TestComp2HarnessFaceUnknownActionNoWrite:
 
 
 # ---------------------------------------------------------------------------
-# B2 (esc-2073-15 regression) — the accurate landed mechanism is the
-# stranded-revert sweep _revert_in_progress_if_no_live_claimant, NOT the
-# escalation-resume cascade (_cascade_unblock_member is blocked-only and
-# DELIBERATELY carves out in-progress — test_cascade_unblock.py:143).
+# B2 (esc-2073-15 regression) — TWO mechanisms now re-pend a stranded
+# in-progress row, and this section pins both: the stranded-revert sweep
+# harness.py::Harness._revert_in_progress_if_no_live_claimant (the periodic
+# owner), and — since task 3540 — the escalation-resume cascade
+# harness.py::Harness._cascade_unblock_member, which gates on CLAIMANT
+# LIVENESS rather than status == 'blocked'.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestB2StrandedInProgressRevert:
-    """B2: a stranded in-progress task with no live claimant is re-pended by
-    the stranded-revert sweep (_revert_in_progress_if_no_live_claimant,
-    harness.py:3719), NOT by the escalation-resume cascade
-    (_cascade_unblock_member is blocked-only — a status='in-progress' task
-    handed to it is a DEBUG-skipped no-op). An infra-held row is exempt.
-    Mirrors test_harness_infra_hold_repend.py:88-195."""
+    """B2: a stranded in-progress task with no live claimant is re-pended.
+
+    Two independent edges deliver that, and both are pinned here:
+
+      - ``harness.py::Harness._revert_in_progress_if_no_live_claimant`` — the
+        periodic stranded-revert sweep, which owns the row when no escalation
+        resolution is involved at all.
+      - ``harness.py::Harness._cascade_unblock_member`` — the escalation-resume
+        cascade.  Task 3540 (PRD ``plans/task-escalation-state-graph-prd.md``
+        D8, spec E9) re-anchored its gate from ``status == 'blocked'`` onto
+        claimant LIVENESS, so a resolution landing on a stranded in-progress
+        row now re-pends it immediately instead of waiting a sweep interval.
+        Its live-claimant twin still writes nothing — a running workflow owns
+        its own re-pend, having been woken synchronously by ``event.set()``.
+
+    An infra-held row is exempt from the sweep.
+    Mirrors ``test_harness_infra_hold_repend.py`` (the revert-liveness suite)."""
 
     async def test_no_live_claimant_reverts_to_pending(self, harness: Harness) -> None:
         tid = 'zeta-b2-stranded'
@@ -399,16 +453,29 @@ class TestB2StrandedInProgressRevert:
                 f"status='infra-hold': {call}"
             )
 
-    async def test_cascade_unblock_member_does_not_flip_in_progress(
-        self, harness: Harness, caplog: pytest.LogCaptureFixture,
+    async def test_cascade_unblock_member_repends_stranded_in_progress(
+        self, harness: Harness,
     ) -> None:
-        """Proves B2 is NOT served by the escalation cascade: a status=
-        'in-progress' task routed through _on_escalation_resolved's
-        l2-cascade path (-> _cascade_unblock_member) is a DEBUG-skipped
-        no-op — _cascade_unblock_member is blocked-only and DELIBERATELY
-        carves out in-progress (test_cascade_unblock.py:143,
-        test_criterion_4_in_progress_task_not_flipped)."""
-        task_id = 'zeta-b2-not-cascade'
+        """B2 IS also served by the escalation cascade, as of task 3540.
+
+        A status='in-progress' row with NO live claimant, routed through
+        ``_on_escalation_resolved``'s l2-cascade path (->
+        ``_cascade_unblock_member``), is re-pended immediately.
+
+        This overturns the codification this cell previously carried (that
+        ``_cascade_unblock_member`` is blocked-only and DEBUG-skips in-progress
+        unconditionally). The twin re-anchor lives in
+        ``test_cascade_unblock.py::TestCascadeUnblockCriteria``
+        (``test_criterion_4a_in_progress_with_live_claimant_not_flipped`` /
+        ``test_criterion_4b_stranded_in_progress_is_repended``); the fork's own
+        contract suite is ``test_resume_claimant_liveness.py``.
+
+        Unaffected by task 3538, and deliberately distinct from it: this row's
+        status is 'in-progress' (is_infra_held False), so it never reaches the
+        infra pre-gate whose target that task changed — it reaches the ordinary
+        Table B resume, whose target is looked up rather than asserted as a
+        literal."""
+        task_id = 'zeta-b2-stranded-cascade'
         esc = _make_esc(
             task_id=task_id,
             resolution_action=None,  # legacy resolve -> maps to 'resume'
@@ -417,36 +484,80 @@ class TestB2StrandedInProgressRevert:
             level=1,
         )
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+        harness.scheduler.get_task = AsyncMock(
+            return_value=_liveness_row(task_id, 'in-progress', live=False)
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        effect = effect_for('resume', esc.level, esc.category)
+        assert effect is not None and effect.target_status is not None
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, effect.target_status,
+        )
+
+    async def test_cascade_unblock_member_does_not_flip_live_in_progress(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The half of the old carve-out that SURVIVES task 3540.
+
+        An in-progress row whose claimant is heartbeating inside
+        ``claimant_liveness_ttl_secs`` still gets no write: the running
+        workflow owns its own re-pend (it was woken synchronously by
+        ``event.set()`` in ``_on_escalation_resolved``), so a flip here would
+        race it. Liveness — not the status string — is what establishes
+        that."""
+        task_id = 'zeta-b2-live-cascade'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,  # legacy resolve -> maps to 'resume'
+            status='resolved',
+            resolved_by='l2-cascade:esc-parent-1',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+        harness.scheduler.get_task = AsyncMock(
+            return_value=_liveness_row(task_id, 'in-progress', live=True)
+        )
 
         with caplog.at_level(logging.DEBUG):
             harness._on_escalation_resolved(esc)
             await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
-            'Expected a DEBUG record for the in-progress carve-out'
-        )
+        assert any(
+            r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
+            for r in caplog.records
+        ), 'Expected a DEBUG record naming the live claimant as the skip reason'
 
 
 # ---------------------------------------------------------------------------
-# B6 — infra-hold first-class: resolved infra_issue escalation on an
-# infra-held task resumes-at-verify (in-progress), NEVER 'pending'; the
-# reconcile stranded sweep skips an infra-held row; a non-infra blocked task
-# still flips to pending (contrast).
+# B6 — infra-hold first-class: a resolved infra_issue escalation on an
+# infra-held task resumes through the dedicated is_infra_held branch (never
+# dropped by the blocked-only gate); the reconcile stranded sweep skips an
+# infra-held row; a non-infra blocked task still flips to pending (contrast).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestB6InfraHoldFirstClass:
     """B6: infra-hold is a first-class status (task 2200/omega4). A resolved
-    infra_issue escalation on an infra-held task resumes-at-verify
-    (in-progress) via _cascade_unblock_member's A1 guard (harness.py:9402-
-    9439), never re-pends to 'pending'; the reconcile stranded sweep skips
-    an infra-held row entirely (is_infra_held guard); a non-infra blocked
-    task still flips to pending. Mirrors
-    test_harness_infra_hold_repend.py:224-424."""
+    infra_issue escalation on an infra-held task resumes via
+    _cascade_unblock_member's A1 pre-gate rather than being skipped by the
+    blocked-only gate (an infra-held row is never 'blocked'); the reconcile
+    stranded sweep skips an infra-held row entirely (is_infra_held guard); a
+    non-infra blocked task still flips to pending. Mirrors
+    test_harness_infra_hold_repend.py's TestInfraHoldEscalationResolution.
 
-    async def test_infra_hold_resolved_escalation_resumes_at_verify(
+    HOLD side vs RESUME side (task 3538 / PRD γ3): the sweep-skip below is the
+    HOLD side and is unchanged. The RESUME side's target moved from
+    'in-progress' to 'pending' — a claimant-less 'in-progress' is the stranded
+    shape and is undispatchable, while resume-at-verify is branch-keyed
+    (_has_prior_implementation) and survives the change. See
+    test_harness_infra_resume_truthful.py."""
+
+    async def test_infra_hold_resolved_escalation_repends_for_dispatch(
         self, harness: Harness,
     ) -> None:
         tid = 'zeta-b6-infra'
@@ -463,14 +574,14 @@ class TestB6InfraHoldFirstClass:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'in-progress')  # type: ignore[attr-defined]
-        pending_calls = [
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+        inprog_calls = [
             c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
-            if c.args[1] == 'pending'
+            if c.args[1] == 'in-progress'
         ]
-        assert not pending_calls, (
-            f"set_task_status('pending') was called despite status='infra-hold'. "
-            f'Calls: {pending_calls}'
+        assert not inprog_calls, (
+            f"set_task_status('in-progress') was called for status='infra-hold' — "
+            f'that is the claimant-less strand shape. Calls: {inprog_calls}'
         )
 
     async def test_reconcile_sweep_skips_infra_held_row(self, harness: Harness) -> None:

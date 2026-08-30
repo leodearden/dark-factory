@@ -70,6 +70,13 @@ from scan_plan_decision_pairing import (
     scan_tree,
 )
 
+# Resolvable only AFTER the import above: the scanner module carries the
+# shared/src bootstrap (its lines 94-101), and this file deliberately reaches
+# through it rather than re-spelling that path. ``detect`` is imported for ONE
+# purpose — the non-circular control asserting the self-name specimen is
+# invisible to the BLANKET predicate — never as the thing under test.
+from shared.toolcall_markup import detect  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Specimens, paraphrased from live victim plans (task ids named per specimen).
 # ---------------------------------------------------------------------------
@@ -143,6 +150,14 @@ SECOND_MISPAIRED_ENTRY = _entry(SECOND_MISPAIRED_DECISION, SECOND_MISPAIRED_RATI
 CLEAN_ENTRY = _entry(CLEAN_DECISION, CLEAN_RATIONALE)
 SUPERSEDES_ONLY_ENTRY = _entry(SUPERSEDES_ONLY_DECISION, SUPERSEDES_ONLY_RATIONALE)
 ENVELOPE_TAINTED_ENTRY = _entry(MISPAIRED_DECISION, ENVELOPE_TAINTED_RATIONALE)
+
+# The SELF-NAME dialect (task 4696): a field mis-closed with its OWN
+# name-echoing tag and no other signature. Measured 2026-08-25 over
+# .worktrees/.task-meta/*/plan.json, this is 296 of the corrupted rationale
+# strings and it matches NO fixed envelope literal, so the param-blind
+# predicate reports it envelope-CLEAN while it is not.
+SELF_NAME_TAINTED_RATIONALE = MISPAIRED_RATIONALE + '\x3c/rationale>'
+SELF_NAME_TAINTED_ENTRY = _entry(MISPAIRED_DECISION, SELF_NAME_TAINTED_RATIONALE)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +370,54 @@ class TestScanPlanFile:
         (record,) = scan_plan_file(path)
 
         assert record.envelope_leak is True
+
+    def test_a_self_name_closer_is_reported_as_envelope_damage(self, tmp_path):
+        """Task 4696: the verdict must see the invoked tool's OWN parameters.
+
+        The blanket predicate enumerates a fixed literal set that spells none
+        of plan-tools' parameter names, so a rationale mis-closed with its own
+        tag was reported envelope-CLEAN. That is a WRONG column rather than a
+        missing one, and it defeats this scanner's whole purpose: the reason
+        the envelope verdict rides along as a column is so ONE report
+        distinguishes the two damage classes instead of an operator running two
+        sweeps and joining them by hand.
+        """
+        path = write_plan(tmp_path, '11', [SELF_NAME_TAINTED_ENTRY])
+
+        (record,) = scan_plan_file(path)
+
+        assert record.envelope_leak is True
+
+    def test_the_self_name_specimen_carries_no_other_signature(self, tmp_path):
+        """The non-circular control: it must be INVISIBLE to the blanket set.
+
+        If a future widening of the fixed literals caught this specimen anyway,
+        the row above would pass for the wrong reason and stop proving the
+        verdict is parameter-aware.
+        """
+        assert detect(SELF_NAME_TAINTED_RATIONALE) is None
+        assert '\x3c/invoke>' not in SELF_NAME_TAINTED_RATIONALE
+
+    def test_a_clean_entry_is_still_reported_envelope_clean(self, tmp_path):
+        """The widening must not turn ordinary prose into a false positive."""
+        path = write_plan(tmp_path, '12', [MISPAIRED_ENTRY])
+
+        (record,) = scan_plan_file(path)
+
+        assert record.envelope_leak is False
+
+    def test_scanning_a_self_name_specimen_does_not_touch_the_file(self, tmp_path):
+        """The read-only guarantee is unchanged by the widened verdict.
+
+        This scanner NEVER writes — the wider predicate reads more, it does not
+        make the scanner a repairer.
+        """
+        write_plan(tmp_path, '11', [SELF_NAME_TAINTED_ENTRY])
+        before = _snapshot(tmp_path)
+
+        scan_plan_file(tmp_path / '11' / 'plan.json')
+
+        _assert_unchanged(tmp_path, before)
 
     def test_task_id_comes_from_the_lane_directory_not_the_document(self, tmp_path):
         """Measured 2026-08-16 over 1299 live plans: the document disagrees on 4.

@@ -321,7 +321,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from shared.proc_group import _unsafe_pgid_reason
-from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
+from shared.task_metadata import (
+    HUMAN_CURATOR_ADJUDICATED_AT_KEY,
+    HUMAN_CURATOR_GATE_KEY,
+    DoneProvenance,
+)
 
 from orchestrator import systemd_inspect
 from orchestrator.deploy_state import (
@@ -487,15 +491,27 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # CONTENT", the stamp says "a human did".  Task 3181 is the incident where the
 # runner had the first and inferred the second from a closed escalation record.
 #
-# SINGLE SOURCE (task 3369): the MARKER's spelling is imported from
-# `shared.task_metadata` (see the import block above) rather than restated as a
-# local literal.  That module's `_deterministic_invariants` validator now reads
-# the key too — to reject the marker alongside a non-null `before_done` at the
-# write boundary — so a second definition would put two spellings of one key in
-# the two modules that both act on it, which is exactly the drift a named
-# constant exists to prevent.  The STAMP keeps a bare literal because `shared`
-# offers no constant to import: it names the stamp only inside
-# `_BLESSED_METADATA_KEYS`, with no validator reading it.
+# SINGLE SOURCE (task 3369, extended to the stamp by task 3420): both the
+# MARKER's and the STAMP's spellings are imported from `shared.task_metadata`
+# (see the import block above) rather than restated as local literals.  That
+# module's `_deterministic_invariants` validator reads the marker — to reject
+# it alongside a non-null `before_done` at the write boundary — so a second
+# definition would put two spellings of one key in the two modules that both
+# act on it, which is exactly the drift a named constant exists to prevent.
+# No validator reads the stamp today, but it gets the same single-definition
+# treatment for the same reason: this module's own dispatch-time guard
+# (`_curator_adjudication_confirmed`) is the one place that decides whether a
+# curator gate may close, so a drifted stamp spelling here would silently
+# defeat it.
+#
+# A fork is caught BEHAVIOURALLY, by the tests that stamp the bare wire literal
+# and drive real code: `TestHumanCuratorGateAdjudicationGuard` in
+# orchestrator/tests/test_deterministic_runner.py, and shared's `parse_metadata`
+# blessed-key tests in shared/tests/test_task_metadata.py.  Do NOT add an
+# in-process `is`/`id()` identity check against the shared constant — CPython
+# interns identifier-shaped string literals, so a forked local literal would be
+# the SAME object and such a check passes either way (a vacuous one was removed
+# by task 3420 for exactly this reason).
 #
 # NAMING (reviewer amendment): the stamp is `human_curator_adjudicated_at`, NOT
 # `curator_adjudicated_at`.  The bare `curator_*` metadata namespace is already
@@ -505,7 +521,6 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # curator would invite a reader of the Tier-A list, or a census consumer
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
-HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.

@@ -2164,6 +2164,115 @@ class GraphitiBackend:
         return edges
 
     @_canonicalize_group_args
+    async def count_foreign_relationships(
+        self, node_uuid: str, *, group_id: str, episode_uuid: str = ''
+    ) -> int:
+        """Count every relationship a DETACH DELETE of *node_uuid* would destroy.
+
+        WHAT IT ANSWERS, contrasted with its neighbour above.
+        :meth:`get_valid_edges_for_node` answers "does this node still carry
+        LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
+        ``invalid_at IS NULL``.  This one answers a different question:
+        "would deleting this node DESTROY ANYTHING?"  It is therefore
+        deliberately UNTYPED and UNFILTERED, because
+        :meth:`delete_entity_node` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n`` that removes EVERY
+        relationship — invalidated ``RELATES_TO`` temporal history and
+        Episodic ``MENTIONS`` included.  A guard authorising a destructive
+        operation must test exactly what that operation destroys, and every
+        other count/edge query in this module is typed to ``RELATES_TO``, so
+        none of them can.
+
+        WHY ``MENTIONS`` MATTERS.  An Entity's provenance links from Episodic
+        nodes are real, load-bearing graph content — ``maintenance/
+        cross_graph_move.py`` recreates ``(ep:Episodic)-[e:MENTIONS]->(n:Entity)``
+        links precisely because losing them loses provenance — and they are
+        wholly invisible to every ``RELATES_TO``-typed query in this file.
+
+        WHY THE ``episode_uuid`` EXCLUSION IS NARROW AND OPTIONAL.  It exists so
+        the single caller (``MemoryService._cleanup_emptied_nodes``) can ask "is
+        this node attached to anything OTHER than the write currently in
+        flight?".  graphiti_core's extraction mints a mis-resolved node AND its
+        ``MENTIONS`` link from the same episodic node in the same
+        ``add_episode``, so a strict zero-degree predicate would never fire on
+        the very phantom that cleanup exists to remove.  Excluding only THIS
+        episode's own ``MENTIONS`` is what actually encodes "minted by this very
+        episode": any invalidated ``RELATES_TO``, or any ``MENTIONS`` from a
+        DIFFERENT episode, proves pre-existing history and still counts.
+        It defaults to ``''``, which applies no exclusion at all and makes the
+        primitive strictly conservative — the fail-closed default.
+
+        THE SELF-LOOP NOTE.  An A->A relationship double-matches the undirected
+        pattern and is intentionally NOT deduped, which is the OPPOSITE choice
+        from :meth:`get_valid_edges_for_node`'s uuid-keyed dedup.  The asymmetry
+        is correct because the two values are consumed differently: that one's
+        list is enumerated, while this one is consumed only as ``== 0``.
+        Over-counting can therefore only ever REFUSE a delete, which is the safe
+        direction; under-counting would authorise one.
+
+        READ-ONLY, and must stay so — it runs on ``ro_query``.  A guard that can
+        write is a guard that can cause the damage it exists to prevent.
+
+        THE ONLY ZERO THIS RETURNS IS ONE THE SERVER ACTUALLY SAID.
+        ``count(r)`` is an UNGROUPED aggregate — it carries no grouping key —
+        so against a real server it yields exactly one row whether or not the
+        ``MATCH`` found anything, and a node with no relationships at all comes
+        back as a readable ``0``.  ``int(rows[0][0])`` is therefore the ONLY
+        zero path, and no legitimate call can reach an empty or ``None``
+        ``result_set`` at all.
+
+        Every OTHER response shape RAISES, and the arms are deliberately
+        symmetric: an empty ``result_set``, an absent one, and a row that is
+        present but unreadable are all equally uninterpretable, so none of them
+        may be quietly degraded into the single value that AUTHORISES a
+        deletion.  An earlier revision returned ``0`` for the two empty arms;
+        that was the one fail-OPEN branch in a guard whose entire purpose is to
+        prevent irreversible loss of a real entity's temporal history, and the
+        asymmetry with the raising arm was unmotivated.  Raising costs nothing
+        on every real path, because no real path gets here.  The caller wraps
+        this in a per-candidate ``try``/``except``, so a raise becomes a logged
+        skip — a refusal to delete.
+
+        Args:
+            node_uuid: UUID of the Entity node whose degree to measure.
+            group_id: Project graph to query.
+            episode_uuid: UUID of the episode whose write is in flight, whose
+                own ``MENTIONS`` link is excluded from the count. ``''`` (the
+                default) excludes nothing.
+
+        Returns:
+            The number of relationships of any type and any validity attached
+            to the node, minus this episode's own ``MENTIONS`` link.
+
+        Raises:
+            RuntimeError: if the backend is not initialized, or if the query
+                came back with no readable row — see above; that is a broken
+                response, never a node with no relationships.
+            IndexError/TypeError/ValueError: if the row is present but its
+                first column cannot be read as an int.
+        """
+        graph = self._graph_for(group_id)
+        cypher = 'MATCH (n:Entity {uuid: $uuid})-[r]-(m) '
+        params: dict[str, Any] = {'uuid': node_uuid}
+        if episode_uuid:
+            cypher += "WHERE NOT (type(r) = 'MENTIONS' AND m.uuid = $episode_uuid) "
+            params['episode_uuid'] = episode_uuid
+        cypher += 'RETURN count(r)'
+        result = await graph.ro_query(cypher, params)
+        rows = result.result_set or []
+        if not rows:
+            # NOT a node with no relationships — that comes back as a readable
+            # `0` row. This is a response nobody can interpret, and reading it
+            # as `0` would authorise a DETACH DELETE on the strength of it.
+            raise RuntimeError(
+                'count_foreign_relationships: empty result_set for node '
+                f'{node_uuid!r} in group {group_id!r}; count(r) is an ungrouped '
+                'aggregate and always yields one row, so this is a broken '
+                'response, not a zero-degree node'
+            )
+        return int(rows[0][0])
+
+    @_canonicalize_group_args
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 

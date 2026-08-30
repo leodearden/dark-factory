@@ -14,18 +14,56 @@ MCP tool-call envelope markup that leaked into their prose fields when the
 harness mis-closed an argument — a trailing mis-close, or a whole sibling
 parameter absorbed into the value before it.  Every entry point that opens
 an existing plan goes through :func:`_read_plan_repaired`, which repairs
-what it can, writes the result back through :func:`_atomic_write_plan`
-(PRD contract C3, scoped to THAT write: a concurrent reader never
-observes a partial *repair* write-back — the tools' own mutation write
-still goes through ``TaskArtifacts.write_plan``, which is truncate-then-
-write, and closing that window needs a change to ``TaskArtifacts`` that
-is out of this module's scope), and reports every repair and every
-refusal on the response's ``markup_repairs``
-key.  No fleet quiesce is needed: the next tool call an agent makes fixes
+what it can, writes the result back through ``TaskArtifacts.write_plan``,
+and reports every repair and every refusal on the response's
+``markup_repairs`` key.  EVERY plan.json write -- repair write-back and
+tool mutation alike -- goes through that one method, which owns the byte
+format and the atomic/durable guarantee (task 3957): a concurrent reader
+observes either the complete old plan or the complete new one, never a
+partial write.  This module deliberately keeps NO writer of its own; the
+duplicate it used to carry existed only while ``TaskArtifacts`` was
+truncate-then-write.  No fleet quiesce is needed: the next tool call an agent makes fixes
 its own plan.  ``shared.toolcall_markup`` is the SINGLE owner of the
 literal set and of every accept/refuse decision (INV-5) — this module
 enumerates only WHICH plan fields are prose (``_REPAIRABLE_PLAN_FIELDS``),
 never what corruption looks like.
+
+TWO MECHANISMS, ONE BOUNDARY EACH (task 4457's ruling — do not collapse them).
+The read-time repair above is NOT the only markup guard on this file:
+``create_server`` also registers
+:class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` under
+``REJECT_WITH_REPAIR``, which guards INBOUND ARGUMENTS at the FastMCP request
+layer, before pydantic validation and before any tool body runs.  The three
+options were enumerated and COMPOSE was chosen:
+
+* SKIP (leave the read-time path as the only mechanism) — rejected.  It cannot
+  reject, cannot see inbound arguments at all, and cannot recover a swallowed
+  REQUIRED parameter; ``_create_plan`` is deliberately unhooked from it and
+  would stay wholly unguarded, on the server that owns 52 of the system's 95
+  unrepairable specimens.
+* SUPERSEDE (register and retire the read-time path) — rejected.  The two have
+  DISJOINT populations: the read-time path's is damage ALREADY LANDED in stored
+  plan.json, which the middleware repairs none of because it only ever sees
+  what an agent is sending NOW.
+* COMPOSE — chosen.  Different layers over different populations: inbound
+  arguments at the request layer, versus stored state at read time inside the
+  tool body.  INV-5 forbids a second ENUMERATION of the envelope literals and
+  there is none — both delegate every accept/refuse decision to
+  ``shared.toolcall_markup``.  D1 forbids per-boundary CALL SITES in place of a
+  blanket middleware, and the read-time path is not a per-boundary call site.
+
+Two consequences of that pairing are load-bearing, and both follow from the
+DECLARED policy rather than from coincidence:
+
+1. Under ``REJECT_WITH_REPAIR`` the middleware NEVER forwards a repaired
+   argument, so no middleware-repaired value can ever reach plan.json — which
+   is why the read-time path can never re-report the same damage as a second
+   fact.
+2. A rejected call short-circuits the tool body, so pre-existing STORED damage
+   is not repaired on that call.  That is a DEFERRAL, not a loss: the next
+   accepted call repairs it.  Do NOT "fix" it by invoking the read-time repair
+   from the middleware — that is exactly how two mechanisms on one boundary
+   become one tangled one.
 
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
@@ -44,22 +82,21 @@ import copy
 import inspect
 import json
 import logging
-import os
 import re
-import stat
 import subprocess
 import sys
-import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
-from shared.toolcall_markup import detect, repair
+from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.toolcall_markup import detect_for, repair
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import markup_sink
 
 logger = logging.getLogger(__name__)
 
@@ -448,7 +485,14 @@ def _repair_one_field(
     value = holder.get(record.field)
     if not isinstance(value, str):
         return None
-    pattern = detect(value)
+    # PARAMETER-AWARE, and free here (task 4696). Unlike the middleware
+    # boundary — which holds only the argument name and will not pay an awaited
+    # get_tool to learn more — this site already has the whole schema in hand
+    # off the DECLARED table, so it scans the shared enumeration widened by
+    # this field's own closer AND every sibling parameter's. The diagnostic
+    # below therefore names the tag actually seen instead of whatever fixed
+    # literal happens to trail the leak.
+    pattern = detect_for(value, record.field, record.schema_params)
     if pattern is None:
         # The cheap prefilter, and the overwhelmingly common path: no literal
         # anywhere in the value, so repair() is never called.
@@ -516,7 +560,8 @@ def _repair_one_field(
         #   RECOVERED value. Declining here would blank the field, and
         #   because the fact still reads ``outcome: 'repaired'``,
         #   ``_read_plan_repaired`` would persist that blank through
-        #   ``_atomic_write_plan`` — authored text destroyed on disk,
+        #   ``TaskArtifacts.write_plan`` — authored text destroyed on
+        #   disk,
         #   unrecoverable on the next read. That is the same
         #   silent-authored-text-loss this whole surface exists to end,
         #   merely pointed the other way.
@@ -603,16 +648,33 @@ def _walk_repairable(plan: dict) -> Iterator[tuple[dict[str, Any], int | None, _
 
 
 def _carries_markup(plan: dict) -> bool:
-    """True when ANY declared field of *plan* trips :func:`detect`.
+    """True when ANY declared field of *plan* trips :func:`detect_for`.
 
     The cheap prefilter over the whole document, run before anything is copied.
-    ``detect`` is a substring scan; a deep copy of a plan is tens of KB of
-    analysis prose plus every step description, and on the overwhelmingly common
-    clean path that copy would be pure waste.
+    Each check is ONE compiled pass over the value; a deep copy of a plan is
+    tens of KB of analysis prose plus every step description, and on the
+    overwhelmingly common clean path that copy would be pure waste.
+
+    PARAMETER-AWARE AS OF TASK 4696, and this gate is why the task exists. It
+    asked the param-free ``detect``, whose fixed literal set spells none of
+    plan-tools' own parameter names — so a plan whose only damage was a field
+    mis-closed with its OWN tag looked CLEAN, the pass never ran, and the
+    corruption survived every read. Measured on 2026-08-25: 296 ``rationale``
+    and 129 ``how`` specimens sitting unrepaired on disk for that reason.
+
+    The widening costs this site NOTHING: the walk already yields the
+    ``_PlanField`` record, so ``record.field`` and ``record.schema_params``
+    come straight off the declared table — no lookup, no second enumeration
+    (INV-5). It is deliberately WIDER than the middleware's gate, which holds
+    only the argument's own name; the asymmetry is a cost decision, recorded at
+    ``MarkupGuardMiddleware._first_markup_argument``, not a divergence.
     """
     for holder, _index, record in _walk_repairable(plan):
         value = holder.get(record.field)
-        if isinstance(value, str) and detect(value) is not None:
+        if (
+            isinstance(value, str)
+            and detect_for(value, record.field, record.schema_params) is not None
+        ):
             return True
     return False
 
@@ -633,10 +695,13 @@ def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
     which :func:`_read_plan_repaired`'s callers do, since ``read_plan`` parses
     the file anew on every call.
 
-    The prefilter runs ``detect`` a second time on the values that DO trip it
-    (once here, once inside :func:`_repair_one_field`). That is deliberate: the
-    duplicate pass is paid only on the corrupted path, where the walk is about
-    to call ``repair()`` anyway, and it buys skipping the copy on the clean one.
+    The prefilter runs ``detect_for`` a second time on the values that DO trip
+    it (once here, once inside :func:`_repair_one_field`). That is deliberate:
+    the duplicate pass is paid only on the corrupted path, where the walk is
+    about to call ``repair()`` anyway, and it buys skipping the copy on the
+    clean one. Both passes ask the SAME parameter-aware predicate with the SAME
+    record, so the prefilter can never wave through a value the walk would then
+    decline to look at, nor the reverse.
     """
     if not _carries_markup(plan):
         return plan, []
@@ -650,145 +715,6 @@ def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
 
     return repaired, facts
 
-
-class PlanWriteError(OSError):
-    """An atomic plan write-back failed; the target was left UNTOUCHED.
-
-    Carries the path in its message so the failure is actionable without
-    log-scraping, and is chained (``raise ... from``) to the underlying cause.
-    """
-
-
-def _verify_plan_json(path: Path) -> None:
-    """Re-read *path* and confirm it parses as JSON. Raises if it does not.
-
-    A named seam, not an inlined ``json.load``: it is the last checkpoint
-    before the swap becomes irreversible, so it must be independently
-    exercisable by a test that injects a failure there.
-    """
-    with path.open(encoding='utf-8') as handle:
-        json.load(handle)
-
-
-def _target_file_mode(target: Path) -> int:
-    """The permission bits *target* must carry AFTER the replace.
-
-    ``tempfile.mkstemp`` forces 0600 and ``os.replace`` carries that mode onto
-    the target, so without this the FIRST repair write-back would silently
-    narrow plan.json from whatever ``TaskArtifacts._write_json`` created it as
-    (0666 & ~umask, typically 0644) to owner-only — an invisible, permanent
-    mutation of a file the lock charter and the merge gate both read, performed
-    as a side effect of a READ. Today every consumer runs as the same uid, so it
-    would break nothing and go unnoticed until a sandboxed reader with a
-    different uid, or a group-readable operator workflow, touched the artifact.
-
-    An existing target's own mode is preserved verbatim. For a target that does
-    not exist yet the answer is what ``path.write_text`` would have produced,
-    which keeps a fresh atomic write byte- AND mode-identical to
-    ``TaskArtifacts.write_plan``. Reading the umask requires setting it (the
-    only interface the OS offers) and restoring it immediately; plan-tools is a
-    single-threaded stdio subprocess and this runs on the rare repair path, so
-    the restored-in-two-statements window is not a real exposure — but it is why
-    this is a named helper rather than an inline dance.
-    """
-    try:
-        return stat.S_IMODE(target.stat().st_mode)
-    except FileNotFoundError:
-        current = os.umask(0)
-        os.umask(current)
-        return 0o666 & ~current
-
-
-def _atomic_write_plan(path: Path, plan: dict) -> None:
-    """Write *plan* to *path* atomically. Returns ``None``; raises on failure.
-
-    PRD contract C3 / boundary row B12: a concurrent reader must never observe
-    a partially written plan.json. Deliberately NOT routed through
-    ``TaskArtifacts._write_json``, which is ``path.write_text`` —
-    truncate-then-write, precisely the window B12 forbids. The byte format is
-    reproduced exactly (``_schema_version`` stamp, ``json.dumps(indent=2)``
-    plus a trailing newline) so a repair write-back cannot churn formatting, and
-    the target's existing permission bits are carried across the swap (see
-    :func:`_target_file_mode`) so an atomic write is invisible in every respect
-    except its content.
-
-    THE GUARANTEE IS SCOPED TO THIS WRITE, and the scope is a real limit rather
-    than a formality. A plan-tools CALL typically repairs on the way in through
-    :func:`_read_plan_repaired` (atomic, here) and then persists its own mutation
-    microseconds later through ``artifacts.write_plan`` — which is still
-    ``path.write_text``, i.e. torn-readable. So "no reader ever sees a partial
-    plan.json" holds for the repair write-back, NOT for a plan-tools call taken
-    as a whole. Closing that second window means making ``TaskArtifacts``
-    itself write atomically, which is out of this task's module scope (its
-    design decision 4 scopes atomicity to the write no agent asked for — the
-    repair — precisely because converting ``_write_json`` would change the
-    durability semantics of ~20 unrelated artifact writers); it is filed as
-    follow-up work rather than half-done here.
-
-    Order: RESOLVE the target, serialize, write to a temp file in the resolved
-    target's own directory, flush, fsync, restore the mode, VERIFY it re-parses,
-    and only then ``os.replace``. Any failure unlinks the temp and leaves the
-    original byte-identical, then raises :class:`PlanWriteError` naming the path
-    — loud, never a silent skip.
-
-    RESOLVING FIRST IS LOAD-BEARING TWICE OVER, which is why it is the first
-    statement rather than an incidental normalisation.
-    ``TaskArtifacts.ensure_lane_plan_symlink`` makes the lane copy
-    ``<worktree>/.task/plan.json`` an ABSOLUTE symlink onto the durable
-    meta-root plan, and ``_artifacts_from_args`` still supports
-    ``meta_root=None`` where ``self.root`` IS ``<worktree>/.task`` — so the
-    path handed here can BE that symlink. ``os.replace`` onto a symlink
-    replaces the LINK with a regular file, which would silently re-fork the
-    lane and meta-root copies and recreate the esc-5205-9 stale-plan
-    divergence the symlink exists to prevent. Resolving also guarantees the
-    temp lands on the same filesystem as the real file, which is what makes
-    the replace a rename rather than a cross-device error.
-
-    A DANGLING link resolves to a path that does not exist (and whose parent
-    may not either). That fails loudly, naming both the original and resolved
-    paths, rather than materialising a stray regular file at the link path —
-    which would BE the divergence, not a recovery from it.
-    """
-    target = Path(os.path.realpath(path))
-    if not target.parent.is_dir():
-        raise PlanWriteError(
-            f'atomic plan write-back to {path} failed: its resolved target '
-            f'{target} has no existing parent directory (a dangling symlink?) '
-            '— refusing to materialise a stray file at the link path'
-        )
-
-    plan['_schema_version'] = PLAN_SCHEMA_VERSION
-    payload = json.dumps(plan, indent=2) + '\n'
-
-    fd, tmp_name = tempfile.mkstemp(
-        dir=target.parent, prefix='.plan.json.', suffix='.tmp'
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Before the swap, never after: the replaced file must already carry the
-        # right bits, or a reader between the two calls sees the 0600 mkstemp
-        # forced — a window with the same shape as the torn read B12 forbids.
-        # Looked up HERE, inside the wrapper, so a stat() failure other than
-        # FileNotFoundError (EACCES, ELOOP, ENAMETOOLONG — _target_file_mode
-        # deliberately swallows only the former) surfaces as PlanWriteError
-        # naming the path, per this function's own docstring, instead of
-        # escaping bare before the try block ever ran.
-        os.chmod(tmp_path, _target_file_mode(target))
-        _verify_plan_json(tmp_path)
-        os.replace(tmp_path, target)
-    except Exception as exc:
-        raise PlanWriteError(
-            f'atomic plan write-back to {path} (resolved to {target}) failed '
-            f'({exc!r}); the existing file was left untouched'
-        ) from exc
-    finally:
-        # os.replace consumed the temp on the success path; missing_ok makes
-        # this a no-op there and a guaranteed cleanup on every failure path.
-        tmp_path.unlink(missing_ok=True)
 
 
 #: Stable event name for a structured markup fact (INV-2). plan-tools is a bare
@@ -958,13 +884,14 @@ def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, 
         return repaired, reportable
 
     try:
-        _atomic_write_plan(plan_path, repaired)
+        artifacts.write_plan(repaired)
     except Exception as exc:
         # Broad on purpose: the caller must receive the repaired plan whatever
-        # went wrong on the way to disk. mkstemp and the json.dumps in
-        # _atomic_write_plan both raise outside its own PlanWriteError wrapper
-        # (OSError / TypeError / ValueError), so narrowing here would turn a
-        # persistence failure into a failed tool call.
+        # went wrong on the way to disk. TaskArtifacts.write_plan can raise an
+        # OSError family member (EACCES, ENOSPC, the ArtifactWriteError
+        # dangling-symlink refusal) or a TypeError/ValueError out of its
+        # json.dumps, so narrowing here would turn a persistence failure into
+        # a failed tool call.
         logger.warning(
             json.dumps({
                 'event': _MARKUP_WRITE_FAILED_EVENT,
@@ -1028,6 +955,11 @@ def _create_plan(
     # wholesale, so there is no existing document to repair on the way in.
     # Guarding these INBOUND arguments against envelope markup is the write-time
     # middleware's job, not this read-time surface's — don't "fix" the omission.
+    # That promise is now KEPT: MarkupGuardMiddleware is LIVE on this server
+    # (see create_server), and it refuses a poisoned title or analysis before
+    # this function is ever entered. The instruction above is load-bearing in
+    # the other direction now — hooking this function into _read_plan_repaired
+    # would put the same damage through two mechanisms.
     files = _coerce_files(files)
     plan = {
         'task_id': task_id,
@@ -1544,6 +1476,120 @@ def _mark_step_committed(
 
 
 # ---------------------------------------------------------------------------
+# The boundary guard's escalation channel (task 4457; promoted to a shared
+# module by task 3690)
+# ---------------------------------------------------------------------------
+#
+# The MECHANISM now lives in ``orchestrator.mcp.markup_sink`` — ONE channel
+# shared with verdict-tools, rather than a second, weaker one per server
+# (INV-5). What stays here is plan-tools' own DECLARATION of it: the spec
+# below, and the thin module-level seams the channel is reached through.
+#
+# The seams are not ceremony. ``_markup_project_root`` and
+# ``_escalation_channel`` are resolved through THIS module's globals at call
+# time (the lambdas in ``_markup_escalation_sink`` close over the names, not
+# the functions), so a test that substitutes either one still steers the sink
+# a `create_server` already built.
+
+#: Where the queue lives under project_root — see ``markup_sink``.
+_MARKUP_QUEUE_DIRNAME = markup_sink.MARKUP_QUEUE_DIRNAME
+
+#: Filed-by attribution. Names the GUARD, not the leaking agent.
+_MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
+
+#: The two queue anchors. Both are NON-TASK ids, and the residue one is
+#: load-bearing at that: the middleware declares residue at ``level=2``, and a
+#: pending level>=2 record carrying a LIVE task id halts that task. See
+#: ``MarkupSinkSpec.residue_anchor_task_id`` for the full reading of the gate.
+_MARKUP_RESIDUE_ANCHOR_TASK_ID = 'plan-tools-markup-residue'
+_MARKUP_STORM_ANCHOR_TASK_ID = 'plan-tools-markup-storm'
+
+_MARKUP_UNATTRIBUTED_SUBJECT = markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
+_MARKUP_RESIDUE_ERROR_TYPE = markup_sink.MARKUP_RESIDUE_ERROR_TYPE
+_MARKUP_STORM_ERROR_TYPE = markup_sink.MARKUP_STORM_ERROR_TYPE
+_MARKUP_STORM_CATEGORY = markup_sink.MARKUP_STORM_CATEGORY
+_MARKUP_STORM_LEVEL = markup_sink.MARKUP_STORM_LEVEL
+_ESCALATION_FALLBACK_CATEGORY = markup_sink.ESCALATION_FALLBACK_CATEGORY
+
+#: plan-tools' declaration of its own channel. Every field is stated here
+#: rather than defaulted in ``markup_sink``: adding a server must be a decision
+#: at every axis, not an inheritance of this server's answers.
+_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+    server_label='plan-tools',
+    agent_role=_MARKUP_AGENT_ROLE,
+    residue_anchor_task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+    storm_anchor_task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+    refusal_consequence='NOTHING was written.',
+    storm_consequence=(
+        "further specimens land permanently in the fleet's plan.json files."
+    ),
+)
+
+_ESCALATION_FALLBACK_SUMMARY = _MARKUP_SINK_SPEC.fallback_summary
+
+
+def _markup_project_root(worktree: Path) -> Path | None:
+    """plan-tools' seam onto :func:`markup_sink.resolve_project_root`."""
+    return markup_sink.resolve_project_root(worktree)
+
+
+def _escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
+    """plan-tools' seam onto :func:`markup_sink.open_escalation_channel`."""
+    return markup_sink.open_escalation_channel(project_root)
+
+
+def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
+    """Which task's call leaked — the record's SUBJECT, not its routing key.
+
+    Deliberately NOT what goes in the escalation's ``task_id`` field: that is
+    ``_MARKUP_RESIDUE_ANCHOR_TASK_ID``, because a level-2 record filed under a
+    LIVE task id halts that task. This is the attribution that then rides in
+    the summary and the detail instead.
+
+    The plan's own ``task_id`` first; the worktree directory name when there is
+    no plan yet (a ``create_plan`` refused before any plan exists); an explicit
+    "unattributed" only when even that is empty — the last two fallbacks are
+    ``markup_sink``'s, applied to whatever this returns. An unreadable plan
+    degrades to the same fallback rather than losing the record: the payload it
+    carries is the only copy that exists.
+    """
+    try:
+        plan = artifacts.read_plan()
+    except Exception:
+        logger.warning(
+            'markup guard: could not read the plan for attribution under %s; '
+            'falling back to the worktree name', artifacts.root,
+        )
+        plan = {}
+    task_id = plan.get('task_id') if isinstance(plan, dict) else None
+    if isinstance(task_id, str) and task_id:
+        return task_id
+    return artifacts.worktree.name or _MARKUP_UNATTRIBUTED_SUBJECT
+
+
+def _markup_escalation_sink(
+    artifacts: TaskArtifacts,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build plan-tools' emitter — the shared channel, this server's spec.
+
+    No ``last_resort``: plan-tools' payload floor is the queue or nothing. A
+    worktree-local file would die with the lane at
+    ``git worktree remove --force`` and nothing would ever read it, so
+    promising one in the refusal hint would be worse than the honest ``None``
+    the middleware already renders.
+    """
+    return markup_sink.make_escalation_sink(
+        worktree=artifacts.worktree,
+        spec=_MARKUP_SINK_SPEC,
+        subject_task_id=lambda: _markup_subject_task_id(artifacts),
+        # Resolved through THIS module's globals per call, so a test that
+        # substitutes either seam steers an already-built sink.
+        resolve_root=lambda worktree: _markup_project_root(worktree),
+        open_channel=lambda project_root: _escalation_channel(project_root),
+    )
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
@@ -1551,6 +1597,57 @@ def _mark_step_committed(
 def create_server(artifacts: TaskArtifacts) -> FastMCP:
     """Create the plan-tools MCP server with all tools registered."""
     mcp = FastMCP('plan-tools')
+
+    # THE WRITE-TIME BOUNDARY GUARD (task 4457, PRD contract C2). Every INBOUND
+    # string argument of every tool on this server is scanned for leaked
+    # tool-call envelope markup before pydantic ever validates it — which is
+    # what lets a repair recover a parameter this server declares as REQUIRED:
+    # the loudest leak shape here is add_design_decision.decision absorbing its
+    # rationale sibling, and no read-time surface can see it at all.
+    #
+    # BOTH ARGUMENTS ARE DECLARED EXPLICITLY (INV-1), never left to a default:
+    #
+    # * The POLICY is PRD section 4 C2's table row for plan-tools. A plan is
+    #   authored once and read for the life of the task, so bouncing the caller
+    #   costs one mechanical retry while forwarding a repair would write a
+    #   guessed-at document that every later reader inherits.
+    # * The empty EXEMPTION SET is an answer, not an omission: no plan-tools
+    #   tool has searching for envelope literals as its job, the way
+    #   fused-memory's scan_memory_content does. An architect legitimately
+    #   QUOTING the literals — planning a task about this very leak — uses the
+    #   deliberate-quoting override instead, which works here even though no
+    #   plan-tools tool declares a `metadata` parameter: the middleware drops
+    #   the flag before dispatch rather than forwarding it as an unexpected
+    #   argument.
+    #
+    # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
+    # is explicit that unrepairable input is refused AND its full raw payload
+    # preserved, and the middleware's refusal hint tells the caller its payload
+    # "is preserved verbatim in the escalation named above". Registering REJECT
+    # with `escalation_sink=None` would ship that promise with nothing behind
+    # it, on the largest unrepairable surface in the system — 52 of the 95
+    # measured specimens are plan-tools' — turning "corrupt but present in
+    # plan.json" into "silently absent".
+    #
+    # Residue is filed under a NON-TASK anchor, never under the leaking task's
+    # own id: the middleware declares it at level 2, and a pending level>=2
+    # record carrying a live task id halts that task. Preserving one payload
+    # must not cost the run that produced it. See
+    # `_MARKUP_RESIDUE_ANCHOR_TASK_ID` for the full reading of the gate.
+    #
+    # `fact_sink` is DELIBERATELY left unwired (its default None). Under
+    # REJECT_WITH_REPAIR every fact's content already reaches the one party
+    # that can act on it — the leaking caller — inside the rejection payload,
+    # and the operator-facing half rides the storm escalation. A second fact
+    # channel with no consumer would repeat exactly the defect this leaf is
+    # chartered to rule against.
+    mcp.add_middleware(
+        MarkupGuardMiddleware(
+            RepairPolicy.REJECT_WITH_REPAIR,
+            exempt_tools=frozenset(),
+            escalation_sink=_markup_escalation_sink(artifacts),
+        )
+    )
 
     @mcp.tool()
     def create_plan(

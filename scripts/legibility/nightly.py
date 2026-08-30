@@ -481,9 +481,67 @@ def _default_poster(url: str, envelope: dict) -> None:
 
 def post_escalation(
     cfg: LegibilityConfig, summary: str, detail: str, *, poster=None,
+    level: int = logging.ERROR,
 ) -> bool:
     """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
     8): extractor crash, coder storm, or commit failure.
+
+    JOURNALS THE PAIR FIRST, AT *level*, BEFORE ANYTHING ELSE HAPPENS.
+    That single line is the contract this function now carries: EVERY
+    escalation this module posts is written to the journal here, at the
+    call site's severity, before the envelope is built and before the POST
+    is attempted. Two properties fall out of putting it here rather than
+    at each of the six call sites, and neither survives a per-branch log
+    call:
+
+    * A future fail-loud branch CANNOT FORGET IT. The log sits on the only
+      path to the POST, so a new branch inherits journal visibility by
+      construction rather than by whoever adds it remembering.
+    * A DOWN ESCALATION SERVER NO LONGER COSTS THE DIAGNOSIS. On
+      2026-08-18 (esc-legibility-trickle-reify-3) the only copy of
+      "coder storm: 6/6 digests failed ... [Errno 2] No such file or
+      directory: claude" lived inside the archived escalation JSON, while
+      ``journalctl --user -u legibility-trickle@reify.service`` showed
+      nothing but an unexplained benign 400 and ``status=1/FAILURE``.
+      Ordering the write BEFORE the POST is what makes the reason durable
+      independent of whether the POST lands.
+
+    *level* IS THE RULE, AND IT IS ABOUT THIS ESCALATION, NOT THE NIGHT:
+    ERROR iff this escalation is ITSELF the fail-loud trigger returning
+    ``exit_code=1``, WARNING iff it deliberately leaves the exit code
+    untouched (the run may still fail LATER, for an unrelated reason). The
+    four decision-8 fail-loud branches take the ERROR default and pass
+    nothing, so the cannot-forget property above is untouched. The three
+    exit-0 sites -- the budget-suppression door, the barren streak and the
+    deletion-directive aggregate -- pass ``logging.WARNING``, because each
+    deliberately leaves ``exit_code=0`` (a non-zero exit would make
+    ``check_trickle_liveness.sh`` fail every night for a timer that is
+    running perfectly, and an ERROR journal line is a weaker version of
+    that same false alarm). Tying the level to what THIS escalation does
+    to the exit code is what keeps ``journalctl -p err`` a list of ACTUAL
+    trickle failures rather than a mixed feed a healthy-but-barren timer
+    also appears in.
+
+    The rule is DELIBERATELY NOT stated as "matches the unit's own systemd
+    ``Result``", which reads tighter but is false in two directions -- so
+    a future maintainer must not "fix" a WARNING site to match an observed
+    ``Result=failed``. :func:`_escalate_barren_streak` is reached through
+    :func:`_record_trickle_progress` from ``run_nightly``'s ``finally``
+    block, so a night that crashes, storms or fails its commit AND has hit
+    the streak posts a WARNING escalation on a unit that reports failure.
+    The deletion-directive aggregate posts at WARNING before execution can
+    still fall into the validation-failure or commit-failure branch below
+    it and exit 1. Both WARNINGs are correct: neither escalation is why
+    the night failed, and the branch that IS why logs its own ERROR here.
+
+    *detail* is logged IN FULL -- never truncated, never ``repr()``-ed.
+    ``census_trigger._bounded_repr`` is this package's precedent for
+    bounding text before a log sink and is deliberately not reused:
+    clipping the aggregate reason is precisely the defect this closes.
+    The ``'%s -- %s'`` grammar is carried verbatim from the two call sites
+    that already logged it, so the journal line shape (and any operator
+    grep keyed on it) is unchanged; no prefix is added because every
+    summary already begins with "legibility trickle".
 
     Posts an MCP ``tools/call`` JSON-RPC envelope for tool
     ``escalate_info`` to ``http://localhost:<cfg.escalation_port>/mcp``
@@ -494,6 +552,7 @@ def post_escalation(
     authoritative loud signal regardless of whether this POST succeeded.
     Returns True on a successful post.
     """
+    logger.log(level, '%s -- %s', summary, detail)
     poster_fn = poster if poster is not None else _default_poster
     url = f'http://localhost:{cfg.escalation_port}/mcp'
     arguments = _build_escalation_arguments(cfg, summary, detail)
@@ -747,9 +806,12 @@ def _report_sample_outcome(
     On ``not sample.selected and sample.budget_skipped > 0`` -- which the
     :class:`~legibility.sampling.SampleResult` conservation invariant makes
     exactly "candidates existed and were ALL discarded on the byte budget" --
-    it additionally logs ONE WARNING and posts ONE best-effort
-    :func:`post_escalation`, reusing the decision-8
-    ``escalate_info``/``infra_issue``/severity=info envelope unchanged.
+    it additionally posts ONE best-effort :func:`post_escalation`,
+    reusing the decision-8 ``escalate_info``/``infra_issue``/severity=info
+    envelope unchanged. THAT CALL IS ALSO WHAT JOURNALS THE PAIR (task
+    4511): ``post_escalation`` logs ``summary -- detail`` itself, here at
+    ``logging.WARNING``, so this function no longer logs it separately and
+    there is exactly one such line per night, not two.
 
     IT NOW REPORTS BOTH BARREN DOORS AT WARNING, BUT ESCALATES ONLY THE
     BUDGET ONE PER-NIGHT (task 3340). The sibling door -- ``not
@@ -794,10 +856,12 @@ def _report_sample_outcome(
     misses the single first-night escalation gets silence thereafter, which
     is the precise pathology (14 indistinguishable nights, 2026-07-16..29)
     this whole task exists to end. The recurring-alarm-fatigue risk is real
-    and accepted with eyes open; the WARNING line is the per-night signal
-    either way, and the severity stays ``info`` so this never gates
-    anything. If the repeats do become noise before the budget is fixed,
-    latch them here rather than downgrading the WARNING.
+    and accepted with eyes open; the WARNING line -- now emitted by
+    :func:`post_escalation` on this function's behalf, at the
+    ``logging.WARNING`` passed below -- is the per-night signal either way,
+    and the severity stays ``info`` so this never gates anything. If the
+    repeats do become noise before the budget is fixed, latch them here
+    rather than downgrading the WARNING.
     """
     summary_line = sampling.format_sample_summary_line(
         sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
@@ -844,8 +908,9 @@ def _report_sample_outcome(
         f'sizes or the cost basis is over-charging; raise the budget or '
         f'investigate the sampler cost basis.'
     )
-    logger.warning('%s -- %s', summary, detail)
-    return post_escalation(cfg, summary, detail, poster=poster)
+    return post_escalation(
+        cfg, summary, detail, poster=poster, level=logging.WARNING,
+    )
 
 
 def _record_trickle_progress(
@@ -946,7 +1011,16 @@ def _escalate_barren_streak(
     is running perfectly -- trading a silent-failure mode for a permanent
     false alarm and burning the one signal that currently works. This is
     the identical refusal :func:`_report_sample_outcome` already records,
-    for the identical reason.
+    for the identical reason -- and it is why the :func:`post_escalation`
+    call below passes ``logging.WARNING`` rather than taking the ERROR
+    default: an escalation that does not itself flip the exit code must
+    not show up in ``journalctl -p err``, even on a night that later fails
+    for an unrelated reason (this one is posted from ``run_nightly``'s
+    ``finally``, so it can accompany one). That call is ALSO the single
+    site that journals
+    ``summary -- detail`` for this escalation (task 4511); this function
+    does not log the pair itself, so a streak night produces exactly one
+    such line.
     """
     if not isinstance(doc, dict):
         return
@@ -997,8 +1071,9 @@ def _escalate_barren_streak(
         f'Probe on demand with: check_trickle_progress.py '
         f'{cfg.project_id} {trickle_state.DEFAULT_MAX_BARREN_RUNS}'
     )
-    logger.warning('%s -- %s', summary, detail)
-    if post_escalation(cfg, summary, detail, poster=poster):
+    if post_escalation(
+        cfg, summary, detail, poster=poster, level=logging.WARNING,
+    ):
         result.barren_escalated = True
 
 
@@ -1261,8 +1336,13 @@ def run_nightly(
                 f'legibility trickle: {len(deletion_skipped)} coding record(s) '
                 f'carried a deletion directive; skipped'
             )
+            # WARNING, not the ERROR default: this branch leaves
+            # exit_code=0 on purpose (loud but non-fatal, the same shape
+            # census.py uses for its mass-rejection signal), so it must not
+            # land in `journalctl -p err`.
             deletion_escalated = post_escalation(
                 cfg, deletion_reason, '; '.join(deletion_skipped), poster=poster,
+                level=logging.WARNING,
             )
 
         validation_errors = codebook.validate(cb)

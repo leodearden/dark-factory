@@ -6,7 +6,9 @@ the agent-legibility survey's cross-cutting root causes
 checkable design-time questions; INV-6..INV-7 were added 2026-08-02
 from the task/escalation strand investigation
 (`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
-the reconciliation loop-blocking incident (task 3778). They gate `/prd`
+the reconciliation loop-blocking incident (task 3778); INV-9 was added
+2026-08-24 from the answered-but-unrecorded escalation investigation
+(esc-6107-7, plus five further instances measured 2026-08-22→24). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -214,6 +216,44 @@ hoist the loop-invariant probe out of the body and bound the fan-out with
 an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
 
+## INV-9 `one-fact-one-home`
+
+**Rule**: A fact about the world — a design ruling, a premise, a state
+claim — has exactly one authoritative home; every other surface that
+mentions it carries a dated pointer (id + commit/date anchor) or is
+rendered from the home, never an independent copy. Where two surfaces
+must both assert it and cannot be collapsed, an explicit reconciliation
+mechanism (a cascade, a sweep, render-from-source) names which side wins
+and when it runs. INV-5 is this rule scoped to code/prompt text; INV-9
+is the same rule for world-facts across records and stores.
+
+**Checkable design question(s)**: Does this feature write the same
+world-fact into more than one record/store (task metadata, escalation
+record, PRD, manifest, memory, a session note)? Which surface is the
+home, and do the others point at it rather than restate it? If a copy is
+machine-read (a `delivered_check`, a gate predicate), what re-checks its
+premise against the home, and on what cadence? When the fact changes at
+the home, which mechanism updates or invalidates each copy — and if
+none, what is the accepted staleness window and who measures it?
+
+**Evidence**: esc-6107-7 — a ruled, implemented, measured design
+decision propagated into four sibling task descriptions but never into
+the escalation record, its cockpit DecisionRecord, or the PRD; the
+record sat answered-but-unrecorded 183h and a fresh session re-derived
+the settled answer. The 2026-08-22→24 watcher sweep measured five such
+records (category-agnostic), 30.2 answered-yet-open days, including a
+Leo-released, fully-verified fix (task 3875) not shipping for 6.8 days.
+A manifest `delivered_check` (`expect: absent`) actively enforced a
+premise that had become false. ~14 memory-corpus entries record the same
+decay family.
+
+**House pattern**: escalation record + git as the two homes for a ruling
+(ratified 2026-08-24); correction blocks citing `esc-id + commit +
+date`; ruling-time amendment (unblock SKILL.md Step 4) bumping
+`updated_at` to re-arm the watcher's re-verify; the ruled-elsewhere
+check + `scripts/member-chain-sweep.py` as the drift detector;
+`reap-decisions` closure-sync.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -228,4 +268,5 @@ batches is an enforcement gap: file a guard task.
 Calibration fixtures — two seeded violations per invariant plus a rehearsal
 verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
-INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06).
+INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
+INV-9 fixtures added 2026-08-24).
