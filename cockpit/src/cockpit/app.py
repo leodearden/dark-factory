@@ -240,6 +240,12 @@ class CockpitApp(App):
         # in _poll_registry is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
+        # Round-tripped through on_mount/_persist_ui_config so a hand-edited
+        # cockpit-ui.json value survives a save -- see _persist_ui_config's
+        # docstring. Seeded from the constructor kwarg here only so an
+        # out-of-order _persist_ui_config call (before on_mount ever runs)
+        # has a defined value rather than raising AttributeError.
+        self._persisted_poll_interval: float = poll_interval
         # Keyed by resolved DisplayTarget, NOT by item key -- see
         # _update_attention's docstring: a decision and the AWAITING_INPUT
         # session it links to can resolve to the SAME target, so urgency
@@ -270,10 +276,16 @@ class CockpitApp(App):
         )
 
     def on_mount(self) -> None:
-        selected_slug = load_ui_config(self.fleet_root).selected_slug
+        # Only selected_slug is restored into the live view below.
+        # poll_interval is stashed too, but purely so _persist_ui_config can
+        # write it back unchanged -- it never feeds set_interval, so a
+        # hand-edited cockpit-ui.json value is preserved, not honored (task
+        # 4054: no restore path / no CLI override for poll_interval).
+        ui_config = load_ui_config(self.fleet_root)
+        self._persisted_poll_interval = ui_config.poll_interval
         self.refresh_registry()
-        if selected_slug is not None:
-            self.query_one('#session-table', SessionTable).select_slug(selected_slug)
+        if ui_config.selected_slug is not None:
+            self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
         self.set_interval(self.poll_interval, self._poll_registry)
 
     def on_unmount(self) -> None:
@@ -1013,12 +1025,25 @@ class CockpitApp(App):
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
 
         Persists just enough to restore the operator's place across a
-        restart (selected_slug) plus the poll_interval currently in effect.
+        restart (selected_slug) plus the poll_interval last seen on disk.
         Never touches sessions/ or decisions/. Reads self._selected_slug
         (not the DataTable) so this is safe to call from on_unmount, after
         the table has already been torn down.
+
+        poll_interval is round-tripped from self._persisted_poll_interval
+        (stashed once in on_mount from load_ui_config), NOT taken from
+        self.poll_interval (the live constructor kwarg driving
+        set_interval) -- writing the live value unconditionally would
+        silently clobber a value an operator hand-edited into
+        cockpit-ui.json between launches. The field is still never read
+        back into app behaviour: nothing mutates self.poll_interval (no
+        action, no binding, no main() CLI flag), so it stays inert by
+        design (task 4054); do not wire it into set_interval without first
+        adding a way to change it.
         """
-        cfg = CockpitUIConfig(selected_slug=self._selected_slug, poll_interval=self.poll_interval)
+        cfg = CockpitUIConfig(
+            selected_slug=self._selected_slug, poll_interval=self._persisted_poll_interval
+        )
         save_ui_config(cfg, self.fleet_root)
 
 
