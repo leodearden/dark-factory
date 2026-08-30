@@ -37,6 +37,7 @@ import tomllib
 from typing import NamedTuple
 
 import pytest
+import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
@@ -1234,48 +1235,64 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
         )
 
 
+# The ruff keyword, aliased from the shared module rather than restated as a
+# literal — the convention the four sibling guards already follow, so
+# ``"ruff check"`` is single-sourced across all five consumers.
+_RUFF_KEYWORD = vci.RUFF
+
+
 def _lint_leg_targets(cmd: str, marker: str) -> list[str]:
     """Return the positional targets of *cmd*'s ``&&``-leg identified by *marker*.
+
+    DELEGATES to ``tests/scripts/verify_command_invariants.py`` (task 3883).
+    This helper was the FIFTH hand-maintained copy of that module's parsing
+    trio, and — awkwardly — the copy whose prose the other guards had been
+    citing as canonical. The "compare whole path TOKENS, never substring-match
+    the raw command" contract, together with its measured ``'shared' in cmd``
+    counterexample, now lives at
+    ``tests/scripts/verify_command_invariants.py::positional_targets``; read it
+    there.
 
     *cmd* is the fleet ``lint_command``, an ``&&``-chain of two legs: a ``ruff
     check <targets...>`` leg and a ``check_bare_magicmock_config.py
     <targets...>`` sibling-checker leg. *marker* selects which leg — pass
-    ``"ruff check"`` or ``"check_bare_magicmock_config.py"`` — by substring
-    after a plain ``&&`` split (unlike the TYPE chain, this command has no
-    ``cd`` clauses to walk: every target is an explicit repo-root-relative
+    ``_RUFF_KEYWORD`` or ``"check_bare_magicmock_config.py"``.
+
+    NO CWD WALK IS NEEDED HERE, unlike the TYPE chain above: this command has
+    no ``cd`` clauses at all, every target being an explicit repo-root-relative
     path, so the production ``_AND_CLAUSE_SPLIT_RE``/``_cd_clause_target``
-    cwd-tracking walk does not apply here).
+    cwd-tracking walk does not apply. That remains this helper's own fact, and
+    is why plain segment selection is sufficient.
 
-    Returns only the tokens AFTER *marker* itself (``shlex.split(marker)``
-    located as a contiguous window in the leg's own ``shlex.split`` tokens,
-    matching the last window token by suffix so a marker like
-    ``"check_bare_magicmock_config.py"`` still matches the full invoked path
-    ``fused-memory/scripts/check_bare_magicmock_config.py``) — NOT
-    ``shlex.split(leg)`` over the whole leg. The whole-leg split always
-    contains the command's own tokens (``uv``, ``run``, ``ruff``, ``check`` /
-    ``python3``, ``<script>.py``), so an ``assert targets`` non-vacuity guard
-    over it can never fire empty even if every positional target were
-    deleted; trimming to the tail after *marker* keeps that guard live.
+    TRIMMING TO THE POST-ANCHOR TAIL is what keeps the callers' ``assert
+    targets`` non-vacuity guard live. A whole-leg tokenisation always contains
+    the command's own tokens (``uv``, ``run``, ``ruff`` / ``python3``,
+    ``<script>.py``), so that guard could never fire empty even if every
+    positional target were deleted.
 
-    Callers must compare whole path TOKENS (as returned here) against member
-    names, never substring-match the raw command — ``"shared" in cmd`` is
-    already true via the OTHER leg's ``shared/tests`` argument, so it would
-    pass vacuously for a member a given leg never actually checks.
+    ``path_anchor=True`` for BOTH markers: the magicmock checker is invoked by
+    PATH (``fused-memory/scripts/check_bare_magicmock_config.py``), and the flag
+    is safe for the ruff leg too because it only ADDS candidate positions and no
+    token before ``check`` in ``uv run ruff check ...`` ends in ``/check``. One
+    call shape therefore serves both markers, with no marker→policy table inside
+    a helper whose whole purpose is to stop being a decision point.
+
+    NO ``value_flags``: this helper filtered nothing at all before the
+    migration, so the empty default — byte-for-byte the naive ``-``-prefix
+    filter, pinned by
+    ``test_verify_command_invariants.py::test_positional_targets_with_no_value_flags_is_the_naive_dash_prefix_filter``
+    — is the closest-preserving choice, and matches the two ``value_flags``-free
+    siblings.
+
+    ``required_segment`` also upgrades a no-match from a silent ``[]`` to a loud
+    exactly-one assertion: a marker that stops matching now names itself instead
+    of degrading into the callers' generic "would pass vacuously" message.
     """
-    marker_tokens = shlex.split(marker)
-    n = len(marker_tokens)
-    for leg in cmd.split("&&"):
-        if marker not in leg:
-            continue
-        tokens = shlex.split(leg)
-        for i in range(len(tokens) - n + 1):
-            window = tokens[i : i + n]
-            if window == marker_tokens or (
-                n == 1 and window[0].endswith(marker_tokens[0])
-            ):
-                return tokens[i + n :]
-        return []
-    return []
+    return vci.positional_targets(
+        vci.required_segment(cmd, marker, label="the fleet lint_command (task 3397)"),
+        marker,
+        path_anchor=True,
+    )
 
 
 def test_lint_leg_targets_reads_flag_values_as_flags_not_paths() -> None:
@@ -1333,7 +1350,7 @@ class TestFleetLintCoversEveryWorkspaceMember:
 
     def test_every_present_workspace_member_is_ruff_checked(self) -> None:
         cmd = _fleet_lint_command()
-        targets = _lint_leg_targets(cmd, "ruff check")
+        targets = _lint_leg_targets(cmd, _RUFF_KEYWORD)
 
         for member in _workspace_member_dirs():
             if not (REPO_ROOT / member / "pyproject.toml").is_file():
