@@ -5,7 +5,7 @@ This module holds NO test functions of its own. Its own unit tests live in
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
-path is covered by one of them — was hand-maintained in FOUR copies:
+path is covered by one of them — was hand-maintained in FIVE copies:
 
   * ``test_root_lint_covers_nonmember_py.py`` (``_ruff_segment`` /
     ``_ruff_targets`` / ``_ruff_exclude_flags`` / ``_is_covered``),
@@ -14,7 +14,8 @@ path is covered by one of them — was hand-maintained in FOUR copies:
   * ``test_contributing_lint_command_drift.py`` (``_ruff_segment`` /
     ``_ruff_targets``),
   * ``test_skills_module_config_decision.py`` (``_pytest_segment`` /
-    ``_pytest_collected_dirs`` / ``_is_collected``).
+    ``_pytest_collected_dirs`` / ``_is_collected``),
+  * ``test_fallback_verify_config.py`` (``_lint_leg_targets``).
 
 They had ALREADY DRIFTED, which is the point: the skills guard's own module
 docstring named the drift (``_is_covered`` normalising trailing slashes with
@@ -22,24 +23,38 @@ docstring named the drift (``_is_covered`` normalising trailing slashes with
 the extraction as [tkt_0RS47G1QXJ5XDPH4T0HKKA1A9S], deferring it only because it
 needed edits to sibling guards. Task 4358 then paid for the same defect class a
 second time INSIDE one file, where ``_narrowing_flag_args`` had missed a slice
-``_targets`` had held from the start. Task 3745 is that extraction.
+``_targets`` had held from the start. Task 3745 is that extraction, over the
+first four; the fifth was outside its fixed scope and was closed separately by
+task 3883.
 
-IMPORT ME, DO NOT COPY ME. A fifth copy is not a shortcut, it is the next
+THAT FIFTH COPY IS THE CAUTIONARY ONE. ``_lint_leg_targets`` was the copy whose
+prose the OTHER guards cited as canonical for the whole-path-TOKENS rule — so
+the file DEFINING the convention was the last one still implementing it
+privately, and had drifted from it: its anchor fallback was a raw
+``str.endswith``, which is the substring match this module's contract forbids.
+Being the documentation home is not the same as being the implementation home,
+and the citations now point at :func:`positional_targets` instead.
+
+IMPORT ME, DO NOT COPY ME. The NEXT copy is not a shortcut, it is the next
 drift — and drift here does not fail loudly. Every one of these helpers feeds a
 coverage assertion, so a copy that silently parses one token differently
 degrades to a guard that passes vacuously. If a caller needs behaviour this
-module does not have, add a PARAMETER here rather than a variant there.
+module does not have, add a PARAMETER here rather than a variant there —
+``path_anchor`` (task 3883) is what that looks like in practice.
 
-THIS MODULE PARSES; IT DOES NOT DECIDE. The four call sites deliberately do not
-agree on semantics, and unifying them would be a behaviour change at three of
+THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
+agree on semantics, and unifying them would be a behaviour change at four of
 them. So everything that is POLICY stays with its caller and arrives as an
 argument: which flags consume the following token (``_RUFF_FLAGS_TAKING_A_VALUE``
-in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, neither
-in the other two), which flag prefixes narrow a target set
+in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, none in
+the other three), which flag prefixes narrow a target set
 (``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
 the checker's own post-anchor arguments, and the skills guard's
 ``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
-What is shared is only the mechanics of reading a shell command.
+What is shared is only the mechanics of reading a shell command. ``path_anchor``
+is NOT an exception to this: it records how the checker was SPELLED on the
+command line, which is a fact about the text being parsed, not a policy about
+the checker.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path`` — pytest's
