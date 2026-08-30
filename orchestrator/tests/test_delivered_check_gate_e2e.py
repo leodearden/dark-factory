@@ -624,7 +624,7 @@ def _drive_to_l2(
     check: dict,
     producer_id: str,
     dependent_id: str,
-) -> tuple[Harness, list]:
+) -> tuple[Harness, _LocalDepMcpSession]:
     """Build one producer/dependent pair on its own real git repo.
 
     Returns ``(harness, session)``; the caller drives the grace arc with

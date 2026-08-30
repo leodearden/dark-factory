@@ -825,6 +825,11 @@ async def _stamp_polarity(root, sidecar_yaml, *, prd_stem, label, files, task_id
         ],
         task_interceptor=task_interceptor,
     )
+    # The sidecar exists and carries the label, so the stamper always returns a
+    # report here. Pinning it once keeps every caller's subscript legible, and
+    # turns a regression to the None no-op path into a named failure rather
+    # than a TypeError at the first subscript.
+    assert report is not None, 'stamper returned the no-op None for a live sidecar'
     return report, task_interceptor, sidecar_path
 
 

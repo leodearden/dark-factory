@@ -896,7 +896,9 @@ class TestSupersessionAttribution:
         ('chore: retire the marker for task-3578', '3578'),
     ])
     def test_attributing_subject_conventions(self, subject, expected):
-        assert _TASK_IN_SUBJECT_RE.search(subject).group(1) == expected
+        match = _TASK_IN_SUBJECT_RE.search(subject)
+        assert match is not None, f'no task id attributed from {subject!r}'
+        assert match.group(1) == expected
 
     @pytest.mark.parametrize('subject', [
         # A PRD/manifest commit naming a RANGE of tasks attributes to none of

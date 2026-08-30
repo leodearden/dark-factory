@@ -1312,7 +1312,10 @@ class TestLintImmunity:
                     'paths': [],
                 }
             ],
-            files=['src/owned.py', 42, None],
+            # Deliberately ill-typed entries: the assertion below is that they
+            # are dropped rather than crashed on, so the checker is told this
+            # violation is the subject of the test, not an accident.
+            files=['src/owned.py', 42, None],  # type: ignore[list-item]
             repo_root=repo,
         )
 
