@@ -716,10 +716,12 @@ def kill_holder_tree(
 
     Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
     snapshot the ``/proc`` PPID map before sending any signal, collect
-    descendants, SIGKILL them, SIGKILL+reap the leader, then fire a GUARDED
-    ``killpg`` backstop for same-group stragglers -- but walks descendants
-    from ``proc.pid`` rather than a recorded pgid, and the ``killpg``
-    backstop only fires when the holder is provably its own group leader.
+    descendants, SIGKILL them, SIGKILL the leader, fire a GUARDED
+    ``killpg`` backstop for same-group stragglers while the leader is
+    still an unreaped zombie, and only THEN reap it -- but walks
+    descendants from ``proc.pid`` rather than a recorded pgid, and the
+    ``killpg`` backstop only fires when the holder is provably its own
+    group leader.
 
     Walking from ``proc.pid`` (rather than
     ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
@@ -756,9 +758,12 @@ def kill_holder_tree(
     ALREADY-REAPED SHORT CIRCUIT: an already-reaped leader means
     ``proc.pid`` is a FREE pid, so the walk below must never run against
     it.  Several call sites reap the leader with ``wait()`` inside their
-    ``try`` block BEFORE their ``finally`` runs this helper (:2478, :2668,
-    :2826, :2905) -- on their GREEN path ``proc.pid`` no longer refers to
-    the holder at all.  ``os.getpgid(proc.pid)`` and
+    ``try`` block BEFORE their ``finally`` runs this helper
+    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
+    ``test_cancel_verify_tree_kills_under_live_watchdog``,
+    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
+    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
+    on their GREEN path ``proc.pid`` no longer refers to the holder at all.  ``os.getpgid(proc.pid)`` and
     ``collect_descendants(proc.pid, ...)`` would then describe whatever
     process happens to OWN that recycled pid now, and every descendant of
     that stranger would be SIGKILLed (and killpg'd by the backstop above,
@@ -793,10 +798,13 @@ def kill_holder_tree(
     # (the same invariant cancel_request documents at
     # verify_cancel.py:246-250).  The pgid is read only to gate the killpg
     # backstop below; a leader already gone by now makes getpgid raise
-    # ProcessLookupError, treated as "no group to backstop".
+    # ProcessLookupError, and a permission mismatch or any other OSError
+    # degrades the same way -- "no group to backstop" -- rather than
+    # propagating out of a finally and masking whatever real assertion
+    # failure the caller was cleaning up after.
     try:
         pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
+    except OSError:
         pgid = None
     # A /proc read losing a race with process exit degrades to an empty map
     # rather than propagating -- this helper runs almost exclusively inside
@@ -814,21 +822,11 @@ def kill_holder_tree(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(pid, signal.SIGKILL)
 
-    # SIGKILL + reap the leader, unless it has already exited (proc.poll()
-    # is not None -- already reaped, nothing to signal).
+    # SIGKILL the leader, unless it has already exited (proc.poll() is not
+    # None -- already reaped, nothing to signal).
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(proc.pid, signal.SIGKILL)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # A leader that will not die must not mask the test's own failure by
-        # raising out of a finally -- surface it loudly instead.
-        warnings.warn(
-            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
-            f'{timeout}s of SIGKILL',
-            stacklevel=2,
-        )
 
     # Guarded killpg backstop for same-group stragglers -- fires ONLY when
     # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
@@ -839,9 +837,31 @@ def kill_holder_tree(
     # lane-lock site) shares this process's own group -- an unguarded
     # killpg there would SIGKILL the pytest worker itself (see
     # test_kill_holder_tree_never_signals_the_callers_own_process_group).
+    #
+    # Fired HERE -- immediately after the leader SIGKILL and BEFORE
+    # proc.wait() reaps it below, not after.  While still unreaped the
+    # leader is a zombie that keeps its pid pinned, so pgid provably still
+    # denotes the holder's own group; group members that outlive it are
+    # killed just as effectively.  Firing this AFTER the reap would let a
+    # pid-recycling race aim killpg at a stranger's group instead -- the
+    # exact hazard the ALREADY-REAPED SHORT CIRCUIT above exists to avoid,
+    # and pid recycling is observed on this fleet, not theoretical
+    # (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
+    # counter demonstrably wrapped on 2026-08-11).
     if pgid is not None and pgid == proc.pid and pgid != os.getpgid(0):
         with contextlib.suppress(ProcessLookupError, OSError):
             _killpg(pgid, signal.SIGKILL)
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A leader that will not die must not mask the test's own failure by
+        # raising out of a finally -- surface it loudly instead.
+        warnings.warn(
+            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
+            f'{timeout}s of SIGKILL',
+            stacklevel=2,
+        )
 
     if proc.stdin is not None:
         with contextlib.suppress(OSError):
