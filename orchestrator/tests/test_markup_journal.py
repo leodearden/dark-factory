@@ -55,7 +55,7 @@ import pytest
 from shared.mcp_markup_middleware import FACT_MARKUP_DETECTED
 from shared.toolcall_markup import ENVELOPE_LITERALS
 
-from orchestrator.mcp import markup_journal
+from orchestrator.mcp import markup_journal, markup_sink
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -145,6 +145,15 @@ def journal_lines(root: Path, label: str = 'plan-tools') -> list[dict[str, Any]]
     path = markup_journal.journal_path(root, label)
     text = path.read_text(encoding='utf-8')
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def worktree_with_no_name() -> str:
+    """A path whose ``.name`` is empty, so the attribution ladder runs out.
+
+    The filesystem root is the only such path, and it is used as a VALUE here —
+    nothing is read from or written to it, because ``resolve_root`` is stubbed.
+    """
+    return os.sep
 
 
 def build_sink(
@@ -402,3 +411,148 @@ class TestTheJournalNeverHoldsARawEnvelopeLiteral:
         assert _LT not in raw
         (line,) = journal_lines(tmp_path)
         assert line['some_future_key'] == smuggled
+
+
+# ---------------------------------------------------------------------------
+# The degraded paths — a journal outage must never become an outage of its own.
+# ---------------------------------------------------------------------------
+
+
+class TestTheJournalNeverRaises:
+    """The middleware calls this channel PURELY ADDITIVELY.
+
+    The call's outcome — rejected, repaired, refused — is already decided by the
+    time ``_emit_fact`` runs, so a journal failure must cost an operator
+    visibility and never turn a working guard into an outage. Same contract
+    ``markup_sink.make_escalation_sink`` keeps, asserted the same way: every row
+    awaits the sink DIRECTLY, so nothing upstream can be masking a raise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_root_costs_a_line_not_the_call(self, tmp_path):
+        """(a) git answered nothing — the commonest transient failure."""
+        sink = build_sink(tmp_path, resolve_root=lambda _worktree: None)
+
+        assert await sink(make_fact()) is None
+        assert not (tmp_path / 'data').exists(), 'nothing half-written'
+
+    @pytest.mark.asyncio
+    async def test_a_raising_project_root_resolver_is_contained(self, tmp_path):
+        """(b) The default resolver never raises, but an injected one may."""
+
+        def boom(_worktree: Path) -> Path:
+            raise OSError('git could not be forked')
+
+        sink = build_sink(tmp_path, resolve_root=boom)
+
+        assert await sink(make_fact()) is None
+
+    @pytest.mark.asyncio
+    async def test_an_uncreatable_journal_directory_is_contained(self, tmp_path):
+        """(c) The parent cannot be made — here because the root is a FILE."""
+        root = tmp_path / 'not-a-directory'
+        root.write_text('', encoding='utf-8')
+        sink = build_sink(tmp_path, resolve_root=lambda _worktree: root)
+
+        assert await sink(make_fact()) is None
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_journal_file_is_contained(self, tmp_path):
+        """(c) The write itself fails — here because the path is a directory."""
+        markup_journal.journal_path(tmp_path, 'plan-tools').mkdir(parents=True)
+        sink = build_sink(tmp_path)
+
+        assert await sink(make_fact()) is None
+
+
+class TestAttributionFailureNeverCostsTheRecord:
+    """Losing a line because attribution failed is the opposite of the point.
+
+    The whole task is that these events reach a durable sink at all; a record
+    that says "somebody leaked from add_design_decision at 16:52:34" is strictly
+    more than the nothing that was written before.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_raising_thunk_still_writes_the_line(self, tmp_path):
+        """(d) It falls back to the worktree name, which is a task lane's id."""
+        worktree = tmp_path / '4744'
+        worktree.mkdir()
+
+        def boom() -> str:
+            raise RuntimeError('the plan could not be read')
+
+        sink = markup_journal.make_fact_journal(
+            worktree=worktree,
+            server_label='plan-tools',
+            subject_task_id=boom,
+            resolve_root=lambda _worktree: tmp_path,
+        )
+
+        assert await sink(make_fact()) is not None
+        (line,) = journal_lines(tmp_path)
+        assert line['subject_task_id'] == '4744'
+
+    @pytest.mark.asyncio
+    async def test_the_bottom_of_the_ladder_is_an_explicit_sentinel(self, tmp_path):
+        """(e) Never None and never absent — an explicit "nobody knows"."""
+        anonymous = Path(worktree_with_no_name())
+        sink = markup_journal.make_fact_journal(
+            worktree=anonymous,
+            server_label='plan-tools',
+            subject_task_id=lambda: '',
+            resolve_root=lambda _worktree: tmp_path,
+        )
+
+        await sink(make_fact())
+
+        (line,) = journal_lines(tmp_path)
+        assert line['subject_task_id'] == markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
+        assert line['subject_task_id'] == 'unattributed'
+
+
+class TestMemoizationIsAsymmetric:
+    """Successes are cached; failures are RETRIED. The asymmetry is the point.
+
+    The reasoning is ``markup_sink.make_escalation_sink``'s, verbatim: a failed
+    git resolution is transient by nature — a fork failure under load, an EINTR,
+    a timeout, an index.lock storm — and caching one would permanently disable
+    the journal for every later event on this server, losing exactly the records
+    this module exists to preserve.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_resolution_is_retried_on_the_next_record(self, tmp_path):
+        """(f) And the second record LANDS once the transient failure clears."""
+        calls: list[Path] = []
+        answers: list[Path | None] = [None, tmp_path]
+
+        def resolve(worktree: Path) -> Path | None:
+            calls.append(worktree)
+            return answers.pop(0)
+
+        sink = build_sink(tmp_path, resolve_root=resolve)
+
+        assert await sink(make_fact(param='first')) is None
+        assert await sink(make_fact(param='second')) is not None
+
+        assert len(calls) == 2, 'a cached failure would silence the journal forever'
+        (line,) = journal_lines(tmp_path)
+        assert line['param'] == 'second'
+
+    @pytest.mark.asyncio
+    async def test_a_successful_resolution_is_memoized(self, tmp_path):
+        """(f) One ``git rev-parse`` per server, not one per leaked call."""
+        calls: list[Path] = []
+
+        def resolve(worktree: Path) -> Path:
+            calls.append(worktree)
+            return tmp_path
+
+        sink = build_sink(tmp_path, resolve_root=resolve)
+
+        await sink(make_fact(param='first'))
+        await sink(make_fact(param='second'))
+
+        assert len(calls) == 1
+        assert [line['param'] for line in journal_lines(tmp_path)] == ['first', 'second']
