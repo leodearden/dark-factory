@@ -278,8 +278,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      - Search empty → not yet a verdict: run the ancestry disposition in [Deriving the
        landed sha](#deriving-the-landed-sha) and follow its arms. Its rc=0 arm yields a sha
        **only** on the verified-group-merge and positive-citation outcomes — proceed with
-       sub-steps a–d there. Its rc=1 / rc=128 not-landed outcomes and rc=0's
-       **phantom-branch** exit are genuine not-landed verdicts →
+       sub-steps a–d there. Its rc=1 / rc=128 not-landed outcomes (both only **outside** the
+       `coalesce-*` arm — on that arm neither is not-landed; see this section's dispositions
+       below) and rc=0's **phantom-branch** exit are genuine not-landed verdicts →
        `mcp__escalation__merge_cancel(request_id)` then **ABORT**. rc=0 with the citation gate
        **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, so it is
        **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
@@ -309,15 +310,21 @@ eyeballed listing.
   **subject-matching task citation** on main. Use the sha and the `note` the ladder specifies for
   that outcome, and proceed with the calling arm's sub-steps a–d above.
 - **A genuine not-landed outcome** — the ladder's three: rc=0's **phantom-branch** exit (nothing
-  on main cites this task), rc=1 **outside** the coalesce arm, and rc=128 with an empty marker
-  search. On any of these: `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not
-  resolve, do not retry, do not direct-merge.
+  on main cites this task), and — both **outside** the `coalesce-*` arm — rc=1, and rc=128 with
+  an empty marker search. On any of these: `mcp__escalation__merge_cancel(request_id)` then
+  **ABORT**. Do not resolve, do not retry, do not direct-merge.
 - **Citation gate un-evaluable** (`git.commit_citation_pattern: ""`) — proves neither verdict, so
   it is **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
   calling `merge_cancel`. This skill scopes that call to genuine not-landed outcomes **only**.
-- **rc=1 on the `coalesce-*` arm is not a not-landed outcome either** — follow the ladder's
-  pointer into `merge-queue/SKILL.md` rules 2–3 and take its **landed-but-not-credited** exit.
-  Do not `merge_cancel`, and do not report it as not-landed.
+- **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
+  outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
+  marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1 (take its **landed-but-not-credited** exit),
+  rule 2a governs rc=128-with-empty-marker (check the tip's merge marker and this task's
+  scheduler status; on either landing signal it is landed). In **neither** case
+  `merge_cancel`, and in neither case report not-landed. This is the one carve-out that most
+  matters here: this skill is fully autonomous, so a wrong not-landed reading cancels and
+  abandons work that actually landed.
 - **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
   it as either outcome.
 

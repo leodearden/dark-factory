@@ -266,10 +266,32 @@ Only outside that arm — no train absorption anywhere in this task's history �
 not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
 `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts).
 
-#### rc=128 with an empty marker search — a genuine not-landed outcome
+#### rc=128 with an empty marker search — **not a not-landed verdict on its own**
 
-The branch ref is gone and nothing on main cites the task, so no ref remains that could prove
-otherwise. Treat as NOT landed and stop rather than stamping provenance.
+Carve out the coalesce case first, exactly as on the rc=1 arm above. If this task was ever
+`superseded` by a `coalesce-*` train (or absorption is otherwise plausible), an empty marker
+search here is **expected, not a signal**: a train merges only the tip branch, so a non-tip
+absorbed member's commits land under the **tip's** marker and never under its own. Reading that
+as not-landed would abandon landed work un-credited — the same failure the rc=1 carve-out exists
+to prevent, and the one call sites act on hardest, since a not-landed reading here drives
+`merge_cancel` and abort.
+
+On that arm, follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
+successor" **rule 2a**, which governs precisely rc=128-with-empty-marker: check the **TIP's**
+merge marker on main and this task's own scheduler status, and on either landing signal take
+rule 2a's self-stamp (`found_on_main` with the tip merge sha) rather than reporting not-landed.
+[`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Here an
+empty rc=128 marker search does NOT mean 'not landed.'"* Note that rule 2a carries **no** veto
+on a non-`done` scheduler status — unlike rule 2b on the rc=1 arm — and merge-queue flags whether
+it should as an open question it deliberately leaves unaddressed; do not import 2b's veto here,
+and do not resolve that question from this doc. **rc=128-with-empty-marker is NOT not-landed on
+the `coalesce-*` arm.**
+
+Only outside that arm — no train absorption anywhere in this task's history — is this a genuine
+not-landed outcome. There the branch ref is gone and nothing on main cites the task, so no ref
+remains that could prove otherwise: treat as NOT landed and stop rather than stamping
+provenance. What to do with it there is the call site's own disposition (`unblock` and
+`merge-queue` keep polling / resubmit; `unblock-low-risk` aborts and cancels).
 
 The rc=128 marker search must be the **exact-subject** one from [step 1](#step-1) — **never an
 unfiltered `git log main --merges | head -5`.** An unfiltered listing takes no task argument, so
