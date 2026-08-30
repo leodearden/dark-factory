@@ -67,7 +67,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -852,6 +852,88 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+def _write_owner_task_id(db_path: Path, test_id: str, owner_task_id: str) -> None:
+    """Point *test_id*'s debt row at *owner_task_id*.
+
+    Exists so :func:`_ensure_owner_task` never hand-rolls an UPDATE at a call site —
+    contract 1 of the module docstring ("writes go only through this API") applies
+    inside the module too, since a second spelling of this statement is exactly how the
+    column would drift.
+
+    Raises on a ledger failure, deliberately: the sole caller wraps the whole filing in
+    its own guard and knows how to degrade loudly, and swallowing here would report a
+    filing as recorded when the pointer never landed.
+    """
+    conn = _open(db_path)
+    try:
+        conn.execute(
+            'UPDATE flake_debt SET owner_task_id = ? WHERE test_id = ?',
+            (owner_task_id, test_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _ensure_owner_task(
+    db_path: Path,
+    project_id: str,
+    row: DebtRow,
+    *,
+    task_client: Any,
+) -> DebtRow:
+    """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
+
+    > Any test in the flaky ledger has a non-terminal de-flake task explicitly
+    > responsible both for fixing the root defect and for removing the test from the
+    > ledger.
+
+    Enforced at WRITE TIME, inside :func:`open_debt`, so it is SELF-MAINTAINING rather
+    than audited after the fact.  Dedup follows
+    ``orchestrator/src/orchestrator/flake_recorder.py::_bump_suppression_streak_and_maybe_escalate``,
+    which already dedupes on a fixed sentinel; here the sentinel is ``owner_task_id`` on
+    the debt row.
+
+    COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
+    except the initial filing.  It never marks a task done, never blocks one, never
+    reprioritises one — a de-flake task's lifecycle belongs to the orchestrator, and the
+    ledger only observes it.  That is what keeps INV-6 (``status-matches-liveness``) N/A
+    by construction rather than merely satisfied.
+
+    Never raises: it runs under :func:`open_debt`'s catch-all (B12) and step-8 adds its
+    own inner per-call guards so ONE failing client call costs only that signal.
+    """
+    if task_client is None:
+        # A legitimate configuration (a CLI, or ε's two `_run_post_merge_verify` callers
+        # that thread nothing) — but it is also the one way the invariant silently stops
+        # being enforced in production, so it is stated rather than assumed.
+        logger.info(
+            'flake_ledger: no task_client wired — debt for test_id=%s is opened with no '
+            'owner and §5.9 is NOT enforced for it (ι renders it as an invariant breach)',
+            row.test_id,
+        )
+        return row
+
+    arguments = build_deflake_task_arguments(row)
+    new_id = str(await task_client.submit_task(arguments) or '')
+    # `planning_mode=True` created the task `deferred`; commit_planning is the SECOND
+    # PHASE of the initial filing, not lifecycle management, and without it the task
+    # exists but is never dispatched.
+    await task_client.commit_planning([new_id])
+    _write_owner_task_id(db_path, row.test_id, new_id)
+    logger.info(
+        'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
+        new_id,
+        row.test_id,
+        project_id,
+    )
+    # Re-read so the caller sees the row as STORED rather than a locally-patched copy.
+    # `dataclasses.replace` is the fallback only for a degraded re-read, where returning
+    # the id we just wrote is strictly more honest than dropping it.
+    refreshed = read_debt(db_path, row.test_id)
+    return refreshed if refreshed is not None else replace(row, owner_task_id=new_id)
+
+
 async def open_debt(
     db_path: Path,
     project_id: str,
@@ -867,12 +949,16 @@ async def open_debt(
     honest degrade is ``None`` rather than a fabricated row, and consumers must handle
     ledger unavailability explicitly.
 
-    ``task_client`` is accepted for SIGNATURE STABILITY and is UNUSED in α.  Task ζ
-    adds the invariant enforcement here — re-corroborate ``owner_task_id``'s live
-    status and file a de-flake task if none is non-terminal — and declaring the
-    parameter (and the ``async`` colour) now means ζ never has to churn ``await`` at
-    ε's merge-path call sites.  The coupling rule ζ inherits: the ledger READS task
-    status but never WRITES it, except for the initial filing.
+    ``task_client`` is where §5.9's invariant is ENFORCED (see
+    :func:`_ensure_owner_task`): after the upsert, ``owner_task_id`` is re-corroborated
+    against live task status and a de-flake task is filed if none is non-terminal.  Pass
+    ``None`` — the CLI and storeless callers do — and the row is written exactly as α
+    wrote it, with no owner; that is a legitimate degrade, logged, and rendered by ι as
+    an invariant breach rather than hidden.
+
+    COUPLING RULE, binding: the ledger READS task status but never WRITES it, except
+    for the initial filing (``submit_task`` plus the ``commit_planning`` that completes
+    it).  It never marks a task done, never blocks one, never reprioritises one.
 
     ``UNKNOWN_TEST_ID`` must never be passed here: a sentinel names no test, so it can
     own no de-flake task.  That is REFUSED, not merely documented — ε/ζ plausibly iterate
@@ -941,7 +1027,11 @@ async def open_debt(
             row = conn.execute('SELECT * FROM flake_debt WHERE test_id = ?', (test_id,)).fetchone()
         finally:
             conn.close()
-        return _to_debt_row(row) if row is not None else None
+        if row is None:
+            return None
+        return await _ensure_owner_task(
+            db_path, project_id, _to_debt_row(row), task_client=task_client
+        )
     except Exception:
         logger.warning(
             'flake_ledger: failed to open debt for test_id=%s (project_id=%s)',

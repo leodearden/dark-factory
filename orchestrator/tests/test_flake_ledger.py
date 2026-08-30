@@ -1782,20 +1782,14 @@ class TestOpenDebt:
 
         assert read_debt(tmp_path / 'absent' / 'runs.db', self.TEST_ID) is None
 
-    async def test_alpha_accepts_task_client_but_files_nothing(self, tmp_path: Path) -> None:
-        """α's scope boundary, machine-checked: the seam exists so ζ can fill it, and
-        α must not file a task through it."""
-        from orchestrator.flake_ledger import open_debt
-
-        db_path = tmp_path / 'runs.db'
-        client = _FakeTaskClient()
-        row = await open_debt(
-            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
-        )
-
-        assert client.submit_calls == []
-        assert row is not None
-        assert row.owner_task_id is None
+    # RETIRED by task ζ (3790): `test_alpha_accepts_task_client_but_files_nothing`
+    # asserted α's scope boundary — that a WIRED client causes NO filing.  ζ is the task
+    # that fills the seam, so that assertion is now the exact negation of the behaviour
+    # under test and cannot be kept.  Its successors, which pin the same seam from the
+    # ζ side, are `TestOpenDebtFilesTheDeflakeTask`:
+    #   - test_first_suppression_files_exactly_one_task_and_stores_its_id (wired client)
+    #   - test_no_client_files_nothing_and_says_so (unwired — α's row, plus a log)
+    #   - test_no_client_row_is_byte_identical_to_alphas (the degrade really is α's)
 
     async def test_open_debt_refuses_the_unknown_sentinel(self, tmp_path: Path, caplog) -> None:
         """``UNKNOWN_TEST_ID`` names no test, so it can own no de-flake task — and this
