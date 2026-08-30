@@ -376,8 +376,26 @@ class HeartbeatWriter:
                 return
 
     def stop_heartbeats(self) -> None:
-        """Stop sending heartbeats WITHOUT closing stdin (Row 3: hard partition)."""
+        """Stop sending heartbeats WITHOUT closing stdin (Row 3: hard partition).
+
+        Joins the writer thread (mirroring close_stdin() below) so a caller
+        that immediately does other teardown -- e.g. kill_holder_tree
+        closing stdin in a finally right after this call -- can never race
+        the writer thread's own write()-after-stop-check window: without
+        the join, the thread could still be between
+        ``self._stop.wait(self._interval)`` returning False and
+        ``self._proc.stdin.write(b'\\n')`` when stdin gets closed out from
+        under it, and ``write()`` on an already-closed BufferedWriter
+        raises ValueError, which ``_run``'s ``except (BrokenPipeError,
+        OSError)`` does not catch -- an unhandled thread exception that
+        pytest promotes to an error (see
+        ``error::pytest.PytestUnhandledThreadExceptionWarning`` in
+        orchestrator/pyproject.toml), possibly failing an unrelated test
+        under xdist. Joining still leaves stdin OPEN (this method's whole
+        contract), it only guarantees the writer has stopped touching it.
+        """
         self._stop.set()
+        self._thread.join(timeout=2)
 
     def close_stdin(self) -> None:
         """Stop heartbeats and close the child's stdin write-end (Row 2: EOF, dispatcher alive)."""
