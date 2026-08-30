@@ -2193,9 +2193,14 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
     assertion proves this test really exercises the shared-group case
     rather than silently testing nothing.
 
-    Passes trivially against the current killpg-free kill_holder_tree; it
-    exists to fail the moment a killpg backstop is added without this
-    guard (see the next impl step).
+    kill_holder_tree's guarded killpg backstop (see its own docstring)
+    fires only when the holder is provably its own process-group leader
+    (``pgid == proc.pid``) AND that group is provably not the caller's
+    own (``pgid != os.getpgid(0)``). A holder that never setsid'd -- like
+    this one -- fails the first condition, so the backstop must stay
+    silent. This test pins that guard directly against the SHIPPED
+    (killpg-aware) helper: it fails the moment a future edit drops either
+    condition, or otherwise makes the backstop unconditional.
     """
     leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
     try:
@@ -2237,13 +2242,83 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
             leader.wait(timeout=5)
 
 
+def test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader():
+    """The guarded killpg backstop's POSITIVE path: it must actually fire.
+
+    test_kill_holder_tree_never_signals_the_callers_own_process_group above
+    only pins the NEGATIVE path -- killpg must stay silent when the holder
+    never setsid'd. Nothing asserts that the backstop actually fires when
+    the holder DID setsid, which is exactly the shape spawn_verify_merge
+    produces when the CLI is launched with ``--request-id`` (cli.py:578-581
+    gates ``start_own_process_group()`` on ``if request_id is not None:``).
+    A regression that made the guard's admission condition unconditionally
+    false -- e.g. inverting the ``pgid == proc.pid`` comparison, or
+    dropping the branch entirely -- would leave both existing
+    kill_holder_tree killpg unit tests green: exactly the "guard reporting
+    PASS while guarding nothing" failure mode this module's anti-vacuity
+    discipline exists to prevent (see
+    test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark's
+    banner).
+
+    Reproduces the setsid'd shape directly with ``start_new_session=True``,
+    which is precisely what makes a Popen leader its own process-group
+    leader (``os.getpgid(leader.pid) == leader.pid``). The two precondition
+    assertions below prove BOTH halves of the backstop's admission
+    condition actually hold before kill_holder_tree runs, so a pass here
+    cannot be a vacuous accident of the harness's own process group.
+    """
+    leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        start_new_session=True,
+    )
+    try:
+        leader_pgid = os.getpgid(leader.pid)
+        assert leader_pgid == leader.pid, (
+            'harness bug: start_new_session=True must make the leader its '
+            'own process-group leader, or this test is not exercising the '
+            "killpg backstop's admission condition it exists to guard"
+        )
+        assert leader_pgid != os.getpgid(0), (
+            "harness bug: the setsid'd leader's group must differ from "
+            "the caller's own, or this test is not exercising the killpg "
+            "backstop's admission condition it exists to guard"
+        )
+
+        killpg_calls: list[tuple[int, int]] = []
+
+        def spy(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        kill_holder_tree(
+            leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS, _killpg=spy,
+        )
+
+        assert leader.poll() is not None, (
+            "kill_holder_tree must reap a setsid'd leader the same as any "
+            'other'
+        )
+        assert killpg_calls == [(leader_pgid, signal.SIGKILL)], (
+            f"kill_holder_tree must killpg a leader that provably setsid'd "
+            f'into its own, non-caller process group -- got {killpg_calls}, '
+            f'expected exactly one call with pgid={leader_pgid}'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
 def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
     """An already-reaped leader means proc.pid is a FREE pid -- signal NOTHING.
 
     Four converted call sites reap the leader with ``wait()`` inside their
-    ``try`` block BEFORE the ``finally`` runs ``kill_holder_tree`` (:2478,
-    :2668, :2826, :2905) -- so on their GREEN path ``proc.pid`` no longer
-    refers to the holder at all by the time this helper runs.
+    ``try`` block BEFORE the ``finally`` runs ``kill_holder_tree``
+    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
+    ``test_cancel_verify_tree_kills_under_live_watchdog``,
+    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
+    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
+    so on their GREEN path ``proc.pid`` no longer refers to the holder at
+    all by the time this helper runs.
     ``os.getpgid(proc.pid)`` and ``collect_descendants(proc.pid, ...)``
     would then describe whatever process happens to OWN that pid now, and
     every descendant of that stranger would be SIGKILLed (and killpg'd by
@@ -2259,7 +2334,8 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
         must never be CALLED AT ALL, which is what proves the short
         circuit lands before the snapshot phase rather than merely seeing
         a map with no descendants in it.  Also pins that the early-return
-        path still closes stdin, since the lane-lock site (:3157)
+        path still closes stdin, since the lane-lock site
+        (``test_live_verify_merge_holds_lane_lock_real_subprocess``)
         delegates its stdin cleanup to this helper.
 
     (b) PID-REUSE MODEL -- the case that makes this RED non-vacuous.
@@ -2322,8 +2398,9 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
     )
     assert leader.stdin is not None and leader.stdin.closed, (
         'kill_holder_tree must still close stdin on the already-reaped '
-        'early-return path -- the lane-lock site (:3157) delegates its '
-        'stdin cleanup to this helper'
+        'early-return path -- the lane-lock site '
+        '(test_live_verify_merge_holds_lane_lock_real_subprocess) '
+        'delegates its stdin cleanup to this helper'
     )
 
     # (b) PID-REUSE MODEL: a synthetic ppid map gives the reaped (free)
