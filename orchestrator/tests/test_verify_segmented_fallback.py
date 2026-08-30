@@ -290,13 +290,19 @@ class TestRunSegmentedSharedDeadline:
     by the segment count and could wedge the merge queue.
 
     This path is load-bearing, not theoretical. The committed config's own
-    measured table records five of eight segments already costing 2238.32s
-    (orchestrator alone 1765.95s — the task-4902 re-measurement of 2026-08-28,
-    the median of 28 green full-suite runs), a lower bound because dashboard,
-    sampler and cockpit carry no measurement at all. So a real chain can
-    exhaust even the raised 3600s ceiling mid-run: 4902 recorded green
-    orchestrator runs up to 3310.50s, and one attempt has already consumed the
-    full 3600s and been logged as a false infra_timeout.
+    measured table records five of eight segments whose sum is the fleet chain
+    floor, dominated by `orchestrator` — re-measured by task 4902 on
+    2026-08-28 — and that floor is a LOWER bound, because dashboard, sampler
+    and cockpit carry no measurement at all. So a real chain can exhaust even
+    the raised warm ceiling mid-run: 4902 recorded green orchestrator runs
+    whose cost alone approaches it, and one attempt has already consumed the
+    full budget and been logged as a false infra_timeout.
+
+    The figures are deliberately NOT copied into this docstring. They live once,
+    in MEASURED_FLEET_SEGMENT_SECS / POST_CAP_ORCHESTRATOR_GREEN_SECS in
+    tests/scripts/test_fallback_verify_config.py, republished in
+    dark-factory-orchestrator.yaml and tied to it by a guard there; a number
+    restated here would be one more copy to raise in lockstep.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the
     UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
@@ -1514,7 +1520,9 @@ class TestRunVerificationSegmentedAcceptance:
         budget exhaustion strictly MORE likely, because all 8 segments now
         always run where the shell previously stopped at the first red. The
         committed config's own measured table already records five of eight
-        segments costing 2238.32s.
+        segments whose sum is the fleet chain floor (the figure itself lives
+        once, in MEASURED_FLEET_SEGMENT_SECS in
+        tests/scripts/test_fallback_verify_config.py, not here).
 
         Synthesising `timed_out` on exhaustion would relabel this genuine red as
         an `infra_timeout` (``classify_failure`` guard 2 wins over every output
