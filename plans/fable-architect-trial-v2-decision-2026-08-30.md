@@ -564,3 +564,107 @@ fidelity score are not the same measurement and must not be averaged together.**
 
 Publishing a two-cell mean without this caveat would be worse than publishing nothing, which
 is why the caveat travels attached to the figure rather than in a footnote.
+
+---
+
+## 6. Cost and $/usable-plan
+
+_RAW OBSERVATION._
+
+### 6a. Does `cost_usd` already include `judge_cost_usd`? — resolved in code, not by arithmetic
+
+Every dollar figure below depends on this, so it is settled by reading the code rather than
+by inferring it from a total that happens to tie out.
+
+**Verified: `metrics.cost_usd` is the cell's TOTAL spend — architect + plan judge — and
+`metrics.judge_cost_usd` is a SUBSET of it, never a disjoint addend.**
+
+- `orchestrator/src/orchestrator/evals/runner.py::run_architect_eval` assembles the cell's
+  metrics with `cost_usd=resolved_arch_cost + judge_cost_usd`, and separately persists
+  `judge_cost_usd=judge_cost_usd`. The local holding the architect-only spend is named
+  `arch_cost_usd` precisely so the two cannot be confused.
+- `orchestrator/src/orchestrator/evals/metrics.py::EvalMetrics` declares the invariant on the
+  `judge_cost_usd` field itself: it "is a SUBSET of" the cell's `cost_usd`. The neighbouring
+  `cost_source` docstring says the same from the other side — the architect path's `cost_usd`
+  is "a TWO-COMPONENT sum (architect spend + plan-judge spend)".
+
+The arithmetic is consistent with the code (§2c: the per-arm `cost_usd` sums reach exactly
+the operator's `TOTAL SPEND: $230.91`, with `judge_cost_usd` reported as an "of which"
+$5.55), and γ1's errata correction 1 asserts the same. **No discrepancy with
+`FINAL-READOUT.txt` was found.** But the code is the authority here, and it is unambiguous:
+
+> **Do not add `judge_cost_usd` to `cost_usd`. Doing so double-counts the judge.**
+
+### 6b. Per-candidate cost
+
+| candidate | cells | $total | judge $ (incl. in $total) | planned cells (`plan_steps>0`) | $/usable-plan |
+|---|---|---|---|---|---|
+| `architect-fable-max` | 26 | $123.64 | $2.09 | 3 | **$41.21** |
+| `architect-opus-max` | 27 | $107.27 | $3.46 | 5 | **$21.45** |
+| **TOTAL** | **53** | **$230.91** | **$5.55** | 8 | — |
+
+### 6c. $/usable-plan under BOTH denominators
+
+"Usable plan" is ambiguous on this band (§3e), and picking one denominator silently would
+mislead. Both are reported.
+
+| denominator | fable | incumbent | ratio (fable ÷ incumbent) |
+|---|---|---|---|
+| **(i)** `plan_steps > 0` — v1's definition, the planRate numerator | $123.64 / 3 = **$41.21** | $107.27 / 5 = **$21.45** | **1.92×** |
+| **(ii)** confirmed plans by forensic terminal cause (§3) | $123.64 / 2 = **$61.82** | $107.27 / 4 = **$26.82** | **2.31×** |
+
+Definition (i) follows v1 (`plans/fable-architect-eval-decision-2026-07-30.md` §3 "Metric
+definitions"): `$total` ÷ the count of *planned* cells only, **not** ÷ all cells. That
+carries the ι precedent that `$/fixture` and `$/usable-plan` are **not interchangeable** — a
+candidate that fails to plan on some cells still spends money on them, so per-fixture cost
+understates the real price of a plan you can actually use.
+
+**Definition (ii) is the one consistent with §3**, because it excludes the two
+plan-then-decline cells whose own authors repudiated their plans.
+
+> **Both ratios should be read with heavy scepticism.** On a band where 47 of 53 cells are
+> verified-correct declines, a "$/usable-plan" figure divides a whole arm's spend by a
+> handful of cells drawn from fixtures where **planning was mostly the wrong answer**. The
+> fable denominator is 3 cells under (i) and 2 under (ii); moving a single cell between
+> classes swings the figure by tens of dollars. This is close to a meaningless ratio on this
+> tranche, and it is reported because ζ's contract requires $/usable-plan on the record —
+> not because it discriminates between the candidates.
+
+### 6d. The v1-vs-v2 comparability caveat
+
+γ1's calibration report instructs ζ by name to carry this, and PRD D11 makes it a mandatory
+statement in this record.
+
+> **v1's dollar figures EXCLUDED judge cost entirely. v2's INCLUDE it. v1 and v2 ABSOLUTE
+> costs are therefore NOT directly comparable. Only RATIOS are.**
+
+v1 reported $4.429 (fable) vs $3.693 (incumbent) per usable plan — a **1.20×** ratio — under
+defect ι3, which omitted judge spend from the cell cost and has since been fixed (PRD §υ
+now records judge cost on architect cells; §6a verifies it is folded into `cost_usd`). The
+v2 figures in §6c include judge cost by construction.
+
+So it is legitimate to observe that fable's cost ratio against the incumbent moved from
+**1.20× (v1)** to **1.92× (v2, definition i)**. It is **not** legitimate to say fable's cost
+per usable plan "rose from $4.43 to $41.21" as though that were one trend — those figures
+come from different fixture pools (v1's six-fixture hard subset vs v2's nine-fixture
+no-plan band), different cost definitions, and in v2's case a denominator of 3 cells.
+
+### 6e. The per-arm cost asymmetry
+
+Raw observation only; §8 owns any reading of it.
+
+| arm | cells | mean $/cell | mean $/cell, no-plan cells | mean $/cell, planned cells |
+|---|---|---|---|---|
+| `architect-fable-max` | 26 | $4.7552 | **$3.7544** (n=23) | $12.4280 (n=3) |
+| `architect-opus-max` | 27 | $3.9731 | **$2.6531** (n=22) | $9.7811 (n=5) |
+
+Recomputed from the 53 cells. `FINDINGS.md` §Answer 3.3 reports $3.61 vs $2.65 on no-plan
+cells at the 51-cell cut; the incumbent figure is unchanged (its arm was already complete)
+and the fable figure moves to $3.7544 with the two additional `reify_task_4026` cells.
+
+**Fable is more expensive per cell on this band — roughly 1.42× on no-plan cells — while
+reaching the same verdicts with about half the tool calls** (`FINDINGS.md` §Answer 3.3:
+median 16 vs 29 on already-done cells; the incumbent additionally spawns subagents). Both
+observations are in `FINDINGS.md`; the per-cell dollar figures above are this record's own
+recomputation over all 53 cells. The mechanism recorded there is **price per token, not
+extra work**.
