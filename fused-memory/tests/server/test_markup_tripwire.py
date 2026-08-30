@@ -20,11 +20,14 @@ including the residue emitter this module also hosts.
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 
 import pytest
 from shared import toolcall_markup
 from shared.mcp_markup_middleware import OUTCOMES
+from shared.toolcall_markup import ENVELOPE_LITERALS
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -831,4 +834,57 @@ class TestSingleSourceOfTruth:
         one assertion a duplicate cannot pass.
         """
         assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
+
+
+# ---------------------------------------------------------------------------
+# Source-hygiene guard (task 4228): both files below predate the ``\x3c``
+# escape convention shared.toolcall_markup's "Sentinel-literal hazard"
+# section establishes. Modelled on
+# scripts/tests/test_sweep_toolcall_markup.py's
+# ``test_the_script_source_spells_no_raw_envelope_literal`` (cross-file) and
+# ``test_this_module_spells_no_raw_envelope_literal`` (self-file).
+# ---------------------------------------------------------------------------
+
+
+def test_the_tripwire_source_spells_no_raw_envelope_literal():
+    """CROSS-FILE: markup_tripwire.py's own source must carry no raw literal.
+
+    Paired with an anti-vacuity check that the module's docstring still names
+    every canonical pattern after decoding — a bare "no raw literal" scan
+    would be trivially satisfiable by deleting the explanatory lines instead
+    of escaping them.
+    """
+    LT = chr(60)
+    needles = (*ENVELOPE_LITERALS, LT + '/', LT + 'parameter ')
+
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / 'src'
+        / 'fused_memory'
+        / 'server'
+        / 'markup_tripwire.py'
+    )
+    assert source_path.is_file(), f'expected markup_tripwire.py at {source_path}'
+    source = source_path.read_text(encoding='utf-8')
+    source_lines = source.splitlines()
+
+    hits = {
+        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
+        for needle in needles
+        if needle in source
+    }
+    assert not hits, (
+        f'{source_path.name} contains raw envelope sentinel(s) {hits!r}. Spell '
+        "them with the \\x3c escape instead — see this module's docstring for "
+        'why.'
+    )
+
+    doc = ast.get_docstring(ast.parse(source))
+    assert doc is not None, f'{source_path.name} lost its module docstring'
+    for pattern in MCP_MARKUP_PATTERNS:
+        assert pattern in doc, (
+            f'{pattern!r} is missing from the decoded docstring of '
+            f'{source_path.name} — escaping must not delete the specimen it '
+            'explains.'
+        )
 
