@@ -138,108 +138,17 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # numeric rc is NOT the two-outcome `&& echo` idiom banned above: it prints
 # on every path and keeps all three outcomes distinguishable. Do not "tidy"
 # it away.
-# rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
-#          commit=<landing sha from the SAME exact-subject marker search used by the rc=128
-#          arm below: git log main --fixed-strings
-#          --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H>.
-#          A NON-EMPTY MARKER IS NOT AUTHORITATIVE ON ITS OWN HERE. On this arm the branch
-#          ref still EXISTS, and GitOps.find_merge_marker's branch-existence gate returns
-#          None in exactly that case — it "prevents finding a stale merge marker from a
-#          PREVIOUS run of a re-opened task that shared the same branch name". We search
-#          anyway (still the best first candidate), so re-supply the guard ourselves:
-git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"; echo "containment rc=$?"
-#          The merge that truly brought this branch in must CONTAIN the current tip; a
-#          previous incarnation's marker predates the recreated ref, so the tip is a
-#          DESCENDANT of it, not an ancestor.
-#            containment rc=0   → this incarnation's true merge commit. Stamp it with
-#              note="merge commit located by exact-subject marker search;
-#              containment-verified against branch tip".
-#            containment rc=1   → STALE previous-incarnation marker. Do NOT stamp; fall
-#              through to the group-merge search below.
-#            containment rc=128 → neither sha resolved, no verdict rendered. Do NOT stamp
-#              and do NOT read it as either outcome; re-derive.
-#          The NOTE IS MANDATORY, not decoration: DoneProvenance rejects
-#          kind='found_on_main' without one (see the summary at the end of this arm).
-#          (The escalation server layers a second guard on the same risk — the marker must
-#          not predate the recorded branch_base_sha; see _found_on_main_response / the
-#          merge_status Tier-3.5 docstring.)
-#          Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT HEAD, which
-#          is this task's merge commit only when this merge happens to be the newest commit
-#          on main — on a live queue it usually is not, so you would stamp an unrelated
-#          task's sha. (git merge-base is also wrong: it gives the common ancestor, NOT the
-#          merge commit.) If the marker search is empty, a coalesce-absorbed non-tip member
-#          is merged under the TIP branch's subject and carries no marker of its own, so
-#          look for the group merge — but VERIFY it before stamping:
-#            c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
-#            if [ -n "$c" ]; then
-#                git merge-base --is-ancestor task/<TASK_ID> "$c^1"
-#                echo "contained-before rc=$?"
-#            fi
-#          A non-empty $c is NOT authoritative on its own. `--ancestry-path
-#          task/<TASK_ID>..main` lists every merge DESCENDED from this branch, so once the
-#          branch is on main it also lists every UNRELATED merge landed AFTERWARDS, and
-#          `tail -1` returns the OLDEST of those — the first unrelated task's merge. The
-#          containment check on $c's FIRST PARENT (main just before that merge) decides:
-#            contained-before rc=1 → the branch was NOT in main before $c, so $c IS the
-#                                    merge that brought it in. Stamp $c (group/train case)
-#                                    with note="absorbed into group merge; sha verified by
-#                                    ancestry containment" — the note is mandatory here too.
-#            contained-before rc=0 → already in main before $c, so $c is an unrelated later
-#                                    merge. Do NOT stamp it; fall through.
-#          Falling through means no merge commit exists for this branch. DO NOT stamp the
-#          tip yet: rc=0 proves the tip is reachable from main, NOT that this branch carries
-#          any work. A branch that never advanced past its creation point has main's own old
-#          base commit as its tip and reaches this exact arm — ancestry rc=0, marker empty,
-#          no verified rev-list candidate — carrying none of the task's work. Gate on a
-#          POSITIVE TASK CITATION on main — the shell form of
-#          `GitOps.find_task_citation_commit` (orchestrator/src/orchestrator/git_ops.py),
-#          which exists for exactly this degenerate case (its docstring: is_ancestor
-#          "returns True trivially for zero-commit branches whose tip equals the main HEAD
-#          at branch-create time... Requiring a positive citation on main rejects that
-#          degenerate case"); the pattern is DEFAULT_COMMIT_CITATION_PATTERN in that module:
-git log main --extended-regexp --format='%H %s' \
-    --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\(\b<TASK_ID>\b[):]|.*\btask/<TASK_ID>\b)|^Merge task/<TASK_ID> into |\(#?<TASK_ID>\)|\(task <TASK_ID>\)'
-#            READ THE %s SUBJECT, not just the count: --grep matches the whole message and
-#              git applies ^/$ per LINE, so a body line can match spuriously. The function
-#              uses --grep only as a coarse pre-filter and re-tests each candidate's SUBJECT
-#              alone — do the same, most-recent-first, first subject match wins.
-#            A SUBJECT-MATCHING ROW EXISTS → real work citing this task is on main: a
-#              genuine fast-forward (or already-contained) landing. Stamp the branch tip —
-#              `git rev-parse task/<TASK_ID>` (rc=0 guarantees the ref still exists) — with
-#              note "fast-forward merge, no separate merge commit; landing confirmed by task
-#              citation <citing sha> on main".
-#            NO SUBJECT-MATCHING ROW → nothing on main cites this task: the PHANTOM-BRANCH
-#              case, NOT a landing. Do NOT stamp. Stop and report as not-landed/phantom-branch.
-#            PROJECT SETS `git.commit_citation_pattern: ""` → empty BY CONFIGURATION, proving
-#              neither verdict. Do NOT stamp; report the gate as un-evaluable.
-#            Do NOT substitute `git cherry` on THIS arm: it reports only commits reachable
-#              from the branch but NOT from main, and rc=0 has just proved every branch
-#              commit IS reachable from main — so it prints nothing for a genuine
-#              fast-forward and a phantom branch alike. Rule 2b's use of it on the rc=1 arm
-#              (where the branch is NOT an ancestor) is correct and unaffected.
-#          kind='found_on_main' REQUIRES BOTH A COMMIT AND A NOTE — DoneProvenance
-#          (shared/src/shared/task_metadata.py::DoneProvenance) raises "commit is required
-#          when kind='found_on_main'" and "note is required when kind='found_on_main'"
-#          independently, so a commit-less blob AND a note-less blob are BOTH rejected.
-#          There is no note-only fallback since the post-3092 hardening, and no
-#          commit-only one either. Every stamp on this arm must carry both; where this
-#          gate finds no honest commit the answer is to write NOTHING AT ALL — never to
-#          substitute a convenient sha. (kind='merged' requires only a commit.)
-# rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the normal state
-#          AFTER a successful merge + cleanup — NOT "not on main". Search main for THIS
-#          branch's merge commit, by exact subject:
-git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
-#          Non-empty output → that SHA IS the true merge commit; treat as done/found_on_main,
-#            stamping commit=<that sha> AND note="merge commit located by exact-subject
-#            marker search" (both required — see the rc=0 summary above).
-#          Empty output    → not landed (branch never existed, or never merged).
-# rc=1   → not an ancestor of main. Outside the coalesce arm (see "Follow
-#          the superseded successor" below) and with the queue healthy:
-#          resubmit (go back to step 3).
 ```
-**The rc=128 search must be the exact-subject one above — never an unfiltered `git log main --merges | head -5`.** That listing takes no task argument, so on any repo with merge history it always prints something: "a hit" becomes unconditionally true and "no hit" unreachable, and every rc=128 — *including a typo'd branch name, the wrong worktree, or a branch never pushed*, all of which also exit 128 — would be recorded as landed with some unrelated task's merge SHA. The server's `done_provenance` backstop is only `git merge-base --is-ancestor <sha> main`, which any recent merge on main passes, so nothing downstream catches it.
+**The three outcomes, and the sha derivation behind rc=0 and rc=128, are [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder)** — the single normative copy of the ladder (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full; do not improvise a shorter version. This skill enters it **ancestry-first**, so the rc above already answers its ref-existence question and its `rev-parse` probe is not needed here — see [Two entry points](../_shared/deriving-landed-sha.md#entry-points).
 
-This mirrors the in-repo authority, `GitOps.find_merge_marker` (`orchestrator/src/orchestrator/git_ops.py:7862-7905`) — the same function the git-authority tier calls on the deleted-branch path. `--fixed-strings` against the exact subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form `Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — BRE, not restricted to merges, matches any commit merely *mentioning* the task, and re-opens that collision. If a project overrides `git.branch_prefix` (default `task/`) or `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding.
+**This skill's dispositions on the ladder's verdicts:**
+
+- **A verified sha (on rc=0, or on rc=128 with a non-empty marker)** → treat as done/`found_on_main` and stamp exactly what that arm specifies — `commit` **and** `note`, both required.
+- **rc=1** → not an ancestor of main. Outside the coalesce arm and with the queue healthy: **resubmit (go back to step 3).**
+- **rc=128 with an empty marker on the `coalesce-*` arm** → **not** one of the ladder's genuine not-landed outcomes below; [Follow the superseded successor](#follow-the-superseded-successor)'s **rule 2a** governs it (tip's merge marker + this task's scheduler status; either landing signal → self-stamp `found_on_main` with the tip merge sha). The shared ladder carries this carve-out explicitly, so running it "in full" no longer contradicts rule 2a.
+- **rc=1 on the `coalesce-*` arm** → that resubmit line does **not** apply; [Follow the superseded successor](#follow-the-superseded-successor)'s rules 2/2b/3 govern instead. Rule 2b's `git cherry main task/<TASK_ID>` content proof is correct **there** — the branch is not an ancestor of main, so the test actually discriminates — and is unaffected by the shared doc's ban on substituting it on the rc=0 arm. Honour rule 2b's **veto**: any non-`done` scheduler status means never self-stamp, and at the ceiling take its **landed-but-not-credited** exit (citing the tip merge sha, the `git cherry` output and the current status) rather than reporting not-landed.
+- **The ladder's genuine not-landed outcomes**, and a citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) → stamp nothing. Un-evaluable proves neither verdict, so never read it as not-landed.
+
 **Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; see its 20-minute ceiling above for the bounded exit instead. **Nor does it apply when this check is reached from [Follow the superseded successor](#follow-the-superseded-successor)'s Escape** — that subsection's rule 3 governs rc=1 there instead; do not resubmit.
 
 ### 4. Handle the outcome
@@ -249,7 +158,7 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 **`done`** — Merge succeeded. Main has been advanced atomically.
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
   - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case). The server backstops with `git merge-base --is-ancestor <sha> main`.
-  - **Where the SHA comes from depends on which call produced the `done`, and not every source is safe to record as `kind: "merged"`.** A terminal-at-submit-time `merge_request` response carries the true merge SHA in `commit` — safe to use directly. A *polled* `done` does not, unless the response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — the durable retention-ring/event-store tiers return only `state`/`request_id`/`generation`/`outcome`/`finished_at` (`escalation/server.py:2404-2420`), and `outcome` is the raw state string `"done"`, not a commit hash. **A `merge_sha` is always a commit ON main, on both of the tier's resolution paths** — the citing commit discovered on main on the live-branch path, the merge commit itself on the deleted-branch (`find_merge_marker`) path — and on both it is checked to still be present at main HEAD before being returned (`_found_on_main_response`), so it is safe to record exactly as returned. Never substitute the branch tip or a `git merge-base` result for it. **One exception:** on a project that sets `git.commit_citation_pattern: ""` (an explicit per-project opt-out for repos with no citation convention) the live-branch path skips the citation gate and `merge_sha` is the raw branch tip — not a commit on main, and not effect-present-checked, so a reverted landing is indistinguishable from a live one. If you are on such a project, confirm with the exact-subject search below before recording it. So: record a bare `merge_sha` as `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge commit if `kind: "merged"` provenance is specifically wanted — and re-derive it with the exact-subject search, `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, **not** by eyeballing `git log main --oneline | head -5` (unscoped to this task, so any SHA picked from it is likely an unrelated task's merge, and the server's only backstop — `git merge-base --is-ancestor <sha> main` — passes for every recent commit on main and would not catch it). If the response has neither `commit` nor `merge_sha` — including on the `poll_by == "branch"` arm, where a durable record can resolve `done` with no `merge_sha` — re-derive the merge commit the same way. Never fabricate a SHA; if the search comes back empty, fall back to `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<explanation>"}` with a SHA you've actually verified is on main.
+  - **Where the SHA comes from depends on which call produced the `done`, and not every source is safe to record as `kind: "merged"`.** A terminal-at-submit-time `merge_request` response carries the true merge SHA in `commit` — safe to use directly. A *polled* `done` does not, unless the response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — the durable retention-ring/event-store tiers return only `state`/`request_id`/`generation`/`outcome`/`finished_at` (`escalation/server.py:2404-2420`), and `outcome` is the raw state string `"done"`, not a commit hash. **A `merge_sha` is always a commit ON main, on both of the tier's resolution paths** — the citing commit discovered on main on the live-branch path, the merge commit itself on the deleted-branch (`find_merge_marker`) path — and on both it is checked to still be present at main HEAD before being returned (`_found_on_main_response`), so it is safe to record exactly as returned. Never substitute the branch tip or a `git merge-base` result for it. **One exception:** on a project that sets `git.commit_citation_pattern: ""` (an explicit per-project opt-out for repos with no citation convention) the live-branch path skips the citation gate and `merge_sha` is the raw branch tip — not a commit on main, and not effect-present-checked, so a reverted landing is indistinguishable from a live one. If you are on such a project, confirm with the exact-subject search below before recording it. So: record a bare `merge_sha` as `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge commit if `kind: "merged"` provenance is specifically wanted — and re-derive it with the exact-subject search, `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, **not** by eyeballing `git log main --oneline | head -5` (unscoped to this task, so any SHA picked from it is likely an unrelated task's merge, and the server's only backstop — `git merge-base --is-ancestor <sha> main` — passes for every recent commit on main and would not catch it). If the response has neither `commit` nor `merge_sha` — including on the `poll_by == "branch"` arm, where a durable record can resolve `done` with no `merge_sha` — re-derive the merge commit the same way. Never fabricate a SHA; and an empty search is **not** a not-landed verdict — resolve it with [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-3) and stamp the sha whichever arm actually yields one (`found_on_main` needs a `commit` **and** a `note`), rather than picking a SHA you merely believe is on main.
   - Use `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<one-sentence explanation>"}` when the implementation is already on main from a sibling task / prior orchestrator run; the server runs the same git merge-base --is-ancestor backstop as for kind="merged".
 - Clean up worktree and branch:
   ```bash
@@ -341,7 +250,7 @@ After a successful direct merge:
 | Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=...)` — `True` only when verification actually passed, `False` otherwise — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff |
-| `merge_status` returns `state: "unknown"` | `request_id`/`task_id` arms: run the canonical ancestry check (rc=0 → done/found_on_main; rc=128 → branch ref gone; confirm with the exact-subject search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — non-empty = landed, empty = not landed; never an unfiltered `--merges` listing; rc=1 + healthy queue → resubmit). `poll_by == "branch"` arm: `unknown` is that arm's live state — keep polling to the 20-min ceiling, then stop and report, never resubmit. Never direct-merge in response to `unknown`. |
+| `merge_status` returns `state: "unknown"` | `request_id`/`task_id` arms: run the [canonical ancestry check](#canonical-ancestry-check), then derive the sha with [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) — run it in full rather than shortcutting it from this row. rc=0 → landed, but the sha comes from the ladder's group-merge / citation arms, never from HEAD; rc=128 → branch ref gone, decided by the ladder's exact-subject marker search (never an unfiltered `--merges` listing) — and **an empty marker search is not by itself a not-landed verdict** ([step 3](../_shared/deriving-landed-sha.md#step-3)), so on the `coalesce-*` arm apply [Follow the superseded successor](#follow-the-superseded-successor) rule 2 before concluding anything; rc=1 + healthy queue, outside the coalesce arm → resubmit. `poll_by == "branch"` arm: `unknown` is that arm's live state — keep polling to the 20-min ceiling, then stop and report, never resubmit. Never direct-merge in response to `unknown`. |
 | Terminal state arrived on an unscoped arm (`poll_by` `"branch"` or `"task_id"`) | Unconfirmed — a branch- or task-keyed poll can match a *prior* round's record on the same reused branch/task_id. A `done` with `kind: "found_on_main"` is git-authoritative — accept directly. Otherwise accept `done` only when the canonical ancestry check says landed (rc=0, or rc=128 with a merge-marker hit); re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
