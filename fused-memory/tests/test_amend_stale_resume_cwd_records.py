@@ -47,63 +47,101 @@ WARNING_ID = 'd007aa46-5800-455c-af3c-32d8fd8445b2'
 
 
 class TestAmendTargetsContract:
-    """The write payload itself -- the DATA this script would send.
+    """The target contract: what this script now PINS, and what it must not carry.
 
-    Deliberately a tight substring contract over the load-bearing FACTS the
-    corpus needs, NOT a prose pin: nothing here asserts docstrings, comments,
-    or the wording of the surrounding sentences, so the texts stay editable.
+    The correction these targets describe LANDED on 2026-08-30 through a
+    Stage-1 memory consolidation, not through this script -- so the targets are
+    VERIFY-ONLY and there is no write payload left to assert. What is pinned
+    instead is the live post-correction text, tightly: a handful of
+    load-bearing facts, never the wording of the surrounding sentences.
     """
 
     def test_two_targets_in_load_bearing_order(self):
-        # Order is semantic, not cosmetic: d007aa46 will assert that 6403e96b
-        # was corrected, so it must never be written first (see step-11/12).
+        # Order is semantic, not cosmetic: d007aa46's text asserts that
+        # 6403e96b was corrected, so it must never be written first. The
+        # ordering guard is retained even though neither target writes today.
         assert [t.memory_id for t in _mod.AMEND_TARGETS] == [STALE_ID, WARNING_ID]
 
-    def test_sentinel_present_in_every_replacement_text(self):
-        # The sentinel is what carries idempotency, so it must be in BOTH
-        # replacement texts -- a target whose new content lacks it would be
-        # rewritten on every re-run.
+    def test_sentinel_is_the_landed_correction_marker(self):
+        # Re-pointed from the never-applied 'amended in place by task 4610' to
+        # the substring the LANDED texts actually carry. This one constant is
+        # what makes both targets classify skip:already_amended -- reusing the
+        # idempotency path rather than adding a parallel branch.
+        assert _mod.AMENDED_SENTINEL == 'Stage-1 memory consolidation, task 4610'
+
+    def test_sentinel_present_in_every_preimage(self):
+        # The inverse of what this suite asserted before the correction landed.
+        # Both records now carry the marker, so a healthy read of either is a
+        # skip -- which is exactly why the run is a zero-write exit-0 no-op.
         for target in _mod.AMEND_TARGETS:
-            assert _mod.AMENDED_SENTINEL in target.new_content
+            assert _mod.AMENDED_SENTINEL in target.expected_preimage
 
-    def test_sentinel_absent_from_every_preimage(self):
-        # If a pre-image already contained the sentinel the classifier could
-        # never reach 'amend' -- the guard would skip the very record it is
-        # meant to correct.
+    def test_every_target_is_verify_only(self):
+        # No replacement text and no metadata payload: there is nothing this
+        # script could write at either target, by construction rather than by
+        # a branch that happens to guard it.
         for target in _mod.AMEND_TARGETS:
-            assert _mod.AMENDED_SENTINEL not in target.expected_preimage
+            assert target.new_content is None
+            assert target.metadata_patch is None
 
-    def test_each_replacement_differs_from_its_own_preimage(self):
+    @pytest.mark.parametrize(
+        'name', ['_STALE_REPLACEMENT', '_WARNING_REPLACEMENT', '_WARNING_PRESERVED_PREFIX'],
+    )
+    def test_the_stale_write_payloads_are_deleted_not_merely_bypassed(self, name):
+        # Re-pointing the sentinel alone would leave these 2026-08-28-authored
+        # rewrites in the module as a loaded gun: unreachable today, but fired
+        # at a landed correction by any future editor who "fixes" the sentinel
+        # or adds a third target. Assert the hazard is GONE.
+        assert not hasattr(_mod, name)
+
+    def test_reversion_preimage_pins_the_original_bare_claim(self):
+        assert _mod.REVERSION_PREIMAGE == (
+            'Broken Claude CLI --resume due to sessions being per-project-directory'
+        )
+
+    def test_reversion_preimage_is_not_any_live_preimage(self):
+        # The property the reversion guard actually depends on: a healthy
+        # record can never EQUAL the reverted text, so the guard cannot fire
+        # on a corrected corpus.
         for target in _mod.AMEND_TARGETS:
-            assert target.new_content != target.expected_preimage
+            assert _mod.REVERSION_PREIMAGE != target.expected_preimage
 
-    def test_stale_record_replacement_carries_the_correcting_facts(self):
-        new_content = _mod.AMEND_TARGETS[0].new_content
-        # The real April incident and the commit that fixed it are PRESERVED
-        # -- this is an amend, not a retraction.
-        assert 'e001dd3746' in new_content
-        # The contrary measurement that supersedes the inferred cause.
-        assert '2.1.236' in new_content
-        assert '2026-08-19' in new_content
-        assert 'plans/session-resume-eligibility-seam-prd.md' in new_content
-        # What is still genuinely open is stated rather than resolved by
-        # assertion -- nobody measured the April-era CLI.
-        assert 'UNDETERMINED' in new_content
+    def test_reversion_preimage_IS_quoted_inside_both_live_preimages(self):
+        # MEASURED, and the whole reason classify_amend_target compares the
+        # reversion text by EQUALITY and never by substring: both landed
+        # corrections quote the original bare sentence verbatim (A inside its
+        # SUPERSEDED preamble, B inside its measured-scores paragraph). A
+        # substring test would classify both healthy records as reverted and
+        # exit 1 on a perfectly correct corpus.
+        for target in _mod.AMEND_TARGETS:
+            assert _mod.REVERSION_PREIMAGE in target.expected_preimage
 
-    def test_hygiene_warning_replacement_retires_the_stale_status_clause(self):
-        warning = _mod.AMEND_TARGETS[1]
-        # The clause being retired is present in the pre-image ...
-        assert 'STILL UNCORRECTED' in warning.expected_preimage
-        # ... and gone from the replacement.
-        assert 'STILL UNCORRECTED' not in warning.new_content
+    def test_corrected_record_preimage_carries_the_superseding_facts(self):
+        preimage = _mod.AMEND_TARGETS[0].expected_preimage
+        # The landed text leads with the supersession marker ...
+        assert 'SUPERSEDED' in preimage
+        # ... and carries the measurement that supersedes the inferred cause.
+        assert '2.1.236' in preimage
+        assert 'cwd-AGNOSTIC' in preimage
 
-    def test_hygiene_warning_replacement_keeps_its_measured_evidence(self):
-        # The record's value is its MEASUREMENTS; the amend retires one status
-        # sentence, it does not rewrite the finding.
-        new_content = _mod.AMEND_TARGETS[1].new_content
-        assert '0.786' in new_content
-        assert '0.692' in new_content
-        assert 'e001dd3746' in new_content
+    def test_hygiene_warning_preimage_has_retired_its_stale_status_clause(self):
+        warning = _mod.AMEND_TARGETS[1].expected_preimage
+        # The clause this task existed to retire is gone from the live record.
+        assert 'STILL UNCORRECTED' not in warning
+        # Replaced by one recording the correction.
+        assert 'was ALSO corrected in place on 2026-08-30' in warning
+
+    def test_hygiene_warning_preimage_still_carries_the_full_story(self):
+        # The nuance the retired _STALE_REPLACEMENT would have put into target
+        # A survives verbatim HERE -- which is why nothing was lost by not
+        # writing it: the April symptom was REAL, only its cause was inferred,
+        # and the April-vs-August question is still open.
+        warning = _mod.AMEND_TARGETS[1].expected_preimage
+        assert '0.786' in warning
+        assert '0.692' in warning
+        assert 'e001dd3746' in warning
+        assert 'UNDETERMINED' in warning
+        assert 'plans/session-resume-eligibility-seam-prd.md' in warning
 
 
 class TestAmendTargetShape:
