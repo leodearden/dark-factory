@@ -36,6 +36,7 @@ import sys
 import tomllib
 from typing import NamedTuple
 
+import pytest
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
@@ -1275,6 +1276,46 @@ def _lint_leg_targets(cmd: str, marker: str) -> list[str]:
                 return tokens[i + n :]
         return []
     return []
+
+
+def test_lint_leg_targets_reads_flag_values_as_flags_not_paths() -> None:
+    """A ``-``-prefixed token is a FLAG, never a lint target.
+
+    Concretely load-bearing rather than tidy. Both call sites below assert
+    ``(REPO_ROOT / target).exists()`` over every returned target, so a flag
+    admitted as a target goes red with "names '--fix', which does not exist
+    under <repo root>" on a lint_command that broke nothing — the same
+    misleading diagnosis ``test_contributing_lint_command_drift.py``'s
+    ``_RUFF_FLAGS_TAKING_A_VALUE`` was introduced to prevent at the sibling
+    boundary.
+
+    MEASURED RED before task 3883: the hand-rolled helper returned every token
+    after the marker window with no filter at all, i.e.
+    ``["--fix", "alpha", "beta.py"]``.
+    """
+    cmd = (
+        "uv run ruff check --fix alpha beta.py && "
+        "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    )
+    assert _lint_leg_targets(cmd, "ruff check") == ["alpha", "beta.py"]
+
+
+def test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix() -> None:
+    """``x_check_bare_magicmock_config.py`` is a DIFFERENT file, not this one.
+
+    MEASURED RED before task 3883: the hand-rolled helper's raw ``str.endswith``
+    fallback matched that unrelated filename and returned ``["a", "b"]`` —
+    another script's arguments silently reported as the magicmock checker's
+    targets, which the caller then asserts must exist on disk. Matching a whole
+    path COMPONENT rejects the near-miss while still matching the live
+    ``fused-memory/scripts/check_bare_magicmock_config.py`` token.
+
+    No ``match=``: assertion wording is not pinned anywhere in this family, so
+    the diagnostics stay free to be reworded.
+    """
+    with pytest.raises(AssertionError):
+        _lint_leg_targets("python3 scripts/x_check_bare_magicmock_config.py a b",
+                          "check_bare_magicmock_config.py")
 
 
 class TestFleetLintCoversEveryWorkspaceMember:
