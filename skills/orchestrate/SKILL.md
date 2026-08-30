@@ -502,18 +502,27 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
 4. **Verify**: run the target project's verify commands (look these up in `$TARGET_CONFIG` — Rust projects use `cargo test`/`cargo clippy`, Python projects use `pytest`/`ruff`/`pyright`, etc. — do not assume Python tooling)
-5. **Merge manually** (if the fix is good):
+5. **Merge manually** (if the fix is good) — capture the merge sha **at the moment of the merge**, never by re-reading `HEAD` later:
    ```bash
    cd "$TARGET_PROJECT"
-   git merge --no-ff task/<task-id>
+   git merge --no-ff task/<task-id> && MERGE_SHA=$(git rev-parse HEAD) && echo "MERGE_SHA=$MERGE_SHA"
    ```
+   The `&&` chain is the point, not style. `$TARGET_PROJECT` is a **machine-operated checkout** — the merge worker, the startup reconciler and git hooks all act on it directly — so `main` can advance between this step and step 6, and a `git rev-parse HEAD` read there can return an *unrelated* task's merge. Chaining also means a conflicted merge (or a checkout that was not on `main`) leaves `MERGE_SHA` **unset** rather than pointing at some other commit, so there is nothing to mis-stamp below. Resolve a conflict first and re-run the chain.
 6. **Update task status**:
    ```
    set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})
    ```
    `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
 
-   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the merge commit you just created (`git rev-parse HEAD` on main), and it is self-evidently attributable because you created it this session, so stamp it directly under `{"kind": "merged", "commit": "<sha>"}`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only.
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5's `&&` chain read it from `HEAD` **immediately after a merge that succeeded**, so it is that merge — not whatever has landed on main since. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only.
+
+   **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
+   ```bash
+   sha=$(git log main --fixed-strings --grep="Merge branch 'task/<task-id>'" --max-count=1 --format=%H)
+   echo "hand-merge sha=$sha"
+   [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
+   ```
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which is what proves that merge brought *this* branch in. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no hand-merge subject is on main: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
 
    **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 
