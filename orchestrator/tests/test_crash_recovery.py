@@ -2325,9 +2325,9 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         et, kwargs = emits[0]
         assert et == EventType.session_resume_fallback
+        # 'capped' stays visible in the set, so routing the dispatch here
+        # rather than to session_resume_capped loses no information.
         assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
-        # 'capped' is still visible in the set — routing it here loses nothing.
-        assert 'capped' in kwargs['data']['reasons']
         assert harness._session_resume_fallback_streak == 0
 
 
