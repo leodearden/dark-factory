@@ -1686,11 +1686,11 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
     # pairs are coming back" from "the registry recorded fewer pairs". There
     # is deliberately NO `inversion_pairs_comparable` row: leaf beta settled
     # this exact question for the identically-shaped `surfacing` family
-    # (memory_eval_staleness_sweep.py:1000-1017, refusing a
-    # `surfacing_pairs_observed` row) — it would be a second name for the
-    # number already published as the metric's `n`, and when exposure is zero
-    # the metric is absent and `metric_families_not_measured` names the gap,
-    # which a bare 0 here would have disguised as a measurement.
+    # (fused-memory/scripts/memory_eval_staleness_sweep.py::_disclosure_counts,
+    # refusing a `surfacing_pairs_observed` row) — it would be a second name
+    # for the number already published as the metric's `n`, and when exposure
+    # is zero the metric is absent and `metric_families_not_measured` names
+    # the gap, which a bare 0 here would have disguised as a measurement.
     for observation in observations.inversions:
         if observation.degraded:
             key = f'degraded_inversion_observations_at_k{observation.k}'
