@@ -419,6 +419,34 @@ def test_positional_targets_needs_no_entry_for_the_equals_spelling() -> None:
     assert vci.positional_targets(segment, _PYTEST) == ["tests/scripts/"]
 
 
+def test_positional_targets_threads_path_anchor_to_the_anchor_split() -> None:
+    """The fifth caller reaches ``anchor_split``'s new parameter through here.
+
+    Over ``_CHAINED_LINT``, already documented above as modelling the live
+    repo-root ``lint_command`` — a ruff leg followed by a ``python3
+    .../check_bare_magicmock_config.py <dir>`` gate whose checker is named by
+    PATH. Reusing that fixture rather than inventing one keeps the pin tied to
+    the shape the live command actually has.
+    """
+    segment = vci.required_segment(_CHAINED_LINT, "check_bare_magicmock_config.py")
+    targets = vci.positional_targets(
+        segment, "check_bare_magicmock_config.py", path_anchor=True
+    )
+    assert targets == ["shared/tests"]
+
+
+def test_positional_targets_default_still_rejects_a_path_spelled_anchor() -> None:
+    """The default is pinned at THIS layer too, not only at ``anchor_split``.
+
+    ``positional_targets`` is what the four task-3745 callers actually call, so
+    a default that leaked here would widen them even with ``anchor_split``'s own
+    default intact.
+    """
+    segment = vci.required_segment(_CHAINED_LINT, "check_bare_magicmock_config.py")
+    with pytest.raises(AssertionError):
+        vci.positional_targets(segment, "check_bare_magicmock_config.py")
+
+
 def test_positional_targets_propagates_the_anchor_assertion_with_the_label() -> None:
     with pytest.raises(AssertionError) as excinfo:
         vci.positional_targets("uv run ruff format alpha", _RUFF, label="the documented command")
