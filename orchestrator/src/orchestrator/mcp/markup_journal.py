@@ -128,6 +128,12 @@ def make_fact_journal(
     from inside the server's event loop, and one record can run a
     ``git rev-parse`` subprocess and a filesystem write.
     """
+    #: Holds SUCCESSES ONLY. A failed git resolution is TRANSIENT by nature (a
+    #: fork failure under load, an EINTR, a timeout, an index.lock storm), and
+    #: caching one would permanently disable this journal for every later event
+    #: on this server — losing exactly the records it exists to preserve. Same
+    #: asymmetry, for the same reason, as ``markup_sink.make_escalation_sink``'s
+    #: two memos.
     project_root: Path | None = None
 
     def _subject() -> str:
@@ -137,15 +143,43 @@ def make_fact_journal(
         answer, then the worktree directory name, then an explicit
         "unattributed" — never ``None`` and never absent, because a consumer
         must be able to tell "nobody knows" from "that emitter forgot the key".
+
+        A RAISING thunk falls to the same ladder rather than losing the line.
+        Attribution is what this journal is FOR, but a record that says
+        "something leaked from add_design_decision at 16:52:34" is still
+        strictly more than the nothing that was written before it existed.
         """
-        return subject_task_id() or worktree.name or markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
+        try:
+            resolved = subject_task_id()
+        except Exception:
+            logger.warning(
+                'markup guard: could not attribute the journal line under %s; '
+                'falling back to the worktree name', worktree,
+            )
+            resolved = ''
+        return resolved or worktree.name or markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
 
     def append(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
         nonlocal project_root
         if project_root is None:
-            project_root = resolve_root(worktree)
+            try:
+                project_root = resolve_root(worktree)
+            except Exception:
+                # The default resolver never raises — it logs and returns None.
+                # An INJECTED one may, and a boundary guard's fact channel is
+                # not where that becomes the caller's problem.
+                logger.exception(
+                    'markup guard: the project-root resolver failed for %s; '
+                    'this markup fact will not be journalled', worktree,
+                )
+                return None
             if project_root is None:
+                logger.warning(
+                    'markup guard: could not resolve project_root from %s, so '
+                    'the markup fact for %s.%s will not be journalled',
+                    worktree, record.get('tool'), record.get('param'),
+                )
                 return None
 
         path = journal_path(project_root, server_label)
@@ -186,7 +220,6 @@ def make_fact_journal(
         # literal the upstream harness bug actually emitted.
         line = line.replace(_LT, _LT_JSON_ESCAPE) + '\n'
 
-        path.parent.mkdir(parents=True, exist_ok=True)
         # ONE ``os.write`` on an O_APPEND fd, and NEVER a read-modify-write.
         #
         # Many of these servers run at once — one stdio subprocess per agent,
@@ -197,14 +230,34 @@ def make_fact_journal(
         # seek-and-write atomic with no cross-process lock to take, but that
         # atomicity is guaranteed only for a BOUNDED write — so the record is
         # capped rather than trusted to be small.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
-            os.write(fd, line.encode('utf-8'))
-        finally:
-            os.close(fd)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                os.write(fd, line.encode('utf-8'))
+            finally:
+                os.close(fd)
+        except OSError:
+            logger.exception(
+                'markup guard: could not append the markup fact for %s.%s to '
+                '%s; the outcome stands', record.get('tool'),
+                record.get('param'), path,
+            )
+            return None
         return str(path)
 
     async def journal(record: dict[str, Any]) -> str | None:
-        return await asyncio.to_thread(append, record)
+        try:
+            return await asyncio.to_thread(append, record)
+        except Exception:
+            # ``append`` already contains every write failure; this is the floor
+            # under the thread hop itself, so the never-raises contract holds
+            # for the whole emitter and not merely for its body. Same floor
+            # ``markup_sink.make_escalation_sink``'s own ``sink`` keeps.
+            logger.exception(
+                'markup guard: could not run the fact journal for %r; the '
+                'outcome stands', record.get('fact'),
+            )
+            return None
 
     return journal
