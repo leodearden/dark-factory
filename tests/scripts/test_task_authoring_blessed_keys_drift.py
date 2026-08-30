@@ -17,7 +17,7 @@ where that ends — at the ORIGINAL base (2026-08-18) the frozenset's own header
 comment said "the 39 load-bearing ...keys" while the frozenset held 42, having
 gone silently stale across two independent blessings (tasks 3697 and 4372)
 before task 3780 dropped the numeral. The stale numeral outlived that base too:
-it still read 39 on the pre-branch main this work rebased onto, against 43 keys.
+it still read 39 on the pre-branch main this work rebased onto, against 44 keys.
 
 The drift is not cosmetic. UNDER-listing is the dangerous direction: an author
 consulting the doc sees a key absent, concludes it is unblessed, and either
