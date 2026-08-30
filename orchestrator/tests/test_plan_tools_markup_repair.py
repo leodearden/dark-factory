@@ -25,11 +25,15 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 
 from __future__ import annotations
 
+import ast
 import copy
 import inspect
 import json
 import logging
 import stat
+import tempfile
+import textwrap
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -321,6 +325,56 @@ _PLAN_WRITING_TOOL_NAMES = (
     'mark_step_committed',
     'confirm_plan',
 )
+
+
+def _plan_writing_tool_names() -> tuple[str, ...]:
+    """Derive the plan-writer candidate set from plan_tools' LIVE module surface.
+
+    A plan_tools entry point is a plan writer iff (a) it is a module-level
+    function DEFINED IN plan_tools — not an imported helper merely visible in
+    its namespace; (b) its name starts with ``_``, the private-impl-behind-an-
+    MCP-tool convention this file already keys on via
+    ``getattr(plan_tools, '_' + tool_name)`` (see :func:`_alternate_writer_changed_the_cell`);
+    (c) its first parameter is ``artifacts``; and (d) its OWN BODY calls one of
+    :data:`_PLAN_MUTATING_ARTIFACT_METHODS`. Returns the surviving names with
+    the leading ``_`` stripped, sorted, as a tuple.
+
+    Reads each survivor's source via ``inspect.getsource`` off the LIVE module
+    OBJECT, never by parsing plan_tools.py as a file. This is required, not
+    stylistic: a synthetic writer monkeypatched onto ``plan_tools`` at test
+    time (as the completeness test does) is invisible to a file-level parse,
+    which would make the completeness property untestable — the one test that
+    proves "a new plan writer is caught" could not be written.
+
+    Detects a write with an ``ast.Call``/``ast.Attribute`` walk over each
+    survivor's own body, never a substring scan of the source text. A text
+    scan would be actively WRONG here: this module's own comments and
+    docstrings mention ``write_plan`` in prose repeatedly — including this
+    very docstring — so a substring match would misclassify a non-writer such
+    as ``_read_plan_repaired`` (which only ever calls ``artifacts.read_plan``
+    and the module-level ``_atomic_write_plan``, and merely discusses
+    ``write_plan`` in prose) as a writer.
+    """
+    names = []
+    for name, obj in vars(plan_tools).items():
+        if not inspect.isfunction(obj):
+            continue
+        if obj.__module__ != plan_tools.__name__:
+            continue  # an imported helper, not an entry point defined here
+        if not name.startswith('_'):
+            continue
+        params = tuple(inspect.signature(obj).parameters)
+        if params[:1] != ('artifacts',):
+            continue
+        tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        if called & _PLAN_MUTATING_ARTIFACT_METHODS:
+            names.append(name[1:])
+    return tuple(sorted(names))
 
 
 def _seed_plan_through_real_writers(root) -> TaskArtifacts:
