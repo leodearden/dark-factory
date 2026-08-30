@@ -1200,6 +1200,126 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert 'session:same-1' not in app._dropped
             assert queue.row_count == 1
 
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_across_a_question_less_round_trip(self, tmp_path):
+        """An AWAITING_INPUT session with NO question stamped is a real queue
+        row (order_queue renders its question as ''), so it is droppable and
+        its drop must expire too.
+
+        Reachable shape: session_hooks._extract_question returns None for an
+        absent/blank Notification `message` and deliberately leaves
+        record.question untouched, so RUNNING -> AWAITING_INPUT(question=
+        None) really happens.
+
+        This pins the OBSERVED round trip -- the poll sees the intervening
+        IDLE, so _ask_identity returns None on that tick and the drop
+        expires there and then, before the second awaiting state is ever
+        scanned. It is a regression pin rather than a defect reproduction:
+        the sibling test below is the one that was red, since it is the
+        identity itself (not the liveness gate) that has to do the work
+        when the non-awaiting state is never observed.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='quiet title')
+        awaiting = _make_record(
+            session_slug='qless-1', status=sr.Status.AWAITING_INPUT, display=display
+        )
+        assert awaiting.question is None
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:qless-1' in app._dropped
+
+            idle = _make_record(session_slug='qless-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+            assert 'session:qless-1' not in app._dropped
+
+            # Asks again, still with nothing stamped -- must be visible.
+            sr.write_record(awaiting, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:qless-1' not in app._dropped
+            assert queue.row_count == 1
+
+    @pytest.mark.timeout(10)
+    async def test_dropped_question_less_key_expires_when_the_record_itself_is_replaced(
+        self, tmp_path
+    ):
+        """A question-less identity must not be a bare constant shared by every
+        question-less ask in the fleet.
+
+        A session slug outlives any one record: a reaped record can be
+        recreated under the same slug (session_registry's upsert path
+        repopulates schema_version/session_slug/start_ts/status), and the
+        cockpit's overlay keys are slug-derived. If a question-less awaiting
+        session identifies as the same constant before and after, the
+        operator's drop of the FIRST record silently suppresses the SECOND
+        record's ask -- the exact failure class this machinery exists to
+        kill, in the question-less corner. Keying it on the record's own
+        (immutable, per-record) start_ts distinguishes them.
+
+        The replacement record differs in `title` as well, which is what
+        moves build_snapshot's tuple and so wakes the prune at all --
+        start_ts is deliberately NOT a snapshot field (it would make a
+        purely-time-passing tick diff). So this pins the IDENTITY's job,
+        with the wake-up trigger supplied independently.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='recycled title')
+        first = _make_record(
+            session_slug='recycled-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            title='first run',
+            start_ts='2026-07-07T00:00:00+00:00',
+        )
+        assert first.question is None
+        sr.write_record(first, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:recycled-1' in app._dropped
+
+            second = _make_record(
+                session_slug='recycled-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                title='second run',
+                start_ts='2026-07-09T00:00:00+00:00',
+            )
+            sr.write_record(second, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:recycled-1' not in app._dropped
+            assert queue.row_count == 1
+
 
 class TestBoostAndDeferOverlaysExpireWithTheAsk:
     @pytest.mark.timeout(10)
