@@ -512,6 +512,52 @@ class TestClassifyMisattributed:
         assert verdict != 'misattributed'
 
 
+class TestCitationGatePositiveArmStampChoice:
+    """Task 4924: why the CITING sha, not the branch tip, is the right `commit`.
+
+    On the landed-sha ladder's citation-gate positive arm the shared runbook
+    (`skills/_shared/deriving-landed-sha.md`) used to prescribe stamping the
+    branch tip (`git rev-parse task/<TASK_ID>`). These two cases record the
+    measured basis for replacing it with the citing sha: this auditor
+    DISCRIMINATES the two, flagging the tip stamp `misattributed` (which gates
+    `check_found_on_main_spurious_rate.py`) while the citing sha short-circuits
+    the guard by construction.
+    """
+
+    def test_branch_tip_stamp_on_a_sibling_covered_branch_is_misattributed(self):
+        """The tip of a branch that never advanced is main's own old base commit.
+
+        Its subject is some *other* task's landing, so a tip stamp cites 4700
+        rather than the audited task 4924 and earns `misattributed`.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True, commit_message='Merge task/4700 into main',
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert reasons
+        assert any('4700' in r for r in reasons)
+
+    def test_citing_sha_stamp_is_ok_because_it_cites_the_audited_task_by_construction(self):
+        """The sha the gate actually discovered cites the audited task, so it is safe.
+
+        The `(#N)` hash-paren form is used deliberately rather than bare `(N)`:
+        task 4705 narrowed this script's CITATION_PATTERN so bare `(N)` no
+        longer cites (see TestExtractCitedTaskIdsBareParenRegressions above),
+        while `orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN` still
+        accepts it — the two are documented as allowed to diverge. `(#N)` is
+        the form BOTH accept, so this pins their agreement, not the divergence.
+        Do not "tidy" it to the bare-paren form.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+        )
+        assert '4924' in extract_cited_task_ids(audit.commit_message)
+        verdict, _reasons = classify(audit)
+        assert verdict != 'misattributed'
+
+
 # ===========================================================================
 # Step-9/10: classify — reverted (post-hoc-revert blind spot)
 # ===========================================================================
