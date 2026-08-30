@@ -3768,6 +3768,12 @@ def create_mcp_server(
                 dual_write=dual_write,
                 causation_id=causation_id,
                 _source=source,
+                # Forwarded VERBATIM, unparsed: `entities_gate` above has
+                # already proved this list parses (a malformed one cannot reach
+                # here), and `MemoryService` is the single site that resolves
+                # and encodes it. Parsing twice would fork what `declared` means
+                # between this boundary and the producer.
+                declared_referents=entities,
             )
         except Exception:
             if attached_to is None:
@@ -3801,6 +3807,13 @@ def create_mcp_server(
                 dual_write=dual_write,
                 causation_id=causation_id,
                 _source=source,
+                # KEPT, unlike the failed parent link this fallback deliberately
+                # drops — and for the same reason it keeps the full content: the
+                # retry is meant to reproduce the exact pre-triage outcome. A
+                # silently downgraded referent source is content loss in the
+                # telemetry dimension: the write would land stamped `derived`
+                # while the agent believes it declared, and nothing would say so.
+                declared_referents=entities,
             )
         if attached_to is not None and not attach_write_landed(result):
             # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
