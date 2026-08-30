@@ -2025,7 +2025,7 @@ async def probe_topic(
             pairs_comparable=comparable_pairs(entry, scored_ranks),
             inversions=tuple(
                 superseded_inversions(
-                    info.results[:scored_k], entry, phrasing=phrasing.text, ranks=scored_ranks,
+                    info.results, entry, phrasing=phrasing.text, ranks=scored_ranks,
                 ),
             ),
             degraded=info.degraded,
