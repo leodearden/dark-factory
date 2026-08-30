@@ -43,6 +43,7 @@ import difflib
 import importlib
 import inspect
 import json
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -70,6 +71,26 @@ _NEW_ENTRY = 'A new memory entry submitted for triage by this probe.'
 #: Both are tried, and whichever the implementation accepts is used for every
 #: subsequent render, so no calling convention is pinned.
 _SPELLINGS = ('id', 'object')
+
+
+#: Two ids belonging to NO candidate in the slate. Rendering against them is
+#: the ECHO CONTROL: a parameter that MARKS the target matches its argument
+#: against the slate, finds nothing, and therefore renders identically for both
+#: (and mentions neither); a parameter whose value is merely interpolated into
+#: the prompt emits whichever nonce it was handed. See ``_echoes_argument``.
+_NONCE_IDS = ('probe-nonce-alpha-9f13', 'probe-nonce-beta-4c07')
+
+#: Names that read as "this parameter designates the attach target". An echoing
+#: parameter is forgiven only when it is named for what it designates, because
+#: a real option (b) that names the target in a HEADER
+#: (``'ATTACH TARGET: ' + attach_target_id``) is structurally indistinguishable
+#: from free-text diagnostics that happens to be interpolated — the name is the
+#: only thing separating them. Target-named parameters are also tried FIRST, so
+#: a module carrying both reaches the real one.
+_TARGET_NAME_RE = re.compile(
+    r'target|attach|canonical|winner|chosen|selected|primary|candidate_id',
+    re.IGNORECASE,
+)
 
 
 class _Unverifiable(Exception):
@@ -202,11 +223,27 @@ def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
         inspect.Parameter.KEYWORD_ONLY,
     )
     usable = [p for p in params if p.kind in kinds]
-    return list(enumerate(usable))[2:]
+    beyond = list(enumerate(usable))[2:]
+    # Target-NAMED parameters first, ties broken by position. A module can
+    # carry both an echoing free-text parameter and a real marker; the search
+    # takes the FIRST combination that holds, so the real one has to be
+    # reached first. ``sorted`` is stable, so declaration order survives
+    # within each group.
+    return sorted(beyond, key=lambda item: not _names_a_target(item[1]))
+
+
+def _names_a_target(param: Any) -> bool:
+    """True when *param*'s NAME reads as designating the attach target."""
+    return bool(_TARGET_NAME_RE.search(param.name))
 
 
 def _value_for(candidate: Any, spelling: str) -> Any:
     return candidate.id if spelling == 'id' else candidate
+
+
+def _nonce_candidate(ident: str) -> _Candidate:
+    """A candidate that is in NO slate — the echo control's stand-in target."""
+    return _Candidate(ident, 'a candidate that is not on the slate', {})
 
 
 def _render(
@@ -240,12 +277,78 @@ def _render(
     return rendered, None
 
 
+def _echoes_argument(
+    build: Any,
+    index: int,
+    param: Any,
+    slate: list[Any],
+    spelling: str,
+) -> str | None:
+    """The CONTROL for the option-(b) swap test: is the argument just echoed?
+
+    The swap test asks whether the rendering DEPENDS on which candidate was
+    named. That is necessary and not sufficient: a parameter whose value is
+    merely interpolated into the prompt — free-text diagnostics, a footer note,
+    a trace id — satisfies BOTH swap conditions the moment the probe feeds it a
+    candidate id. The interpolated line mentions an id (condition 1) and each
+    id gains or loses that line (condition 2), while nothing in the module
+    binds a verdict to a candidate. Measured: a judge whose only extra
+    parameter was ``footer_note`` appended as ``'NOTE: ' + str(footer_note)``,
+    with main's flat candidate list and main's bare-str ``parse_judge_verdict``,
+    reported option (b) satisfied and exited 0 — authorising the production
+    flip this gate exists to hold shut. That is the same false-pass class as
+    ``_echoes_payload`` catches in the option-(a) half.
+
+    So render against ids belonging to NO candidate on the slate. An
+    implementation that MARKS the target compares its argument against the
+    slate, matches nothing, and renders the same prompt for either nonce
+    without mentioning either. An echoing parameter emits whichever nonce it
+    was handed, or otherwise lets it perturb the output.
+
+    Returns the reason string when the echo is detected, else ``None``.
+
+    FAILS TOWARDS THE PASS, deliberately, on two counts. A renderer that
+    REFUSES an off-slate target is a validating marker, not an echo, so a raise
+    reports no echo. And an echo is only DISQUALIFYING for a parameter whose
+    name does not designate the attach target (see ``_names_a_target``): a real
+    option (b) that names the target in a header — ``'ATTACH TARGET: ' +
+    attach_target_id`` — echoes its argument in exactly this way, and only the
+    parameter's name separates it from the false pass above.
+    """
+    renders: list[tuple[str, str]] = []
+    for nonce in _NONCE_IDS:
+        rendered, error = _render(
+            build, index, param, slate, _nonce_candidate(nonce), spelling,
+        )
+        if error is not None or rendered is None:
+            return None
+        renders.append((nonce, rendered))
+    for nonce, rendered in renders:
+        if nonce in rendered:
+            return (
+                f'the argument is ECHOED into the prompt, not matched against the '
+                f'slate — rendering with {nonce!r}, which is no candidate on the '
+                f'slate, put {nonce!r} into the prompt verbatim. A parameter that '
+                'MARKS the attach target marks nothing for an id it does not '
+                'recognise; one that merely interpolates its value satisfies the '
+                'swap test without binding any verdict to any candidate'
+            )
+    if renders[0][1] != renders[1][1]:
+        return (
+            f'the argument is ECHOED into the prompt, not matched against the '
+            f'slate — two ids belonging to no candidate ({_NONCE_IDS[0]!r} and '
+            f'{_NONCE_IDS[1]!r}) rendered DIFFERENTLY, so the value perturbs the '
+            'prompt on its own rather than selecting among the candidates'
+        )
+    return None
+
+
 def _search_option_b(
     build: Any,
     slate: list[Any],
     target: Any,
     other: Any,
-) -> tuple[tuple[int, Any, str] | None, list[str], bool]:
+) -> tuple[tuple[int, Any, str, bool] | None, list[str], bool]:
     """Search the (parameter x spelling) space for a combination that holds.
 
     Returns ``(winner, attempts, rendered_any)``.
@@ -261,11 +364,17 @@ def _search_option_b(
       rendered identically for both targets and FAILED.
     * the third parameter is not the only place a target argument can sit.
 
-    So every combination is tried and the FIRST one whose swap test holds
-    wins. A combination the implementation ignores renders identically and is
-    simply not the winner, which costs nothing; only a judge where NO
-    combination holds fails. On failure the whole search is reported, so the
-    operator sees what was tried rather than one arbitrary verdict.
+    So every combination is tried and the first one whose swap test holds AND
+    whose argument survives the echo control (``_echoes_argument``) wins. A
+    combination the implementation ignores renders identically and is simply
+    not the winner, which costs nothing; only a judge where NO combination
+    holds fails. On failure the whole search is reported, so the operator sees
+    what was tried rather than one arbitrary verdict.
+
+    ORDER MATTERS, hence ``_target_parameters`` yields target-NAMED parameters
+    first: a module can carry both an echoing free-text parameter and a real
+    marker, and taking the first combination that holds would otherwise stop at
+    whichever came earlier in the signature.
     """
     attempts: list[str] = []
     rendered_any = False
@@ -283,9 +392,19 @@ def _search_option_b(
             rendered_any = True
             assert rendered_target is not None and rendered_other is not None
             reason = _swap_verdict(slate, target, other, rendered_target, rendered_other)
-            if reason is None:
-                return (index, param, spelling), attempts, rendered_any
-            attempts.append(f'{label} — {reason}')
+            if reason is not None:
+                attempts.append(f'{label} — {reason}')
+                continue
+            # The CONTROL. The swap test cannot tell a parameter that MARKS the
+            # attach target from one that merely echoes whatever it is handed,
+            # because feeding a candidate id to an echoing parameter satisfies
+            # both swap conditions. Only a parameter NAMED for the target is
+            # forgiven an echo, and the report says so out loud.
+            echo = _echoes_argument(build, index, param, slate, spelling)
+            if echo is not None and not _names_a_target(param):
+                attempts.append(f'{label} — {echo}')
+                continue
+            return (index, param, spelling, echo is not None), attempts, rendered_any
     return None, attempts, rendered_any
 
 
@@ -708,6 +827,28 @@ def _rescue_note(slate_ids: list[Any], index: int) -> list[str]:
     ]
 
 
+def _echo_forgiven_note(param: Any) -> list[str]:
+    """Say out loud that this pass rests partly on a parameter's NAME.
+
+    The winning parameter echoed an off-slate id straight into the prompt, so
+    the swap test alone cannot distinguish it from free-text diagnostics that
+    the probe happened to feed a candidate id (see ``_echoes_argument``). It
+    was accepted because its name designates the attach target — a real option
+    (b) that names the target in a header looks exactly like this. Surfacing it
+    keeps the operator from reading a name-assisted pass as a purely behavioural
+    one.
+    """
+    return [
+        f'WARN  ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER: {param.name!r} put an',
+        '      off-slate id into the prompt verbatim rather than matching it against',
+        '      the candidates, so the swap test alone cannot separate it from free',
+        '      text that merely echoes its argument. It is accepted because its NAME',
+        '      designates the attach target (a real option (b) naming the target in a',
+        '      header renders exactly this way). Confirm by eye that the judge prompt',
+        '      genuinely tells the model which candidate the attach will touch.',
+    ]
+
+
 def _probe(src_root: Path, out: list[str]) -> int:
     out.append(f'write_triage attach-target invariant probe — src-root={src_root}')
     module = _import_judge(src_root)
@@ -765,13 +906,15 @@ def _probe(src_root: Path, out: list[str]) -> int:
         out.extend(_rescue_note(slate_ids, index))
         return EXIT_FAIL
 
-    param_index, param, spelling = winner
+    param_index, param, spelling, forgiven_echo = winner
     out.append(
         f'option (b): satisfied — build_judge_prompt accepts an attach target via '
         f'{param.name!r} (parameter {param_index}, spelled as the candidate '
         f'{spelling}) and its rendering depends on which candidate is the attach '
         'target',
     )
+    if forgiven_echo:
+        out.extend(_echo_forgiven_note(param))
     out.append(
         'PASS  the judge path binds a verdict to a determinate candidate '
         '(option (b)).',
