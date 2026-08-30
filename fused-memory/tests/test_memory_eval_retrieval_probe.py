@@ -4253,18 +4253,6 @@ class TestObservationDepthIsHonest:
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
 
-    def test_one_run_reports_the_same_depth_across_every_family(self):
-        """Record-level statement of 'one run, one scored depth': contamination,
-        claims and inversions must never disagree about what depth was scored."""
-        observations = self._observe((10,))
-
-        depths = (
-            {o.k for o in observations.contamination}
-            | {o.k for o in observations.claims}
-            | {o.k for o in observations.inversions}
-        )
-        assert len(depths) == 1
-
 
 class TestInversionFamilyIsPinnedToScoredDepth:
     """The inversion/comparable-pair family is scored at ``scored_k``, not the
@@ -4288,9 +4276,10 @@ class TestInversionFamilyIsPinnedToScoredDepth:
 
     def test_a_pair_visible_only_beyond_the_scored_depth_is_not_comparable(self):
         """A deeper fetch must not widen the family: both members return only
-        beyond the tripwire depth (rank 6, 7 at ks=(10,)). This is the failing
-        assertion today: at full fetch depth the pair is comparable and
-        6 < 7 fires one inversion."""
+        beyond the tripwire depth (ranks 6 and 7 at ks=(10,)); at full fetch
+        depth this pair would be comparable and 6 < 7 would fire an
+        inversion, which is precisely what the scored-depth pin must
+        suppress."""
         observations = self._observe(superseded_rank=6, successor_rank=7)
 
         assert observations.inversions
