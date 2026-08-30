@@ -1826,9 +1826,12 @@ def _reject_contradictory_metadata_mode(
     ``sqlite_task_backend.py::_resolve_metadata_mode``, so without this every
     orchestrator caller would be permanently exempt from any backend-side
     rejection of it.  Task 3581 is the sibling backend fix for the same
-    contradiction one layer down; it is unmerged at the time of writing, so
-    this guard is currently the ONLY one that exists on this path — do not read
-    it as redundant belt-and-braces.
+    contradiction one layer down, and it HAS landed — but that does not make
+    this one redundant belt-and-braces: because ``append`` never reaches the
+    wire, 3581's guard is structurally unreachable from any orchestrator
+    caller.  Exactly one guard fires per path — this one for orchestrator
+    callers, 3581's for direct-MCP callers (interactive / curator / recon) —
+    so removing either would leave its path unguarded.
 
     Deliberately exactly one cell wide: ``('replace', True)`` (the sanctioned
     destructive co-signal) and ``('additive', True)`` (both signals agree) stay
