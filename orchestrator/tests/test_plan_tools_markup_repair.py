@@ -841,6 +841,50 @@ class TestRepairableFieldTable:
             'itself already claims write a repairable cell'
         )
 
+    def test_an_undeclared_plan_writer_cannot_escape_the_sweep(self, tmp_path, monkeypatch):
+        """Pins the contract of ``_undeclared_alternates`` — the property
+        nothing checks today, since the completeness sweep's candidate set
+        was, until now, a hand-maintained tuple that a new writer could be
+        left out of.
+
+        (a) COMPLETENESS: a plan writer that exists but is declared nowhere
+        is actually caught.
+        (b) LOUD-ON-UNKNOWN-PARAMETER: a parameter the probe cannot
+        synthesize halts the sweep with an actionable finding rather than
+        silently skipping the tool — a skip would just reopen the same
+        completeness hole this task exists to close.
+        """
+
+        def _probe_writer(artifacts, description):
+            plan = artifacts.read_plan()
+            plan['steps'][0]['description'] = description
+            artifacts.write_plan(plan)
+            return {'status': 'ok'}
+
+        # The honest simulation of "a function defined in plan_tools": the
+        # derivation's __module__ guard would otherwise exclude a function
+        # defined in this test module.
+        _probe_writer.__module__ = plan_tools.__name__
+        monkeypatch.setattr(plan_tools, '_probe_writer', _probe_writer, raising=False)
+
+        undeclared = _undeclared_alternates(tmp_path / 'completeness', monkeypatch)
+        assert ('probe_writer', 'steps', 'description') in undeclared
+
+        def _probe_flavoured(artifacts, description, flavour):
+            plan = artifacts.read_plan()
+            plan['steps'][0]['description'] = description
+            artifacts.write_plan(plan)
+            return {'status': 'ok'}
+
+        _probe_flavoured.__module__ = plan_tools.__name__
+        monkeypatch.setattr(plan_tools, '_probe_flavoured', _probe_flavoured, raising=False)
+
+        with pytest.raises(AssertionError) as exc_info:
+            _undeclared_alternates(tmp_path / 'unknown-param', monkeypatch)
+        message = str(exc_info.value)
+        assert 'probe_flavoured' in message
+        assert 'flavour' in message
+
 
 # ---------------------------------------------------------------------------
 # step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
