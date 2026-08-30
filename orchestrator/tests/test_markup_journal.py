@@ -556,3 +556,116 @@ class TestMemoizationIsAsymmetric:
 
         assert len(calls) == 1
         assert [line['param'] for line in journal_lines(tmp_path)] == ['first', 'second']
+
+
+# ---------------------------------------------------------------------------
+# The BOUND — what makes the O_APPEND atomicity premise sound, not assumed.
+# ---------------------------------------------------------------------------
+
+
+class TestTheLineIsBounded:
+    """A single ``os.write`` on an O_APPEND fd is atomic only while it is SMALL.
+
+    Every row above rests on that atomicity, and the payloads this guard sees
+    are measured in tens of KB. So the bound is ENFORCED here rather than
+    assumed: an over-budget record degrades to a shorter, still-valid,
+    still-identity-carrying line, which is strictly better than either a torn
+    line or a silently dropped one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_huge_pattern_still_yields_one_bounded_line(self, tmp_path):
+        """(a) The measured payloads reach tens of KB; the line must not."""
+        sink = build_sink(tmp_path)
+        huge = 'x' * 10_000
+
+        await sink(make_fact(pattern=huge, misclose=huge))
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert raw.count(b'\n') == 1, 'one event is one line, however big it was'
+        assert len(raw) <= markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision', 'still a complete record'
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_field_is_a_prefix_and_is_disclosed(self, tmp_path):
+        """(b) A trimmed value must be tellable from a short one."""
+        sink = build_sink(tmp_path)
+        huge = 'y' * 10_000
+
+        await sink(make_fact(pattern=huge))
+
+        (line,) = journal_lines(tmp_path)
+        cap = markup_journal.MARKUP_JOURNAL_MAX_FIELD_CHARS
+        assert line['pattern'] == huge[:cap], (
+            'a PREFIX of what was sent, never a rewrite — the same discipline '
+            "the middleware's own repair keeps"
+        )
+        assert 'pattern' in line['journal_truncated']
+        assert 'misclose' not in line['journal_truncated'], (
+            'a field that fit must not be reported as trimmed, or the marker '
+            'stops meaning anything'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_huge_recovered_params_list_is_capped_and_disclosed(self, tmp_path):
+        """(c) The one list field the middleware emits, bounded by COUNT."""
+        sink = build_sink(tmp_path)
+
+        await sink(make_fact(recovered_params=[f'p{i}' for i in range(5_000)]))
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert len(raw) <= markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES
+        (line,) = journal_lines(tmp_path)
+        assert len(line['recovered_params']) == markup_journal.MARKUP_JOURNAL_MAX_LIST_ITEMS
+        assert 'recovered_params' in line['journal_truncated']
+
+    @pytest.mark.asyncio
+    async def test_the_overflow_floor_keeps_a_record_rather_than_dropping_it(
+        self, tmp_path
+    ):
+        """(d) A shape a future middleware could grow — many keys, each small.
+
+        Per-field caps cannot bound this one, so there has to be a floor under
+        them. A record must never be dropped and must never be written torn:
+        dropping it is the exact fail-soft this whole PRD exists to end.
+        """
+        sink = build_sink(tmp_path)
+        sprawl = {f'future_key_{i}': f'value-{i}' for i in range(2_000)}
+
+        await sink(make_fact(**sprawl))
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert raw.count(b'\n') == 1
+        assert len(raw) <= markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES
+        (line,) = journal_lines(tmp_path)
+        assert line['journal_overflow'] is True, (
+            'the marker is what tells an operator this line is the floor and '
+            'not the whole record'
+        )
+        for key in ('ts', 'server', 'subject_task_id', 'tool', 'param', 'outcome'):
+            assert key in line, f'{key} is identity — the floor must still carry it'
+        assert line['subject_task_id'] == '4744'
+        assert line['tool'] == 'add_design_decision'
+        assert line['outcome'] == 'rejected'
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_record_is_nowhere_near_the_bound(self, tmp_path):
+        """(e) A regression pin: the caps must never tighten onto the normal path.
+
+        The measured leak is a realistic fact, and if the ordinary case ever
+        starts brushing the bound the journal quietly stops carrying the very
+        fields it was built to carry.
+        """
+        sink = build_sink(tmp_path)
+
+        await sink(make_fact())
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_bytes()
+        assert len(raw) < markup_journal.MARKUP_JOURNAL_MAX_LINE_BYTES // 2
+        (line,) = journal_lines(tmp_path)
+        assert 'journal_truncated' not in line, (
+            'an untrimmed record carries no trim marker at all, so the key '
+            "means \"something was cut\" rather than \"this emitter ran\""
+        )
+        assert 'journal_overflow' not in line
