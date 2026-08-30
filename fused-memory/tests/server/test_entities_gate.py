@@ -158,3 +158,137 @@ class TestMalformedDeclarationsAreRejected:
         block = entities_gate([{'id': 'abc'}], content=_CITES_3127, group_id=GROUP)
 
         assert json.loads(json.dumps(block)) == block
+
+
+class TestConflictingDeclarationsAreRejected:
+    """The leaf's user-observable signal: a declaration its own prose refutes.
+
+    Every case here reaches ``_conflicting_referents``, whose four documented
+    choices this class pins from the OUTSIDE — the scoping rules are gamma's,
+    and what delta adds is that a non-empty ``.conflicts`` blocks the write and
+    names BOTH sides of the disagreement (INV-2, structured-facts-at-failure).
+    """
+
+    def test_the_prd_headline_row_blocks_and_names_both_sides(self):
+        """Content says 3127, the caller declared 3129: the adjacent-number
+        typo this PRD exists to catch."""
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}],
+            content=_CITES_3127,
+            group_id=GROUP,
+            agent_id='claude-interactive',
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['error'] == 'declared_referent_conflict', f'{block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['agent_id'] == 'claude-interactive', f'{block!r}'
+        assert block['content_excerpt'] == _CITES_3127[:200], f'{block!r}'
+        assert block['hint'], f'a rejection with no remediation is a dead end: {block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['declared'] == ['Task 3129'], f'{block!r}'
+        assert block['content_referents'] == ['Task 3127'], f'{block!r}'
+
+    def test_the_conflict_block_is_json_safe(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert json.loads(json.dumps(block)) == block
+
+    def test_an_ambiguous_only_scan_still_names_the_content_side(self):
+        """The correctness trap, and the reason the content side is
+        ``refs + ambiguous`` rather than ``refs``.
+
+        This content claims 2500 BOTH bare and foreign-qualified, so
+        ``scan_content`` routes both spellings to ``LabelScan.ambiguous`` and
+        leaves ``.refs`` EMPTY (the fixture is
+        tests/test_canonical_labels.py's own ambiguity split, reused rather
+        than reinvented).  ``_conflicting_referents`` tests membership against
+        ``refs | ambiguous``, so the scan still "saw this kind" and the
+        declaration still conflicts — but a block reporting ``refs`` alone
+        would say the content cites NOTHING while rejecting the write for
+        contradicting the content, which reads as a guard malfunction rather
+        than a decision.
+        """
+        content = 'dark_factory:2500 blocks task 2500 here'
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=content, group_id='reify',
+        )
+
+        assert isinstance(block, dict), f'the ambiguous scan did not reject: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['content_referents'], (
+            f'the content side must never be empty beside a conflict: {block!r}'
+        )
+        assert block['content_referents'] == ['dark_factory:2500', 'Task 2500'], f'{block!r}'
+
+    def test_a_declaration_that_resolves_an_ambiguity_does_not_conflict(self):
+        """Naming an ambiguous referent SETTLES the contest the prose left
+        open — gamma's choice 3, and the single most useful thing a
+        declaration can do."""
+        assert entities_gate(
+            [{'kind': 'task', 'id': 2500}],
+            content='dark_factory:2500 blocks task 2500 here',
+            group_id='reify',
+        ) is None
+
+    def test_the_project_axis_conflicts_and_spells_the_foreign_node_name(self):
+        """The cross-project collapse this PRD exists to detect.
+
+        The prose names a BARE 'Task 3127', which is own-project by definition
+        — the local project is the default namespace of the prose.  Declaring
+        the same number under a FOREIGN project is therefore a contradiction,
+        not silence, and the block must spell it 'reify:3127' rather than
+        'Task 3127' or the reader cannot see what the disagreement IS.
+        """
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3127, 'project_id': 'reify'}],
+            content=_CITES_3127,
+            group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the project axis did not reject: {block!r}'
+        assert block['declared'] == ['reify:3127'], f'{block!r}'
+        assert block['conflicts'] == ['reify:3127'], f'{block!r}'
+        assert block['content_referents'] == ['Task 3127'], f'{block!r}'
+
+    def test_a_foreign_declaration_the_prose_never_mentions_does_not_conflict(self):
+        """Gamma's choice 2: the scan reaches a foreign task ONLY through an
+        explicit qualifier, so its silence about that project is silence, not
+        disagreement.  Read as contradiction, this rejected an honest write
+        whenever ANY local task number happened to appear in the prose."""
+        assert entities_gate(
+            [{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        ) is None
+
+    def test_a_multi_entry_partial_conflict_names_only_the_contradicted_entry(self):
+        """The per-referent verdict, not a set-level disjointness one.
+
+        3127 corroborates and 3129 is the adjacent-number typo; a
+        "declared and scanned are disjoint" verdict would pass this write.
+        ``declared`` still lists BOTH, so the agent can see what it sent
+        beside what was refused.
+        """
+        block = entities_gate(
+            [{'id': 3127}, {'id': 3129}], content=_CITES_3127, group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the partial conflict did not reject: {block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['declared'] == ['Task 3127', 'Task 3129'], f'{block!r}'
+
+    def test_a_self_qualified_declaration_is_not_a_conflict(self):
+        """Gamma reclassifies a declaration qualified with the LOCAL project to
+        an own-project referent, exactly as ``scan_content`` does.  Without
+        that, a caller who was right could never compare equal to the scanned
+        form."""
+        assert entities_gate(
+            [{'id': 3127, 'project_id': 'dark_factory'}],
+            content=_CITES_3127,
+            group_id=GROUP,
+        ) is None
