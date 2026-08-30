@@ -698,3 +698,133 @@ consumer was a banding or spend decision is now unreachable. Each item is marked
 **Carrying these discharges γ1's directive in full. None of them changes anything in §8.**
 Item 1 is load-bearing for §6 and was re-verified in code; items 3, 5 and 6 are retained as
 inputs the redesign should inherit; items 2 and 4 are recorded as closed.
+
+---
+
+## 8. Finding and recommendation
+
+_**INTERPRETATION — the only interpretive section in this record.** Everything above (§2-§7)
+is raw observation; this is where this record exercises judgment._
+
+### The finding
+
+**Ratifying ruling A: tranche 1 is a POSITIVE result on decline-consistency and a NULL
+result on the capability question.**
+
+The no-plan band is **decline-shaped, not incapability-shaped**. On the large majority of
+these fixtures the correct architect behaviour *is* to decline via the mandated plan-tools
+protocol, and §3 shows both arms overwhelmingly do so correctly — 47 of 53 cells, after
+substantive investigation, through the server-accepted protocol, on grounds adversarially
+verified true in every checked case. They did not fail to plan. They declined to, and they
+were right to.
+
+Scoring these cells as `plan_steps > 0` therefore **measured the wrong construct**. A fixture
+where declining is correct registers identically to one the architect genuinely could not
+plan. §3e is the sharpest illustration available: two cells — one per arm, on the same
+fixture — built and confirmed complete 6-step plans and then declined, with the fable cell
+explicitly instructing that its own plan "should be disregarded." Both score `plan_steps > 0`.
+Neither produced a usable plan.
+
+> **This is a REAL, INFORMATIVE result — not a failed, wasted, or void run.** It establishes
+> something worth knowing about both arms: on tasks that should not be planned, they
+> reliably recognise it and exit correctly, with true grounds. The remaining spend a full
+> 66-cell tranche would have added was **correctly not chased**, because it would only have
+> bought more measurements of decline-consistency on a band already answered.
+
+> **Equally plainly: this record is evidence NEITHER FOR NOR AGAINST fable's planning
+> capability.** Δ = −0.0556 (§4) is a fact about the band, not the candidates. The
+> validity-bounded `plan_quality` figures rest on n=2 per arm with no paired fixture (§5e).
+> Anyone citing this tranche as showing "fable does not unlock these tasks" — or as showing
+> that it does — is misreading it.
+
+**Two structural causes, without which the finding is not legible** (`FINDINGS.md` Answer 4.1):
+
+1. **The band was mis-defined at selection.** γ1's "incumbent failed to plan" cells were
+   verified: **10 of 11 were explicit protocol declines** (5 false-premise, 3 blocking, 2
+   already-done). The 11th, `reify_task_12`, was a **pure infra failure** — a 401 auth error
+   plus a dropped connection mid-exploration — so no architect judgment ever occurred and its
+   γ1 `plan_steps=0` carries **no information at all**. The band was never "tasks the
+   incumbent cannot plan"; it was "tasks a correct architect declines," plus one dropped
+   connection. **The hypothesis was untestable on this band from the start.** §4d's
+   well-posed-subset diagnostic is the same fact arriving from the data side: the premise
+   fails on 5 of 9 fixtures.
+2. **The eval environment contradicts its own premise.** The fixture pins a historical base
+   commit, but the eval worktree **shares the live repo's object DB and refs** by
+   construction, and ambient MCP exposes the **live task DB and escalation queue**. An
+   architect can therefore observe that the fixture's task landed on main months ago, that
+   its live status is `done` with `done_provenance`, or that the escalation server rejects
+   filings because the task is terminal. Nothing in the briefing says "this is a historical
+   replay; plan as if main were at base." **An architect that investigates honestly is
+   *required by its role contract* to report already-done.** The declines are the models
+   doing exactly what their role commands, in the environment they were given.
+
+### Recommendation
+
+**Per ruling C:**
+
+1. **Fold the 53 completed cells into FORENSIC-ONLY status** — retained as decline-consistency
+   evidence, **not usable as capability data**. §1 states this as the record's standing.
+2. **Run NO further cells under the 66-cell tranche-1 design.** That design is **superseded,
+   not paused**, by the redesigned eval set Leo is drafting. The 13 unrun cells will never be
+   run.
+3. **Redirect all future capability-testing work to that redesign.**
+
+**Instrument fixes the redesign should inherit** (`FINDINGS.md` Answers 4.3/4.4, plus §7's
+retained errata):
+
+- **Split `plan_steps = 0` by terminal cause.** Persist the terminal `report_*` artifact kind
+  into the result JSON. The plan-tools server **already writes these artifacts**; only the
+  metrics plumbing ignores them, and `cleanup_eval_worktree` then destroys them (§2e). This
+  is the cheapest durable fix and it is the one without which planRate cannot be read as
+  capability on *any* future tranche.
+- **Score declines as their own outcome class, validated against ground truth.** A decline on
+  a fixture whose reference diff landed under the same task id is **correct**, not failed.
+- **Isolate the replay, or explicitly brief the architect that it is one** — already tracked
+  as **task 4844** (pending), which makes exactly this design choice and enforces it across
+  all three architect-eval prompt-building call paths.
+- **Fix the fixture pipeline:** the `timestamp_walk` base fallback (bases up to **1,322**
+  commits stale) and the reference-merge matcher (misses `"Merge task/NNNN: …"` subjects,
+  which needlessly downgraded `reify_task_4026` to planRate-only scoring).
+- **Exclude fixtures whose task landed under its own id** as unplannable-by-design — verified
+  for 2324, 2699, 2573, 2778, 2531, 2260 and 4026.
+- **Mint the cheap valid-reference anchor population** γ1 missed (§7 item 3) — §5e's binding
+  limitation is precisely a shortage of validly-referenced cells, and a population of 14 was
+  available at zero extra spend.
+- **Do not inherit un-sourced cost parameters** (§7 item 6).
+
+### What this record does NOT do
+
+> **NO CONFIG FLIP IS APPLIED OR RECOMMENDED BY THIS RECORD.** `routing.allowed_models`, the
+> routing ladder and the per-model ceilings are **byte-unchanged**. No task status is written
+> by this record. No admission decision is taken.
+>
+> **Admission remains Leo-ratified downstream at η (task 3637)**, on the evidence assembled
+> here. This record produces evidence and a recommendation only — and its recommendation is
+> about the *eval design*, not about admission, because §8's finding is that this tranche
+> **cannot** answer the admission question in either direction.
+
+### A side-finding, stated separately
+
+Independent of the admission question, and material: **eval cells write into live production
+stores.** From the no-plan cells of this campaign alone (`FINDINGS.md` §Side-findings): **36
+`add_memory` calls** into live fused-memory (7 fable / 29 incumbent), **7 `escalate_info`
+filings**, **3 `submit_task` calls**, and tickets that entered the **live triage flow** — two
+were folded into pending task **3735**, and a curator dedup ticket already exists for 3
+near-duplicate memories the eval cells wrote about the same gotcha. **None carries an
+eval-provenance tag**, and repeated trials of the same fixture triple-file the same finding.
+
+The root cause is verified in code: `run_architect_eval` injects only plan-tools but leaves
+`strict_mcp_config` **False**, so the CLI merges the worktree's own checked-in `.mcp.json`,
+which points at the live production escalation and fused-memory servers. The eval profile
+carefully null-routes the *harness's* fused-memory client and leaves the *agent's* ambient
+MCP live — **the isolation intent exists and covers the wrong client.**
+
+Here it was serendipitously *useful*: two real, still-live defects surfaced by the eval
+architects on `df_task_2260` are now genuinely tracked (task 3735 names both). That does not
+make it safe. **The redesign must close it.**
+
+**Already tracked — no new task filed.** This is **task 4757**, *"Cut eval agents off from
+live production MCP — eval runs write into live fused-memory, escalations and the task DB"*
+(status `pending`, priority `high`, filed 2026-08-26), whose description cites this same
+evidence and the same verified root cause. This record confirms the finding rather than
+re-filing it; filing a duplicate would fragment the lane.
