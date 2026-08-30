@@ -50,6 +50,8 @@ _BYTE_IDENTICAL = 'byte-identical'
 _MARKS_FIRST = 'distinguishes slate[0]'
 _SWAP_HELD = 'rendering depends on which candidate is the attach target'
 _OPTION_A_HELD = 'the verdict itself names its candidate'
+_ECHOED = 'ECHOED into the prompt'
+_ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +429,65 @@ def parse_judge_verdict(raw, candidate_ids=None):
         raise ValueError('verdict names a candidate outside the slate')
     return (verdict, candidate_id)
 ''',
+    # A FALSE PASS in the option-(b) half, symmetric to `echoes_payload` in the
+    # option-(a) half. The extra parameter is free-text diagnostics that is
+    # merely INTERPOLATED into the prompt; nothing in the module binds a verdict
+    # to a candidate, and the candidate list stays flat and undifferentiated.
+    # Both swap conditions are nevertheless met when the probe feeds it a
+    # candidate id — the NOTE line mentions an id, and each id's footprint
+    # gains/loses that line — so an unguarded search blesses it and authorises
+    # the production flip.
+    'echoed_free_text': r"""
+
+def build_judge_prompt(content, candidates, *, footer_note=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    if footer_note is not None:
+        lines.append('NOTE: ' + str(footer_note))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
+    # The same echoing shape, but the module ALSO carries a real target-named
+    # marker parameter. The search must reach the real one rather than stopping
+    # at the first parameter whose swap test happens to hold.
+    'echoed_free_text_plus_real_target': r"""
+
+def build_judge_prompt(content, candidates, *, footer_note=None, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    if footer_note is not None:
+        lines.append('NOTE: ' + str(footer_note))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
+    # A REAL option (b) that names the target in a HEADER rather than marking it
+    # in the list. Structurally this echoes its argument exactly like
+    # `echoed_free_text` does — the ONLY thing separating them is that the
+    # parameter is named for what it designates. It must still pass.
+    'target_named_header': r"""
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '']
+    lines.append('THE ATTACH TARGET IS: ' + str(attach_target_id))
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
 }
 
 
@@ -549,6 +610,51 @@ class TestSwapAndRescuePath:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, f'probe pinned prompt wording:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
+
+
+class TestEchoedArgumentIsNotATarget:
+    """A parameter whose value is merely INTERPOLATED into the prompt is not an
+    attach target, however well it satisfies the swap test.
+
+    Reviewer-reported false pass (esc-4810-6), symmetric to the
+    ``echoes_payload`` control in the option-(a) half: feed a candidate id into
+    ANY free-text parameter that reaches the rendering and both swap conditions
+    hold — a differing line mentions a candidate id, and each id's footprint
+    gains or loses that line — while nothing in the module binds a verdict to a
+    candidate. Exit 0 there would authorise the production ``write_triage``
+    flip the whole gate exists to hold shut.
+
+    The discriminator is a NONCE CONTROL: render against an id that is in no
+    candidate's slate. A genuine marker matches it against the slate, marks
+    nothing, and renders exactly as it would for any other unknown id; an
+    echoing parameter emits the nonce verbatim. Because a target named in a
+    HEADER echoes its argument too, an echo is forgiven only when the parameter
+    is NAMED for what it designates — and the report says so out loud.
+    """
+
+    def test_echoed_free_text_parameter_does_not_satisfy_option_b(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='echoed_free_text')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'probe blessed an echoed free-text parameter:\n{proc.stdout}'
+        assert _INDETERMINATE in proc.stdout, proc.stdout
+        assert _ECHOED in proc.stdout, proc.stdout
+
+    def test_search_reaches_the_real_target_past_the_echoing_parameter(self, tmp_path):
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='echoed_free_text_plus_real_target',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe failed a real fix:\n{proc.stdout}\n{proc.stderr}'
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+        assert "'attach_target_id'" in proc.stdout, proc.stdout
+
+    def test_target_named_header_still_passes_but_is_flagged(self, tmp_path):
+        """Echoing is forgiven for a target-NAMED parameter, and reported."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='target_named_header')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+        assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
 
 
 class TestOptionAAcceptance:
