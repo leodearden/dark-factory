@@ -52,7 +52,7 @@ from test_verify_merge_flake_suppression import (
     _module_config,
 )
 
-from orchestrator import verify
+from orchestrator import flake_recorder, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_gates import PostMergePyrightResult
@@ -108,10 +108,15 @@ def _failing_rerun_result() -> VerifyResult:
 def _reset_suppression_streak():
     """The INV-4 streak is a module global; reset it around every test here so
     a threshold assertion measures THIS test's suppressions only.
+
+    It lives on ``flake_recorder`` after task ε.  Poking ``verify`` instead would
+    not fail — it would CREATE a new attribute there and quietly stop resetting the
+    real counter, leaving every test in this file order-dependent on the ones
+    before it.
     """
-    verify._merge_flake_suppression_streak = 0
+    flake_recorder._merge_flake_suppression_streak = 0
     yield
-    verify._merge_flake_suppression_streak = 0
+    flake_recorder._merge_flake_suppression_streak = 0
 
 
 async def _drive_merge_boundary(
@@ -258,7 +263,7 @@ class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
         """(c1) The suppression bumps the INV-4 streak — the fail-soft path is
         not escape-less."""
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        assert verify._merge_flake_suppression_streak == 0
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
         outcome = await _drive_merge_boundary(
             tmp_path, task_id='c1', breadth='full',
@@ -267,7 +272,7 @@ class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
         )
 
         assert outcome is None
-        assert verify._merge_flake_suppression_streak == 1, (
+        assert flake_recorder._merge_flake_suppression_streak == 1, (
             'a confirmed suppression at the merge boundary must advance the '
             'storm streak by exactly 1'
         )
@@ -282,7 +287,7 @@ class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
         the bump helper.
         """
         mc_alpha, _mc_beta, registry = self._two_module_registry()
-        threshold = verify._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+        threshold = flake_recorder._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
         queue = _FakeEscalationQueue(open_l2=None)
 
         for i in range(threshold):
@@ -297,11 +302,11 @@ class TestUntouchedModuleRedIsSuppressibleAtTheMergeBoundary:
             f'got {len(queue.submitted)}'
         )
         esc = queue.submitted[0]
-        assert esc.task_id == verify._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
+        assert esc.task_id == flake_recorder._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
         assert esc.task_id == 'merge-flake-suppression-storm'
         assert esc.severity == 'critical'
         assert esc.level == 2
-        assert verify._merge_flake_suppression_streak == 0, (
+        assert flake_recorder._merge_flake_suppression_streak == 0, (
             'the window must reset so the counter cannot grow unbounded'
         )
 
@@ -338,7 +343,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert verify._merge_flake_suppression_streak == 0
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
     # -- (ii) empty registry: safe degrade ------------------------------------
 
@@ -358,7 +363,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert verify._merge_flake_suppression_streak == 0
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
     # -- (iii) a red in NO registered module: still fail-closed ---------------
 
@@ -380,7 +385,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert verify._merge_flake_suppression_streak == 0
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
     # -- (iv) a GENUINE red in an untouched module: never suppressed ----------
 
@@ -406,7 +411,7 @@ class TestMergeBoundarySuppressionControls:
         assert isinstance(outcome, MergeOutcome)
         assert outcome.status == 'blocked'
         assert _suppression_events(store) == []
-        assert verify._merge_flake_suppression_streak == 0
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
 
 # ---------------------------------------------------------------------------
