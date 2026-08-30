@@ -52,6 +52,8 @@ _SWAP_HELD = 'rendering depends on which candidate is the attach target'
 _OPTION_A_HELD = 'the verdict itself names its candidate'
 _ECHOED = 'ECHOED into the prompt'
 _ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
+_BARE_STR = 'returns a bare str'
+_OUTSIDE_SRC_ROOT = 'outside --src-root'
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +657,57 @@ class TestEchoedArgumentIsNotATarget:
         assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+
+
+class TestDiagnosticsAndProvenance:
+    """Two properties that do not change any verdict but decide whether the
+    verdict can be TRUSTED and ACTED ON: the report has to name the real
+    reason, and the module measured has to be the one the ref shipped.
+
+    Both were reported as suggestions on review cycle 4.
+    """
+
+    def test_bare_str_gets_its_own_diagnostic(self, tmp_path):
+        """main's actual shape must be reported as such, not as 'inconclusive'.
+
+        A bare-str ``parse_judge_verdict`` sets the bare-str flag AND fails
+        ``_binds_candidate``, so it also lands in the inconclusive bucket. If
+        the inconclusive bucket is consulted first, the specific, actionable
+        message ('the verdict names no candidate') is dead code and the single
+        most common real-world case gets the least legible diagnostic --
+        against a gate whose whole job is to tell an operator what to fix.
+        """
+        src_root = _write_fake_judge(tmp_path / 'src', variant='flat')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, proc.stdout
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
+        assert _BARE_STR in proc.stdout, (
+            'the bare-str case must name itself, not hide behind the generic '
+            f'inconclusive bucket:\n{proc.stdout}'
+        )
+
+    def test_sibling_directory_extending_the_root_is_not_inside_it(self, tmp_path):
+        """``--src-root <r>`` must measure a module UNDER <r>, not one whose
+        path merely starts with <r>'s characters.
+
+        A raw string-prefix guard accepts ``<r>-installed/...`` for
+        ``--src-root <r>``, so the probe can report on a module the ref never
+        shipped -- precisely the substitution the guard exists to catch. Here
+        the ref's own tree carries NO judge at all while a path-extending
+        sibling carries a passing one, so a prefix-matching guard exits 0 on
+        evidence from the wrong tree.
+        """
+        root = tmp_path / 'src'
+        root.mkdir()
+        sibling = tmp_path / 'src-installed'
+        _write_fake_judge(sibling, variant='by_id')
+        proc = _run_probe(root, env={'PYTHONPATH': str(sibling)})
+        assert proc.returncode != 0, (
+            'the probe measured a module outside the ref it was pointed at:\n'
+            f'{proc.stdout}'
+        )
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+        assert _OUTSIDE_SRC_ROOT in proc.stdout, proc.stdout
 
 
 class TestOptionAAcceptance:
