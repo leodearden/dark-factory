@@ -2420,6 +2420,214 @@ def _assert_logged_loudly(caplog) -> None:
     assert all(r.exc_info is not None for r in records)
 
 
+class _PartialTaskClient:
+    """An old or half-migrated adapter: it has ``submit_task`` and nothing else.
+
+    Not a contrived fault — ``chronic_flake``'s adapter shipped with exactly this
+    surface before step-10 grew it, and a client project pinning an older orchestrator
+    would hand one in.  ``AttributeError`` is the shape that arrives, and B12 says it
+    must cost one signal, not a merge.
+    """
+
+    def __init__(self) -> None:
+        self.submit_calls: list[dict] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        self.submit_calls.append(arguments)
+        return 'task-partial'
+
+
+@pytest.mark.asyncio
+class TestOpenDebtInvariantDegrades:
+    """B12 applied to the new filing path, plus INV-3's fail-safe DIRECTION.
+    ASYNC-ONLY CLASS.
+
+    The merge path has no ``VerifyInfraError`` handler, so an uncaught raise here stalls
+    the merge queue: a ledger failure must never fail a verify or a merge.  Every case
+    below degrades to an honest value and logs LOUDLY with ``exc_info``.
+
+    The DIRECTION of the failure matters as much as the fact of it.  Unlike
+    ``chronic_flake._has_open_dedup_match``, which fails OPEN towards filing, an
+    unreadable status here must NOT file: there, a duplicate is bounded by
+    ``FilingLedger``'s multi-day per-test rate limit; here there is no rate limit, so a
+    transient MCP outage during a suppression burst would file one duplicate per
+    suppression.  And INV-3 says corroborate BEFORE acting — an unreadable status is not
+    evidence the owner went terminal, so filing on it is acting on a FAILED
+    corroboration.  A missed filing is cheaply recoverable (the next suppression of the
+    same test retries); a duplicate task tree is not.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def _seed(self, db_path: Path, owner: str = 'task-901') -> None:
+        from orchestrator.flake_ledger import open_debt
+
+        seeder = _FakeTaskClient(submit_returns=owner)
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
+        assert _owner(db_path, self.TEST_ID) == owner
+
+    async def test_a_failed_corroboration_does_not_file(self, tmp_path: Path, caplog) -> None:
+        """The fail-safe direction, pinned: a raising ``get_statuses`` KEEPS the stored
+        owner and files nothing."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses_raises=RuntimeError('mcp unreachable'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+            )
+
+        assert client.submit_calls == []
+        assert client.commit_calls == []
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+        _assert_logged_loudly(caplog)
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'submit_raises': RuntimeError('submit blew up')},
+            {'submit_returns': ''},
+            {'submit_returns': None},
+        ],
+        ids=['raises', 'empty_id', 'none_id'],
+    )
+    async def test_a_failed_filing_leaves_no_owner(
+        self, tmp_path: Path, caplog, kwargs: dict
+    ) -> None:
+        """A filing that did not produce a usable id must leave the column NULL — which
+        is exactly what ``flake_report`` renders as ``*** NO OWNER (invariant breach)
+        ***`` and counts in ``unowned_tests``.  Storing an empty string instead would
+        hide the breach behind a truthy-looking value."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(**kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert client.commit_calls == []
+        assert _owner(db_path, self.TEST_ID) is None
+        assert row is not None
+        assert row.test_id == self.TEST_ID
+        assert row.owner_task_id is None
+        _assert_logged_loudly(caplog)
+
+    async def test_a_failed_commit_still_stores_the_owner(self, tmp_path: Path, caplog) -> None:
+        """ORDERING PICKS WHICH FAILURE IS SURVIVABLE.  The task really was created, so
+        losing the pointer would orphan it — invisible, unreferenced, and re-created on
+        the next suppression.  Writing the pointer FIRST means the worst case is a row
+        pointing at a ``deferred`` task, which ι renders (owner shown) and which the next
+        suppression repairs."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(
+            submit_returns='task-905', commit_raises=RuntimeError('commit_planning failed')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert len(client.submit_calls) == 1
+        assert _owner(db_path, self.TEST_ID) == 'task-905'
+        assert row is not None and row.owner_task_id == 'task-905'
+        _assert_logged_loudly(caplog)
+
+    async def test_a_failed_commit_is_retried_not_refiled(self, tmp_path: Path) -> None:
+        """The other end of the same loop: the next suppression finds the stored id
+        ``deferred`` and FINISHES the filing rather than starting a second one.  Without
+        the pairing above this would be untested end to end — a row whose pointer was
+        dropped would look identical to a fresh row and file forever."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        broken = _FakeTaskClient(
+            submit_returns='task-905', commit_raises=RuntimeError('commit_planning failed')
+        )
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=broken, now=self.NOW)
+
+        recovered = _FakeTaskClient(statuses={'task-905': 'deferred'})
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=recovered, now=self.LATER
+        )
+
+        assert recovered.submit_calls == []
+        assert recovered.commit_calls == [['task-905']]
+        assert _owner(db_path, self.TEST_ID) == 'task-905'
+
+    async def test_a_partial_client_degrades_on_the_filing_path(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """No ``commit_planning`` at all — an ``AttributeError``, not an exception the
+        client chose to raise."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _PartialTaskClient()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert row is not None and row.test_id == self.TEST_ID
+        _assert_logged_loudly(caplog)
+
+    async def test_a_partial_client_degrades_on_the_corroboration_path(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """No ``get_statuses`` at all.  Same fail-safe direction as a raising one: the
+        stored owner is kept and nothing is filed."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _PartialTaskClient()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+            )
+
+        assert client.submit_calls == []
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+        _assert_logged_loudly(caplog)
+
+    @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
+    async def test_an_unwritable_ledger_never_reaches_the_client(
+        self, tmp_path: Path, caplog, make_path
+    ) -> None:
+        """α's existing degrade, unchanged by ζ: no row means no debt to own, so the
+        client is not consulted at all — a ledger outage must not become a burst of
+        de-flake tasks filed against rows that were never written."""
+        from orchestrator.flake_ledger import open_debt
+
+        client = _FakeTaskClient()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert (
+                await open_debt(
+                    make_path(tmp_path), 'dark_factory', self.TEST_ID, task_client=client
+                )
+                is None
+            )
+
+        assert client.calls == []
+        _assert_logged_loudly(caplog)
+
+
 @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
 class TestNeverRaisesSync:
     """Boundary row B12, applied uniformly to every SYNC entry point: a ledger failure
