@@ -1460,6 +1460,17 @@ class TestTTLCacheBoundsBypassConcurrency:
                 for _ in range(20)
             ]
             await asyncio.wait_for(entered.wait(), timeout=5.0)
+            # Raise the bound back up now that the shared bypass has
+            # started: the lock-timeout phase (forcing every caller to time
+            # out acquiring the REAL lock) and this sharing-observation
+            # phase (proving 20 timed-out callers join ONE refresh) want
+            # different bounds -- otherwise, once bypass inheritance is
+            # itself bounded (task 4789 review fix), this window would
+            # legitimately contain re-arms of the shared bypass and inflate
+            # calls['n'] past 1. Works because the constant is read as a
+            # module global at call time (the _FANOUT_REWARN_EVERY idiom),
+            # so the patch takes effect on the very next read.
+            monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 5.0)
             # Let every other timed-out caller get a chance to join the one
             # shared bypass refresh rather than start its own.
             await asyncio.sleep(0.2)
@@ -1478,6 +1489,314 @@ class TestTTLCacheBoundsBypassConcurrency:
             'concurrent timed-out callers for one key must share a single '
             'bypass refresh, not accumulate one refresh per caller'
         )
+
+
+class TestTTLCacheBoundedBypassInheritance:
+    """A caller must not inherit another caller's stall past the bound.
+
+    Reviewer finding (mcp_fanout.py:627-639, pre-fix): ``_bypass_refresh``
+    joined a running bypass with ``return await asyncio.shield(running)`` --
+    no deadline -- and ``_bypass_tasks[key]`` was cleared only by the
+    task's own done-callback. So if the SHARED bypass also never returns
+    (the likely case: the wedge is endpoint/session-level, and
+    ``first_success`` invalidates a cached MCP session only on an
+    *exception*, never on a hang), caller #3 and every caller after it
+    inherits a dead task forever.
+
+    REPRODUCED against the pre-fix code before writing this class: bound
+    monkeypatched to 0.05, refresh parked on a never-set Event -- caller #3
+    never returned, ``refresh`` was called exactly 2 times, and
+    ``cache._bypass_tasks['k']`` stayed pending. Confirmed.
+
+    Invariant pinned here: a caller waits at most
+    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` on the lock, and at most that again on
+    any single refresh it did not start -- and never on one already known
+    to have outlived that bound. Every method monkeypatches
+    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to 0.05 and uses the REAL clock.
+    These tests deliberately create tasks that never complete -- on the
+    pre-fix code the pile is larger (a joiner that should have been
+    promoted instead hangs forever too) -- so teardown cancels every
+    outstanding task via ``_cancel_all`` rather than assuming they finished.
+    """
+
+    @staticmethod
+    def _task_of(entry):
+        """Return the Task inside a ``_bypass_tasks`` entry, tuple or bare.
+
+        Handles both the pre-step-8 shape (``dict[str, Task]``) and the
+        post-step-8 shape (``dict[str, tuple[float, Task]]``), so teardown
+        code written once works unchanged against either version of the
+        map. Passes a bare ``None`` through unchanged.
+        """
+        return entry[1] if isinstance(entry, tuple) else entry
+
+    @staticmethod
+    async def _cancel_all(*tasks):
+        """Cancel every still-pending task and await all of them.
+
+        Safe with a mix of pending, already-done, and ``None`` entries --
+        cancelling a completed task is a no-op and ``None`` is dropped, so
+        callers can pass optional captured handles unconditionally.
+        """
+        live = [t for t in tasks if t is not None]
+        for t in live:
+            t.cancel()
+        if live:
+            await asyncio.gather(*live, return_exceptions=True)
+
+    @staticmethod
+    def _always_wedging_refresh():
+        """Counting refresh stub: EVERY call parks on a never-set Event forever.
+
+        Unlike ``TestTTLCacheBoundedLockAcquisition._wedging_refresh`` (whose
+        call #2+ resolves), nothing here ever resolves on its own -- these
+        tests pin the invariant in the worst case, where a caller promoted
+        off a dead shared bypass still cannot itself return.
+        """
+        entered = asyncio.Event()
+        wedged = asyncio.Event()
+        calls = {'n': 0}
+
+        async def _refresh():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                entered.set()
+            await wedged.wait()  # never set -- genuinely unresolved
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        return _refresh, entered, calls
+
+    async def test_a_bypass_that_never_returns_does_not_wedge_the_next_caller(
+        self, monkeypatch
+    ):
+        """The reviewer's explicitly requested regression test.
+
+        Calls #1 and #2 park on a never-set Event; call #3 returns 'value'
+        immediately -- the realistic production shape, since each fresh MCP
+        call carries its own per-HTTP-request budget (``mcp_tool_call``
+        threads ``timeout`` into every httpx post), so a fresh attempt CAN
+        return while an older one stays wedged.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
+        entered = asyncio.Event()
+        wedged = asyncio.Event()  # never set
+
+        async def _refresh():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                entered.set()
+            if calls['n'] <= 2:
+                await wedged.wait()
+                raise AssertionError('unreachable: the wedged event is never set')
+            return 'value'
+
+        holder = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+        second = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        superseded = None
+        try:
+            # Let caller #2 time out acquiring the lock, become the bypass
+            # creator, and wedge inside the refresh it started.
+            await asyncio.sleep(0.2)
+            superseded = cache._bypass_tasks.get('k')
+            assert superseded is not None, (
+                'precondition: caller #2 must have registered a bypass'
+            )
+
+            third = await asyncio.wait_for(
+                cache.get_or_refresh('k', _refresh), timeout=5.0
+            )
+
+            assert third == 'value'
+            assert cache.get_fresh('k') == 'value'
+        finally:
+            current = cache._bypass_tasks.get('k')
+            await self._cancel_all(
+                holder, second, self._task_of(superseded), self._task_of(current),
+            )
+
+    async def test_a_caller_never_waits_past_the_bound_on_a_refresh_it_did_not_start(
+        self, monkeypatch
+    ):
+        """The reviewer's exact repro shape: EVERY call wedges.
+
+        Caller #3 must still be promoted off the dead shared task within one
+        bound, even though nothing it can reach ever returns -- so caller #3
+        itself still does not RETURN in this test either. That is correct
+        and out of this layer's reach: its own (promoted) refresh never
+        returns, which is the pre-existing cold-caller exposure
+        ``get_or_refresh`` cannot remove while it stays a total function (no
+        call site can observe a raised TimeoutError).
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        _refresh, entered, calls = self._always_wedging_refresh()
+
+        holder = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+        second = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        superseded = None
+        third = None
+        try:
+            await asyncio.sleep(0.2)  # let caller #2 time out and become the bypass creator
+            superseded = cache._bypass_tasks.get('k')
+            assert superseded is not None, (
+                'precondition: caller #2 must have registered a bypass'
+            )
+
+            third = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+            await asyncio.sleep(0.25)  # ~5 bound-windows -- plenty for the promotion
+
+            assert calls['n'] == 3, (
+                'caller #3 must be promoted to running its OWN refresh '
+                f"instead of parking on the dead shared task forever, got "
+                f"{calls['n']}"
+            )
+            current = cache._bypass_tasks.get('k')
+            assert current is None or self._task_of(current) is not self._task_of(
+                superseded
+            ), (
+                'the map must no longer track the task caller #2 created -- '
+                'it is provably over-age and nobody may still be waiting on it'
+            )
+        finally:
+            current = cache._bypass_tasks.get('k')
+            await self._cancel_all(
+                holder, second, third,
+                self._task_of(superseded), self._task_of(current),
+            )
+
+    async def test_a_re_armed_bypass_is_counted_and_logged(self, monkeypatch, caplog):
+        """The reviewer's "count each such re-arm through _note_lock_bypass".
+
+        Abandoning an over-age shared bypass is not a repeat of the
+        ORIGINAL lock-acquisition timeout -- the lock did not time out
+        again, the inherited BYPASS did -- so it must log its own,
+        differently-worded record, while still going through the same
+        per-key streak counter so the existing WARNING/DEBUG throttle
+        covers it. The streak is already > 1 by the time the re-arm fires
+        here, so the re-arm record lands at DEBUG under that throttle --
+        asserted at DEBUG, not WARNING, for that reason.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        _refresh, entered, calls = self._always_wedging_refresh()
+
+        holder = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+        second = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+        superseded = None
+        third = None
+        try:
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+                await asyncio.sleep(0.2)
+                superseded = cache._bypass_tasks.get('k')
+                assert superseded is not None, (
+                    'precondition: caller #2 must have registered a bypass'
+                )
+
+                third = asyncio.create_task(cache.get_or_refresh('k', _refresh))
+                await asyncio.sleep(0.25)
+
+            records = [
+                r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
+            ]
+            rearm_records = [r for r in records if 'inherited' in r.getMessage()]
+            assert rearm_records, (
+                'abandoning the over-age shared bypass must log its own '
+                'record -- the lock did not time out again, the inherited '
+                f'bypass did -- got: {[r.getMessage() for r in records]}'
+            )
+            assert all(r.levelno == logging.DEBUG for r in rearm_records), (
+                'the streak is already > 1 by the time the re-arm fires '
+                f'here, so it lands at DEBUG under the existing throttle, '
+                f'got levels {[logging.getLevelName(r.levelno) for r in rearm_records]}'
+            )
+            assert cache._bypass_streaks.get('k', 0) > 2, (
+                'the re-arm must be counted through the same per-key streak '
+                "counter as the two lock-acquisition timeouts (second's and "
+                f"third's), not a separate uncounted path; streak="
+                f"{cache._bypass_streaks.get('k')}"
+            )
+        finally:
+            current = cache._bypass_tasks.get('k')
+            await self._cancel_all(
+                holder, second, third,
+                self._task_of(superseded), self._task_of(current),
+            )
+
+    async def test_bypass_concurrency_stays_bounded_while_callers_pile_up(
+        self, monkeypatch
+    ):
+        """Fence, not a RED -- must hold both before and after step-8.
+
+        Guards the resource property ``_bypass_refresh`` exists for: even
+        once bypass inheritance is bounded (so a wedge causes roughly one
+        new refresh per bound-window rather than zero), it must never
+        regress to one refresh PER CALLER -- the pre-existing
+        one-refresh-per-timed-out-caller shape
+        ``TestTTLCacheBoundsBypassConcurrency`` was written to close -- and
+        at most one bypass task may be tracked for the key at any instant.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.05)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
+        release = asyncio.Event()
+
+        async def _refresh():
+            calls['n'] += 1
+            await release.wait()
+            return 'value'
+
+        # Hold the key's lock directly so every caller below times out
+        # acquiring it -- the same idiom TestTTLCacheBoundsBypassConcurrency
+        # already uses.
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        try:
+            waiters = [
+                asyncio.create_task(cache.get_or_refresh('k', _refresh))
+                for _ in range(20)
+            ]
+            start = time.monotonic()
+            await asyncio.sleep(0.2)
+            elapsed = time.monotonic() - start
+
+            assert calls['n'] < 20, (
+                '20 concurrent timed-out callers must never each start '
+                f"their own refresh, got {calls['n']}"
+            )
+            assert (
+                calls['n']
+                <= 2 + elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+            ), (
+                f"at most about one new refresh per bound-window is "
+                f"expected, got {calls['n']} over {elapsed:.3f}s"
+            )
+            assert len(cache._bypass_tasks) <= 1, (
+                'at most one tracked live bypass per key at any instant, '
+                f'got {len(cache._bypass_tasks)}'
+            )
+        finally:
+            release.set()
+            lock.release()
+            await asyncio.wait_for(
+                asyncio.gather(*waiters, return_exceptions=True), timeout=5.0
+            )
 
 
 class TestTTLCacheSweepsOnTheBypassPath:
