@@ -475,6 +475,137 @@ class TestAddMemoryStampsReferents:
         assert '_write_op_id' in payload
 
 
+class TestAddMemoryStampsDeclaredReferents:
+    """The tier ABOVE the metadata bridge, reachable for the first time.
+
+    Leaf delta's `entities` parameter fills the `declared=None` seam epsilon
+    left annotated at this producer. What lands on the wire is
+    `{'source': 'declared', ...}` — the bucket leaf iota counts and leaf zeta
+    verifies edges against.
+
+    The service is MECHANISM, not policy, exactly as gamma split reporting from
+    rejecting: a declaration that contradicts the prose is LEGAL here and
+    stamps normally. The tool-boundary `entities_gate` is what refuses it, and
+    tests/server/test_entities_gate_ingestion.py is where that is pinned.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declared_outranks_the_derived_scan(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_declared_outranks_the_metadata_bridge(self, service):
+        """The precedence tier that could not be tested before this leaf, and
+        the one that proves declared > metadata > derived > none is live end to
+        end: prose says 3127, ambient metadata says 3129, the declaration says
+        3127 and wins."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            metadata={'task_id': 3129},
+            declared_referents=[{'kind': 'task', 'id': 3127}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_empty_declaration_is_distinct_from_none(self, service):
+        """`{'source': 'declared', 'refs': []}` vs `{'source': 'none', ...}` IS
+        the "considered referents and none applied" vs "never looked" signal
+        leaf iota counts. Collapsing [] onto None anywhere on this path would
+        erase it silently."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'declared', 'refs': []}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('omit', [True, False], ids=['omitted', 'explicit-None'])
+    async def test_epsilons_behaviour_is_byte_identical_without_a_declaration(
+        self, service, omit,
+    ):
+        """The regression guard for epsilon: adding a tier must not disturb the
+        three below it."""
+        kwargs = {} if omit else {'declared_referents': None}
+        cases = [
+            ({'metadata': {'task_id': 3129}}, 'metadata', ['3129']),
+            ({}, 'derived', ['3127']),
+        ]
+        for extra, source, numbers in cases:
+            service.durable_queue.enqueue.reset_mock()
+            await service.add_memory(
+                content='the fix for Task 3127 landed',
+                category='decisions_and_rationale',
+                project_id='dark_factory',
+                **extra,
+                **kwargs,
+            )
+            payload = service.durable_queue.enqueue.call_args[1]['payload']
+            assert payload['referents'] == {
+                'source': source,
+                'refs': [
+                    {'kind': 'task', 'project_id': '', 'number': n} for n in numbers
+                ],
+            }, f'{extra!r}: {payload["referents"]!r}'
+
+        service.durable_queue.enqueue.reset_mock()
+        await service.add_memory(
+            content='the merge-lane hardening task',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            **kwargs,
+        )
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'none', 'refs': []}
+
+    @pytest.mark.asyncio
+    async def test_declared_digits_are_verbatim(self, service):
+        """'0132' is a DIFFERENT referent from '132'; int-normalizing would
+        silently repoint the caller's own assertion."""
+        await service.add_memory(
+            content='the merge-lane hardening task',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'id': '0132'}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents']['refs'][0]['number'] == '0132'
+
+    @pytest.mark.asyncio
+    async def test_the_declared_blob_is_json_safe(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+
+
 class TestAddEpisodeStampsReferents:
     """The second producer. `add_episode` deliberately never persists a
     metadata argument — the same fact that forced task 3142's
