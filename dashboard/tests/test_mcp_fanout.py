@@ -1448,31 +1448,59 @@ class TestTTLCacheBoundsBypassConcurrency:
             await release.wait()
             return 'value'
 
-        # Hold the key's lock directly so every caller below times out
+        # Hold the key's lock directly so the FIRST caller below times out
         # acquiring it -- the same idiom TestTTLCacheBypassRechecksFreshness
-        # already uses.
+        # already uses -- and becomes the bypass creator through the real
+        # get_or_refresh -> lock-timeout -> _bypass_refresh path.
         lock = cache._locks.setdefault('k', asyncio.Lock())
         await lock.acquire()
 
         try:
-            waiters = [
-                asyncio.create_task(cache.get_or_refresh('k', _refresh))
-                for _ in range(20)
-            ]
+            first = asyncio.create_task(cache.get_or_refresh('k', _refresh))
             await asyncio.wait_for(entered.wait(), timeout=5.0)
+
             # Raise the bound back up now that the shared bypass has
-            # started: the lock-timeout phase (forcing every caller to time
-            # out acquiring the REAL lock) and this sharing-observation
-            # phase (proving 20 timed-out callers join ONE refresh) want
-            # different bounds -- otherwise, once bypass inheritance is
-            # itself bounded (task 4789 review fix), this window would
-            # legitimately contain re-arms of the shared bypass and inflate
-            # calls['n'] past 1. Works because the constant is read as a
-            # module global at call time (the _FANOUT_REWARN_EVERY idiom),
-            # so the patch takes effect on the very next read.
+            # started: the lock-timeout phase (forcing the first caller to
+            # time out acquiring the REAL lock) and this
+            # sharing-observation phase (proving 19 MORE timed-out callers
+            # join that ONE refresh) want different bounds.
+            #
+            # MEASURED HAZARD: launching the other 19 through
+            # get_or_refresh (racing the SAME real lock, as an earlier
+            # version of this test did) does NOT work even with the raise
+            # placed immediately after entered.wait() fires. asyncio.
+            # create_task only SCHEDULES; none of the 19 gets to run its
+            # own `await asyncio.wait_for(lock.acquire(), ...)` until this
+            # coroutine yields, and by then they all reach their OWN
+            # lock-timeout in the SAME event-loop batch the FIRST caller's
+            # timeout fired in -- entirely before `entered` is even set
+            # (that requires the shared bypass task to be scheduled AND
+            # run, which happens one loop turn later). So all 19 read the
+            # bound and lock in their join deadline BEFORE this line can
+            # possibly run, reproducibly costing one extra shared refresh
+            # (calls['n'] == 2, not 1) regardless of how soon after
+            # entered.wait() the raise happens. Repro + fix measured
+            # directly against this branch.
+            #
+            # Calling the private _bypass_refresh directly, AFTER the
+            # raise, sidesteps the batching: it is exactly what
+            # get_or_refresh's own next line runs the instant a caller
+            # times out on the lock, so it faithfully simulates "19 more
+            # timed-out callers of this key" without re-racing the
+            # lock-timeout that isn't what this test is pinning. Works
+            # because the constant is read as a module global at call time
+            # (the _FANOUT_REWARN_EVERY idiom), so the raise takes effect
+            # on the very next read.
             monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 5.0)
-            # Let every other timed-out caller get a chance to join the one
-            # shared bypass refresh rather than start its own.
+
+            more = [
+                asyncio.create_task(
+                    cache._bypass_refresh('k', _refresh, lambda v: True)
+                )
+                for _ in range(19)
+            ]
+            # Let every one of the 19 timed-out callers get a chance to
+            # join the one shared bypass refresh rather than start its own.
             await asyncio.sleep(0.2)
             assert calls['n'] == 1, (
                 f'expected exactly one bypass refresh to have started for '
@@ -1480,7 +1508,9 @@ class TestTTLCacheBoundsBypassConcurrency:
             )
 
             release.set()
-            results = await asyncio.wait_for(asyncio.gather(*waiters), timeout=5.0)
+            results = await asyncio.wait_for(
+                asyncio.gather(first, *more), timeout=5.0
+            )
         finally:
             lock.release()
 
