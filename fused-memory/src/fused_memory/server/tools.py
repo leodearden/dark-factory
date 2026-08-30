@@ -88,6 +88,7 @@ from fused_memory.server.consolidation import (
     build_consolidation_result,
     validate_consolidate_args,
 )
+from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.entity_mint_authz import (
     resolve_entity_mint_authorization,
     validate_mint_name,
@@ -3203,6 +3204,7 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
+        entities: list[dict] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a classified memory directly. Skips the extraction pipeline.
@@ -3276,6 +3278,16 @@ def create_mcp_server(
         overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
+        Optionally DECLARE what the memory is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct a body whose prose names a task ambiguously or not at
+        all. A declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the write does not
+        happen — the block names both what you declared and what the content
+        actually cites. Only a conflict is ever rejected: omitting `entities`,
+        or passing [] to record that you considered referents and none applied,
+        always succeeds.
+
         Content carrying a raw MCP envelope fragment is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
         residue cannot be parsed) — a harness serialization bug has been leaking
@@ -3310,6 +3322,23 @@ def create_mcp_server(
                       Both flags are write-time-only and are stripped before
                       persistence — neither is ever stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
+            entities: Optional explicit declaration of WHICH referents this
+                      memory is about. TRI-STATE: omit it (or None) to say you
+                      never considered referents and let the content scan derive
+                      them; pass [] to say you DID consider them and none apply;
+                      pass a list to declare them. Each entry is
+                      {'kind': 'task', 'id': <digits>, 'project_id': <optional>}
+                      — 'kind' and 'project_id' are optional and default to
+                      'task' and the local project; 'id' is the task number's
+                      digits (an int, or a string of ASCII digits), never a
+                      label like "Task 3127". This is NOT "all entities": the
+                      extraction pipeline legitimately derives entities no caller
+                      could predict, and this parameter names only the referents
+                      the memory is ABOUT. A declaration the content contradicts
+                      is REJECTED (error_type=DeclaredReferentConflictRejected)
+                      and nothing is written; a malformed entry is rejected as a
+                      ValidationError. Absence is never rejected, so omitting
+                      this parameter always succeeds.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3329,6 +3358,26 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 3669 / PRD leaf delta: reject a declaration the content itself
+        # contradicts. Grouped with the structural argument validations above
+        # and deliberately ahead of EVERY I/O-bearing gate below — the
+        # strip_markup_override pass, the recon-stage content gates, the
+        # `_premature_completion_block` live task-status lookup,
+        # `_completion_claim_gate`'s authority checks, the near-duplicate
+        # embedding round trip and write triage's judge call. This gate is a
+        # pure in-memory scan; a structurally invalid or self-contradictory
+        # declaration should cost none of them.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        if err := entities_gate(
+            entities, content=content, group_id=project_id, agent_id=agent_id,
+        ):
+            return err
         # MCP-markup rejection no longer happens here: task 4458 retired this
         # tool body's in-line gate in favour of the ONE boundary guard
         # (fused_memory.server.markup_guard), which runs before this function is
