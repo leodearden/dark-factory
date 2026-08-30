@@ -4904,7 +4904,7 @@ async def test_unblock_dependent_guards(
         else:
             reconciler.task_interceptor.set_task_status.assert_not_awaited()
     else:
-        mock_taskmaster.set_task_status.assert_not_called()
+        mock_taskmaster.set_task_status.assert_not_awaited()
 
 
 # ── task-4903: durability of the write + per-dependent isolation ───────────
