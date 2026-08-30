@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_flake_recorder import _FakeLedgerTaskClient
 from test_merge_boundary_effective_module_configs import (
     _ALPHA_TEST,
     _BETA_FAILING_ID,
@@ -46,6 +47,7 @@ from orchestrator.flake_ledger import (
     FlakeSuppression,
     FlakeVerdict,
     ledger_db_path,
+    list_open_debt,
     read_occurrences,
 )
 from orchestrator.merge_gates import PostMergePyrightResult
@@ -136,6 +138,7 @@ async def _drive(
     cross_check: bool = False,
     rerun_passes: bool = True,
     max_enospc: int = 1,
+    task_client=None,
 ):
     """Drive the REAL ``_run_post_merge_verify``.
 
@@ -192,6 +195,7 @@ async def _drive(
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
             runner=runner,
+            task_client=task_client,
         )
 
 
@@ -472,5 +476,166 @@ class TestDispatcherRecordsTheFlakeObservation:
         )
         assert rows[0].verdict == 'passes_in_isolation'
         assert rows[0].test_id == _BETA_FAILING_ID
+        assert len(_suppression_events(store)) == 1, store.emits
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+class _ExplodingTaskClient:
+    """A task client whose every method raises — a wedged MCP dispatch, a closed
+    scheduler, a partial adapter.  B12's worst case at this boundary."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def submit_task(self, arguments: dict) -> str:
+        self.calls.append('submit_task')
+        raise RuntimeError('mcp dispatch failed')
+
+    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+        self.calls.append('get_statuses')
+        raise RuntimeError('mcp dispatch failed')
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        self.calls.append('commit_planning')
+        raise RuntimeError('mcp dispatch failed')
+
+
+def _debt(tmp_path: Path):
+    return list_open_debt(ledger_db_path(tmp_path))
+
+
+@pytest.mark.asyncio
+class TestDispatcherOpensDebt:
+    """Boundary row B7 end-to-end (PRD task ζ): a suppressed merge red leaves an
+    OWNED ``flake_debt`` row.
+
+    ε proved the observation reaches the dispatcher; this proves the dispatcher
+    turns it into §5.9's enforced invariant — a test in the ledger has a
+    non-terminal de-flake task responsible both for fixing the root defect and for
+    removing the test from the ledger.  That filed task is this task's whole
+    user-observable signal, so it is asserted through the REAL
+    ``_run_post_merge_verify`` rather than at the recorder's own seam.
+    """
+
+    # -- (a) the LOCAL path: the user-observable signal ----------------------
+
+    async def test_local_suppression_files_the_task_and_owns_the_row(
+        self, tmp_path: Path,
+    ) -> None:
+        """A merge whose scoped red was suppressed leaves the failing test in the
+        ledger, OWNED, and exactly one de-flake task filed under ``planning_mode``.
+
+        The observation here is produced by the production gate inside the
+        boundary's own ``LocalRunner`` — nothing is hand-fed — so this is the real
+        path from "a red was masked" to "somebody owns it".
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        client = _FakeLedgerTaskClient()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-local', runner=None,
+            event_store=store, escalation_queue=queue, task_client=client,
+        )
+
+        assert outcome is None, f'the suppressed red must still land; got {outcome!r}'
+
+        rows = _debt(tmp_path)
+        assert len(rows) == 1, rows
+        assert rows[0].test_id == _BETA_FAILING_ID
+        assert rows[0].owner_task_id, f'§5.9 breach — the row has no owner: {rows[0]}'
+
+        assert len(client.submit_calls) == 1, client.submit_calls
+        args = client.submit_calls[0]
+        assert args['planning_mode'] is True, args
+        assert _BETA_FAILING_ID in args['title'] or _BETA_FAILING_ID in args['description']
+        assert args['metadata']['flake_debt_test'] == _BETA_FAILING_ID
+        # planning_mode files DEFERRED; the second phase is what releases it.
+        assert client.commit_calls == [[rows[0].owner_task_id]], client.commit_calls
+
+    # -- (b) the REMOTE path: identical, because the host must not matter -----
+
+    async def test_remote_wire_deserialized_suppression_opens_the_same_debt(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same observation, genuinely wire-serialized through the runner codec.
+
+        The invariant must not be a property of WHICH HOST ran the verify — that
+        host-dependence is the entire defect ε fixed for the other three effects,
+        and a debt row that only appears on local merges would reintroduce it for
+        the fourth.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        client = _FakeLedgerTaskClient()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-remote',
+            runner=_remote_runner(_wired(_suppressed_pass(_suppression()))),
+            event_store=store, escalation_queue=queue, task_client=client,
+        )
+
+        assert outcome is None
+        rows = _debt(tmp_path)
+        assert len(rows) == 1, rows
+        assert rows[0].test_id == _BETA_FAILING_ID
+        assert rows[0].owner_task_id
+        assert len(client.submit_calls) == 1, client.submit_calls
+        assert client.submit_calls[0]['metadata']['flake_debt_test'] == _BETA_FAILING_ID
+
+    # -- (c) no client wired: byte-identical to ε -----------------------------
+
+    async def test_no_task_client_is_byte_identical_to_the_epsilon_behaviour(
+        self, tmp_path: Path,
+    ) -> None:
+        """The default, and the two ``_run_post_merge_verify`` callers that thread
+        nothing.
+
+        Occurrence row, event and streak exactly as ε left them; NO debt row,
+        because a row nobody can own would be rendered by ι as an invariant breach
+        and would swamp the surface that exists to show a filing which was
+        ATTEMPTED and failed.  This is what makes those two callers provably
+        unaffected by ζ.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-none',
+            runner=_remote_runner(_wired(_suppressed_pass(_suppression()))),
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert outcome is None
+        assert _debt(tmp_path) == []
+        assert len(_rows(tmp_path)) == 1, _rows(tmp_path)
+        assert len(_suppression_events(store)) == 1, store.emits
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+    # -- (d) B12: a wedged client costs the filing and nothing else -----------
+
+    async def test_a_raising_task_client_leaves_the_merge_outcome_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """B12 at the boundary that matters: bookkeeping must never stall a merge.
+
+        Every client method raises, so the filing is lost — and the MERGE OUTCOME,
+        the occurrence row, the structured fact and the INV-4 streak are all exactly
+        what a ledger-less run produces.  The breach is left VISIBLE (a row with no
+        owner) rather than papered over, which is precisely what ι renders and what
+        distinguishes a failed filing from an unwired one.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        client = _ExplodingTaskClient()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-boom',
+            runner=_remote_runner(_wired(_suppressed_pass(_suppression()))),
+            event_store=store, escalation_queue=queue, task_client=client,
+        )
+
+        assert outcome is None, f'a wedged task client must not stall the merge: {outcome!r}'
+        assert client.calls == ['submit_task'], client.calls
+        rows = _debt(tmp_path)
+        assert len(rows) == 1, rows
+        assert rows[0].owner_task_id is None, 'a failed filing must stay visible'
+        assert len(_rows(tmp_path)) == 1
         assert len(_suppression_events(store)) == 1, store.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
