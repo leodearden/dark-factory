@@ -334,3 +334,137 @@ gave up silently; zero hit turn or budget caps.
 
 _That is the observation. What it means for the admission question is §8's to say, not this
 section's._
+
+---
+
+## 4. Paired per-fixture statistics
+
+_RAW OBSERVATION._ **Forensic / decline-consistency evidence — NOT a capability
+comparison.** Read this section only alongside §3, which establishes what a "no-plan" cell
+on this band actually is. Per ruling C these figures have no capability standing.
+
+### 4a. Per-fixture planned/valid
+
+Recomputed from `cells/*.json`; "valid" = non-`cap_tainted` cells, which here is all of them
+(§2d).
+
+| fixture | fable planned/valid | incumbent planned/valid |
+|---|---|---|
+| `df_task_2260` | 0/3 | 1/3 |
+| `reify_task_12` | 2/3 | 1/3 |
+| `reify_task_2324` | 0/3 | 0/3 |
+| `reify_task_2531` | 0/3 | 1/3 |
+| `reify_task_2573` | 0/3 | 0/3 |
+| `reify_task_2699` | 0/3 | 1/3 |
+| `reify_task_2778` | 0/3 | 0/3 |
+| `reify_task_3883` | 0/3 | 0/3 |
+| `reify_task_4026` | 1/**2** | 1/3 |
+| `reify_task_4370` | *unrun* | *unrun* |
+| `reify_task_4832` | *unrun* | *unrun* |
+
+### 4b. planRate is published at TWO units, and they disagree
+
+⚠️ **This is a live confusion between two committed artifacts, and this record resolves it
+by labelling rather than by choosing.** Both upstream artifacts publish a number called
+`planRate`, and they are not the same number:
+
+| unit | fable | incumbent | who publishes it |
+|---|---|---|---|
+| **CELL-level** — planned cells ÷ all cells | 3/26 = **0.1154** | 5/27 = **0.1852** | `FINAL-READOUT.txt` |
+| **FIXTURE-level** — mean of per-fixture rates over the 9 scored fixtures | **0.1296** | **0.1852** | `analyse_tranche1.py` (its Δ and CI) |
+
+Both recomputed here, not copied. Fixture-level fable = (0/3 + 2/3 + 0/3 + 0/3 + 0/3 + 0/3 +
+0/3 + 0/3 + 1/2) ÷ 9 = (2/3 + 1/2) ÷ 9 = **0.1296**. Fixture-level incumbent = (5 × 1/3) ÷ 9
+= **0.1852**.
+
+**Why they diverge in the fable arm and not the incumbent's:** `reify_task_4026` ran **2**
+fable trials, not 3 (§2a). At the cell level that cell contributes 1 of 26; at the fixture
+level it contributes a rate of 1/2 = 0.5, weighted equally with every other fixture. The
+incumbent arm is balanced 3-per-fixture throughout, so its two units coincide at 0.1852.
+
+`analyse_tranche1.py` uses the fixture-level unit **deliberately**: three trials on one
+fixture are correlated, and treating 53 cells as independent overstates confidence by
+roughly √3. A downstream reader comparing 0.1154 against 0.1296 and concluding one artifact
+is wrong would be mistaken — **they are different statistics, both correct in their own
+unit**.
+
+### 4c. The paired diff and its bootstrap CI
+
+Computed by re-running the ruled readout rather than reimplementing it:
+
+```
+python3 /home/leo/src/dark-factory/data/eval-campaign/tranche1/analyse_tranche1.py \
+        --results /home/leo/src/dark-factory/data/eval-campaign/tranche1/cells \
+        --marker <any file older than every cell>
+```
+
+Method of record: `analyse_tranche1.py::boot` — a **paired cluster bootstrap over
+FIXTURES**, both arms resampled together on the same fixture draw, **10,000 draws, seed
+20260825**.
+
+| quantity | value | 95% CI |
+|---|---|---|
+| planRate fable (fixture-level) | 0.1296 | — |
+| planRate incumbent (fixture-level) | 0.1852 | — |
+| **Δ = fable − incumbent** | **−0.0556** | **[−0.2037, +0.0926]** |
+| UNLOCKED fixtures | 0 of 9 | [0, 0] |
+
+The CI lower bound does **not** exclude zero.
+
+### 4d. The caveats the instrument itself emits
+
+These are carried, not re-derived; each is `analyse_tranche1.py`'s own inline warning.
+
+1. **The unit of replication is the FIXTURE, not the cell.** Three correlated trials per
+   fixture overstate confidence by ~√3 if treated as independent. This is why §4b's two
+   units exist at all, and why the CI above is computed over 9 fixtures rather than 53 cells.
+2. **Degenerate-data / zero-width-CI guard.** The bootstrap returns `None` rather than a
+   spurious interval when no fixture has both arms scored. It fires visibly in §4e, where
+   the well-posed subset yields a genuinely zero-width `[+0.0000, +0.0000]` — that is a
+   degenerate interval, not a precise one.
+3. **The WELL-POSED-SUBSET diagnostic is the load-bearing one.** The band was selected on a
+   **single γ1 trial** in which the incumbent planned 0 of 11. On re-run at 3 trials the
+   incumbent planned on **5 of 9** scored fixtures. So the band's defining premise — *"the
+   incumbent cannot plan this"* — **fails on 5 of the 9 fixtures**:
+   `df_task_2260`, `reify_task_12`, `reify_task_2531`, `reify_task_2699`, `reify_task_4026`
+   (each incumbent 0.33). Only **4 fixtures** still satisfy it.
+
+   The instrument states the consequence directly: the ruled ±0.17/±0.22 resolution floor
+   assumed **11** well-posed fixtures. Only **4** qualify. **The effective resolution is
+   therefore materially WORSE than the floor stated before the run.**
+
+### 4e. The well-posed subset
+
+| quantity | value |
+|---|---|
+| premise holds on | 4 of 9 fixtures |
+| fable planRate on the well-posed subset | 0.0000 |
+| incumbent planRate there | 0.0000 (by construction) |
+| **Δ restricted to well-posed fixtures** | **+0.0000**, 95% CI [+0.0000, +0.0000], n=4 |
+| unlocked fixtures | **0 of 4** |
+
+Every "unlocked" fixture — a fixture fable plans and the incumbent cannot — must by
+definition come from this subset. **There are none.** The zero-width interval is the
+degenerate-data guard firing, not a precise measurement.
+
+### 4f. Reading the sign, and the standing of this whole section
+
+**Δ is NEGATIVE: −0.0556. The incumbent planned MORE on this band than the candidate, not
+less — the opposite of the trial's hypothesis in direction.**
+
+**This is NOT evidence against fable's planning capability.** On a band where §3 shows 47 of
+53 cells are verified-correct declines, **planning is frequently the defect and declining is
+the correct behaviour**. A higher planRate on a verified-moot fixture is a worse result, not
+a better one: `FINDINGS.md` Answer 3.1 records that the incumbent's extra plans on 2699,
+2531 and 4026 are duplicate or moot work — one 17-step incumbent "success" (`d1a73352`)
+re-implements already-landed registration and absorbs work the real task explicitly deferred.
+
+The arms agree at the *should-this-be-planned* level on essentially every fixture, and two
+fixtures are unanimous 6/6 across both arms (§3b). **The fixtures drove the outcome, not the
+models.** Δ here is measuring the band, not the candidates.
+
+> **NO DECISION HANGS ON THIS Δ OR ITS CI.** The CI/bootstrap readout rule is **inert** —
+> see §9. No further cells are being scored, so there is no stopping criterion left for
+> this interval to feed. These statistics are published because ζ's contract mandates
+> paired per-fixture statistics as forensic evidence, and for no other reason. A reader who
+> arrives at this table without having read §9 must not mistake it for a live decision rule.
