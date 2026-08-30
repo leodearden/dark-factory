@@ -765,33 +765,38 @@ class TestAddEpisodeStampsDeclaredReferents:
                 ],
             }, f'{content!r}: {payload["referents"]!r}'
 
-    def test_the_metadata_rung_stays_structurally_unreachable(self):
+    @pytest.mark.asyncio
+    async def test_the_metadata_rung_stays_structurally_unreachable(self, service):
         """Adding the declared tier must not quietly wake the dead metadata rung.
 
-        Asserted on the SIGNATURE rather than on behaviour, because that is
-        where the guarantee actually lives: `MemoryService.add_episode` has no
-        `metadata` parameter at all — the tool reads metadata only for
-        _causation_id/source routing and never forwards it — which is what
-        makes epsilon's hardcoded `metadata=None` true by construction instead
-        of by convention. A behavioural probe cannot even be written here: the
-        call raises TypeError before any referent is resolved.
+        `MemoryService.add_episode` has no `metadata` parameter at all — the
+        tool reads metadata for _causation_id/source routing and never forwards
+        it — which is what makes epsilon's hardcoded `metadata=None` true by
+        CONSTRUCTION rather than by convention. So the pin is the raise itself:
+        there is no metadata rung to consult here because the call carrying one
+        cannot be made.
 
-        So the check that has teeth is the pair. Adding `declared_referents`
-        is the first time in this leaf that a new resolve-input crossed into
-        this producer, and the failure mode worth catching is a later change
-        that adds `metadata` alongside it "for symmetry with add_memory" —
-        which would silently give this producer a metadata rung whose value
-        nothing persists, and re-open the very asymmetry epsilon documented.
+        Asserted behaviourally (the TypeError) rather than by
+        `inspect.signature`, per the house norm against parameter-name
+        introspection meta-tests. Here the two are not equivalent anyway — the
+        raise is the actual consequence a caller meets, and the signature is
+        merely its cause.
+
+        The regression this guards: `declared_referents` is the first new
+        resolve-input to cross into this producer, and the plausible next
+        change is adding `metadata` alongside it "for symmetry with
+        add_memory". That would hand this producer a metadata rung whose value
+        nothing persists, silently re-opening the asymmetry epsilon documented
+        — and it would turn this test green-to-red at exactly the right moment.
         """
-        import inspect
+        with pytest.raises(TypeError, match='metadata'):
+            await service.add_episode(
+                content='the fix for Task 3127 landed',
+                project_id='dark_factory',
+                metadata={'task_id': 9999},
+            )
 
-        params = inspect.signature(MemoryService.add_episode).parameters
-        assert 'declared_referents' in params, sorted(params)
-        assert 'metadata' not in params, (
-            'add_episode grew a `metadata` parameter; epsilon\'s metadata=None '
-            'at this producer is only correct while this stays true '
-            f'(params: {sorted(params)})'
-        )
+        service.durable_queue.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_declaration_is_additive_to_every_preexisting_key(self, service):
