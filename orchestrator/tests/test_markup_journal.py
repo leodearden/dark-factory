@@ -47,7 +47,7 @@ import asyncio
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -255,8 +255,8 @@ class TestOneEventIsOneLine:
         (line,) = journal_lines(tmp_path)
         parsed = datetime.fromisoformat(line['ts'])
         assert parsed.tzinfo is not None, 'a naive timestamp is not correlatable'
-        assert parsed.utcoffset() == timezone.utc.utcoffset(None)
-        assert parsed == datetime.fromtimestamp(1_756_000_000.0, tz=timezone.utc)
+        assert parsed.utcoffset() == UTC.utcoffset(None)
+        assert parsed == datetime.fromtimestamp(1_756_000_000.0, tz=UTC)
 
     @pytest.mark.asyncio
     async def test_the_sink_returns_the_journal_path_as_a_locator(self, tmp_path):
