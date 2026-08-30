@@ -828,3 +828,159 @@ live production MCP — eval runs write into live fused-memory, escalations and 
 (status `pending`, priority `high`, filed 2026-08-26), whose description cites this same
 evidence and the same verified root cause. This record confirms the finding rather than
 re-filing it; filing a duplicate would fragment the lane.
+
+---
+
+## 9. 🔴 Stale-stopping-rule notice for task 3635 (McNemar withdrawal)
+
+**This section is deliberately self-contained.** Its whole purpose is to stop a reader who
+arrives here via task 3635's stored description from acting on what that description says.
+It repeats what it needs to; do not compress it by reference.
+
+> 🔴 **Task 3635's stored description is STALE ON THE STOPPING RULE and must NOT be actioned
+> as written.** It still names the **WITHDRAWN** McNemar rule — *"b >= 5 → STOP"*, priced as
+> `p = 0.5^b` — and a contingent *"fresh tranche-2 gate"*. **That rule no longer governs.**
+
+### Why the McNemar rule was withdrawn — three statistical defects
+
+1. **The p-value formula was wrong except in a case the rule never checked.** `0.5^b` is
+   valid **only when the reverse-discordant count `c` = 0**, but the rule priced every
+   outcome as though `c` were always 0. The true exact binomial two-sided values:
+
+   | discordant counts | true p | verdict at α = 0.05 |
+   |---|---|---|
+   | b=5, c=0 | 0.031 | passes |
+   | b=5, c=1 | **0.109** | **fails** |
+   | b=5, c=2 | **0.227** | **fails** |
+
+   The rule would have declared significance in two cases where the data do not support it.
+
+2. **The `b >= 5` threshold cleared a ONE-SIDED test only**, and the one-sided choice was
+   left **unstated**. The two-sided p at b=5 is **0.0625** — which does not clear α = 0.05.
+   A reader applying the rule as written had no way to know a one-sided test was intended.
+
+3. **The ≥2-of-3 majority vote discarded within-fixture rate information**, compressing a
+   0.4 per-trial rate to a 0.35 per-fixture rate. §4d's first caveat is the same concern
+   handled correctly: the fixture is the unit of replication, but the *rate* within it should
+   not be thrown away.
+
+### The compounding fact
+
+The McNemar rule was **superseded by the paired cluster-bootstrap Δ/CI readout** — recorded
+in task 3635's own *"WHY THE McNEMAR RULE WAS WITHDRAWN"* section, and implemented in
+`analyse_tranche1.py::boot` (§4c).
+
+**But tranche 1 is now stopped short at 53 of 66 and ruled FORENSIC-ONLY (§1, §8).** So even
+the *superseding* rule's own inputs — a completed 66-cell tranche — never materialised.
+
+### All three are inert
+
+| rule | status |
+|---|---|
+| The McNemar `b >= 5 → STOP` rule | ❌ **WITHDRAWN** — statistically defective (above) |
+| The CI / bootstrap readout rule that replaced it | ❌ **MOOT** — no further cells are being scored |
+| Any *"run tranche 2 next"* implication | ❌ **INERT** — the design is superseded, not paused (§1, §8) |
+
+**Nothing in this record establishes a live stopping criterion, because there is nothing left
+to stop.** §4's Δ and CI are published as forensic evidence under an explicit "no decision
+hangs on this" statement, and must not be read as the surviving decision rule.
+
+Task 3635 carries its own short dated superseded-notice pointing at this record, so the two
+artifacts are **mutually cross-linked** — a reader arriving from either side reaches the same
+disposition.
+
+---
+
+## 10. Appendix: reproduction recipe
+
+> 🔴 **Caveat first, because it is the reason this appendix is not load-bearing.** Everything
+> named below lives under `data/eval-campaign/tranche1/`, which is **GITIGNORED** (root
+> `.gitignore` line 9, root-anchored `/data/`) and exists **only in the main checkout**. It
+> is on no ref and in no backup this repository controls, and under ruling C nothing protects
+> it from cleanup. **Every figure in §2-§7 is therefore quoted in full above.** This recipe is
+> a convenience for a reader who still has the tree — not the carrier of any number.
+
+**Re-run the ruled readout** (reproduces §4's Δ, CI, well-posed subset, and the per-candidate
+table):
+
+```bash
+T1=/home/leo/src/dark-factory/data/eval-campaign/tranche1
+# cells/ is the already-isolated copy; the script's DEFAULT --results points at the
+# SHARED store orchestrator/src/orchestrator/evals/results/ with an mtime cut against
+# RUN_START_MARKER, which would sweep in unrelated cells. Always pass --results
+# explicitly, with a marker older than every cell.
+touch -t 200001010000 /tmp/ancient_marker
+python3 "$T1/analyse_tranche1.py" --results "$T1/cells" --marker /tmp/ancient_marker
+```
+
+Expected shape: `cells in campaign scope: 53`, Δ = −0.0556 with 95% CI [−0.2037, +0.0926],
+well-posed subset 4 of 9, 0 unlocked, cap-excluded 0 vs 0 → SYMMETRIC.
+
+**Recompute the inventory, cost and validity-bounded quality figures** (§2, §5, §6) directly
+from the cells, independent of the script:
+
+```python
+import json, glob, collections, statistics
+
+CELLS = '/home/leo/src/dark-factory/data/eval-campaign/tranche1/cells/*.json'
+cells = [json.load(open(f)) for f in sorted(glob.glob(CELLS))]
+assert len(cells) == 53, len(cells)
+
+by_arm = collections.Counter(c['config_name'] for c in cells)
+assert by_arm == {'architect-fable-max': 26, 'architect-opus-max': 27}, by_arm
+# outcome is 'done' on every cell INCLUDING declines — see §2e
+assert {c['outcome'] for c in cells} == {'done'}
+
+for arm in sorted(by_arm):
+    a = [c for c in cells if c['config_name'] == arm]
+    m = [c['metrics'] for c in a]
+    cost   = sum(x.get('cost_usd') or 0.0 for x in m)
+    judge  = sum(x.get('judge_cost_usd') or 0.0 for x in m)
+    # cap symmetry (§2d) — CONFIRM, never assume
+    tainted = sum(1 for x in m if x.get('cap_tainted'))
+    planned = [x for x in m if (x.get('plan_steps') or 0) > 0]
+    # validity bounding (§5) — judged_without_reference is σ's marker (PRD D9).
+    # Do NOT average plausibility-scored cells in; that is the forbidden operation.
+    fidelity = [x for x in planned if not x.get('judged_without_reference')]
+    print(arm, len(a),
+          'cost=%.4f' % cost, 'judge=%.4f' % judge,   # judge is a SUBSET of cost (§6a)
+          'cap_tainted=%d' % tainted,
+          'planned=%d' % len(planned),
+          'cellPlanRate=%.4f' % (len(planned) / len(a)),
+          'boundedPQ=%.4f (n=%d)' % (statistics.mean(x['plan_quality'] for x in fidelity),
+                                     len(fidelity)))
+```
+
+Expected: fable `26 cost=123.6355 judge=2.0911 cap_tainted=0 planned=3 cellPlanRate=0.1154
+boundedPQ=0.8950 (n=2)`; incumbent `27 cost=107.2742 judge=3.4560 cap_tainted=0 planned=5
+cellPlanRate=0.1852 boundedPQ=0.9250 (n=2)`.
+
+**The forensic artifacts** (§3) are under `$T1/investigation/`: `FINDINGS.md` (the
+investigation, 51-cell cut), `claims.txt` (decline payloads), `summaries/` (per-cell
+tool-level extractions plus `_index.json`), `gamma1/` (γ1 selection forensics),
+`extract_transcripts.py` (the extractor).
+
+**§3e's fable cell is not in `summaries/`** — the 51-cell cut predates it. It was verified for
+this record by extracting the plan-tool call sequence directly from its transcript at
+`~/.claude/projects/-home-leo-src-reify-eval-worktrees-reify-task-4026-run-f2f205af/`.
+Transcripts under `~/.claude/projects/*run-<id>/` are the **only** surviving record of why any
+cell declined (§2e), and they are outside this repository entirely.
+
+### Cross-links
+
+- **Upstream PRD:** `plans/fable-architect-trial-v2-prd.md` §ζ, and its capability manifest
+  `plans/fable-architect-trial-v2-prd.capability-manifest.md` §ζ. Both carry a dated
+  superseded-notice pointing here.
+- **v1 precedent (the "2863 shape"):** `plans/fable-architect-eval-decision-2026-07-30.md` —
+  the decision-record skeleton, the INV-2 apparatus, and the `$/fixture`-vs-`$/usable-plan`
+  discipline reused in §6c.
+- **γ1 calibration report:** `plans/fable-trial-v2-calibration-2026-08-24.md`, whose §Errata
+  names ζ directly and is discharged in §7.
+- **Tasks:** 3635 (δ — tranche-1 run gate; carries the reciprocal superseded-notice, §9),
+  3637 (η — admission re-ruling gate, this record's consumer), 4757 (eval→production
+  contamination, §8d), 4844 (replay isolation / honest-frame briefing, §8b), 3735 (the two
+  live `df_task_2260` defects the eval architects surfaced).
+- **Gates:** esc-3635-1 and esc-4761-1 (ruling D9), esc-3634-1 (γ2 ruling, which added γ1's
+  errata), esc-2864-1 (Leo's ruled reopening condition for the v2 trial).
+- **Primary data (gitignored, main checkout only):**
+  `/home/leo/src/dark-factory/data/eval-campaign/tranche1/`.
