@@ -1700,6 +1700,12 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
     # for the number already published as the metric's `n`, and when exposure
     # is zero the metric is absent and `metric_families_not_measured` names
     # the gap, which a bare 0 here would have disguised as a measurement.
+    # `pairs_beyond_scored_depth` is NOT that same refusal reversed: it is
+    # the population the pin REMOVED (both-present in the full fetch, not
+    # both within the scored depth), a number `n` never carries at all.
+    # Without it a corpus where superseded entries reliably outrank their
+    # successors just past the scored depth is indistinguishable, in this
+    # artifact, from one with no such pairs anywhere in reach.
     for observation in observations.inversions:
         if observation.degraded:
             key = f'degraded_inversion_observations_at_k{observation.k}'
@@ -1709,6 +1715,8 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
         counts[key] = counts.get(key, 0) + 1
         key = f'inversion_pairs_registered_at_k{observation.k}'
         counts[key] = counts.get(key, 0) + observation.pairs_registered
+        key = f'inversion_pairs_beyond_scored_depth_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + observation.pairs_beyond_scored_depth
     return counts
 
 
