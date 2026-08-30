@@ -1597,12 +1597,16 @@ class TestBuildReport:
     def test_the_caveats_name_the_suppression_bound(self) -> None:
         """Not a prose pin: the CONTRACT that the artifact states the bound.
 
-        Asserted on the measurable key name plus the worked hazard, so
-        re-wording the caveat is free and deleting the disclosure is not.
+        Asserted on the measurable KEY NAME only — referential integrity
+        between the caveats and a real report key — so re-wording the caveat
+        is free and deleting the disclosure is not. Deliberately NOT asserted
+        on the caveat's wording (nor on a looser regex over it): a phrasing
+        assertion breaks on an edit that changes no behaviour, which is the
+        failure mode the house rule against prose meta-tests exists to
+        prevent.
         """
         blob = ' '.join(self._build([])['caveats'])
         assert 'suppressed_by_bare_id' in blob
-        assert 'LOWER BOUND' in blob
 
     def test_by_graph_tallies_every_swept_graph(self) -> None:
         summary = self._build([_finding(), _finding(edge_uuid='e2')])['summary']

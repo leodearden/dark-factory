@@ -267,8 +267,9 @@ sibling deterministic task 2456", is plausibly a correct relation. This is
 exactly why every finding is a **candidate for human adjudication** and why
 the script has no remediation path (§5).
 
-**31 families** (a node with ≥2 findings) cover 88 findings; the remaining
-**93 are singletons**.
+**34 families** (a node with ≥2 findings) cover 98 findings; the remaining
+**94 are singletons**. The split sums to this run's 192 findings, which is
+the arithmetic check to re-run whenever the artifact is regenerated.
 
 ---
 
@@ -536,49 +537,70 @@ else:
 
 It computes `resolvable = len(candidates) == 1`, resolves
 `new_endpoint_uuid` via the read-only
-`MemoryService._intended_endpoint_uuid` — and then **only logs a warning**.
-Its own docstring says so: *"DETECTS AND RECORDS ONLY — it performs no writes
-of any kind"*, pinned by
-`fused-memory/tests/test_referent_verification.py` (`_WRITE_PRIMITIVES` /
-`assert_never_repaired()`).
+`MemoryService._intended_endpoint_uuid` — and itself writes nothing. Its own
+docstring says so: *"DETECTS AND RECORDS ONLY — it performs no writes of any
+kind"*, pinned by `fused-memory/tests/test_referent_verification.py`
+(`_WRITE_PRIMITIVES` / `assert_never_repaired()`). ζ detects; it is not the
+end of the chain.
 
 The repair chain — **leaf ETA**, `ensure_entity_node` → `reassign_edge` →
-`refresh_entity_summary` — is documented in that same method's docstring and
-in `plans/memory-referent-fidelity-prd.md` (where η is still listed as a
-**leaf**, depending on α and ζ). It has **no production wiring**:
-`fused_memory/backends/graphiti_client.py::GraphitiBackend.ensure_entity_node`
-has **zero production call sites** repo-wide — every occurrence outside its
-own body is either a test (`test_write_time_identity.py`,
-`test_referent_verification.py`) or prose.
+`refresh_entity_summary` — **is built, wired and live on the write path.**
+`memory_service.py::MemoryService._repair_episode_referents` is the WRITER
+that consumes ζ's findings, and it runs as the **eighth sub-pass of the
+identity-reconcile chain** (registered in `_reconcile_episode_identity`); it
+reaches `graphiti_client.py::GraphitiBackend.ensure_entity_node` through
+`memory_service.py::MemoryService._repair_edge_findings`, which is therefore
+a real production call site. ETA landed on this branch's base as commit
+`b5cb396e19` (2026-08-25), and **task 3672 is `done`**, with
+`done_provenance.commit = 6dba49cf00`, recorded 2026-08-27T08:57Z — two days
+before this artifact's 2026-08-29 regeneration.
 
-So the system already *knows* about these 192 edges at write time and
-deliberately does nothing.
+So the system does not merely *know* about wrong bindings at write time: as
+of ETA it repairs the resolvable ones, under the identity lock, going
+forward. That reframes what these 192 edges are — see below.
 
 ### Recommendation
 
-**The primary fix is already a filed, live task — do not re-file it.**
+**The primary preventive fix is already BUILT AND LIVE — do not re-file
+it, and do not read this sweep as proposing it.**
 
-1. **Primary — wire leaf ETA: already tracked as task 3672**, *"Referent
-   repair path: `ensure_entity_node` → `reassign_edge` →
-   `refresh_entity_summary`, + streak escalation"*, **status
-   `in-progress`**, priority high. This sweep does not propose new work here;
-   it supplies 3672 with a measured population (192 edges) and one design
-   constraint it should honour:
+1. **Prevention — leaf ETA, task 3672, is `done` and wired.** The
+   write-path repair (`_repair_episode_referents` → `_repair_edge_findings`
+   → `ensure_entity_node` / `reassign_edge` / `refresh_entity_summary`)
+   runs today on every episode write, so this sweep proposes no new
+   preventive work. What it contributes instead is a **measured population
+   to check ETA's existing gating against**, and one open question. Two
+   parts, and only the second is open:
 
-   > **Gate the repair on `resolvable`, and exclude mode 2.** 113/192 (59 %)
-   > already have an existing correct node (recomputed on each regenerated
-   > artifact, never carried over — the ratio has held across three runs, so
-   > neither does the strength of this recommendation move); mode 1 (§2)
-   > supplies the rest via `ensure_entity_node`. **Do not** auto-repair the
-   > mode-2 cell (`unrelated` proximity + node present, ~67 edges): it
-   > contains
-   > legitimate cross-task relations, and it is precisely where an automated
-   > verdict would corrupt good data.
+   > **`resolvable` gating: already honoured.** `_repair_edge_findings`
+   > opens with `if not finding.resolvable or intended is None:` and records
+   > `'unrepairable'` rather than guessing — and `ReferentFinding.resolvable`
+   > defaults to `False`, so fail-closed is structural rather than a branch.
+   > Nothing to add.
+
+   > **'Exclude mode 2': an OPEN CHECK, not a constraint on future work.**
+   > 113/192 (59 %) of these findings already have an existing correct node
+   > (recomputed on each regenerated artifact, never carried over — the
+   > ratio has held across three runs); mode 1 (§2) supplies the rest via
+   > `ensure_entity_node`. The mode-2 cell (`unrelated` proximity + node
+   > present, ~67 edges) contains legitimate cross-task relations, and is
+   > precisely where an automated verdict would corrupt good data. **This
+   > sweep did not establish whether ETA's `resolvable` gate already
+   > excludes that cell.** ζ's `resolvable` is a set-membership/per-edge-
+   > pairing verdict against the *episode's* referents; this sweep's
+   > proximity classes are a different lens over the *live graph*, and the
+   > two have not been cross-walked. Someone should measure the overlap
+   > before concluding either that ETA is safe here or that it is not.
 
 2. **Remediation of the existing edges — already tracked as task 3673**
-   (leaf θ, `pending`), which remediates measured live conflations. The 192
-   findings here are candidate input to it, **not** a mandate: each still
-   needs human adjudication (§5, below).
+   (leaf θ, **status `blocked`** as of 2026-08-29), which remediates measured
+   live conflations. The 192 findings here are candidate input to it,
+   **not** a mandate: each still needs human adjudication (§5, below). Note
+   that with ETA live, these 192 are best read as **historical residue** —
+   edges written before the repair path existed, or ones it declined as
+   unresolvable — rather than as an ongoing accrual; this sweep did not
+   measure the post-ETA accrual rate, and that measurement is what would
+   settle it.
 
 3. **Complementary prevention — NOT currently tracked; filed by this task.**
    `graphiti_client.py::GraphitiBackend.add_episode` is the only place

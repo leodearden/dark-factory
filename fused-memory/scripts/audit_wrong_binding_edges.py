@@ -26,10 +26,14 @@ Detection, and its exact relationship to the LIVE write-time guard
 ``fused_memory/services/memory_service.py::MemoryService._verify_episode_referents``
 already performs this check post-write, as a ``set-membership`` test: an
 endpoint whose name is a task label must be among the referents its fact
-names. It computes the correction and logs a warning; leaf ETA
-(``fused_memory/backends/graphiti_client.py::GraphitiBackend.ensure_entity_node``
--> ``reassign_edge`` -> ``refresh_entity_summary``) that would ACT on it has
-no production wiring.
+names. It computes the correction and records it, but writes nothing itself;
+leaf ETA -- ``MemoryService._repair_episode_referents`` ->
+``MemoryService._repair_edge_findings`` ->
+``fused_memory/backends/graphiti_client.py::GraphitiBackend.ensure_entity_node``
+-> ``reassign_edge`` -> ``refresh_entity_summary`` -- is the WRITER that acts
+on those findings, and it IS wired: it runs as a sub-pass of the
+identity-reconcile chain on every episode write (task 3672, done). So the
+live path both detects and repairs the resolvable cases going forward.
 
 This sweep is the RETROSPECTIVE counterpart of that check, and it IMPORTS the
 same detection vocabulary rather than re-deriving it — see
