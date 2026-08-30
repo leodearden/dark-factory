@@ -468,3 +468,99 @@ models.** Δ here is measuring the band, not the candidates.
 > this interval to feed. These statistics are published because ζ's contract mandates
 > paired per-fixture statistics as forensic evidence, and for no other reason. A reader who
 > arrives at this table without having read §9 must not mistake it for a live decision rule.
+
+---
+
+## 5. `plan_quality`, validity-bounded
+
+_RAW OBSERVATION._ **Forensic evidence, not a capability readout.** This section reports
+`plan_quality` **only where a valid reference block exists**. Plausibility-judged cells are
+enumerated individually and are **never averaged in silently**.
+
+### 5a. Every cell with `plan_steps > 0`, enumerated
+
+All 8 such cells across 53, recomputed from `cells/*.json`. The `reference valid?` column is
+driven by σ's structured marker `metrics.judged_without_reference` (PRD D9): a cell with
+`judged_without_reference == True` was scored against **no reference diff** — the judge
+rated the plan's *plausibility*, not its *fidelity* to a known-good answer.
+
+| fixture | arm | trial | `plan_steps` | `plan_quality` | reference valid? |
+|---|---|---|---|---|---|
+| `reify_task_12` | fable | 1 | 22 | 0.85 | ✅ yes (fidelity) |
+| `reify_task_12` | fable | 2 | 24 | 0.94 | ✅ yes (fidelity) |
+| `reify_task_4026` | fable | 2 | 6 | 0.93 | ❌ **no — plausibility** |
+| `df_task_2260` | incumbent | 1 | 14 | 0.95 | ✅ yes (fidelity) |
+| `reify_task_12` | incumbent | 3 | 26 | 0.90 | ✅ yes (fidelity) |
+| `reify_task_2531` | incumbent | 1 | 10 | 0.70 | ❌ **no — plausibility** |
+| `reify_task_2699` | incumbent | 2 | 17 | 0.95 | ❌ **no — plausibility** |
+| `reify_task_4026` | incumbent | 3 | 6 | 0.91 | ❌ **no — plausibility** |
+
+Note that **two of these eight cells are the plan-then-decline cells of §3e** (`reify_task_4026`,
+both arms). They carry a `plan_quality` score for a plan their own author repudiated.
+
+### 5b. The validity-bounded means
+
+Bounding strictly to `judged_without_reference == False`:
+
+| arm | fidelity-scored cells | `plan_quality` values | **bounded mean** | n |
+|---|---|---|---|---|
+| `architect-fable-max` | `reify_task_12` t1, t2 | 0.85, 0.94 | **0.895** | **2** |
+| `architect-opus-max` | `df_task_2260` t1, `reify_task_12` t3 | 0.95, 0.90 | **0.925** | **2** |
+
+Plausibility-scored and therefore excluded from both means: fable 0.93; incumbent 0.95,
+0.91, 0.70.
+
+### 5c. `FINAL-READOUT`'s `mean_pq` is SUPERSEDED by §5b
+
+`FINAL-READOUT.txt` and `analyse_tranche1.py` both publish a per-candidate `mean_pq`:
+
+| arm | published `mean_pq` | over | this record's bounded figure |
+|---|---|---|---|
+| `architect-fable-max` | **0.907** | 3 planned cells | **0.895** (n=2) |
+| `architect-opus-max` | **0.882** | 5 planned cells | **0.925** (n=2) |
+
+Those published means average **all** planned cells — including 1 of 3 fable and 3 of 5
+incumbent that were plausibility-judged. That is precisely the operation ζ's contract
+forbids, so **the published `mean_pq` is superseded by §5b for all purposes.**
+
+Both figures are quoted here deliberately. Two committed artifacts now carry different
+quality numbers for the same campaign; simply omitting the older one would leave a reader
+to guess which is authoritative. It is **this record's §5b**.
+
+> ⚠️ A further note for anyone reading `analyse_tranche1.py`'s output directly: its
+> per-candidate table prints a `NOTE` claiming "plan_quality here is validity-bounded."
+> **It is not.** The `mean_pq` that table prints is 0.907 / 0.882 — the all-planned-cells
+> mean, arithmetically verifiable as including the plausibility-scored cells
+> (fable: mean(0.85, 0.94, 0.93) = 0.9067). The note is best read as a *warning that
+> plausibility-scored cells are present*, not as a description of the computation. The
+> genuinely bounded figures are §5b's and appear nowhere in the instrument's output.
+
+### 5d. Corroboration: γ1 measured the inflation
+
+γ1's calibration report (`plans/fable-trial-v2-calibration-2026-08-24.md`, §"plan_quality
+validity — the binding constraint") measured plausibility scoring across 15 cells and found
+it **inflates `plan_quality` by +0.0810 on average** and **compresses the distribution into
+[0.92, 0.95]**, while fidelity-scored cells spread across [0.70, 0.93].
+
+The four plausibility-scored cells here are consistent with that pattern: three sit in or at
+the edge of the compressed band (0.93, 0.95, 0.91). The fourth, the incumbent's 0.70 on
+`reify_task_2531`, sits well below it — so the pattern is a tendency, not a rule, and this
+record does not claim otherwise. **The operative point is that a plausibility score and a
+fidelity score are not the same measurement and must not be averaged together.**
+
+### 5e. The binding limitation
+
+> **n = 2 valid-reference planned cells per arm, out of 26 and 27 cells respectively.**
+>
+> **`reify_task_12` is the ONLY fixture carrying a valid-reference planned cell in BOTH
+> arms. There is therefore no paired quality comparison available at all** — the v1
+> paired-per-fixture discipline cannot be applied to `plan_quality` on this tranche, because
+> the pairing does not exist.
+>
+> **The bounded means in §5b carry NO inferential weight.** They are reported because ζ's
+> contract requires the validity-bounded figure to be on the record, and for no other
+> reason. A 2-cell mean supports no conclusion about either arm, and the 0.895-vs-0.925
+> gap between them is not a finding.
+
+Publishing a two-cell mean without this caveat would be worse than publishing nothing, which
+is why the caveat travels attached to the figure rather than in a footnote.
