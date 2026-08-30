@@ -3924,16 +3924,21 @@ class TestStoresServedDisclosure:
         be walled off into its own key rather than polluting either count —
         the same discipline `degraded_observations_at_k` holds the phrasing
         family to.
+
+        `inversion_pairs_beyond_scored_depth_at_k5` is a different kind of
+        row — a trim diagnostic, not an exposure — but is walled off from
+        the degraded observation the same way as the other two.
         """
         observations = _mod().ProbeObservations(inversions=[
-            _inversion_obs('a', pairs=3, inversions=1, k=5),
-            _inversion_obs('b', pairs=2, k=5),
-            _inversion_obs('c', pairs=99, k=5, degraded=True),
+            _inversion_obs('a', pairs=3, inversions=1, k=5, beyond_depth=2),
+            _inversion_obs('b', pairs=2, k=5, beyond_depth=1),
+            _inversion_obs('c', pairs=99, k=5, degraded=True, beyond_depth=99),
         ])
         counts = _build(observations).corpus.counts
 
         assert counts['inversion_observations_at_k5'] == 2
         assert counts['inversion_pairs_registered_at_k5'] == 5
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 3
         assert counts['degraded_inversion_observations_at_k5'] == 1
 
     def test_inversion_observations_at_different_depths_produce_separate_keys(self):
@@ -3941,13 +3946,15 @@ class TestStoresServedDisclosure:
         same hazard the serving-store disclosure guards against, restated
         for the inversion family."""
         observations = _mod().ProbeObservations(inversions=[
-            _inversion_obs('a', pairs=1, k=5),
-            _inversion_obs('a', pairs=1, k=10),
+            _inversion_obs('a', pairs=1, k=5, beyond_depth=1),
+            _inversion_obs('a', pairs=1, k=10, beyond_depth=1),
         ])
         counts = _build(observations).corpus.counts
 
         assert counts['inversion_observations_at_k5'] == 1
         assert counts['inversion_observations_at_k10'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k10'] == 1
 
     def test_the_probe_band_records_both_exposures_distinctly(self):
         """Registered pairs and comparable pairs are different facts.
