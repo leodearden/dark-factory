@@ -71,7 +71,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_statuses import TERMINAL
@@ -853,6 +853,42 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+class FlakeLedgerTaskClient(Protocol):
+    """The task-filing seam :func:`open_debt` needs to enforce §5.9 — declared
+    STRUCTURALLY (``typing.Protocol``) so it is machine-checked (INV-1) rather than
+    prose, and so no import edge is created to the module that satisfies it.
+
+    ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient``
+    is the concrete adapter.  It is NOT imported here, deliberately: this module depends
+    on ``shared`` alone, and importing ``chronic_flake`` would drag ``orchestrator.config``
+    into a module the merge path calls on every suppression.
+
+    Every method must degrade rather than raise where it can, but the ledger does not
+    RELY on that — :func:`_ensure_owner_task` guards each call independently, because a
+    partial or older adapter (one lacking a method entirely, hence ``AttributeError``) is
+    a shape that really arrives.
+    """
+
+    async def submit_task(self, arguments: dict) -> str:
+        """File the task described by *arguments* (see
+        :func:`build_deflake_task_arguments`) and return its id.  The block carries
+        ``planning_mode: True``, so this must return a REAL, synchronously-known task id
+        — not a ticket id — or the invariant it backs is hollow.  A falsy return is
+        treated as a failed filing."""
+        ...
+
+    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+        """Live ``{id: status}`` for *ids*.  Unknown ids are OMITTED rather than
+        reported as a status, and the ledger reads that omission as a corroborated
+        absence."""
+        ...
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        """Release planning-mode tasks from ``deferred`` to ``pending`` — the second
+        phase of the initial filing, without which the task never dispatches."""
+        ...
+
+
 def _owner_liveness(status: str | None) -> str:
     """Three-way verdict on a stored owner's LIVE status: ``open`` | ``deferred`` | ``closed``.
 
@@ -909,7 +945,7 @@ async def _ensure_owner_task(
     project_id: str,
     row: DebtRow,
     *,
-    task_client: Any,
+    task_client: FlakeLedgerTaskClient | None,
 ) -> DebtRow:
     """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
 
@@ -952,7 +988,28 @@ async def _ensure_owner_task(
     if row.owner_task_id:
         # INV-3: corroborate BEFORE acting.  The stored id is a snapshot; it is re-read
         # against live status on every suppression and never assumed still-open.
-        statuses = await task_client.get_statuses([row.owner_task_id])
+        #
+        # Its OWN guard, and the fail-safe direction is do-NOT-file.  This is the
+        # opposite of `chronic_flake._has_open_dedup_match`'s fail-open-towards-filing,
+        # deliberately: there a duplicate is bounded by `FilingLedger`'s multi-day
+        # per-test rate limit, here there is none, so a transient MCP outage during a
+        # suppression burst would file one duplicate PER SUPPRESSION.  An unreadable
+        # status is also simply not evidence that the owner went terminal, and INV-3
+        # says corroborate before acting.  A missed filing is cheaply recoverable — the
+        # next suppression of the same test retries, and θ's age backstop catches a row
+        # that stays stuck; a duplicate task tree is not.
+        try:
+            statuses = await task_client.get_statuses([row.owner_task_id])
+        except Exception:
+            logger.warning(
+                'flake_ledger: could not corroborate owner %s for test_id=%s — KEEPING '
+                'the stored owner and filing nothing (an unreadable status is not '
+                'evidence the task went terminal)',
+                row.owner_task_id,
+                row.test_id,
+                exc_info=True,
+            )
+            return row
         liveness = _owner_liveness(statuses.get(row.owner_task_id))
         if liveness == 'open':
             logger.debug(
@@ -972,7 +1029,16 @@ async def _ensure_owner_task(
                 row.owner_task_id,
                 row.test_id,
             )
-            await task_client.commit_planning([row.owner_task_id])
+            try:
+                await task_client.commit_planning([row.owner_task_id])
+            except Exception:
+                logger.warning(
+                    'flake_ledger: could not complete the half-filed de-flake task %s '
+                    'for test_id=%s — it stays deferred and the next suppression retries',
+                    row.owner_task_id,
+                    row.test_id,
+                    exc_info=True,
+                )
             return row
         logger.info(
             'flake_ledger: de-flake task %s owning test_id=%s is no longer live '
@@ -982,13 +1048,61 @@ async def _ensure_owner_task(
             statuses.get(row.owner_task_id),
         )
 
-    arguments = build_deflake_task_arguments(row)
-    new_id = str(await task_client.submit_task(arguments) or '')
+    # The filing gets its OWN guard for the same reason the corroboration does: one
+    # failing client call must cost exactly that signal, never the merge (B12) and never
+    # the other side-effects — the "independently guarded side-effects" discipline
+    # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
+    try:
+        new_id = str(await task_client.submit_task(build_deflake_task_arguments(row)) or '')
+        if not new_id:
+            # A falsy id is a FAILED filing, not a filing with an empty name.  Storing
+            # '' would hide the breach behind a truthy-looking column value; leaving the
+            # column NULL is what `flake_report` renders as the invariant breach it is.
+            raise ValueError('submit_task returned no task id')
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
+            '— the debt row stays UNOWNED and §5.9 is breached for it until the next '
+            'suppression retries',
+            row.test_id,
+            project_id,
+            exc_info=True,
+        )
+        return row
+
+    # The pointer is written BEFORE commit_planning is awaited, and the order picks
+    # which failure is survivable.  Written last, a commit_planning failure would orphan
+    # a task that really was created — invisible, unreferenced, and re-created on every
+    # subsequent suppression.  Written first, the worst case is a row pointing at a
+    # `deferred` task, which ι renders (owner shown) and which the `deferred` branch
+    # above repairs on the next suppression.  Same principle as the recorder's "durable
+    # row first, lose the recoverable half".
+    try:
+        _write_owner_task_id(db_path, row.test_id, new_id)
+    except Exception:
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but could not store the '
+            'pointer — the task is ORPHANED and the next suppression will file another',
+            new_id,
+            row.test_id,
+            exc_info=True,
+        )
+        return row
+
     # `planning_mode=True` created the task `deferred`; commit_planning is the SECOND
     # PHASE of the initial filing, not lifecycle management, and without it the task
     # exists but is never dispatched.
-    await task_client.commit_planning([new_id])
-    _write_owner_task_id(db_path, row.test_id, new_id)
+    try:
+        await task_client.commit_planning([new_id])
+    except Exception:
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but could not release it '
+            'from deferred — the pointer IS stored, so the next suppression completes it '
+            'rather than filing a duplicate',
+            new_id,
+            row.test_id,
+            exc_info=True,
+        )
     logger.info(
         'flake_ledger: filed de-flake task %s owning debt for test_id=%s (project_id=%s)',
         new_id,
@@ -1007,7 +1121,7 @@ async def open_debt(
     project_id: str,
     test_id: str,
     *,
-    task_client: Any = None,
+    task_client: FlakeLedgerTaskClient | None = None,
     now: datetime | None = None,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
