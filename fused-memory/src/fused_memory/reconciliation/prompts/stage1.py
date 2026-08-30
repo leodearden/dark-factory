@@ -14,6 +14,7 @@ from fused_memory.reconciliation.prompts import (
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_entity_standing_decision_schema_section,
@@ -228,6 +229,8 @@ count a `finding_id` for it:
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 - `run_id_unknown` / `report_already_completed` — nothing was filed. Do not fabricate a \
   `finding_id` or claim the finding was recorded.
+
+{render_finding_provenance_section(can_file_tasks=False)}
 
 ## Refresh Entity Summary Failure Recording (Task 1157)
 When the response from `mcp__fused-memory__refresh_entity_summary` contains an `error` \

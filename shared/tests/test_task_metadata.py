@@ -2295,6 +2295,63 @@ class TestParseMetadataFailurePolicy:
         empty_model, _ = parse_metadata({}, direction='read')
         assert 'execution_class' not in empty_model.model_dump()
 
+    def test_finding_provenance_memory_ids_key_is_blessed(self):
+        """`related_memory_ids` must not census-warn (esc-3796-1 / task 4373).
+
+        The memory-ids half of the finding-provenance family: where
+        `source_finding_id` names WHICH finding a task was spawned from,
+        `related_memory_ids` names the memory ids that finding cites. It is
+        ratified as the CANONICAL plural spelling on the same corpus-dominance
+        grounds as the id-trio above, and shares that family's unusual
+        property of having no code reader and no code writer — after task
+        4373 the recon Stage 1/2 prompts are its writer, so a future reader
+        who greps for a code writer and finds none must not prune it as dead.
+
+        Basis: esc-3796-1, cited by id. The per-key census figures are
+        transcribed exactly once, beside the entries in
+        shared/src/shared/task_metadata.py; restating them here would age
+        into a second stale copy.
+
+        RED until 'related_memory_ids' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata({'related_memory_ids': ['90bd6ecf']}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'related_memory_ids'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for related_memory_ids; got: {offending}'
+        )
+
+    @pytest.mark.parametrize('near_miss_alias', ['origin_memory_ids', 'memory_ids'])
+    def test_finding_provenance_memory_ids_near_miss_aliases_still_warn(self, near_miss_alias):
+        """The plural-memory-id near misses must KEEP emitting unknown_key (esc-3796-1).
+
+        The negative half of the test above. Once `related_memory_ids` is
+        blessed it goes silent by design, so the drift signal for the
+        plural-memory-id family lives entirely in the UNBLESSED spellings:
+        `code=unknown_key` is what an operator greps for to find a caller
+        still on a wrong spelling. Blessing one of these — or promoting it to
+        a typed `TaskMetadata` field — would void that contract with no other
+        test failing and leave the grep silently returning nothing.
+
+        Scoped to exactly two spellings, both of which this task measured:
+        `origin_memory_ids` is the variant esc-3796-1 explicitly rejected, and
+        `memory_ids` is the bare form. The wider corpus holds further ad-hoc
+        plural spellings, but their inventory is a point-in-time census figure
+        this task did not re-measure — pinning unmeasured names would assert
+        something unverified.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test,
+        not a documentation meta-test.
+        """
+        _, warnings = parse_metadata({near_miss_alias: ['v']}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert near_miss_alias in unknown_key_fields, (
+            f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
+            f'in the census; got warnings: {warnings}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)

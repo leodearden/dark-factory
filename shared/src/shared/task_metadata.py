@@ -1081,6 +1081,21 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'source_finding_id',
         'stage1_finding_id',
         'origin_finding_id',
+        # `related_memory_ids` is the memory-ids half of the SAME family
+        # (esc-3796-1, task 4373): where the id-trio above names WHICH finding
+        # a task came from, this names the memory ids that finding cites. Two
+        # facts carry the ruling. It already exists and co-occurs 100% with
+        # `source_finding_id` — task 3796 itself carries exactly that shape —
+        # so it is not a new invention; and the corpus had already forked into
+        # 10 plural memory-id spellings, so the remedy is to canonicalize the
+        # strongest EXISTING one rather than mint an 11th. `origin_memory_ids`
+        # was considered and rejected (one task, 3107, cancelled).
+        #
+        # Like the trio, it has NO code reader and NO code writer. After task
+        # 4373 the recon Stage 1/2 PROMPT is its writer — a future reader who
+        # greps for a code writer, finds none, and prunes the entry as dead
+        # would be wrong in the same way.
+        'related_memory_ids',
         'spawned_from',
         'program',
         'program_stream',

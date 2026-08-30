@@ -20,6 +20,7 @@ from fused_memory.reconciliation.prompts import (
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -69,6 +70,8 @@ Interpreting the status:
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
+
+{render_finding_provenance_section(can_file_tasks=True)}
 
 {render_execution_class_section()}
 
