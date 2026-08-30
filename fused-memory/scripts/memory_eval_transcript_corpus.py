@@ -868,7 +868,7 @@ def coverage_status(coverage: Mapping[str, Any]) -> str:
     a consumer looking only at the count would read a totally broken run as a
     clean empty result. That is precisely the failure this script exists to
     make impossible (design-invariants INV-2 structured-facts-at-failure,
-    INV-10 no-silent-fail-soft).
+    INV-11 no-silent-fail-soft).
 
     So the cause is resolved here into a status that a human reads in the
     report and a wrapper reads as an exit code:

@@ -14,7 +14,8 @@ seeded 2026-07-14; INV-6..7 fixtures were added 2026-08-02 with the
 task/escalation state-graph invariants; INV-8 fixtures were added
 2026-08-06 with the loop-occupancy invariant; INV-9 fixtures were added
 2026-08-24 with the one-fact-one-home invariant; INV-10 fixtures were
-added with the promotion of `no-silent-fail-soft`.
+added 2026-08-30 with the guards-exercise-behaviour invariant (task 4666);
+INV-11 fixtures were added with the promotion of `no-silent-fail-soft`.
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -58,7 +59,8 @@ records the verdict each yields against the expected slug. Columns:
 Acceptance: every fixture flags with the correct slug. The base table
 holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
 2026-08-06 addendum adds 2 (INV-8), the 2026-08-24 addendum adds 2
-(INV-9), and the INV-10 addendum adds 2 — 20 rows cumulative, all `Y`.
+(INV-9), the 2026-08-30 addendum adds 2 (INV-10), and the INV-11 addendum
+adds 2 — 22 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 

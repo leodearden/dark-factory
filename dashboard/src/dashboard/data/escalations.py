@@ -252,7 +252,7 @@ def _merge_summaries(summaries: list[dict]) -> dict:
     malformed, and defaulting it would turn "this summary was built by a path
     that forgot to count skips" into a confident "0 unreadable" — precisely the
     silent-zero the key exists to eliminate.  Fail loud on a ``KeyError``
-    instead (INV-10, ``no-silent-fail-soft``).
+    instead (INV-11, ``no-silent-fail-soft``).
     """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}

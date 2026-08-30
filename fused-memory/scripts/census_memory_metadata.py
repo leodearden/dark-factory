@@ -213,7 +213,7 @@ _SHORT_HEX_RE = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 #:
 #: Raised rather than returning a short stream: a truncated census is
 #: indistinguishable from a census of a smaller corpus, and its consumer
-#: (leaf beta's grandfather list) cannot tell the difference (INV-10
+#: (leaf beta's grandfather list) cannot tell the difference (INV-11
 #: no-silent-fail-soft).
 #:
 #: An ALIAS of the backend's exception, not a subclass. The paging loop that
@@ -522,7 +522,7 @@ def build_report(
         -- a cell scrolling fewer points than ``count_by_metadata`` expected,
         or per-category counts summing short of the collection's point total
         -- sets ``coverage.complete=false`` and appears as a NAMED entry in
-        ``coverage.deltas`` (INV-10 no-silent-fail-soft). The caller exits
+        ``coverage.deltas`` (INV-11 no-silent-fail-soft). The caller exits
         non-zero on that flag.
     """
     projects: dict[str, Any] = {}
@@ -756,7 +756,7 @@ def topic_registry_loader() -> Any:
     module's entire test suite with it, bypassing the ``registry_coverage:
     null`` + ``registry_error`` path built for exactly that failure. The
     registry gauge is ONE optional block of the report; it must not be able to
-    take the measurement down with it (INV-2 no-silent-fail-soft cuts both
+    take the measurement down with it (INV-11 no-silent-fail-soft cuts both
     ways -- disclose the shortfall, do not escalate it into a total loss).
     """
     global _TOPIC_REGISTRY_LOADER  # noqa: PLW0603 - one-shot memo
@@ -852,7 +852,7 @@ def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None
     not be read at all -- a DIFFERENT claim from "the guard is off", and one
     the report must be able to make. Defaulting a failed read to ``False``
     would tell a reader the uniqueness violations are expected warn-mode
-    backlog when in fact nothing is known about the regime (INV-2
+    backlog when in fact nothing is known about the regime (INV-11
     no-silent-fail-soft).
 
     Pass *config* to report the regime the run ACTUALLY operated under: the

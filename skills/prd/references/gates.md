@@ -184,7 +184,7 @@ This trigger-shape list and the family row above have now drifted out of sync tw
 
 **Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
 
-**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table (10 rows for INV-1..5; a 2026-08-02 addendum walk covers INV-6..7; a 2026-08-06 addendum walk covers INV-8; a 2026-08-24 addendum walk covers INV-9; a further addendum walk covers INV-10), for calibrating this walk against dark-factory's family. A project with its own invariant family has its own fixtures or none.
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table (10 rows for INV-1..5; a 2026-08-02 addendum walk covers INV-6..7; a 2026-08-06 addendum walk covers INV-8; a 2026-08-24 addendum walk covers INV-9; a 2026-08-30 addendum walk covers INV-10; a further addendum walk covers INV-11), for calibrating this walk against dark-factory's family. A project with its own invariant family has its own fixtures or none.
 
 ---
 
