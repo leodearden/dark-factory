@@ -1086,6 +1086,64 @@ class TestFlipPreconditionsScript:
         assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
         assert _UNVERIFIABLE in proc.stdout, proc.stdout
 
+    def test_option_a_judge_passes_item_1_through_the_script(self, tmp_path):
+        """Mechanism-agnostic END TO END, not just in the probe's own tests.
+
+        Every other PASS-item-1 case here is an option (b). If the shell ever
+        grew a step that presumed a marked PROMPT, the probe suite would not
+        notice: it never runs the shell.
+        """
+        repo = _make_gate_repo(tmp_path, judge='option_a', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+        _assert_no_bare_grep_verdict(proc.stdout)
+
+    def test_missing_probe_fails_closed(self, tmp_path):
+        """A distinct record_fail site: the probe is simply not there.
+
+        It is the one branch that cannot report anything from the probe, so a
+        regression that dropped its record_fail would silently PASS item 1 on
+        no evidence whatsoever.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        (repo / 'scripts' / _PROBE.name).unlink()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, (
+            f'the gate passed with no probe on disk:\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert 'FAIL  item 1' in proc.stdout, proc.stdout
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_probe_timeout_fails_closed(self, tmp_path):
+        """exit 124, the branch the bounded `timeout` exists to produce.
+
+        Stands in for the probe hanging: a judge whose import never returns.
+        The interpreter test covers exit 127 (cannot run at all); this covers
+        ran-but-never-finished, which reaches a different record_fail site.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        # Shrink the gate's own `timeout 90` so the test does not take 90s.
+        gate = repo / 'scripts' / _GATE_SCRIPT.name
+        gate.write_text(gate.read_text().replace("timeout 90", "timeout 2"))
+        judge = (
+            repo / 'fused-memory' / 'src' / 'fused_memory' / 'server'
+            / 'write_triage_judge.py'
+        )
+        judge.write_text('import time\ntime.sleep(600)\n')
+        subprocess.run(['git', 'add', '-A', '-f'], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', 'hang'],
+            cwd=repo, check=True, capture_output=True,
+        )
+        proc = _run_gate(gate, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, (
+            f'the gate passed on a probe that never finished:\n{proc.stdout}'
+        )
+        assert 'FAIL  item 1' in proc.stdout, proc.stdout
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
     def test_items_2_and_4_still_fail_on_their_patterns(self, tmp_path):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
