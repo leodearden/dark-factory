@@ -355,9 +355,26 @@ Every decision must respect this order:
 
 **tasks.db corruption detection:**
 Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
-`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). If tasks.db has
-shrunk, task IDs are mismatched/duplicated, or tasks have disappeared — this is a **critical
-infrastructure error**:
+`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
+file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
+not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
+change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+two instead:
+
+- **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
+  returns the exact count as `pagination['total']` in a response small enough to note every cycle (see
+  "Draining pending escalations" for why full dumps are the context sink to avoid). Compare against the
+  previous cycle's.
+- **`PRAGMA integrity_check`** — SQLite's own structural check. Read the db **read-only** so you never
+  contend with the live orchestrator, per the hard constraint above:
+  `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
+  than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
+  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
+  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+
+If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
+`integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
+disappeared — this is a **critical infrastructure error**:
 1. Find the orchestrator process **for this project only** — verify its command-line args reference this project's root before doing anything
 2. Send SIGTERM (not SIGKILL) and let it finish gracefully
 3. Tell the human immediately with full details

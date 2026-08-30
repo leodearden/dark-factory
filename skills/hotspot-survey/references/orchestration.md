@@ -141,7 +141,7 @@ Mine the tracker's storage directly (a file read beats N MCP round-trips); the o
 ```
 SOURCE: the task database at ${ROOT}/<tracker path> — <shape probed in Phase 0, e.g. "SQLite at
 .taskmaster/tasks/tasks.db. Open it READ-ONLY so you never contend with the live orchestrator:
-sqlite3.connect('file:.taskmaster/tasks/tasks.db?mode=ro', uri=True). `tasks` columns: tag, id,
+sqlite3.connect('file:${ROOT}/.taskmaster/tasks/tasks.db?mode=ro', uri=True). `tasks` columns: tag, id,
 title, description, details, test_strategy, status, priority, metadata, updated_at,
 claimant_run_id, heartbeat_at, candidate_key — `metadata` is a JSON string. There is NO
 `dependencies` column: dependencies are their own table keyed (tag, task_id, depends_on)">.
