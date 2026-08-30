@@ -668,3 +668,33 @@ median 16 vs 29 on already-done cells; the incumbent additionally spawns subagen
 observations are in `FINDINGS.md`; the per-cell dollar figures above are this record's own
 recomputation over all 53 cells. The mechanism recorded there is **price per token, not
 extra work**.
+
+---
+
+## 7. γ1 errata carried forward (live vs moot)
+
+_RAW OBSERVATION — transcribed with attribution._
+
+`plans/fable-trial-v2-calibration-2026-08-24.md` §Errata (added 2026-08-25 at γ2 ruling
+time, esc-3634-1) instructs this record **by name**: *"None changes the ruling; ζ should
+carry them."* It lists five corrections plus a sixth item flagged *"One further caveat for ζ,
+load-bearing and not stated above."*
+
+That instruction is discharged here by **explicit triage**, not wholesale restatement.
+Restating all six as though they still bind would imply a live stage-2 decision and would
+directly contradict §8: under ruling C no further cells will be run, so anything whose only
+consumer was a banding or spend decision is now unreachable. Each item is marked **LIVE** or
+**MOOT** with its reason.
+
+| # | γ1 erratum | status | why |
+|---|---|---|---|
+| 1 | `cost_usd` **includes** judge cost; the "0 budget exhaustions, max $11.38" predicate is false as written (`reify_task_2908` = $15.579, architect share $14.74; $11.38 was the max over *no-plan* cells) | 🟢 **LIVE** | This is the basis for every dollar figure in §6. Independently re-verified **in code** at §6a rather than taken on the erratum's word. |
+| 2 | The Q_ceiling base-only counterfactual's mechanism is `df_task_2430_adv_plan` trial 3 cap-starvation (→ `plan_quality` 0.625, dragging the base-only anchor to 0.8550), **not** the reify fixtures being scored 0.0 — right conclusion, wrong mechanism | ⚪ **MOOT** | No further banding will be performed. Q_ceiling has no remaining consumer. |
+| 3 | **14 non-adversarial v1 fixtures carried a `reference` block** at the v1 run tip (19 `architect-opus-max` cells already in the packaged results dir). A validly-referenced anchor was available at **zero extra spend** and was never weighed; it yields Q ≈ 0.84 → 11 discarded | ⚪ **MOOT for banding** — but **recorded as a standing input to the redesign** | The banding it would have informed will not be redone. It is retained because §5e's binding limitation is *exactly* a shortage of validly-referenced cells: a cheap valid-reference population existing and being missed is an instrument fact the redesigned eval set should inherit. |
+| 4 | The sensitivity window 0.84–0.89 is the **second-steepest** 0.05 window (+4 fixtures; 0.89–0.94 moves +7), not a flat one; the prose also narrowed "the plausible range" to exclude its own table's 0.94 row. `df_task_2169` scores **exactly 0.89** and is discarded at Q=0.890 on a `>=` at precisely the anchor mean | ⚪ **MOOT** | The threshold lever only ever mattered for stage-2 spend, which will not occur. |
+| 5 | Two inconsistent cost labels ($359.86 vs $345; $359.86 is reproducible). **$8.57/cell is not the cost of an admissible cell** — marginal admissible is **$7.93**, retained-set mean **$7.67**, because the retained set skews cheap: no-plan cells measured **$3.53** against **$9.50** for planned cells | ⚪ **MOOT for projection** — underlying measurement **corroborates §6e** | No spend projection will be made. But γ1's $3.53-vs-$9.50 split independently corroborates §6e's recomputed tranche-1 figures (no-plan $3.75 fable / $2.65 incumbent; planned $12.43 / $9.78) — the same large no-plan-vs-planned gap, measured on a different campaign. |
+| 6 | **The load-bearing further caveat.** Regimes (b) and (c) are **not derivable from γ1's published inputs**: both rest on an implied fable-at-$25 cell cost of ~$14.67 that appears nowhere and follows from nothing measured (the PRD's "$25" is explicitly illustrative; no fable $/turn exists — the v1 dumps carry no turn field). On γ1's own inputs a fable cell costs **$10.92**, below both the $15 and $25 caps, so lifting the cap would have changed nothing and **(b) would have equalled (a)** | ⚪ **MOOT AND NOW UNREACHABLE** — but **recorded** | No regime ruling will be executed under the superseded design, so this can no longer mislead a decision. It is recorded anyway because **the redesigned eval set must not inherit an un-sourced cost parameter**: a figure that appears nowhere in its own report's inputs and follows from nothing measured is a defect of method, and it survived into two published regimes before anyone checked. |
+
+**Carrying these discharges γ1's directive in full. None of them changes anything in §8.**
+Item 1 is load-bearing for §6 and was re-verified in code; items 3, 5 and 6 are retained as
+inputs the redesign should inherit; items 2 and 4 are recorded as closed.
