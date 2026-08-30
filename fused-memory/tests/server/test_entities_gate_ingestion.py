@@ -282,3 +282,225 @@ class TestAddMemoryForwardsTheDeclaration:
             assert call.kwargs['declared_referents'] == [{'kind': 'task', 'id': 3127}], (
                 f'the {label} call dropped the declaration: {call.kwargs!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# add_episode (step-11) — PRD Open Question 3, resolved in this leaf: BOTH
+# write tools get `entities`, in one leaf, because the gate stack does not
+# diverge. Both tools reach the gate with a canonical project_id and a
+# FastMCP-enforced `str` content, and the gate reads nothing else off either.
+#
+# The one honest asymmetry is a tier BELOW this one: add_episode persists no
+# metadata, so epsilon deliberately passes metadata=None at its producer and
+# the metadata['task_id'] bridge is dead by construction there. That is a
+# statement about tier 2, not about the tier-1 declaration these tests pin.
+# ---------------------------------------------------------------------------
+
+#: Recon-stage content that DOES reach the live task-status authority — the
+#: byte-identical fixture test_recon_premature_completion_gate.py uses, so the
+#: ordering control below is anchored to a claim we know fires that lookup.
+_COMPLETION_CONTENT = 'task 5252 has landed and now enforces the manifest gate'
+_KNOWN_PROJECTS = {'dark_factory': '/root'}
+
+
+def _pass_through_episode(mock_service: AsyncMock, dump: dict | None = None) -> MagicMock:
+    """Configure ``mock_service.add_episode`` to return a dict-dumpable result.
+
+    Same shape trap as `_pass_through`: `add_episode` ends in
+    `result.model_dump()`, so a bare AsyncMock return would make the tool's
+    final expression an unawaited coroutine rather than a dict.
+    """
+    ep_result = MagicMock()
+    ep_result.model_dump.return_value = dump if dump is not None else {'id': 'ep'}
+    mock_service.add_episode.return_value = ep_result
+    return ep_result
+
+
+async def _call_episode(server, **overrides) -> dict:
+    args = {
+        'content': _CONTENT,
+        'agent_id': 'claude-interactive',
+        'project_id': _PROJECT_ID,
+    }
+    args.update(overrides)
+    return await server._tool_manager.call_tool('add_episode', args)
+
+
+class TestAddEpisodeEntitiesGate:
+    """The same gate, wired into `add_episode`'s chain."""
+
+    @pytest.mark.asyncio
+    async def test_a_conflicting_declaration_rejects_and_does_not_write(self):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call_episode(server, entities=_CONFLICTING)
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        assert result.get('error') == 'declared_referent_conflict', f'{result!r}'
+        assert result.get('agent_id') == 'claude-interactive', f'{result!r}'
+        # INV-2: both sides named, exactly as at add_memory's boundary.
+        assert result.get('declared') == ['Task 3129'], f'{result!r}'
+        assert result.get('conflicts') == ['Task 3129'], f'{result!r}'
+        assert result.get('content_referents') == ['Task 3127'], f'{result!r}'
+        assert result.get('hint'), f'{result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_declaration_rejects_and_does_not_write(self):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call_episode(server, entities=_MALFORMED)
+
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        assert result.get('content_excerpt') == _CONTENT[:200], f'{result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'entities',
+        [
+            pytest.param(None, id='omitted'),
+            pytest.param([], id='considered-none-apply'),
+            pytest.param(_CORROBORATING, id='corroborating'),
+        ],
+    )
+    async def test_absence_and_agreement_always_write(self, entities):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        kwargs = {} if entities is None else {'entities': entities}
+        result = await _call_episode(server, **kwargs)
+
+        assert 'error' not in result, f'entities={entities!r} was blocked: {result!r}'
+        mock_service.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_is_cheap_no_live_authority_round_trip(self):
+        """Gate ORDERING: the declaration is checked ahead of every gate that
+        does live authority I/O.
+
+        `add_episode`'s chain is far more expensive than `add_memory`'s once a
+        recon-stage agent is writing a completion claim: the 2824
+        premature-completion gate reads live task statuses, and
+        `_completion_claim_gate` reads statuses / tickets / git after it. A
+        structurally self-contradictory declaration should pay for none of
+        them.
+
+        The control is load-bearing for the same reason as add_memory's: with
+        no call that DOES reach `get_statuses`, "get_statuses was not called"
+        would also pass if this input could never reach it, and the ordering
+        claim would be vacuous.
+        """
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={'5252': 'in-progress'})
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        result = await _call_episode(
+            server,
+            content=_COMPLETION_CONTENT,
+            agent_id='recon-stage-task_knowledge_sync',
+            entities=_CONFLICTING,
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        task_interceptor.get_statuses.assert_not_called()
+        mock_service.add_episode.assert_not_called()
+
+        control_interceptor = MagicMock()
+        control_interceptor.get_statuses = AsyncMock(return_value={'5252': 'in-progress'})
+        control_service = AsyncMock()
+        _pass_through_episode(control_service)
+        control_server = create_mcp_server(
+            control_service,
+            task_interceptor=control_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        await _call_episode(
+            control_server,
+            content=_COMPLETION_CONTENT,
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        assert control_interceptor.get_statuses.call_count, (
+            'the control never reached the live task-status lookup, so the '
+            'ordering assertion above proves nothing'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_pre_existing_temporal_context_arm_is_undisturbed(self):
+        """The new chain link must not shadow or reorder what was already there."""
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call_episode(server, temporal_context='nonsense')
+
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        assert 'temporal_context' in str(result.get('error', '')), f'{result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_valid_reference_time_still_parses(self):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call_episode(
+            server,
+            reference_time='2026-03-22T00:00:00+00:00',
+            entities=_CORROBORATING,
+        )
+
+        assert 'error' not in result, f'{result!r}'
+        mock_service.add_episode.assert_called_once()
+
+
+class TestAddEpisodeForwardsTheDeclaration:
+    """`add_episode` has exactly ONE service call site (unlike add_memory's
+    two), and the accepted declaration must cross it verbatim."""
+
+    @pytest.mark.asyncio
+    async def test_the_caller_list_is_forwarded_verbatim(self):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        await _call_episode(server, entities=_CORROBORATING)
+
+        kwargs = mock_service.add_episode.call_args.kwargs
+        assert kwargs['declared_referents'] == [{'kind': 'task', 'id': 3127}], f'{kwargs!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('entities', 'expected'),
+        [
+            pytest.param(None, None, id='omitted-stays-None'),
+            pytest.param([], [], id='empty-stays-empty'),
+        ],
+    )
+    async def test_the_tri_state_survives_the_hop_intact(self, entities, expected):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        kwargs = {} if entities is None else {'entities': entities}
+        await _call_episode(server, **kwargs)
+
+        forwarded = mock_service.add_episode.call_args.kwargs['declared_referents']
+        assert forwarded == expected, f'{forwarded!r}'
+        assert (forwarded is None) == (expected is None), (
+            f'[] and None must stay distinguishable, got {forwarded!r}'
+        )
