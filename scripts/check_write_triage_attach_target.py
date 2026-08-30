@@ -960,6 +960,32 @@ def _echo_forgiven_note(param: Any) -> list[str]:
     ]
 
 
+def _pass_scope_note() -> list[str]:
+    """What a PASS deliberately does NOT prove.
+
+    Item 1 asserts that the JUDGE PATH binds a verdict to a determinate
+    candidate. It does not execute the attach, so neither remedy is checked
+    for being CONSUMED: option (a) does not show the id is validated against
+    the slate or threaded through BandDecision, and option (b) does not show
+    the attach touches whatever the prompt named. A change that only widens
+    the parse contract therefore opens this gate while the attach still lands
+    on the band's top-1 — the very harm item 1 describes.
+
+    Emitted on the PASS path only. That is where an operator is about to flip
+    a production flag on the strength of this line, and it is also the report
+    whose 2000-char window is NOT contended: a FAIL's window belongs to the
+    remedy.
+    """
+    return [
+        '      NOTE this gate does NOT assert that the bound candidate is CONSUMED.',
+        '      It measures the judge path only: that a verdict can be tied to a',
+        '      determinate candidate. It does not execute the attach, so it does not',
+        '      show the id is validated against the slate, threaded through',
+        '      BandDecision, or that the write the flag enables touches the candidate',
+        '      the judge reasoned about. Confirm that separately before flipping.',
+    ]
+
+
 def _probe(src_root: Path, out: list[str]) -> int:
     out.append(f'write_triage attach-target invariant probe — src-root={src_root}')
     module = _import_judge(src_root)
@@ -979,6 +1005,7 @@ def _probe(src_root: Path, out: list[str]) -> int:
             'PASS  the judge path binds a verdict to a determinate candidate '
             '(option (a)).',
         )
+        out.extend(_pass_scope_note())
         return EXIT_OK
 
     build = _require(module, 'build_judge_prompt')
@@ -1030,6 +1057,7 @@ def _probe(src_root: Path, out: list[str]) -> int:
         'PASS  the judge path binds a verdict to a determinate candidate '
         '(option (b)).',
     )
+    out.extend(_pass_scope_note())
     return EXIT_OK
 
 
