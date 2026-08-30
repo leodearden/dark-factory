@@ -159,7 +159,7 @@ def optional_token_segment(cmd: str, keyword: str) -> str | None:
 
 
 def anchor_split(
-    segment: str, keyword: str, *, label: str | None = None
+    segment: str, keyword: str, *, path_anchor: bool = False, label: str | None = None
 ) -> tuple[list[str], list[str]]:
     """*segment* split at the checker anchor into ``(pre, post)`` token lists.
 
@@ -199,6 +199,32 @@ def anchor_split(
     :func:`optional_token_segment`, which SKIPS such a segment: there, an
     unparseable clause is one among several and the helper has no opinion about
     it; here, the caller has already committed to this segment being the one.
+
+    *path_anchor* additionally accepts the anchor spelled as the PATH the
+    checker was INVOKED BY. It exists because a checker need not be on ``PATH``
+    at all: the live repo-root ``lint_command`` runs ``python3
+    fused-memory/scripts/check_bare_magicmock_config.py <dirs>``, so its anchor
+    ``check_bare_magicmock_config.py`` is never a bare token and the exact-token
+    rule cannot locate it. That is what kept
+    ``test_fallback_verify_config.py::_lint_leg_targets`` on a private copy of
+    this parser until task 3883.
+
+    THE DEFAULT IS False, and the four task-3745 callers therefore stay on
+    strict exact-token matching — this parameter only ever ADDS candidate
+    positions, so no existing caller's parse can change. Pinned rather than
+    claimed, by
+    ``test_verify_command_invariants.py::test_anchor_split_still_asserts_on_a_path_spelled_anchor_by_default``.
+
+    A WHOLE PATH COMPONENT, never a raw string suffix. ``token.endswith("/" +
+    anchor)`` IS the component test for a POSIX shell token, and the distinction
+    is not pedantry: a bare ``token.endswith(anchor)`` is a SUBSTRING match, so
+    ``scripts/x_check_bare_magicmock_config.py`` — a different file whose name
+    merely ends with the anchor — would match and report another program's
+    arguments as this checker's targets. "Compare by exact element, never
+    substring-match" is the contract this module exists to enforce, and
+    ``path_anchor`` must not smuggle in an exception to it. Deliberately NOT
+    ``pathlib``/``posixpath``: a normalisation layer would import ``..``
+    resolution and absolute-path semantics this parser has no opinion about.
     """
     anchor = keyword.split()[-1]
     try:
@@ -208,12 +234,16 @@ def anchor_split(
             f"cannot tokenise the `{keyword}` segment of {_where(label, segment)}: "
             f"{exc}; segment: {segment!r}"
         ) from exc
-    assert anchor in tokens, (
+    at = None
+    for i, token in enumerate(tokens):
+        if token == anchor or (path_anchor and token.endswith("/" + anchor)):
+            at = i
+            break
+    assert at is not None, (
         f"no `{anchor}` token in the `{keyword}` segment of "
         f"{_where(label, segment)}, so the checker's own arguments cannot be "
         f"located; segment: {segment!r}"
     )
-    at = tokens.index(anchor)
     return tokens[:at], tokens[at + 1:]
 
 
