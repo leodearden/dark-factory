@@ -7,15 +7,39 @@ import logging
 import os
 import re
 import shutil
+import stat
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+from shared import safe_io
 
 from orchestrator.config import TASK_META_DIRNAME
 
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+
+
+class ArtifactWriteError(OSError):
+    """An atomic artifact write was REFUSED; the target was left UNTOUCHED.
+
+    Names both the requested and the resolved path in its message so the
+    failure is actionable without log-scraping.
+
+    Reserved for the ONE refusal that has no natural ``OSError`` of its own:
+    declining to write through a DANGLING symlink is a decision this module
+    makes, not an error the kernel reported.  Ordinary write failures
+    (EACCES, ENOSPC, …) keep propagating as their own types — ``_write_json``
+    has ~13 callers whose observable contract is "whatever OSError the
+    filesystem raised", and blanket-wrapping them would change that for every
+    artifact writer in the orchestrator as a side effect of an atomicity fix.
+
+    Subclasses ``OSError`` so existing ``except OSError`` handlers keep
+    working, and is a DISTINCT type so ``_write_json``'s vanished-root
+    ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
+    """
+
 
 # Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
 # trailing whitespace) at the START of a step description.  Used by
@@ -25,6 +49,30 @@ PLAN_SCHEMA_VERSION = 1
 # than stacking provenance.  The ``+`` also cleans up any tags that a prior
 # (pre-strip) implementation may have already stacked.
 _COMMITTED_TAG_RE = re.compile(r'^(?:\[COMMITTED [0-9a-fA-F]+\]\s*)+')
+
+
+def _existing_mode(target: Path) -> int | None:
+    """The permission bits *target* must carry AFTER an atomic replace.
+
+    An existing target's own mode is preserved verbatim, matching what
+    ``Path.write_text`` (which truncates rather than recreates) did before
+    every artifact write became a tmp+rename.  Without this, the first write
+    after that migration would silently re-mode every `.task-meta` artifact.
+
+    ``None`` for a target that does not exist yet lets ``atomic_write_text``
+    create the temp 0o666 and have the KERNEL apply the process umask —
+    exactly what ``write_text`` produces for a new file, and free of the
+    non-thread-safe ``os.umask(os.umask(0))`` read-back that plan-tools'
+    superseded (now deleted) mode helper needed to compute the same answer.
+
+    Swallows ONLY FileNotFoundError.  EACCES/ELOOP/ENAMETOOLONG on the stat
+    are genuine failures and must surface, not be papered over as "new file".
+    """
+    try:
+        return stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        return None
+
 
 # Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
 # session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
@@ -1521,13 +1569,122 @@ class TaskArtifacts:
         return False
 
     def _write_json(self, path: Path, data: dict) -> None:
+        """Write *data* to *path* as JSON, ATOMICALLY and DURABLY.
+
+        The single write seam behind every whole-file `.task-meta` artifact
+        (metadata, plan, review_state, reviews, verdicts, agent_session,
+        reconcile_state, the architect's report artifacts), and therefore the
+        single owner of their byte format and their durability guarantees.
+
+        What a concurrent reader may rely on: it observes either the complete
+        OLD contents or the complete NEW contents — never a truncated file,
+        and never a missing one.  ``os.replace`` on a temp written in the
+        destination's own directory is what buys that, by itself and for
+        almost nothing.  (The superseded ``path.write_text`` was
+        truncate-then-write, and a reader racing it could and did observe a
+        half-written file — see ``TestWriteJsonIsAtomic``.)
+
+        ``fsync=True`` is a SEPARATE guarantee, deliberately bought, not a
+        free extension of that one — and it is the dominant cost of this
+        method.  MEASURED on this repo's own filesystem (ext4 on NVMe, a
+        5.5 KB plan.json, 200-write loops): ``write_text`` 0.18 ms/write,
+        atomic WITHOUT fsync 0.27 ms, atomic WITH fsync 5.26 ms.  Atomicity
+        costs ~0.1 ms; durability costs ~5 ms on top — ~20x more — and every
+        caller of this seam pays it.  ``shared.safe_io`` defaults the flag to
+        False for precisely that reason, so overriding its default here is a
+        decision, and it rests on three things:
+
+        * Passing ``fsync=False`` would be a REGRESSION rather than a neutral
+          default.  The plan-tools plan.json writer this method absorbed
+          fsynced its temp before every replace, so a non-fsyncing
+          ``_write_json`` would silently weaken plan.json's existing
+          guarantee on the very change that consolidated it.
+          ``atomic_write_text``'s flag is both-or-neither (temp file AND
+          parent directory), so the real choice was "keep it for every
+          artifact" or "lose it for plan.json".
+        * These artifacts ARE the crash-recovery inputs.  A resumed
+          orchestrator reads plan.json / metadata.json / review_state.json /
+          agent_session.json back to learn what a task already did; an
+          artifact that is atomically written but not durable is exactly what
+          a host crash turns into a silently rewound task.  The
+          parent-directory half earns its keep for the same reason — without
+          it a crash can leave fully synced bytes unreachable under a name
+          that was never persisted.
+        * The cost is bounded because nothing behind this seam is a hot loop.
+          These are lifecycle writes — at most tens per task across all ~13
+          artifacts — so ~5 ms apiece totals well under a second per task,
+          once, against a task lifetime measured in minutes.
+
+        A per-call-site durability flag was rejected: it would make an
+        artifact's crash-safety depend on which method happened to write it,
+        and no current site has a defensible reason to opt out.  Should a
+        future caller genuinely write in a loop, give THAT caller the flag
+        rather than flipping the default underneath the recovery artifacts.
+        The kwargs this contract turns on are pinned by
+        ``TestWriteJsonDelegatesToSharedSafeIo``.
+
+        An EXISTING target keeps its own permission bits across the swap (see
+        :func:`_existing_mode`), which the superseded ``write_text`` got for
+        free by truncating rather than recreating; a new one lands with the
+        umask-derived mode ``write_text`` would have given it.
+
+        A SYMLINKED target is written THROUGH, as ``write_text`` wrote through
+        it: *path* is resolved first and the real file is what gets replaced.
+        This is load-bearing, not hygiene — ``ensure_lane_plan_symlink`` makes
+        ``<worktree>/.task/plan.json`` a symlink onto the meta-root plan, and
+        a bare replace onto the link path would swap it for a regular file,
+        silently re-forking the lane and meta-root copies (the esc-5205-9
+        stale-plan divergence).  Resolving also guarantees the temp shares a
+        filesystem with the real file, so the replace is an intra-filesystem
+        rename rather than EXDEV.  A DANGLING link is REFUSED with
+        :class:`ArtifactWriteError` rather than materialising a stray regular
+        file at the link path — that stray file would BE the divergence.
+
+        The tmp+rename itself is DELEGATED to ``shared.safe_io`` rather than
+        re-implemented here: that helper is the repo's single blessed home for
+        the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
+        still-open fd, and BaseException-safe cleanup are all things a local
+        copy would have to re-earn), and the consolidation is machine-enforced
+        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+
+        ``append_iteration_log`` is deliberately NOT routed through here: it
+        is genuinely append-only, and tmp+rename would turn an O(1) append
+        into an O(n) rewrite while destroying the partial-read tolerance that
+        makes a truncated log still usable line-by-line.
+        """
         # Tolerate a vanished worktree.  Callers that care about durability
         # (init, plan, base_commit, etc.) check ``self.root`` themselves; the
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2) + '\n')
+            # Resolve FIRST — write through a symlink, never onto it.  Order
+            # inside this block is deliberate: the refusal must precede any
+            # filesystem mutation, so dangling check → mode lookup → write.
+            target = Path(os.path.realpath(path))
+            if path.is_symlink() and not target.parent.is_dir():
+                raise ArtifactWriteError(
+                    f'atomic artifact write to {path} refused: its resolved '
+                    f'target {target} has no existing parent directory (a '
+                    'dangling symlink?) — refusing to materialise a stray '
+                    'file at the link path'
+                )
+            # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
+            # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
+            # same path as any other write failure.  It swallows
+            # FileNotFoundError ITSELF and reports the target as new, so a
+            # vanished target does NOT short-circuit here — it reaches
+            # ``atomic_write_text``, which re-creates the parent chain under
+            # ``mkdir=True``, exactly as the superseded
+            # ``path.parent.mkdir(parents=True)`` did.  The tolerated no-op
+            # branch below is therefore reached from the WRITE, never from
+            # the mode lookup.
+            safe_io.atomic_write_text(
+                target,
+                json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
+                mode=_existing_mode(target),
+                fsync=True,
+                mkdir=True,
+            )
         except FileNotFoundError:
             if not self.root.is_dir():
                 logger.info(

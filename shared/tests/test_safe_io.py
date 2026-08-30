@@ -943,23 +943,6 @@ _ALLOWED_RENAMERS = {
         'already-current skip). The EXDEV branch delegates to _archive_one '
         'when the rename is physically impossible, so the cross-device case '
         'is handled by the entry above rather than by a second writer here.',
-    ('orchestrator/src/orchestrator/mcp/plan_tools.py', '_atomic_write_plan'):
-        'Cannot delegate without losing three semantics atomic_write_text does '
-        'not offer. (1) SYMLINK RESOLUTION: it writes to os.path.realpath(path) '
-        'and refuses a dangling link; atomic_write_text replaces the path as '
-        'given, so an os.replace onto the lane plan.json symlink would swap the '
-        'LINK for a regular file and re-fork the lane/meta-root copies (the '
-        'esc-5205-9 divergence that symlink exists to prevent). (2) PRE-REPLACE '
-        'VERIFICATION: _verify_plan_json re-parses the TEMP file after the '
-        'chmod and before the swap — a deliberately named seam a test injects '
-        'into, at the last reversible checkpoint; atomic_write_text has no '
-        'pre-replace inspection hook, and verifying after the swap is backwards. '
-        '(3) FSYNC ASYMMETRY: it fsyncs the temp file but NOT the parent dir, '
-        'while atomic_write_text does both under fsync=True and neither under '
-        'fsync=False, so no setting reproduces it. It also funnels every '
-        'failure into PlanWriteError naming both the original and resolved '
-        'paths. A follow-up may widen atomic_write_text; it must not be forced '
-        'through the current signature.',
 }
 
 
