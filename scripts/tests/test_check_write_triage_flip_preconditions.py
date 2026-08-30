@@ -578,6 +578,77 @@ def parse_judge_verdict(raw):
 """
 
 
+# A judge whose code calls sys.exit() -- realistically a lazily-imported
+# dependency's import guard, or an argparse-style bail. SystemExit is a
+# BaseException and NOT an Exception, so it escapes _build_slate's
+# `except Exception`, escapes _probe, escapes main()'s last-resort arm, and
+# terminates the process with ITS OWN code. `raise SystemExit(0)` therefore
+# exits 0 having printed NOTHING at all, and any caller trusting rc==0 alone
+# reads that as PASS. Total fail-open on a gate whose EXIT-CODE CONTRACT says
+# an invariant that could not be verified is not a satisfied one.
+_VARIANT_TAILS['exits_during_select'] = r"""
+
+
+def select_judge_candidates(results, n, *, canonical_id):
+    raise SystemExit(0)
+
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    return 'unreachable'
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+# A CORRECT option (b) whose selector rescues the hoisted parent's evidence
+# child by HOISTING IT TO THE FRONT rather than appending it. The append is a
+# MECHANISM -- TestRescueAppendIsAMechanism already says so in as many words --
+# but _build_slate took ids.index(_CHILD_ID) unconditionally, so the target
+# became slate[0], _probe's `other is target` guard fired, and a valid fix was
+# failed UNVERIFIABLE for a reason having nothing to do with the invariant.
+# That is the mechanism-pin false FAIL task 4810 exists to remove, one level
+# down from where it was removed.
+_VARIANT_TAILS['front_hoisting_rescue'] = r"""
+
+
+def select_judge_candidates(results, n, *, canonical_id):
+    ordered = [r for r in (results or ()) if _cosine_of(r) is not None]
+    ordered.sort(key=_cosine_of, reverse=True)
+    if not ordered:
+        return []
+    if n <= 0:
+        n = _DEFAULT_JUDGE_CANDIDATE_COUNT
+    selected = ordered[:n]
+    if canonical_id is not None and all(r.id != canonical_id for r in selected):
+        winner = next(
+            (
+                r
+                for r in ordered
+                if (r.metadata or {}).get(PARENT_ID_KEY) == canonical_id
+            ),
+            None,
+        )
+        if winner is not None and winner not in selected:
+            # PREPEND, where main appends. Same rescue, other end.
+            selected = [winner, *selected[: max(n - 1, 0)]]
+    return selected
+
+
+def build_judge_prompt(content, candidates, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+
 def _write_fake_judge(src_root: Path, *, variant: str) -> Path:
     """Lay down a standalone judge module at *src_root* and return *src_root*.
 
@@ -839,6 +910,77 @@ class TestRescueAppendIsAMechanism:
             f'a candidates[0]-marking judge passed:\n{proc.stdout}'
         )
         assert _MARKS_FIRST in proc.stdout, proc.stdout
+
+    def test_valid_fix_passes_when_the_rescue_PREPENDS(self, tmp_path):
+        """A selector that hoists the winner to the FRONT is still a mechanism.
+
+        _build_slate took ids.index(_CHILD_ID) unconditionally, so a rescue
+        that prepends made the attach target slate[0], tripped _probe's
+        `other is target` guard, and failed a CORRECT option (b) as
+        UNVERIFIABLE. That contradicts this class's own contract in the one
+        direction no fixture covered: every existing variant moves the target
+        AWAY from index 0, so nothing exercised a selector that reorders
+        rather than appends.
+        """
+        src_root = _write_fake_judge(tmp_path / 'src', variant='front_hoisting_rescue')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            'a correct option (b) was failed because its selector PREPENDED '
+            f'the rescued winner:\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+
+
+class TestProbeCannotPassByExiting:
+    """The probe must never exit 0 without having asserted the invariant.
+
+    main()'s last-resort arm caught `Exception`, but the probe drives
+    arbitrary code out of the ref's own tree, and SystemExit is a
+    BaseException — the realistic carrier being a lazily-imported dependency's
+    import guard calling sys.exit(). It escaped _build_slate's `except
+    Exception`, escaped _probe, escaped main, and terminated the process with
+    ITS code.
+
+    Measured before the fix: a judge whose select_judge_candidates raises
+    SystemExit(0) made the probe exit 0 having printed ZERO bytes, and the
+    gate — which tested `probe_rc -eq 0` alone — printed `PASS item 1` and
+    then `RESULT: all preconditions satisfied — the flip may proceed`. A total
+    fail-open authorising the production write_triage.enabled flip, on a gate
+    whose stated EXIT-CODE CONTRACT is that an invariant which could not be
+    verified is not a satisfied one.
+
+    _import_judge already caught BaseException for precisely this reason, so
+    the convention existed and was simply not applied at the outer arm. Both
+    halves are pinned here: the probe must fail closed, AND the gate must not
+    take rc==0 on faith from a report that never claimed a PASS.
+    """
+
+    def test_system_exit_in_the_judge_fails_closed(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='exits_during_select')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, (
+            'the probe exited 0 on a judge that called sys.exit():\n'
+            f'stdout={proc.stdout!r} stderr={proc.stderr!r}'
+        )
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_the_gate_refuses_a_silent_exit_zero_probe(self, tmp_path):
+        """Belt and braces: rc==0 with no PASS marker is UNVERIFIABLE, not PASS.
+
+        Independent of the probe fix — the gate must not be the only thing
+        standing between a mute exit-0 subprocess and a production flip.
+        """
+        repo = _make_gate_repo(tmp_path, judge='exits_during_select', eval_src='fixed')
+        proc = _run_gate(
+            repo / 'scripts' / 'check_write_triage_flip_preconditions.sh',
+            ref=_FIXTURE_REF,
+            probe_py=sys.executable,
+        )
+        assert proc.returncode != 0, (
+            f'the gate authorised the flip on a mute probe:\n{proc.stdout}'
+        )
+        assert 'PASS  item 1' not in proc.stdout, proc.stdout
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
 
 
 class TestDiagnosticsAndProvenance:
