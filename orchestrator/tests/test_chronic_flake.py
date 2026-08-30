@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
 from unittest.mock import MagicMock
@@ -781,12 +782,15 @@ class _StubScheduler:
     the real ``Scheduler``, mirroring the module's cross-project scope
     boundary)."""
 
-    def __init__(self, return_value):
+    def __init__(self, return_value, raises: BaseException | None = None):
         self.return_value = return_value
+        self.raises = raises
         self.calls: list[tuple[str, dict, float | None]] = []
 
     async def dispatch_tool(self, name, arguments, *, timeout=15):
         self.calls.append((name, arguments, timeout))
+        if self.raises is not None:
+            raise self.raises
         return self.return_value
 
 
@@ -880,6 +884,156 @@ class TestSchedulerChronicFlakeTaskClient:
         scheduler, client = await self._client(['not', 'a', 'dict'])
         result = await client.search_tasks('test_a.sh')
         assert result == []
+
+
+class TestSchedulerClientServesTheFlakeLedgerSeam:
+    """The SAME adapter also satisfies ``flake_ledger.FlakeLedgerTaskClient`` (task ζ).
+
+    Deliberately grown in place rather than replaced by a second client: two adapters
+    over one ``dispatch_tool`` seam is exactly the drift this facility exists to avoid,
+    and the ledger consumes it STRUCTURALLY (a locally-declared Protocol), so no import
+    edge is created between the two modules.
+    """
+
+    async def _client(self, return_value, raises=None):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value, raises)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    # ── get_statuses ──────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_dispatches_project_root_and_ids(self):
+        scheduler, client = await self._client({'statuses': {'42': 'pending', '43': 'done'}})
+        result = await client.get_statuses(['42', '43'])
+        assert scheduler.calls[0][0] == 'get_statuses'
+        assert scheduler.calls[0][1] == {'project_root': '/proj', 'ids': ['42', '43']}
+        assert result == {'42': 'pending', '43': 'done'}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_coerces_ids_to_str(self):
+        """The ledger stores ``owner_task_id`` as TEXT but a caller may hold ints; the
+        wire argument must be strings or the tool silently matches nothing."""
+        scheduler, client = await self._client({'statuses': {}})
+        await client.get_statuses([42, 43])
+        assert scheduler.calls[0][1]['ids'] == ['42', '43']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            {'statuses': {'42': 'pending'}},
+            {'structuredContent': {'statuses': {'42': 'pending'}}},
+            {'result': {'statuses': {'42': 'pending'}}},
+            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
+        ],
+        ids=['direct', 'structured_content', 'result', 'content_text_block'],
+    )
+    async def test_get_statuses_handles_every_envelope_shape(self, envelope):
+        """The same four shapes ``_unwrap_dispatch_envelope`` already normalises for
+        id-extraction and search results — one envelope policy, three parsers."""
+        _, client = await self._client(envelope)
+        assert await client.get_statuses(['42']) == {'42': 'pending'}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [{'unexpected': 'shape'}, {'statuses': ['not', 'a', 'dict']}, None, ['not', 'a', 'dict']],
+        ids=['unrecognised', 'non_dict_statuses', 'none', 'list'],
+    )
+    async def test_get_statuses_degrades_to_empty_mapping(self, envelope):
+        _, client = await self._client(envelope)
+        assert await client.get_statuses(['42']) == {}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_degrades_when_dispatch_raises(self):
+        """Never raises: the ledger reads an empty mapping as a corroborated absence
+        ONLY on a successful call, so this must degrade at the adapter rather than
+        propagate — and the ledger's own guard is the second line, not the first."""
+        _, client = await self._client(None, raises=RuntimeError('mcp down'))
+        assert await client.get_statuses(['42']) == {}
+
+    # ── commit_planning ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_dispatches_comma_joined_ids(self):
+        """``commit_planning``'s ``task_ids`` is a COMMA-SEPARATED STRING, not a list
+        (fused-memory server/tools.py::commit_planning) — a list would be rejected."""
+        scheduler, client = await self._client({'success': True})
+        await client.commit_planning(['42', '43'])
+        assert scheduler.calls[0][0] == 'commit_planning'
+        assert scheduler.calls[0][1] == {
+            'project_root': '/proj',
+            'task_ids': '42,43',
+            'target_status': 'pending',
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [{'error': 'no such task'}, {'success': False}, None],
+        ids=['error', 'not_successful', 'non_dict'],
+    )
+    async def test_commit_planning_does_not_raise_on_a_failure_envelope(self, envelope, caplog):
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake']
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_does_not_raise_when_dispatch_raises(self):
+        _, client = await self._client(None, raises=RuntimeError('mcp down'))
+        assert await client.commit_planning(['42']) is None
+
+    # ── submit_task's project_root injection ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_submit_task_injects_project_root_when_omitted(self):
+        """``flake_ledger.build_deflake_task_arguments`` omits the key on purpose:
+        ``open_debt`` holds a ``db_path``, not a project root, and deriving one from it
+        would be a silent, position-dependent inversion of ``ledger_db_path``.  The
+        adapter already HOLDS the root, so the injection lives where the fact does."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task({'title': 't'})
+        assert scheduler.calls[0][1]['project_root'] == '/proj'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_clobber_an_explicit_project_root(self):
+        """``setdefault``, not assignment — which is what keeps chronic_flake's OWN
+        path (``build_chronic_flake_fix_task_arguments`` always sets the key) byte-
+        identical to before this change."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task({'title': 't', 'project_root': '/elsewhere'})
+        assert scheduler.calls[0][1]['project_root'] == '/elsewhere'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_mutate_the_callers_dict(self):
+        """The caller's argument block is COPIED before injection.  ``open_debt``
+        compares the emitted block against ``build_deflake_task_arguments``' output, and
+        a shared dict mutated here would make that comparison depend on call order."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        arguments = {'title': 't'}
+        await client.submit_task(arguments)
+        assert arguments == {'title': 't'}
+
+    @pytest.mark.asyncio
+    async def test_chronic_flakes_own_block_reaches_the_wire_unchanged(self):
+        """Regression guard on the shared path: chronic_flake's own builder sets
+        ``project_root`` explicitly, so the injection must be a no-op for it."""
+        from orchestrator.chronic_flake import (
+            ChronicFlakeEvidence,
+            build_chronic_flake_fix_task_arguments,
+        )
+
+        expected = build_chronic_flake_fix_task_arguments(
+            ChronicFlakeEvidence(
+                test='test_a.sh', count=3, window=20, dates=[], roles=[], entries=[]
+            ),
+            '/proj',
+        )
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task(dict(expected))
+        assert scheduler.calls[0][1] == expected
 
 
 class TestExtractTaskId:
