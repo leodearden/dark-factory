@@ -1255,26 +1255,43 @@ class TestTheSinkNeverGivesUpPermanently:
         an EINTR, a transient timeout, an index.lock storm. Caching that answer
         for the life of the server would turn one such blip into permanent,
         silent data loss.
+
+        The outage is modelled as a STATE that clears between the two records,
+        rather than as a fixed list of answers to pop. That seam feeds BOTH
+        injected channels (task 4744 routes the fact journal through it too), so
+        a per-call script would silently encode how many consumers there happen
+        to be — and would start failing for a reason that has nothing to do with
+        the memoization this row is about.
         """
         queue = _FakeQueue()
         rig = build_residue_rig(monkeypatch, artifacts, queue)
         await rig.harness.seed_plan()
 
-        answers = [None, artifacts.worktree]
-        monkeypatch.setattr(
-            plan_tools, '_markup_project_root', lambda worktree: answers.pop(0)
-        )
+        git_is_down = True
+        asked: list[Path] = []
+
+        def flaky_root(worktree: Path) -> Path | None:
+            asked.append(worktree)
+            return None if git_is_down else artifacts.worktree
+
+        monkeypatch.setattr(plan_tools, '_markup_project_root', flaky_root)
 
         first = await rig.refuse(
             'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
         )
+        asked_during_the_outage = len(asked)
+        git_is_down = False
         second = await rig.refuse(
             'add_design_decision', {'decision': SECOND_UNREPAIRABLE_DECISION}
         )
 
         assert first['escalation_id'] is None
         assert rig.returns[0] is None
-        assert answers == [], 'the second record must have re-asked git'
+        assert asked_during_the_outage > 0, 'the first record really did ask'
+        assert len(asked) > asked_during_the_outage, (
+            'the second record must have RE-ASKED git — a cached failure would '
+            'have skipped the call entirely and lost this payload'
+        )
         assert isinstance(second['escalation_id'], str) and second['escalation_id']
         assert len(rig.queue.submitted) == 1
         assert SECOND_UNREPAIRABLE_DECISION in rig.queue.submitted[0].detail

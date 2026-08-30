@@ -96,7 +96,7 @@ from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_sink
+from orchestrator.mcp import markup_journal, markup_sink
 
 logger = logging.getLogger(__name__)
 
@@ -1589,6 +1589,32 @@ def _markup_escalation_sink(
     )
 
 
+def _markup_fact_journal(
+    artifacts: TaskArtifacts,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build plan-tools' DURABLE fact channel (task 4744).
+
+    The middleware emits one ``markup_detected`` fact on every outcome, and it
+    is the only record anywhere that names WHICH call leaked. Before this it
+    reached exactly one place: a ``logger.warning`` in a per-agent stdio
+    subprocess whose stderr the CLI agent that spawned it consumes. This gives
+    it a consumer that survives the process — see ``markup_journal``.
+
+    ``resolve_root`` is routed through THIS module's ``_markup_project_root``
+    global (a lambda closing over the NAME, not the function), exactly as the
+    escalation sink's is, so a test that substitutes that seam steers a journal
+    ``create_server`` has already built. It is also why one patch steers both
+    channels to the same project root — which is the correct coupling: a record
+    and the journal line about it belong in the same checkout.
+    """
+    return markup_journal.make_fact_journal(
+        worktree=artifacts.worktree,
+        server_label=_MARKUP_SINK_SPEC.server_label,
+        subject_task_id=lambda: _markup_subject_task_id(artifacts),
+        resolve_root=lambda worktree: _markup_project_root(worktree),
+    )
+
+
 # ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
@@ -1635,17 +1661,36 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     # must not cost the run that produced it. See
     # `_MARKUP_RESIDUE_ANCHOR_TASK_ID` for the full reading of the gate.
     #
-    # `fact_sink` is DELIBERATELY left unwired (its default None). Under
-    # REJECT_WITH_REPAIR every fact's content already reaches the one party
-    # that can act on it — the leaking caller — inside the rejection payload,
-    # and the operator-facing half rides the storm escalation. A second fact
-    # channel with no consumer would repeat exactly the defect this leaf is
-    # chartered to rule against.
+    # `fact_sink` IS WIRED, to a durable journal (task 4744). It was left
+    # unwired here on the premise that "the operator-facing half rides the
+    # storm escalation" and that a second fact channel would have no consumer.
+    # Both halves of that premise were measured false on 2026-08-25.
+    #
+    # The storm escalation carries only count / threshold / window_seconds /
+    # outcome / project — a WINDOW summary — and `project` is structurally None
+    # on this boundary, because `_identity` reads only arguments named agent_id
+    # / project_root / project_id and no plan-tools tool declares any of the
+    # three. So it can say that N calls leaked and never which. Meanwhile the
+    # per-call line that CAN say so reached only this subprocess's stderr:
+    #
+    #     journalctl --user --since 2026-08-22 | grep 'markup guard:'
+    #         ->  0 plan-tools lines
+    #
+    # against 35 real plan-tools rejections in data/orchestrator/
+    # agent-transcripts/ over the same span. A storm record therefore asked a
+    # human to identify the leaking caller from log lines nobody retains, and
+    # anyone following that instruction correctly concluded "no evidence" and
+    # was wrong.
+    #
+    # The fact channel now HAS a consumer — an operator reading
+    # `data/orchestrator/markup-guard/plan-tools.jsonl` — which is exactly the
+    # condition the old comment made the wiring conditional on.
     mcp.add_middleware(
         MarkupGuardMiddleware(
             RepairPolicy.REJECT_WITH_REPAIR,
             exempt_tools=frozenset(),
             escalation_sink=_markup_escalation_sink(artifacts),
+            fact_sink=_markup_fact_journal(artifacts),
         )
     )
 
