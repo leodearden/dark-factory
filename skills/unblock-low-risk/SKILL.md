@@ -226,7 +226,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        server-issued `already_merged` verdict, and a fast-forward or coalesce-absorbed
        landing carries no marker. Run the ancestry disposition in [Deriving the landed
        sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm that terminates
-       without a sha — its rc=1 / rc=128 not-landed outcomes, and rc=0's **phantom-branch** (no
+       without a sha — its rc=1 / rc=128 not-landed outcomes (both only **outside** the
+       `coalesce-*` arm — on that arm neither is not-landed), and rc=0's **phantom-branch** (no
        subject-matching citation on main) and **gate-un-evaluable**
        (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be stamped:
        report them rather than proceeding to sub-steps a–d.
@@ -248,7 +249,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           response. An empty search is **not** by itself a not-landed verdict — you are
           holding a server-issued polled `done`. Run the ancestry disposition in [Deriving
           the landed sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm
-          that terminates without a sha — its rc=1 / rc=128 not-landed outcomes, and rc=0's
+          that terminates without a sha — its rc=1 / rc=128 not-landed outcomes (both only
+          **outside** the `coalesce-*` arm — on that arm neither is not-landed), and rc=0's
           **phantom-branch** (no subject-matching citation on main) and **gate-un-evaluable**
           (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be
           stamped.
