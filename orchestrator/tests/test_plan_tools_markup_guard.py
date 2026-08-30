@@ -73,7 +73,7 @@ from shared.toolcall_markup import (
 )
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import markup_journal, plan_tools
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -183,6 +183,19 @@ def _clear_reported_refusals():
     plan_tools._REPORTED_REFUSALS.clear()
     yield
     plan_tools._REPORTED_REFUSALS.clear()
+
+
+def journal_lines(root: Path) -> list[dict[str, Any]]:
+    """Every plan-tools markup fact journalled under *root*, parsed.
+
+    An absent file reads as no lines rather than raising: "the journal was
+    never written" is an assertable outcome here, not an error.
+    """
+    path = markup_journal.journal_path(root, 'plan-tools')
+    if not path.exists():
+        return []
+    text = path.read_text(encoding='utf-8')
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 class Harness:
@@ -668,6 +681,11 @@ def build_residue_rig(
     files through (``_escalation_channel``, normally the lazily imported
     ``EscalationQueue``). The record BUILDER — attribution, level, category,
     the raw payload — is the real one, which is the part under test.
+
+    ``_markup_project_root`` steers BOTH injected channels, so this also lands
+    the task-4744 fact journal under ``artifacts.worktree`` (which is the
+    ``tmp_path`` the fixtures are built over) instead of shelling out to
+    ``git rev-parse`` per leak. Read it with :func:`journal_lines`.
     """
     queue = _FakeQueue() if queue is None else queue
     records: list[dict[str, Any]] = []
@@ -1343,3 +1361,173 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
             'that payload would discard the very thing worth keeping'
         )
         assert queue.reads == [], 'only the storm kind dedups'
+
+
+# ---------------------------------------------------------------------------
+# THE DURABLE JOURNAL — task 4744's user-observable signal.
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-08-25, while fulfilling a plan-tools storm escalation's OWN
+# instruction ("identify the leaking caller from the guard's log lines"):
+#
+#     journalctl --user --since 2026-08-22 | grep 'markup guard:'  ->  0 lines
+#
+# against 35 REAL plan-tools rejections in data/orchestrator/agent-transcripts/
+# over the same span. plan-tools is a per-agent stdio subprocess whose stderr
+# the CLI agent that spawned it consumes, so the per-call fact — the only record
+# anywhere that names WHICH call leaked — reached no durable sink at all. The
+# instruction was unfollowable by construction, and anyone following it
+# correctly concluded "no evidence" and was wrong.
+#
+# These rows are the inverse of that measurement, driven through the REAL
+# server: after a rejection, the leaking task is nameable from a durable
+# artifact with no transcript mining.
+
+
+class TestTheRejectionReachesADurableJournal:
+    """One line per EVENT, carrying the identity the storm summary cannot."""
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_call_is_journalled_with_its_task_id(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(a) THE user-observable signal, on the measured leak shape."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision'
+        assert line['param'] == 'decision'
+        assert line['outcome'] == 'rejected'
+        assert line['subject_task_id'] == 'test-1', (
+            "the seeded plan's own task_id — this is what lets an operator name "
+            'the leaking agent without mining agent transcripts'
+        )
+        assert line['server'] == 'plan-tools'
+
+    @pytest.mark.asyncio
+    async def test_the_unrepairable_outcome_is_journalled_too(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(b) All three outcomes, not just the ones that reach the queue.
+
+        The escalation channel sees an unrepairable record and a burst summary;
+        it never sees an ordinary REJECTED call, which is what the 35 measured
+        rejections were. The fact channel sees all of them.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        (line,) = journal_lines(tmp_path)
+        assert line['outcome'] == 'unrepairable'
+        assert line['tool'] == 'add_design_decision'
+        assert line['subject_task_id'] == 'test-1'
+
+    @pytest.mark.asyncio
+    async def test_a_leak_before_any_plan_exists_still_lands(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(c) A ``create_plan`` refused before there is a plan to attribute to.
+
+        The attribution thunk has nothing to read, so it falls to the worktree
+        directory name — which in the fleet IS the task's lane id. Losing the
+        record instead would be the opposite of the point.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+
+        await rig.refuse(
+            'create_plan',
+            {'task_id': 'test-1', 'title': ABSORBED_ANALYSIS, 'files': ['a.py']},
+        )
+
+        assert not rig.harness.plan_path.exists(), 'no plan to attribute against'
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'create_plan'
+        assert line['subject_task_id'] == artifacts.worktree.name
+        assert line['subject_task_id'], 'never empty, never None'
+
+    @pytest.mark.asyncio
+    async def test_a_burst_is_three_journal_lines_and_one_escalation(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(d) The journal is per-EVENT; the escalation is per-WINDOW.
+
+        This is the whole division of labour. A storm record can only ever say
+        "N calls leaked in this window" — its own fields are count / threshold /
+        window_seconds / outcome / project, and ``project`` is structurally None
+        on this boundary. Which caller leaked is a per-event fact, and the
+        journal is where it now lives.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(3):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        lines = journal_lines(tmp_path)
+        assert len(lines) == 3, 'one line per rejection, not one per window'
+        assert {line['subject_task_id'] for line in lines} == {'test-1'}
+        assert len(rig.queue.submitted) == 1, 'still exactly one burst alarm'
+
+    @pytest.mark.asyncio
+    async def test_a_journal_outage_never_changes_a_refusal(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """(f) The journal is ADDITIVE: the outcome is decided before it runs.
+
+        Forced here by making the journal path an existing DIRECTORY, so the
+        append cannot open it.
+        """
+        markup_journal.journal_path(tmp_path, 'plan-tools').mkdir(parents=True)
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': ABSORBED_RATIONALE}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['outcome'] == 'rejected'
+        assert payload['field'] == 'decision'
+        assert payload['repaired_call']['rationale'] == _RATIONALE_PROSE
+
+    def test_the_registered_guard_declares_a_fact_sink(self, harness: Harness):
+        """(e) INV-1, at the axis this task adds.
+
+        The fact channel had no consumer, and the comment at the registration
+        site said so. It has one now, so the wiring is a DECLARATION at the
+        registration site rather than a global logging side effect.
+        """
+        (guard,) = [
+            m for m in harness.server.middleware if isinstance(m, MarkupGuardMiddleware)
+        ]
+
+        assert guard._fact_sink is not None, (
+            'without it the per-call record naming the leaking caller reaches '
+            "only this subprocess's stderr, which nobody retains"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_still_writes_nothing_to_the_plan(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """The journal is additive in the other direction too.
+
+        "Reject writes nothing" is the contract the whole policy rests on; a new
+        write-side channel is exactly the kind of change that could quietly
+        breach it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        before = rig.harness.plan_bytes()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        assert rig.harness.plan_bytes() == before
+        assert len(journal_lines(tmp_path)) == 1, 'the record went to the journal'
