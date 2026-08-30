@@ -49,8 +49,9 @@ are not separate gates.
 Map your entry point onto the ladder:
 
 - **`ref rc≠0` / `ancestry rc=128`** → [step 2](#step-2)'s *branch GONE* arm decides on the marker alone. An empty marker there is [step 4](#step-4)'s genuine not-landed outcome.
-- **`ref rc=0` / `ancestry rc=0`** → [step 2](#step-2)'s *branch EXISTS* arm; containment is required before stamping. A marker that is empty or disqualified falls through to [step 4](#step-4)'s **rc=0** sub-ladder — and since you already hold rc=0, do not re-run the ancestry check to get there.
-- **`ancestry rc=1`** → [step 4](#step-4)'s **rc=1** arm directly.
+- **`ref rc=0` (marker-first)** → [step 2](#step-2)'s *branch EXISTS* arm; containment is required before stamping. A marker that is empty or disqualified falls through to [step 3](#step-3)/[step 4](#step-4), where the ancestry check tells you which of rc=0 and rc=1 you are on. (`ref rc=0` alone does **not** mean rc=0: it means rc=0 *or* rc=1.)
+- **`ancestry rc=0` (ancestry-first)** → the same *branch EXISTS* arm, but you already know the answer the ancestry check would give, so do not re-run it: containment first, and on an empty or disqualified marker go straight to [step 4](#step-4)'s **rc=0** sub-ladder.
+- **`ancestry rc=1` (ancestry-first)** → [step 4](#step-4)'s **rc=1** arm directly. Steps 1–2 cannot change that verdict: containment can only come back stale or marker-empty on this arm, since a containment rc=0 would make the branch an ancestor of main and contradict rc=1.
 
 ---
 
