@@ -208,7 +208,7 @@ _REPO_ROOT = _PACKAGE_ROOT.parent
 # installed nowhere, and NOT on fused-memory's pytest `pythonpath`. This insert
 # is the only way the two mandated readers import at all, so it runs at module
 # scope rather than under a __main__ guard (the importlib-loaded test needs it
-# too). Idempotent, guarded — the migrate_tasks_json_to_sqlite.py idiom.
+# too). Idempotent, guarded — the standard repo-root sys.path-insert idiom.
 #
 # `shared` deliberately gets NO such insert: fused-memory/pyproject.toml
 # declares dark-factory-shared as a workspace dependency, so `shared.*` already
