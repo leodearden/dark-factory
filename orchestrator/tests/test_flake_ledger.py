@@ -1965,6 +1965,135 @@ class TestOpenDebtFilesTheDeflakeTask:
 
 
 @pytest.mark.asyncio
+class TestOpenDebtRecorroboratesTheOwner:
+    """INV-3 — boundary row B8.  ASYNC-ONLY CLASS.
+
+    A stored ``owner_task_id`` is a SNAPSHOT.  The task behind it may have gone terminal,
+    been cancelled, or been deleted since it was written, so it is re-read against LIVE
+    status on every suppression and NEVER assumed still-open.  An implementation that
+    short-circuited on a non-NULL ``owner_task_id`` would satisfy the invariant's letter
+    while pointing every stale row at a done task forever — which is the whole reason
+    B8 exists as a separate boundary row from B7.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def _seed(self, db_path: Path, owner: str = 'task-901') -> None:
+        """First suppression, which files and stores *owner*."""
+        from orchestrator.flake_ledger import open_debt
+
+        seeder = _FakeTaskClient(submit_returns=owner)
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
+        assert _owner(db_path, self.TEST_ID) == owner
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked', 'review'])
+    async def test_a_live_owner_is_not_refiled(self, tmp_path: Path, status: str) -> None:
+        """The dedup half: one genuinely-open owner means no second task, ever."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses={'task-901': status})
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert client.submit_calls == []
+        assert client.commit_calls == []
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    async def test_a_terminal_owner_is_replaced(self, tmp_path: Path, status: str) -> None:
+        """The enforcement half: a debt row whose owner went terminal owes a NEW task,
+        or the ledger accumulates rows nothing is responsible for."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses={'task-901': status}, submit_returns='task-902')
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert len(client.submit_calls) == 1
+        assert client.commit_calls == [['task-902']]
+        assert _owner(db_path, self.TEST_ID) == 'task-902'
+        assert row is not None and row.owner_task_id == 'task-902'
+
+    async def test_an_absent_owner_is_replaced(self, tmp_path: Path) -> None:
+        """``get_statuses`` silently OMITS ids it does not know, so an empty mapping for
+        a stored id is a CORROBORATED ABSENCE — the task was deleted — and is treated as
+        closed.  Distinct from a failed read (:class:`TestOpenDebtInvariantDegrades`),
+        which is not evidence of anything and must not file."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses={'some-other-task': 'pending'}, submit_returns='task-903')
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
+
+        assert len(client.submit_calls) == 1
+        assert _owner(db_path, self.TEST_ID) == 'task-903'
+
+    async def test_a_deferred_owner_is_completed_not_refiled(self, tmp_path: Path) -> None:
+        """``deferred`` is a THIRD state, not a synonym for closed: ``planning_mode``
+        creates the task deferred, so between ``submit_task`` and ``commit_planning``
+        there is a real window in which a crash leaves a task that EXISTS but will never
+        dispatch.  Reading that as terminal would file another orphan on every
+        subsequent suppression — a duplicate-generating loop that gets worse the more
+        the test flakes.  So the half-done filing is FINISHED, never repeated."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses={'task-901': 'deferred'})
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert client.submit_calls == []
+        assert client.commit_calls == [['task-901']]
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+
+    @pytest.mark.parametrize(
+        'statuses',
+        [
+            {'task-901': 'pending'},
+            {'task-901': 'done'},
+            {'task-901': 'deferred'},
+            {},
+        ],
+        ids=['open', 'terminal', 'deferred', 'absent'],
+    )
+    async def test_the_stored_value_is_never_trusted(
+        self, tmp_path: Path, statuses: dict[str, str]
+    ) -> None:
+        """THE point of B8, asserted in every branch: a live read really happens, on the
+        stored id, exactly once.  Without this, an implementation that short-circuited
+        on a non-NULL ``owner_task_id`` would pass the dedup case above and silently
+        fail the two that matter."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        client = _FakeTaskClient(statuses=statuses, submit_returns='task-904')
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
+
+        assert client.statuses_calls == [['task-901']]
+        # ...and it is consulted BEFORE anything is filed, not as an afterthought.
+        assert client.calls[0] == 'get_statuses'
+
+
+@pytest.mark.asyncio
 class TestResolveDebt:
     """``resolve_debt`` closes the current cycle.  ASYNC-ONLY CLASS."""
 
