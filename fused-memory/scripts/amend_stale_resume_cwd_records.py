@@ -564,6 +564,12 @@ def _precondition_satisfied(decision: dict[str, Any]) -> bool:
     False for every ``'refuse:*'`` outcome, including a pre-image mismatch: if
     somebody else edited the record underneath us we do not know what it now
     says, and asserting it carries our correction would be a guess.
+
+    False for ``'skip:verify_only'`` too, and for the same reason: reaching it
+    means the pre-image matched while the sentinel did NOT, i.e. the record is
+    in its pinned state but does not carry the correction. The skip is clean
+    in itself, but nothing downstream may assert a correction it does not
+    have.
     """
     return decision['action'] in ('amend', 'skip:already_amended')
 
@@ -579,6 +585,15 @@ async def _apply_amendments(
 
     Returns the decision list with write outcomes folded in; mutates
     *applied_ids* to hold the ids actually written.
+
+    A target classified ``'amend'`` but carrying no ``new_content`` is
+    VERIFY-ONLY and is demoted to ``'skip:verify_only'`` up front -- a SKIP,
+    deliberately not a member of :data:`ERROR_OUTCOMES`, because a verify-only
+    target matching its pre-image is a correct result and exiting 1 on it
+    would make the verifier unusable. It does NOT satisfy the precondition
+    chain (see :func:`_precondition_satisfied`): a matched pre-image without
+    the sentinel means the record does not carry the correction, so nothing
+    later may assert that it does.
 
     The capability probe runs ONCE, before the first write, and only if there
     is something to write:
@@ -605,6 +620,35 @@ async def _apply_amendments(
     classification (a mismatch refuses and breaks the chain; a sentinel means
     somebody else already landed the correction, which keeps it intact).
     """
+    targets_by_id = {t.memory_id: t for t in AMEND_TARGETS}
+
+    # VERIFY-ONLY demotion, before anything else on this path. A target
+    # carrying no ``new_content`` has nothing to write, so a decision of
+    # 'amend' on it means only "the record still matches its pin" -- there is
+    # no replacement to send, and passing ``content=None`` to update_memory
+    # would be a clobber with no text behind it. Demoting here (rather than
+    # declining at the write call) is what makes the write path structurally
+    # unreachable for such a target instead of merely guarded: everything
+    # downstream -- the capability probe, the chain, the re-read -- sees a
+    # skip and never considers it writable. Both real targets are verify-only,
+    # so this is the branch the whole live run takes.
+    decisions = [
+        {
+            **d,
+            'action': 'skip:verify_only',
+            'detail': (
+                'this target carries no replacement text (new_content is '
+                'None), so it is corroborated but never written'
+            ),
+        }
+        if (
+            d['action'] == 'amend'
+            and getattr(targets_by_id.get(d['id']), 'new_content', None) is None
+        )
+        else d
+        for d in decisions
+    ]
+
     amendable = [d for d in decisions if d['action'] == 'amend']
     if not amendable:
         return decisions
@@ -629,7 +673,6 @@ async def _apply_amendments(
             for d in decisions
         ]
 
-    targets_by_id = {t.memory_id: t for t in AMEND_TARGETS}
     updated: list[dict[str, Any]] = []
     # The precondition chain. Every target after the first asserts, in its own
     # text, that the earlier correction landed -- so once one link fails, no

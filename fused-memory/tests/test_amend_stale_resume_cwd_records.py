@@ -104,7 +104,7 @@ class TestAmendTargetsContract:
         # record can never EQUAL the reverted text, so the guard cannot fire
         # on a corrected corpus.
         for target in _mod.AMEND_TARGETS:
-            assert _mod.REVERSION_PREIMAGE != target.expected_preimage
+            assert target.expected_preimage != _mod.REVERSION_PREIMAGE
 
     def test_reversion_preimage_IS_quoted_inside_both_live_preimages(self):
         # MEASURED, and the whole reason classify_amend_target compares the
