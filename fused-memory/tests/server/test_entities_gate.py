@@ -238,22 +238,60 @@ class TestConflictingDeclarationsAreRejected:
     def test_the_project_axis_conflicts_and_spells_the_foreign_node_name(self):
         """The cross-project collapse this PRD exists to detect.
 
-        The prose names a BARE 'Task 3127', which is own-project by definition
-        — the local project is the default namespace of the prose.  Declaring
-        the same number under a FOREIGN project is therefore a contradiction,
-        not silence, and the block must spell it 'reify:3127' rather than
-        'Task 3127' or the reader cannot see what the disagreement IS.
+        The prose names 'reify:3129' — a DIFFERENT project's task carrying the
+        declared number — while the caller declared the OWN-project 'Task
+        3129'.  An own-project declaration keeps the whole-kind scan bucket
+        (gamma's choice 2 narrows only the FOREIGN side), so the foreign
+        reference is evidence about it: not silence, but the number collapse
+        that is invisible to any rule comparing bare numbers.
+
+        The block must spell the content side 'reify:3129' rather than 'Task
+        3129', or the reader cannot see what the disagreement IS.
+
+        DIRECTION MATTERS, and the mirror image is the sibling test below.
+        The plan's step-3 sketch asked for the INVERSE case — a foreign
+        declaration against bare local prose — which is structurally identical
+        to its own adjacent "a foreign declaration the prose never mentions
+        does NOT conflict" bullet and measures as a NON-conflict (verified:
+        declared reify:3127 against 'the fix for Task 3127 landed' yields
+        conflicts=()).  Gamma's choice 2 is deliberate — the scan reaches a
+        foreign task ONLY through an explicit qualifier, so its silence about
+        that project is silence — and making that case reject would require
+        the gate to grow policy of its own, which every design decision in
+        this leaf forbids.  The property the plan wanted pinned (the project
+        axis conflicts; foreign node names are spelled foreign) is pinned
+        here and below, in the two directions that actually carry it.
         """
         block = entities_gate(
-            [{'kind': 'task', 'id': 3127, 'project_id': 'reify'}],
-            content=_CITES_3127,
+            [{'kind': 'task', 'id': 3129}],
+            content='mirrors reify:3129',
             group_id=GROUP,
         )
 
         assert isinstance(block, dict), f'the project axis did not reject: {block!r}'
-        assert block['declared'] == ['reify:3127'], f'{block!r}'
-        assert block['conflicts'] == ['reify:3127'], f'{block!r}'
-        assert block['content_referents'] == ['Task 3127'], f'{block!r}'
+        assert block['declared'] == ['Task 3129'], f'{block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['content_referents'] == ['reify:3129'], f'{block!r}'
+
+    def test_a_foreign_declaration_the_prose_contradicts_is_spelled_foreign(self):
+        """The declared side spelled foreign, and choice 2's other half.
+
+        The prose DOES name that project ('reify:3129'), so the foreign
+        declaration's narrowed bucket is non-empty and its silence argument no
+        longer applies — 'reify:132' is contradicted.  Pins that a foreign
+        referent reaches the agent as 'reify:132' and never as 'Task 132',
+        which is the spelling the graph uses and the one leaf zeta emits.
+        """
+        block = entities_gate(
+            [{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            content='mirrors reify:3129',
+            group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the foreign conflict did not reject: {block!r}'
+        assert block['declared'] == ['reify:132'], f'{block!r}'
+        assert block['conflicts'] == ['reify:132'], f'{block!r}'
+        assert block['content_referents'] == ['reify:3129'], f'{block!r}'
 
     def test_a_foreign_declaration_the_prose_never_mentions_does_not_conflict(self):
         """Gamma's choice 2: the scan reaches a foreign task ONLY through an

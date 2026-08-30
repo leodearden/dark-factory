@@ -38,10 +38,25 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fused_memory.utils.referent_resolution import resolve_referents
+from fused_memory.utils.canonical_labels import scan_content
+from fused_memory.utils.referent_resolution import ReferentSet, resolve_referents
 from fused_memory.utils.validation import InputValidationError
 
 logger = logging.getLogger(__name__)
+
+#: Remediation for a declaration the content contradicts.  Names BOTH
+#: legitimate remedies, and says explicitly that omitting the parameter is
+#: always safe — an agent that reads "your referents were rejected" and cannot
+#: tell whether silence is also rejected will start guessing, and a guessed
+#: declaration is the misattribution this PRD exists to prevent.
+_ENTITIES_CONFLICT_HINT = (
+    'The referents you declared in `entities` are contradicted by your own '
+    'content (see conflicts/content_referents). Either correct `entities` to '
+    'name what the content is actually about, or drop `entities` entirely and '
+    'let the content scan derive the set for you. This gate rejects only a '
+    'CONFLICT, never an absence: omitting `entities` — or passing [] to record '
+    'that you considered referents and none applied — always succeeds.'
+)
 
 
 def entities_gate(
@@ -106,9 +121,7 @@ def entities_gate(
         return None
 
     try:
-        # Called for its VALIDATION verdict only, for now — the `.conflicts`
-        # this resolution also carries is read by the conflict arm.
-        resolve_referents(
+        resolution = resolve_referents(
             declared=entities,
             metadata=None,
             content=content,
@@ -121,6 +134,50 @@ def entities_gate(
         # task-vocabulary project_id) leaves `_declared_referents` as exactly
         # this type — written so THIS handler catches all of them.
         return build_entities_malformed_block(agent_id, content, exc)
+
+    if resolution.conflicts:
+        # A SECOND CALL of the one scanner, on the REJECTION PATH ONLY.
+        #
+        # `ReferentResolution` deliberately publishes `.conflicts` (the
+        # DECLARED side) and `.ambiguous` but withholds the scan's `.refs`, so
+        # the content side of the disagreement is not derivable from the
+        # resolution — and INV-2 requires a rejection to name both sides.  This
+        # is a second CALL, not a second COPY: the label vocabulary stays at
+        # its one normative site in canonical_labels, so it is not the INV-5
+        # lockstep duplication beta exists to prevent, and leaf zeta already
+        # sets this precedent by re-deriving the producer's ambiguity set from
+        # `content`.  Scoping it inside this branch keeps the ACCEPTED path at
+        # exactly one scan.
+        scan = scan_content(content, group_id=group_id)
+        block = build_entities_conflict_block(
+            agent_id,
+            content,
+            declared=resolution.referents,
+            conflicts=resolution.conflicts,
+            # `refs + ambiguous`, never `refs` alone. `_conflicting_referents`
+            # tests membership against `refs | ambiguous`, so a scan that found
+            # ONLY an ambiguous referent still satisfies its "the scan saw this
+            # kind" precondition and CAN produce a conflict. Reporting `refs`
+            # there would emit "the content cites nothing" beside a rejection
+            # for contradicting the content — a guard malfunction to read, not
+            # a decision.
+            content_referents=scan.refs + scan.ambiguous,
+        )
+        # The interim operator-greppable record until leaf iota's telemetry
+        # surface lands (INV-4: a rejection nobody can count is a rejection
+        # nobody can see). Carries the same fields as the block, so grepping
+        # the log and reading the agent's error tell the same story.
+        logger.warning(
+            'entities_gate: rejecting write — declared referents contradict the '
+            'content. agent_id=%r group_id=%r declared=%r conflicts=%r '
+            'content_referents=%r',
+            agent_id,
+            group_id,
+            block['declared'],
+            block['conflicts'],
+            block['content_referents'],
+        )
+        return block
 
     return None
 
@@ -150,4 +207,55 @@ def build_entities_malformed_block(
         'agent_id': agent_id,
         'content_excerpt': content[:200],
     }
+
+
+def build_entities_conflict_block(
+    agent_id: str | None,
+    content: str,
+    *,
+    declared: ReferentSet,
+    conflicts: ReferentSet,
+    content_referents: ReferentSet,
+) -> dict[str, Any]:
+    """Build the write-blocking dict for a declaration the content refutes.
+
+    A DISTINCT ``error_type`` from the malformed arm, following the same
+    precedent as ``ProceduralKnowledgeNearDuplicateWriteRejected`` versus
+    ``ProceduralKnowledgeKnownTopicClusterWriteRejected``.  The two failures
+    need opposite remedies — one is "your list is the wrong shape", the other
+    is "your list disagrees with your own prose" — and merging them behind one
+    type would leave leaf iota unable to separate structural rejections from
+    the semantic misattribution signal this PRD exists to produce.
+
+    Args:
+        declared: The FULL declared set, so the agent sees what it sent beside
+            what was refused.
+        conflicts: The subset the content contradicts — a per-referent verdict,
+            not a set-level one, which is what catches ``[3127, 3129]`` where
+            3129 is an adjacent-number typo and 3127 corroborates.
+        content_referents: What the scan actually found, ``refs + ambiguous``.
+
+    All three are spelled as ``Referent.node_name`` ('Task 3127' own-project,
+    'reify:132' foreign) because that is the spelling the agent and the graph
+    both use, and the one leaf zeta's reason strings already emit.
+    """
+    return {
+        'error': 'declared_referent_conflict',
+        'error_type': 'DeclaredReferentConflictRejected',
+        'agent_id': agent_id,
+        'content_excerpt': content[:200],
+        'declared': _node_names(declared),
+        'conflicts': _node_names(conflicts),
+        'content_referents': _node_names(content_referents),
+        'hint': _ENTITIES_CONFLICT_HINT,
+    }
+
+
+def _node_names(referents: ReferentSet) -> list[str]:
+    """Spell a referent set the way the agent and the graph both spell it.
+
+    ``Referent.node_name`` rather than the wire dict, and a plain ``list`` so
+    the block stays JSON-safe without a caller having to coerce it.
+    """
+    return [referent.node_name for referent in referents]
 
