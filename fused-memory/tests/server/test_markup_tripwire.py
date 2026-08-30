@@ -16,6 +16,15 @@ longer refuses a leaked write while a guarded one does.
 Boundary/wiring tests for the MCP write tools live in that sibling file;
 ``tests/test_markup_guard_fused_memory.py`` covers the boundary guard itself,
 including the residue emitter this module also hosts.
+
+## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
+
+Every envelope literal quoted below is spelled with the ``\\x3c`` escape for
+``<`` rather than the raw bracket: writing it raw would force an agent editing
+this file to emit that literal inside its own tool-call envelope, reproducing
+the very defect these tests pin. See shared/src/shared/toolcall_markup.py's
+"Sentinel-literal hazard" section — the owner of this rule — for the full
+rationale.
 """
 
 from __future__ import annotations
@@ -69,7 +78,7 @@ _REPAIRED_STORM = {**_REJECTED_STORM, 'outcome': 'repaired'}
 #
 # Pattern of tests/test_lock_charter_guard.py::_CANONICAL_EXTENSIONS.
 # ---------------------------------------------------------------------------
-_CANONICAL_PATTERNS = ('</content>', '<parameter name=', '</invoke>')
+_CANONICAL_PATTERNS = ('\x3c/content>', '\x3cparameter name=', '\x3c/invoke>')
 
 
 def test_pattern_list_drift_guard():
@@ -77,8 +86,8 @@ def test_pattern_list_drift_guard():
 
     A same-file consistency check — update BOTH together.  The three literals
     are the envelope fragments observed leaking into the corpus (DF 3083
-    vector-1 specimens are ``</content>``/``</invoke>`` tails; vector-2 is the
-    ``<parameter name=`` fragment that mis-parsed task 3210's priority).
+    vector-1 specimens are ``\x3c/content>``/``\x3c/invoke>`` tails; vector-2 is
+    the ``\x3cparameter name=`` fragment that mis-parsed task 3210's priority).
     """
     assert MCP_MARKUP_PATTERNS == _CANONICAL_PATTERNS, (
         f'Write-time pattern list drifted: {MCP_MARKUP_PATTERNS!r} != '
