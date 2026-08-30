@@ -352,7 +352,19 @@ class ChronicFlakeTaskClient(Protocol):
     fused-memory MCP directly — mirrors
     ``offline_lane.OfflineLaneTaskClient``'s cross-project scope boundary.
     :class:`SchedulerChronicFlakeTaskClient` (step-15/step-16) is the
-    concrete adapter over a duck-typed scheduler."""
+    concrete adapter over a duck-typed scheduler.
+
+    That adapter now serves a SECOND consumer:
+    ``orchestrator/src/orchestrator/flake_ledger.py::FlakeLedgerTaskClient``,
+    the seam ``open_debt`` files its de-flake task through (task ζ). It was
+    grown in place — with ``get_statuses`` and ``commit_planning`` — rather
+    than duplicated, because two adapters over one ``dispatch_tool`` seam is
+    precisely the drift this facility exists to avoid. The ledger satisfies
+    that Protocol STRUCTURALLY, so no import edge exists in either direction
+    and ``flake_ledger``'s ``shared``-only dependency set is preserved. Those
+    two methods are NOT declared here: this module does not use them, and
+    adding them would oblige every ``ChronicFlakeTaskClient`` to grow a
+    surface only the ledger needs."""
 
     async def submit_task(self, arguments: dict) -> str:
         """Submit a new task from a ``submit_task``-shaped argument block
@@ -595,6 +607,26 @@ def _extract_results_list(result: object) -> list[dict]:
     return [entry for entry in results if isinstance(entry, dict)]
 
 
+def _extract_statuses_map(result: object) -> dict[str, str]:
+    """Best-effort extraction of a ``get_statuses`` response's ``statuses`` mapping
+    from a ``dispatch_tool`` envelope (see :func:`_unwrap_dispatch_envelope`).
+
+    Written beside :func:`_extract_results_list` and over the same seam so all three
+    response parsers share ONE envelope-shape policy — a second, independently-evolved
+    unwrapper is exactly how one of them would silently stop handling a shape the
+    others still do.
+
+    Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
+    hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.  A
+    non-dict ``statuses`` or an unrecognised envelope yields ``{}`` rather than raising.
+    """
+    envelope = _unwrap_dispatch_envelope(result)
+    statuses = envelope.get('statuses')
+    if not isinstance(statuses, dict):
+        return {}
+    return {str(key): str(value) for key, value in statuses.items()}
+
+
 # Per-call dispatch_tool timeout for submit_task — matches
 # harness._OfflineLaneTaskClient.submit_fix_task's precedent.
 _SUBMIT_TASK_TIMEOUT_SECS = 30
@@ -617,12 +649,91 @@ class SchedulerChronicFlakeTaskClient:
     async def submit_task(self, arguments: dict) -> str:
         """Submit *arguments* (see
         :func:`build_chronic_flake_fix_task_arguments`) via
-        ``dispatch_tool('submit_task', ...)`` and return a best-effort id
-        (log-only — submit is two-phase server-side)."""
+        ``dispatch_tool('submit_task', ...)`` and return a best-effort id.
+
+        For this module's own path the id is log-only (submit is two-phase
+        server-side); for ``flake_ledger``'s it is the ``owner_task_id`` the
+        §5.9 invariant is stored against, which is why that path's argument
+        block carries ``planning_mode: True`` — that makes the response a
+        REAL task id, synchronously.
+
+        ``project_root`` is INJECTED when absent, over a copy of *arguments*
+        so a caller's dict is never mutated. ``flake_ledger.open_debt`` holds
+        a ``db_path``, not a project root, and deriving one from it would be a
+        silent, position-dependent inversion of ``ledger_db_path``; this
+        adapter already holds the root, so the fact lives here. ``setdefault``
+        rather than assignment keeps this module's own path — where
+        :func:`build_chronic_flake_fix_task_arguments` always sets the key —
+        byte-identical on the wire.
+        """
+        arguments = {**arguments}
+        arguments.setdefault('project_root', self._project_root)
         result = await self._scheduler.dispatch_tool(
             'submit_task', arguments, timeout=_SUBMIT_TASK_TIMEOUT_SECS,
         )
         return extract_task_id(result)
+
+    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+        """Live ``{id: status}`` for *ids* via ``dispatch_tool('get_statuses', ...)``.
+
+        Serves ``flake_ledger``'s INV-3 re-corroboration. Unknown ids are
+        silently OMITTED by the tool, and that omission is meaningful to the
+        consumer (a corroborated absence — the task was deleted), so a
+        FAILURE must be distinguishable from it: any raise or unparseable
+        envelope degrades to ``{}`` here AND the ledger guards the call
+        separately, treating an unreadable status as no evidence at all
+        rather than as an absence.
+
+        Ids are coerced to ``str`` — the ledger's ``owner_task_id`` column is
+        TEXT, and an int on the wire would match nothing.
+        """
+        try:
+            result = await self._scheduler.dispatch_tool(
+                'get_statuses',
+                {'project_root': self._project_root, 'ids': [str(i) for i in ids]},
+            )
+        except Exception:
+            logger.warning(
+                'chronic_flake: get_statuses dispatch failed for ids=%s', list(ids), exc_info=True,
+            )
+            return {}
+        return _extract_statuses_map(result)
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        """Release planning-mode tasks from ``deferred`` to ``pending`` via
+        ``dispatch_tool('commit_planning', ...)``.
+
+        ``task_ids`` goes on the wire as a COMMA-SEPARATED STRING, not a
+        list — that is the tool's declared parameter type
+        (``fused-memory/src/fused_memory/server/tools.py::commit_planning``),
+        and a list is rejected.
+
+        Never raises: this is the second phase of an initial filing whose
+        first phase already succeeded, so a failure here leaves a real task
+        parked in ``deferred``, which the caller repairs on its next pass.
+        """
+        try:
+            result = await self._scheduler.dispatch_tool(
+                'commit_planning',
+                {
+                    'project_root': self._project_root,
+                    'task_ids': ','.join(str(i) for i in task_ids),
+                    'target_status': 'pending',
+                },
+                timeout=_SUBMIT_TASK_TIMEOUT_SECS,
+            )
+        except Exception:
+            logger.warning(
+                'chronic_flake: commit_planning dispatch failed for task_ids=%s — they stay '
+                'deferred', list(task_ids), exc_info=True,
+            )
+            return
+        envelope = _unwrap_dispatch_envelope(result)
+        if envelope.get('error') or not envelope.get('success'):
+            logger.warning(
+                'chronic_flake: commit_planning did not confirm success for task_ids=%s '
+                '(response=%r) — they may still be deferred', list(task_ids), result,
+            )
 
     async def search_tasks(self, query: str) -> list[dict]:
         """Semantic search over already-filed tasks via

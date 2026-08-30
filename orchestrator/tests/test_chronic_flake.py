@@ -812,7 +812,13 @@ class TestSchedulerChronicFlakeTaskClient:
         result = await client.submit_task({'title': 't'})
         assert result == 'fix-7'
         assert scheduler.calls[0][0] == 'submit_task'
-        assert scheduler.calls[0][1] == {'title': 't'}
+        # `project_root` is injected when the block omits it (task ζ) — additive, so
+        # the caller's own keys still reach the wire verbatim.  This bare block is not
+        # a shape chronic_flake itself ever sends: `build_chronic_flake_fix_task_arguments`
+        # always sets the key, and `TestSchedulerClientServesTheFlakeLedgerSeam::
+        # test_chronic_flakes_own_block_reaches_the_wire_unchanged` is the byte-identity
+        # guard for that real path.
+        assert scheduler.calls[0][1] == {'title': 't', 'project_root': '/proj'}
 
     @pytest.mark.asyncio
     async def test_submit_task_uses_timeout_30(self):
