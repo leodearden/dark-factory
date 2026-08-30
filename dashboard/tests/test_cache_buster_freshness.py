@@ -614,7 +614,7 @@ class TestHardcodedFloorIsRetired:
         The floor was dead weight: index.html shipped v=49 while the floor
         still read 45, four releases stale.  The base-relative MONOTONIC rule
         next door is a self-maintaining superset of what it protected against,
-        and eight sibling modules keep their own `min(versions) >= N`
+        and seven sibling modules keep their own `min(versions) >= N`
         anti-revert pins regardless.
         """
         from test_index_html import test_redux_cache_buster_bumped as bumped
