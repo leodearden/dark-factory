@@ -783,9 +783,11 @@ def kill_holder_tree(
     # ALREADY-REAPED SHORT CIRCUIT paragraph above.  Captured once, via
     # proc.returncode (a pure read of state this Popen already owns, no
     # waitpid side effect) rather than a fresh proc.poll(), and not
-    # re-read later in this function -- the `if proc.poll() is None:`
-    # leader-kill guard further down stays exactly as it is, since it is
-    # only ever reachable on this (live) path.
+    # re-read later in this function.  ``proc.poll()`` is deliberately
+    # called NOWHERE in this helper: a poll() after this point would
+    # ``waitpid``-reap a leader that exited in the meantime and FREE
+    # proc.pid, aiming the killpg backstop below at a recycled group --
+    # see the unguarded leader SIGKILL further down for the full argument.
     if proc.returncode is not None:
         if proc.stdin is not None:
             with contextlib.suppress(OSError):
@@ -822,11 +824,30 @@ def kill_holder_tree(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(pid, signal.SIGKILL)
 
-    # SIGKILL the leader, unless it has already exited (proc.poll() is not
-    # None -- already reaped, nothing to signal).
-    if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _kill(proc.pid, signal.SIGKILL)
+    # SIGKILL the leader.  UNGUARDED, deliberately: there is no
+    # `if proc.poll() is None:` here, and adding one back would REINTRODUCE
+    # the pid-recycling hazard the backstop below exists to avoid.
+    # ``Popen.poll()`` is not a passive read -- it calls ``_internal_poll()``
+    # -> ``os.waitpid(pid, WNOHANG)``, so if the leader exited at any point
+    # after the entry-time ``proc.returncode is not None`` short circuit
+    # (the Row 5 holder's ``finally`` calls ``stop_heartbeats()`` FIRST,
+    # which arms the CLI's stdin-watchdog self-kill, making exactly that a
+    # DESIGNED behaviour, not an exotic race), a poll() here would REAP it
+    # and FREE proc.pid -- and the backstop below would then evaluate
+    # ``pgid == proc.pid`` against a pgid captured pre-reap and fire
+    # ``killpg`` at a now-free pgid, SIGKILLing a stranger's whole process
+    # group on a shared dev box or CI host.
+    #
+    # Signalling here is safe unguarded and costs nothing: the entry-time
+    # short circuit already established the leader was un-reaped, and this
+    # Popen object is the ONLY thing that can reap it, so with no poll() in
+    # this function the pid stays PINNED (a zombie at worst) until
+    # ``proc.wait()`` below.  SIGKILL to an exited-but-unreaped zombie is a
+    # no-op, and ProcessLookupError/PermissionError are suppressed anyway.
+    # This is what makes the backstop's "still unreaped, pid provably
+    # pinned" premise actually true rather than merely asserted.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _kill(proc.pid, signal.SIGKILL)
 
     # Guarded killpg backstop for same-group stragglers -- fires ONLY when
     # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
@@ -2301,6 +2322,144 @@ def test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader():
             f"kill_holder_tree must killpg a leader that provably setsid'd "
             f'into its own, non-caller process group -- got {killpg_calls}, '
             f'expected exactly one call with pgid={leader_pgid}'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
+def _wait_until_zombie(pid: int, *, timeout: float = 5.0) -> bool:
+    """Poll ``/proc/<pid>/stat`` until *pid* is a zombie (state ``Z``).
+
+    Deliberately does NOT use ``Popen.wait()``/``poll()``: those reap the
+    process, which is precisely the state transition the caller here needs
+    to NOT happen.  Reads the state field positionally from the tail after
+    the last ``)`` so a comm containing spaces or parens cannot skew it.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            stat = Path(f'/proc/{pid}/stat').read_text()
+        except OSError:
+            return False  # already reaped by someone else, or gone
+        tail = stat.rpartition(')')[2].split()
+        if tail and tail[0] == 'Z':
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_kill_holder_tree_does_not_reap_a_leader_that_exits_mid_teardown():
+    """A leader that exits DURING teardown must not be reaped before the backstop.
+
+    Closes the window between the entry-time ``proc.returncode is not
+    None`` short circuit and the killpg backstop.  The two existing killpg
+    unit tests only cover the endpoints -- "already reaped at entry"
+    (``test_kill_holder_tree_is_safe_when_the_leader_already_exited``) and
+    "alive throughout"
+    (``test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader``)
+    -- and both stay GREEN with a ``poll()`` reintroduced at the leader
+    kill, so neither can catch this.
+
+    THE HAZARD.  ``Popen.poll()`` is not a passive read: it calls
+    ``os.waitpid(pid, WNOHANG)``.  A ``poll()`` at the leader-kill step
+    would therefore REAP a leader that exited since entry and FREE
+    ``proc.pid`` -- after which the backstop's ``pgid == proc.pid`` test
+    compares a pre-reap pgid against a freed pid, and fires
+    ``killpg(pgid, SIGKILL)`` at a group the kernel is free to have
+    reassigned to a stranger.  On a shared dev box or CI host that is an
+    unrelated user's entire process group.
+
+    THIS IS THE ROW 5 HOLDER'S DESIGNED BEHAVIOUR, not an exotic race: its
+    ``finally`` calls ``heartbeat_holder.stop_heartbeats()`` immediately
+    before ``kill_holder_tree``, and stopping heartbeats ARMS the CLI's
+    stdin-watchdog self-kill, so the holder exiting on its own inside the
+    teardown window is exactly what the surrounding code sets up.
+
+    THE ASSERTION.  The ``_ppid_map_provider`` seam is used to land the
+    leader's exit strictly inside the window: the provider SIGKILLs the
+    leader and waits (via ``/proc``, never ``wait()``) until it is a
+    ZOMBIE, so the leader is provably exited-but-unreaped by the time the
+    helper reaches the leader kill.  The killpg spy then records
+    ``proc.returncode`` AT CALL TIME.  Under the fixed helper that is
+    ``None`` -- nothing in the helper reaped it, so the pid is still
+    PINNED and ``pgid`` provably still denotes the holder's own group.
+    Reintroduce the ``poll()`` guard and the spy sees a non-``None``
+    returncode: the pid was freed before the backstop fired, and the test
+    goes RED.
+    """
+    leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        start_new_session=True,
+    )
+    try:
+        leader_pgid = os.getpgid(leader.pid)
+        assert leader_pgid == leader.pid, (
+            'harness bug: start_new_session=True must make the leader its '
+            'own process-group leader, or this test is not exercising the '
+            "killpg backstop's admission condition it exists to guard"
+        )
+        assert leader_pgid != os.getpgid(0), (
+            "harness bug: the setsid'd leader's group must differ from the "
+            "caller's own, or this test is not exercising the killpg "
+            "backstop's admission condition it exists to guard"
+        )
+        assert leader.returncode is None, (
+            'harness bug: the leader must be un-reaped at entry, or '
+            "kill_holder_tree's already-reaped short circuit fires and this "
+            'test exercises nothing'
+        )
+
+        became_zombie: list[bool] = []
+
+        def provider_that_kills_the_leader():
+            """Land the leader's exit strictly inside the teardown window."""
+            os.kill(leader.pid, signal.SIGKILL)
+            became_zombie.append(_wait_until_zombie(leader.pid))
+            return {}  # no descendants; the pid-pinning property is under test
+
+        killpg_calls: list[tuple[int, int, int | None]] = []
+
+        def killpg_spy(pgid, sig):
+            # Record the leader's REAPED-ness as the backstop sees it.
+            killpg_calls.append((pgid, sig, leader.returncode))
+
+        kill_holder_tree(
+            leader,
+            timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+            _ppid_map_provider=provider_that_kills_the_leader,
+            _killpg=killpg_spy,
+        )
+
+        assert became_zombie == [True], (
+            f'harness bug: the leader never became an unreaped zombie inside '
+            f'the teardown window ({became_zombie}) -- this test is not '
+            f'exercising the exit-mid-teardown race it exists to pin'
+        )
+        assert killpg_calls, (
+            'kill_holder_tree must still fire its killpg backstop for a '
+            "leader that setsid'd and then exited mid-teardown -- same-group "
+            'stragglers still need reaping'
+        )
+        assert [(pgid, sig) for pgid, sig, _rc in killpg_calls] == [
+            (leader_pgid, signal.SIGKILL)
+        ], (
+            f'kill_holder_tree must killpg exactly the holder\'s own group -- '
+            f'got {killpg_calls}, expected pgid={leader_pgid}'
+        )
+        assert all(rc is None for _pgid, _sig, rc in killpg_calls), (
+            f'kill_holder_tree REAPED the leader before firing its killpg '
+            f'backstop (returncode at killpg time: '
+            f'{[rc for _p, _s, rc in killpg_calls]}) -- proc.pid was FREED, '
+            f'so pgid={leader_pgid} may already belong to a stranger. This is '
+            f'the pid-recycling hazard the backstop is documented to avoid; '
+            f'a poll()/wait() must not run before the backstop.'
+        )
+        assert leader.poll() is not None, (
+            'kill_holder_tree must still reap the leader by the time it '
+            'returns -- pinning the pid across the backstop is not a licence '
+            'to leak a zombie'
         )
     finally:
         if leader.poll() is None:
