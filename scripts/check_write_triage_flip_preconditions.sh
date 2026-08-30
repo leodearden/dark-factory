@@ -173,23 +173,16 @@ else
     if [ "$probe_rc" -eq 0 ]; then
       note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
     elif [ "$probe_rc" -eq 1 ]; then
+      # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
+      # candidates[0] warning are all stated by the probe's own report,
+      # printed directly below this and carrying the MEASURED slate. Stating
+      # them here too cost ~1.1 KB of the 2000-char window that is all
+      # _default_run_script forwards to the operator -- budget items 2 and 4
+      # have to share. Say it once, in the copy that measured it.
       note "FAIL  item 1  the judge path does NOT bind a verdict to a determinate candidate"
-      note "              The judge is shown up to judge_candidate_count candidates but"
-      note "              the attach touches exactly one of them, so once the flag is on"
-      note "              a verdict reasoned about candidate #3 lands on candidate #1 and"
-      note "              stamps x_contested on a canonical the entry never contradicted."
-      note "              EITHER remedy closes this -- what is asserted is the INVARIANT,"
-      note "              not which mechanism landed:"
-      note "                (a) make parse_judge_verdict return the judged candidate"
-      note "                    alongside the outcome, so the verdict names its own"
-      note "                    candidate and slate position stops mattering; or"
-      note "                (b) give build_judge_prompt a parameter naming the attach"
-      note "                    target and make its rendering DEPEND on it."
-      note "              Marking candidates[0] is NOT sufficient: select_judge_candidates"
-      note "              rescues a hoisted parent's evidence child by APPENDING it, so on"
-      note "              that slate the attach target is LAST. The probe's own report"
-      note "              below carries the measured slate."
       note "              Subject: $JUDGE at ref '$REF'."
+      note "              The harm, BOTH accepted remedies and what was measured are in"
+      note "              the probe's own report below."
       record_fail 1
     else
       note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."

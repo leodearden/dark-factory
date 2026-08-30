@@ -645,7 +645,12 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
                     errors.append(f'{payload!r} -> {exc!r}')
                     break
                 if isinstance(result, str):
+                    # Fully explained by the bare-str branch below. Letting it
+                    # fall through to `inert` too restated the same finding
+                    # once per (word, field) pair — eight identical clauses on
+                    # main — crowding the report's limited window.
                     saw_bare_str = True
+                    break
                 if not _binds_candidate(result):
                     inert.append(
                         f'{payload!r} -> returned {type(result).__name__}, which '
