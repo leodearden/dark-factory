@@ -97,9 +97,13 @@ Establish ref existence per [Two entry points](#entry-points) — the `rev-parse
   behind — it is "the single most common post-merge state". A deleted ref is also precisely the
   regime `GitOps.find_merge_marker` itself searches in, so the stale-marker concern below cannot
   apply (no ref exists to have been recreated). Stamp
-  `{"kind": "found_on_main", "commit": "<marker sha>", "note": "merge commit located by
-  exact-subject marker search"}` and stop here. The `note` is **mandatory**, not decoration —
-  see the [`DoneProvenance` contract](#doneprovenance-contract).
+  `{"kind": "<merged|found_on_main>", "commit": "<marker sha>", "note": "merge commit located by
+  exact-subject marker search"}` and stop here. Pick the `kind` by the
+  [`DoneProvenance` contract](#doneprovenance-contract)'s rule — `merged` when this branch
+  supplied the merge you are recording (the usual case when you are polling your own merge
+  request), `found_on_main` when the work was already on main when you found it. Carry the `note`
+  either way: it is **mandatory** for `found_on_main`, and it is what makes a `merged` stamp
+  auditable.
 - **ref rc=0 / ancestry rc=0 or rc=1 (branch still EXISTS)** → the marker is **NOT authoritative
   on its own**, and `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in
   exactly that situation — it "prevents finding a stale merge marker from a *previous* run of a
@@ -116,9 +120,9 @@ marker from a previous incarnation does not: it predates the recreated ref, so t
 *descendant* of it, not an ancestor.
 
 - **containment rc=0** → the marker is this incarnation's true merge commit. Stamp
-  `{"kind": "found_on_main", "commit": "<that sha>", "note": "merge commit located by
-  exact-subject marker search; containment-verified against branch tip"}` and stop here. The
-  `note` is **mandatory** — see the [`DoneProvenance` contract](#doneprovenance-contract).
+  `{"kind": "<merged|found_on_main>", "commit": "<that sha>", "note": "merge commit located by
+  exact-subject marker search; containment-verified against branch tip"}` and stop here — same
+  `kind` rule and same `note` guidance as the *branch GONE* arm above.
 - **containment rc=1** → a stale marker from a previous incarnation of a re-opened task. Do
   **not** stamp it. Fall through to [step 3](#step-3)/[step 4](#step-4) and let them decide.
 - **containment rc=128** → the **marker sha** would not resolve — the branch ref already
@@ -126,9 +130,9 @@ marker from a previous incarnation does not: it predates the recreated ref, so t
   and do not read it as either outcome — re-derive.
 
 (The escalation server layers a second guard on the same risk — the marker must not predate the
-recorded `branch_base_sha`; see `escalation/server.py::_found_on_main_response` and the
-`merge_status` Tier-3.5 docstring. The containment check above is the shell-side equivalent
-available to an agent.)
+recorded `branch_base_sha`; see
+`escalation/src/escalation/server.py::_found_on_main_response` and the `merge_status` Tier-3.5
+docstring. The containment check above is the shell-side equivalent available to an agent.)
 
 <a id="step-3"></a>
 ### Step 3 — an empty marker search is NOT a not-landed verdict
@@ -183,8 +187,9 @@ returns the **oldest** of those — the first unrelated task's merge. The contai
 `$c`'s first parent (main just before that merge) decides:
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
-  that brought it in. Stamp `{"kind": "found_on_main", "commit": "$c", "note": "absorbed into
-  group merge; sha verified by ancestry containment"}`. The note is mandatory here too.
+  that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
+  into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
+  this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
 - **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
   `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp the
   tip yet** — continue to the citation gate below.
