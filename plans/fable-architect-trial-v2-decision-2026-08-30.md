@@ -96,3 +96,99 @@ recomputed: reconstructing them would require re-running seven verification agen
 `/home/leo/src/reify` and re-analysing 45 γ1 cells, neither of which this task did. Where
 this record verified a transcribed claim itself, it says so at the point of use (§3e is the
 one place it materially did).
+
+---
+
+## 2. Cell inventory, the early stop, and the cap_excluded symmetry check
+
+_RAW OBSERVATION._ Every figure in this section was **recomputed directly from
+`cells/*.json`**, not transcribed from `FINAL-READOUT.txt`. Where the two agree, that is
+independent corroboration rather than a transcription (v1's device); where they disagree,
+this record says so (§3e is the one such place, and it is a definitional disagreement, not
+an arithmetic one).
+
+### 2a. Per-fixture × per-arm cell counts
+
+| fixture | fable cells | incumbent cells |
+|---|---|---|
+| `df_task_2260` | 3 | 3 |
+| `reify_task_12` | 3 | 3 |
+| `reify_task_2324` | 3 | 3 |
+| `reify_task_2531` | 3 | 3 |
+| `reify_task_2573` | 3 | 3 |
+| `reify_task_2699` | 3 | 3 |
+| `reify_task_2778` | 3 | 3 |
+| `reify_task_3883` | 3 | 3 |
+| **`reify_task_4026`** | **2** ⚠️ | **3** |
+| **TOTAL** | **26** | **27** |
+
+⚠️ **`reify_task_4026` is the sole unbalanced fixture: 2 fable cells against 3 incumbent.**
+Every other scored fixture is 3+3. This asymmetry is not cosmetic — it is the entire reason
+the cell-level and fixture-level planRates diverge in the fable arm (§4b). 26 + 27 = **53**.
+
+### 2b. The two unrun fixtures
+
+The band was 11 fixtures; 9 were scored. `reify_task_4370` and `reify_task_4832` were never
+run. Per `FINAL-READOUT.txt`, **both were protocol declines in γ1** (`reify_task_4370`:
+already-done; `reify_task_4832`: false-premise), so the unrun remainder is drawn from the
+same decline population as the scored fixtures and would not have changed the finding.
+
+### 2c. The stop
+
+**53 of 66 cells**, stopped cleanly by Leo at **2026-08-26T08:51:18Z**. Not a crash, not a
+cap kill, not a budget exhaustion — an operator decision taken once the band was found
+untestable for the stated hypothesis. Total spend **$230.91**, of which judge **$5.55**.
+
+Recomputed from the cells and reconciled against `FINAL-READOUT.txt`'s
+`TOTAL SPEND: $230.91 (judge $5.55)`:
+
+| arm | cells | Σ `cost_usd` | Σ `judge_cost_usd` |
+|---|---|---|---|
+| `architect-fable-max` | 26 | $123.6355 | $2.0911 |
+| `architect-opus-max` | 27 | $107.2742 | $3.4560 |
+| **TOTAL** | **53** | **$230.9097** → **$230.91** | **$5.5471** → **$5.55** |
+
+Both totals tie out to the cent against the operator's published figures.
+
+### 2d. The `cap_excluded` symmetry check — CONFIRMED, not assumed
+
+The δ gate's acceptance criterion is *zero unexplained cap-excluded asymmetry between
+candidates*. It exists to catch **differential exclusion bias**: if one arm's cells were
+dropped for cap starvation at a higher rate than the other's, the surviving cells would no
+longer be a like-for-like comparison, and any Δ computed over them would be confounded.
+
+Computed directly as `sum(metrics.cap_tainted)` per arm over all 53 cells:
+
+| arm | cells | `cap_tainted` |
+|---|---|---|
+| `architect-fable-max` | 26 | **0** |
+| `architect-opus-max` | 27 | **0** |
+
+**Result: 0 vs 0 → SYMMETRIC. The acceptance criterion is satisfied.**
+
+This is the **trivial case**, and it is worth naming as such rather than claiming a strong
+result: the ι4 `UsageGate` retrofit on `run_architect_eval` held for the entire campaign, so
+**zero cells were cap-excluded in either arm**. Differential-exclusion bias cannot be present
+in a population from which nothing was excluded. The criterion is met because there was
+nothing to explain — not because a real asymmetry was measured and found small. The figures
+are on the page above so a downstream reader can confirm that themselves rather than take
+"trivially satisfied" on trust.
+
+### 2e. `outcome` is `'done'` on all 53 cells — including every decline
+
+Recomputed: `Counter(outcome)` over the 53 cells is `{'done': 53}`. There are no `'failed'`,
+`'error'` or `'declined'` cells, **because no such outcome value can be produced on this
+path**.
+
+Per `investigation/FINDINGS.md` §"Harness mechanics" item 4, verified in code: each
+`report_*` decline tool writes a distinct artifact
+(`orchestrator/src/orchestrator/agents/plan_tools.py` → `artifacts.write_*`), but
+`run_architect_eval` reads only `artifacts.read_plan()`, and `cleanup_eval_worktree` then
+`shutil.rmtree`s the whole meta root. **`EvalMetrics` has no field for the terminal
+`report_*` kind, so a deliberate protocol decline is byte-identical in the persisted JSON to
+a content failure.**
+
+This is not a footnote — it is the fact that **forces §3 to rest on transcript forensics**.
+The result JSONs alone cannot distinguish "correctly declined via the role's own mandated
+protocol" from "could not plan," and every one of the 47 no-plan cells is one of those two
+things.
