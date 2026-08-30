@@ -9079,7 +9079,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # automatically safe the moment a remote runner is turned on. The BLIND
     # SPOT above (toolchains writing outside merge_wt) applies verbatim to
     # the cross-check leg of the REMOTE arm too.
-    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
+    #
+    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
+    # longest PER-COMMAND verify timeout the target can authorise, because a
+    # command that is still within its own sanctioned runtime is by definition
+    # healthy and must never be killed here. pytest writes its junit XML only
+    # at command COMPLETION, so a single verify command legitimately produces
+    # ZERO writes under merge_wt for its entire duration — the no-progress
+    # signal cannot distinguish that from a hang, and must not try to.
+    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
+    # global fallback path (the path a zero-.py / cross-cutting diff routes
+    # to), above every per-module budget (max: scripts/ at 2400s). The old
+    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
+    # verify with 30 minutes of authorised runtime still to go.
+    # It did: under host oversubscription (load 76-137 on 32 cores) three
+    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
+    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
+    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
+    # pytest runs that caused the contention. A livelock, not a hang.
+    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
+    # if any per-command budget is ever raised past 5400s; the ordering is the
+    # contract, not the number.
+    # Cost of the raise, accepted deliberately: a genuinely hung verify now
+    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
+    # than the livelock above, which had no terminating condition at all.
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
     # the walk cost is bounded independently of the 10s abort-poll cadence.
