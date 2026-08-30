@@ -496,6 +496,29 @@ def parse_judge_verdict(raw):
 }
 
 
+# A REAL option (a) that ALSO carries the parsed payload for diagnostics,
+# paired with main's flat prompt so only option (a) can save it. It genuinely
+# binds the verdict to the candidate -- element [1] is read from the contract
+# -- but the echo control finds the decoy id inside the carried payload and
+# reports 'ECHOED, not bound'. Reviewer-reported false FAIL: the control
+# cannot tell 'reads the field' from 'reproduces the input' when BOTH are
+# true. What separates them is that a binder surfaces the id one MORE time
+# than it reproduces it.
+_VARIANT_TAILS['option_a_with_payload'] = r"""
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    payload = json.loads(raw)
+    return (_parse_bare_str(raw), payload.get('candidate_id'), payload)
+"""
+
+
 # The winner-rescue APPEND is a MECHANISM, not the invariant. These two
 # variants redefine select_judge_candidates to plain top-n, shadowing the
 # preamble's, so the hoisted parent's evidence child never enters the slate.
@@ -716,6 +739,39 @@ class TestEchoedArgumentIsNotATarget:
         assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+
+
+class TestPayloadCarryingBinderIsNotAnEcho:
+    """The echo control must not disqualify a parser that BOTH reads the
+    candidate field and carries the payload it read it from.
+
+    Reported as a review-cycle-4 suggestion. The control submits a decoy id
+    under a field no contract reads and asks whether it comes back out; a
+    parser carrying the payload for diagnostics answers yes even though it
+    also, separately, binds the verdict to the candidate. Failing it is a
+    false FAIL of the same class task 4810 exists to remove.
+    """
+
+    def test_binder_that_also_carries_the_payload_passes(self, tmp_path):
+        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a_with_payload')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            'a genuine option (a) was failed for carrying its own payload:\n'
+            f'{proc.stdout}\n{proc.stderr}'
+        )
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_pure_echo_is_still_caught(self, tmp_path):
+        """The CONTROL for the above: the discriminator must keep its teeth.
+
+        echoes_payload discards the candidate entirely and surfaces the id
+        only by reproducing the input -- exactly ONCE, where the binder above
+        surfaces it twice.
+        """
+        src_root = _write_fake_judge(tmp_path / 'src', variant='echoes_payload')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'a pure echo passed:\n{proc.stdout}'
+        assert _OPTION_A_HELD not in proc.stdout, proc.stdout
 
 
 class TestRescueAppendIsAMechanism:
