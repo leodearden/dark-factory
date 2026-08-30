@@ -707,6 +707,41 @@ class TestRepairableFieldTable:
         assert 'mark_step_committed' in alternates[('steps', 'description')]
         assert 'mark_step_committed' in alternates[('prerequisites', 'description')]
 
+    def test_plan_mutating_method_names_are_real_task_artifacts_methods(self):
+        """Guards the derivation's silent-vacuity failure mode.
+
+        ``_plan_writing_tool_names()`` keys its source-level walk on
+        ``_PLAN_MUTATING_ARTIFACT_METHODS`` — the TaskArtifacts method names
+        that mutate plan.json. If one of those names ever stopped being a real
+        TaskArtifacts method (e.g. a rename), a derivation keyed on the stale
+        name would silently shrink the candidate set instead of failing
+        loudly, and the completeness sweep would then pass over fewer tools
+        while still reporting green — the exact silent-vacuity failure mode
+        this guards against.
+        """
+        assert isinstance(_PLAN_MUTATING_ARTIFACT_METHODS, frozenset)
+        assert _PLAN_MUTATING_ARTIFACT_METHODS, (
+            'the set of plan-mutating TaskArtifacts methods must not be empty'
+        )
+        for name in _PLAN_MUTATING_ARTIFACT_METHODS:
+            attr = getattr(TaskArtifacts, name, None)
+            assert callable(attr), (
+                f'{name!r} is not a real callable attribute of TaskArtifacts — '
+                'the derivation would silently lose this writer'
+            )
+        separate_artifact_writers = {
+            'write_blocking_dependency',
+            'write_already_done',
+            'write_ready_to_merge',
+            'write_unactionable_task',
+            'write_false_premise',
+        }
+        assert _PLAN_MUTATING_ARTIFACT_METHODS.isdisjoint(separate_artifact_writers), (
+            'admitting a report_* separate-artifact writer here would wrongly '
+            'pull the whole report_* family into the plan-writer sweep — each '
+            'persists to its own artifact file and never touches plan.json'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
