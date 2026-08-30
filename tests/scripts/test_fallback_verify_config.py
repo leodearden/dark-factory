@@ -711,10 +711,18 @@ def _verify_budgets() -> dict:
 # Task 4902: the per-segment measurement above is republished, verbatim, as an
 # operator-facing comment block in dark-factory-orchestrator.yaml. These two
 # regexes walk that block. They are deliberately anchored on its SHAPE (a
-# comment, four-plus spaces of indent, name then float then `(`) rather than on
-# any prose, so they parse structure and assert numbers only.
+# comment, four-plus spaces of indent, name then float) rather than on any
+# prose, so they parse structure and assert numbers only — rewording the
+# paragraphs around the table keeps this green.
+#
+# The entry pattern requires only `<name> <float>`, NOT the trailing `(` of
+# each entry's parenthetical gloss. That parenthetical is prose: an editor who
+# drops or reflows one while correcting a number should get the NUMERIC
+# mismatch they actually caused, not a parse failure that says nothing about
+# it. The yaml carries a DO-NOT-REFLOW marker immediately above the table so
+# this coupling is discoverable from the side that gets edited.
 _YAML_SEGMENT_ENTRY_RE = re.compile(
-    r'^#\s{4,}([A-Za-z][\w/-]*)\s+([0-9]+\.[0-9]+)\s+\(', re.MULTILINE
+    r'^#\s{4,}([A-Za-z][\w/-]*)\s+([0-9]+\.[0-9]+)(?:\s|$)', re.MULTILINE
 )
 _YAML_SEGMENT_TOTAL_RE = re.compile(
     r'^#\s{4,}([0-9]+\.[0-9]+)s\s+<-', re.MULTILINE
@@ -848,8 +856,9 @@ def test_published_yaml_segment_table_matches_the_python_measurement_table() -> 
         f'{pathlib.Path(__file__).name}; a short or empty parse means the block '
         'was reflowed or removed, which would silently disable the check rather '
         'than fail it. Restore the block shape — each entry a comment line of '
-        "four-plus spaces then `<name>  <float>  (...)`, and the total line "
-        'keeping its `<-` marker — or update these regexes deliberately.'
+        'four-plus spaces then `<name>` then its float (the trailing '
+        'parenthetical is prose and is NOT parsed), and the total line keeping '
+        'its `<-` marker — or update these regexes deliberately.'
     )
 
     parsed = {name: float(value) for name, value in entries}

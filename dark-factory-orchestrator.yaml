@@ -592,6 +592,17 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # median green full-suite cost stepped from 691.40s to 1765.95s — ~2.6x. The
 # four 2026-07-31 figures were NOT re-measured and are 28 days older.
 #
+# DO NOT REFLOW the table below. It is parsed by tests/scripts/
+# test_fallback_verify_config.py::test_published_yaml_segment_table_matches
+# _the_python_measurement_table, which ties these figures to
+# MEASURED_FLEET_SEGMENT_SECS in that file so the two copies of one
+# measurement cannot drift apart. Load-bearing: each entry staying one
+# comment line of four-plus spaces, then its name, then its float; and the
+# total line keeping its `<-` marker. NOT load-bearing: the parenthetical
+# gloss on each entry, the ordering, and every word of prose around the
+# block — reword those freely. Change a number here and you must change it
+# there, in the SAME commit.
+#
 #     shared         120.21   (2582 passed)
 #     escalation     123.29   (898 passed)
 #     orchestrator  1765.95   (median of 28 green full-suite runs, 2026-08-22..2026-08-28)
