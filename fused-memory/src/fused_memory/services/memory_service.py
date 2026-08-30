@@ -5976,6 +5976,7 @@ class MemoryService:
         temporal_context: str | None = None,
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
+        declared_referents: list[dict] | None = None,
     ) -> AddEpisodeResponse:
         """Full ingestion pipeline — durably enqueue episode, return immediately.
 
@@ -6002,6 +6003,33 @@ class MemoryService:
         at enqueue time, and the real uuid does not exist until the queued
         write runs.  The two are tied together by an INFO log in
         ``_execute_graphiti_write``, which is the only record of the mapping.
+
+        ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
+        EXPLICIT statement of which referents this episode is about — the
+        strongest source in gamma's precedence chain. It arrives from the
+        ``entities`` parameter on the ``add_episode`` MCP tool, verbatim and
+        unparsed.
+
+        TRI-STATE, and all three states are distinct on the wire:
+        ``None`` = never considered (falls through to the derived scan);
+        ``[]`` = considered and none apply, HONOURED as a declaration and
+        stamped ``source='declared'`` with an empty set; ``[...]`` = declared.
+        The ``[]``/``None`` distinction is the "the agent considered referents
+        and none applied" versus "the agent never looked" signal leaf iota
+        counts, so nothing on this path may collapse one onto the other.
+
+        The chain is SHORTER here than at ``add_memory``, and by construction:
+        this method takes no ``metadata`` parameter at all, so the ladder is
+        ``declared > derived > none`` with the metadata rung absent rather than
+        merely unused. See the ``resolve_referents`` call below.
+
+        Deliberately UNVALIDATED here, exactly as at ``add_memory``: gamma's
+        ``_declared_referents`` owns the TOTAL ``InputValidationError``
+        contract, and a direct service caller that passes a malformed list gets
+        that raise — which is correct. A CONFLICTING declaration is likewise
+        legal at this layer: this is mechanism, and
+        ``server/entities_gate.py`` is the policy that refuses it at the tool
+        boundary.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         # task 3561: this id is minted HERE, at enqueue time, before the queued
@@ -6035,15 +6063,23 @@ class MemoryService:
         # InputValidationError on a structural wiring bug, and that must not be
         # absorbed by an enqueue-failure handler.
         #
-        # metadata=None is not an oversight: add_episode deliberately never
-        # persists a metadata argument — the same fact that forced task 3142's
-        # `unverified_claim` onto this payload channel — so the bridge has
-        # nothing to read and the derived scan is the only live source here.
+        # metadata=None is not an oversight, and it is not a choice this method
+        # could make differently: add_episode takes no `metadata` parameter at
+        # all — the same fact that forced task 3142's `unverified_claim` onto
+        # this payload channel — so the bridge has nothing to read. It stays
+        # None now that leaf delta has landed: adding one "for symmetry with
+        # add_memory" would hand this producer a rung whose value nothing
+        # persists. tests/test_referent_queue_threading.py pins that absence on
+        # the signature.
         #
-        # declared=None: leaf delta owns the `entities` parameter; this is the
-        # seam it fills.
+        # The seam leaf delta (task 3669) fills: `declared_referents` is the
+        # `entities` parameter on the add_episode MCP tool, forwarded verbatim.
+        # Its `entities_gate` has already rejected any declaration the content
+        # contradicts and any malformed entry, so neither can reach here FROM
+        # THAT PATH — a direct service caller still gets gamma's raise, which
+        # is the intended loud failure.
         resolution = resolve_referents(
-            declared=None,
+            declared=declared_referents,
             metadata=None,
             content=content,
             group_id=scope.graphiti_group_id,
