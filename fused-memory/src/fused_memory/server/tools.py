@@ -2971,6 +2971,7 @@ def create_mcp_server(
         metadata: dict | None = None,
         temporal_context: str | None = None,
         reference_time: str | None = None,
+        entities: list[dict] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
@@ -3007,6 +3008,16 @@ def create_mcp_server(
         :mod:`fused_memory.services.completion_claim_gate` for why the fail
         direction is inverted there.
 
+        Optionally DECLARE what the episode is about with `entities`. A
+        declaration outranks the referents scanned out of the content, so it is
+        how you correct prose that names a task ambiguously or not at all. A
+        declaration your own content CONTRADICTS is rejected
+        (error_type=DeclaredReferentConflictRejected) and the episode is not
+        ingested — the block names both what you declared and what the content
+        actually cites. Only a conflict is ever rejected: omitting `entities`,
+        or passing [] to record that you considered referents and none applied,
+        always succeeds.
+
         Args:
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
@@ -3030,6 +3041,26 @@ def create_mcp_server(
                 time instead of the date the described state was current).
                 Complements temporal_context='retrospective': temporal_context marks
                 the *kind* of episode; reference_time sets the *timestamp*.
+            entities: Optional explicit declaration of WHICH referents this
+                episode is about. TRI-STATE: omit it (or None) to say you never
+                considered referents and let the content scan derive them; pass
+                [] to say you DID consider them and none apply; pass a list to
+                declare them. Each entry is
+                {'kind': 'task', 'id': <digits>, 'project_id': <optional>} —
+                'kind' and 'project_id' are optional and default to 'task' and
+                the local project; 'id' is the task number's digits (an int, or
+                a string of ASCII digits), never a label like "Task 3127". This
+                is NOT "all entities": extraction legitimately derives entities
+                no caller could predict, and this parameter names only the
+                referents the episode is ABOUT. A declaration the content
+                contradicts is REJECTED
+                (error_type=DeclaredReferentConflictRejected) and nothing is
+                ingested; a malformed entry is rejected as a ValidationError.
+                Absence is never rejected, so omitting this always succeeds.
+                One asymmetry against add_memory, and it is a tier below this
+                parameter: add_episode persists no metadata, so there is no
+                metadata['task_id'] fallback here — a declaration overrides
+                only the derived content scan.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3063,6 +3094,25 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 3669 / PRD leaf delta: reject a declaration the content
+        # contradicts. Grouped with the structural argument validations above
+        # deliberately — everything BELOW this line does live authority I/O
+        # (the 2824 premature-completion gate reads task statuses,
+        # _completion_claim_gate reads statuses / tickets / git), and a
+        # self-contradictory or malformed declaration should cost none of it.
+        # This gate is a pure in-memory scan and, for the undeclared majority,
+        # not even that: `entities is None` short-circuits before scanning.
+        #
+        # It must still come AFTER `_canonicalize_project_id_arg`: the gate's
+        # `group_id` has to be the CANONICAL project id, because
+        # `Scope.graphiti_group_id` IS `project_id` and both sides canonicalize
+        # through `canonicalize_project_id` — so the gate and `MemoryService`
+        # classify local-vs-foreign referents identically. A raw id here would
+        # let the two disagree about whether a qualifier names us.
+        if err := entities_gate(
+            entities, content=content, group_id=project_id, agent_id=agent_id,
+        ):
+            return err
         # task 2022: auto-upgrade the batch-queue / decompose-and-queue plan-episode
         # shape to temporal_context='planning' so its Graphiti-extracted completion
         # edges are registered as planned (excluded from default search) instead of
@@ -3186,6 +3236,13 @@ def create_mcp_server(
             causation_id=causation_id,
             temporal_context=temporal_context,
             reference_time=parsed_reference_time,
+            # Forwarded VERBATIM, unparsed: `entities_gate` above has already
+            # proved this list parses, and the service is the single site that
+            # resolves and encodes it onto the durable-queue payload. Parsing
+            # twice would fork what `declared` means between the boundary and
+            # the producer. Unlike add_memory, this tool has exactly ONE
+            # service call site, so there is no fallback path to keep in step.
+            declared_referents=entities,
             _source=op_source,
             **extra,
         )

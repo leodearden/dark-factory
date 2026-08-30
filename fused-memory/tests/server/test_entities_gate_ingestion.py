@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.server.tools import create_mcp_server
+
 # The C1 fallback harness, imported rather than re-derived: reaching
 # `add_memory`'s SECOND service call site needs write triage enabled with a
 # calibrated high-cosine candidate, and a private copy would drift the moment
@@ -37,8 +39,6 @@ import pytest
 # test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
 # same way).
 from server.test_add_memory_write_triage_gate import _candidate, _configure_config
-
-from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
 
