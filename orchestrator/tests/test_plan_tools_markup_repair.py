@@ -271,6 +271,25 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
     'reuse': 'add_reuse_item',
 }
 
+#: The only three ``TaskArtifacts`` methods that mutate plan.json — measured,
+#: not assumed: ``write_plan`` (artifacts.py:356), ``update_step_status``
+#: (:734) and ``mark_step_committed`` (:753) each write
+#: ``self.root / 'plan.json'`` (the latter via a call to ``self.write_plan``).
+#: ``_plan_writing_tool_names()`` below keys its live-module walk on this set
+#: to derive the candidate set for "could this plan-tools entry point write a
+#: ``_REPAIRABLE_PLAN_FIELDS`` cell?".
+#:
+#: The five ``write_<report-kind>`` methods (``write_blocking_dependency`` /
+#: ``write_already_done`` / ``write_ready_to_merge`` / ``write_unactionable_task``
+#: / ``write_false_premise``) are deliberately EXCLUDED: each persists to its
+#: own separate artifact file and never touches plan.json, so admitting one
+#: here would wrongly pull the whole ``report_*`` family into the sweep.
+_PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
+    'write_plan',
+    'update_step_status',
+    'mark_step_committed',
+})
+
 #: Every MCP-registered plan-tools impl that can reach ``artifacts.write_plan``
 #: (or an equivalent plan-mutating call) at all — the full candidate set for
 #: "could this be an UNDECLARED alternate writer of a
