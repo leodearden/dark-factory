@@ -424,16 +424,25 @@ class TTLCache(Generic[V]):
     **Key space is bounded by disuse, not by cardinality.** A key that stops
     being requested is reclaimed: :meth:`_evict_expired` drops store entries
     older than ``_EVICTION_TTL_MULTIPLE`` times the TTL, along with their
-    idle locks and any bypass-streak counter that has outlived both, and
-    ``get_or_refresh`` runs it on the cold path — the same path that mints
-    new keys, so growth and reclamation are coupled by construction. An entry
-    past its TTL is already unservable (``get_fresh`` enforces the TTL and is
-    the only reader), so eviction reclaims memory with NO semantic change;
-    the multiple is margin against a callable ``ttl_seconds`` that returns a
-    larger value later. (The in-flight bypass-task map introduced below is
-    separately self-bounding — see :meth:`_bypass_refresh` — since its entry
-    is removed the instant the refresh completes, never outliving the
-    refresh itself.)
+    idle locks, any bypass-streak counter that has outlived both, and any
+    now-dead bypass-task entry, and ``get_or_refresh`` runs it on the cold
+    path — the same path that mints new keys, so growth and reclamation are
+    coupled by construction. An entry past its TTL is already unservable
+    (``get_fresh`` enforces the TTL and is the only reader), so eviction
+    reclaims memory with NO semantic change; the multiple is margin against a
+    callable ``ttl_seconds`` that returns a larger value later. (The
+    in-flight bypass-task map introduced below has two independent
+    reclamation paths, not one: an entry whose refresh COMPLETES is removed
+    by the task's own done-callback the instant it finishes (see
+    :meth:`_start_bypass`), while an entry whose refresh never completes is
+    removed either by supersession — the next caller to time out on it
+    re-arms a fresh one, see :meth:`_bypass_refresh` — or, for a key that
+    goes quiet before that happens, by :meth:`_evict_expired` on a later cold
+    miss for a DIFFERENT key. Its steady-state size is therefore bounded by
+    the same "keys requested within the eviction horizon" rule as ``_store``
+    and ``_locks`` above, not by the stronger claim that an entry can never
+    outlive the refresh it tracks — outliving it is exactly the case this
+    task exists to handle.)
 
     This makes a HIGH-CARDINALITY key space safe, which it previously was
     not. It used to be true that "neither ``_store`` nor ``_locks`` ever
@@ -495,7 +504,15 @@ class TTLCache(Generic[V]):
         * SEMANTICALLY — an evicted entry is older than the TTL, and
           :meth:`get_fresh` (the only reader of ``_store``) already refuses
           to serve those. Eviction therefore changes no observable value,
-          only resident memory.
+          only resident memory. Dropping an over-age ``_bypass_tasks`` entry
+          changes no observable value either: every joiner's own wait
+          deadline IS that entry's deadline (``started_at +
+          _LOCK_ACQUIRE_TIMEOUT_SECONDS``, see :meth:`_bypass_refresh`), so
+          once an entry is over-age no caller can still be parked on it —
+          dropping it strands nobody. Doing so also reclaims the last
+          reference this cache holds to a wedged refresh's task, so the
+          coroutine can be garbage-collected once it finally resolves or the
+          event loop shuts down.
         * CONCURRENTLY — this method is fully synchronous, so it runs to
           completion without yielding to another coroutine, and a lock is
           dropped only when it is neither held nor awaited. A coroutine that
@@ -570,6 +587,27 @@ class TTLCache(Generic[V]):
         ]
         for key in dead_streaks:
             del self._bypass_streaks[key]
+        # A tracked bypass entry is safe to drop once no caller can still be
+        # waiting on it: its task has already finished (belt-and-braces —
+        # _start_bypass's done-callback normally removes these itself, but
+        # one that fired while the entry was already superseded has nothing
+        # left to remove), OR it is over-age. The predicate is deliberately
+        # age-based rather than the lock sweep's "not locked() and no
+        # _waiters" above: every joiner's own wait deadline IS
+        # `started_at + _LOCK_ACQUIRE_TIMEOUT_SECONDS` (see
+        # _bypass_refresh), so once an entry passes that instant no caller
+        # can still be parked on it and dropping it strands nobody — while a
+        # WITHIN-bound entry must survive, since pruning it would silently
+        # restore one-refresh-per-caller for every later timed-out caller of
+        # this key. The abandoned task is never cancelled (see the design
+        # decision on abandon-don't-cancel): it keeps running in the
+        # background and may still store a late value.
+        dead_bypasses = [
+            k for k, (started_at, task) in self._bypass_tasks.items()
+            if task.done() or (now - started_at) >= _LOCK_ACQUIRE_TIMEOUT_SECONDS
+        ]
+        for key in dead_bypasses:
+            del self._bypass_tasks[key]
         return len(stale)
 
     async def _refresh_and_store(
