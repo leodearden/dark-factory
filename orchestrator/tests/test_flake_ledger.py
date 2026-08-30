@@ -2578,7 +2578,11 @@ class TestOpenDebtInvariantDegrades:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             row = await open_debt(
-                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+                # DELIBERATE protocol violation: a client missing methods of
+                # FlakeLedgerTaskClient is exactly what this test exercises.
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client,  # type: ignore[arg-type]
+                now=self.NOW,
             )
 
         assert row is not None and row.test_id == self.TEST_ID
@@ -2597,7 +2601,11 @@ class TestOpenDebtInvariantDegrades:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             row = await open_debt(
-                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+                # DELIBERATE protocol violation: a client missing methods of
+                # FlakeLedgerTaskClient is exactly what this test exercises.
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client,  # type: ignore[arg-type]
+                now=self.LATER,
             )
 
         assert client.submit_calls == []

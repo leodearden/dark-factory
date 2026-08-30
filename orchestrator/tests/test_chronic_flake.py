@@ -921,7 +921,9 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         """The ledger stores ``owner_task_id`` as TEXT but a caller may hold ints; the
         wire argument must be strings or the tool silently matches nothing."""
         scheduler, client = await self._client({'statuses': {}})
-        await client.get_statuses([42, 43])
+        # DELIBERATE type violation: the point of the test is that a caller
+        # holding ints is coerced at the wire, not rejected.
+        await client.get_statuses([42, 43])  # type: ignore[arg-type]
         assert scheduler.calls[0][1]['ids'] == ['42', '43']
 
     @pytest.mark.asyncio
