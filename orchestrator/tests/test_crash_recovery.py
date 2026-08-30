@@ -2280,6 +2280,56 @@ class TestSessionResumeGuard:
         assert len(emits) == 1
         assert emits[0][0] == EventType.session_resume_capped
 
+    async def test_capped_plus_another_reason_emits_fallback_not_capped(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A capped session that ALSO fails corroboration emits
+        session_resume_fallback carrying BOTH reasons — NOT session_resume_capped.
+
+        This pins the caller's ``reasons == {'capped'}`` EXACT-equality routing
+        (task 3728), which every other capped test leaves unexercised because
+        they all drive a fresh, corroborated session whose only failing leg is
+        the cap. Relaxing that equality to ``'capped' in reasons`` passes the
+        whole rest of the suite, and it would silently restore two defects at
+        once: config.py documents session_resume_capped as throttling of an
+        otherwise HEALTHY resumable session, so the throttle population would
+        be overstated by sessions that could not have resumed anyway, and the
+        co-occurring corroboration failure would be BURIED — first-match
+        reporting reintroduced one level up, in the event routing rather than
+        in the reason string. It would also move these dispatches between the
+        two events the event_store.py ratio recipe counts.
+
+        The streak stays 0 either way: both reasons are by-design (D4), so the
+        richer event costs nothing in escalation noise.
+        """
+        session = {
+            'session_id': 'uuid-cap-notr',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),   # fresh: not 'stale'
+            'resume_count': 3,                             # at the cap
+        }
+        # The config dir SURVIVES but holds no transcript for this session, so
+        # corroboration yields 'no_transcript' (the surviving-dir arm) rather
+        # than 'reseeded'.
+        empty_cfg = tmp_path / 'claude-config-cap-notr'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+        harness.config.transcript_archive = TranscriptArchiveConfig()
+
+        resume_id = await _drive_session_slot(
+            harness, 'cn1', session, config_dir=empty_cfg
+        )
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['capped', 'no_transcript']
+        # 'capped' is still visible in the set — routing it here loses nothing.
+        assert 'capped' in kwargs['data']['reasons']
+        assert harness._session_resume_fallback_streak == 0
+
 
 @pytest.mark.asyncio
 class TestSessionResumeStorm:
@@ -2431,35 +2481,87 @@ class TestSessionResumeStorm:
         vocabulary is read structurally out of the predicate's own source, so
         adding a reason without classifying it fails HERE.
 
+        The read is deliberately FAIL-CLOSED, and that is the whole design of
+        it. An earlier version collected only string constants sitting inside
+        ``set.add(...)`` / ``frozenset(...)`` calls, which failed OPEN for
+        every other spelling: ``reasons |= {'x'}``, ``reasons.update({'x'})``
+        and a reason routed through a module constant were all invisible, so a
+        new unclassified reason would have slipped past this row and gone
+        straight onto the INV-4 storm feeder as escalation noise. So instead of
+        guessing which syntax introduces a reason, this collects EVERY string
+        literal in the method (docstrings excluded) plus any module-global the
+        method references that is itself a string or a collection of strings,
+        and requires the total to partition exactly into declared non-reasons
+        and classified reasons.
+
+        The cost of fail-closed is that an unrelated new literal — say a fourth
+        sidecar key — also fails this row. That is intended: the fix is one
+        line in ``non_reason_literals`` below, and it forces a human to state
+        which kind of string was just added. Fail-open, by contrast, is silent.
+
         ε (task 3733) is EXPECTED to trip this when it adds ``restore_failed``.
-        The correct resolution is almost certainly to extend this assertion,
-        NOT the constant: a restore failure is a genuine feeder, which is the
-        whole point of ε.
+        The correct resolution is almost certainly to extend the expected
+        vocabulary here, NOT the constant: a restore failure is a genuine
+        feeder, which is the whole point of ε.
         """
         import ast  # noqa: PLC0415 — structural read of one method's source
         import inspect  # noqa: PLC0415
         import textwrap  # noqa: PLC0415
 
+        import orchestrator.harness as harness_mod  # noqa: PLC0415
         from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
 
-        tree = ast.parse(
-            textwrap.dedent(inspect.getsource(Harness._session_resume_reasons))
-        )
-        producible: set[str] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            adds = isinstance(fn, ast.Attribute) and fn.attr == 'add'
-            builds = isinstance(fn, ast.Name) and fn.id == 'frozenset'
-            if adds or builds:
-                producible |= {
-                    c.value for c in ast.walk(node)
-                    if isinstance(c, ast.Constant) and isinstance(c.value, str)
-                }
+        # Strings the method uses that are NOT reasons. Every one is a key read
+        # off the recovered-session sidecar dict; nothing here reaches the
+        # returned set.
+        non_reason_literals = {'started_at', 'resume_count', 'session_id'}
 
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(Harness._session_resume_reasons))
+        ).body[0]
+
+        # Docstrings are string constants too — identify them by position (the
+        # first statement of any scope) and skip exactly those nodes.
+        docstrings = {
+            id(scope.body[0].value)
+            for scope in ast.walk(fn)
+            if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            and scope.body
+            and isinstance(scope.body[0], ast.Expr)
+            and isinstance(scope.body[0].value, ast.Constant)
+            and isinstance(scope.body[0].value.value, str)
+        }
+        strings: set[str] = {
+            node.value
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        }
+        # ...and any module-level constant the method reads that could CARRY a
+        # reason, so routing one through an indirection does not hide it.
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Name):
+                continue
+            value = getattr(harness_mod, node.id, None)
+            if isinstance(value, str):
+                strings.add(value)
+            elif isinstance(value, set | frozenset | tuple | list) and all(
+                isinstance(item, str) for item in value
+            ):
+                strings |= set(value)
+
+        producible = strings - non_reason_literals
         assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
-                              'reseeded'}, 'the source read itself drifted'
+                              'reseeded'}, (
+            'the string literals in _session_resume_reasons no longer partition '
+            'into the declared non-reasons and the known reason vocabulary. If '
+            'you added a REASON, classify it in '
+            '_BY_DESIGN_SESSION_RESUME_REASONS (or deliberately leave it out, '
+            'making it a genuine storm feeder) and extend this assertion; if '
+            'you added a non-reason string, add it to non_reason_literals '
+            f'above. Saw: {sorted(producible)}'
+        )
         assert producible == _BY_DESIGN_SESSION_RESUME_REASONS
 
     async def test_reseeded_fallbacks_never_file_l1(
