@@ -68,6 +68,15 @@ logger = logging.getLogger(__name__)
 #: respelling it, so the instruction and the artifact cannot drift apart.
 MARKUP_JOURNAL_DIRNAME = 'data/orchestrator/markup-guard'
 
+#: The opening angle bracket and the JSON unicode escape it is written as.
+#:
+#: Built from ``chr()`` rather than written verbatim for the reason
+#: ``shared/src/shared/toolcall_markup.py`` records: this module's subject IS
+#: envelope markup, so its own bytes stay free of anything a later edit could
+#: grow into a literal by appending one character.
+_LT = chr(60)
+_LT_JSON_ESCAPE = '\\u003c'
+
 
 def journal_path(project_root: Path, server_label: str) -> Path:
     """The one file this server's markup facts are appended to.
@@ -155,7 +164,27 @@ def make_fact_journal(
             # so a journal line and a log line are the same bytes plus this
             # module's envelope.
             sort_keys=True,
-        ) + '\n'
+        )
+
+        # ESCAPE THE OPENING ANGLE BRACKET, blanket, on the encoded line.
+        #
+        # This journal records envelope literals by construction: ``pattern``
+        # and ``misclose`` ARE the leaked markup. A file holding them verbatim
+        # is a file no agent can safely read or edit — pulling it into a
+        # tool-call argument reproduces the exact over-consumption defect the
+        # journal exists to record, at the one artifact an operator is told to
+        # open. The committed specimen corpus
+        # (``shared/tests/fixtures/toolcall_markup_corpus.jsonl``) escapes every
+        # literal the same way for the same reason.
+        #
+        # A blanket replacement on the ENCODED line stays valid JSON: in JSON
+        # output the opening angle bracket can only ever occur inside a string,
+        # never as structural punctuation, so nothing else can be hit. And
+        # ``\\u003c`` round-trips through ``json.loads`` back to the original
+        # character, so the escape is lossless rather than sanitisation — a
+        # mangled ``pattern`` would destroy the one field that says which
+        # literal the upstream harness bug actually emitted.
+        line = line.replace(_LT, _LT_JSON_ESCAPE) + '\n'
 
         path.parent.mkdir(parents=True, exist_ok=True)
         # ONE ``os.write`` on an O_APPEND fd, and NEVER a read-modify-write.
