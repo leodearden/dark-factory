@@ -48,6 +48,7 @@ from _fm_helpers import (
     FALKOR_PORT,
     await_index_operational,
     falkor_skipif,
+    poll_until,
     unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
@@ -272,28 +273,29 @@ class TestDropVectorIndicesLive:
 
 @pytest_asyncio.fixture
 async def bulk_vector_graph():
-    """Seed a throwaway 50,000-node graph with a mixed VECTOR+RANGE Entity index.
+    """Seed a throwaway 1,000-node graph with a mixed VECTOR+RANGE Entity index.
 
     Backs TestDropRebuildWindow below — see its docstring for the measurement
-    table that fixed 50,000 as the seed size. The mixed index (``name_embedding``
-    VECTOR merged with ``name`` RANGE, both on ``:Entity``) is what makes the
-    class's ``DROP VECTOR INDEX`` a REBUILD rather than a removal: FalkorDB keeps
-    the label's index record alive to carry the surviving RANGE field, and that
-    rebuild is what opens the window under test. A single-field vector index —
-    like the module fixture's ``live_vector_graph`` RELATES_TO index — never
-    opens this window, because dropping its only field removes the whole record
+    table that justifies 1,000 as the seed size now that the class polls for
+    the phantom instead of requiring it on a single un-polled read. The mixed
+    index (``name_embedding`` VECTOR merged with ``name`` RANGE, both on
+    ``:Entity``) is what makes the class's ``DROP VECTOR INDEX`` a REBUILD
+    rather than a removal: FalkorDB keeps the label's index record alive to
+    carry the surviving RANGE field, and that rebuild is what opens the
+    window under test. A single-field vector index — like the module
+    fixture's ``live_vector_graph`` RELATES_TO index — never opens this
+    window, because dropping its only field removes the whole record
     outright.
+
+    No stale-graph pre-delete here (unlike ``live_vector_graph`` above):
+    ``graph_name`` is minted fresh from ``unique_graph_name`` on every call,
+    so no prior run's graph can ever share this name to delete.
     """
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     graph_name = unique_graph_name('4748_drop_rebuild_window')
-    # Best-effort delete any stale graph from a prior run.
-    with contextlib.suppress(Exception):
-        stale = client.select_graph(graph_name)
-        await stale.delete()
-
     graph = client.select_graph(graph_name)
     await graph.query(
-        'UNWIND range(1, 50000) AS i '
+        'UNWIND range(1, 1000) AS i '
         'CREATE (:Entity {name: "n"+i, name_embedding: vecf32([1.0, 2.0, 3.0, 4.0])})'
     )
     await graph.query(
@@ -304,12 +306,13 @@ async def bulk_vector_graph():
     # field below removes the Entity index record entirely instead of
     # rebuilding it, and the window this fixture exists to open never opens.
     await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
-    # MANDATORY (task 4748, in the voice of the task-3377 barrier comment on
-    # live_vector_graph above) — do NOT lower timeout_s when copying this
-    # fixture. The default 10s budget is NOT enough at this seed size: the
-    # initial HNSW build over 50,000 vectors measured 8.5-9.2s at loadavg ~96
-    # on 32 cores.
-    await await_index_operational(graph, timeout_s=60.0)
+    # (task 4748) At this seed size the initial HNSW build measured 0.02-0.3s
+    # at loadavg ~96 on 32 cores, well inside await_index_operational's
+    # default 10s budget -- no override needed. If this fixture's seed size
+    # is ever raised, re-measure the build time before assuming the default
+    # still covers it (see TestDropRebuildWindow's measurement table; at
+    # 50,000 nodes the same build measured 8.5-9.2s and needed timeout_s=60).
+    await await_index_operational(graph)
     try:
         yield graph
     finally:
@@ -347,16 +350,16 @@ def _row_has_vector(types: dict) -> bool:
     )
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(30)
 class TestDropRebuildWindow:
     """PREMISE PIN for the post-DROP rebuild window — task 4748.
 
     This is NOT a red-first TDD test; it is expected to PASS on introduction.
     A timing race cannot be reliably RED-tested: at small seed sizes the
-    phantom this test pins only shows up in a fraction of runs (see the
-    measurement table below), so a test built to fail without the fix would
-    itself be a new flake — the exact defect this task removes. This mirrors
-    test_list_indices_integration.py::TestCallDbIndexesOverRoQuery
+    phantom this test pins only shows up in a fraction of single-shot reads
+    (see the measurement table below), so a test built to fail without the
+    fix would itself be a new flake — the exact defect this task removes.
+    This mirrors test_list_indices_integration.py::TestCallDbIndexesOverRoQuery
     .test_db_indexes_result_shape_matches_the_barriers_assumptions (task
     3377's build-side pin), which rejects the same idea for the same reason.
 
@@ -373,7 +376,8 @@ class TestDropRebuildWindow:
     rows — a fresh ``['name']`` row still ``'[Indexing] N/M: UNDER
     CONSTRUCTION'`` beside the stale ``['name_embedding', 'name']`` row still
     reporting ``'OPERATIONAL'`` and still advertising the just-dropped VECTOR
-    type. Phantom rate on the FIRST post-drop read, by seed size:
+    type. Phantom rate on the FIRST (single-shot, un-polled) post-drop read,
+    by seed size:
 
         nodes      phantom rate              window
         1          ~1 in 40-70 (tight loop)   ~4 ms
@@ -382,12 +386,12 @@ class TestDropRebuildWindow:
         50,000     7/7                        0.21-0.75s
         200,000    3/3                        ~0.73s
 
-    50,000 is the smallest measured size that is deterministic (7/7); that is
-    what bulk_vector_graph seeds. Initial index build measured 8.5-9.2s at
-    50,000 nodes vs 32-36s at 200,000 — this class's own
-    @pytest.mark.timeout(120) leaves generous headroom over either, and keeps
-    the module-wide budget (see pytestmark above) tight for the two fast tests
-    in TestDropVectorIndicesLive.
+    A single un-polled read is only deterministic at 50,000+ nodes. Polling
+    for the phantom within a bounded deadline (below) is deterministic at
+    1,000 nodes too — and ~50x cheaper to seed and build (0.02-0.3s vs
+    8.5-9.2s) — which is why the test below polls rather than reading once,
+    and why bulk_vector_graph seeds only 1,000 nodes. A stuck poll still
+    raises loudly at its deadline; it does not silently pass.
     """
 
     @pytest.mark.asyncio
@@ -398,27 +402,40 @@ class TestDropRebuildWindow:
         graph = bulk_vector_graph
         await graph.query('DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)')
 
-        # (a) The phantom is real: MORE THAN ONE Entity row survives the very
-        # next catalog read, and one of them still lists name_embedding VECTOR.
-        result = await graph.query('CALL db.indexes()')
-        entity_rows = _entity_index_rows(result)
-        assert len(entity_rows) > 1, (
-            f'expected the drop-side rebuild phantom (>1 Entity row immediately '
-            f'after DROP VECTOR INDEX) but got {len(entity_rows)}: {entity_rows!r}. '
-            'If FalkorDB has stopped rebuilding the merged index in place, every '
-            'post-drop barrier this task (4748) added is dead weight -- see this '
-            'class docstring before deleting them.'
-        )
-        assert any(_row_has_vector(types) for types, _ in entity_rows), (
-            f'expected one stale Entity row still advertising a VECTOR type: '
-            f'{entity_rows!r}'
-        )
+        last_rows: list[tuple[dict, str]] = []
 
-        # (b) await_index_operational has a signal to wait on: at least one row
-        # is not exactly 'OPERATIONAL'.
-        assert any(status != 'OPERATIONAL' for _, status in entity_rows), (
-            f'expected at least one Entity row not yet OPERATIONAL: {entity_rows!r}'
-        )
+        async def _phantom_rows():
+            nonlocal last_rows
+            result = await graph.query('CALL db.indexes()')
+            rows = _entity_index_rows(result)
+            last_rows = rows
+            # (a) the phantom is real: MORE THAN ONE Entity row, one of them
+            # still listing name_embedding VECTOR; (b) await_index_operational
+            # has a signal to wait on: at least one row is not 'OPERATIONAL'.
+            is_phantom = (
+                len(rows) > 1
+                and any(_row_has_vector(types) for types, _ in rows)
+                and any(status != 'OPERATIONAL' for _, status in rows)
+            )
+            return rows if is_phantom else None
+
+        # A single un-polled read is only deterministic at 50,000+ nodes (see
+        # class docstring); polling within a bounded deadline is what lets
+        # bulk_vector_graph's seed size be 1,000 instead. The 5ms interval is
+        # deliberately tight against the measured 40-64ms window at this seed
+        # size — a round trip costs ~0.2ms, so this buys several attempts
+        # inside the window rather than one.
+        try:
+            await poll_until(_phantom_rows, timeout=5.0, interval=0.005)
+        except AssertionError as exc:
+            raise AssertionError(
+                'expected the drop-side rebuild phantom (>1 Entity row, one '
+                'still VECTOR-typed, one not yet OPERATIONAL) within 5s but '
+                f'last saw {last_rows!r}. If FalkorDB has stopped rebuilding '
+                'the merged index in place, every post-drop barrier this '
+                'task (4748) added is dead weight -- see this class '
+                'docstring before deleting them.'
+            ) from exc
 
         # (c) The barrier is SUFFICIENT: once satisfied, the phantom is gone.
         await await_index_operational(graph)
