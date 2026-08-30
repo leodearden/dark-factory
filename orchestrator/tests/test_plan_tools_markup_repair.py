@@ -761,6 +761,32 @@ class TestRepairableFieldTable:
             'persists to its own artifact file and never touches plan.json'
         )
 
+    def test_the_derived_candidate_set_cannot_silently_collapse(self):
+        """Non-vacuity floor for the derivation: production's own claims.
+
+        The floor is computed from the PRODUCTION table itself — every
+        collection's schema-owner tool name, plus every name any row already
+        declares in ``also_written_by`` — so this check adds no new
+        hardcoded list of its own; it merely proves the derivation cannot
+        lose a tool the module already claims writes a repairable cell. If
+        the derivation silently collapsed (e.g. a broken AST walk), the
+        completeness sweep would then pass vacuously over a shrunken
+        candidate set while still reporting green — the dangerous failure
+        mode a derived set is exposed to that a hardcoded list is not.
+        """
+        derived = _plan_writing_tool_names()
+        assert derived, 'the derived candidate set must not be empty'
+
+        floor = set(plan_tools._COLLECTION_SCHEMA_TOOL.values())
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            floor.update(record.also_written_by)
+
+        assert floor <= set(derived), (
+            f'the derived candidate set {sorted(derived)!r} is missing '
+            f'{sorted(floor - set(derived))!r} — tool(s) the production table '
+            'itself already claims write a repairable cell'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
