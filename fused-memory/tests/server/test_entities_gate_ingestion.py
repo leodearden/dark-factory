@@ -191,7 +191,7 @@ class TestAddMemoryEntitiesGate:
 
         await _call(control_server, category='procedural_knowledge')
 
-        control.search.assert_called(), (
+        assert control.search.call_count, (
             'the control never reached the near-duplicate search, so the '
             'ordering assertion above proves nothing'
         )

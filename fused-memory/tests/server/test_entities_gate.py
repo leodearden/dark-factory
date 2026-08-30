@@ -131,6 +131,7 @@ class TestMalformedDeclarationsAreRejected:
         """
         block = entities_gate(declared, content=_CITES_3127, group_id=GROUP)
 
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
         assert _DECLARED_REFERENT_HINT in block['error'], f'{block!r}'
 
     def test_the_malformed_block_carries_no_separate_hint_key(self):
@@ -139,6 +140,7 @@ class TestMalformedDeclarationsAreRejected:
         the same text maintained at two sites."""
         block = entities_gate([{'id': 'abc'}], content=_CITES_3127, group_id=GROUP)
 
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
         assert 'hint' not in block, f'{block!r}'
 
     def test_a_falsy_non_list_is_rejected_rather_than_read_as_absence(self):
