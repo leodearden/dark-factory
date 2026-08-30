@@ -408,6 +408,48 @@ def _memory_service(contents: dict[str, str] | None = None) -> AsyncMock:
     return service
 
 
+def _write_capable_targets() -> tuple:
+    """Two SYNTHETIC write-capable targets standing in for AMEND_TARGETS.
+
+    Both real targets are verify-only (``new_content is None``) because the
+    correction they describe already landed, so nothing live exercises the
+    retained write machinery -- the capability preflight, the pre-write
+    re-corroboration, the precondition chain, the write-error handling. These
+    stand-ins restore an amendable pre-image and a replacement text carrying
+    the sentinel, while keeping the REAL memory ids and the REAL ordering so
+    every id/order assertion below still means exactly what it did.
+
+    Pinning that machinery against stand-ins rather than deleting it is
+    deliberate: the blocking defect was in the pinned DATA, and ~400 lines of
+    tested write path is a far larger and riskier thing to remove than the two
+    constants that were actually dangerous. What makes keeping it SAFE is
+    ``TestVerifyOnlyTargetsAreNeverWritten`` below -- the real targets cannot
+    reach this path at all.
+    """
+    return (
+        _mod.AmendTarget(
+            memory_id=STALE_ID,
+            expected_preimage='a stale record, pre-correction',
+            new_content=f'a corrected record -- {_mod.AMENDED_SENTINEL}',
+            metadata_patch={'x_corrected_by_task': '4610'},
+        ),
+        _mod.AmendTarget(
+            memory_id=WARNING_ID,
+            expected_preimage='a hygiene warning saying the first is STILL UNCORRECTED',
+            new_content=f'a hygiene warning, status retired -- {_mod.AMENDED_SENTINEL}',
+            metadata_patch={'x_corrected_by_task': '4610'},
+        ),
+    )
+
+
+@pytest.fixture
+def write_capable_targets(monkeypatch):
+    """Swap AMEND_TARGETS for write-capable stand-ins for one test."""
+    targets = _write_capable_targets()
+    monkeypatch.setattr(_mod, 'AMEND_TARGETS', targets)
+    return targets
+
+
 class TestRunDryRun:
     """Dry run is the DEFAULT, and it must be inert."""
 
@@ -447,11 +489,29 @@ class TestRunDryRun:
         assert calls == []
 
     @pytest.mark.asyncio
-    async def test_dry_run_reports_both_targets_as_amendable_but_unapplied(self):
+    async def test_dry_run_over_the_real_corpus_reports_both_already_corrected(self):
+        # The corpus as it actually stands: both records carry the landed
+        # correction, so the honest report is two skips and nothing applied.
         report = await _mod.run(
             _memory_service(), project_id='dark_factory', apply=False,
         )
         assert report['dry_run'] is True
+        assert [c['action'] for c in report['changes']] == [
+            'skip:already_amended', 'skip:already_amended',
+        ]
+        assert all(c['applied'] is False for c in report['changes'])
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_over_an_amendable_corpus_reports_amend_but_applies_nothing(
+        self, write_capable_targets,  # noqa: ARG002
+    ):
+        # The same path with something actually to do: the report says 'amend'
+        # and the applied flags stay False. This is what makes the dry run a
+        # PREVIEW rather than a status readout.
+        report = await _mod.run(
+            _memory_service(), project_id='dark_factory', apply=False,
+        )
         assert [c['action'] for c in report['changes']] == ['amend', 'amend']
         assert all(c['applied'] is False for c in report['changes'])
 
@@ -472,6 +532,7 @@ class TestRunDryRun:
         assert read_ids == [STALE_ID, WARNING_ID]
 
 
+@pytest.mark.usefixtures('write_capable_targets')
 class TestRunApply:
     """The --apply write path: exactly two content amends, no deletes."""
 
@@ -539,6 +600,7 @@ class TestRunApply:
         assert report['totals']['amended'] == 2
 
 
+@pytest.mark.usefixtures('write_capable_targets')
 class TestPreWriteRecorroboration:
     """Each write is corroborated against a read of its OWN record, just before.
 
@@ -656,6 +718,7 @@ class TestPreWriteRecorroboration:
         assert _mod.resolve_exit_code(report) == 1
 
 
+@pytest.mark.usefixtures('write_capable_targets')
 class TestApplyStoreMutationPreflight:
     """The guard's own behaviour, re-rigged per test rather than assumed away.
 
@@ -729,6 +792,7 @@ class TestApplyStoreMutationPreflight:
         assert report['totals']['refused'] == 2
 
 
+@pytest.mark.usefixtures('write_capable_targets')
 class TestPreconditionOrdering:
     """d007aa46 asserts that 6403e96b was corrected, so it must never be
     written unless that is TRUE.
@@ -836,6 +900,7 @@ class TestPreconditionOrdering:
         assert actions[WARNING_ID] == 'amend'
 
 
+@pytest.mark.usefixtures('write_capable_targets')
 class TestIdempotency:
     """Re-running after a successful (or partial) apply must be safe.
 
@@ -909,6 +974,103 @@ class TestIdempotency:
         )
         assert first['changes'] == second['changes']
         assert first['totals'] == second['totals']
+
+
+class TestVerifyOnlyTargetsAreNeverWritten:
+    """The property that makes keeping the retired write arm SAFE.
+
+    Both real targets carry ``new_content is None``. Even under ``--apply``,
+    even with every guard neutralised, they must reach no write at all -- not
+    "are currently skipped by the sentinel branch", but cannot be written.
+    Without this, a future target reintroduces a silent clobber the moment
+    somebody re-points the sentinel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_apply_over_the_real_corpus_writes_nothing(self):
+        service = _memory_service()
+        await _mod.run(service, project_id='dark_factory', apply=True)
+        service.update_memory.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_over_the_real_corpus_does_not_probe_write_capability(
+        self, monkeypatch,
+    ):
+        # Nothing to write means no capability is needed, so an operator can
+        # run the verifier under --apply from a sandbox and still get an
+        # answer rather than a fail-closed refusal.
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw),
+        )
+        await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_apply_over_the_real_corpus_is_a_clean_zero_write_no_op(self):
+        report = await _mod.run(
+            _memory_service(), project_id='dark_factory', apply=True,
+        )
+        assert [c['action'] for c in report['changes']] == [
+            'skip:already_amended', 'skip:already_amended',
+        ]
+        assert all(c['applied'] is False for c in report['changes'])
+        assert report['totals']['amended'] == 0
+        assert report['totals']['refused'] == 0
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_an_amendable_verify_only_target_is_skipped_not_written(
+        self, monkeypatch,
+    ):
+        # THE regression guard. A verify-only target whose pre-image matches
+        # exactly -- so the classifier says 'amend' -- must still not be
+        # written. The apply path must treat `new_content is None` as
+        # unwritable, never pass content=None to update_memory.
+        target = _mod.AmendTarget(
+            memory_id=STALE_ID,
+            expected_preimage='content with no sentinel in it at all',
+        )
+        monkeypatch.setattr(_mod, 'AMEND_TARGETS', (target,))
+        service = _memory_service()
+
+        # It really does classify 'amend' -- the skip below is the apply
+        # path's doing, not the classifier declining to match.
+        assert _mod.classify_amend_target(
+            target, {'found': True, 'content': target.expected_preimage},
+        )['action'] == 'amend'
+
+        report = await _mod.run(service, project_id='dark_factory', apply=True)
+
+        service.update_memory.assert_not_awaited()
+        service.delete_memory.assert_not_awaited()
+        assert [c['action'] for c in report['changes']] == ['skip:verify_only']
+        assert report['changes'][0]['applied'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_verify_only_skip_is_clean_not_a_refusal(self):
+        # skip:verify_only belongs to the skip family, NOT to ERROR_OUTCOMES:
+        # a verify-only target that matches its pre-image is a correct result,
+        # and exiting 1 on it would make the verifier unusable.
+        assert 'skip:verify_only' not in _mod.ERROR_OUTCOMES
+
+    @pytest.mark.asyncio
+    async def test_a_verify_only_target_needs_no_write_capability(self, monkeypatch):
+        # The amendable set is computed BEFORE the preflight (step-14's
+        # ordering), so an all-verify-only run probes nothing.
+        calls = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw),
+        )
+        monkeypatch.setattr(_mod, 'AMEND_TARGETS', (
+            _mod.AmendTarget(
+                memory_id=STALE_ID,
+                expected_preimage='content with no sentinel in it at all',
+            ),
+        ))
+        await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+        assert calls == []
 
 
 class TestBuildParser:
