@@ -204,16 +204,25 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
     except Exception as exc:  # noqa: BLE001 - a raising selector is unverifiable
         raise _Unverifiable(f'select_judge_candidates raised: {exc!r}') from exc
     ids = [getattr(c, 'id', None) for c in slate]
-    if _CHILD_ID in ids:
+    if _CHILD_ID in ids and ids.index(_CHILD_ID) != 0:
         # The strongest case, and the one main actually produces: the rescued
         # evidence child of a hoisted parent, sitting wherever the selector
-        # put it.
+        # put it — as long as that is not slate[0].
+        #
+        # THE `!= 0` IS LOAD-BEARING. A selector that rescues the winner by
+        # HOISTING IT TO THE FRONT rather than appending it puts the child at
+        # index 0, and _probe then has no second target to swap against: its
+        # `other is target` guard fires and a CORRECT option (b) is failed
+        # UNVERIFIABLE. Which END the rescue writes to is a MECHANISM, exactly
+        # as the append is; falling through to the selection below finds a
+        # usable target on such a slate instead of refusing it.
         index = ids.index(_CHILD_ID)
     else:
-        # The winner-rescue APPEND is a MECHANISM. All this probe needs is an
-        # attach target that is not slate[0], so that a candidates[0]-marking
-        # implementation is still caught; a selector that reaches the hoisted
-        # parent some other way is no less verifiable. Requiring the append
+        # The winner-rescue APPEND is a MECHANISM, and so is its DIRECTION.
+        # All this probe needs is an attach target that is not slate[0], so
+        # that a candidates[0]-marking implementation is still caught; a
+        # selector that reaches the hoisted parent some other way — not at all,
+        # or by prepending it — is no less verifiable. Requiring the append
         # would fail a CORRECT fix closed forever for a reason unrelated to
         # which candidate the attach touches — the same false-FAIL defect this
         # probe exists to remove, one level down. Take the LAST candidate that
@@ -1077,7 +1086,31 @@ def main(argv: list[str] | None = None) -> int:
         out.append(f'FAIL  UNVERIFIABLE: {exc}')
         out.append('      Failing closed — an unverifiable invariant is not a satisfied one.')
         rc = EXIT_FAIL
-    except Exception:  # noqa: BLE001 - the probe itself must never pass by crashing
+    except BaseException:  # noqa: BLE001 - the probe itself must never pass by crashing
+        # BaseException, not Exception. This probe EXECUTES arbitrary code out
+        # of the ref's own tree, and the realistic escape is SystemExit — a
+        # lazily-imported dependency's import guard, or an argparse-style bail,
+        # calling sys.exit(). SystemExit is not an Exception, so it slipped
+        # past every inner handler AND past this arm, and terminated the
+        # process with ITS OWN code. Measured: a judge whose
+        # select_judge_candidates raises SystemExit(0) exited 0 having printed
+        # zero bytes, and the gate read that as PASS and authorised the flip.
+        # _import_judge already caught BaseException for exactly this reason;
+        # the convention simply was not applied at the outer arm.
+        #
+        # This is the SINGLE CHOKEPOINT for that class: the inner handlers
+        # (_render, _option_a_verdict, _echoes_payload, _build_slate) each
+        # catch Exception for DIAGNOSTIC reasons — to attribute a failure to
+        # one combination and keep searching — and a SystemExit out of any of
+        # them lands here. Widening them individually would be both redundant
+        # and worse, since a SystemExit is never evidence about one candidate.
+        #
+        # KeyboardInterrupt is deliberately included. A gate that reports
+        # 'unverifiable' on an interrupted run is correct; one that lets a
+        # Ctrl-C read as anything else is not.
+        #
+        # argparse stays OUTSIDE this try, so --help and a bad --src-root keep
+        # their own exit codes instead of being reported as a failed probe.
         out.append('FAIL  UNVERIFIABLE: the probe raised while evaluating the invariant.')
         out.append('      Failing closed — an unverifiable invariant is not a satisfied one.')
         out.extend('      ' + line for line in traceback.format_exc().splitlines())

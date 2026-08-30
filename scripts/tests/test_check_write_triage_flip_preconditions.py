@@ -965,11 +965,7 @@ class TestProbeCannotPassByExiting:
         assert _UNVERIFIABLE in proc.stdout, proc.stdout
 
     def test_the_gate_refuses_a_silent_exit_zero_probe(self, tmp_path):
-        """Belt and braces: rc==0 with no PASS marker is UNVERIFIABLE, not PASS.
-
-        Independent of the probe fix — the gate must not be the only thing
-        standing between a mute exit-0 subprocess and a production flip.
-        """
+        """End to end: a judge that calls sys.exit() must not reach PASS."""
         repo = _make_gate_repo(tmp_path, judge='exits_during_select', eval_src='fixed')
         proc = _run_gate(
             repo / 'scripts' / 'check_write_triage_flip_preconditions.sh',
@@ -981,6 +977,56 @@ class TestProbeCannotPassByExiting:
         )
         assert 'PASS  item 1' not in proc.stdout, proc.stdout
         assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_the_gate_alone_refuses_a_mute_exit_zero_probe(self, tmp_path):
+        """The gate's SECOND lock, exercised without the probe's help.
+
+        Once the probe fails closed, the end-to-end test above no longer
+        reaches the shell's rc==0-without-a-PASS-marker arm — the probe exits 1
+        first, and that arm becomes untested. So stub the probe out entirely
+        with an interpreter that prints nothing and exits 0, which is exactly
+        the observable behaviour the SystemExit fail-open produced. The gate
+        must refuse it on its own, because the whole point of belt and braces
+        is that neither lock depends on the other being right.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        mute = tmp_path / 'mute-probe-interpreter'
+        mute.write_text('#!/bin/sh\nexit 0\n')
+        mute.chmod(0o755)
+        proc = _run_gate(
+            repo / 'scripts' / 'check_write_triage_flip_preconditions.sh',
+            ref=_FIXTURE_REF,
+            probe_py=str(mute),
+        )
+        assert proc.returncode != 0, (
+            f'the gate trusted rc==0 from a mute probe:\n{proc.stdout}'
+        )
+        assert 'PASS  item 1' not in proc.stdout, proc.stdout
+        assert 'exited 0 without reporting a PASS' in proc.stdout, proc.stdout
+
+    def test_the_gates_pass_marker_matches_the_probes_own_wording(self, tmp_path):
+        """The two must not drift apart silently.
+
+        The gate greps the probe's stdout for a literal PASS marker. If the
+        probe reworded its PASS line, every real PASS would start being
+        reported as 'exited 0 without reporting a PASS' — the gate would fail
+        CLOSED forever, re-blocking task 3169 against a correct fix. Pin the
+        shared string from both ends.
+        """
+        marker = None
+        for line in _GATE_SCRIPT.read_text().splitlines():
+            if line.startswith('PROBE_PASS_MARKER='):
+                marker = line.split('=', 1)[1].strip().strip("'\"")
+                break
+        assert marker, 'the gate no longer defines PROBE_PASS_MARKER'
+
+        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, proc.stdout
+        assert marker in proc.stdout, (
+            f'the gate greps for {marker!r}, which the probe no longer '
+            f'emits on a PASS:\n{proc.stdout}'
+        )
 
 
 class TestDiagnosticsAndProvenance:

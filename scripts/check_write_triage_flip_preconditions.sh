@@ -80,6 +80,13 @@ CONF='fused-memory/config/config.yaml'
 # hermetic tests point the probe at their own interpreter instead of resolving
 # the fused-memory virtualenv.
 PROBE="$REPO/scripts/check_write_triage_attach_target.py"
+
+# The probe's own PASS line, matched literally (grep -F). Both of its PASS
+# branches -- option (a) and option (b) -- emit this prefix, and no FAIL or
+# UNVERIFIABLE path does. Pinned by the hermetic tests in
+# scripts/tests/test_check_write_triage_flip_preconditions.py so the two
+# cannot drift apart silently.
+PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candidate'
 if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
   PROBE_PY="$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
 elif [ -x "$REPO/.venv/bin/python3" ]; then
@@ -170,8 +177,22 @@ else
     probe_out="$($PROBE_TIMEOUT $PROBE_PY "$PROBE" \
       --src-root "$PROBE_TMP/fused-memory/src" 2>&1)"
     probe_rc=$?
-    if [ "$probe_rc" -eq 0 ]; then
+    # BELT AND BRACES: rc 0 alone is not a PASS. The probe EXECUTES the ref's
+    # own judge module, so a SystemExit out of that code (a lazily-imported
+    # dependency's import guard calling sys.exit()) used to terminate it with
+    # THAT code, printing nothing. Measured before the fix: a judge whose only
+    # statement was `raise SystemExit(0)` produced rc 0 and an EMPTY report,
+    # and this branch declared PASS and the gate authorised the flip. The probe
+    # now fails closed on BaseException, and this second lock means the gate
+    # never again depends on the probe alone getting that right: a report that
+    # does not CLAIM a pass is not one.
+    if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -qF "$PROBE_PASS_MARKER"; then
       note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
+    elif [ "$probe_rc" -eq 0 ]; then
+      note "FAIL  item 1  UNVERIFIABLE: the probe exited 0 without reporting a PASS."
+      note "              Its report claims no verdict, so nothing was asserted about"
+      note "              the invariant. Failing closed."
+      record_fail 1
     elif [ "$probe_rc" -eq 1 ]; then
       # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
       # candidates[0] warning are all stated by the probe's own report,
