@@ -558,60 +558,11 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # The trailing `echo` is REQUIRED -- see the [canonical ancestry
   # check](#branch-on-main) above for why: without it, "on main" and "NOT on
   # main" print identical empty output and exit 0, indistinguishable.
-  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main' and the
-  #   landing sha derived by the THREE-STEP ladder in the [canonical ancestry
-  #   check](#branch-on-main) above — do not improvise a shorter version of it:
-  #     (1) marker search `git log main --fixed-strings
-  #         --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` → NOT
-  #         authoritative alone on this arm (the ref still exists, so a re-opened task's
-  #         PREVIOUS incarnation can own the marker — the guard find_merge_marker applies
-  #         by refusing to search at all). Require containment first:
-  #         `git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"` — rc=0 → stamp it
-  #         with note="merge commit located by exact-subject marker search;
-  #         containment-verified against branch tip"; rc=1 → stale previous-incarnation
-  #         marker, fall through to (2)/(3); rc=128 → no verdict, re-derive;
-  #     (2) marker empty → `c=$(git rev-list --ancestry-path --merges
-  #         task/<TASK_ID>..main | tail -1)`, then CONFIRM with
-  #         `git merge-base --is-ancestor task/<TASK_ID> "$c^1"` — rc=1 means $c really is
-  #         the merge that brought this branch in (stamp $c); rc=0 means $c is an
-  #         unrelated LATER merge that merely descends from this branch (do NOT stamp it);
-  #     (3) otherwise no merge commit exists → GATE ON A TASK CITATION before stamping,
-  #         because rc=0 does not prove this branch carries any work: a branch that never
-  #         advanced past its creation point reaches this exact arm with main's old base
-  #         commit as its tip. Run the citation search from the canonical check above (the
-  #         shell form of `GitOps.find_task_citation_commit`) and read the %s SUBJECT of
-  #         each row, not just the count:
-  #           a subject-matching row exists → genuine fast-forward landing; stamp the
-  #             branch tip `git rev-parse task/<TASK_ID>` with note "fast-forward merge, no
-  #             separate merge commit; landing confirmed by task citation <citing sha> on
-  #             main";
-  #           none → PHANTOM BRANCH, never advanced. Do NOT stamp; stop and report as
-  #             not-landed/phantom-branch (the same verdict the `already_merged` guidance
-  #             above reaches on "nothing on main cites this task");
-  #           `git.commit_citation_pattern: ""` → empty BY CONFIGURATION, proves neither
-  #             verdict; do NOT stamp, report the gate as un-evaluable.
-  #         NOT `git cherry` here — on the rc=0 arm it is empty by construction for both
-  #         cases; it is correct only on rule 2b's rc=1 arm.
-  #   kind='found_on_main' REQUIRES BOTH A COMMIT AND A NOTE (DoneProvenance raises on each
-  #   independently) — every stamp above must carry both, and a note-less blob is rejected
-  #   just as a commit-less one is. Where the gate finds no honest commit, write NOTHING —
-  #   never substitute a convenient sha. "Do not stamp" IS available here.
-  #   Do NOT use `git log --format=%H -1 main` <!-- provenance-guard: negative --> here: that is main's CURRENT
-  #   HEAD, which is this task's merge commit only when this merge happens to be the
-  #   newest commit on main — on a live queue it usually is not, so you would stamp an
-  #   unrelated task's sha. (git merge-base is also wrong: it gives the common ancestor,
-  #   NOT the merge commit.)
-  # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
-  #   this as "not on main". Run the exact-subject merge-marker search from the canonical
-  #   check above:
-  #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
-  #         --max-count=1 --format=%H
-  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main', with
-  #     note="merge commit located by exact-subject marker search" (both required).
-  #   Empty     → not landed. (Do NOT substitute an unfiltered `git log main --merges`:
-  #                it takes no task argument and would report "landed" for every rc=128.)
-  # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
+  Read that rc against [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) — the single normative ladder, entered **ancestry-first** (see [Two entry points](../_shared/deriving-landed-sha.md#entry-points); you already hold the ref-existence answer, so its `rev-parse` probe is not needed here). Run it in full; do not improvise a shorter version. The [canonical ancestry check](#branch-on-main) above states this skill's `branch_on_main()` contract over the ladder's verdicts.
+
+  **This site's action.** On a landed verdict — the ladder yields a verified sha — proceed to **step 8**, stamping `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required. On **rc=1** with the queue healthy, loop back to **step 7** (resubmit) — except on the `coalesce-*` arm, where rc=1 is the normal permanent post-landing state and `skills/merge-queue/SKILL.md` rules 2–3 resolve it instead. On the ladder's genuine not-landed outcomes, and where the citation gate is **un-evaluable**, stamp nothing and report rather than proceeding to step 8.
+
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
 
 - `poll["state"] == "superseded"` → this request was superseded by another one. Two distinct
@@ -775,40 +726,11 @@ git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
 # The trailing `echo` is REQUIRED -- see the [canonical ancestry
 # check](#branch-on-main) above for why: without it, "on main" and "NOT on
 # main" print identical empty output and exit 0, indistinguishable.
-# rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
-#   and the landing sha derived by the THREE-STEP ladder in the [canonical ancestry
-#   check](#branch-on-main) — run it in full, do not shortcut it:
-#   (1) marker search `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main"
-#       --max-count=1 --format=%H` → NOT authoritative alone here: the branch ref still
-#       exists, so a re-opened task's PREVIOUS incarnation can own the marker. Require
-#       `git merge-base --is-ancestor task/<TASK_ID> "<marker sha>"` — rc=0 → stamp with
-#       note="merge commit located by exact-subject marker search; containment-verified
-#       against branch tip"; rc=1 → stale, fall through to (2)/(3); rc=128 → no verdict;
-#   (2) marker empty → `c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main
-#       | tail -1)`, then CONFIRM with `git merge-base --is-ancestor task/<TASK_ID> "$c^1"`:
-#       rc=1 → $c is the merge that brought this branch in, stamp it; rc=0 → $c is an
-#       unrelated later merge that merely descends from this branch, do NOT stamp it;
-#   (3) otherwise no merge commit exists → GATE ON A TASK CITATION before stamping. rc=0 does
-#       not prove this branch carries work: a branch that never advanced past its creation
-#       point reaches this exact arm with main's old base commit as its tip. Run the citation
-#       search from the canonical check (the shell form of `GitOps.find_task_citation_commit`)
-#       and read each row's %s SUBJECT: a subject-matching row → genuine fast-forward (or
-#       already-contained) landing, stamp the branch tip `git rev-parse task/<TASK_ID>` with
-#       note "fast-forward merge, no separate merge commit; landing confirmed by task citation
-#       <citing sha> on main"; NONE → PHANTOM BRANCH, do NOT stamp, stop and report as
-#       not-landed/phantom-branch; `git.commit_citation_pattern: ""` → empty by configuration,
-#       proves neither verdict, do NOT stamp. NOT `git cherry` here — on the rc=0 arm it is
-#       empty by construction for both cases.
-#   kind='found_on_main' requires BOTH a commit AND a note (DoneProvenance raises on each
-#   independently); there is no note-only fallback and no commit-only one, so every stamp
-#   above must carry both. Where the gate finds no honest commit, write NOTHING rather than
-#   substituting a convenient sha.
-#   Not `git log --format=%H -1 main` <!-- provenance-guard: negative --> — that is main's current HEAD, not this
-#   task's merge commit.
-# rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
-#   run the merge-marker search from the canonical check above before concluding anything
-# rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
 ```
+Read that rc against [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) — the single normative ladder, entered **ancestry-first** (see [Two entry points](../_shared/deriving-landed-sha.md#entry-points)). Run it in full; do not shortcut it. The [canonical ancestry check](#branch-on-main) above states this skill's `branch_on_main()` contract over its verdicts.
+
+**This site's action** — you are deciding whether the entry still needs abandoning. On a landed verdict (the ladder yields a verified sha) the entry does **not** need abandoning: treat it as done and proceed to **step 8** with `done_provenance={"kind": "found_on_main", "commit": "<that sha>", "note": "<the note the ladder specifies for that arm>"}`; both fields are required. On **rc=1** outside the `coalesce-*` arm the merge did not land — decide whether to resubmit or discard. On the ladder's other genuine not-landed outcomes, and where the citation gate is **un-evaluable**, stamp nothing and report; do not read either as a confirmed landing.
+
 Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 
 *If this is an escalated task (pending escalation, agent is paused):*
