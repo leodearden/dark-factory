@@ -181,12 +181,14 @@ Recomputed: `Counter(outcome)` over the 53 cells is `{'done': 53}`. There are no
 path**.
 
 Per `investigation/FINDINGS.md` §"Harness mechanics" item 4, verified in code: each
-`report_*` decline tool writes a distinct artifact
-(`orchestrator/src/orchestrator/agents/plan_tools.py` → `artifacts.write_*`), but
-`run_architect_eval` reads only `artifacts.read_plan()`, and `cleanup_eval_worktree` then
-`shutil.rmtree`s the whole meta root. **`EvalMetrics` has no field for the terminal
-`report_*` kind, so a deliberate protocol decline is byte-identical in the persisted JSON to
-a content failure.**
+`report_*` decline tool on the plan-tools MCP server
+(`orchestrator/src/orchestrator/mcp/plan_tools.py::report_task_already_done`,
+`::report_blocking_dependency`, `::report_false_premise`) writes a distinct artifact, by
+delegating to `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.write_already_done`
+/ `write_blocking_dependency` / `write_false_premise` — but `run_architect_eval` reads only
+`artifacts.read_plan()`, and `cleanup_eval_worktree` then `shutil.rmtree`s the whole meta
+root. **`EvalMetrics` has no field for the terminal `report_*` kind, so a deliberate
+protocol decline is byte-identical in the persisted JSON to a content failure.**
 
 This is not a footnote — it is the fact that **forces §3 to rest on transcript forensics**.
 The result JSONs alone cannot distinguish "correctly declined via the role's own mandated
@@ -267,6 +269,17 @@ fable cell cited a **task/2779 merge-resolution commit** as adjacent supporting 
 The decline's substantive ground was verified true regardless; the citation was simply
 imprecise. It is recorded here because a record claiming "essentially all TRUE" owes its
 reader the exception.
+
+**A second recorded qualification, and it is not an imprecision but a frame conflict.**
+`FINDINGS.md` L31-34 states of the incumbent `reify_task_4026` cell that its already-done
+claim **"is false in the fixture frame: the constants landed one day *after* the pinned
+base."** The fable twin on the same fixture rests on the same live-main evidence (§3e). So
+**both `reify_task_4026` already-done grounds are true against live main and false against
+the fixture's pinned base.** Neither arm erred factually; the fixture is pinned to a base
+whose repository state the architects could not actually observe — the eval environment
+contradicting its own premise, §8 structural cause 2. Read "verified TRUE" throughout this
+section as *true in the frame the architect could observe*, which for these two cells is
+the only frame the environment made available.
 
 ### 3d. Method and provenance
 
@@ -364,9 +377,10 @@ Recomputed from `cells/*.json`; "valid" = non-`cap_tainted` cells, which here is
 
 ### 4b. planRate is published at TWO units, and they disagree
 
-⚠️ **This is a live confusion between two committed artifacts, and this record resolves it
-by labelling rather than by choosing.** Both upstream artifacts publish a number called
-`planRate`, and they are not the same number:
+⚠️ **This is a live confusion between two campaign artifacts — `FINAL-READOUT.txt` and
+`analyse_tranche1.py`, both gitignored and resident only in the main checkout (§1, §10) —
+and this record resolves it by labelling rather than by choosing.** Both upstream artifacts
+publish a number called `planRate`, and they are not the same number:
 
 | unit | fable | incumbent | who publishes it |
 |---|---|---|---|
@@ -418,10 +432,14 @@ These are carried, not re-derived; each is `analyse_tranche1.py`'s own inline wa
 1. **The unit of replication is the FIXTURE, not the cell.** Three correlated trials per
    fixture overstate confidence by ~√3 if treated as independent. This is why §4b's two
    units exist at all, and why the CI above is computed over 9 fixtures rather than 53 cells.
-2. **Degenerate-data / zero-width-CI guard.** The bootstrap returns `None` rather than a
-   spurious interval when no fixture has both arms scored. It fires visibly in §4e, where
-   the well-posed subset yields a genuinely zero-width `[+0.0000, +0.0000]` — that is a
-   degenerate interval, not a precise one.
+2. **Degenerate-data / zero-width-CI guard.** `analyse_tranche1.py::boot` returns `None`
+   instead of a spurious interval when *no* fixture has both arms scored
+   (`fx = [f for f in BAND if rf.get(f) is not None and ri.get(f) is not None]`;
+   `if not fx: return None, None, 0`). **That guard did not fire anywhere in this analysis**,
+   §4e's well-posed subset included — the script reports `n=4` there, i.e. `len(fx) == 4`
+   and the bootstrap ran normally. §4e's zero-width `[+0.0000, +0.0000]` has a different
+   cause, stated there: the statistic is identically zero on every draw. Degenerate either
+   way, but by a different mechanism than the guard.
 3. **The WELL-POSED-SUBSET diagnostic is the load-bearing one.** The band was selected on a
    **single γ1 trial** in which the incumbent planned 0 of 11. On re-run at 3 trials the
    incumbent planned on **5 of 9** scored fixtures. So the band's defining premise — *"the
@@ -444,8 +462,16 @@ These are carried, not re-derived; each is `analyse_tranche1.py`'s own inline wa
 | unlocked fixtures | **0 of 4** |
 
 Every "unlocked" fixture — a fixture fable plans and the incumbent cannot — must by
-definition come from this subset. **There are none.** The zero-width interval is the
-degenerate-data guard firing, not a precise measurement.
+definition come from this subset. **There are none.**
+
+**The zero-width interval is degenerate, not precise — but no guard fired to produce it.**
+`analyse_tranche1.py::boot`'s degenerate-data guard covers only the case where no fixture
+has both arms scored, and it did not trigger here: the script prints `n=4`, so all four
+well-posed fixtures were scored in both arms and the bootstrap ran its full 10,000 draws.
+The interval collapses because fable and the incumbent each plan **0 of 3** on all four of
+those fixtures — so every resample, whatever it draws, yields Δ = 0 exactly. A CI over a
+statistic with zero variance reports no precision; it reports that there is nothing there
+to resolve.
 
 ### 4f. Reading the sign, and the standing of this whole section
 
@@ -523,9 +549,11 @@ Those published means average **all** planned cells — including 1 of 3 fable a
 incumbent that were plausibility-judged. That is precisely the operation ζ's contract
 forbids, so **the published `mean_pq` is superseded by §5b for all purposes.**
 
-Both figures are quoted here deliberately. Two committed artifacts now carry different
-quality numbers for the same campaign; simply omitting the older one would leave a reader
-to guess which is authoritative. It is **this record's §5b**.
+Both figures are quoted here deliberately. Two campaign artifacts (gitignored, main
+checkout only — §1, §10) now carry different quality numbers for the same campaign; simply
+omitting the older one would leave a reader to guess which is authoritative. It is **this
+record's §5b**. Quoting both in full is also what makes that reconciliation outlive the
+data tree — of the three artifacts, only this record is committed.
 
 > ⚠️ A further note for anyone reading `analyse_tranche1.py`'s output directly: its
 > per-candidate table prints a `NOTE` claiming "plan_quality here is validity-bounded."
@@ -715,8 +743,11 @@ The no-plan band is **decline-shaped, not incapability-shaped**. On the large ma
 these fixtures the correct architect behaviour *is* to decline via the mandated plan-tools
 protocol, and §3 shows both arms overwhelmingly do so correctly — 47 of 53 cells, after
 substantive investigation, through the server-accepted protocol, on grounds adversarially
-verified true in every checked case. They did not fail to plan. They declined to, and they
-were right to.
+verified true in every checked case — subject to the two qualifications §3c records: one
+imprecise supporting citation on `reify_task_2778`, and `reify_task_4026`'s already-done
+grounds holding against live main but not against the fixture's pinned base, which is
+structural cause 2 below showing up in the data rather than an error by either arm. They
+did not fail to plan. They declined to, and they were right to.
 
 Scoring these cells as `plan_steps > 0` therefore **measured the wrong construct**. A fixture
 where declining is correct registers identically to one the architect genuinely could not
