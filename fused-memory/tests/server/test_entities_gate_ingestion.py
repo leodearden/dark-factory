@@ -28,6 +28,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# The C1 fallback harness, imported rather than re-derived: reaching
+# `add_memory`'s SECOND service call site needs write triage enabled with a
+# calibrated high-cosine candidate, and a private copy would drift the moment
+# those bands are retuned. The bare `server.` import resolves because
+# fused-memory/tests/conftest.py inserts the tests dir onto sys.path and
+# tests/server/ is a package (see the same note in
+# test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
+# same way).
+from server.test_add_memory_write_triage_gate import _candidate, _configure_config
+
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -185,3 +195,90 @@ class TestAddMemoryEntitiesGate:
             'the control never reached the near-duplicate search, so the '
             'ordering assertion above proves nothing'
         )
+
+
+class TestAddMemoryForwardsTheDeclaration:
+    """An ACCEPTED declaration must reach the service, at BOTH call sites.
+
+    The tool owns the gate; the service owns the resolve. So what crosses the
+    hop is the caller's list VERBATIM, not a parsed `ReferentSet` — parsing
+    twice would fork what `declared` means between the boundary and the
+    producer that encodes it onto the durable-queue payload.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_caller_list_is_forwarded_verbatim(self):
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        await _call(server, entities=_CORROBORATING)
+
+        kwargs = mock_service.add_memory.call_args.kwargs
+        assert kwargs['declared_referents'] == [{'kind': 'task', 'id': 3127}], f'{kwargs!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('entities', 'expected'),
+        [
+            pytest.param(None, None, id='omitted-stays-None'),
+            pytest.param([], [], id='empty-stays-empty'),
+        ],
+    )
+    async def test_the_tri_state_survives_the_hop_intact(self, entities, expected):
+        """Collapsing [] to None here would silently downgrade the write from
+        source='declared' to 'derived'/'none' and corrupt the very counter
+        leaf iota reads."""
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        kwargs = {} if entities is None else {'entities': entities}
+        await _call(server, **kwargs)
+
+        forwarded = mock_service.add_memory.call_args.kwargs['declared_referents']
+        assert forwarded == expected, f'{forwarded!r}'
+        assert (forwarded is None) == (expected is None), (
+            f'[] and None must stay distinguishable, got {forwarded!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_write_triage_fallback_retry_also_carries_it(self):
+        """`add_memory` has a SECOND service call site: the standalone retry
+        write triage falls back to when an attach raises (contract C1).
+
+        A declaration dropped there is exactly the silent degradation this
+        repo's loud-over-silent norm forbids — the write would land stamped
+        `derived` while the agent believes it declared, and no error would say
+        so. The fallback deliberately drops the failed parent link; it must
+        NOT drop this, for the same reason it keeps the full content.
+
+        Harness reused from `test_add_memory_write_triage_gate.py`'s C1 suite
+        rather than re-derived, so a retune of its bands or its candidate shape
+        carries this test with it.
+        """
+        mock_service = AsyncMock()
+        _configure_config(mock_service, enabled=True)
+        mem_result = MagicMock()
+        mem_result.model_dump.return_value = {'id': 'fallback-id'}
+        mock_service.add_memory.side_effect = [
+            RuntimeError('parent_id rejected by the write seam'),
+            mem_result,
+        ]
+        mock_service.search.return_value = [_candidate('m1', 0.97, content=_CONTENT)]
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server, category='procedural_knowledge', entities=_CORROBORATING,
+        )
+
+        assert 'error' not in result, f'the write was blocked: {result!r}'
+        assert mock_service.add_memory.await_count == 2, (
+            f'expected attach then fallback: {mock_service.add_memory.await_args_list!r}'
+        )
+        for label, call in zip(
+            ('attach', 'fallback'), mock_service.add_memory.await_args_list, strict=True,
+        ):
+            assert call.kwargs['declared_referents'] == [{'kind': 'task', 'id': 3127}], (
+                f'the {label} call dropped the declaration: {call.kwargs!r}'
+            )
