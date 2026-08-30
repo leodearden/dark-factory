@@ -845,18 +845,22 @@ It repeats what it needs to; do not compress it by reference.
 
 1. **The p-value formula was wrong except in a case the rule never checked.** `0.5^b` is
    valid **only when the reverse-discordant count `c` = 0**, but the rule priced every
-   outcome as though `c` were always 0. The true exact binomial two-sided values:
+   outcome as though `c` were always 0. The true exact binomial values the rule's `0.5^b`
+   formula approximates (`0.5^b` is the **one-sided** tail, and only at `c` = 0):
 
-   | discordant counts | true p | verdict at α = 0.05 |
-   |---|---|---|
-   | b=5, c=0 | 0.031 | passes |
-   | b=5, c=1 | **0.109** | **fails** |
-   | b=5, c=2 | **0.227** | **fails** |
+   | discordant counts | exact one-sided p | exact two-sided p | verdict at α = 0.05 |
+   |---|---|---|---|
+   | b=5, c=0 | 0.031 | 0.0625 | passes ONE-SIDED only; fails two-sided (0.0625) |
+   | b=5, c=1 | **0.109** | **0.219** | **fails** |
+   | b=5, c=2 | **0.227** | **0.453** | **fails** |
 
-   The rule would have declared significance in two cases where the data do not support it.
+   The rule would have declared significance in **all three** cases under a two-sided test
+   — and in two of the three even under the one-sided test it silently assumed.
 
 2. **The `b >= 5` threshold cleared a ONE-SIDED test only**, and the one-sided choice was
    left **unstated**. The two-sided p at b=5 is **0.0625** — which does not clear α = 0.05.
+   That figure is not a separate calculation: it is precisely the `b=5, c=0` two-sided cell of
+   defect 1's table above, which is why the one row that "passes" there passes one-sided only.
    A reader applying the rule as written had no way to know a one-sided test was intended.
 
 3. **The ≥2-of-3 majority vote discarded within-fixture rate information**, compressing a
