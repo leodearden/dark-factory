@@ -1717,7 +1717,9 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
     )
 
 
-def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5):
+def _inversion_obs(
+    topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5, beyond_depth=0,
+):
     m = _mod()
     return m.InversionObservation(
         topic=topic,
@@ -1727,6 +1729,9 @@ def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=Fa
         # Default: every registered pair came back both-present. Tests that
         # care about the exposure gap set it explicitly.
         pairs_comparable=pairs if comparable is None else comparable,
+        # Default: nothing was trimmed by the scored-depth pin. Tests that
+        # care about the diagnostic set it explicitly.
+        pairs_beyond_scored_depth=beyond_depth,
         inversions=tuple(
             m.InversionRecord(
                 topic=topic, phrasing='q',
@@ -2430,7 +2435,7 @@ def _report_observations():
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
         inversions=[m.InversionObservation(
             topic='alpha-topic', phrasing='tuned', k=5,
-            pairs_registered=1, pairs_comparable=1,
+            pairs_registered=1, pairs_comparable=1, pairs_beyond_scored_depth=0,
             inversions=(m.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
                 superseded_hash='dead' * 4, successor_hash='beef' * 4,

@@ -1528,6 +1528,14 @@ class InversionObservation:
     returned at all, which is a findability fact ``canonical-in-top-k``
     measures and this metric must not be read as if it had.
 
+    ``pairs_beyond_scored_depth`` is a THIRD number, diagnostic rather than an
+    exposure: registry pairs both-present in the full FETCHED list but not
+    both within the scored depth — the population the scored-depth pin
+    removed from ``pairs_comparable``. It is never summed into the metric or
+    published as a second ``n``; it exists only so a run where the pin
+    genuinely trimmed exposure is distinguishable, in the artifact, from one
+    with nothing beyond the scored depth to trim.
+
     ``k`` is the depth this observation was SCORED at, not the depth fetched
     — mirroring :class:`ContaminationObservation` and :class:`ClaimObservation`.
     It is required rather than defaulted so no construction site can silently
@@ -1540,6 +1548,7 @@ class InversionObservation:
     k: int
     pairs_registered: int
     pairs_comparable: int
+    pairs_beyond_scored_depth: int
     inversions: tuple[InversionRecord, ...] = ()
     degraded: bool = False
 
@@ -2017,12 +2026,19 @@ async def probe_topic(
             foreign_records=outcome.foreign_records,
             degraded=info.degraded,
         ))
+        # Both at once so `pairs_beyond_scored_depth` is exactly their
+        # difference — the population both-present at full fetch depth but
+        # not both within the scored depth — rather than a second, possibly
+        # divergent computation of the same narrowing.
+        comparable_at_full_depth = comparable_pairs(entry, ranks)
+        comparable_at_scored_depth = comparable_pairs(entry, scored_ranks)
         observations.inversions.append(InversionObservation(
             topic=entry.topic,
             phrasing=phrasing.text,
             k=scored_k,
             pairs_registered=len(entry.supersedes_pairs),
-            pairs_comparable=comparable_pairs(entry, scored_ranks),
+            pairs_comparable=comparable_at_scored_depth,
+            pairs_beyond_scored_depth=comparable_at_full_depth - comparable_at_scored_depth,
             inversions=tuple(
                 superseded_inversions(
                     info.results, entry, phrasing=phrasing.text, ranks=scored_ranks,
