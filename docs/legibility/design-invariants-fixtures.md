@@ -399,6 +399,42 @@ def record_ruling(task, ruling: str) -> None:
 {"invariant": "one-fact-one-home", "file": "orchestrator/src/orchestrator/ruling_writer.py", "line": 3, "issue": "record_ruling writes the same ruling as independent prose into the task description and the PRD while the escalation record that owns the question is never updated — three copies, no designated home, no pointers, no reconciler, so the copies drift the moment any one is corrected", "severity": "warning"}
 ```
 
+## INV-10 `guards-exercise-behaviour`
+
+### PRD-leaf-shaped (`INV-10-PRD`)
+
+> The /unblock runbook must keep telling agents to derive the landing SHA
+> with a task-scoped search rather than from main's tip. Add a pytest
+> guard that greps `skills/unblock/SKILL.md` for the
+> `--grep="Merge task/<TASK_ID> into main"` form and fails if a
+> `git log --format=%H -1 main` appears anywhere in the file.
+
+**Expected disposition**: `flag: guards-exercise-behaviour`
+
+**Redesign that clears it**: Run the documented derivation against a
+fixture repo carrying two task merges and assert it returns THIS task's
+merge SHA rather than main's tip. The guard then fails on the defect
+itself instead of on the spelling, survives a rewrite of every sentence
+around the command, and cannot be defeated by a placeholder the matcher
+did not anticipate.
+
+### Code-snippet-shaped (`INV-10-CODE`)
+
+```python
+_SCOPED_RE = re.compile(r'--grep="Merge task/<[A-Za-z0-9_]+> into main"')
+
+def test_runbook_derivation_is_task_scoped():
+    text = (REPO_ROOT / "skills/orchestrate/SKILL.md").read_text()
+    for cmd in _extract_git_commands(text):
+        assert _SCOPED_RE.search(cmd), f"unscoped SHA derivation: {cmd}"
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "guards-exercise-behaviour", "file": "tests/scripts/test_runbook_sha_derivation.py", "line": 1, "issue": "the guard asserts on the SPELLING of a documented command rather than on what the command resolves to: its character class excludes the hyphen, so orchestrate's `task/<task-id>` placeholder makes every CORRECT instruction in that runbook fail, while nothing here would notice a well-spelled command that returns the wrong commit — the derivation is runnable against a fixture repo and should be run", "severity": "warning"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -527,6 +563,29 @@ prompt text (`no-lockstep-duplication`'s scope; INV-9's own rule text
 draws that seam explicitly), there is no fallback/suppressor (INV-4),
 no log-scrape of emitter-known facts (INV-2), and the defect is writing
 copies, not acting on a stale one (not INV-3).
+
+### Addendum — INV-10 walk (2026-08-30)
+
+Walked against the as-landed G7 text (both paths: the normative walk,
+which Reads the doc at run time and auto-extended to INV-10 with no edit;
+and the trigger-shape fallback, which never auto-extends and gained an
+INV-10 entry in the same change) and the Step 5.5 audit text. The same
+snapshot caveat applies: the Verdict column transcribes phrasing as it
+read on 2026-08-30, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-10-PRD` | PRD | INV-10 guards-exercise-behaviour | `guards-exercise-behaviour` | Normative path: G7's walk of the checkable question ("if what needs protecting is an instruction or a documented command, can it be EXECUTED against a fixture instead of matched?") fires — the row proposes a grep over a runbook for a command that is runnable against a fixture repo. Fallback path: the new trigger-shape entry ("a guard whose assertion target is prose/text rather than the behaviour it protects, where the thing could have been executed or mirrored") fires on the same row → `flag: guards-exercise-behaviour` | Y |
+| `INV-10-CODE` | CODE | INV-10 guards-exercise-behaviour | `guards-exercise-behaviour` | Step 5.5 (unchanged — Reads the doc generically) applies INV-10's question to `test_runbook_derivation_is_task_scoped`: the assertion target is the command's spelling, the matcher is itself untested and excludes a placeholder the guarded doc actually uses, and a correctly-spelled command resolving the wrong commit passes → `invariant_findings` entry with `invariant="guards-exercise-behaviour"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 20/20). Isolation re-checked
+while walking: no other trigger shape fires on either INV-10 fixture —
+the guard is not duplicated lock-step logic (`no-lockstep-duplication`
+covers the copy, not the check over it), there is no fallback/suppressor
+(INV-4), no log-scrape of emitter-known facts (INV-2), and nothing acts
+on a stale snapshot (INV-3). INV-1 is adjacent by construction — INV-10
+is INV-1 turned on the checks themselves — but INV-1's trigger shapes ask
+whether a CONTRACT lives in prose, not whether a GUARD asserts on it.
 
 ## Reconciliation — 2026-07-14 base walk
 

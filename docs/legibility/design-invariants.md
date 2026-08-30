@@ -8,7 +8,9 @@ from the task/escalation strand investigation
 (`docs/task-escalation-state-spec.md`); INV-8 was added 2026-08-06 from
 the reconciliation loop-blocking incident (task 3778); INV-9 was added
 2026-08-24 from the answered-but-unrecorded escalation investigation
-(esc-6107-7, plus five further instances measured 2026-08-22→24). They gate `/prd`
+(esc-6107-7, plus five further instances measured 2026-08-22→24);
+INV-10 was added 2026-08-30 from the doc-guard reconciliation
+(task 4666). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -254,6 +256,60 @@ date`; ruling-time amendment (unblock SKILL.md Step 4) bumping
 check + `scripts/member-chain-sweep.py` as the drift detector;
 `reap-decisions` closure-sync.
 
+## INV-10 `guards-exercise-behaviour`
+
+**Rule**: A guard exercises the behaviour it protects; it does not match
+text that describes it. Where the protected claim is an instruction or a
+recipe, the guard RUNS it against a fixture and asserts the outcome.
+Where nothing is runnable, it mirrors a marker-delimited span against the
+live artifact that span must agree with — a config value, a model, a
+family derived from its own source of truth — so that rewording moves
+nothing. A regex or substring over prose is not a guard: it pins wording
+rather than behaviour, goes red on edits that broke nothing, and carries
+an untested matcher whose characteristic failure is a silent green. This
+is INV-1 (`contracts-machine-checked`) applied to the checks themselves.
+
+**Checkable design question(s)**: Does this feature add a test or check
+whose assertion target is TEXT rather than behaviour? If what needs
+protecting is an instruction, a documented command, or a payload example,
+can it be EXECUTED against a fixture instead of matched? If it genuinely
+cannot, which live artifact does it mirror, and what delimits the span?
+If a matcher is unavoidable, what proves the matcher itself correct, and
+what goes red when it silently stops matching? Would fully rewording the
+surrounding sentence, with the mechanism unchanged, turn this check red —
+and if so, why is that the right behaviour?
+
+**Evidence**: eleven prose-pinning test modules or blocks were deleted on
+review between 2026-04-24 and 2026-08-25 — `4ed37e9367`, `d53cd62b68`,
+`3e8d369b24`, `10978d1ddc`, `9427896b8c`, `fabba102c7`, `d733c1bdc7`,
+`9c73deb78d`, `cb6d74359e`, `c3f8fa0b35`, `ba7fcffdbc` — the largest a
+769-line marker-anchored module whose revert message records that it
+"exercised no runtime behaviour". The predicted matcher bug is not
+hypothetical: task 4095's own guard scopes SHA derivations with a
+character class excluding the hyphen, so `skills/orchestrate/SKILL.md`'s
+`task/<task-id>` placeholder makes it report that runbook's CORRECT
+instructions as violations. The same failure reaches non-test checks —
+capability `qdrant-vector-access-for-ann` (task 3210) was gated by a
+file-scoped `grep` that would have reported DELIVERED had the parameter
+landed on the wrong function (`scripts/check_method_param_wiring.py`),
+and `docs/task-authoring.md`'s `delivered_checks` guidance states the
+same rule for that mechanism.
+
+**House pattern**: a three-tier ladder, in preference order. (1) EXECUTE
+the documented thing — `tests/scripts/test_package_source_lookup_convention.py`
+(task 3959) runs the recipe CLAUDE.md hands agents and asserts it resolves
+a real package. (2) MIRROR a marker-delimited span against the live
+artifact — `tests/scripts/test_contributing_lint_command_drift.py` (task
+3558) against `dark-factory-orchestrator.yaml`'s `lint_command`, and
+`scripts/tests/test_design_invariants_consistency.py` (task 3802) against
+this doc's own headings. (3) Nothing else: a substring/regex over prose is
+a finding, not a guard, and "harden the regex" is not a remedy. The
+reviewer's standing discriminator
+(`orchestrator/src/orchestrator/agents/roles.py::REVIEWER_COMPREHENSIVE`)
+is the same test stated from the other side — if fully rewording the
+surrounding sentence while keeping the mechanism leaves the check green,
+it is referential integrity rather than a wording pin.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -269,4 +325,5 @@ Calibration fixtures — two seeded violations per invariant plus a rehearsal
 verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
 INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
-INV-9 fixtures added 2026-08-24).
+INV-9 fixtures added 2026-08-24;
+INV-10 fixtures added 2026-08-30).
