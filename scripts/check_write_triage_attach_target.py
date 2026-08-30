@@ -145,6 +145,16 @@ def _fixture_results(parent_key: str) -> list[_Candidate]:
     return results
 
 
+def _is_inside(path: Path, root: Path) -> bool:
+    """Is *path* under *root*, comparing PATH COMPONENTS rather than characters?"""
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        # An unresolvable path is not demonstrably inside the root, and this
+        # gate fails closed.
+        return False
+
+
 def _import_judge(src_root: Path) -> Any:
     """Import the judge module out of *src_root*, shadowing any installed copy.
 
@@ -162,7 +172,11 @@ def _import_judge(src_root: Path) -> Any:
             f'cannot import {_MODULE_NAME} from {src_root}: {exc!r}',
         ) from exc
     origin = getattr(module, '__file__', None)
-    if origin is None or not str(Path(origin).resolve()).startswith(str(src_root.resolve())):
+    # PATH CONTAINMENT, not a string prefix: `str(a).startswith(str(b))` also
+    # accepts a SIBLING whose name extends the root -- `<root>-installed/...`
+    # for `--src-root <root>` -- so the probe would report on a module the ref
+    # never shipped, which is the substitution this guard exists to catch.
+    if origin is None or not _is_inside(Path(origin), src_root):
         raise _Unverifiable(
             f'{_MODULE_NAME} resolved to {origin!r}, which is outside --src-root '
             f'{src_root} — the probe would be testing the wrong tree',
@@ -674,13 +688,20 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
                 'it was given, so the verdict itself names its candidate and the '
                 'position of the attach target in the slate stops mattering'
             )
-    if inert:
-        return False, 'inconclusive — ' + _first_few(inert)
+    # ORDER MATTERS. A bare str both sets the flag and fails _binds_candidate,
+    # so it ALSO lands in `inert`; consulting `inert` first made this branch
+    # dead code and gave main's actual shape — the most common case by far —
+    # the least legible diagnostic. The bare-str finding is the specific,
+    # actionable one, so it outranks the generic bucket. Nothing is dropped:
+    # the rest of the bucket is still reported after it.
     if saw_bare_str:
+        rest = ('; also ' + _first_few(inert)) if inert else ''
         return False, (
             'parse_judge_verdict returns a bare str — the verdict names no '
-            'candidate, so the attach must guess one from the slate'
+            'candidate, so the attach must guess one from the slate' + rest
         )
+    if inert:
+        return False, 'inconclusive — ' + _first_few(inert)
     return False, (
         f'inconclusive — parse_judge_verdict accepted no probe payload '
         f'({_first_few(errors)})'
