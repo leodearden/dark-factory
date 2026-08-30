@@ -1395,6 +1395,135 @@ class TestReadOccurrences:
         assert read_occurrences(tmp_path / 'absent' / 'runs.db') == []
 
 
+def _debt_row(**overrides):
+    """A :class:`DebtRow` for the pure-builder tests — no DB round-trip needed."""
+    from orchestrator.flake_ledger import DebtRow
+
+    fields = {
+        'test_id': 'tests/test_a.py::test_one',
+        'project_id': 'dark_factory',
+        'opened_at': '2026-08-06T12:00:00+00:00',
+        'resolved_at': None,
+        'owner_task_id': None,
+        'open_count': 1,
+        'prior_resolved_at': None,
+        'prior_resolving_commit': None,
+        'last_occurrence_at': '2026-08-06T12:00:00+00:00',
+    }
+    fields.update(overrides)
+    return DebtRow(**fields)
+
+
+class TestBuildDeflakeTaskArguments:
+    """``build_deflake_task_arguments`` — the ``submit_task`` argument block ζ files.
+
+    SYNC-ONLY CLASS (the builder is pure; see the module docstring on the split).
+
+    These are assertions on a DATA STRUCTURE this module emits at RUNTIME, not on
+    documentation: the block is what reaches the fused-memory ``submit_task`` tool, so
+    its keys are a wire contract.  Prose is pinned only through module constants, so
+    the text can be reworded without churning a test.
+    """
+
+    # Remedy-presupposing vocabulary that must not appear in the TITLE (§5.5).  The
+    # title is what an agent reads first, and "de-flake" framing is what biased task
+    # 1836 into a 10s->30s timeout widening that masked a real SIGHUP bug for a day.
+    # `fix`/`timeout` are here too: the title states what was OBSERVED, and the
+    # description — not the title — is where the responsibilities and the
+    # never-widen-a-timeout constraint live.
+    REMEDY_WORDS = ('de-flake', 'deflake', 'flaky test', 'fix', 'timeout')
+
+    def test_block_shape(self) -> None:
+        """The keys the fused-memory ``submit_task`` tool actually reads."""
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        row = _debt_row(open_count=3, opened_at='2026-08-01T09:30:00+00:00')
+        args = build_deflake_task_arguments(row)
+
+        assert isinstance(args['title'], str) and args['title']
+        assert isinstance(args['description'], str) and args['description']
+        assert args['priority'] == 'medium'
+        # planning_mode=True is what makes `submit_task` return a REAL task id
+        # SYNCHRONOUSLY (fused-memory task_interceptor.py::_submit_task_planning_mode)
+        # instead of a `{'ticket': ...}` the curator may drop or combine — without it
+        # there is no id to store and §5.9's invariant is silently hollow.
+        assert args['planning_mode'] is True
+        assert args['metadata'] == {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': row.test_id,
+            'flake_debt_open_count': 3,
+            'flake_debt_opened_at': '2026-08-01T09:30:00+00:00',
+        }
+
+    def test_block_omits_project_root(self) -> None:
+        """``open_debt`` holds a ``db_path``, not a ``project_root`` (§8.3).  The
+        adapter injects the key (``SchedulerChronicFlakeTaskClient.submit_task``,
+        which already HOLDS it); the ledger must never re-derive one by walking
+        ``db_path``'s parents, which is a silent, position-dependent inversion of
+        :func:`ledger_db_path` that breaks for every non-standard path."""
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        assert 'project_root' not in build_deflake_task_arguments(_debt_row())
+
+    def test_names_the_test_verbatim(self) -> None:
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        row = _debt_row(test_id='orchestrator/tests/test_zeta.py::TestZ::test_burst')
+        args = build_deflake_task_arguments(row)
+
+        assert row.test_id in args['title']
+        assert row.test_id in args['description']
+
+    def test_carries_the_observation_vocabulary(self) -> None:
+        """§5.5: the emitted text names the OBSERVATION (``passes_in_isolation``), which
+        is the verdict vocabulary the ledger stores, not a diagnosis of the test."""
+        from orchestrator.flake_ledger import FlakeVerdict, build_deflake_task_arguments
+
+        args = build_deflake_task_arguments(_debt_row())
+
+        assert FlakeVerdict.passes_in_isolation.value in args['title']
+        assert FlakeVerdict.passes_in_isolation.value in args['description']
+
+    @pytest.mark.parametrize('word', REMEDY_WORDS)
+    def test_title_presupposes_no_remedy(self, word: str) -> None:
+        """§5.5's corollary, machine-checked on the field an agent reads first.
+
+        The test_id is EXCISED before scanning: a test legitimately named
+        ``test_fix_timeout`` must not make this vacuously fail on a title that is
+        itself clean."""
+        from orchestrator.flake_ledger import build_deflake_task_arguments
+
+        row = _debt_row()
+        title = build_deflake_task_arguments(row)['title']
+
+        assert word not in title.replace(row.test_id, '').lower()
+
+    def test_description_carries_the_never_widen_constraint(self) -> None:
+        """The binding constraint of §5.5, carried in the filed task rather than left
+        for the de-flake agent to already know."""
+        from orchestrator.flake_ledger import (
+            NEVER_WIDEN_A_TIMEOUT,
+            build_deflake_task_arguments,
+        )
+
+        assert NEVER_WIDEN_A_TIMEOUT
+        assert NEVER_WIDEN_A_TIMEOUT in build_deflake_task_arguments(_debt_row())['description']
+
+    def test_description_names_both_responsibilities(self) -> None:
+        """§5.9's invariant names TWO responsibilities, and a task carrying only the
+        first would leave the ledger row open forever after the defect was fixed —
+        which is exactly what θ's class-2 age backstop would then escalate on."""
+        from orchestrator.flake_ledger import (
+            RESPONSIBILITY_FIX_ROOT_DEFECT,
+            RESPONSIBILITY_REMOVE_FROM_LEDGER,
+            build_deflake_task_arguments,
+        )
+
+        description = build_deflake_task_arguments(_debt_row())['description']
+
+        assert RESPONSIBILITY_FIX_ROOT_DEFECT in description
+        assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
+
 class _FakeTaskClient:
     """Records every ``submit_task`` call, so a test can assert that α files NOTHING.
 
