@@ -279,6 +279,54 @@ def test_anchor_split_reports_an_untokenisable_segment_with_its_label() -> None:
     assert "uv run ruff check alpha'" in message
 
 
+def test_anchor_split_locates_a_path_spelled_anchor() -> None:
+    """``path_anchor=True`` finds an anchor spelled as the PATH it was invoked by.
+
+    This is the shape the live repo-root ``lint_command``'s tail leg actually
+    has: the magicmock checker is run as ``python3
+    fused-memory/scripts/check_bare_magicmock_config.py <dirs>``, so the anchor
+    ``check_bare_magicmock_config.py`` is never a bare token. Without this
+    parameter the exact-token rule cannot locate it at all, which is what kept
+    ``test_fallback_verify_config.py::_lint_leg_targets`` on a private copy of
+    this parser (task 3883).
+    """
+    segment = "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    assert vci.anchor_split(segment, "check_bare_magicmock_config.py", path_anchor=True) == (
+        ["python3"],
+        ["shared/tests"],
+    )
+
+
+def test_anchor_split_still_asserts_on_a_path_spelled_anchor_by_default() -> None:
+    """The DEFAULT is unchanged: a path-spelled anchor is not an exact token.
+
+    Load-bearing rather than incidental. ``path_anchor`` only ever ADDS
+    candidate positions, so pinning that the default rejects the path spelling
+    is what guarantees task 3745's four callers cannot be silently widened by
+    the fifth caller's needs.
+    """
+    segment = "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    with pytest.raises(AssertionError):
+        vci.anchor_split(segment, "check_bare_magicmock_config.py")
+
+
+def test_anchor_split_path_anchor_matches_a_whole_component_not_a_suffix() -> None:
+    """A whole path COMPONENT, never a raw string suffix.
+
+    ``scripts/x_check_bare_magicmock_config.py`` is a DIFFERENT file whose name
+    merely ends with the anchor, so a raw ``str.endswith`` would report another
+    program's arguments as this checker's targets. "Compare by exact element,
+    never substring-match" is the contract this whole module exists to enforce,
+    and ``path_anchor`` must not smuggle in an exception to it.
+    """
+    with pytest.raises(AssertionError):
+        vci.anchor_split(
+            "python3 scripts/x_check_bare_magicmock_config.py a b",
+            "check_bare_magicmock_config.py",
+            path_anchor=True,
+        )
+
+
 def test_positional_targets_propagates_the_tokenisation_failure() -> None:
     """The guard is at the choke point, so every caller reaching it inherits it."""
     with pytest.raises(AssertionError) as excinfo:
