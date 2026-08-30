@@ -1525,19 +1525,62 @@ class TestBuildDeflakeTaskArguments:
         assert RESPONSIBILITY_REMOVE_FROM_LEDGER in description
 
 class _FakeTaskClient:
-    """Records every ``submit_task`` call, so a test can assert that α files NOTHING.
+    """The full ``FlakeLedgerTaskClient`` seam, recorded.
 
-    Task ζ is what makes ``open_debt`` file a de-flake task; keeping the seam here and
-    asserting it stays unused makes α's scope boundary machine-checked rather than
-    trusted.
+    α asserted this stayed UNUSED (``test_alpha_accepts_task_client_but_files_nothing``,
+    which keeps passing by leaving its client's ``submit_task`` unexercised — α opened
+    debt without one).  ζ fills the seam, so the fake grows the other two methods plus
+    injectable returns and failures.
+
+    ``calls`` records METHOD NAMES in order across all three methods, which is what lets
+    a test assert ORDERING (e.g. that ``get_statuses`` really was consulted BEFORE a
+    filing) rather than only per-method counts.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        submit_returns: object = 'task-901',
+        statuses: dict[str, str] | None = None,
+        submit_raises: BaseException | None = None,
+        statuses_raises: BaseException | None = None,
+        commit_raises: BaseException | None = None,
+    ) -> None:
         self.submit_calls: list[dict] = []
+        self.statuses_calls: list[list[str]] = []
+        self.commit_calls: list[list[str]] = []
+        self.calls: list[str] = []
+        self._submit_returns = submit_returns
+        self._statuses = statuses if statuses is not None else {}
+        self._submit_raises = submit_raises
+        self._statuses_raises = statuses_raises
+        self._commit_raises = commit_raises
 
     async def submit_task(self, arguments: dict) -> str:
+        self.calls.append('submit_task')
         self.submit_calls.append(arguments)
-        return 'ticket-fake-123'
+        if self._submit_raises is not None:
+            raise self._submit_raises
+        return self._submit_returns  # type: ignore[return-value]
+
+    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+        self.calls.append('get_statuses')
+        self.statuses_calls.append(list(ids))
+        if self._statuses_raises is not None:
+            raise self._statuses_raises
+        return dict(self._statuses)
+
+    async def commit_planning(self, task_ids: list[str]) -> None:
+        self.calls.append('commit_planning')
+        self.commit_calls.append(list(task_ids))
+        if self._commit_raises is not None:
+            raise self._commit_raises
+
+
+def _owner(db_path: Path, test_id: str) -> str | None:
+    """``owner_task_id`` read with RAW sqlite3 — never through the module under test."""
+    (raw,) = _rows(db_path, 'SELECT * FROM flake_debt WHERE test_id = ?', (test_id,))
+    return raw['owner_task_id']
 
 
 @pytest.mark.asyncio
@@ -1801,6 +1844,130 @@ class TestOpenDebt:
 
         assert [r.test_id for r in read_occurrences(db_path)] == [UNKNOWN_TEST_ID]
         assert list_open_debt(db_path) == []
+
+
+@pytest.mark.asyncio
+class TestOpenDebtFilesTheDeflakeTask:
+    """§5.9's invariant, enforced at WRITE TIME — boundary row B7.  ASYNC-ONLY CLASS.
+
+    "Any test in the flaky ledger has a non-terminal de-flake task explicitly
+    responsible both for fixing the root defect and for removing the test from the
+    ledger."  Enforced inside ``open_debt`` so it is SELF-MAINTAINING rather than
+    audited after the fact.  This class covers the FRESH-filing half; re-corroboration
+    of an already-stored owner is :class:`TestOpenDebtRecorroboratesTheOwner`.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    async def test_first_suppression_files_exactly_one_task_and_stores_its_id(
+        self, tmp_path: Path
+    ) -> None:
+        import dataclasses
+
+        from orchestrator.flake_ledger import build_deflake_task_arguments, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns='task-901')
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+        )
+
+        assert row is not None
+        # The emitted block, asserted as the VALUE the builder produces for this row —
+        # not re-derived prose (that is TestBuildDeflakeTaskArguments' job).
+        assert client.submit_calls == [
+            build_deflake_task_arguments(dataclasses.replace(row, owner_task_id=None))
+        ]
+        assert client.submit_calls[0]['planning_mode'] is True
+        # planning_mode leaves the task `deferred`; commit_planning is the second phase
+        # OF the initial filing, without which the task exists but never dispatches.
+        assert client.commit_calls == [['task-901']]
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+
+    async def test_returned_row_carries_the_owner_not_a_pre_filing_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        """The caller must not have to re-read to see the owner it just caused."""
+        from orchestrator.flake_ledger import open_debt, read_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns='task-902')
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+        )
+
+        assert row is not None
+        assert row.owner_task_id == 'task-902'
+        assert row == read_debt(db_path, self.TEST_ID)
+
+    async def test_a_fresh_row_does_not_consult_get_statuses(self, tmp_path: Path) -> None:
+        """Nothing to corroborate: a row with no ``owner_task_id`` has no stored claim
+        that could be stale, so the read is skipped rather than issued against ``None``."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient()
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW)
+
+        assert client.statuses_calls == []
+        assert client.calls == ['submit_task', 'commit_planning']
+
+    async def test_no_client_files_nothing_and_says_so(self, tmp_path: Path, caplog) -> None:
+        """The storeless callers (a CLI, ε's two other ``_run_post_merge_verify``
+        callers) pass nothing.  That must degrade to α's exact behaviour — and be
+        VISIBLE, because an unwired client is the one way the invariant silently stops
+        being enforced in production."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.INFO, logger='orchestrator.flake_ledger'):
+            row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert row is not None
+        assert row.owner_task_id is None
+        assert _owner(db_path, self.TEST_ID) is None
+        messages = [r.getMessage() for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert any('task_client' in m for m in messages), messages
+
+    async def test_no_client_row_is_byte_identical_to_alphas(self, tmp_path: Path) -> None:
+        """Same row, from ζ's code path with no client and from a bare α-shaped call."""
+        from orchestrator.flake_ledger import open_debt
+
+        with_none = tmp_path / 'a' / 'runs.db'
+        bare = tmp_path / 'b' / 'runs.db'
+        await open_debt(with_none, 'dark_factory', self.TEST_ID, task_client=None, now=self.NOW)
+        await open_debt(bare, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert _rows(with_none, 'SELECT * FROM flake_debt') == _rows(
+            bare, 'SELECT * FROM flake_debt'
+        )
+
+    async def test_the_unknown_sentinel_is_refused_before_any_client_call(
+        self, tmp_path: Path
+    ) -> None:
+        """The sentinel names no test, so it can own no de-flake task — and the refusal
+        must land BEFORE the client, or ζ files a task against a test that does not
+        exist.  ε plausibly iterates the test_ids of a recorded occurrence batch, which
+        is exactly where the sentinel lives."""
+        from orchestrator.flake_ledger import UNKNOWN_TEST_ID, ensure_schema, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        client = _FakeTaskClient()
+
+        assert (
+            await open_debt(
+                db_path, 'dark_factory', UNKNOWN_TEST_ID, task_client=client, now=self.NOW
+            )
+            is None
+        )
+
+        assert client.calls == []
+        assert _rows(db_path, 'SELECT COUNT(*) AS n FROM flake_debt')[0]['n'] == 0
 
 
 @pytest.mark.asyncio
