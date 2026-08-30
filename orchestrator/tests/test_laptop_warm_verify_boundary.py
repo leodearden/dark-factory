@@ -775,7 +775,42 @@ def kill_holder_tree(
     ONCE, at entry, strictly before the pgid read and the ppid-map
     snapshot below: an already-reaped leader's descendants have already
     been reparented to init (or the nearest subreaper) and are no longer
-    reachable from ``proc.pid`` anyway, so the early return costs nothing.
+    reachable from ``proc.pid`` anyway, so the early return forgoes no
+    reachable kill.
+
+    IT IS NOT FREE, THOUGH -- KNOWN RESIDUE (esc-4092-3, measured
+    2026-08-30).  "No longer reachable" is a statement about this helper's
+    ability to FIND the descendants, NOT a claim that something else kills
+    them.  Nothing does.  A session-escaped grandchild (verify.py's
+    ``_run_cmd`` runs every build via
+    ``create_subprocess_shell(..., start_new_session=True)``, so it holds
+    its OWN pgid/sid) is reachable ONLY via the /proc ppid chain, and that
+    chain is severed the instant the leader dies.  When a caller reaps the
+    leader inside its ``try`` -- as the four rows named above do -- the
+    grandchild is already reparented to init by the time this runs, the
+    descendant walk returns EMPTY, and the killpg backstop cannot reach it
+    either (different group).  It then survives to its full ``sleeper_spec``
+    duration.
+
+    MEASURED, not inferred: over 5 instrumented full-module xdist runs, 3
+    leaked exactly one ``sleep 300.0``, each reparented to pid 1940
+    (``systemd --user``) in its own pgid/sid.  The surviving orphan's
+    ``/proc/<pid>/cwd`` resolved to
+    ``.../test_watchdog_timeout_env_over0/repo/.worktrees/_merge-<uuid>``
+    -- i.e. one of the four already-reaped rows, whose logged teardown
+    state was ``returncode=1, /proc entry gone, descendants=[]``.  The two
+    ``_KNOWN_HOLDER_TEARDOWN_ROWS`` anchors did NOT leak: their leaders were
+    logged alive (``returncode=None``, state ``S``) with a NON-EMPTY
+    descendant set containing the real sleeper, which was swept correctly.
+
+    ACCEPTED for now, deliberately: the residue is bounded by the spec's own
+    sleep duration, has no correctness impact on the assertions, and closing
+    it needs a design change this helper cannot make alone (the descendant
+    set must be captured EARLY, while the leader is provably alive, and
+    carried into teardown -- a spawn-time pgid does not suffice, because the
+    grandchild setsid's into a group of its own).  Tracked as a follow-up;
+    do NOT "fix" it by deleting the short circuit, which would reintroduce
+    the free-pid walk described above.
     """
     timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
 
