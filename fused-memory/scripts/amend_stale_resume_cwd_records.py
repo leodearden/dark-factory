@@ -1,22 +1,74 @@
 #!/usr/bin/env python3
-"""One-shot (idempotently re-runnable) corpus correction: version-scope the
-stale "Claude CLI --resume is broken because sessions are per-project-directory"
-claim in Mem0, and retire the hygiene warning's now-false STATUS clause
+"""Standing regression VERIFIER for the corrected "Claude CLI --resume is
+broken because sessions are per-project-directory" records in Mem0
 (task 4610, esc-3578-5).
 
-Why a script exists at all
---------------------------
-The same two writes are available as the ``update_memory`` MCP tool, and this
-script calls the SAME function underneath —
-``MemoryService.update_memory``. It owns no copy of the amendment logic; it
-parses flags, corroborates each pre-image, and delegates. It exists because
-NOBODY WHO CAN BE DISPATCHED AT THIS WORK MAY CALL THAT TOOL:
+Status of this correction: DONE -- but NOT by this script
+---------------------------------------------------------
+Both target records were corrected in place on 2026-08-30, while the branch
+authoring this script was still in flight. MEASURED, by direct re-read:
+
+  * 6403e96b -- ``updated_at`` 2026-08-30T06:23:54Z. Content now opens with a
+    ``SUPERSEDED 2026-08-30`` marker, carries the cwd-AGNOSTIC correction
+    (task 3578, CLI 2.1.236, measured 2026-08-19/20), and ends "Do not cite
+    this entry's original title as current fact." Metadata gained
+    ``x_amended_at``, ``x_amended_by_task``, ``x_superseded_note``.
+  * d007aa46 -- ``updated_at`` 2026-08-30T07:12:21Z. Its STATUS clause no
+    longer claims 6403e96b is "STILL UNCORRECTED"; it records the correction
+    and demotes itself to historical/audit context for esc-3578-5.
+
+Both texts attribute the change to a "Stage-1 memory consolidation, task
+4610". That attribution is the RECORDS' OWN, not an independent measurement:
+each payload's ``agent_id`` still names the record's original author
+(``claude-interactive`` on the 2026-04-10 entry, ``claude-task-3578-steward``
+on the 2026-08-22 one), so Mem0 preserves the creator across an amend and the
+amending identity is not recoverable from the record. What IS established is
+that the writes landed at the timestamps above through a path with the
+``update_memory`` authorization this script's authoring agent did not hold.
+
+That is why the corroborate-before-acting guard below matters more than the
+write arm ever did: it is the guard that CAUGHT this. A run of the original
+--apply would have refused with ``refuse:preimage_mismatch`` rather than
+overwriting somebody else's landed correction -- exactly the "a curator
+sitting, a recon Stage-1/2 consolidation" race
+:func:`classify_amend_target` names.
+
+What it does now
+----------------
+Verifies, and writes NOTHING. Both entries in :data:`AMEND_TARGETS` are
+VERIFY-ONLY (``new_content is None``), so there is no replacement text in this
+module to send and the write path cannot reach them:
+
+  * **Clean (exit 0)** -- both records still carry
+    :data:`AMENDED_SENTINEL`, the substring both landed corrections contain.
+    Each classifies ``skip:already_amended``; zero writes, no capability
+    probe.
+  * **Reverted (exit 1)** -- a record has gone back to the bare pre-2026-08
+    causal claim (:data:`REVERSION_PREIMAGE`), reported by name as
+    ``refuse:correction_reverted``.
+  * **Drifted (exit 1)** -- a record is neither, i.e. it was reworded past
+    the correction into content this module does not recognise:
+    ``refuse:preimage_mismatch``.
+
+The last two are the point. An in-place amend is invisible to every
+downstream reader, and this pair of records demonstrably moved TWICE inside a
+single day. A consolidation that dropped the SUPERSEDED marker and restored
+the bare claim would silently re-open the hazard esc-3578-5 was filed for --
+the top-ranked hit on the "sessions stored per-project-directory" query once
+again asserting an unmeasured inference as fact. This script turns that
+invisible regression into a non-zero exit an operator or a cron can gate on.
+
+Why a script exists at all (provenance)
+---------------------------------------
+Recorded because it explains the shape of what is here, not as a pending
+instruction. The two amendments were originally to be made by this script,
+because NOBODY WHO COULD BE DISPATCHED AT THIS WORK MAY CALL ``update_memory``:
 
   * ``update_memory``'s authorization gate admits only ``recon-stage-*`` and
     ``curator-*`` agent ids. The task-3578 steward hit it on both the
     ``content_amend`` and ``metadata_patch`` arms and recorded the refusal in
-    esc-3578-5 rather than working around it — which is why 6403e96b was still
-    uncorrected months later.
+    esc-3578-5 rather than working around it -- which is why 6403e96b was
+    still uncorrected months later.
   * An orchestrator-dispatched agent CANNOT clear that gate:
     ``orchestrator/src/orchestrator/agents/briefing.py`` hardcodes
     ``agent_id = f'claude-task-{task_id}-{role}'``, so every role this task
@@ -25,33 +77,32 @@ NOBODY WHO CAN BE DISPATCHED AT THIS WORK MAY CALL THAT TOOL:
     precise situation: adopting a ``curator-`` id "because you hit
     ``Mem0UpdateNotAuthorized`` in the middle of unrelated work and want past
     it" is "self-authorization for a silent-rewrite primitive ... not a key you
-    borrow". Widening the allowlist is closed too — the ``Mem0UpdateConfig``
+    borrow". Widening the allowlist is closed too -- the ``Mem0UpdateConfig``
     field descriptions in ``fused_memory.config.schema`` record Leo's
     esc-3524-1 ruling that the bar is deliberately narrow.
 
 The gate is MCP-TOOL-LAYER ONLY; the service seam beneath it carries no prefix
-check. So the sanctioned route — the one six sibling scripts in this directory
-already take — is to land the change as REVIEWABLE CODE and have a session that
-legitimately holds the capability run ``--apply``. That is the whole point: the
-corpus mutation stays visible in git history and in review, instead of
-happening once, invisibly, inside somebody's chat transcript.
+check. So the sanctioned route -- the one six sibling scripts in this
+directory already take -- was to land the change as REVIEWABLE CODE and have a
+session that legitimately holds the capability run ``--apply``. All of that
+reasoning still holds; it was simply overtaken by a write that reached the
+records first.
 
-What it does
-------------
-Exactly TWO in-place CONTENT amendments, in a fixed order, and NO deletes:
+Why the write machinery is retained but the payloads are not
+------------------------------------------------------------
+The two replacement texts (``_STALE_REPLACEMENT``, ``_WARNING_REPLACEMENT``)
+are DELETED, not left unreachable behind a re-pointed sentinel. Unreachable
+today is a loaded gun: any future editor who "fixes" the sentinel, or who adds
+a third target, would fire a 2026-08-28-authored rewrite at a correction that
+landed 2026-08-30 -- producing two independently-worded corrections that
+drift, the exact failure the original payload's own comment warned about.
 
-  **A — 6403e96b** ("Broken Claude CLI --resume due to sessions being
-  per-project-directory"). Replaced with a version-scoped rewording modelled on
-  the already-corrected Graphiti half of this same contradiction (edge
-  fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08, reworded 2026-08-22). It PRESERVES the
-  real 2026-04-10 incident and the commit that fixed it, labels the causal
-  explanation as an inference that was never measured, states the contrary
-  2026-08-19 measurement, and records what remains UNDETERMINED.
-
-  **B — d007aa46** (the esc-3578-5 corpus-hygiene warning). Its final STATUS
-  sentence claims 6403e96b "is STILL UNCORRECTED". Once A lands that sentence
-  is false, so it is replaced by one recording the correction. Every measured
-  score and the do-not-delete rationale are kept verbatim.
+The read/classify/report/exit-code/CLI machinery IS retained and still fully
+exercised by the test suite, because the defect was in the pinned DATA, not in
+that code. What keeps retaining it safe is that a verify-only target is
+structurally unwritable: ``_apply_amendments`` demotes it to
+``'skip:verify_only'`` before the amendable set is computed, so the write
+path never considers it.
 
 Why an amend and not a delete
 -----------------------------
@@ -59,58 +110,61 @@ The April incident was REAL: a steward CWD switch to project_root did break
 ``--resume``, with instant "No conversation found" failures at 0 cost / 0 turns
 / 0 duration on all three retries, and removing the switch (commit e001dd3746)
 fixed it. Only the CAUSE bolted onto that symptom was an unmeasured inference.
-Deleting the record — or flatly invalidating it — would retire a true
+Deleting the record -- or flatly invalidating it -- would retire a true
 historical observation, which is exactly the move the task-3578 steward
 declined on the Graphiti side after provenance showed a measured symptom with
 an inferred cause. There is no delete arm anywhere in this script, and the test
-suite asserts its absence.
+suite asserts its absence. That nuance was not lost by never writing
+``_STALE_REPLACEMENT``: it survives verbatim in the RETAINED d007aa46 record,
+which still carries the measured scores, commit e001dd3746, and the
+still-open UNDETERMINED question of whether the CLI changed between April and
+August or the April diagnosis mis-attributed a real failure.
 
 Safety properties
 -----------------
-* **Dry-run is the DEFAULT.** ``--apply`` is opt-in.
+* **Dry-run is the DEFAULT.** ``--apply`` is opt-in, and for the current
+  verify-only targets it is a no-op that differs from a dry run only in the
+  report's ``dry_run`` flag.
 * **Corroborate before acting.** Each target's exact pre-image is pinned here
-  and re-read live IMMEDIATELY BEFORE THAT TARGET'S OWN WRITE; a mismatch
-  REFUSES rather than clobbers. An in-place amend is invisible to every
-  downstream reader, so blindly overwriting a record that changed underneath us
-  (a curator sitting, a recon Stage-1/2 consolidation) would destroy someone
-  else's correction with no trace. The per-target re-read matters because the
-  batch read happens before ANY write: without it, the second target's
-  corroboration would predate the first target's write by a Qdrant round-trip
-  plus a re-embed, and a race landing in that window would be clobbered by the
-  very guard meant to catch it. ``MemoryService.update_memory`` offers no
-  compare-and-swap, so the residual read-to-write window is narrowed to a
-  single await rather than eliminated.
-* **Idempotent.** Re-running after a successful apply finds the sentinel in
-  both records and writes nothing. Safe to re-run after a partial failure.
-* **Ordered.** B is written only if A actually succeeded (or was already
-  amended). If A fails, B is short-circuited untouched — a corpus asserting
-  "corrected" while the stale record still misleads is strictly worse than the
-  status quo, and undetectable to anyone who trusts the warning.
+  -- verified byte-exact against Mem0's own content hash -- and re-read live
+  IMMEDIATELY BEFORE THAT TARGET'S OWN WRITE; a mismatch REFUSES rather than
+  clobbers. The per-target re-read matters because the batch read happens
+  before ANY write: without it, the second target's corroboration would
+  predate the first target's write by a Qdrant round-trip plus a re-embed, and
+  a race landing in that window would be clobbered by the very guard meant to
+  catch it. ``MemoryService.update_memory`` offers no compare-and-swap, so the
+  residual read-to-write window is narrowed to a single await rather than
+  eliminated.
+* **Idempotent.** Every run over a healthy corpus finds the sentinel in both
+  records and writes nothing, so it is safe to run on a schedule.
+* **Ordered.** B is only ever written if A actually succeeded (or was already
+  amended), because B's text asserts that A was corrected. Retained even
+  though neither target writes today -- it is what would keep a future
+  write-capable target honest.
 * **Fail-closed capability preflight** before the first write, so a run that
   cannot write mem0's history dir refuses up front instead of half-writing.
+  Never reached on the verify-only path: the amendable set is computed first,
+  so a verification run needs no write capability and can be run from a
+  sandbox.
 * **Attributed writes** (``_source=WRITE_SOURCE``, and ``agent_id`` set to the
   same value) so the amendment storm alarm and the metadata-vocabulary census
   both read this sweep rather than a generic ``mcp_tool`` and a null agent.
 
 Usage
 -----
-  # Dry run (default): corroborate both pre-images, print the report, write
-  # nothing. Safe from anywhere, including a sandboxed task worktree.
+  # Verify the corpus. Reads both records, prints the report, writes nothing.
+  # Safe from anywhere, including a sandboxed task worktree.
   python scripts/amend_stale_resume_cwd_records.py
 
-  # Commit both amendments.
+  # Same, under --apply. Both targets are verify-only, so this performs no
+  # writes and no capability probe; it exists so the flag keeps meaning what
+  # it says if a write-capable target is ever added.
   python scripts/amend_stale_resume_cwd_records.py --apply
 
-Exit code is 0 for a clean run (dry-run, fully applied, or all-skipped) and 1
-if ANY target was refused, so an operator can gate on it without parsing the
-report.
-
-Status of this correction: NOT YET APPLIED. Like
-``scripts/repair_recon_citation.py`` before it, the authoring task agent could
-not run ``--apply`` — a task agent holds neither the ``update_memory``
-authorization prefix nor (from a sandboxed worktree) write access to mem0's
-history directory. An operator or steward session must run it. Update this line
-to ``DONE — APPLIED <date> by <session>`` once it has been.
+Exit code is 0 when both records still carry the correction (or, for a
+write-capable target, when the amendment landed or was already present) and 1
+if ANY target was refused -- reverted, drifted, missing or unreadable -- so an
+operator can gate on it without parsing the report.
 """
 
 from __future__ import annotations
