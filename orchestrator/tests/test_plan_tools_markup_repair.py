@@ -294,39 +294,6 @@ _PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
     'mark_step_committed',
 })
 
-#: Every MCP-registered plan-tools impl that can reach ``artifacts.write_plan``
-#: (or an equivalent plan-mutating call) at all — the full candidate set for
-#: "could this be an UNDECLARED alternate writer of a
-#: ``_REPAIRABLE_PLAN_FIELDS`` cell?", used by
-#: ``test_no_plan_writing_tool_is_an_undeclared_alternate``.
-#:
-#: The ``report_*`` family (``report_blocking_dependency``,
-#: ``report_task_already_done``, ``report_ready_to_merge``,
-#: ``report_unactionable_task``, ``report_false_premise``) is excluded
-#: deliberately, not by oversight: each persists to an entirely separate
-#: artifact file (``artifacts.write_blocking_dependency`` / ``write_already_done``
-#: / ``write_ready_to_merge`` / ``write_unactionable_task`` / ``write_false_premise``,
-#: plan_tools.py:1339-1431) and never calls ``artifacts.write_plan`` at all, so
-#: none of them can possibly write a plan.json cell. Sweeping them in would only
-#: add unrecognised-parameter synthesis (``classification``, ``premise``,
-#: ``evidence``, ...) to observe a guaranteed no-op every time — the exact
-#: fragility the module's design decisions rejected a full entry-point sweep
-#: over.
-_PLAN_WRITING_TOOL_NAMES = (
-    'create_plan',
-    'add_plan_step',
-    'add_prerequisite',
-    'add_design_decision',
-    'add_reuse_item',
-    'update_plan_metadata',
-    'remove_plan_step',
-    'replace_plan_step',
-    'mark_step_done',
-    'mark_step_committed',
-    'confirm_plan',
-)
-
-
 def _plan_writing_tool_names() -> tuple[str, ...]:
     """Derive the plan-writer candidate set from plan_tools' LIVE module surface.
 
@@ -354,6 +321,20 @@ def _plan_writing_tool_names() -> tuple[str, ...]:
     as ``_read_plan_repaired`` (which only ever calls ``artifacts.read_plan``
     and the module-level ``_atomic_write_plan``, and merely discusses
     ``write_plan`` in prose) as a writer.
+
+    The ``report_*`` family (``report_blocking_dependency``,
+    ``report_task_already_done``, ``report_ready_to_merge``,
+    ``report_unactionable_task``, ``report_false_premise``) never appears in
+    the returned tuple — not because it is hand-excluded, but as a
+    MACHINE-CHECKED CONSEQUENCE of this derivation: each persists to its own
+    separate artifact file (``artifacts.write_blocking_dependency`` /
+    ``write_already_done`` / ``write_ready_to_merge`` /
+    ``write_unactionable_task`` / ``write_false_premise``,
+    plan_tools.py:1339-1431) and so calls none of
+    :data:`_PLAN_MUTATING_ARTIFACT_METHODS`. Their absence costs no
+    unrecognised-parameter synthesis (``classification``, ``premise``,
+    ``evidence``, ...) for a guaranteed no-op — the fragility the module's
+    design decisions rejected a full entry-point sweep over.
     """
     names = []
     for name, obj in vars(plan_tools).items():
@@ -512,7 +493,9 @@ def _alternate_writer_changed_the_cell(
             raise AssertionError(
                 f'_alternate_writer_changed_the_cell does not know how to '
                 f'synthesize a value for {impl.__name__}({name!r}) — extend '
-                'the probe rather than silently probing nothing'
+                'the probe rather than silently probing nothing, or exclude '
+                'it from _PLAN_MUTATING_ARTIFACT_METHODS if it does not '
+                'write plan.json'
             )
     result = impl(artifacts, **kwargs)
     refusal = None
@@ -521,6 +504,49 @@ def _alternate_writer_changed_the_cell(
 
     after, still_exists = _cell()
     return still_exists and after != before, refusal
+
+
+def _undeclared_alternates(tmp_path, monkeypatch) -> set[tuple[str, str | None, str]]:
+    """Every (tool, collection, field) triple OBSERVED writing a cell while
+    declared neither as that row's schema owner nor in its ``also_written_by``.
+
+    Completeness half of ``also_written_by``: the soundness check
+    (``test_every_alternate_writer_really_writes_that_field``) only proves
+    every DECLARED alternate really writes its field, and passes VACUOUSLY
+    when an alternate is silently dropped from the table. This sweeps every
+    row of ``_REPAIRABLE_PLAN_FIELDS`` against every name in the DERIVED
+    candidate set :func:`_plan_writing_tool_names` returns — never a
+    hand-maintained list a new writer could be left out of — and asserts the
+    CONVERSE of the soundness check.
+
+    A refused probe call is not itself a finding — most (tool, row) pairs are
+    simply not applicable (``mark_step_done`` can never touch ``reuse``), and
+    per :func:`_alternate_writer_changed_the_cell`'s contract a refusal is
+    conclusive proof the cell was not written; only an OBSERVED, UNDECLARED
+    change is accumulated.
+
+    A candidate whose signature the probe cannot synthesize a value for
+    raises ``AssertionError`` (propagated unchanged from
+    :func:`_alternate_writer_changed_the_cell`) rather than being silently
+    skipped — a skip would reopen exactly the completeness hole this sweep
+    exists to close.
+    """
+    monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
+    undeclared: set[tuple[str, str | None, str]] = set()
+    for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+        owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
+        for tool_name in _plan_writing_tool_names():
+            if tool_name == owner:
+                continue  # already reported as `tool`, not an "alternate"
+            root = tmp_path / f'{record.collection}-{record.field}-{tool_name}'
+            changed, _refusal = _alternate_writer_changed_the_cell(
+                root, record.collection, record.field, tool_name
+            )
+            if not changed:
+                continue
+            if tool_name not in record.also_written_by:
+                undeclared.add((tool_name, record.collection, record.field))
+    return undeclared
 
 
 class TestRepairableFieldTable:
@@ -703,36 +729,19 @@ class TestRepairableFieldTable:
         next undeclared writer along with them, without re-adding hardcoded
         pins one at a time.
 
-        Sweeps every :data:`_PLAN_WRITING_TOOL_NAMES` tool against every row
-        and asserts the CONVERSE of the soundness check: whatever the probe
-        OBSERVES writing a cell is either that row's schema owner (already
-        reported as ``tool``, so skipped here) or already named in
-        ``also_written_by``. A refused probe call is not itself a failure —
-        most (tool, row) pairs are simply not applicable (``mark_step_done``
-        can never touch ``reuse``), and per
-        :func:`_alternate_writer_changed_the_cell`'s contract a refusal is
-        conclusive proof the cell was not written; only an OBSERVED,
-        UNDECLARED change fails this test.
+        Sweeps every tool in the DERIVED candidate set
+        (:func:`_plan_writing_tool_names`, not a hand-maintained list a new
+        writer could be left out of) against every row and asserts the
+        CONVERSE of the soundness check: whatever the probe OBSERVES writing
+        a cell is either that row's schema owner (already reported as
+        ``tool``, so skipped here) or already named in ``also_written_by``.
+        A refused probe call is not itself a failure — most (tool, row)
+        pairs are simply not applicable (``mark_step_done`` can never touch
+        ``reuse``), and per :func:`_alternate_writer_changed_the_cell`'s
+        contract a refusal is conclusive proof the cell was not written;
+        only an OBSERVED, UNDECLARED change fails this test.
         """
-        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
-        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
-            owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
-            for tool_name in _PLAN_WRITING_TOOL_NAMES:
-                if tool_name == owner:
-                    continue  # already reported as `tool`, not an "alternate"
-                root = tmp_path / f'{record.collection}-{record.field}-{tool_name}'
-                changed, _refusal = _alternate_writer_changed_the_cell(
-                    root, record.collection, record.field, tool_name
-                )
-                if not changed:
-                    continue
-                assert tool_name in record.also_written_by, (
-                    f'{tool_name!r} was observed writing '
-                    f'{record.collection}.{record.field} but is declared '
-                    f'neither as that row\'s schema owner ({owner!r}) nor in '
-                    f'its also_written_by {record.also_written_by!r} — the '
-                    'table under-reports a real writer'
-                )
+        assert _undeclared_alternates(tmp_path, monkeypatch) == set()
 
     def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
         """Identifiers, enums and lists may never receive a recovered string.
