@@ -4287,6 +4287,10 @@ class TestInversionFamilyIsPinnedToScoredDepth:
             assert obs.pairs_registered == 1
             assert obs.pairs_comparable == 0
             assert obs.inversions == ()
+            # Both-present at full fetch depth (ranks 6, 7 <= limit=10) but
+            # not both within scored_k=5: the pin's cut is disclosed, not
+            # silently indistinguishable from a corpus with nothing to trim.
+            assert obs.pairs_beyond_scored_depth == 1
 
     def test_a_pair_inside_the_scored_depth_stays_comparable(self):
         """The pin narrows only what is genuinely out of scope: a pair fully
@@ -4298,6 +4302,8 @@ class TestInversionFamilyIsPinnedToScoredDepth:
             assert obs.pairs_registered == 1
             assert obs.pairs_comparable == 1
             assert len(obs.inversions) == 1
+            # Nothing was trimmed: the pair was already inside scored_k.
+            assert obs.pairs_beyond_scored_depth == 0
 
     def test_a_straddling_pair_is_not_comparable(self):
         """One member inside the scored depth (rank 1), one beyond it
@@ -4310,3 +4316,7 @@ class TestInversionFamilyIsPinnedToScoredDepth:
             assert obs.pairs_registered == 1
             assert obs.pairs_comparable == 0
             assert obs.inversions == ()
+            # Both-present at full fetch depth (rank 1 and rank 6 <= limit=10)
+            # but not both within scored_k=5: the straddle is a trim too, not
+            # just a comparable-pairs miss.
+            assert obs.pairs_beyond_scored_depth == 1
