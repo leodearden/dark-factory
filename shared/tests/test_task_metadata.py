@@ -28,6 +28,7 @@ from shared.task_metadata import (
     ExternalDep,
     MemoryHints,
     Milestone,
+    Recurrence,
     RetryLedger,
     RoutingDecisionMirror,
     RoutingState,
@@ -622,6 +623,71 @@ class TestMilestone:
     def test_unknown_subfield_retained_and_reemitted(self):
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
+class TestRecurrence:
+    """``metadata.recurrence`` — the recurring-chain link spec (task 4676).
+
+    PRD ``docs/prds/recurring-deterministic-tasks.md`` decision R-D4. A
+    recurrence marks one link of a chain of deterministic predicate tasks:
+    ``key`` is the stable chain id every link shares, ``interval_secs`` is
+    the cadence, and ``minted_from`` is the predecessor's task id — absent
+    on the seed link an author writes, stamped by the mint on successors.
+    """
+
+    def test_minimal_seed_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400)
+        assert r.key == 'reify-closure-staleness'
+        assert r.interval_secs == 86400
+        assert r.minted_from is None
+
+    def test_minted_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400, minted_from='4676')
+        assert r.minted_from == '4676'
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            pytest.param({'key': 'k', 'interval_secs': 0}, id='interval_secs_zero'),
+            pytest.param({'key': 'k', 'interval_secs': -1}, id='interval_secs_negative'),
+            pytest.param({'key': 'k', 'interval_secs': '1d'}, id='interval_secs_non_int'),
+            # The three rows pydantic's LAX int coercion would have ACCEPTED
+            # (True -> 1, '86400' -> 86400, 86400.0 -> 86400). strict=True is
+            # what rejects them, and a bool slipping through would mint a
+            # one-second cadence — the silent-wrong-value bug, not a typo.
+            pytest.param({'key': 'k', 'interval_secs': True}, id='interval_secs_bool'),
+            pytest.param({'key': 'k', 'interval_secs': '86400'}, id='interval_secs_numeric_str'),
+            pytest.param({'key': 'k', 'interval_secs': 86400.0}, id='interval_secs_float'),
+            pytest.param({'key': 'k'}, id='interval_secs_missing'),
+            pytest.param({'interval_secs': 86400}, id='key_missing'),
+            pytest.param({'key': '', 'interval_secs': 86400}, id='key_empty'),
+            pytest.param({'key': 'Reify-Closure', 'interval_secs': 86400}, id='key_upper'),
+            pytest.param({'key': 'reify_closure', 'interval_secs': 86400}, id='key_underscore'),
+            pytest.param({'key': 'reify closure', 'interval_secs': 86400}, id='key_space'),
+            pytest.param({'key': '-reify', 'interval_secs': 86400}, id='key_leading_dash'),
+            pytest.param({'key': 'reify-', 'interval_secs': 86400}, id='key_trailing_dash'),
+            pytest.param({'key': 'reify--closure', 'interval_secs': 86400}, id='key_double_dash'),
+            # The cap half of the topic-slug mirror: the regex alone accepts
+            # any length, so without max_length this row constructs fine.
+            pytest.param({'key': 'a' * 101, 'interval_secs': 86400}, id='key_over_max_len'),
+        ],
+    )
+    def test_invalid_specs_rejected(self, kwargs):
+        with pytest.raises(ValidationError):
+            Recurrence(**kwargs)  # type: ignore[arg-type]
+
+    def test_key_at_max_length_accepted(self):
+        """The cap is 100 (TOPIC_SLUG_MAX_LEN), inclusive — pin the boundary.
+
+        Paired with the ``key_over_max_len`` row above so a future edit to
+        the literal cannot move the limit in silence.
+        """
+        assert Recurrence(key='a' * 100, interval_secs=86400).key == 'a' * 100
+
+    def test_unknown_subfield_retained_and_reemitted(self):
+        r = Recurrence(key='k', interval_secs=86400, x_extra='keep')  # type: ignore[call-arg]
+        dumped = r.model_dump()
         assert dumped['x_extra'] == 'keep'
 
 
@@ -1244,6 +1310,109 @@ class TestMilestoneRegistration:
             parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
 
 
+class TestRecurrenceRegistration:
+    """``recurrence``'s registration with the W10 extension point + parse_metadata integration.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4. The
+    cardinality pin lives HERE rather than in
+    TestProductionRegistrationCardinality for the reason that class's
+    docstring gives: cardinality is pinned in the suite that imports the
+    registering module, and this file imports ``shared.task_metadata``
+    directly.
+
+    These rows READ the production registration made at import time; none of
+    them calls ``register_metadata_submodel('recurrence', ...)``, because the
+    autouse fixture's teardown fails any test that adds a non-``_stub`` key
+    (task 3352).
+    """
+
+    _CARRIER = {
+        'task_kind': 'deterministic',
+        'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+        'before_done': {
+            'kind': 'predicate',
+            'script': 'scripts/x.sh',
+            'timeout_secs': 120,
+        },
+        'recurrence': {'key': 'reify-closure-staleness', 'interval_secs': 86400},
+    }
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['recurrence'] is Recurrence
+
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['recurrence'] == 'dict'
+
+    def test_carrier_round_trip_no_warnings(self):
+        model, warnings = parse_metadata(copy.deepcopy(self._CARRIER), direction='write')
+        assert warnings == []
+        assert isinstance(model.recurrence, Recurrence)  # type: ignore[attr-defined]
+        dumped = model.model_dump()['recurrence']
+        assert not isinstance(dumped, BaseModel)
+        assert dumped == {
+            'key': 'reify-closure-staleness',
+            'interval_secs': 86400,
+            'minted_from': None,
+        }
+        # The seed/successor discriminator r2's mint (and R-D5's gauge) must
+        # use, pinned explicitly because the dict above already shows the
+        # trap: the carrier was authored WITHOUT 'minted_from', yet the
+        # round-trip materialises the key with a None value. Key PRESENCE is
+        # therefore not the discriminator and never was —
+        # ``'minted_from' in rec`` reads True for this seed link. Only the
+        # VALUE separates the two, and it holds on the as-authored form too.
+        assert 'minted_from' not in self._CARRIER['recurrence']
+        assert 'minted_from' in dumped
+        assert dumped['minted_from'] is None
+        assert model.recurrence.minted_from is None  # type: ignore[attr-defined]
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'recurrence': {'key': 'k'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['recurrence'] == {'key': 'k'}
+
+    def test_malformed_slice_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'recurrence': {'key': 'k'}}, direction='write', enforce=True)
+
+    def test_scalar_slice_is_invalid_submodel_not_wrong_cardinality(self):
+        """A scalar slice falls through to ``submodel(**raw)`` — a TypeError, not a shape error.
+
+        The task-4142 cardinality gate compares ``isinstance(raw, list)``
+        against the declared cardinality, so a SCALAR never trips it; only a
+        list value does (see the row below).
+        """
+        _, warnings = parse_metadata({'recurrence': 'nope'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+
+    def test_list_slice_read_warns_wrong_cardinality(self):
+        model, warnings = parse_metadata(
+            {'recurrence': [{'key': 'k', 'interval_secs': 86400}]}, direction='read'
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['recurrence'] == [{'key': 'k', 'interval_secs': 86400}]
+
+    def test_list_slice_write_enforce_raises_type_error(self):
+        """The task-4142 shape rejection registration buys under write+enforce.
+
+        This is what covers ``update_task``, which never runs fused-memory's
+        deterministic-task guard: registering the key subjects the slice to
+        the cardinality gate at the write boundary regardless of caller.
+        """
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {'recurrence': [{'key': 'k', 'interval_secs': 86400}]},
+                direction='write',
+                enforce=True,
+            )
+
+
 class TestRoutingRegistration:
     """``routing``'s registration with the W10 extension point + parse_metadata integration."""
 
@@ -1860,6 +2029,45 @@ class TestParseMetadataFailurePolicy:
             w for w in warnings if w.code == 'unknown_key' and w.field == 'files_tagged_at'
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
+
+    def test_recurrence_metadata_key_is_blessed(self):
+        """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
+
+        PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4 specifies
+        BOTH: ``recurrence`` is a registered submodel (so parse_metadata
+        types and validates the slice) and a Tier-A blessed key (so the
+        unknown-key scan skips it even if the registration is ever moved,
+        made lazy, or otherwise not yet in place when a blob is parsed) —
+        and so that migrate_task_metadata_to_x_namespace.py refuses to
+        x_-namespace it, which for a submodel-backed key with live readers
+        is the correct refusal.
+
+        Assertion 2 exists precisely because assertion-by-unknown_key-alone
+        cannot distinguish the blessing from the registration: a REGISTERED
+        key is already in known_fields and never reaches the unknown-key
+        scan, so the obvious spelling of this test would be born green. It
+        pops the registration to isolate the property the blessing buys.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above also covers the key for free once blessed — this test carries
+        the rationale, not the coverage.
+        """
+        # 1. Direct membership: the blessing is belt-and-braces over the
+        #    registration.
+        assert 'recurrence' in task_metadata_module._BLESSED_METADATA_KEYS
+
+        # 2. The behaviour that membership buys, proven independently of the
+        #    registration. The autouse fixture snapshots and restores
+        #    _SUBMODEL_REGISTRY, and its ownership assertion inspects only
+        #    keys a test ADDED — so a pop is safe and is restored on
+        #    teardown. Do NOT re-register the production key (task 3352).
+        task_metadata_module._SUBMODEL_REGISTRY.pop('recurrence')
+        _, warnings = parse_metadata(
+            {'recurrence': {'key': 'k', 'interval_secs': 1}}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'recurrence' not in unknown_key_fields
 
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).

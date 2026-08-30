@@ -33,6 +33,7 @@ __all__ = [
     'MemoryHints',
     'MergeRetryPending',
     'Milestone',
+    'Recurrence',
     'RetryLedger',
     'RoutingDecisionMirror',
     'RoutingState',
@@ -299,6 +300,36 @@ _FILE_LINE_RE = re.compile(
 )
 _WHITESPACE_RE = re.compile(r'\s+')
 
+# The kebab-case shape of a recurrence chain key (task 4676, PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4). Kept as a pattern STRING
+# because it is handed to pydantic's Field(pattern=...) rather than used via
+# re.match. Deliberately MIRRORS fused_memory.topic_slug::TOPIC_SLUG_RE
+# instead of importing it: `shared` is the base package fused-memory depends
+# on, so the reverse import would be a layering violation.
+#
+# The one intentional difference from that mirror is the END anchor's CASE:
+# TOPIC_SLUG_RE is a compiled *Python* regex and spells it `\Z`, whereas
+# pydantic v2 compiles Field(pattern=...) with the Rust regex crate, which
+# rejects `\Z` outright ("unrecognized escape sequence") and spells the same
+# end-of-haystack anchor `\z`. Both reject a trailing newline, which is the
+# property TOPIC_SLUG_RE's own comment says the anchor exists for — `$` would
+# NOT, under a Python-engine fallback.
+_RECURRENCE_KEY_RE_STR = r'^[a-z0-9]+(?:-[a-z0-9]+)*\z'
+
+# The length cap that COMPLETES the topic-slug mirror above. The regex
+# alone accepts an arbitrarily long key; every real consumer of
+# TOPIC_SLUG_RE pairs it with TOPIC_SLUG_MAX_LEN instead
+# (fused_memory.topic_slug::is_valid_topic_slug, memory_metadata's `topic`
+# check, config.schema::ProceduralTopicCluster), so mirroring the pattern
+# without the cap would leave `key` a weaker shape than the one its
+# comment — and docs/task-authoring.md §6.1 — advertise it as.
+#
+# Copied as a literal for the same layering reason as the pattern:
+# `shared` is the base package fused-memory depends on. Kept numerically
+# EQUAL to TOPIC_SLUG_MAX_LEN so "safe as a slug" stays true of a chain
+# key, which doubles as a grep anchor and (R-D5) a gauge group key.
+_RECURRENCE_KEY_MAX_LEN = 100
+
 
 class RetryLedger(BaseModel):
     """``metadata.retry_ledger`` — anti-thrash counters (PRD §5).
@@ -409,6 +440,62 @@ class Milestone(BaseModel):
             if self.at is not None:
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
+
+
+class Recurrence(BaseModel):
+    """``metadata.recurrence`` — one link of a recurring deterministic chain.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` decision
+    R-D4. A recurring job is modelled as a CHAIN of ``task_kind='deterministic'``
+    predicate tasks rather than as a single self-rescheduling task, so every
+    run, failure and overdue-ness is visible in the task tree.
+
+    ``key`` is the stable chain id shared by every link of one chain —
+    kebab-case so it is safe as a slug and as a grep anchor. The pattern AND
+    the length cap deliberately MIRROR ``fused_memory.topic_slug``'s
+    ``TOPIC_SLUG_RE``/``TOPIC_SLUG_MAX_LEN`` pair rather than importing them,
+    because ``shared`` is the base package fused-memory depends on and the
+    reverse import would be a layering violation. Both halves are copied
+    because that module's own consumers always apply both — the regex alone
+    would accept an unbounded key.
+
+    ``interval_secs`` (> 0) is the cadence, measured from the predecessor's
+    TERMINAL time — never from a missed slot, so a late or long-running link
+    shifts the chain forward instead of accruing catch-up runs (contract
+    C-6).
+
+    ``minted_from`` is the predecessor's task id: an author omits it on the
+    seed link, and r2's mint stamps it on every successor. It is typed
+    ``str`` because task ids are ``str`` codebase-wide (the SQLite task
+    backend's signatures, ``ExternalDep.task_id``).
+
+    The seed-vs-successor DISCRIMINATOR is the VALUE — ``minted_from is
+    None`` — never key presence. The field is declared with a ``None``
+    default, so any round-trip through ``parse_metadata`` + ``model_dump``
+    materialises an explicit ``'minted_from': None`` on a seed link an author
+    wrote without one. A consumer that tests ``'minted_from' in rec`` would
+    therefore classify every round-tripped seed as a minted successor;
+    ``rec.get('minted_from') is None`` is the check that holds on both the
+    as-authored and the round-tripped form.
+
+    ``extra='allow'`` matches the Milestone/routing/merge_retry_pending
+    precedent, so a later writer's field survives round-trip untouched (I1).
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    key: str = Field(
+        min_length=1, max_length=_RECURRENCE_KEY_MAX_LEN, pattern=_RECURRENCE_KEY_RE_STR
+    )
+    # strict=True, not merely gt=0: pydantic's LAX int coercion accepts
+    # `True` (-> 1), `'86400'` and `86400.0`, so a stray boolean would mint a
+    # chain with a ONE-SECOND cadence against a contract scoped to
+    # hours-to-days. That is the same silent-wrong-value class the sibling
+    # guard already defends against with its `always_escalates is True`
+    # identity check. A cadence arrives from JSON, where an int is an int, so
+    # nothing legitimate needs the coercion.
+    interval_secs: int = Field(gt=0, strict=True)
+    minted_from: str | None = None
 
 
 class RoutingDecisionMirror(BaseModel):
@@ -709,7 +796,7 @@ def register_metadata_submodel(
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
 #
-# cardinality='dict' is stated explicitly on all three registrations below
+# cardinality='dict' is stated explicitly on every registration below
 # even though it is the default: these are the load-bearing declarations the
 # task-4142 shape gate exists to make legible, and an explicit call site is
 # immune to a future flip of the default.
@@ -727,6 +814,15 @@ register_metadata_submodel('routing', RoutingState, cardinality='dict')
 # `| None = None` field, staying absent from model_dump() when unset (no
 # None-noise on every task).
 register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality='dict')
+
+# recurrence (PRD docs/prds/recurring-deterministic-tasks.md R-D4, task
+# 4676): registered at import time like milestone/routing/merge_retry_pending
+# so the slice is typed and validated before any of parse_metadata's
+# cross-package callers run, lands in known_fields (no unknown_key census
+# noise), stays absent from model_dump() when unset, and picks up the
+# task-4142 cardinality gate — so a list-shaped value is REJECTED under
+# write+enforce instead of silently validating element-wise.
+register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -874,11 +970,19 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # depend on but that are not (yet) typed TaskMetadata fields. Skipped in
 # parse_metadata's unknown-key scan below so a deliberate, documented
 # convention doesn't manufacture unknown_key census noise — extra='allow'
-# still preserves each value byte-for-value (I1). None of these collide with
-# TaskMetadata.model_fields or _SUBMODEL_REGISTRY (only 'milestone' is
-# currently registered there). gate_escalated_at / before_done_ran_at /
-# before_done_verified_at / before_done_verified_pid are the
-# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
+# still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
+# disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
+# field or a registered submodel already suppresses unknown_key via
+# known_fields, so blessing it too would be redundant. 'recurrence' is the
+# one deliberate overlap: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# stays suppressed if its registration is ever moved or made lazy, and so
+# migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
+# for a submodel-backed key with live readers is the correct refusal.
+#
+# gate_escalated_at / before_done_ran_at / before_done_verified_at /
+# before_done_verified_pid are the DeterministicRunner's own stamps
+# (CLAUDE.md "Deterministic task kind").
 #
 # Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
 # Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
@@ -1010,6 +1114,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # against a live reader — renaming it on one task would fork the
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
+        # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
+        # R-D4) is the ONE blessed key that is also a registered submodel — see
+        # the header note above on why the overlap is deliberate.
+        'recurrence',
     }
 )
 

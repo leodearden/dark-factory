@@ -781,6 +781,103 @@ comparison, per its header.) The anchor stamps when X reaches `done`;
 §5) — predicate mode reuses the `DeterministicRunner` (§5), and the
 delayed anchor waits on the same dependency gate described in §3.
 
+### 6.1 Recurring chains (`metadata.recurrence`)
+
+A recurring job is not a self-rescheduling task — it is a **chain** of
+`task_kind='deterministic'` predicate links, one per run. Completing a link
+mints its successor, so every run, every failure, and every overdue check is
+an ordinary visible task in the tree rather than opaque state inside a
+systemd timer. See `docs/prds/recurring-deterministic-tasks.md`.
+
+**`metadata.recurrence`** (set at `submit_task`; validated by the shared
+`Recurrence` model):
+
+```
+{
+  key: "<stable kebab-case chain id>",  # required; shared by EVERY link of one chain
+  interval_secs: <int>,                 # required and > 0; cadence. Strict int:
+                                        #   true / "86400" / 86400.0 are REJECTED,
+                                        #   not coerced.
+  minted_from: "<predecessor task id>", # mint-stamped; null on the seed link
+}
+```
+
+`key` is the chain's identity: every link of one chain carries the same
+value, so it doubles as a slug and a grep anchor (lowercase alphanumeric
+segments joined by single hyphens, at most 100 characters — the same shape,
+regex *and* length cap, as a memory topic slug).
+
+`interval_secs` is measured from the predecessor's **terminal** time, never
+from a missed slot: a late or long-running link shifts the whole chain
+forward instead of accruing catch-up runs. There is no backfill.
+
+**Mint-stamped field** (never author-supplied): `minted_from`, the
+predecessor's task id. An author writes the seed link *without* it and it is
+stamped on every successor — the same author-never-sets-it rule as §6's
+`milestone_deps_satisfied_at`.
+
+**Read it by VALUE, never by key presence.** `minted_from` is declared with a
+`None` default, so a seed link an author wrote *without* the key comes back
+out of any `parse_metadata` round-trip carrying an explicit
+`"minted_from": null`. The seed-vs-successor discriminator is therefore
+`minted_from is None`, which holds on both the as-authored and the
+round-tripped form; `'minted_from' in recurrence` reads **true** for a
+round-tripped seed and would misclassify it as a minted successor.
+
+**Carrier contract.** A task carrying `recurrence` MUST be all three of:
+
+- `task_kind='deterministic'`,
+- `before_done.kind='predicate'` (§6's exit-code contract), and
+- a valid `metadata.milestone` with `mode='dated'` — the link's fire time,
+  which is what the mint advances by `interval_secs`. A `delayed` anchor has
+  no fire time to advance from.
+
+Anything else carrying `recurrence` is rejected at `submit_task` with a
+structured `ValidationError` plus a hint, and **never persisted** — the
+shape by `shared/src/shared/task_metadata.py::Recurrence` and the
+cross-field carrier rules by
+`fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_recurrence`,
+exactly the split §6's `Milestone` already uses.
+
+**The carrier contract is submit-time only.** `submit_task` is the sole
+boundary that checks the three-way relation above. `update_task` never runs
+that guard, and the check the submodel registration buys at the write
+boundary covers the `recurrence` *shape* alone. So a later `update_task`
+that flips `before_done.kind` to `deploy`, deletes `metadata.milestone`, or
+attaches `recurrence` to an existing normal task lands exactly the state
+this contract forbids, with no error raised. That is not specific to
+`recurrence`: it is the root cause task **3093** tracks, which `milestone`
+(§6) and `task_kind` are already symptoms of. Don't do it — and any consumer
+acting on a chain link (the mint above all) should re-verify the carrier
+rather than assume submit-time validation still holds.
+
+**Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
+task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
+is rejected. This is deliberately **unruled, not unimplemented** (PRD "Out
+of scope"): a recurring chain of act-then-done deploys has no agreed
+semantics for what re-running the action means. A future ruling can lift the
+restriction; until one exists, the rejection *is* the contract.
+
+**Exemplar** — a daily staleness check, seed link (note: no `minted_from`):
+
+```
+{
+  "task_kind": "deterministic",
+  "milestone": {"mode": "dated", "at": "2026-09-01T00:00:00+00:00"},
+  "before_done": {
+    "kind": "predicate",
+    "script": "scripts/check_reify_closure_staleness.sh",
+    "timeout_secs": 120
+  },
+  "recurrence": {"key": "reify-closure-staleness", "interval_secs": 86400}
+}
+```
+
+**Not live yet.** Only the metadata contract above is implemented. The
+mint-on-terminal step, the chain-state gauge, and the carrier's timeout
+category are separate PRD tasks. Filing a carrier today therefore gets you a
+*validated, time-withheld one-shot link* — not an auto-renewing chain.
+
 ---
 
 ## 7. Per-task model pins (`metadata.model_overrides`)
@@ -889,8 +986,18 @@ gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, source_finding_id,
 stage1_finding_id, origin_finding_id, spawned_from, program,
 program_stream, stream, cross_repo, cross_repo_project,
-human_curator_gate, human_curator_adjudicated_at, last_blocked_at
+human_curator_gate, human_curator_adjudicated_at, last_blocked_at,
+recurrence
 ```
+
+`recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
+submodel, so it is doubly exempt from the `unknown_key` scan (a registered
+key is already in `known_fields`). The blessing is deliberate
+belt-and-braces — it keeps the key suppressed if the registration is ever
+moved or made lazy, and it is what makes
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
+`x_`-namespace it, which for a submodel-backed key with live readers is the
+correct refusal. Every other key in this list is unregistered.
 
 The finding-provenance trio (`source_finding_id`, `stage1_finding_id`,
 `origin_finding_id`) is the one Tier-A family that does **not** meet the
