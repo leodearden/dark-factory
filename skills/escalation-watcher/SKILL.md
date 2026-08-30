@@ -350,11 +350,31 @@ Every decision must respect this order:
 **Hard constraints — violating these is never acceptable:**
 - Never delete tasks, databases, or anything outside the project directory
 - Never kill processes belonging to other orchestrators, the user, or the system
-- Never directly modify `.taskmaster/tasks/tasks.json` — all task mutations go through fused-memory MCP
+- Never directly modify `.taskmaster/tasks/tasks.db` — all task mutations go through fused-memory MCP
 - If the MCP is down, ask the human for help. MCP task mutations trigger reconciliation that maintains memory quality; bypassing it silently degrades the system.
 
-**tasks.json corruption detection:**
-If tasks.json has shrunk, task IDs are mismatched/duplicated, or tasks have disappeared — this is a **critical infrastructure error**:
+**tasks.db corruption detection:**
+Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
+`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
+file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
+not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
+change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+two instead:
+
+- **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
+  returns the exact count as `pagination['total']` in a response small enough to note every cycle (see
+  "Draining pending escalations" for why full dumps are the context sink to avoid). Compare against the
+  previous cycle's.
+- **`PRAGMA integrity_check`** — SQLite's own structural check. Read the db **read-only** so you never
+  contend with the live orchestrator, per the hard constraint above:
+  `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
+  than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
+  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
+  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+
+If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
+`integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
+disappeared — this is a **critical infrastructure error**:
 1. Find the orchestrator process **for this project only** — verify its command-line args reference this project's root before doing anything
 2. Send SIGTERM (not SIGKILL) and let it finish gracefully
 3. Tell the human immediately with full details
@@ -575,7 +595,7 @@ a record is ever hand-edited.
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
-the tasks.json-corruption park) is never auto-closed this way and needs explicit human closure.
+the tasks.db-corruption park) is never auto-closed this way and needs explicit human closure.
 Likewise, a decision whose `escalation_id` never resolves to a status — the escalation was purged
 by archive retention pruning, or never existed — also stays `open` forever and needs the same
 explicit human closure; until then, every cycle repeats a full scan of the escalations archive
