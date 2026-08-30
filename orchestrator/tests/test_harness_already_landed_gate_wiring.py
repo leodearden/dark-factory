@@ -363,7 +363,9 @@ def _open_escalation(
     """A pending escalation row as ``get_by_task(tid, status='pending')`` yields.
 
     ``filing_claimant_run_id`` is left at its default ``None`` (the shape every
-    legacy row and most current producers carry) — irrelevant for L1/L2, and
+    legacy row carries, and every producer that still does not stamp it — task
+    3550 added stamping to TaskWorkflow, Harness and the agent filing tools)
+    — irrelevant for L1/L2, and
     for L0 the gate passes ``live_claimant=False``, which classifies
     ``dead_l0`` identity-independently.
     """

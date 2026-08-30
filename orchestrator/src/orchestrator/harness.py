@@ -27,7 +27,7 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
-from shared.task_claimant import has_live_claimant
+from shared.task_claimant import compose_claimant_run_id, has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
@@ -246,6 +246,15 @@ _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
 # workflow waits on, giving get_by_task(..., level=2) a durable self-heal handle
 # and make_id a per-sentinel counter across restarts.
 _CONFIG_UNKNOWN_KEYS_SENTINEL: str = 'config-unknown-keys-startup'
+
+# The session_id component the harness embeds in the claimant identity it
+# stamps on every Escalation it files (task 3550, see
+# Harness._filing_claimant_run_id).  A FIXED literal, not a per-task value:
+# the harness is a process-level filer with no per-task session id at any of
+# its filing sites.  Deliberately not in TaskWorkflow.session_id's
+# f'{task_id}-{uuid4().hex[:8]}' shape — no '-', no '/', under 10 chars — so a
+# harness-filed record can never collide with a workflow's identity.
+_HARNESS_FILING_SESSION_ID: str = 'harness'
 
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
@@ -2015,6 +2024,58 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    @property
+    def _filing_claimant_run_id(self) -> str | None:
+        """This harness process's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        only while the incarnation that FILED it lives, judged by comparing
+        this value WHOLE against the live claimant.  Three facts a reviewer
+        needs about why this differs from
+        :attr:`TaskWorkflow._filing_claimant_run_id`:
+
+        1. The harness is a PROCESS-level filer, not a task-workflow
+           incarnation.  None of its ~28 filing sites has a per-task
+           ``session_id``, and there is no live-``TaskWorkflow`` registry to
+           look one up from — :meth:`is_workflow_active` is a bare
+           ``_workflow_cancel_events`` membership test, not a workflow map.
+           So a genuine per-task incarnation identity is structurally
+           unavailable here.
+        2. ``_HARNESS_FILING_SESSION_ID`` is therefore a fixed literal, and
+           deliberately disjoint from every ``{task_id}-{uuid8}`` workflow
+           session id.  A harness-filed L0 can never be mistaken for a
+           workflow handoff, whatever task id a workflow carries.
+        3. Unlike ``TaskWorkflow``'s property there is no DB claimant
+           counterpart this must stay byte-identical to — that constraint
+           comes from the dispatch stamp, which the harness does not write.
+           So an unknown ``_run_id`` (the pre-:meth:`run` startup window,
+           where ``__init__`` has only declared it ``None``) degrades to a
+           fail-safe ``None`` rather than emitting the well-shaped-but-wrong
+           partial ``'/harness/pid={pid}'``.  A partial would carry the
+           ``/pid=`` marker, survive ``pins._norm_id``'s shape guard, and then
+           be compared whole as if KNOWN — mismatching every live claimant.
+           This is the same choice ``workflow.py``'s ``lock_plan`` call site
+           already makes ("Passed RAW, not ``or ''`` as the DB stamp does"),
+           and the one task 3563 ratified when it left that DB stamp's
+           asymmetry in place.
+
+        Read via ``getattr`` because this sits on the ESCALATION-FILING path,
+        which ``Harness.__new__``-built test fixtures reach without running
+        ``__init__`` (see ``tests/_orch_helpers.py::_init_harness_state_for_test``).
+        That is the same reason the filing sites themselves read
+        ``getattr(self, '_escalation_queue', None)`` rather than the attribute
+        directly.  It widens nothing: a MISSING ``_run_id`` and a declared-but
+        -``None`` one are the same statement — the run id is unknown — and
+        point 3 above already routes unknown to a fail-safe ``None``.
+        """
+        run_id = getattr(self, '_run_id', None)
+        if not run_id:
+            return None
+        return compose_claimant_run_id(
+            run_id, _HARNESS_FILING_SESSION_ID, os.getpid(),
+        )
 
     def _is_action_teardown_task(self, tid: str) -> bool:
         """Bound-method wrapper wired as the ``suppress_blocked_write``
@@ -5337,6 +5398,7 @@ class Harness:
                 ),
                 suggested_action='manual_intervention',
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             self._escalation_queue.resolve(
@@ -5555,6 +5617,7 @@ class Harness:
             ),
             suggested_action='manual_intervention',
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store is not None:
@@ -6212,6 +6275,7 @@ class Harness:
                     ),
                     suggested_action='manual_intervention',
                     level=1,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self._escalation_queue.submit(esc)
                 if self.event_store:
@@ -6681,6 +6745,7 @@ class Harness:
                 f'be failing.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
 
@@ -6801,6 +6866,7 @@ class Harness:
                     f'loop and raises only for non-transient rejections.'
                 ),
                 suggested_action='investigate_persistence_layer_rejection',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -7019,6 +7085,7 @@ class Harness:
                     'this escalation.'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             # Cleared only on a successful file: while dedup suppresses, the
@@ -7102,6 +7169,7 @@ class Harness:
                     '_resolve_pool_storage_absent_escalation().'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 pool-storage-absent escalation %s', esc.id)
@@ -7176,6 +7244,7 @@ class Harness:
                     'fixed.'
                 ),
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 session-resume fallback-storm escalation %s', esc.id)
@@ -7263,6 +7332,7 @@ class Harness:
                 ),
                 suggested_action='investigate_and_resume_scheduler',
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning('Filed L1 scheduler-pause escalation %s', esc.id)
@@ -7334,6 +7404,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -7416,6 +7487,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -7480,6 +7552,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_investigation',
             level=0,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.info(
@@ -7579,6 +7652,7 @@ class Harness:
                 detail=detail,
                 suggested_action='Run reify/scripts/ensure-warm-base.sh',
                 level=0,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning(
@@ -7628,6 +7702,7 @@ class Harness:
                 detail=detail,
                 suggested_action='Run reify/scripts/ensure-warm-base.sh',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.warning(
@@ -7742,6 +7817,7 @@ class Harness:
                 ),
                 suggested_action='manual_investigation',
                 level=0,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
             logger.info(
@@ -8203,6 +8279,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -8279,6 +8356,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -8543,6 +8621,7 @@ class Harness:
                     'autonomous triage.'
                 ),
                 suggested_action='investigate_watcher_supervisor',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             logger.warning(
@@ -8681,6 +8760,7 @@ class Harness:
                 suggested_action=(
                     'Commit or stash the dirty files listed above in project_root.'
                 ),
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
         self._escalation_queue.submit(esc)
 
@@ -8780,6 +8860,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='fix_unknown_config_keys',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -11512,6 +11593,61 @@ class Harness:
 
         return _lookup
 
+    def _build_task_claimant_lookup(self) -> Callable[[str], Awaitable[str | None]]:
+        """Return an async callable (task_id) -> claimant_run_id|None (task 3550).
+
+        Injected into the escalation MCP server as ``task_claimant_lookup``,
+        the deliberate mirror of :meth:`_build_task_status_lookup`.  The server
+        stamps the returned value onto every agent-filed ``Escalation``'s
+        ``filing_claimant_run_id``, which is what lets ``escalation.pins``
+        Link 4 tell a live agent handoff from one filed by a dead incarnation.
+
+        WHY THE DB ROW IS THE SOURCE.  ``claimant_run_id`` holds the identity
+        ``TaskWorkflow``'s dispatch stamp wrote, via the very same
+        ``shared.task_claimant.compose_claimant_run_id`` call that
+        ``TaskWorkflow._filing_claimant_run_id`` uses — so an agent-filed
+        escalation is stamped with the identity of the incarnation that
+        DISPATCHED that agent, byte-identical to what that workflow stamps on
+        its own filings.  Reading it introduces no new coupling:
+        ``scheduler.get_task`` returning the full task dict is an already
+        proven server-side access pattern (the escalation server reaches
+        through ``getattr(harness, 'scheduler', None)`` to it in
+        ``_git_authority_task_metadata``); this is just a second, narrower
+        closure over the same source.
+
+        WHY NOT THE HEADER.  ``X-Escalation-Identity`` carries only a bare role
+        string (see the header constant here and
+        ``escalation/src/escalation/authority.py``), is read only at non-filing
+        sites (``resolve_issue``, ``stamp_triage``, ``promote_to_l2``), and
+        regular dispatched agents send no header at all — no run_id/session_id/
+        pid ever crosses the escalation MCP boundary in any form.  A new tool
+        argument was likewise rejected: it would be caller-supplied and
+        therefore unenforceable, the weakness ``server.py`` already documents
+        for ``agent_role``.
+
+        TOTAL BY CONSTRUCTION.  Every degraded outcome — no such task, no
+        ``claimant_run_id`` key, a ``None``/blank value, or a raising
+        ``get_task`` — yields ``None``, which ``pins`` reads as UNKNOWN and
+        fails safe to pinning.  The server has its own fail-open, but that
+        exists for genuinely unexpected breakage; letting ordinary conditions
+        propagate into it would be a louder path to the same answer.
+        """
+        async def _lookup(task_id: str) -> str | None:
+            try:
+                task = await self.scheduler.get_task(task_id)
+            except Exception as exc:
+                logger.warning(
+                    'task_claimant_lookup: get_task(%s) failed, filing '
+                    'identity left unknown: %s', task_id, exc,
+                )
+                return None
+            claimant = (task or {}).get('claimant_run_id')
+            # Blank/whitespace normalises to None so an empty string never
+            # reaches escalation.pins._norm_id as a pseudo-value.
+            return (claimant or '').strip() or None
+
+        return _lookup
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -11558,6 +11694,7 @@ class Harness:
             event_store=self.event_store,
             harness=self,
             task_status_lookup=self._build_task_status_lookup(),
+            task_claimant_lookup=self._build_task_claimant_lookup(),
             merge_inflight_registry=self._merge_inflight_registry,
         )
         host = self.config.escalation.host
@@ -11791,6 +11928,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_stranded_escalation',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             logger.warning(
@@ -12751,6 +12889,7 @@ class Harness:
                 worktree=None,
                 workflow_state=esc.workflow_state,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(reesc)
             self._escalation_queue.resolve(
@@ -13615,6 +13754,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
@@ -13864,6 +14004,7 @@ class Harness:
             detail=detail,
             suggested_action=suggested_action,
             level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -13941,6 +14082,7 @@ class Harness:
             detail=detail,
             options=options,
             level=2,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
         if self.event_store:
@@ -15079,6 +15221,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_reblock_loop',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -15184,6 +15327,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_lane_record_drift',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:
@@ -15311,6 +15455,7 @@ class Harness:
                 summary=summary,
                 detail=detail,
                 suggested_action='investigate_warm_lane_structural_exhaustion',
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             queue.submit(esc)
             try:

@@ -57,11 +57,18 @@ Over-fold evidence (default-empty; task 3998):
               log-scrape.
   SOLE WRITER: `queue.add_members_to_l2` (also the sole trimmer).
 
-Filing-identity field (default-None; task 3533):
+Filing-identity field (default-None; task 3533, populated by task 3550):
   filing_claimant_run_id:
               the FILING incarnation's claimant id in
               `shared.task_claimant.compose_claimant_run_id` format;
-              None = unknown.  Semantics and the fail-safe rule are stated
+              None = unknown.  STAMPED BY: `orchestrator.workflow.TaskWorkflow`,
+              `orchestrator.harness.Harness`, and the
+              `escalate_blocker`/`escalate_info` chokepoint in
+              `escalation.server`.  For the producers that do NOT stamp it —
+              and why each one's records are (or are not) moot — see the
+              inventory on `escalation.pins.classify_pins`; do not restate or
+              summarise it here, and in particular do not assume the
+              non-stamping set is level-1/2-only.  Semantics and the fail-safe rule are stated
               once on `escalation.pins.classify_pins` (normative source:
               spec docs/task-escalation-state-spec.md S6) — do not restate
               them here.
@@ -365,6 +372,9 @@ class Escalation:
     # serialises it automatically, and queue.submit / submit_resolved /
     # _atomic_write / resolve / park / stamp_triage need NO change (they are
     # field-agnostic passthroughs or RMW-on-hydrated-record).
+    # Stamped by TaskWorkflow, Harness, and the escalate_blocker/escalate_info
+    # chokepoint (task 3550); None on legacy rows and from non-stamping
+    # producers such as submit.py's detached CLI.
     filing_claimant_run_id: str | None = None
     # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
     # overwrites this record's own root_cause / detail / options / summary — the
