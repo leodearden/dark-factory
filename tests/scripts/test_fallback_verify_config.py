@@ -605,6 +605,12 @@ POST_CAP_ORCHESTRATOR_GREEN_SECS = {
 # percentiles and the n that produced them cannot drift apart.
 POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
+# The day commit 685f558728 landed `verify_admission_pytest_n: "8"`, capping
+# orchestrator's xdist fanout. Any `orchestrator` figure measured before this
+# describes the SUPERSEDED regime; the provenance guard below anchors on this
+# date rather than on "orchestrator is the newest row in the table".
+FANOUT_CAP_LANDED_ON = datetime.date(2026, 8, 20)
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE — this table now spans TWO measurement epochs. Do not read it as
@@ -766,30 +772,31 @@ def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
             'observed, even when it is 1.'
         )
 
-    # (c) The re-measurement must be visible as data: orchestrator's entry is
-    #     strictly newer than every figure it was NOT measured alongside.
+    # (c) The re-measurement must be visible as data: orchestrator's entry
+    #     post-dates the regime change it exists to record.
+    #
+    #     ANCHORED ON THE REGIME, NOT ON RANK. The property wanted here is
+    #     "orchestrator's figure was taken under the current -n 8 regime", not
+    #     "orchestrator is the newest row". The latter would encode a one-time
+    #     accident — task 4902 happened to re-measure only this segment — as a
+    #     permanent invariant, and would go red the moment someone HONESTLY
+    #     re-measured any other segment on a later date, with no remedy except
+    #     back-dating that measurement or deleting this assertion. A date floor
+    #     catches the failure actually worth catching (the orchestrator figure
+    #     silently reverted to its pre-cap value) and lets every legitimate
+    #     later re-measurement land untouched.
     orchestrator = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
-    others = {
-        segment: record
-        for segment, record in MEASURED_FLEET_SEGMENT_PROVENANCE.items()
-        if segment != 'orchestrator'
-    }
-    newest_other = max(
-        others.items(), key=lambda kv: datetime.date.fromisoformat(kv[1].measured_at)
-    )
     assert (
-        datetime.date.fromisoformat(orchestrator.measured_at)
-        > datetime.date.fromisoformat(newest_other[1].measured_at)
+        datetime.date.fromisoformat(orchestrator.measured_at) >= FANOUT_CAP_LANDED_ON
     ), (
         f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at="
-        f'{orchestrator.measured_at} is not strictly later than the newest other '
-        f"segment ('{newest_other[0]}', {newest_other[1].measured_at}). Task 4902 "
-        're-measured ONLY the orchestrator segment, so it must be the newest '
-        'entry in the table. If this fails, either the orchestrator figure was '
-        'reverted to a pre-4902 value without reverting its provenance — which '
-        'is exactly what this assertion exists to catch — or the other four were '
-        're-measured too, in which case update their records rather than '
-        'relaxing this.'
+        f'{orchestrator.measured_at} predates {FANOUT_CAP_LANDED_ON.isoformat()}, '
+        'the day commit 685f558728 landed `verify_admission_pytest_n: "8"` and '
+        'stepped this segment ~2.6x. A pre-cap date means the recorded figure '
+        'describes the SUPERSEDED regime — which is the defect task 4902 was '
+        'filed to fix, so this most likely means the re-measurement was reverted '
+        'without its provenance being reverted too. Re-measure under the current '
+        'regime and record that date; do not simply re-date the old figure.'
     )
 
     # (d) The recorded sample and the recorded percentiles must describe the
