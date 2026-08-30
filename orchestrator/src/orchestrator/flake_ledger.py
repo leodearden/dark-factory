@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)
 
@@ -852,6 +853,34 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+def _owner_liveness(status: str | None) -> str:
+    """Three-way verdict on a stored owner's LIVE status: ``open`` | ``deferred`` | ``closed``.
+
+    Mirrors ``orchestrator/src/orchestrator/chronic_flake.py::_is_open_status``'s
+    ``status not in TERMINAL and status != 'deferred'`` predicate against the same source
+    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to three values
+    so ``deferred`` stays distinguishable.
+
+    Why that refinement is load-bearing and not a nicety: ``planning_mode=True`` creates
+    the task ``deferred``, so between ``submit_task`` and ``commit_planning`` there is a
+    real window in which a crash or a failed second round-trip leaves a task that EXISTS
+    but will never be dispatched.  The boolean predicate classifies that as NOT open, so
+    every subsequent suppression of the same test would file another orphan — a
+    duplicate-generating loop that gets worse the more the test flakes.  The
+    ``deferred`` branch finishes the half-done filing instead.
+
+    Empty/absent is ``closed``: ``get_statuses`` silently OMITS ids it does not know, so
+    a missing entry from a SUCCESSFUL read is a corroborated absence (the task was
+    deleted).  A FAILED read never reaches here — see :func:`_ensure_owner_task`, where
+    an unreadable status is explicitly not treated as evidence of anything.
+    """
+    if not status:
+        return 'closed'
+    if status == 'deferred':
+        return 'deferred'
+    return 'closed' if status in TERMINAL else 'open'
+
+
 def _write_owner_task_id(db_path: Path, test_id: str, owner_task_id: str) -> None:
     """Point *test_id*'s debt row at *owner_task_id*.
 
@@ -894,6 +923,12 @@ async def _ensure_owner_task(
     which already dedupes on a fixed sentinel; here the sentinel is ``owner_task_id`` on
     the debt row.
 
+    INV-3, verbatim and load-bearing: a stored ``owner_task_id`` is a SNAPSHOT.  The
+    task behind it may have gone terminal, been cancelled, or been deleted since it was
+    written, so it is re-read against LIVE status every time and NEVER assumed
+    still-open.  Short-circuiting on a non-NULL ``owner_task_id`` would satisfy the
+    invariant's letter while pointing stale rows at done tasks forever.
+
     COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
     except the initial filing.  It never marks a task done, never blocks one, never
     reprioritises one — a de-flake task's lifecycle belongs to the orchestrator, and the
@@ -913,6 +948,39 @@ async def _ensure_owner_task(
             row.test_id,
         )
         return row
+
+    if row.owner_task_id:
+        # INV-3: corroborate BEFORE acting.  The stored id is a snapshot; it is re-read
+        # against live status on every suppression and never assumed still-open.
+        statuses = await task_client.get_statuses([row.owner_task_id])
+        liveness = _owner_liveness(statuses.get(row.owner_task_id))
+        if liveness == 'open':
+            logger.debug(
+                'flake_ledger: debt for test_id=%s is already owned by live task %s',
+                row.test_id,
+                row.owner_task_id,
+            )
+            return row
+        if liveness == 'deferred':
+            # A half-completed initial filing, not a closed one.  Finish it — filing a
+            # SECOND task here is the duplicate-generating loop _owner_liveness exists
+            # to prevent.  Completing the initial filing is explicitly exempted from
+            # §5.9's coupling rule; this is still never lifecycle management.
+            logger.info(
+                'flake_ledger: completing the half-filed de-flake task %s for test_id=%s '
+                '(deferred — its commit_planning never landed)',
+                row.owner_task_id,
+                row.test_id,
+            )
+            await task_client.commit_planning([row.owner_task_id])
+            return row
+        logger.info(
+            'flake_ledger: de-flake task %s owning test_id=%s is no longer live '
+            '(status=%r) — filing a replacement',
+            row.owner_task_id,
+            row.test_id,
+            statuses.get(row.owner_task_id),
+        )
 
     arguments = build_deflake_task_arguments(row)
     new_id = str(await task_client.submit_task(arguments) or '')
