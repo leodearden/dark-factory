@@ -75,17 +75,18 @@ def _open_param(name: str) -> str:
     return _LT + 'parameter name="' + name + '">'
 
 
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal.
+#: ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single owner of the literal
+#: set, INV-5) plus the two structural prefixes every built specimen uses, so a
+#: builder output spelled out by hand is caught even when it is not itself one
+#: of the enumerated literals. Applied to this module's OWN BYTES at import, and
+#: to the JOURNAL FILE the sink writes — the same predicate, two artifacts.
+_FORBIDDEN_SEQUENCES = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
 
-    Checked against ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single
-    owner of the literal set, INV-5) plus the two structural prefixes every
-    built specimen uses, so a builder output spelled out by hand is caught even
-    when it is not itself one of the enumerated literals.
-    """
+
+def _assert_no_raw_sentinels() -> None:
+    """Fail at IMPORT if this file's own bytes carry a raw envelope literal."""
     source = Path(__file__).read_text(encoding='utf-8')
-    forbidden = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
-    for sequence in forbidden:
+    for sequence in _FORBIDDEN_SEQUENCES:
         if sequence in source:
             raise AssertionError(
                 f'{Path(__file__).name} contains a RAW envelope sentinel '
@@ -315,3 +316,89 @@ class TestConcurrentAppendsNeverLoseALine:
         assert len({line['param'] for line in lines}) == writers * per_writer, (
             'every distinct record survived, not merely the right count of them'
         )
+
+
+# ---------------------------------------------------------------------------
+# The journal FILE is itself a file an agent can safely read.
+# ---------------------------------------------------------------------------
+
+
+class TestTheJournalNeverHoldsARawEnvelopeLiteral:
+    """The escaping contract, applied to the ARTIFACT rather than to a source file.
+
+    This journal records envelope literals BY CONSTRUCTION — the ``pattern`` and
+    ``misclose`` fields ARE the leaked markup. A file holding them verbatim is a
+    file no agent can safely read or edit: pulling it into a tool-call argument
+    reproduces the exact over-consumption defect the journal exists to record,
+    at the one artifact an operator is told to open. That is the hazard
+    ``shared/src/shared/toolcall_markup.py`` warns about and the reason the
+    committed specimen corpus escapes every literal the same way.
+    """
+
+    def test_the_fixture_really_carries_markup_to_escape(self):
+        """(c) A control: the test cannot pass by being handed a clean specimen."""
+        assert any(literal in _PATTERN for literal in ENVELOPE_LITERALS), (
+            'the pattern specimen must be a real envelope literal, or (a) below '
+            'is vacuous'
+        )
+        assert _MISCLOSE.startswith(_LT + '/'), (
+            'the mis-close specimen must carry the structural closing prefix'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_written_file_holds_no_raw_sentinel(self, tmp_path):
+        """(a) The same predicate ``_assert_no_raw_sentinels`` applies to source."""
+        sink = build_sink(tmp_path)
+
+        await sink(make_fact())
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_text(
+            encoding='utf-8'
+        )
+        for sequence in _FORBIDDEN_SEQUENCES:
+            assert sequence not in raw, (
+                f'the journal holds a RAW envelope sentinel ({sequence!r}) — '
+                'reading this file into a tool-call argument would reproduce '
+                'the defect it records'
+            )
+        assert _LT not in raw, (
+            'no opening angle bracket at all: a partial escape leaves a shape '
+            'a future literal could slip through'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_escape_is_lossless_not_sanitisation(self, tmp_path):
+        """(b) Escaped on the way to disk, IDENTICAL on the way back out.
+
+        A journal that mangled the pattern would answer "something leaked" while
+        destroying which literal it was — the one field that says what the
+        upstream harness bug actually emitted.
+        """
+        sink = build_sink(tmp_path)
+        fact = make_fact()
+
+        await sink(fact)
+
+        (line,) = journal_lines(tmp_path)
+        assert line['pattern'] == _PATTERN
+        assert line['misclose'] == _MISCLOSE
+
+    @pytest.mark.asyncio
+    async def test_an_angle_bracket_anywhere_in_the_record_is_escaped(self, tmp_path):
+        """The replacement is blanket, so a NEW field carrying markup is covered too.
+
+        In JSON output the opening angle bracket can only ever occur inside a
+        string, so escaping every occurrence is both sufficient and safe — it
+        can never touch the structural punctuation.
+        """
+        sink = build_sink(tmp_path)
+        smuggled = 'prose ' + _close('rationale') + ' more prose'
+
+        await sink(make_fact(some_future_key=smuggled))
+
+        raw = markup_journal.journal_path(tmp_path, 'plan-tools').read_text(
+            encoding='utf-8'
+        )
+        assert _LT not in raw
+        (line,) = journal_lines(tmp_path)
+        assert line['some_future_key'] == smuggled
