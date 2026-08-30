@@ -747,6 +747,24 @@ _MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
 # about. `TestSessionResumeStorm::
 # test_by_design_constant_classifies_every_producible_reason` reads the
 # predicate's source and fails if a reason is added without being classified.
+#
+# HANDOFF TO ε (task 3733) — what this carve-out gives up, recorded so the
+# replacement is designed rather than assumed. Exempting `no_transcript`
+# removes the only AUTOMATED alarm on the one failure mode the runbook still
+# calls unexplained: OPERATIONS.md "Caveat U2" states outright that what
+# removes the live transcript from a lane's config dir is not known. That arm
+# is reached specifically when the config dir SURVIVED (the `reseeded` arm is
+# the provably-wiped one), so it is the disappearance itself, not a lane
+# reseed. Exempting it is still right — a run of them is EXPECTED at today's
+# rate, so the L1 it filed was noise, and INV-3 telemetry is retained in full:
+# every one still emits `session_resume_fallback` with 'no_transcript' in
+# data.reasons. But ε's feeder is archive-RESTORE failure, a DIFFERENT
+# population: a restore that succeeds leaves the disappearance unexplained and
+# now unwatched. So ε (or a sibling) must add a RATE-based watch on
+# `session_resume_fallback` where data.reasons is ['no_transcript'] — a step
+# change in the rate, not a run of them — to replace what this line removes.
+# Do NOT close that gap by putting 'no_transcript' back on the streak: the
+# streak is a consecutive-run detector and the signal here is a rate change.
 _BY_DESIGN_SESSION_RESUME_REASONS: frozenset[str] = frozenset({
     'disabled',       # kill switch — the feature is off (B6)
     'capped',         # per-task resume throttle (B7)

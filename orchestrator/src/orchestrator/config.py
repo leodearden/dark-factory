@@ -937,7 +937,15 @@ class SessionResumeConfig(BaseModel):
             'storm_window_secs (and reset to 0 on any eligible resume) rather '
             'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
             'above both the resume cap and ordinary collision noise, so only '
-            'systematic breakage trips it.'
+            'systematic breakage trips it. '
+            'NOT CURRENTLY REACHABLE, by design and only for now: with '
+            "today's reason vocabulary EVERY producible reason is by-design, "
+            'so the streak has no feeder and this threshold cannot fire at '
+            'any value. Tuning it changes nothing until PRD leaf epsilon '
+            '(task 3733) installs the first genuine feeder '
+            '(archive-restore failure); the mechanism is retained unfed so '
+            'that lands on a tested path. Until then, watch the '
+            'session_resume_fallback event rate directly.'
         ),
     )
     storm_window_secs: int = Field(
@@ -956,7 +964,13 @@ class SessionResumeConfig(BaseModel):
             'with a wide margin on both sides. Measured on the monotonic '
             'clock, deliberately: the stale reason is itself PRODUCED by '
             'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect.'
+            'failure mode it must detect. '
+            'Its ESCALATION-driving role is inert for the same reason '
+            'fallback_storm_threshold is (see above) — nothing feeds the '
+            'streak until task 3733 — but the window is still LIVE as the '
+            'expiry clock: it is evaluated on every dispatch carrying a '
+            'recovered session, so shortening it still changes when a run '
+            'is considered over.'
         ),
     )
 
