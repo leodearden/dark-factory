@@ -975,6 +975,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
+<!-- tier-a-blessed-keys-mirror -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -983,12 +984,22 @@ user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
-before_done_verified_pid, files_tagged_at, source_finding_id,
-stage1_finding_id, origin_finding_id, spawned_from, program,
-program_stream, stream, cross_repo, cross_repo_project,
+before_done_verified_pid, files_tagged_at, files_tagged_empty,
+source_finding_id, stage1_finding_id, origin_finding_id, spawned_from,
+program, program_stream, stream, cross_repo, cross_repo_project,
 human_curator_gate, human_curator_adjudicated_at, last_blocked_at,
-recurrence
+recurrence, execution_class
 ```
+<!-- /tier-a-blessed-keys-mirror -->
+
+This listing is **machine-checked** against the live frozenset by
+`tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
+anchors on the `tier-a-blessed-keys-mirror` markers above — so keep edits
+inside them, and expect a red suite rather than silent drift if a blessing
+lands here but not in code (or vice versa). Before that guard existed this
+copy was hand-maintained prose: task 4372 had to mirror two keys across in a
+separate follow-up commit, and the frozenset's own header comment sat stale
+across two blessings.
 
 `recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
 submodel, so it is doubly exempt from the `unknown_key` scan (a registered
@@ -1017,6 +1028,28 @@ Tier-B below for which spelling to use in new writes.
 filer is itself registered), and read by **both** the orchestrator's
 dispatch-time cross-repo admission gate (which blocks the task before any
 agent spins up) and its pre-merge narrowing gate.
+
+`execution_class` is blessed on the standard "already relied on by real
+writers" criterion — unlike the finding-provenance trio, which is the
+documented exception. It is machine-read at the fused-memory submit boundary
+by `execution_class_guard`, `operational_routing_guard` (which coerces
+`operational` / `decision` to `task_kind='deterministic'` +
+`always_escalates`, a real dispatch consequence), `routing_intent_guard`,
+`operational_suggestion_guard`, `operational_ask_registry`, the
+`task_interceptor` gate-marker set, and the task curator's decision-cache key.
+
+It is deliberately **not** a typed field, even though `EXECUTION_CLASSES` in
+`recon_self_model` looks like a closed vocabulary — a reader who assumes
+otherwise will re-litigate this. Two reasons, both recorded beside the
+frozenset entry (which also carries the point-in-time census, per the
+one-place rule): its validity rule is conditional on recon-stage **caller
+identity**, which no pydantic field validator can express, so validation
+correctly lives in the boundary guard; and the vocabulary is not closed in the
+data, so a `Literal` would raise on every metadata write to the landed tasks
+carrying an out-of-vocabulary value. Note also that `EXECUTION_CLASSES` is not
+the write-time contract: `operational_routing_guard` and
+`operational_ask_registry` each hardcode their own `{operational, decision}`
+set rather than deriving it.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are
@@ -1209,30 +1242,50 @@ there only for a genuinely load-bearing, stable convention; Tier-B/C drift
 should be fixed by renaming to the canonical key or moving under `x_`, not
 by blessing it.
 
-### Known gaps (measured 2026-08-06 — not fixed)
+**Blessing is not second-best to typing.** `execution_class` (task 3780) is
+the worked example, because a closed-looking vocabulary makes typing look
+obviously right and the next reader will otherwise re-litigate it. Three
+facts decided it. (1) Its validity rule is conditional on recon-stage
+**caller identity**, which a pydantic field validator cannot see — the note
+on `operational_mode` in `shared/src/shared/task_metadata.py` records this
+explicitly, contrasting `operational_mode` as the caller-*independent* rule
+a typed `Literal` can carry. (2) The vocabulary is not closed in the data:
+landed `done` tasks carry an out-of-vocabulary value, and a `Literal` would
+raise on every metadata write to them under `direction='write',
+enforce=True` — permanently, since the `done_provenance` write-authority
+floor (below) makes them unrepairable. `shared/tests/test_task_metadata.py`
+pins that value as *accepted* so the constraint is not silently
+re-tightened. (3) `EXECUTION_CLASSES` is not the write-time contract
+anyway: `operational_routing_guard` and `operational_ask_registry` each
+hardcode their own `{operational, decision}` set rather than deriving from
+it. Generalising: prefer blessing when validation is context-dependent, when
+the live corpus already contains values a type would reject, or when the
+apparent enum is not the thing writers are actually held to.
 
-Three `unknown_key` sources are known, measured, and deliberately left
+### Known gaps (re-measured 2026-08-18 — not fixed)
+
+Two `unknown_key` sources are known, measured, and deliberately left
 open. They are recorded here so the next reader does not re-measure them.
-All counts are a snapshot of a **growing** corpus (3553 tasks carried dict
-metadata at measurement), not an invariant.
+All counts are a snapshot of a **growing** corpus (4204 tasks carried dict
+metadata at the latest measurement, up from 3553 when this section was
+first written), not an invariant.
 
 | Gap | Measured | Owner |
 |---|---|---|
-| `execution_class` is read by two live guards but is neither blessed nor typed | 272 tasks | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
-| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 — 29 distinct tasks, of which only 6 are writable today | task 4302 |
 | Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
 
-**`execution_class`** is not in `_BLESSED_METADATA_KEYS`, is not a typed
-`TaskMetadata` field and is not a registered submodel — yet
-`execution_class_guard` and `routing_intent_guard` both read it, so every
-one of those 272 tasks plausibly emits this same warning class. It was
-deliberately **not** blessed by task 3697: 272 tasks and two live guards
-make it a broader vocabulary decision (bless / promote to a typed field /
-retire) than a single-task cleanup should settle. Originally recorded as
-Finding 5 of the toolcall-markup-containment capability manifest. The
-count is still climbing — 253 at that PRD's decompose, 272 here.
+**`execution_class` was the third row here and is now CLOSED** — task 3780
+blessed it into Tier-A rather than typing or retiring it. Recorded so a
+reader arriving from an older revision does not re-open it: the fork was
+decided, not deferred. Retiring was ruled out because `operational_mode` is
+documented as *orthogonal*, not a substitute, so there was nothing to
+migrate to; typing was ruled out for the reasons under "Promoting a
+convention" above. See the frozenset entry in
+`shared/src/shared/task_metadata.py` for the census and the reader list.
 **Semantics** (what the key actually does at submit): §4's
-"`execution_class` routes to a HUMAN" subsection.
+"`execution_class` routes to a HUMAN" subsection — blessing changed the
+key's census standing, not its dispatch consequence.
 
 **The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
 a ~30-task metadata rewrite has a very different blast radius from one
@@ -1250,8 +1303,20 @@ its own timestamped pre-write snapshot and never overwrites an existing
 one — a path you named is refused, one the script chose steps aside — so
 the re-run prescribed here cannot cost you the original row.
 
-**The write-path blocker** is why the third row is still open, and it
-bounds both of the others: `update_task` rejects any metadata payload
+What actually gates the sweep is **writability**, not effort. Of the 29
+target tasks, 23 carry `done_provenance` and are structurally unwritable
+under the floor described below; only 3048, 3084, 3116, 3162, 3282 and 3501
+can be migrated today. Sweeping just those six is worse than not sweeping:
+it forks the vocabulary across the corpus for a fifth of the benefit, which
+is the outcome the canonical-spelling convention exists to prevent. Hence
+task 4302 (split out of task 3780, which reached this measurement while
+closing the `execution_class` row; originally filed as
+`tkt_0RSM2ECXBS1RPHMGYQVZ0V3QZZ`, which the curator dropped into 4302 as a
+duplicate) carries a hard dependency on task 3777 and should not be started
+before it lands.
+
+**The write-path blocker** is why the second row is still open, and it
+bounds the other one too: `update_task` rejects any metadata payload
 containing `done_provenance` — a presence-only write-authority floor
 evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
 retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`

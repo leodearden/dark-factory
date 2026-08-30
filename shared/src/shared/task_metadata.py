@@ -965,7 +965,7 @@ class SchemaWarning(BaseModel):
 _WHOLE_METADATA_FIELD = '<metadata>'
 
 
-# Tier-A: the 39 load-bearing conventional metadata keys that real writers
+# Tier-A: the load-bearing conventional metadata keys that real writers
 # (orchestrator, curator, DeterministicRunner, escalation flows) already
 # depend on but that are not (yet) typed TaskMetadata fields. Skipped in
 # parse_metadata's unknown-key scan below so a deliberate, documented
@@ -1118,6 +1118,41 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # R-D4) is the ONE blessed key that is also a registered submodel — see
         # the header note above on why the overlap is deliberate.
         'recurrence',
+        # Recon-stage execution-class discriminator (task 3780): machine-read
+        # by live guards at the fused-memory submit boundary, with real
+        # dispatch consequences rather than decorative ones. Readers, named
+        # because that is what a future reader greps when deciding whether the
+        # key is still load-bearing (all re-verified 2026-08-18):
+        # `execution_class_guard.execution_class_error` (the recon-stage submit
+        # gate), `operational_routing_guard` (coerces 'operational'/'decision'
+        # to task_kind='deterministic' + always_escalates),
+        # `routing_intent_guard` / `operational_suggestion_guard`
+        # (`_EXEMPT_EXECUTION_CLASSES`), `operational_ask_registry`
+        # (`_BOUNDARY_OWNED_EXECUTION_CLASSES`), `task_interceptor`
+        # (`_GATE_MARKER_KEYS`, consumed by `_is_gate_metadata` /
+        # `_candidate_from_kwargs`) and `task_curator` (decision-cache key).
+        #
+        # Census (2026-08-18): 336 of 4204 dict-metadata tasks carry it —
+        # code_tdd 196, operational 126, decision 12, implementation 2. As with
+        # the finding-provenance entries above, this comment is deliberately
+        # the SINGLE in-repo copy of those figures: the dedicated test's
+        # docstring and docs/task-authoring.md §8 cite the reasoning and point
+        # here instead, so a re-census updates one place.
+        #
+        # BLESSED rather than promoted to a typed field, even though
+        # recon_self_model.EXECUTION_CLASSES looks like a closed vocabulary.
+        # Two reasons, and the next reader will re-litigate this without them.
+        # (1) The note on `operational_mode` above already records that
+        # execution_class is validated only by a guard conditional on
+        # recon-stage caller identity — logic a pydantic field validator cannot
+        # express — and contrasts operational_mode as the caller-INDEPENDENT
+        # rule a Literal can carry. (2) The vocabulary is not actually closed in
+        # the data: tasks 3623 and 3624 carry 'implementation', and both are
+        # `done` carrying done_provenance, so a Literal would raise on every
+        # metadata write to them (direction='write', enforce=True) and they are
+        # unrepairable until task 3777 lifts the presence-only write-authority
+        # floor.
+        'execution_class',
     }
 )
 

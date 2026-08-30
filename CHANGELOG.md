@@ -144,6 +144,63 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 
 ### Changed
 
+#### `execution_class` blessed into Tier-A, and the Tier-A listing is now machine-checked (task 3780)
+
+**Two changes, and the second matters more than the first.**
+
+**`execution_class` is now a Tier-A blessed metadata key.** It had eight
+production read sites across seven modules — `execution_class_guard`,
+`operational_routing_guard` (which coerces `operational`/`decision` to
+`task_kind='deterministic'` + `always_escalates`, a real dispatch consequence),
+`routing_intent_guard`, `operational_suggestion_guard`,
+`operational_ask_registry`, the `task_interceptor` gate-marker set and the task
+curator's decision-cache key — while still emitting `code=unknown_key` on every
+read. Measured 2026-08-18: **336 of 4204 dict-metadata tasks carry it**
+(`code_tdd` 196, `operational` 126, `decision` 12, `implementation` 2), so that
+is 336 census lines removed.
+
+Blessed rather than promoted to a typed `Literal`, despite `EXECUTION_CLASSES`
+looking like a closed vocabulary. Its validity rule is conditional on
+recon-stage caller identity, which no pydantic field validator can see; and the
+vocabulary is not closed in the data — tasks 3623/3624 carry `'implementation'`,
+and both are `done` carrying `done_provenance`, so a `Literal` would raise on
+every metadata write to them and they stay unrepairable until task 3777 lands.
+That acceptance is now pinned by a test, so the constraint cannot be silently
+re-tightened into a stranding bug. `docs/task-authoring.md` §8 "Promoting a
+convention" records the generalised rule.
+
+**`docs/task-authoring.md` §8's Tier-A listing is now pinned to the frozenset**
+by `tests/scripts/test_task_authoring_blessed_keys_drift.py`, anchored on a
+`tier-a-blessed-keys-mirror` marker pair. This is the structural half. The
+listing is what a task author reads before deciding whether a key they are about
+to write will manufacture census noise, and nothing kept it in step with the
+code. The failure is measured, not hypothetical: task 4372 blessed two keys the
+day before, then mirrored them into the doc by hand in a *separate* follow-up
+commit whose own message names the hazard — "hand-maintained prose with no sync
+test, so it drifts silently if not mirrored by hand". Under-listing is the
+dangerous direction: an author sees a blessed key absent, concludes it is
+unblessed, and either `x_`-renames a machine-written key — forking the
+vocabulary against every sibling task and blinding its live reader — or files a
+redundant blessing task. The same file's frozenset header comment had meanwhile
+gone stale across two blessings, claiming 39 keys against 42; that count is now
+dropped rather than re-derived, since a hand-maintained denominator needs a hand
+re-count on every future blessing.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Re-measured after the change: **1622 tasks still carry at least one unknown
+key** (down from 1688 — the blessing removes 336 warning *lines* but clears only
+66 tasks entirely, because most carry other unknown keys too), spread across
+**975 distinct spellings**, 725 of which appear on exactly one task. The largest
+single contributor is `related_tasks` at 445 tasks — which is the *canonical*
+Tier-B spelling, not drift. Blessing one key does not move that number much, and
+the remaining tail is deliberately left warning as a drift signal.
+
+Also splits out the corpus `x_` sweep that this task originally carried, as task
+4302: 23 of its 29 target tasks carry `done_provenance` and are unwritable until
+task 3777 lands, and sweeping only the 6 writable ones would fork the vocabulary
+for a fifth of the benefit. §8's Known-gaps table is re-pointed and re-measured
+accordingly; the `execution_class` row there is now closed.
+
 #### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
 
 **Behaviour change, operator-visible.** Two changes to the pre-write snapshot
