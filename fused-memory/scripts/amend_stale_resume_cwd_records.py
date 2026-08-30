@@ -158,16 +158,26 @@ WRITE_REASON = (
     'hygiene warning that says it is uncorrected (task 4610, esc-3578-5)'
 )
 
-#: Distinctive substring present in BOTH replacement texts. This is what
-#: carries idempotency: a record already containing it has been amended, so a
-#: re-run skips it rather than tripping the pre-image mismatch refusal.
+#: Distinctive substring present in BOTH landed corrections. It no longer marks
+#: "a record THIS SCRIPT amended" — it marks "a record carrying the landed
+#: correction, whichever path applied it". The correction reached both records
+#: on 2026-08-30 through a Stage-1 memory consolidation, via the authorized
+#: ``recon-stage-*`` path this script could not use, and both texts name it.
+#:
+#: This one constant is what makes the whole run a zero-write no-op: the
+#: classifier tests the sentinel BEFORE the pre-image comparison, so both
+#: targets classify ``skip:already_amended``, which is not in
+#: :data:`ERROR_OUTCOMES`. That reuses the idempotency path steps 3/4/13/14
+#: already pin rather than adding a parallel "already corrected elsewhere"
+#: branch. If a future consolidation rewords past this substring the result is
+#: a loud refusal, not a silent pass — the desired failure direction.
 #:
 #: It lives in CONTENT rather than metadata deliberately — content is the field
 #: already read for the pre-image check (no extra fetch), it survives a
 #: metadata wipe or a ``metadata_mode='replace'`` from an unrelated sweep, and
 #: it keeps idempotency independent of whether the optional metadata arm
 #: survives vocabulary validation.
-AMENDED_SENTINEL = 'amended in place by task 4610'
+AMENDED_SENTINEL = 'Stage-1 memory consolidation, task 4610'
 
 #: Outcomes meaning the corpus did not get what the plan intended. Named once,
 #: here, so :func:`resolve_exit_code` and the report agree on what "clean"
@@ -190,139 +200,134 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
 
 @dataclass(frozen=True)
 class AmendTarget:
-    """One record to amend, with the pre-image it must still match.
+    """One record to corroborate, and -- if it carries one -- the text to write.
 
-    ``expected_preimage`` is the record's exact content as read live from Mem0
-    on 2026-08-28 while authoring this script. It is the corroboration key, not
-    documentation: :func:`classify_amend_target` refuses to write unless the
-    live content still equals it, so a record that moved underneath us produces
-    a loud refusal instead of a silent clobber.
+    ``expected_preimage`` is the record's exact content as read LIVE from Mem0
+    on 2026-08-30, AFTER the Stage-1 consolidation landed the correction. It is
+    the corroboration key, not documentation: :func:`classify_amend_target`
+    compares against it, so a record that has drifted from the landed text
+    produces a loud refusal rather than a silent pass.
 
-    ``metadata_patch`` is optional and deliberately NOT load-bearing — the
+    ``new_content`` is OPTIONAL. A target with ``new_content is None`` is
+    VERIFY-ONLY: there is nothing to write, and the apply path is structurally
+    unable to write it (see the ``skip:verify_only`` branch in
+    :func:`_apply_amendments`) rather than merely declining to today. Both real
+    targets are verify-only, because the correction they describe has already
+    landed -- writing a second, differently-worded correction over it is
+    precisely the drift this script's pre-image guard exists to prevent.
+
+    ``metadata_patch`` is optional and deliberately NOT load-bearing -- the
     content sentinel carries idempotency on its own, so dropping the metadata
-    arm entirely would lose provenance and nothing else.
+    arm entirely would lose provenance and nothing else. Neither real target
+    carries one: the landed correction already stamped ``x_amended_at`` /
+    ``x_amended_by_task`` / ``x_superseded_note`` on 6403e96b.
     """
 
     memory_id: str
     expected_preimage: str
-    new_content: str
+    new_content: str | None = field(default=None)
     metadata_patch: dict[str, Any] | None = field(default=None)
 
 
-#: The stale record's pre-image: one bare sentence asserting an inferred cause
+#: The record's ORIGINAL content: one bare sentence asserting an inferred cause
 #: as fact, with no date visible to a reader and nothing marking it historical.
-_STALE_PREIMAGE = (
+#: This is no longer a pre-image to amend -- it is the REVERSION tripwire. If a
+#: future consolidation rewords past the correction and restores this claim,
+#: :func:`classify_amend_target` says so by name (``refuse:correction_reverted``)
+#: rather than folding it into a generic mismatch.
+#:
+#: Compared by strict EQUALITY, never by substring: BOTH landed corrections
+#: quote this sentence verbatim (target A inside its SUPERSEDED preamble,
+#: target B inside its measured-scores paragraph), so a substring test would
+#: classify a perfectly healthy corpus as reverted and exit 1.
+REVERSION_PREIMAGE = (
     'Broken Claude CLI --resume due to sessions being per-project-directory'
 )
 
-#: Modelled on Graphiti edge fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08's current
-#: text (reworded 2026-08-22 for the same contradiction), adapted to a Mem0
-#: single-claim record. Keeping the two stores telling the same story with the
-#: same caveats is the point — two independently-worded corrections drift.
-_STALE_REPLACEMENT = (
-    'SUPERSEDED AS A GENERAL CLAIM — historical record only; do NOT cite as '
-    'evidence that a moved cwd blocks --resume today. '
-    'WHAT WAS REALLY OBSERVED (2026-04-10, Claude CLI version unrecorded): a '
-    'steward CWD switch to project_root broke --resume with instant "No '
-    'conversation found" failures — 0 cost, 0 turns, 0 duration on all 3 '
-    'retries. That incident was real and was fixed by commit e001dd3746, which '
-    'removed the CWD switch. '
-    'WHAT WAS ONLY INFERRED: the causal explanation recorded alongside it — '
-    '"sessions are stored per-project-directory" — was an inference from that '
-    'symptom, never a measurement, and it is FALSE for the current CLI. '
-    'MEASURED CONTRARY FACT (task 3578, Claude Code CLI 2.1.236, 2026-08-19): '
-    'the CLI is cwd-AGNOSTIC for --resume. It scans every projects/*/ subdir of '
-    'CLAUDE_CONFIG_DIR by session id and ignores BOTH the encoded directory '
-    'name AND the cwd recorded inside the JSONL records; a transcript under a '
-    'completely unrelated projects/<enc>/ still resolves. Arms M1 (re-encoded '
-    'under new cwd), M2 (original encoding, new cwd) and Y (unrelated path) all '
-    'resolved and reached auth. Full method and results: '
-    'plans/session-resume-eligibility-seam-prd.md §14; mem0 '
-    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc. '
-    'UNDETERMINED: whether the CLI changed behaviour between 2026-04 and '
-    '2026-08, or the original 2026-04 diagnosis mis-attributed a real failure '
-    'to the wrong cause. Nobody has measured the April-era CLI, so this is not '
-    'resolvable from the record. '
-    f'(Content {AMENDED_SENTINEL} on the basis of esc-3578-5; the record is '
-    'kept, not deleted, because the April symptom was measured.)'
+
+#: Target A (6403e96b) as read LIVE on 2026-08-30 — i.e. POST-correction.
+#: Verified byte-exact against the record's own Mem0 content hash
+#: (4a07fdd601bc8242ce9c0aeb85d760ec). It carries :data:`AMENDED_SENTINEL`,
+#: so a healthy read classifies ``skip:already_amended`` and never reaches
+#: the equality comparison; the pin is what makes any reword that drops the
+#: sentinel fall through to a loud ``refuse:preimage_mismatch``.
+_CORRECTED_RECORD_PREIMAGE = (
+    'SUPERSEDED 2026-08-30 (by Stage-1 memory consolidation, task 4610). '
+    'This entry\'s original framing — "Broken Claude CLI --resume due to '
+    'sessions being per-project-directory" (2026-04-10) — is CONTRADICTED '
+    'by later measurement and must not be relied on. Claude CLI `--resume` '
+    'is actually cwd-AGNOSTIC (verified 2026-08-19/20, task 3578, CLI '
+    '2.1.236): it scans every `projects/*/` subdir of CLAUDE_CONFIG_DIR by '
+    'session id and ignores both the encoded directory name and the `cwd` '
+    'recorded in the JSONL transcript records — a transcript under a '
+    'completely unrelated `projects/<enc>/` dir still resumes. Reachability '
+    'is filesystem-scoped (same CLAUDE_CONFIG_DIR), not '
+    'OAuth-account-scoped and not cwd/project-scoped. See memories '
+    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc (cwd-agnostic scan measurement), '
+    '8683ea57-b9f0-4625-a014-400cbed7b7b3 (moved-cwd restore all pass), and '
+    'd1f640ff-95fb-4205-a069-3e7606b3fe57 (filesystem- vs account-scoped) '
+    "for the full current picture. Do not cite this entry's original title "
+    'as current fact.'
 )
 
-#: The hygiene warning's pre-image, read live 2026-08-28. Everything up to the
-#: STATUS clause is preserved verbatim in the replacement below.
-_WARNING_PREIMAGE = (
+#: Target B (d007aa46) as read LIVE on 2026-08-30, two hours after A. Its
+#: STATUS clause no longer says 6403e96b is "STILL UNCORRECTED"; it records
+#: the correction and demotes this record to historical/audit context.
+#: Verified byte-exact against its Mem0 content hash
+#: (00d79a0b57074bd4ae1997b35c53fc50).
+_CORRECTED_WARNING_PREIMAGE = (
     'CORPUS-HYGIENE WARNING (2026-08-22, esc-3578-5): the query "claude CLI '
     '--resume session cwd changed / sessions stored per-project-directory" '
     'returns STALE records ABOVE the correct ones, so rank is not a truth '
     'signal here. Measured on that exact query: mem0 '
-    '6403e96b-f1af-403a-9513-59f007ed6d39 ("Broken Claude CLI --resume due to '
-    'sessions being per-project-directory", 2026-04-10) returned at store_score '
-    '0.786 — the TOP hit of the whole result set — while the correct entry '
-    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc returned at 0.692. Graphiti edge '
-    'fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08 returned at graphiti store_rank 1 '
-    'with temporal=null and created_at=null, i.e. NO visible date, so a reader '
-    'cannot tell it is old. THE TRUTH: Claude Code CLI 2.1.236, measured '
-    '2026-08-19 by task 3578, is cwd-AGNOSTIC for --resume — it scans every '
-    'projects/*/ subdir of CLAUDE_CONFIG_DIR by session id and ignores both the '
-    'encoded dir name and the cwd inside the JSONL. See '
-    'plans/session-resume-eligibility-seam-prd.md §14. WHY THE OLD RECORDS '
-    'EXIST AND ARE NOT SIMPLY WRONG: the 2026-04-10 incident was REAL — a '
-    'steward CWD switch to project_root did break --resume (0 cost, 0 turns, '
-    'all 3 retries), fixed by commit e001dd3746. Only the CAUSE attached to it '
-    'was an inference. Whether the CLI changed between April and August or the '
-    'April diagnosis mis-attributed the cause is UNDETERMINED; the April-era '
-    'CLI was never measured. STATUS: edge fb96a8c0 was reworded in place on '
-    '2026-08-22 and now self-dates and carries the correction. Mem0 6403e96b is '
-    'STILL UNCORRECTED — update_memory rejected both its content_amend and '
-    'metadata_patch arms for a steward agent_id (authorized prefixes are '
-    'recon-stage-* and curator-* only), so it needs an authorized agent. Task '
-    '3730 is the consumer at risk, since its acceptance criterion is to obtain '
-    'this exact gate answer.'
-)
-
-#: The prefix of the warning that stays byte-identical: everything before its
-#: STATUS sentence. Split out so the replacement is visibly an edit to ONE
-#: clause rather than a rewrite of a record whose value is its measurements.
-_WARNING_PRESERVED_PREFIX = _WARNING_PREIMAGE.split(' STATUS: ')[0]
-
-_WARNING_REPLACEMENT = (
-    _WARNING_PRESERVED_PREFIX
-    + ' STATUS (updated 2026-08-28, task 4610): BOTH records are now '
-    'corrected. Edge fb96a8c0 was reworded in place on 2026-08-22 and '
-    'self-dates. Mem0 6403e96b was subsequently '
-    f'{AMENDED_SENTINEL} — its bare causal claim is now version-scoped, marked '
-    'SUPERSEDED AS A GENERAL CLAIM, and carries the 2026-08-19 contrary '
-    'measurement. NEITHER was deleted: the April symptom was measured and real, '
-    'only its inferred cause was wrong, so both are kept as dated historical '
-    'records rather than retracted. The correction had to be routed through '
-    'scripts/amend_stale_resume_cwd_records.py because update_memory admits '
-    'only recon-stage-* and curator-* agent ids and no dispatchable role holds '
-    'one. Task 3730 was the consumer at risk.'
+    '6403e96b-f1af-403a-9513-59f007ed6d39 ("Broken Claude CLI --resume due '
+    'to sessions being per-project-directory", 2026-04-10) returned at '
+    'store_score 0.786 — the TOP hit of the whole result set — while the '
+    'correct entry 0ecc40cf-db46-4c91-9240-cf8991fe4dfc returned at 0.692. '
+    'Graphiti edge fb96a8c0-da93-4e34-9e2c-6a1e7a3d1c08 returned at '
+    'graphiti store_rank 1 with temporal=null and created_at=null, i.e. NO '
+    'visible date, so a reader cannot tell it is old. THE TRUTH: Claude '
+    'Code CLI 2.1.236, measured 2026-08-19 by task 3578, is cwd-AGNOSTIC '
+    'for --resume — it scans every projects/*/ subdir of CLAUDE_CONFIG_DIR '
+    'by session id and ignores both the encoded dir name and the cwd inside '
+    'the JSONL. See plans/session-resume-eligibility-seam-prd.md §14. WHY '
+    'THE OLD RECORDS EXIST AND ARE NOT SIMPLY WRONG: the 2026-04-10 '
+    'incident was REAL — a steward CWD switch to project_root did break '
+    '--resume (0 cost, 0 turns, all 3 retries), fixed by commit e001dd3746. '
+    'Only the CAUSE attached to it was an inference. Whether the CLI '
+    'changed between April and August or the April diagnosis mis-attributed '
+    'the cause is UNDETERMINED; the April-era CLI was never measured. '
+    'STATUS (updated 2026-08-30): edge fb96a8c0 was reworded in place on '
+    '2026-08-22 and now self-dates and carries the correction. Mem0 '
+    '6403e96b was ALSO corrected in place on 2026-08-30 (Stage-1 memory '
+    'consolidation, task 4610) — its content now leads with a SUPERSEDED '
+    'marker and points to the correct current facts (see '
+    '0ecc40cf-db46-4c91-9240-cf8991fe4dfc, '
+    '8683ea57-b9f0-4625-a014-400cbed7b7b3, '
+    'd1f640ff-95fb-4205-a069-3e7606b3fe57). Both records now self-date and '
+    "carry the correction; this warning's original purpose (flagging the "
+    'uncorrected record) is moot and this entry is retained only as '
+    'historical/audit context for esc-3578-5. Task 3730 is the consumer at '
+    'risk, since its acceptance criterion is to obtain this exact gate '
+    'answer.'
 )
 
 
-#: The two amendments, in the order they MUST be applied. d007aa46's new text
-#: asserts that 6403e96b was corrected, so it is written only after that is
-#: true — see the ordering guard in ``run()``.
+#: The two records this script corroborates, in the order the ORDERING GUARD
+#: still walks them. Both are VERIFY-ONLY (``new_content is None``): the
+#: correction landed on 2026-08-30 via a Stage-1 memory consolidation, so there
+#: is nothing left to write and the guard gates no write today. It is retained
+#: because it is the property that keeps a future write-capable target honest --
+#: d007aa46's text asserts that 6403e96b was corrected, and that claim must
+#: never be written while the record it describes is unverified.
 AMEND_TARGETS: tuple[AmendTarget, ...] = (
     AmendTarget(
         memory_id='6403e96b-f1af-403a-9513-59f007ed6d39',
-        expected_preimage=_STALE_PREIMAGE,
-        new_content=_STALE_REPLACEMENT,
-        # 'correction_basis' — the spelling d007aa46's own metadata already
-        # carries — is NOT in memory_metadata.BLESSED_METADATA_KEYS, so it
-        # would census as an (non-fatal) unknown_key drift violation on every
-        # write. The 'x_' experimental namespace is the sanctioned home for an
-        # unblessed key, so the provenance is recorded there instead.
-        metadata_patch={
-            'x_correction_basis': 'esc-3578-5',
-            'x_corrected_by_task': '4610',
-        },
+        expected_preimage=_CORRECTED_RECORD_PREIMAGE,
     ),
     AmendTarget(
         memory_id='d007aa46-5800-455c-af3c-32d8fd8445b2',
-        expected_preimage=_WARNING_PREIMAGE,
-        new_content=_WARNING_REPLACEMENT,
-        metadata_patch={'x_corrected_by_task': '4610'},
+        expected_preimage=_CORRECTED_WARNING_PREIMAGE,
     ),
 )
 
