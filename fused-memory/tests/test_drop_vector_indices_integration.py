@@ -273,12 +273,17 @@ class TestDropVectorIndicesLive:
 
 @pytest_asyncio.fixture
 async def bulk_vector_graph():
-    """Seed a throwaway 1,000-node graph with a mixed VECTOR+RANGE Entity index.
+    """Seed a throwaway 10,000-node graph with a mixed VECTOR+RANGE Entity index.
 
     Backs TestDropRebuildWindow below — see its docstring for the measurement
-    table that justifies 1,000 as the seed size now that the class polls for
-    the phantom instead of requiring it on a single un-polled read. The mixed
-    index (``name_embedding`` VECTOR merged with ``name`` RANGE, both on
+    that justifies 10,000 as the seed size now that the class polls for the
+    phantom instead of requiring it on a single un-polled read. 1,000 was
+    tried first and rejected: re-measured empirically (task 4748 amendment
+    pass, loadavg ~185 on 32 cores) at only 12/15 phantom sightings even WITH
+    polling, i.e. the window can fail to open at all at that size, which no
+    poll interval can fix. 10,000 measured 25/25 in the same conditions,
+    every one on the very first post-drop read. The mixed index
+    (``name_embedding`` VECTOR merged with ``name`` RANGE, both on
     ``:Entity``) is what makes the class's ``DROP VECTOR INDEX`` a REBUILD
     rather than a removal: FalkorDB keeps the label's index record alive to
     carry the surviving RANGE field, and that rebuild is what opens the
@@ -295,7 +300,7 @@ async def bulk_vector_graph():
     graph_name = unique_graph_name('4748_drop_rebuild_window')
     graph = client.select_graph(graph_name)
     await graph.query(
-        'UNWIND range(1, 1000) AS i '
+        'UNWIND range(1, 10000) AS i '
         'CREATE (:Entity {name: "n"+i, name_embedding: vecf32([1.0, 2.0, 3.0, 4.0])})'
     )
     await graph.query(
@@ -306,8 +311,8 @@ async def bulk_vector_graph():
     # field below removes the Entity index record entirely instead of
     # rebuilding it, and the window this fixture exists to open never opens.
     await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
-    # (task 4748) At this seed size the initial HNSW build measured 0.02-0.3s
-    # at loadavg ~96 on 32 cores, well inside await_index_operational's
+    # (task 4748) At this seed size the initial HNSW build measured 1.3-2.8s
+    # across loadavg ~96-185 on 32 cores, well inside await_index_operational's
     # default 10s budget -- no override needed. If this fixture's seed size
     # is ever raised, re-measure the build time before assuming the default
     # still covers it (see TestDropRebuildWindow's measurement table; at
@@ -388,12 +393,21 @@ class TestDropRebuildWindow:
         50,000     7/7                        0.21-0.75s
         200,000    3/3                        ~0.73s
 
-    A single un-polled read is only deterministic at 50,000+ nodes. Polling
-    for the phantom within a bounded deadline (below) is deterministic at
-    1,000 nodes too — and ~50x cheaper to seed and build (0.02-0.3s vs
-    8.5-9.2s) — which is why the test below polls rather than reading once,
-    and why bulk_vector_graph seeds only 1,000 nodes. A stuck poll still
-    raises loudly at its deadline; it does not silently pass.
+    A single un-polled read is only deterministic at 50,000+ nodes, which is
+    why bulk_vector_graph originally seeded that many. Polling for the
+    phantom within a bounded deadline (below) removes the single-shot timing
+    dependence, but does NOT make the window open on every trial at every
+    seed size -- re-measured directly (task 4748 amendment pass, loadavg
+    ~185 on 32 cores, 15 trials/size): 1,000 nodes hit only 12/15 (80%) even
+    WITH a 5ms-interval/5s-deadline poll, because on a miss the window never
+    opened at all rather than merely being hard to catch -- no poll interval
+    fixes an absent window. 10,000 nodes hit 25/25 (2 batches), every single
+    time on the very first post-drop read. That is why bulk_vector_graph
+    seeds 10,000 nodes, not the 1,000 a first pass at this fix tried: it is
+    still ~3-6x cheaper to seed and build than 50,000 (1.3-2.8s vs
+    8.5-9.2s) while being the smallest size this task could empirically
+    confirm never drops the phantom. A stuck poll still raises loudly at its
+    deadline; it does not silently pass.
     """
 
     @pytest.mark.asyncio
@@ -423,10 +437,13 @@ class TestDropRebuildWindow:
 
         # A single un-polled read is only deterministic at 50,000+ nodes (see
         # class docstring); polling within a bounded deadline is what lets
-        # bulk_vector_graph's seed size be 1,000 instead. The 5ms interval is
-        # deliberately tight against the measured 40-64ms window at this seed
-        # size — a round trip costs ~0.2ms, so this buys several attempts
-        # inside the window rather than one.
+        # bulk_vector_graph's seed size be 10,000 instead of that -- but NOT
+        # the 1,000 a first pass at this fix tried, which measured only
+        # 12/15 phantom sightings even polled (the window can fail to open
+        # at all, not just be hard to catch). The 5ms interval is deliberately
+        # tight against the measured 52-135ms window at 10,000 nodes — a
+        # round trip costs ~0.2ms, so this buys many attempts inside the
+        # window rather than one.
         try:
             await poll_until(_phantom_rows, timeout=5.0, interval=0.005)
         except AssertionError as exc:
