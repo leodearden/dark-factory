@@ -252,6 +252,7 @@ def positional_targets(
     keyword: str,
     *,
     value_flags: frozenset[str] = frozenset(),
+    path_anchor: bool = False,
     label: str | None = None,
 ) -> list[str]:
     """The positional path arguments *keyword* checks, as whole TOKENS.
@@ -298,8 +299,18 @@ def positional_targets(
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
     to close. Widening the set is the caller's call, not this module's.
+
+    *path_anchor* is passed straight through to :func:`anchor_split`, for the
+    fifth caller ``test_fallback_verify_config.py::_lint_leg_targets`` (task
+    3883), whose ``check_bare_magicmock_config.py`` leg names the checker by
+    PATH. It is ORTHOGONAL to *value_flags*, and reading it as another policy
+    knob would be a category error: *value_flags* is per-checker POLICY (which
+    flags eat the following token — a fact about the checker's CLI), while
+    *path_anchor* is a fact about how the checker was SPELLED on this particular
+    command line. The same checker invoked by bare name and by path wants the
+    same *value_flags* and different *path_anchor*.
     """
-    post = anchor_split(segment, keyword, label=label)[1]
+    post = anchor_split(segment, keyword, path_anchor=path_anchor, label=label)[1]
     targets: list[str] = []
     consume = False
     for token in post:
