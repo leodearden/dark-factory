@@ -77,6 +77,96 @@ MARKUP_JOURNAL_DIRNAME = 'data/orchestrator/markup-guard'
 _LT = chr(60)
 _LT_JSON_ESCAPE = '\\u003c'
 
+#: THE SIZE BOUNDS, which are what make the O_APPEND atomicity premise sound
+#: rather than assumed. A single ``os.write`` to an append-only fd is atomic
+#: only while it is small; the payloads this guard sees reach tens of KB, so a
+#: record is capped rather than trusted.
+#:
+#: 200 chars per string field mirrors ``build_markup_block``'s existing
+#: ``content_excerpt`` convention — this journal answers "who leaked, from which
+#: tool, into which parameter", and every one of those answers fits easily. The
+#: verbatim payload is deliberately NOT this file's job: it has exactly one
+#: owner, the residue escalation.
+MARKUP_JOURNAL_MAX_FIELD_CHARS = 200
+
+#: Bounds ``recovered_params`` — the one list field the middleware emits, whose
+#: length is a property of the LEAK (how many sibling parameters it ate) and so
+#: is not bounded by anything upstream.
+MARKUP_JOURNAL_MAX_LIST_ITEMS = 20
+
+#: The line's own ceiling, well under the 4096-byte PIPE_BUF floor times two and
+#: far under any filesystem's atomic-append size. Protects the concurrent
+#: append: a record that would exceed it is degraded to the identity-only floor
+#: below rather than written torn across another process's line.
+MARKUP_JOURNAL_MAX_LINE_BYTES = 8192
+
+#: The identity a line must carry even at the floor — who leaked, from which
+#: tool, into which parameter, when, and with what outcome. Exactly the question
+#: the storm escalation asks a human to answer and gives them no way to.
+MARKUP_JOURNAL_FLOOR_KEYS = ('ts', 'server', 'subject_task_id', 'tool', 'param', 'outcome')
+
+#: The two disclosure keys, NAMESPACED under ``journal_`` because everything
+#: else in a line except this module's own envelope comes from the middleware's
+#: fact record — so a fact that grew a ``truncated`` or an ``overflow`` key
+#: later could not collide with, or be mistaken for, the journal's own marker.
+#:
+#: Both are ABSENT on an untouched record, so their presence means "something
+#: was cut" rather than merely "this emitter ran".
+MARKUP_JOURNAL_TRUNCATED_KEY = 'journal_truncated'
+MARKUP_JOURNAL_OVERFLOW_KEY = 'journal_overflow'
+
+
+def _encode(entry: dict[str, Any]) -> str:
+    """One journal record as a line, with no envelope literal left verbatim.
+
+    Deterministic key order is what makes the file greppable BY FIELD, and
+    matches the encoding the existing fact emitters
+    (``verdict_tools._emit_markup_fact`` and ``escalation.server``'s twin) use —
+    so a journal line and a log line are the same bytes plus this module's
+    envelope.
+
+    THE OPENING ANGLE BRACKET IS ESCAPED, blanket. This journal records envelope
+    literals by construction: ``pattern`` and ``misclose`` ARE the leaked
+    markup. A file holding them verbatim is a file no agent can safely read or
+    edit — pulling it into a tool-call argument reproduces the exact
+    over-consumption defect the journal exists to record, at the one artifact an
+    operator is told to open. The committed specimen corpus
+    (``shared/tests/fixtures/toolcall_markup_corpus.jsonl``) escapes every
+    literal the same way for the same reason.
+
+    A blanket replacement on the ENCODED line stays valid JSON: in JSON output
+    the opening angle bracket can only ever occur inside a string, never as
+    structural punctuation, so nothing else can be hit. And the escape
+    round-trips through ``json.loads`` back to the original character, so this
+    is lossless rather than sanitisation — a mangled ``pattern`` would destroy
+    the one field that says which literal the upstream harness bug emitted.
+    """
+    return json.dumps(entry, sort_keys=True).replace(_LT, _LT_JSON_ESCAPE) + '\n'
+
+
+def _capped(value: Any, trimmed: list[str], name: str) -> Any:
+    """*value* bounded in place, appending *name* to *trimmed* if it was cut.
+
+    A trimmed string is a PREFIX of what was sent, never a rewrite — the same
+    discipline the middleware's own repair keeps, so an operator comparing a
+    journal line against a transcript sees the beginning of the real value
+    rather than an elision of it. The disclosure rides in
+    ``MARKUP_JOURNAL_TRUNCATED_KEY`` instead of in an in-band suffix for the
+    same reason: an in-band marker would corrupt the value it describes.
+    """
+    if isinstance(value, str) and len(value) > MARKUP_JOURNAL_MAX_FIELD_CHARS:
+        trimmed.append(name)
+        return value[:MARKUP_JOURNAL_MAX_FIELD_CHARS]
+    if isinstance(value, (list, tuple)):
+        items = [
+            item[:MARKUP_JOURNAL_MAX_FIELD_CHARS] if isinstance(item, str) else item
+            for item in value[:MARKUP_JOURNAL_MAX_LIST_ITEMS]
+        ]
+        if len(value) > MARKUP_JOURNAL_MAX_LIST_ITEMS:
+            trimmed.append(name)
+        return items
+    return value
+
 
 def journal_path(project_root: Path, server_label: str) -> Path:
     """The one file this server's markup facts are appended to.
@@ -183,42 +273,45 @@ def make_fact_journal(
                 return None
 
         path = journal_path(project_root, server_label)
-        line = json.dumps(
-            {
-                'ts': datetime.fromtimestamp(now(), tz=UTC).isoformat(),
-                'server': server_label,
-                'subject_task_id': _subject(),
-                'worktree': str(worktree),
-                'pid': os.getpid(),
-                **record,
-            },
-            # Deterministic key order is what makes the file greppable BY
-            # FIELD, and matches the encoding the existing fact emitters
-            # (verdict_tools._emit_markup_fact, escalation.server's twin) use —
-            # so a journal line and a log line are the same bytes plus this
-            # module's envelope.
-            sort_keys=True,
-        )
 
-        # ESCAPE THE OPENING ANGLE BRACKET, blanket, on the encoded line.
-        #
-        # This journal records envelope literals by construction: ``pattern``
-        # and ``misclose`` ARE the leaked markup. A file holding them verbatim
-        # is a file no agent can safely read or edit — pulling it into a
-        # tool-call argument reproduces the exact over-consumption defect the
-        # journal exists to record, at the one artifact an operator is told to
-        # open. The committed specimen corpus
-        # (``shared/tests/fixtures/toolcall_markup_corpus.jsonl``) escapes every
-        # literal the same way for the same reason.
-        #
-        # A blanket replacement on the ENCODED line stays valid JSON: in JSON
-        # output the opening angle bracket can only ever occur inside a string,
-        # never as structural punctuation, so nothing else can be hit. And
-        # ``\\u003c`` round-trips through ``json.loads`` back to the original
-        # character, so the escape is lossless rather than sanitisation — a
-        # mangled ``pattern`` would destroy the one field that says which
-        # literal the upstream harness bug actually emitted.
-        line = line.replace(_LT, _LT_JSON_ESCAPE) + '\n'
+        envelope = {
+            'ts': datetime.fromtimestamp(now(), tz=UTC).isoformat(),
+            'server': server_label,
+            'subject_task_id': _subject(),
+            'worktree': str(worktree),
+            'pid': os.getpid(),
+        }
+        trimmed: list[str] = []
+        entry: dict[str, Any] = {
+            **envelope,
+            **{name: _capped(value, trimmed, name) for name, value in record.items()},
+        }
+        if trimmed:
+            entry[MARKUP_JOURNAL_TRUNCATED_KEY] = sorted(trimmed)
+
+        line = _encode(entry)
+        if len(line.encode('utf-8')) > MARKUP_JOURNAL_MAX_LINE_BYTES:
+            # THE OVERFLOW FLOOR. Per-field caps cannot bound a record that is
+            # over budget in its KEY COUNT rather than in any one value — a
+            # shape a future middleware could grow — so there has to be a floor
+            # under them.
+            #
+            # A shorter honest line beats both a torn line (which would corrupt
+            # another process's record in the same file) and a dropped one.
+            # Dropping it is the exact fail-soft this PRD exists to end: the
+            # whole reason this module exists is that these events reached no
+            # durable sink at all.
+            logger.warning(
+                'markup guard: the journal record for %s.%s exceeded %d bytes; '
+                'writing the identity-only floor instead',
+                record.get('tool'), record.get('param'),
+                MARKUP_JOURNAL_MAX_LINE_BYTES,
+            )
+            floor = {
+                key: entry[key] for key in MARKUP_JOURNAL_FLOOR_KEYS if key in entry
+            }
+            floor[MARKUP_JOURNAL_OVERFLOW_KEY] = True
+            line = _encode(floor)
 
         # ONE ``os.write`` on an O_APPEND fd, and NEVER a read-modify-write.
         #
