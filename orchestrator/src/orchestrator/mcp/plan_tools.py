@@ -1523,6 +1523,16 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_consequence=(
         "further specimens land permanently in the fleet's plan.json files."
     ),
+    #: Composed from ``MARKUP_JOURNAL_DIRNAME`` rather than respelled, so the
+    #: constant stays the single owner of the path and the instruction cannot
+    #: drift away from the artifact it names (task 4744).
+    attribution_source=(
+        'every markup fact this server sees is journalled one line per event '
+        f'to {markup_journal.MARKUP_JOURNAL_DIRNAME}/plan-tools.jsonl under '
+        'the main checkout — each line carries subject_task_id, tool, param, '
+        'outcome and a UTC timestamp, so the leaking task is nameable from '
+        "the burst window's own lines (jq or grep '\"subject_task_id\"')"
+    ),
 )
 
 _ESCALATION_FALLBACK_SUMMARY = _MARKUP_SINK_SPEC.fallback_summary

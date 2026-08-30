@@ -122,6 +122,26 @@ class MarkupSinkSpec:
     #: sentence, rendered into the storm alarm's body.
     storm_consequence: str
 
+    #: WHERE an operator can identify the leaking caller for THIS boundary, as
+    #: an instruction they can follow. Rendered into the storm alarm's detail
+    #: and its suggested_action.
+    #:
+    #: REQUIRED, not defaulted, and that is load-bearing (task 4744). This field
+    #: replaced a hard-coded "grep the orchestrator logs for 'markup guard:'"
+    #: sentence that was measured UNFOLLOWABLE on 2026-08-25::
+    #:
+    #:     journalctl --user --since 2026-08-22 | grep 'markup guard:'
+    #:         ->  0 plan-tools lines
+    #:
+    #: against 35 real plan-tools rejections in data/orchestrator/
+    #: agent-transcripts/ over the same span. These servers are per-agent STDIO
+    #: SUBPROCESSES whose stderr the CLI agent that spawned them consumes, so
+    #: those lines reach no durable sink; an operator following that instruction
+    #: correctly concluded "no evidence" and was wrong. A DEFAULT here would let
+    #: the next such server silently inherit the same false sentence, which is
+    #: the exact defect being fixed — so each boundary states its own answer.
+    attribution_source: str
+
     @property
     def fallback_summary(self) -> str:
         return (
@@ -255,6 +275,12 @@ def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
 
     Points at ``plans/toolcall-markup-containment-prd.md`` and NOT at DF 3083,
     which is done and CLOSED to appends: nothing reads what is attached there.
+
+    The "identify the leaking caller" sentence is the SPEC's
+    (:attr:`MarkupSinkSpec.attribution_source`), not this module's, because the
+    honest answer differs per boundary — and a wrong one here is worse than
+    none, since a reader who follows it concludes "no evidence" rather than
+    "I looked in the wrong place".
     """
     return '\n'.join([
         f'count={record.get("count")!r}',
@@ -269,9 +295,9 @@ def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
         'now, not that the guard is misfiring — do NOT disable it, or '
         + spec.storm_consequence,
         '',
-        'Identify the leaking caller from the guard\'s own log lines (grep the '
-        "orchestrator logs for 'markup guard:' and 'markup_guard_storm') and "
-        'report it against plans/toolcall-markup-containment-prd.md.',
+        'Identify the leaking caller: ' + spec.attribution_source,
+        '',
+        'Then report it against plans/toolcall-markup-containment-prd.md.',
     ])
 
 
@@ -384,9 +410,9 @@ def file_storm(
         ),
         detail=storm_detail(record, spec),
         suggested_action=(
-            "identify the leaking caller from the guard's log lines and report "
-            'it against plans/toolcall-markup-containment-prd.md — DF task 3083 '
-            'is done and closed to appends'
+            'identify the leaking caller — ' + spec.attribution_source +
+            ' — and report it against plans/toolcall-markup-containment-prd.md '
+            '(DF task 3083 is done and closed to appends)'
         ),
         worktree=str(worktree),
         level=MARKUP_STORM_LEVEL,
