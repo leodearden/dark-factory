@@ -434,6 +434,42 @@ class TestTmuxBackendReorder:
         ]
         assert move_failures == []
 
+    def test_dedup_keeps_the_first_occurrence_of_a_repeated_target(self, caplog):
+        """The dedup must keep the FIRST occurrence, not just SOME occurrence:
+        a target's position in *targets* IS its destination window index, so
+        which occurrence survives decides which window lands where.
+
+        test_reorder_is_defensive_against_a_duplicated_target above cannot
+        see that -- its [s:1, s:1, s:0] input yields the identical surviving
+        order under keep-first and keep-last. [s:1, s:0, s:1] separates
+        them: keep-first is [s:1, s:0], so wB (at s:1) takes index 0 and wA
+        (at s:0) takes index 1 -- the table below is the swap. Keep-last
+        would be [s:0, s:1], which is the identity arrangement and leaves
+        the table untouched, so a regression to it fails loudly here rather
+        than passing quietly.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        table = FakeTmuxWindowTable({'s:0': 'wA', 's:1': 'wB'})
+        backend = TmuxBackend(run=table)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+            DisplayTarget(kind='tmux', tmux_target='s:0'),
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        assert table.windows == {'s:0': 'wB', 's:1': 'wA'}
+        move_failures = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'move-window' in r.getMessage()
+        ]
+        assert move_failures == []
+
 
 class TestTmuxBackendSetUrgency:
     def test_is_a_noop_and_logs_debug(self, caplog):

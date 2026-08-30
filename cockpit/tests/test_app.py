@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -1450,6 +1450,80 @@ class TestReorderTargetsAreDeduped:
             assert app.query_one(DecisionQueue).row_count == 2
 
             assert backend.reorder_calls[-1] == [DisplayTarget(kind='tmux', tmux_target='s:1')]
+
+    @pytest.mark.timeout(10)
+    async def test_dedup_keeps_the_highest_scoring_occurrence_of_a_repeated_target(
+        self, tmp_path
+    ):
+        """The dedup must keep the FIRST occurrence, not just SOME occurrence.
+
+        queue_items is score-descending, and for tmux the position a target
+        holds in the reorder list IS its destination window index -- so
+        keeping the first occurrence is what makes a shared target land at
+        its highest-scoring item's position rather than its lowest-scoring
+        one's. The sibling test above cannot see that: with a single
+        distinct target, ordering is unobservable. Nor can the tmux
+        backend's [s:1, s:1, s:0] case, whose surviving order is the same
+        under keep-first and keep-last.
+
+        Here the queue resolves to [A, B, A]: the two policies diverge --
+        keep-first yields [A, B], keep-last [B, A] -- so a refactor to a
+        keep-last dedup (or a set-then-sort) fails instead of passing
+        silently while swapping which window lands at index 0.
+
+        Scores are made deterministic with an injected now_fn, and the
+        premise (the queue really is A, B, A before dedup) is asserted
+        rather than assumed:
+          - dec-a       severity='urgent' (weight 6.0)        -> ~2.87
+          - session s-b asked_at 9d old, age term saturated   -> ~2.69
+          - session s-a asked_at == now, no age term          -> ~2.60
+        dec-a carries session_id='sess-a', so resolve_target maps it
+        through sess-a's own display -- target A, the same object the
+        sess-a row resolves to.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        target_a = DisplayTarget(kind='tmux', tmux_target='s:0')
+        target_b = DisplayTarget(kind='tmux', tmux_target='s:1')
+
+        sess_a = _make_record(
+            session_slug='sess-a',
+            status=sr.Status.AWAITING_INPUT,
+            display=sr.Display(kind='tmux', tmux_target='s:0'),
+            question=sr.Question(text='Newest ask?', asked_at='2026-07-10T00:00:00+00:00'),
+        )
+        sr.write_record(sess_a, root=tmp_path)
+        sess_b = _make_record(
+            session_slug='sess-b',
+            status=sr.Status.AWAITING_INPUT,
+            display=sr.Display(kind='tmux', tmux_target='s:1'),
+            question=sr.Question(text='Older ask?', asked_at='2026-07-01T00:00:00+00:00'),
+        )
+        sr.write_record(sess_b, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-10T00:00:00+00:00',
+            session_id='sess-a',
+            severity='urgent',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05, now_fn=lambda: now)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert app.query_one(DecisionQueue).row_count == 3
+            # Premise: the pre-dedup target sequence really is [A, B, A].
+            items = sorted(app._queue_items_by_key.values(), key=lambda i: (-i.score, i.key))
+            assert [item.target for item in items] == [target_a, target_b, target_a]
+
+            assert backend.reorder_calls[-1] == [target_a, target_b]
 
 
 class TestCopyAction:
