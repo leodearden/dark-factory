@@ -704,7 +704,11 @@ episode uuids cited by the 192 findings, **7 (6 %) are dangling** — the
 Those edges are **permanently un-adjudicable from the graph alone**. A lookup
 by episode uuid returning empty means the episode was deleted — not that the
 query was malformed. This was discovered incidentally here; its corpus-wide
-extent is **not** scoped by this sweep and is filed as follow-up work.
+extent is **not** scoped by this sweep and is filed as **task 4779**
+(`deferred`), rolled up with the write-time prevention track under **task
+4876**. 4779 records the measurement as taken on the 2026-08-27 run (7 of 116
+cited uuids, over the 181 findings that run produced); the *same seven* uuids
+are still the dangling set here, so only the denominator moved.
 
 *(The `add_memory:*` census in §3.4 holds over the **113** cited episodes
 that still exist — 120 cited minus these 7, all 113 `add_memory:*`. The
