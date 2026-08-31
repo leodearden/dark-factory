@@ -30,6 +30,7 @@ tests/scripts/conftest.py inserts scripts/ onto sys.path for exactly this
 """
 
 import importlib.util
+import os
 import pathlib
 import types
 
@@ -318,6 +319,20 @@ def _apply_preserved(rendered_text, preserved):
     return render_dashboard_unit.apply_preserved(rendered_text, preserved)
 
 
+# The two skip CODES, read off the module rather than spelled here. The
+# absent-vs-empty distinction is a behavioural contract — one is a greenfield
+# host, the other a host whose setting was blanked — and it used to be asserted
+# through substrings of the operator prose (`"absent" in reason.lower()`).
+# That coupled four tests to wording that carries no behaviour: rewording a
+# sentence turned them red, and a sentence that happened to contain the other
+# word would have satisfied the wrong assertion. The code is the contract; the
+# sentence stays free to change.
+def _skip_codes():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.SKIP_ABSENT, render_dashboard_unit.SKIP_EMPTY
+
+
 def _rendered(repo_root="/home/leo/src/dark-factory"):
     """The committed template rendered at *repo_root* — the single-root default."""
     return _render_template(
@@ -379,7 +394,7 @@ def test_preserved_values_greenfield_preserves_nothing():
 
     assert preserved == {}
     assert _KNOWN_ROOTS in skipped
-    assert "absent" in skipped[_KNOWN_ROOTS].lower(), skipped
+    assert skipped[_KNOWN_ROOTS] == _skip_codes()[0], skipped
 
     rendered = _rendered()
     assert _apply_preserved(rendered, preserved) == rendered
@@ -392,7 +407,7 @@ def test_preserved_values_ignores_a_unit_that_never_declares_the_name():
     preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
 
     assert preserved == {}
-    assert "absent" in skipped[_KNOWN_ROOTS].lower(), skipped
+    assert skipped[_KNOWN_ROOTS] == _skip_codes()[0], skipped
 
 
 def test_preserved_values_refuses_an_empty_installed_value():
@@ -408,7 +423,7 @@ def test_preserved_values_refuses_an_empty_installed_value():
     preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
 
     assert preserved == {}
-    assert "empty" in skipped[_KNOWN_ROOTS].lower(), skipped
+    assert skipped[_KNOWN_ROOTS] == _skip_codes()[1], skipped
 
 
 def test_preserved_values_refuses_a_whitespace_only_installed_value():
@@ -418,7 +433,7 @@ def test_preserved_values_refuses_a_whitespace_only_installed_value():
     preserved, skipped = _preserved_values(installed, (_KNOWN_ROOTS,))
 
     assert preserved == {}
-    assert "empty" in skipped[_KNOWN_ROOTS].lower(), skipped
+    assert skipped[_KNOWN_ROOTS] == _skip_codes()[1], skipped
 
 
 def test_preserved_values_reads_the_multi_assignment_spelling():
@@ -467,6 +482,102 @@ def test_apply_preserved_raises_when_the_rendered_text_is_ambiguous():
         _apply_preserved(rendered, {_KNOWN_ROOTS: NINE_ROOTS})
 
     assert _KNOWN_ROOTS in str(excinfo.value), excinfo.value
+
+
+# --- The write side must be the INVERSE of the read side -------------------
+#
+# environment_map deliberately understands systemd's quoted and
+# multi-assignment spellings, so a value carrying whitespace is perfectly
+# READABLE off an installed unit. Re-emitting it bare is not the inverse of
+# that: systemd splits the re-written line on the space and keeps the first
+# token, so the value silently truncates on re-render — and the loss is
+# invisible afterwards, because this variable is value-blessed by
+# DIVERGENCE_ALLOWLIST. Measured before the fix:
+#
+#     installed  Environment="DASHBOARD_KNOWN_PROJECT_ROOTS=/a b,/c"
+#     preserved  /a b,/c
+#     written    Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a b,/c
+#     re-read    /a                          <- b,/c gone
+#
+# The template's comment asks operators to keep spaces out of the value, which
+# MITIGATES this and does not close it: a comment is not a mechanism.
+
+_SPACED_ROOTS = "/home/leo/src/a b,/home/leo/src/c"
+
+
+def _installed_with(value, repo_root="/home/leo/src/dark-factory"):
+    """The rendered template with *value* quoted into its KNOWN_PROJECT_ROOTS line.
+
+    Quoted because that is how an operator legitimately writes a value with a
+    space, and how systemd documents it.
+    """
+    text = _rendered(repo_root)
+    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
+    assert single in text, f"fixture anchor {single!r} not found"
+    return text.replace(single, f'Environment="{_KNOWN_ROOTS}={value}"')
+
+
+def _round_trip(text):
+    """Read KNOWN_PROJECT_ROOTS back out with the reader the parity gate uses."""
+    return _env(text)[_KNOWN_ROOTS]
+
+
+def test_apply_preserved_round_trips_a_value_containing_whitespace():
+    """A preserved value with a space must READ BACK as itself, not as its first token."""
+    preserved, skipped = _preserved_values(_installed_with(_SPACED_ROOTS), (_KNOWN_ROOTS,))
+    assert preserved == {_KNOWN_ROOTS: _SPACED_ROOTS}, (preserved, skipped)
+
+    result = _apply_preserved(_rendered(), preserved)
+
+    assert _round_trip(result) == _SPACED_ROOTS, (
+        "the preserved value did not survive being written back:\n"
+        + _env_line(result, _KNOWN_ROOTS)
+    )
+
+
+def test_apply_preserved_round_trips_a_padded_value():
+    """A padded value is preserved WHOLE, or the non-empty test was a lie.
+
+    ``"KNOWN=   /a"`` passes preserved_values because only the STRIPPED form is
+    tested for emptiness — the value kept is the unstripped one. Written back
+    bare, systemd re-reads it as EMPTY: the run would report a preserved value
+    and install an unset one.
+    """
+    padded = "   /home/leo/src/dark-factory"
+    preserved, _ = _preserved_values(_installed_with(padded), (_KNOWN_ROOTS,))
+    assert preserved == {_KNOWN_ROOTS: padded}
+
+    result = _apply_preserved(_rendered(), preserved)
+
+    assert _round_trip(result) == padded, _env_line(result, _KNOWN_ROOTS)
+
+
+def test_apply_preserved_does_not_quote_a_value_that_does_not_need_it():
+    """The ordinary case stays BYTE-IDENTICAL — no quotes appear from nowhere.
+
+    The nine measured roots are a comma-separated path list, which shlex quoting
+    leaves alone. This is what keeps the committed unit, the parity comparison
+    and every ordinary host render unchanged by the round-trip fix.
+    """
+    result = _apply_preserved(_rendered(), {_KNOWN_ROOTS: NINE_ROOTS})
+
+    assert f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}" in result
+    assert _round_trip(result) == NINE_ROOTS
+
+
+def test_apply_preserved_refuses_a_value_it_cannot_write_faithfully():
+    """A value no single Environment= line can carry RAISES rather than installs.
+
+    Quoting rescues whitespace; nothing rescues a newline, which would end the
+    directive and turn the remainder into text of its own. Refusing is the same
+    answer this function already gives for a template that changed shape: a
+    value that will not round-trip must not be written, because nothing
+    downstream would report the difference.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _apply_preserved(_rendered(), {_KNOWN_ROOTS: "/a\nEnvironment=SNEAKY=1"})
+
+    assert _KNOWN_ROOTS in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -958,4 +1069,104 @@ def test_main_reports_a_fallback_to_the_rendered_default(tmp_path, capsys):
 
     report = capsys.readouterr().out
     assert _KNOWN_ROOTS in report, report
-    assert "absent" in report.lower(), report
+    # The bracketed CODE, which is the stable half of the line. The sentence
+    # beside it is operator prose and deliberately not asserted on.
+    assert f"[{_skip_codes()[0]}]" in report, report
+
+
+def test_main_no_preserve_ignores_the_installed_values(tmp_path, capsys):
+    """(g) ``--no-preserve`` renders the template as-is — for the REPO-SIDE copy.
+
+    The preserving CLI is exactly wrong for regenerating
+    dashboard/dark-factory-dashboard.service: there the --output being read as
+    "the installed unit" IS the artifact under regeneration, so a stale
+    committed value would be carried straight back into the "fresh" render, and
+    test_dashboard_service_template.py::test_template_renders_to_hardcoded_file
+    would stay red with no hint why. Today the committed value happens to equal
+    the rendered default, which is what hid the trap; a change to the template's
+    default is what springs it.
+    """
+    argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+
+    assert _main(argv + ["--no-preserve"]) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _env_line(text, _KNOWN_ROOTS) == _NEW_ROOT, (
+        "--no-preserve still carried a host-local value into the render"
+    )
+    assert NINE_ROOTS not in text
+    report = capsys.readouterr().out
+    assert "--no-preserve" in report, report
+
+
+def test_main_preserves_the_output_files_mode(tmp_path, capsys):
+    """(h) The replace is MODE-NEUTRAL on a file that already exists.
+
+    tempfile creates 0600 and os.replace carries the temp file's mode onto the
+    destination, so an unguarded atomic write silently re-permissions the unit —
+    0664 in, 0600 out (measured). Functionally harmless for `systemctl --user`
+    as the owning user, which is why it is not a correctness bug; it is still an
+    unreported side effect in a tool whose entire contract is to leave this
+    host's state alone, and it applies equally to re-rendering the committed
+    repo-side copy.
+    """
+    argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+    os.chmod(output, 0o664)
+
+    assert _main(argv) == 0
+    capsys.readouterr()
+
+    assert output.stat().st_mode & 0o7777 == 0o664, oct(output.stat().st_mode)
+
+
+def test_main_creates_a_world_readable_unit_on_a_greenfield_host(tmp_path, capsys):
+    """(h, second shape) With no destination to copy a mode from, 0644.
+
+    What the `sed >` redirect this replaced produced under a normal umask — not
+    tempfile's 0600, which would be a mode no previous install ever wrote.
+    """
+    argv, output = _cli(tmp_path)
+
+    assert _main(argv) == 0
+    capsys.readouterr()
+
+    assert output.stat().st_mode & 0o7777 == 0o644, oct(output.stat().st_mode)
+
+
+def _tmp_leftovers(output):
+    """Any temp file this tool left beside *output*."""
+    return sorted(
+        p.name
+        for p in output.parent.iterdir()
+        if p.name.startswith(f".{output.name}.") and p.name.endswith(".tmp")
+    )
+
+
+def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monkeypatch):
+    """(i) A failed write leaves NO orphan beside the unit, and says the unit is intact.
+
+    ``NamedTemporaryFile(delete=False)`` plus a rename that never happens is one
+    stranded ``.dark-factory-dashboard.service.<rand>.tmp`` in
+    ~/.config/systemd/user/ per failed run, accumulating silently in a directory
+    an operator reads to understand this host. The failure message also owed the
+    same "was NOT modified" reassurance the other two failing paths already
+    give — the whole point of the temp-file-and-rename is that a failure is
+    byte-safe, and a message that does not say so invites a panicked recovery.
+    """
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+    before = output.read_bytes()
+
+    def _boom(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(render_dashboard_unit.os, "replace", _boom)
+
+    assert _main(argv) == 1
+
+    assert _tmp_leftovers(output) == [], _tmp_leftovers(output)
+    assert output.read_bytes() == before, "the failed write modified the unit"
+    captured = capsys.readouterr()
+    assert "was NOT modified" in captured.err, captured.err
+    assert captured.err.count(_TAG) == len(captured.err.strip().splitlines())

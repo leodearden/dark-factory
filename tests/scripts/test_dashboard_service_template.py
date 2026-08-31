@@ -593,7 +593,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     If this test fails, the template and hardcoded file have drifted.  Re-render
     with::
 
-        python3 scripts/render_dashboard_unit.py \\
+        python3 scripts/render_dashboard_unit.py --no-preserve \\
             --template  scripts/dashboard.service.template \\
             --repo-root /home/leo/src/dark-factory \\
             --uv-path   /home/leo/.local/bin/uv \\
@@ -602,6 +602,17 @@ def test_template_renders_to_hardcoded_file() -> None:
     (The two literals are HARDCODED_SERVICE_REPO_ROOT / HARDCODED_SERVICE_UV_PATH
     above — the committed copy is deliberately pinned to this host's paths, not
     to whatever checkout happens to be running the test.)
+
+    ``--no-preserve`` IS LOAD-BEARING HERE, and its absence was a trap.  That
+    CLI's whole purpose is host-side: it reads --output FIRST as the installed
+    copy and carries its host-local DASHBOARD_KNOWN_PROJECT_ROOTS into the
+    render.  Pointed at the REPO-side artifact, the file being read is the one
+    under regeneration — so the moment the template's default for that variable
+    changes, the preserving form would copy the stale committed value straight
+    back in, leave this test red, and give no hint why.  It is a no-op today
+    only because the two values coincide.  Never pass --no-preserve when
+    rendering an INSTALLED unit; that is the clobber the renderer exists to
+    prevent, and setup-host.sh does not pass it.
     """
     rendered = render_dashboard_unit.render_template(
         TEMPLATE.read_text(encoding="utf-8"),

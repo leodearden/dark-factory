@@ -50,8 +50,10 @@ hard requirement for something setup-host.sh calls before any venv exists.
 """
 
 import argparse
+import contextlib
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -151,11 +153,27 @@ _ENVIRONMENT_SECTION = "Service"
 # docstring: DASHBOARD_KNOWN_PROJECT_ROOTS is allowlisted, so setup-host.sh's
 # post-install parity check is structurally incapable of saying anything about
 # its value, and this record is the only trace that the variable was handled.
-_SKIP_ABSENT = "absent from the installed unit — rendered default used"
-_SKIP_EMPTY = (
-    "declared empty in the installed unit — rendered default used (an empty "
-    "value is not a usable setting and would be worse than the default)"
-)
+#
+# TWO LAYERS, DELIBERATELY. `preserved_values` returns the stable CODE; the
+# sentence is looked up only when the report is printed. The distinction
+# absent-vs-empty is a behavioural contract (one is a greenfield host, the other
+# is a host whose setting was blanked), and pinning it through substrings of the
+# operator prose made rewording the prose a test failure while letting a
+# reworded sentence that happened to contain the other word satisfy the wrong
+# assertion. The code is what tests assert on; the sentence is free to change.
+# Both are emitted, the code as a bracketed token, so the operator-facing line
+# is greppable AND readable.
+SKIP_ABSENT = "absent"
+SKIP_EMPTY = "empty"
+
+_SKIP_SENTENCE = {
+    SKIP_ABSENT: "absent from the installed unit — rendered default used",
+    SKIP_EMPTY: (
+        "declared empty in the installed unit — rendered default used (an "
+        "empty value is not a usable setting and would be worse than the "
+        "default)"
+    ),
+}
 
 
 def preserved_values(
@@ -167,7 +185,11 @@ def preserved_values(
 
     - ``preserved`` — ``{name: value}`` for every name the installed unit
       declares with a non-empty stripped value.
-    - ``skipped`` — ``{name: reason}`` for every other name in *names*.
+    - ``skipped`` — ``{name: code}`` for every other name in *names*, where the
+      code is ``SKIP_ABSENT`` or ``SKIP_EMPTY``. A stable code rather than the
+      operator sentence, so callers (and tests) can branch on WHICH fallback
+      happened without depending on how it is worded; ``_SKIP_SENTENCE`` holds
+      the prose ``main`` prints.
 
     The skipped map is not diagnostic garnish. Taking the rendered default is
     the RIGHT answer on a greenfield host and the WRONG one to take silently on
@@ -195,12 +217,60 @@ def preserved_values(
     skipped: dict[str, str] = {}
     for name in names:
         if name not in env:
-            skipped[name] = _SKIP_ABSENT
+            skipped[name] = SKIP_ABSENT
         elif not env[name].strip():
-            skipped[name] = _SKIP_EMPTY
+            skipped[name] = SKIP_EMPTY
         else:
             preserved[name] = env[name]
     return preserved, skipped
+
+
+def _environment_token(name: str, value: str) -> str:
+    """Spell ``NAME=VALUE`` so the same reader gets *value* back, verbatim.
+
+    THE ASYMMETRY THIS CLOSES. ``environment_map`` reads an ``Environment=``
+    line the way systemd does — several assignments per line, values quotable —
+    so a value carrying whitespace is perfectly readable off an installed unit.
+    Writing it back BARE was not the inverse of that: installed
+    ``Environment="DASHBOARD_KNOWN_PROJECT_ROOTS=/a b,/c"`` read as ``/a b,/c``
+    and re-emitted unquoted becomes two tokens, of which systemd keeps the
+    first — the value silently truncates to ``/a`` on a re-render. A padded
+    value (``"KNOWN=   /a"``) was worse: non-empty by the stripped test, then
+    written unquoted and re-read as EMPTY. Both are the silent-clobber class
+    this module exists to remove, one asymmetry in, and both are invisible
+    afterwards because this variable is value-blessed by the parity checker's
+    DIVERGENCE_ALLOWLIST.
+
+    ``shlex.quote`` is a no-op for the values that actually occur (a
+    comma-separated path list quotes to itself), so the committed unit and every
+    ordinary host render stay BYTE-IDENTICAL; only a value that needs quoting
+    gets any.
+
+    The round trip is then VERIFIED, through the very reader the parity gate
+    compares with, and a value that does not survive it raises rather than
+    installs. That is the backstop for spellings quoting cannot rescue — a value
+    containing a newline cannot live on one ``Environment=`` line at all — and
+    it keeps the promise structural instead of resting on shlex and systemd
+    agreeing about every escape.
+    """
+    token = shlex.quote(f"{name}={value}")
+    roundtrip = systemd_unit_parity.environment_map(
+        systemd_unit_parity.parse_unit_directives(
+            f"[{_ENVIRONMENT_SECTION}]\nEnvironment={token}\n"
+        ),
+        _ENVIRONMENT_SECTION,
+    )
+    if roundtrip.get(name) != value:
+        raise ValueError(
+            f"{name}: the installed value {value!r} cannot be written to a "
+            f"single Environment= line — quoted as {token!r} it reads back as "
+            f"{roundtrip.get(name)!r}. Refusing to install a unit whose "
+            "host-local value would differ from the one it was preserved from; "
+            "the truncation would be invisible afterwards, because this "
+            "variable is value-blessed by the parity checker's "
+            "DIVERGENCE_ALLOWLIST."
+        )
+    return token
 
 
 def apply_preserved(rendered_text: str, preserved: "dict[str, str]") -> str:
@@ -223,6 +293,10 @@ def apply_preserved(rendered_text: str, preserved: "dict[str, str]") -> str:
       wins, so rewriting one and leaving the other installs a value nobody
       chose, invisibly.
 
+    ALSO raises ValueError, from ``_environment_token``, for a value that cannot
+    be written to one ``Environment=`` line such that the same reader gets it
+    back. The written line is quoted when quoting is what makes it round-trip.
+
     Every other byte of *rendered_text* is left alone.
     """
     lines = rendered_text.splitlines(keepends=True)
@@ -240,7 +314,7 @@ def apply_preserved(rendered_text: str, preserved: "dict[str, str]") -> str:
             )
         index = matches[0]
         newline = "\n" if lines[index].endswith("\n") else ""
-        lines[index] = f"{prefix}{value}{newline}"
+        lines[index] = f"Environment={_environment_token(name, value)}{newline}"
     return "".join(lines)
 
 
@@ -304,6 +378,18 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     fails part-way therefore leaves the host's existing unit BYTE-UNCHANGED
     rather than truncated: "stale but working" is recoverable, and setup-host.sh's
     pre-install parity gate reports it on the next run; "no unit at all" is not.
+    The temp file is REMOVED on every failing path (a bare ``delete=False``
+    would otherwise leave one ``.<unit>.<rand>.tmp`` per failed run beside the
+    unit), and --output's MODE is carried across the replace — a fresh
+    NamedTemporaryFile is 0600, so replacing without restoring would silently
+    re-permission a unit this tool exists to leave alone.
+
+    ``--no-preserve`` renders the template and nothing else. It is for
+    REGENERATING THE REPO-SIDE committed copy, where preserving is exactly
+    wrong: there the --output being read is the artifact under regeneration, so
+    a stale committed value would be carried straight back into the "fresh"
+    render. Never use it against an installed unit — that is the clobber the
+    rest of this module exists to prevent, and setup-host.sh does not pass it.
 
     Returns 0 on success, non-zero with a tagged error line on any failure,
     having written nothing.
@@ -326,6 +412,15 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             "function's docstring for why this is a flag and not a redirect."
         ),
     )
+    parser.add_argument(
+        "--no-preserve",
+        action="store_true",
+        help=(
+            "Do not read host-local values out of --output. For regenerating "
+            "the REPO-SIDE committed unit, where the file being overwritten is "
+            "the artifact under regeneration; never for an installed unit."
+        ),
+    )
     args = parser.parse_args(argv)
 
     template_path = pathlib.Path(args.template)
@@ -345,7 +440,17 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # The installed side. An absent --output is the greenfield case, not an
     # error: there is simply nothing to preserve.
     installed_text = ""
-    if output_path.is_file():
+    names: tuple[str, ...] = HOST_LOCAL_ENVIRONMENT
+    if args.no_preserve:
+        # Not merely "read nothing": the preserve SET is emptied too, so the
+        # names do not then get reported as absent-from-the-installed-unit,
+        # which would be a true sentence about a file this run never read.
+        names = ()
+        _log(
+            f"--no-preserve: rendering the template as-is; no host-local "
+            f"Environment= values were read from {output_path}"
+        )
+    elif output_path.is_file():
         try:
             installed_text = output_path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -366,6 +471,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             repo_root=args.repo_root,
             uv_path=args.uv_path,
             installed_text=installed_text,
+            names=names,
         )
     except ValueError as exc:
         _log(f"FAILED: {exc}", stream=sys.stderr)
@@ -382,9 +488,15 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # the only record that the variable was handled at all.
     for name, value in preserved.items():
         _log(f"preserved host-local Environment={name}={value}")
-    for name, reason in skipped.items():
-        _log(f"default used for Environment={name}: {reason}")
+    for name, code in skipped.items():
+        # The CODE is emitted as a bracketed token beside the sentence: stable
+        # for anything matching on it, while the prose stays free to change.
+        _log(f"default used for Environment={name} [{code}]: {_SKIP_SENTENCE[code]}")
 
+    # `temp_name` is bound INSIDE the `with` but read in the `except`, so it is
+    # declared here and assigned before the write: a failing `handle.write`
+    # (ENOSPC, I/O error) must still leave the name available to clean up.
+    temp_name: str | None = None
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -395,11 +507,32 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             suffix=".tmp",
             delete=False,
         ) as handle:
-            handle.write(text)
             temp_name = handle.name
+            handle.write(text)
+        # Carry the destination's mode across the replace. tempfile creates
+        # 0600, so without this a re-render silently re-permissions the unit —
+        # an unreported side effect in a tool whose whole contract is to leave
+        # this host's state alone. 0644 when there is nothing to carry, which is
+        # what the `sed >` redirect this replaced produced under a normal umask.
+        try:
+            mode = output_path.stat().st_mode & 0o7777
+        except OSError:
+            mode = 0o644
+        os.chmod(temp_name, mode)
         os.replace(temp_name, output_path)
     except OSError as exc:
+        # Remove the temp file rather than orphaning one `.<unit>.<rand>.tmp`
+        # per failed run in the unit directory. suppress(OSError) because the
+        # cleanup must not mask the failure being reported.
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
         _log(f"FAILED: cannot write {output_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"  {output_path} was NOT modified — the write goes through a temp "
+            "file and a rename, so it is byte-unchanged.",
+            stream=sys.stderr,
+        )
         return 1
 
     _log(f"rendered {output_path}")
