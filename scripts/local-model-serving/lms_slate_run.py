@@ -286,6 +286,23 @@ def sweep_arms(
     return failures
 
 
+def existing_parts(parts_dir: str | Path) -> list[str]:
+    """The part files that EXIST on disk, in manifest order.
+
+    Only the ones that exist.  Handing the merge a manifest-derived path that
+    is missing would route the refusal through an `OSError` on a nonexistent
+    file; handing it what exists routes it through `merge_reports`'
+    manifest-coverage check instead, which NAMES the uncovered arms.  Both
+    refuse and neither writes -- but only one explains.
+    """
+    parts = Path(parts_dir)
+    return [
+        str(part_path(parts, arm.arm_id))
+        for arm in load_arms().arms
+        if part_path(parts, arm.arm_id).exists()
+    ]
+
+
 def run_slate(
     parts_dir: str | Path,
     output: str | Path,
@@ -296,12 +313,35 @@ def run_slate(
 ) -> int:
     """Sweep the slate, then assemble the artifact from the parts it produced.
 
-    *output* is the slate artifact path.  It is never written by this module --
-    see the merge step for why that separation is load-bearing.
+    THE ARTIFACT IS NEVER WRITTEN HERE.  `lms_healthcheck --merge` writes it,
+    and its `merge_reports` manifest-coverage check is THE enforcement point
+    against an artifact assembled from a partial slate -- it refuses by name
+    ("arms [...] carry no row ... would describe a NARROWER slate than the
+    manifest commissions while reading as a complete one") and writes nothing.
+
+    That check is deliberately NOT duplicated here.  A second coverage check in
+    this driver could drift from the manifest, and would then either block a
+    legitimate merge or -- much worse -- permit a short artifact that reads as
+    a complete slate.  For the same reason this module never imports
+    `merge_reports` itself: its `expected_arm_ids` parameter defaults to
+    `None`, which SKIPS the coverage check entirely, so a library call is one
+    forgotten keyword away from writing exactly the artifact that must not
+    exist.
+
+    The merge is issued even when NO part exists.  Skipping it on a totally
+    failed sweep would end the run with no refusal recorded anywhere.
     """
     failures = sweep_arms(
         parts_dir, ready_timeout=ready_timeout, force=force, runner=runner,
     )
     for arm_id, stage, code in failures:
         print(f'lms_slate_run: {arm_id}: {stage} failed (exit {code})', file=sys.stderr)
-    return 0
+
+    merged = runner(healthcheck_argv(
+        '--merge', *existing_parts(parts_dir), '--output', str(output),
+    )).returncode
+
+    # A failed arm counts even when the merge succeeded: `--merge` can only
+    # judge the parts it was handed, so an arm that failed and left no part is
+    # invisible to a merge handed a complete set from a previous run.
+    return merged or (1 if failures else 0)
