@@ -3350,8 +3350,10 @@ class Harness:
         *task_id* is ``None`` (the no-plan lane site, which has no
         plan-derived id) falls back to the sidecar's own v2 ``task_id``. If
         neither yields a usable key (a v1 sidecar on a no-plan lane) — or the
-        sidecar is missing/unreadable — nothing is adopted and ``None`` is
-        returned. Never raises.
+        sidecar is missing, unreadable, or parsed to something that is not a
+        JSON OBJECT — nothing is adopted and ``None`` is returned. Never
+        raises: the "RAW dict" above is ENFORCED, not assumed, so
+        ``_recovered_sessions`` is dict-only for every downstream reader.
 
         Returns the adopted key, or ``None`` if nothing was adopted.
         """
@@ -3364,6 +3366,30 @@ class Harness:
             logger.warning(
                 'Recovery: %s sidecar unreadable (%s) — not adopting session',
                 entry.name, e,
+            )
+            return None
+        if not isinstance(session_data, dict):
+            # The REACHABILITY boundary. This method is the sole writer of
+            # `_recovered_sessions`, so rejecting a non-object here is what
+            # makes the _run_slot guard's `recovered_session.get('session_id')`
+            # sound — the half `_session_resume_reasons`' own non-dict guard
+            # cannot reach, because that guard returns a reason set and the
+            # caller still has to read the session to build the event payload.
+            #
+            # Placed BEFORE the `key = ...` line below so ONE check covers both
+            # keying paths: the no-plan-lane arity dereferences
+            # `session_data.get('task_id')` right there, and both arities then
+            # reach the adopting info log's `.get('role')`. Both raise today,
+            # out of a method whose docstring promises "Never raises" and
+            # promises it reads the sidecar "as a RAW dict".
+            #
+            # Deliberate belt-and-braces with `_session_resume_reasons`' guard,
+            # not duplication: adoption is the reachability boundary, the
+            # predicate is the contract (and is pinned independently, without
+            # staging a corrupt file on disk).
+            logger.warning(
+                'Recovery: %s sidecar is a JSON %s, not an object — not '
+                'adopting session', entry.name, type(session_data).__name__,
             )
             return None
         key = task_id if task_id is not None else session_data.get('task_id')
