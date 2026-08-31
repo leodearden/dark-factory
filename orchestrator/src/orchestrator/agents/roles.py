@@ -653,7 +653,7 @@ _TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 
 `InputValidationError` reports a defect in the CALL you just made, and it
 echoes back the exact bytes you sent — read that echo before retrying. It
-reports two different shapes, and they need OPPOSITE fixes:
+reports several distinct shapes, and they do not share a fix:
 
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
@@ -708,17 +708,13 @@ reports two different shapes, and they need OPPOSITE fixes:
 # number baked into a role prompt goes stale silently.
 MISSING_REQUIRED_PARAMETER_REJECTION = """\
 - A rejection naming a REQUIRED parameter that is MISSING is a third shape,
-  distinct from both above: the call parsed fine, and the parameter it
-  names IS a real, accepted field — the defect is that a required sibling
-  was left out. Re-emit the whole call with every required field supplied;
-  do not edit or drop the field that was already accepted, and do not
-  reach for `ToolSearch` — the schema was already in context, and loading
-  it again neither supplies the missing value nor changes the outcome. The
-  raw error string is IDENTICAL to the deferred-tool shape above, so the
-  string alone does not tell you which you hit — read the echo: the
-  deferred case carries a trailer saying the tool's schema was not sent to
-  the API and names a parameter the schema does not have; this case
-  carries neither. Catalogued sighting: a sub-dispatch via the `Agent` tool
+  distinct from both above: the call parsed fine and the parameter it
+  names IS a real, accepted field — a required sibling was left out. No
+  schema-not-sent trailer, and the named parameter is real rather than
+  invented, means a required sibling is missing rather than the
+  deferred-tool problem above — re-emit the whole call with every required
+  field supplied; do not edit or drop the field that was already accepted,
+  and do not reach for `ToolSearch`. Catalogued sighting: an `Agent` call
   that supplied `prompt` and omitted the required `description`, rejected
   before any sub-agent launched.
 """
