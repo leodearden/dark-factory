@@ -43,16 +43,23 @@ from orchestrator.verify import run_verification
 
 @pytest.fixture(autouse=True)
 def _clear_escape_latch():
-    """The escape latch is MODULE-LEVEL (one record per worktree per process),
-    so clear it around every test.
+    """The escape latch is MODULE-LEVEL (one record per worktree base per
+    process), so clear it around every test.
 
     Each test builds its own tmp_path geometry and therefore its own latch key,
     but pinning that independence here means a future test reusing a path can
     never silently observe another test's suppression.
+
+    BOTH structures are cleared. ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` suppresses just
+    as effectively as ``_RUFF_ESCAPE_REPORTED`` once it reaches the cap, so an
+    un-cleared attempt counter would leak silence across tests — and it would do
+    so invisibly, since a suppressed probe emits nothing to assert against.
     """
     verify._RUFF_ESCAPE_REPORTED.clear()
+    verify._RUFF_ESCAPE_PROBE_ATTEMPTS.clear()
     yield
     verify._RUFF_ESCAPE_REPORTED.clear()
+    verify._RUFF_ESCAPE_PROBE_ATTEMPTS.clear()
 
 
 

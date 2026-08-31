@@ -3998,7 +3998,26 @@ def _ruff_escape_latch_key(worktree: Path) -> _RuffEscapeLatchKey:
 # to which ``.py`` file ``_ruff_probe_target`` falls back on, is not caught and
 # stays suppressed for the process.  That is bounded and strictly better than a
 # path-only key, and is stated rather than papered over.
+#
+# Holds MEASURED keys only — see ``_RUFF_ESCAPE_PROBE_ATTEMPTS``.
 _RUFF_ESCAPE_REPORTED: set[_RuffEscapeLatchKey] = set()
+
+# Probe attempts for keys that have NOT yet yielded a measurement.  Deliberately
+# a SECOND structure, because the two states mean different things: a key in
+# ``_RUFF_ESCAPE_REPORTED`` was ANSWERED, and suppressing a repeat of a known
+# answer is exactly what a latch is for; a key here was merely ASKED, and
+# suppressing a question never answered would let one transient failure (ruff
+# momentarily unavailable, a single timeout) silence that base for the rest of
+# the process.
+#
+# Bounded rather than unlimited, because two of the probe's three None paths are
+# PERSISTENT — ruff genuinely absent, or its output no longer formatting as
+# ``Settings path:`` — and an unbounded retry would spawn a doomed subprocess on
+# every lint leg of every module for the life of the process.  A key is dropped
+# from here the moment it IS measured, so the two structures never both hold it
+# and neither grows without bound.
+_RUFF_ESCAPE_PROBE_ATTEMPTS: dict[_RuffEscapeLatchKey, int] = {}
+_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS: int = 3
 
 
 async def _report_ruff_config_escape(worktree: Path) -> None:
@@ -4019,14 +4038,39 @@ async def _report_ruff_config_escape(worktree: Path) -> None:
     (``verify_all_modules`` gathers one ``run_verification`` per module).  Every
     other potentially-blocking call in this module observes the same rule.
 
+    The latch is OUTCOME-AWARE: a key is suppressed once it has been MEASURED,
+    not once it has been asked.  An unmeasurable probe increments
+    ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` instead and is retried on the next lint leg,
+    up to ``_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS``.
+
     Structurally non-fatal — nothing here propagates.
     """
     key = _ruff_escape_latch_key(Path(worktree))
-    if key in _RUFF_ESCAPE_REPORTED:
+    if (
+        key in _RUFF_ESCAPE_REPORTED
+        or _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS
+    ):
         return
-    _RUFF_ESCAPE_REPORTED.add(key)
     try:
         settings = await asyncio.to_thread(_ruff_settings_path, Path(worktree))
+        if settings is None:
+            # UNMEASURED, which is not the same as "no escape": count the
+            # attempt and let the next lint leg ask again.  ``_ruff_settings_path``
+            # has already logged WHICH give-up reason fired; this logs the
+            # give-up on the KEY, once, as the cap is reached.
+            attempts = _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) + 1
+            _RUFF_ESCAPE_PROBE_ATTEMPTS[key] = attempts
+            if attempts >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS:
+                logger.debug(
+                    'ruff config-escape probe gave up on %s: unmeasurable on '
+                    '%d of %d permitted attempts; not probing this base again',
+                    key, attempts, _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS,
+                )
+            return
+        # Measured. The question is answered for this (worktree, base), so the
+        # latch may suppress it and the attempt counter is no longer needed.
+        _RUFF_ESCAPE_REPORTED.add(key)
+        _RUFF_ESCAPE_PROBE_ATTEMPTS.pop(key, None)
         if not _settings_path_escapes(settings, worktree):
             return
         probe = ' '.join(
