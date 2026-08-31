@@ -51,9 +51,14 @@ class TestAmendTargetsContract:
 
     The correction these targets describe LANDED on 2026-08-30 through a
     Stage-1 memory consolidation, not through this script -- so the targets are
-    VERIFY-ONLY and there is no write payload left to assert. What is pinned
-    instead is the live post-correction text, tightly: a handful of
-    load-bearing facts, never the wording of the surrounding sentences.
+    VERIFY-ONLY and there is no write payload left to assert. What is asserted
+    instead is strictly RELATIONAL: target ordering, the absence of the retired
+    write payloads, and the sentinel/reversion-text relationships that
+    classify_amend_target's equality-not-substring behaviour depends on. The
+    record wording itself is deliberately NOT pinned here -- the pinned
+    expected_preimage constants are the single source of that truth, and
+    restating their prose in assertions would only break on a legitimate
+    reword while catching no regression.
     """
 
     def test_two_targets_in_load_bearing_order(self):
@@ -61,13 +66,6 @@ class TestAmendTargetsContract:
         # 6403e96b was corrected, so it must never be written first. The
         # ordering guard is retained even though neither target writes today.
         assert [t.memory_id for t in _mod.AMEND_TARGETS] == [STALE_ID, WARNING_ID]
-
-    def test_sentinel_is_the_landed_correction_marker(self):
-        # Re-pointed from the never-applied 'amended in place by task 4610' to
-        # the substring the LANDED texts actually carry. This one constant is
-        # what makes both targets classify skip:already_amended -- reusing the
-        # idempotency path rather than adding a parallel branch.
-        assert _mod.AMENDED_SENTINEL == 'Stage-1 memory consolidation, task 4610'
 
     def test_sentinel_present_in_every_preimage(self):
         # The inverse of what this suite asserted before the correction landed.
@@ -94,11 +92,6 @@ class TestAmendTargetsContract:
         # or adds a third target. Assert the hazard is GONE.
         assert not hasattr(_mod, name)
 
-    def test_reversion_preimage_pins_the_original_bare_claim(self):
-        assert _mod.REVERSION_PREIMAGE == (
-            'Broken Claude CLI --resume due to sessions being per-project-directory'
-        )
-
     def test_reversion_preimage_is_not_any_live_preimage(self):
         # The property the reversion guard actually depends on: a healthy
         # record can never EQUAL the reverted text, so the guard cannot fire
@@ -115,33 +108,6 @@ class TestAmendTargetsContract:
         # exit 1 on a perfectly correct corpus.
         for target in _mod.AMEND_TARGETS:
             assert _mod.REVERSION_PREIMAGE in target.expected_preimage
-
-    def test_corrected_record_preimage_carries_the_superseding_facts(self):
-        preimage = _mod.AMEND_TARGETS[0].expected_preimage
-        # The landed text leads with the supersession marker ...
-        assert 'SUPERSEDED' in preimage
-        # ... and carries the measurement that supersedes the inferred cause.
-        assert '2.1.236' in preimage
-        assert 'cwd-AGNOSTIC' in preimage
-
-    def test_hygiene_warning_preimage_has_retired_its_stale_status_clause(self):
-        warning = _mod.AMEND_TARGETS[1].expected_preimage
-        # The clause this task existed to retire is gone from the live record.
-        assert 'STILL UNCORRECTED' not in warning
-        # Replaced by one recording the correction.
-        assert 'was ALSO corrected in place on 2026-08-30' in warning
-
-    def test_hygiene_warning_preimage_still_carries_the_full_story(self):
-        # The nuance the retired _STALE_REPLACEMENT would have put into target
-        # A survives verbatim HERE -- which is why nothing was lost by not
-        # writing it: the April symptom was REAL, only its cause was inferred,
-        # and the April-vs-August question is still open.
-        warning = _mod.AMEND_TARGETS[1].expected_preimage
-        assert '0.786' in warning
-        assert '0.692' in warning
-        assert 'e001dd3746' in warning
-        assert 'UNDETERMINED' in warning
-        assert 'plans/session-resume-eligibility-seam-prd.md' in warning
 
 
 class TestAmendTargetShape:
