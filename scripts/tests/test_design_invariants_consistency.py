@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
@@ -2366,9 +2367,32 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # docstring documents for the `tmp_path` fixtures.
 # ---------------------------------------------------------------------------
 
-def _write_scan_tree(root: Path, relative_paths: list[str]) -> None:
-    """Create an empty file at each of *relative_paths* under *root*."""
+def _write_scan_tree(
+    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+) -> None:
+    """Build a real git repo at *root*: *relative_paths* end up TRACKED via
+    ``git init`` + ``git add -A -f``; any *untracked* paths are written only
+    AFTER the add, so they stay out of the index.
+
+    A real repo, not a bare directory: task 4971 re-sources the scan from
+    ``git ls-files``, so trackedness must be exercised by the fixture rather
+    than asserted by reading the code — the same reasoning `_in_excluded_tree`'s
+    docstring gives for taking `root` from the caller. No commit and no
+    `user.email`/`user.name` config is needed: `git ls-files` reads the index,
+    not history.
+    """
     for relative in relative_paths:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    for args in (("init", "-q"), ("add", "-A", "-f")):
+        subprocess.run(
+            ["git", *args],
+            cwd=root, capture_output=True, text=True, check=True, timeout=60,
+        )
+
+    for relative in untracked:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
@@ -2444,8 +2468,11 @@ def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> No
 
     Same contract as `unregistered_enumeration_sites`: "no drift found" and
     "nothing was read" are indistinguishable downstream, and only one of them is
-    good news.
+    good news. The repo is initialised but empty — a non-repo root is a
+    different, louder failure mode covered separately (task 4971).
     """
+    _write_scan_tree(tmp_path, [])
+
     with pytest.raises(AssertionError) as excinfo:
         _citation_scan_files(root=tmp_path)
 
