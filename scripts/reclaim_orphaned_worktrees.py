@@ -791,6 +791,15 @@ def build_report(
     carry the best-effort data-loss-guard skips and per-worktree failures — the
     machine-readable signal (INV-4) a cron/watchdog wrapper reads without
     alarming on the always-0 exit code.
+
+    ``refused_target`` is that same channel for the fail-closed target verify:
+    true when ``repo`` could not be verified as the root of the repository git
+    resolves for it, so the sweep AND the final prune were declined and every
+    scanned parking landed in ``skipped``. It is reported SEPARATELY because
+    ``skipped`` alone cannot distinguish "detached branch" from "refused
+    target", and the always-0 exit code carries no signal at all. A refused
+    sweep is a MISSED nightly the next run retries — never a wedged timer, and
+    never a sweep of a repository the caller did not name.
     """
     return {
         'root': str(root),
@@ -807,6 +816,7 @@ def build_report(
         'skipped_paths': [str(p) for p in outcome.skipped],
         'failed': len(outcome.failed),
         'failed_paths': [str(p) for p in outcome.failed],
+        'refused_target': outcome.refused,
     }
 
 
@@ -818,7 +828,15 @@ def main(argv: list[str] | None = None) -> int:
     process always exits 0 so a nightly timer does not alarm on a routine
     per-worktree hiccup. ``--check`` never removes/commits. A ``git worktree
     prune`` runs after real (non-check) removals to clear any stale admin
-    entries.
+    entries — gated, like the sweep and every park-commit, on ``repo`` being the
+    VERIFIED root of the repository git resolves for it.
+
+    When that verify fails, nothing is swept, committed or pruned and the report
+    carries ``refused_target: true`` — the machine-readable channel a
+    cron/watchdog wrapper reads, since the always-0 exit code cannot carry it. A
+    refused sweep is a MISSED nightly the next run retries, which is strictly
+    better than a sweep of a repository the caller never named, and (unlike a
+    raising or non-zero run) it cannot wedge the systemd timer.
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
@@ -845,15 +863,27 @@ def main(argv: list[str] | None = None) -> int:
     outcome = reclaim_worktrees(repo, reclaim_records, dry_run=args.check)
 
     if not args.check:
-        rc, _out, err = _run_git(['worktree', 'prune'], cwd=repo)
-        if rc != 0:
+        # Conditioned on BOTH not-a-dry-run and a VERIFIED target: prune is the
+        # third destructive phase and self-guards like the other two, so a
+        # `--repo` git resolves to some other repository never has its admin
+        # entries rewritten.
+        if not is_git_toplevel(repo):
             logger.warning(
-                '%s `git worktree prune` failed in %s (rc=%s): %s',
+                '%s REFUSING the final `git worktree prune` — repo %s is not '
+                'the root of the repository git resolves for it',
                 _LOG_PREFIX,
                 repo,
-                rc,
-                err.strip(),
             )
+        else:
+            rc, _out, err = _run_git(['worktree', 'prune'], cwd=repo)
+            if rc != 0:
+                logger.warning(
+                    '%s `git worktree prune` failed in %s (rc=%s): %s',
+                    _LOG_PREFIX,
+                    repo,
+                    rc,
+                    err.strip(),
+                )
 
     report = build_report(
         root=parking_root,
