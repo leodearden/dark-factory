@@ -222,10 +222,13 @@ def log(msg: str) -> None:
 def _build_eval_accounts_file() -> Path:
     """Create a temp accounts YAML = shared accounts + eval-only account A.
 
-    Account A is reserved for interactive/eval use and excluded from the
-    shared ``config/usage-accounts.yaml`` so orchestrators don't cap it.
-    The eval launcher appends it here and injects the path via
-    ``USAGE_ACCOUNTS_FILE`` so both dark-factory and reify configs pick it up.
+    RULING 2026-08-30 (task 4741): account A is reserved for INTERACTIVE use
+    only, not eval use — it is excluded from the shared
+    ``config/usage-accounts.yaml`` so orchestrators don't cap it, but evals
+    have no dedicated account of their own and are supposed to share the
+    fleet pool and tolerate cap/429 events. This function still appends A
+    below, which is exactly the stale behavior the ruling retires; fixing
+    it is tracked in the follow-up task filed from 4741, not done here.
     """
     import tempfile
 
@@ -254,8 +257,10 @@ def build_eval_env() -> dict[str, str]:
     """Build the env dict passed to ``orchestrator eval`` subprocesses.
 
     Loads ``.env`` for OAuth tokens. Generates a temp accounts file that
-    includes the shared pool + eval-only account A, and sets
-    ``USAGE_ACCOUNTS_FILE`` so orchestrator configs pick it up.
+    includes the shared pool + account A, and sets ``USAGE_ACCOUNTS_FILE``
+    so orchestrator configs pick it up. NOTE: per the 2026-08-30 ruling
+    (task 4741) A is not actually an "eval-only" account — see
+    ``_build_eval_accounts_file`` above.
     """
     env = os.environ.copy()
     dotenv_path = PROJECT_ROOT / ".env"
