@@ -95,6 +95,17 @@ class _FakeLedgerTaskClient:
     *order* is a call-name log shared with whatever else a test wants to interleave
     (the streak bump, in (d)), which is what makes ORDERING assertable rather than only
     per-method counts.
+
+    ``get_statuses`` returns the ``(statuses, error)`` PAIR the
+    ``flake_ledger.FlakeLedgerTaskClient`` Protocol declares — NOT a bare dict.  This
+    is load-bearing, not cosmetic: ``_ensure_owner_task`` unpacks the result into two
+    names, so a bare-dict double makes every corroboration raise ``ValueError`` into
+    the surrounding ``except``, which routes silently into the failed-read degrade
+    branch.  The live-owner dedup branch would then never execute and (c) below would
+    pass VACUOUSLY.  *statuses_error* (in-band failure, the shape the real adapter
+    reports) and *statuses_raises* (a partial/older adapter that raises instead) mirror
+    test_flake_ledger.py's ``_FakeTaskClient`` so the two doubles of one Protocol
+    degrade identically.
     """
 
     def __init__(
@@ -103,6 +114,8 @@ class _FakeLedgerTaskClient:
         submit_raises: BaseException | None = None,
         status_after_submit: str = 'pending',
         statuses: dict[str, str] | None = None,
+        statuses_error: Exception | None = None,
+        statuses_raises: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
         self.submit_calls: list[dict] = []
@@ -113,6 +126,8 @@ class _FakeLedgerTaskClient:
         self._submit_raises = submit_raises
         self._status_after_submit = status_after_submit
         self._statuses: dict[str, str] = dict(statuses or {})
+        self._statuses_error = statuses_error
+        self._statuses_raises = statuses_raises
 
     async def submit_task(self, arguments: dict) -> str:
         self.order.append('submit_task')
@@ -124,11 +139,18 @@ class _FakeLedgerTaskClient:
         self._statuses.setdefault(new_id, self._status_after_submit)
         return new_id
 
-    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+    async def get_statuses(
+        self, ids: list[str],
+    ) -> tuple[dict[str, str], Exception | None]:
         self.order.append('get_statuses')
         self.statuses_calls.append(list(ids))
+        if self._statuses_raises is not None:
+            raise self._statuses_raises
         # Unknown ids are OMITTED, exactly as the real `get_statuses` omits them.
-        return {i: self._statuses[i] for i in ids if i in self._statuses}
+        return (
+            {i: self._statuses[i] for i in ids if i in self._statuses},
+            self._statuses_error,
+        )
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         self.order.append('commit_planning')
@@ -597,7 +619,7 @@ class TestRecordOpensDebt:
     # -- (c) INV-4's per-test dedup bound -------------------------------------
 
     async def test_repeat_suppression_of_one_test_files_exactly_one_task(
-        self, tmp_path: Path,
+        self, tmp_path: Path, caplog,
     ) -> None:
         """The bound that stops write-time filing from becoming a task-spam generator.
 
@@ -606,13 +628,27 @@ class TestRecordOpensDebt:
         instead).  And the second pass really did CORROBORATE — ``get_statuses`` is
         consulted against the stored id — rather than short-circuiting on a non-NULL
         column, which is INV-3's whole point.
+
+        The ``could not corroborate`` assertion is what keeps that claim HONEST.  A
+        failed corroboration ALSO files nothing and ALSO leaves one row, so the three
+        count assertions below are satisfied identically by the degrade branch — this
+        test passed vacuously for exactly that reason while the fake's ``get_statuses``
+        returned a bare dict and every unpack raised into the ``except``.  Asserting
+        the warning is ABSENT is the only thing that pins the pass to the live-owner
+        dedup branch, so a regression re-filing against a LIVE owner cannot stay green.
         """
         client = _FakeLedgerTaskClient()
         s1 = _suppression(test_ids=self.ONE_ID, observed_at='2026-08-22T12:00:00+00:00')
         s2 = _suppression(test_ids=self.ONE_ID, observed_at='2026-08-22T12:00:01+00:00')
 
-        await _record(_result(s1), tmp_path, task_client=client)
-        await _record(_result(s2), tmp_path, task_client=client)
+        with caplog.at_level(logging.WARNING):
+            await _record(_result(s1), tmp_path, task_client=client)
+            await _record(_result(s2), tmp_path, task_client=client)
+
+        assert 'could not corroborate' not in caplog.text, (
+            'the second pass degraded instead of corroborating, so the dedup branch '
+            f'under test never ran: {caplog.text}'
+        )
 
         rows = list_open_debt(ledger_db_path(tmp_path))
         assert len(rows) == 1, rows
