@@ -1535,6 +1535,13 @@ class _FakeTaskClient:
     ``calls`` records METHOD NAMES in order across all three methods, which is what lets
     a test assert ORDERING (e.g. that ``get_statuses`` really was consulted BEFORE a
     filing) rather than only per-method counts.
+
+    ``get_statuses`` returns the ``(statuses, error)`` PAIR the Protocol declares, and
+    the fake carries BOTH degrade injections on purpose.  ``statuses_error`` is the
+    in-band failure the real adapter reports; ``statuses_raises`` is a partial or older
+    adapter that raises instead — a shape the Protocol docstring names and
+    :class:`_PartialTaskClient` already stands for.  Both must degrade identically, so
+    both stay injectable rather than one replacing the other.
     """
 
     def __init__(
@@ -1544,6 +1551,7 @@ class _FakeTaskClient:
         statuses: dict[str, str] | None = None,
         submit_raises: BaseException | None = None,
         statuses_raises: BaseException | None = None,
+        statuses_error: Exception | None = None,
         commit_raises: BaseException | None = None,
     ) -> None:
         self.submit_calls: list[dict] = []
@@ -1554,6 +1562,7 @@ class _FakeTaskClient:
         self._statuses = statuses if statuses is not None else {}
         self._submit_raises = submit_raises
         self._statuses_raises = statuses_raises
+        self._statuses_error = statuses_error
         self._commit_raises = commit_raises
 
     async def submit_task(self, arguments: dict) -> str:
@@ -1563,12 +1572,12 @@ class _FakeTaskClient:
             raise self._submit_raises
         return self._submit_returns  # type: ignore[return-value]
 
-    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
         self.calls.append('get_statuses')
         self.statuses_calls.append(list(ids))
         if self._statuses_raises is not None:
             raise self._statuses_raises
-        return dict(self._statuses)
+        return dict(self._statuses), self._statuses_error
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         self.calls.append('commit_planning')
@@ -2025,16 +2034,29 @@ class TestOpenDebtRecorroboratesTheOwner:
         assert _owner(db_path, self.TEST_ID) == 'task-902'
         assert row is not None and row.owner_task_id == 'task-902'
 
-    async def test_an_absent_owner_is_replaced(self, tmp_path: Path) -> None:
-        """``get_statuses`` silently OMITS ids it does not know, so an empty mapping for
-        a stored id is a CORROBORATED ABSENCE — the task was deleted — and is treated as
-        closed.  Distinct from a failed read (:class:`TestOpenDebtInvariantDegrades`),
-        which is not evidence of anything and must not file."""
+    @pytest.mark.parametrize(
+        'statuses', [{}, {'some-other-task': 'pending'}], ids=['empty', 'other_ids_only']
+    )
+    async def test_an_absent_owner_is_replaced(
+        self, tmp_path: Path, statuses: dict[str, str]
+    ) -> None:
+        """``get_statuses`` silently OMITS ids it does not know, so a SUCCESSFUL read
+        that lacks the stored id is a CORROBORATED ABSENCE — the task was deleted — and
+        is treated as closed.  ``statuses_error`` is None here, and that is exactly what
+        distinguishes this from a failed read (:class:`TestOpenDebtInvariantDegrades`),
+        which is not evidence of anything and must not file.
+
+        The ``empty`` case is the one the pair had to be introduced for: before it, a
+        wholly-empty mapping was what BOTH a real absence and a swallowed MCP failure
+        produced.  It must still file — otherwise the fix bought the fail-safe direction
+        by breaking the enforcement it exists to protect."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        client = _FakeTaskClient(statuses={'some-other-task': 'pending'}, submit_returns='task-903')
+        client = _FakeTaskClient(
+            statuses=statuses, statuses_error=None, submit_returns='task-903'
+        )
 
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
 
@@ -2468,14 +2490,35 @@ class TestOpenDebtInvariantDegrades:
         await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=seeder, now=self.NOW)
         assert _owner(db_path, self.TEST_ID) == owner
 
-    async def test_a_failed_corroboration_does_not_file(self, tmp_path: Path, caplog) -> None:
-        """The fail-safe direction, pinned: a raising ``get_statuses`` KEEPS the stored
-        owner and files nothing."""
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'statuses_raises': RuntimeError('mcp unreachable')},
+            {'statuses_error': RuntimeError('mcp down')},
+        ],
+        ids=['raises', 'in_band_error'],
+    )
+    async def test_a_failed_corroboration_does_not_file(
+        self, tmp_path: Path, caplog, kwargs: dict
+    ) -> None:
+        """The fail-safe direction, pinned across BOTH shapes a failed read arrives in.
+
+        ``raises`` is a partial or older adapter that lets the exception out.
+        ``in_band_error`` is what the REAL adapter does — it never raises, so it reports
+        the failure as the error half of its ``(statuses, error)`` pair.  Before that
+        pair existed the second shape arrived as a bare ``{}``, indistinguishable from
+        the corroborated absence in
+        :meth:`TestOpenDebtRecorroboratesTheOwner.test_an_absent_owner_is_replaced`, and
+        the ledger filed a replacement on it — one duplicate per suppression, for the
+        length of the outage.
+
+        ONE body asserts both so the two degrade paths cannot drift apart: the stored
+        owner is KEPT, nothing is filed, nothing is committed, and it is loud."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        client = _FakeTaskClient(statuses_raises=RuntimeError('mcp unreachable'))
+        client = _FakeTaskClient(**kwargs)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             row = await open_debt(
@@ -2487,6 +2530,9 @@ class TestOpenDebtInvariantDegrades:
         assert _owner(db_path, self.TEST_ID) == 'task-901'
         assert row is not None and row.owner_task_id == 'task-901'
         _assert_logged_loudly(caplog)
+        # The warning names the owner it is KEEPING, so an operator reading the log can
+        # tell a preserved pointer from a dropped one without re-reading the db.
+        assert any('task-901' in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
         'kwargs',
@@ -2634,6 +2680,191 @@ class TestOpenDebtInvariantDegrades:
 
         assert client.calls == []
         _assert_logged_loudly(caplog)
+
+
+class _RoutingStubScheduler:
+    """A ``dispatch_tool``-only scheduler double that answers PER TOOL NAME, so one
+    instance can serve a whole ``open_debt`` pass (``get_statuses`` then, if the read
+    corroborated a closure, ``submit_task`` and ``commit_planning``).
+
+    Duck-typed, exactly like ``test_chronic_flake._StubScheduler``: the real adapter
+    depends on ``dispatch_tool`` alone.  ``raises`` applies to EVERY tool, standing for
+    an MCP that is down rather than one endpoint that is broken.
+
+    ``calls`` records ``(name, arguments)`` for every dispatch, which is what lets a
+    test assert NO ``submit_task`` ever reached the wire — the strongest available
+    statement of "no duplicate was filed", stronger than counting rows afterwards.
+    """
+
+    def __init__(self, responses: dict[str, object], raises: BaseException | None = None):
+        self.responses = responses
+        self.raises = raises
+        self.calls: list[tuple[str, dict]] = []
+
+    async def dispatch_tool(self, name, arguments, *, timeout=15):
+        self.calls.append((name, arguments))
+        if self.raises is not None:
+            raise self.raises
+        return self.responses.get(name)
+
+    @property
+    def dispatched(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+
+@pytest.mark.asyncio
+class TestOpenDebtOverTheRealAdapter:
+    """The COMPOSED path: real ``open_debt`` over the real
+    ``chronic_flake.SchedulerChronicFlakeTaskClient``.  ASYNC-ONLY CLASS.
+
+    Every other test here drives ``open_debt`` through :class:`_FakeTaskClient`, and
+    every adapter test drives the adapter through a stub scheduler.  Both sides passed
+    while the composition was broken: the adapter swallowed a failed ``get_statuses``
+    into ``{}``, and the ledger read ``{}`` as a corroborated absence and filed a
+    replacement de-flake task for a test whose owner was alive and unread.  Neither
+    suite could see it, because the defect lived in the SEAM.  This class is the test
+    whose absence let that ship.
+
+    Test-only import of ``chronic_flake`` — no production import edge is created, and
+    ``flake_ledger``'s ``shared``-only dependency set is untouched.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+
+    # Every envelope shape that reaches the adapter without carrying a readable
+    # `statuses` mapping.  Each one used to become `{}` — the corroborated-absence
+    # value — one seam away.
+    UNREADABLE = [
+        {'unexpected': 'shape'},
+        {'statuses': ['not', 'a', 'dict']},
+        None,
+    ]
+
+    def _client(self, scheduler):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+
+        return SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    async def _seed(self, db_path: Path, owner: str = 'task-901') -> None:
+        """First suppression, filed through the REAL adapter over a healthy scheduler."""
+        from orchestrator.flake_ledger import open_debt
+
+        scheduler = _RoutingStubScheduler(
+            {'submit_task': {'task_id': owner}, 'commit_planning': {'success': True}}
+        )
+        await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.NOW,
+        )
+        assert _owner(db_path, self.TEST_ID) == owner
+
+    async def test_a_dead_mcp_keeps_the_owner_and_files_nothing(self, tmp_path: Path) -> None:
+        """(a) The raise half, end to end.  The adapter catches it and reports it in
+        band; the ledger returns early on the error and keeps the pointer."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        scheduler = _RoutingStubScheduler({}, raises=RuntimeError('mcp down'))
+
+        row = await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.LATER,
+        )
+
+        assert 'submit_task' not in scheduler.dispatched
+        assert 'commit_planning' not in scheduler.dispatched
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+
+    @pytest.mark.parametrize('envelope', UNREADABLE, ids=['unrecognised', 'non_dict', 'none'])
+    async def test_an_unreadable_envelope_keeps_the_owner_and_files_nothing(
+        self, tmp_path: Path, envelope: object
+    ) -> None:
+        """(b) The half a raise-only fix would miss.  Nothing raised here — the
+        scheduler answered — but the answer carried no readable ``statuses``, so it is
+        not evidence the owner went terminal either."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        scheduler = _RoutingStubScheduler({'get_statuses': envelope})
+
+        await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.LATER,
+        )
+
+        assert 'submit_task' not in scheduler.dispatched
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+
+    async def test_a_corroborated_absence_still_files_a_replacement(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) The CONTRAST, without which this class would only prove suppression.
+
+        The same setup, but the scheduler answers with a well-formed ``{'statuses': {}}``
+        — the tool ran and does not know the id, i.e. the task was deleted.  That IS
+        evidence, and §5.9 is only enforced if it still files."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        scheduler = _RoutingStubScheduler(
+            {
+                'get_statuses': {'statuses': {}},
+                'submit_task': {'task_id': 'task-902'},
+                'commit_planning': {'success': True},
+            }
+        )
+
+        row = await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.LATER,
+        )
+
+        assert 'submit_task' in scheduler.dispatched
+        assert _owner(db_path, self.TEST_ID) == 'task-902'
+        assert row is not None and row.owner_task_id == 'task-902'
+
+    async def test_a_suppression_burst_through_an_outage_files_zero_duplicates(
+        self, tmp_path: Path
+    ) -> None:
+        """(d) The harm, named directly.  ``TestOpenDebtInvariantDegrades``' docstring
+        says an unreadable status must not file because "a transient MCP outage during a
+        suppression burst would file one duplicate PER SUPPRESSION" — there is no rate
+        limit on this path to bound it.  Ten suppressions through a dead MCP: zero."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        scheduler = _RoutingStubScheduler({}, raises=RuntimeError('mcp down'))
+
+        for hour in range(10):
+            await open_debt(
+                db_path,
+                'dark_factory',
+                self.TEST_ID,
+                task_client=self._client(scheduler),
+                now=self.LATER + timedelta(hours=hour),
+            )
+
+        assert scheduler.dispatched == ['get_statuses'] * 10
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
 
 
 @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
