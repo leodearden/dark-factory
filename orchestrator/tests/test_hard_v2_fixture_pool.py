@@ -210,6 +210,26 @@ class TestCandidatesBlock:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# The availability summary — derived from the rows, never hand-authored
+# ---------------------------------------------------------------------------
+
+class TestMergeShaAvailability:
+    def test_availability_block_is_derived_from_the_committed_rows(
+        self, manifest: dict,
+    ) -> None:
+        # Total equality against the SHARED derivation: no number and no claim
+        # in the committed summary can disagree with the rows it summarises.
+        # Substring checks could not carry this — the shipped block said
+        # "22/41" and "17 of 41" (which do not even sum to their own stated
+        # denominator) beside rows reading referenced=20, planrate_only=19
+        # over 39 included candidates, and called the SPLIT set a MAJORITY
+        # when it is now the smaller of the two.
+        driver = _load_driver()
+        assert manifest['merge_sha_availability'] == \
+            driver.merge_sha_availability_block(manifest['candidates'])
+
+
+# ---------------------------------------------------------------------------
 # The ceilings block — derived and shown not to bind, never guessed
 # ---------------------------------------------------------------------------
 
@@ -291,7 +311,11 @@ class TestCurationMdIsGenerated:
                 f'candidate {c["project"]}/{c["task_id"]} is missing from the table'
             )
 
-    def test_records_the_split_majority_finding(self, manifest: dict) -> None:
+    def test_renders_the_availability_finding(self, manifest: dict) -> None:
+        # Round-trip only: the derived sentence reaches the human artifact.
+        # Its SEMANTICS are carried by
+        # TestMergeShaAvailability::test_availability_block_is_derived_from_the_committed_rows
+        # — substring presence could never check that the sentence is true.
         text = CURATION_MD.read_text()
         assert manifest['merge_sha_availability']['finding'] in text
 

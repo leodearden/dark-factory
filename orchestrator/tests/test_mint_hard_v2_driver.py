@@ -1016,6 +1016,37 @@ class TestRedriveProvenance:
             }))
         assert changes == []
 
+    def test_redrive_regenerates_the_finding_prose_not_just_the_counts(
+        self,
+    ) -> None:
+        # The shipped contradiction: --redrive recomputed the two integers and
+        # left the sentence beside them untouched, so the manifest ended up
+        # publishing counts that its own prose denied.
+        before = _redrive_manifest()
+        before['merge_sha_availability'] = driver.merge_sha_availability_block(
+            before['candidates'])
+        stale_finding = before['merge_sha_availability']['finding']
+        # Authored while both include rows were planRate-only.
+        assert _SPLIT_MAJORITY_CLAIM in stale_finding
+
+        # Upgrade BOTH rows, inverting the majority.
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': ('7c1d0e5b91' + 'c' * 30, '0a4f2b6d83' + 'd' * 30,
+                     'merge_first_parent'),
+        }))
+
+        # The WHOLE block — counts AND prose — is the shared derivation over
+        # the rows this call just rewrote.
+        assert after['merge_sha_availability'] == \
+            driver.merge_sha_availability_block(after['candidates'])
+        # And the sentence actually moved: "recomputed the two integers, left
+        # the sentence" cannot pass here.
+        assert after['merge_sha_availability']['finding'] != stale_finding
+        assert _SPLIT_MAJORITY_CLAIM not in \
+            after['merge_sha_availability']['finding']
+
 
 # ---------------------------------------------------------------------------
 # base_distance_rows — REPORT the measured distances, never assert them
