@@ -214,6 +214,24 @@ def _coerce_owner_pid(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _coerce_session_id(value: Any) -> str | None:
+    """Read ``claude_session_id`` from a record body, tolerating junk.
+
+    Mirrors ``_coerce_owner_pid``: anything that is not a ``str`` reads as
+    None ("no session id bound") instead of surviving to the hook trio's
+    ``(record.claude_session_id or '').strip()`` call, where a non-str would
+    raise AttributeError outside the ownership probe's try/except and lose
+    the whole hook event. A str value is stripped, and a whitespace-only
+    string also reads as None. Never raises: this is on ``from_dict``'s
+    path, and a hand-edited or older record body must not be what breaks a
+    session hook.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -255,6 +273,8 @@ class SessionRecord:
         ``session_hooks.hook_session_slug`` compares it against the current
         hook's stdin session_id to tell the session spawn-claude.sh launched
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
+        A non-str or whitespace-only value in a record body reads back as
+        None instead of surviving unchanged (see ``_coerce_session_id``).
     claude_owner_pid: pid of the ``claude`` PROCESS that bound
         ``claude_session_id``, stamped at the same moment, or None for a
         record bound before this field existed (or where the pid could not
@@ -263,7 +283,9 @@ class SessionRecord:
         alone cannot tell "the owner re-minted" from "a nested claude
         inherited the env var". The owning process keeps its pid across a
         re-mint; a nested ``claude`` never shares it. See
-        ``session_hooks._env_slug_is_owned``.
+        ``session_hooks._env_slug_is_owned``. A non-int, bool, or
+        non-positive value in a record body reads back as None instead of
+        surviving unchanged (see ``_coerce_owner_pid``).
     """
 
     session_slug: str
@@ -338,7 +360,7 @@ class SessionRecord:
             spawn_mode=data.get('spawn_mode', SpawnMode.CHILD),
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
-            claude_session_id=data.get('claude_session_id'),
+            claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
         )
 
