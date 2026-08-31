@@ -118,6 +118,43 @@ Useful variants: `lms_ctl active` / `stop-all`; `lms_fetch_weights --all`
 
 Logs are the journal: `journalctl --user -u lms-arm@qwen3.5-9b.service -f`.
 
+### The whole slate: `lms_slate_run.py`
+
+Steps 1-5 above are the per-arm primitives. To run the WHOLE slate, don't type
+them seven times — that is how the 2026-08-06 run was driven, and it is why no
+compliant invocation for it existed anywhere in the repo afterwards.
+
+```bash
+uv run --project shared python scripts/local-model-serving/lms_slate_run.py
+journalctl --user -u lms-slate-run -f      # follow it
+```
+
+That submits ONE transient `systemd --user` unit for the whole sweep (PRD
+hazard 11: long runs go in transient units, never bare background shells — a
+~30 minute slate through a background shell dies with your session, losing
+every arm measured so far). Inside the unit it drives exactly the steps above,
+**one arm at a time**: start / wait-ready / `--arm ... --output <part>` / stop.
+Each arm is stopped even when its probe fails, because `lms_ctl start` refuses
+rather than evicting — one arm left running would turn into six spurious
+refusals.
+
+It is **resumable**. Each arm's report lands in `--parts-dir` as
+`<arm_id>.json`, and a re-run skips any arm that already has a valid part, so
+a sweep that died at arm six re-measures one arm and not seven. `--force`
+re-measures everything regardless. Pass `--parts-dir` explicitly to resume into
+a directory from a previous run; the default lives under `$XDG_RUNTIME_DIR` and
+does not survive a reboot.
+
+`--dry-run` prints the compliant command and runs nothing — useful for reading
+the exact invocation without a card. `--ready-timeout` forwards to
+`lms_ctl wait-ready` (default 900s).
+
+The artifact is written by `lms_healthcheck --merge`, never by the driver, and
+that merge **refuses a partial slate**: an arm that failed leaves no part, and
+`merge_reports`' manifest-coverage check writes nothing rather than emit a
+short report that reads as a complete one. So a failed sweep leaves the
+previous artifact intact and says which arms are uncovered.
+
 ### One arm at a time
 
 `lms_ctl start` is **exclusive by default** — it refuses while another arm's
