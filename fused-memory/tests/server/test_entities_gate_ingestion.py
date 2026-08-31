@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
 
 # The C1 fallback harness, imported rather than re-derived: reaching
 # `add_memory`'s SECOND service call site needs write triage enabled with a
@@ -39,6 +40,14 @@ from fused_memory.server.tools import create_mcp_server
 # test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
 # same way).
 from server.test_add_memory_write_triage_gate import _candidate, _configure_config
+
+# The malformed-shape corpus, IMPORTED rather than re-spelled. The unit tests
+# pin what the pure gate answers for each shape; this module pins what an agent
+# actually receives for the same shape. Two copies of the list would let those
+# two claims drift — a shape added to one and not the other is silently
+# unchecked at the seam that matters — which is the whole point of the
+# single-list amendment (see `_MALFORMED_SHAPES`' own comment).
+from server.test_entities_gate import _MALFORMED_SHAPES
 
 _PROJECT_ID = 'dark_factory'
 
@@ -503,4 +512,76 @@ class TestAddEpisodeForwardsTheDeclaration:
         assert forwarded == expected, f'{forwarded!r}'
         assert (forwarded is None) == (expected is None), (
             f'[] and None must stay distinguishable, got {forwarded!r}'
+        )
+
+
+class TestEveryMalformedShapeReachesTheGate:
+    """The gate — not pydantic — answers EVERY wrong shape, at both tools.
+
+    `entities` is annotated `Any` on both tools precisely so this class can
+    exist. A narrower `list[dict] | None` would put FastMCP/pydantic's
+    validator ahead of the tool body, and the two mistakes an agent is
+    likeliest to make — a bare `'task 3127'`, a single un-wrapped
+    `{'kind': ..., 'id': ...}` — would come back as a raw ToolError
+    ("Input should be a valid list") carrying NO remediation, while a
+    structurally-valid-but-wrong entry like `[{'id': 'abc'}] `reached the gate
+    and came back with the hint. The write is blocked either way, so this is
+    not a correctness defect; it is a legibility one, and precisely the
+    guessing behaviour `_DECLARED_REFERENT_HINT` exists to prevent.
+
+    So every case here asserts the AGENT-VISIBLE outcome: a returned dict (not
+    a raised ToolError), the house-shape ValidationError, and the accepted
+    entry shape inside the message. Re-narrowing either annotation turns this
+    class red rather than silently reverting the boundary to two answers.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    async def test_add_memory_answers_with_the_hinted_block(self, declared):
+        mock_service = AsyncMock()
+        _pass_through(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, entities=declared)
+
+        assert isinstance(result, dict), f'expected a dict, got {type(result)}: {result!r}'
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        assert _DECLARED_REFERENT_HINT in result.get('error', ''), f'{result!r}'
+        assert result.get('content_excerpt') == _CONTENT[:200], f'{result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    async def test_add_episode_answers_with_the_hinted_block(self, declared):
+        mock_service = AsyncMock()
+        _pass_through_episode(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call_episode(server, entities=declared)
+
+        assert isinstance(result, dict), f'expected a dict, got {type(result)}: {result!r}'
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        assert _DECLARED_REFERENT_HINT in result.get('error', ''), f'{result!r}'
+        assert result.get('content_excerpt') == _CONTENT[:200], f'{result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('tool', ['add_memory', 'add_episode'])
+    async def test_the_declared_shape_is_still_advertised_in_the_tool_schema(self, tool):
+        """The one thing `Any` costs, pinned so it stays paid for.
+
+        Widening drops the JSON-schema type constraint, so the accepted shape
+        survives only in the docstring Args text FastMCP publishes as the tool
+        description. That text is now the parameter's ONLY machine-readable
+        shape hint, which makes deleting it a silent regression rather than a
+        docs edit — this asserts it is there.
+        """
+        server = create_mcp_server(AsyncMock())
+        (spec,) = [t for t in server._tool_manager.list_tools() if t.name == tool]
+
+        assert 'entities' in spec.parameters['properties'], f'{spec.parameters!r}'
+        description = spec.description or ''
+        assert "{'kind': 'task', 'id': <digits>" in description, (
+            f'{tool} no longer documents the accepted `entities` entry shape, '
+            'which is the only shape hint left once the annotation is `Any`'
         )

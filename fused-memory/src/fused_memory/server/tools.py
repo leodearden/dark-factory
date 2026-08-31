@@ -2971,7 +2971,14 @@ def create_mcp_server(
         metadata: dict | None = None,
         temporal_context: str | None = None,
         reference_time: str | None = None,
-        entities: list[dict] | None = None,
+        # `Any`, not `list[dict] | None`, on purpose — see the identical note
+        # at `add_memory` below and `entities_gate`'s module docstring: a
+        # narrower annotation would let pydantic reject the two commonest
+        # mistakes (a bare string, a single un-wrapped dict) BEFORE the gate
+        # runs, with a raw ToolError carrying no remediation. Same precedent as
+        # `get_tasks(statuses: Any = None)`, which is `Any` for this exact
+        # reason.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add an episode to memory. Full ingestion pipeline: raw content is processed
@@ -3055,8 +3062,11 @@ def create_mcp_server(
                 referents the episode is ABOUT. A declaration the content
                 contradicts is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested; a malformed entry is rejected as a ValidationError.
-                Absence is never rejected, so omitting this always succeeds.
+                ingested. ANY wrong shape — a bare string, a single un-wrapped
+                dict, a bad entry inside the list — is rejected as a
+                ValidationError whose message carries the accepted entry shape,
+                so you never have to guess the remedy. Absence is never
+                rejected, so omitting this always succeeds.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3261,7 +3271,21 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         dual_write: bool = False,
-        entities: list[dict] | None = None,
+        # `Any`, not `list[dict] | None`, on purpose. This parameter's whole
+        # error surface is `entities_gate`, whose rejection folds gamma's
+        # `_DECLARED_REFERENT_HINT` — the accepted entry shape AND the
+        # remediation — into one structured house-shape block. A narrower
+        # annotation hands the shape check to pydantic, which runs BEFORE this
+        # body and answers a bare `'task 3127'` or a single un-wrapped
+        # `{'kind': ..., 'id': ...}` — precisely the two mistakes an agent is
+        # likeliest to make — with a raw ToolError carrying no hint at all, so
+        # the remediation reaches an agent or not depending on WHICH way it got
+        # the shape wrong. `Any` makes every wrong shape reach the one gate and
+        # get the one answer. Precedent: `get_tasks(statuses: Any = None)`,
+        # widened for the same reason (a bare string there is rejected in the
+        # body, not by pydantic). The accepted shape stays documented in the
+        # Args block below, which is what an agent actually reads.
+        entities: Any = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a classified memory directly. Skips the extraction pipeline.
@@ -3393,9 +3417,12 @@ def create_mcp_server(
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
                       is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written; a malformed entry is rejected as a
-                      ValidationError. Absence is never rejected, so omitting
-                      this parameter always succeeds.
+                      and nothing is written. ANY wrong shape — a bare string,
+                      a single un-wrapped dict, a bad entry inside the list — is
+                      rejected as a ValidationError whose message carries the
+                      accepted entry shape, so you never have to guess the
+                      remedy. Absence is never rejected, so omitting this
+                      parameter always succeeds.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)

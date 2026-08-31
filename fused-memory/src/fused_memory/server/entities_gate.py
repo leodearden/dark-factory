@@ -79,7 +79,16 @@ def entities_gate(
             ``[]`` = considered and none apply, ``[...]`` = declared.  Typed
             ``Any`` rather than ``list[dict] | None`` on purpose: this is raw
             MCP input, so every wrong shape is reachable and the point of the
-            gate is to REJECT them rather than to assume them away.
+            gate is to REJECT them rather than to assume them away. That
+            reachability is not free — it holds only because BOTH write tools
+            annotate ``entities`` as ``Any`` too (same precedent as
+            ``get_tasks(statuses: Any = None)``). Narrow either annotation and
+            pydantic rejects the commonest mistakes ahead of this function,
+            with a raw ToolError carrying none of the remediation gamma folded
+            into its message — so the hint would reach an agent or not
+            depending on WHICH way it got the shape wrong.
+            ``tests/server/test_entities_gate_ingestion.py::TestEveryMalformedShapeReachesTheGate``
+            fails if that happens.
         content: The verbatim write body, scanned for the referents the prose
             actually names.
         group_id: The local project id.  Must be the CANONICAL one — the

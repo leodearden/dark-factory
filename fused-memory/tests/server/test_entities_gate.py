@@ -34,6 +34,33 @@ _CITES_3127 = 'the fix for Task 3127 landed'
 #: gamma treats as UNINFORMATIVE rather than contradictory.
 _CITES_NOTHING = 'the merge-lane hardening work'
 
+#: The falsy NON-list shapes, as ``(id, value)`` pairs.  Their own arm below
+#: pins the property that singles them out — that the gate short-circuits on
+#: ``entities is None`` and never on ``not entities`` — and they are spliced
+#: into ``_MALFORMED_SHAPES`` so the shared coverage sees them too, from ONE
+#: spelling of the triple.
+_FALSY_NON_LIST_SHAPES = (('empty-str', ''), ('empty-dict', {}), ('zero', 0))
+
+#: Every shape gamma's TOTAL ``InputValidationError`` contract must reject,
+#: hoisted to one list because THREE tests consume it: the two arms below, and
+#: the tool-boundary arm in ``tests/server/test_entities_gate_ingestion.py``,
+#: which imports it from here.  Kept as one list on purpose — a shape added to
+#: a second copy and not the first would be silently unchecked for the property
+#: the first pins, which is the lockstep duplication this batch keeps guarding
+#: against.  The boundary import is what stops the pure-function claim and the
+#: agent-visible behaviour from drifting apart: every shape here is reachable
+#: through FastMCP only because both tools annotate ``entities`` as ``Any``.
+_MALFORMED_SHAPES = [
+    pytest.param('task 3127', id='a-str-not-a-list'),
+    pytest.param([{'id': 'abc'}], id='non-digit-id'),
+    pytest.param([{'id': 3127, 'projectId': 'reify'}], id='unrecognized-key'),
+    pytest.param([{'id': True}], id='bool-id'),
+    pytest.param([{'id': 3127, 'project_id': 'task'}], id='task-vocabulary-qualifier'),
+    pytest.param([[1]], id='a-list-of-non-dicts'),
+    pytest.param({'kind': 'task', 'id': 3127}, id='an-unwrapped-single-dict'),
+    *(pytest.param(value, id=f'falsy-{label}') for label, value in _FALSY_NON_LIST_SHAPES),
+]
+
 
 class TestAbsenceIsNeverRejected:
     """The tri-state's two non-declaring arms, and the corroborating one.
@@ -91,16 +118,7 @@ class TestMalformedDeclarationsAreRejected:
     ``server/tools.py`` already return.
     """
 
-    @pytest.mark.parametrize(
-        'declared',
-        [
-            pytest.param('task 3127', id='a-str-not-a-list'),
-            pytest.param([{'id': 'abc'}], id='non-digit-id'),
-            pytest.param([{'id': 3127, 'projectId': 'reify'}], id='unrecognized-key'),
-            pytest.param([{'id': True}], id='bool-id'),
-            pytest.param([{'id': 3127, 'project_id': 'task'}], id='task-vocabulary-qualifier'),
-        ],
-    )
+    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
     def test_each_malformed_shape_blocks_the_write(self, declared):
         block = entities_gate(
             declared, content=_CITES_3127, group_id=GROUP, agent_id='claude-interactive',
@@ -112,16 +130,7 @@ class TestMalformedDeclarationsAreRejected:
         assert block['agent_id'] == 'claude-interactive', f'{block!r}'
         assert block['content_excerpt'] == _CITES_3127[:200], f'{block!r}'
 
-    @pytest.mark.parametrize(
-        'declared',
-        [
-            pytest.param('task 3127', id='a-str-not-a-list'),
-            pytest.param([{'id': 'abc'}], id='non-digit-id'),
-            pytest.param([{'id': 3127, 'projectId': 'reify'}], id='unrecognized-key'),
-            pytest.param([{'id': True}], id='bool-id'),
-            pytest.param([{'id': 3127, 'project_id': 'task'}], id='task-vocabulary-qualifier'),
-        ],
-    )
+    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
     def test_the_remediation_reaches_the_agent_inside_the_message(self, declared):
         """Gamma single-sources the accepted shape into the exception message.
 
@@ -150,8 +159,15 @@ class TestMalformedDeclarationsAreRejected:
         as absence would silently downgrade the write's referent source and
         lose the caller's intent invisibly — the silent degradation this
         repo's loud-over-silent norm forbids.
+
+        These three are also spliced into ``_MALFORMED_SHAPES``, so the arms
+        above and the tool boundary check them too.  This arm is kept separate
+        anyway because it pins a DIFFERENT property — not "the gate rejects
+        this shape" but "the gate did not read this shape as an absence" — and
+        that is the claim whose failure message a reader needs when a future
+        ``not entities`` shortcut appears.
         """
-        for falsy in ('', {}, 0):
+        for _label, falsy in _FALSY_NON_LIST_SHAPES:
             block = entities_gate(falsy, content=_CITES_3127, group_id=GROUP)
             assert isinstance(block, dict), f'{falsy!r} was read as absence: {block!r}'
             assert block['error_type'] == 'ValidationError', f'{falsy!r}: {block!r}'
