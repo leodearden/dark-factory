@@ -498,10 +498,14 @@ def read_decline_artifacts(
     unreadable field costs exactly ONE field's visibility, never the whole eval
     cell. Each reader is called inside its own ``try/except Exception`` that
     logs a warning naming the kind, so a corrupt ``already_done.json`` still
-    lets the other four report. This matters because the SOLE caller is inside
-    ``run_architect_eval``'s ``finally`` block — the only place the artifacts
-    still exist, since the next statement ``rmtree``s the meta root — where a
-    raise would turn an already-scored cell into a lost run.
+    lets the other four report. EVERY route to ``None``-for-an-unreadable-kind
+    logs — the raise, the missing reader, and a file whose JSON parses but is
+    not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
+    Only a kind the architect never reported goes quiet, because that ``None``
+    is a measurement, not a degradation. This matters because the SOLE caller
+    is inside ``run_architect_eval``'s ``finally`` block — the only place the
+    artifacts still exist, since the next statement ``rmtree``s the meta root
+    — where a raise would turn an already-scored cell into a lost run.
 
     ``artifacts is None`` (the harness-error path, where it was never
     constructed) and an object missing a reader (a legacy or monkeypatched
@@ -526,7 +530,19 @@ def read_decline_artifacts(
                 type(exc).__name__, exc,
             )
             continue
-        out[kind] = artifact if isinstance(artifact, dict) else None
+        if artifact is not None and not isinstance(artifact, dict):
+            # A file holding VALID JSON that is not an object (``[]``, ``"x"``,
+            # ``3``) parses cleanly, so neither ``except`` above fires — and
+            # dropping it silently would read downstream as "the architect
+            # never declined", degrading exactly the signal this function
+            # exists to make legible. Loud over silent: same warning shape as
+            # the two above, naming the kind and what was actually seen.
+            logger.warning(
+                'decline artifact %s unreadable: expected a JSON object, got %s',
+                kind, type(artifact).__name__,
+            )
+            continue
+        out[kind] = artifact
     return out
 
 

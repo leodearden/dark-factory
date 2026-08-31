@@ -409,6 +409,39 @@ class TestReadDeclineArtifacts:
         assert out['false_premise'] is not None       # the others survive
         assert 'already_done' in caplog.text
 
+    @pytest.mark.parametrize(
+        ('written', 'observed_type'),
+        [('[]', 'list'), ('"x"', 'str'), ('3', 'int')],
+    )
+    def test_a_non_object_artifact_degrades_LOUDLY(
+            self, eval_artifacts, caplog, written, observed_type):
+        """VALID JSON that is not an OBJECT is a degradation, and says so.
+
+        The shape no ``except`` catches: ``json.load`` returns cleanly, so the
+        reader raises nothing and the value simply is not a dict. Coercing it
+        to ``None`` without a log line would read downstream as "the architect
+        never declined" — the silent degradation of exactly the signal this
+        module exists to make legible, against the repo's
+        loud-over-silent-degradation norm. The warning must name BOTH the kind
+        (which artifact to go look at) and the type actually seen (why it was
+        rejected), because ``None`` alone is indistinguishable from the
+        ordinary "this kind was never reported".
+        """
+        import logging
+
+        from orchestrator.evals.metrics import read_decline_artifacts
+
+        eval_artifacts.write_false_premise(*_WRITERS['false_premise'][1])
+        (eval_artifacts.root / 'already_done.json').write_text(written)
+
+        with caplog.at_level(logging.WARNING):
+            out = read_decline_artifacts(eval_artifacts)
+
+        assert out['already_done'] is None
+        assert out['false_premise'] is not None       # the others survive
+        assert 'already_done' in caplog.text
+        assert observed_type in caplog.text
+
     def test_none_artifacts_returns_the_all_none_map(self):
         """The harness-error path: ``artifacts`` was never constructed."""
         from orchestrator.evals.metrics import DECLINE_KINDS, read_decline_artifacts
