@@ -1081,6 +1081,91 @@ class TestPollUntilStable:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the shared retry_until_observed() observation barrier (task 4972)
+# ---------------------------------------------------------------------------
+# The third member of the barrier family, and the reason it exists: poll_until
+# and poll_until_stable both assume the condition, once it arrives, stays
+# observable long enough for a client read to catch it. A racy TRANSIENT breaks
+# that assumption -- it can close before any client read lands, and then no
+# interval and no deadline on a single attempt can help, because there is
+# nothing left to observe. The only lever that acts on an absent window is to
+# RE-OPEN it and look again.
+#
+# The motivating call site is
+# tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow, whose
+# post-DROP rebuild window measured only 28/30 first-attempt observations under
+# the offline lane's own `nice -n 19 ionice -c3` scheduling: on a miss FalkorDB
+# had finished the rebuild INSIDE the DROP round-trip, so the very first
+# post-DROP read (6.8 ms after DROP returned) already showed one settled
+# OPERATIONAL row.
+#
+# Every assertion below is on CALL COUNTS and CALL ORDER against a shared
+# append-only log -- never on wall clock -- so this suite is load-independent
+# and cannot itself become the next flake, the same discipline TestPollUntil
+# and TestPollUntilStable above already keep.
+
+class TestRetryUntilObserved:
+    """Unit tests for retry_until_observed(observe, *, reopen, attempts, message)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_observation_on_the_first_attempt_returns_verbatim_and_never_reopens(self):
+        """A first-attempt observation returns the value verbatim, at zero reopen cost.
+
+        The no-miss path costing nothing is what makes this barrier safe to
+        adopt in a fixture-backed live test: when the window IS open (the
+        measured 28/30 case) the helper is indistinguishable from the single
+        un-retried observation it replaces.
+
+        Returning the observed value verbatim rather than coerced to True
+        mirrors poll_until's documented return contract, so all three
+        primitives in the family chain the same way.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_observation_on_the_first_attempt_is_awaited(self):
+        """A coroutine-function `observe` is awaited, matching poll_until's isawaitable contract.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is always truthy, so a helper that failed to await would still
+        "succeed" on the first attempt -- but it would return the coroutine
+        rather than the payload, and the log would stay empty because the
+        coroutine body never ran.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        async def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
 # ---------------------------------------------------------------------------
 # Idempotent + 409-tolerant collection (re)creation, used by the qdrant
