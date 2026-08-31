@@ -19,6 +19,7 @@ background shells" -- is enforced here as a CHECKED PROPERTY of the built
 argv, mirroring `test_lms_fetch_weights.py`'s treatment of hazard 5.
 """
 import sys
+from pathlib import Path
 
 import lms_fetch_weights
 import lms_slate_run
@@ -777,3 +778,192 @@ def test_a_failed_arm_makes_the_run_non_zero_even_when_the_merge_succeeds(
     code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
 
     assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# the CLI surface
+#
+# Two layers, and the split is the guard: the DEFAULT path submits a transient
+# unit, `--in-unit` is what the unit's own payload passes back in.  Without the
+# flag the unit would re-submit itself, recursively.
+# ---------------------------------------------------------------------------
+
+
+class _SubmitRecorder:
+    """Records what the submit layer would run. Nothing is executed."""
+
+    def __init__(self, returncode=0):
+        self.calls: list[list[str]] = []
+        self._returncode = returncode
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return _FakeCompleted(self._returncode)
+
+
+def test_a_bare_invocation_submits_the_transient_unit(tmp_path, two_arms):
+    runner = _SubmitRecorder()
+
+    code = lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert code == 0
+    assert len(runner.calls) == 1
+    assert runner.calls[0][:2] == ['systemd-run', '--user']
+
+
+def test_a_bare_invocation_does_not_run_the_sweep_in_process(tmp_path, two_arms):
+    """The sweep belongs in the unit. Running it here would be the bare
+    background shell PRD hazard 11 forbids, only worse: in the foreground of
+    whatever session invoked it."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    for argv in runner.calls:
+        assert '--arm' not in argv
+        assert 'start' not in argv
+
+
+def test_dry_run_prints_the_compliant_command_and_runs_nothing(
+    tmp_path, two_arms, capsys,
+):
+    runner = _SubmitRecorder()
+
+    code = lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert code == 0
+    assert runner.calls == []
+    out = capsys.readouterr().out
+    assert 'systemd-run' in out
+    assert lms_slate_run.SLATE_UNIT_NAME in out
+
+
+def test_dry_run_prints_no_follow_hint_for_a_unit_it_never_created(
+    tmp_path, two_arms, capsys,
+):
+    """A `journalctl --user -u lms-slate-run -f` line for a unit that was
+    never created sends an operator to watch nothing, indefinitely."""
+    lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(),
+    )
+
+    assert 'journalctl' not in capsys.readouterr().out
+
+
+def test_a_real_submit_prints_the_follow_hint(tmp_path, two_arms, capsys):
+    lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(),
+    )
+
+    out = capsys.readouterr().out
+    assert f'journalctl --user -u {lms_slate_run.SLATE_UNIT_NAME} -f' in out
+
+
+def test_the_submit_path_propagates_a_failing_systemd_run(tmp_path, two_arms):
+    """Swallowing this would report a slate run as started when systemd
+    refused it -- e.g. because a unit of the same name is already active."""
+    code = lms_slate_run.main(
+        ['--parts-dir', str(tmp_path / 'parts'), '--output', str(tmp_path / 'o.json')],
+        runner=_SubmitRecorder(returncode=1),
+    )
+
+    assert code == 1
+
+
+def test_in_unit_runs_the_sweep_and_does_not_resubmit(tmp_path, two_arms):
+    """The recursion guard: without it, the unit's payload would submit
+    another unit, which would submit another."""
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--parts-dir', str(tmp_path / 'parts'),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-one') in stages
+    assert not any('systemd-run' in argv for argv in runner.calls)
+
+
+def test_in_unit_forwards_the_parts_dir_output_and_ready_timeout(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    output = tmp_path / 'artifact.json'
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--parts-dir', str(parts_dir), '--output', str(output),
+         '--ready-timeout', '7.5'],
+        runner=runner,
+    )
+
+    wait = next(a for a in runner.calls if _stage_key(a)[:2] == ('ctl', 'wait-ready'))
+    assert wait[wait.index('--timeout') + 1] == '7.5'
+    probe = next(a for a in runner.calls if _stage_key(a) == ('healthcheck', 'arm-one'))
+    assert probe[probe.index('--output') + 1] == str(parts_dir / 'arm-one.json')
+    merge = _merge_call(runner)
+    assert merge[merge.index('--output') + 1] == str(output)
+
+
+def test_in_unit_force_re_runs_an_arm_that_has_a_valid_part(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.main(
+        ['--in-unit', '--force', '--parts-dir', str(parts_dir),
+         '--output', str(tmp_path / 'o.json')],
+        runner=runner,
+    )
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_the_output_defaults_to_the_committed_artifact_path(tmp_path, two_arms):
+    """The whole point is to regenerate THAT file; making an operator retype
+    its path is how a slate run lands somewhere nobody reads."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main(['--parts-dir', str(tmp_path / 'parts')], runner=runner)
+
+    argv = runner.calls[0]
+    assert argv[argv.index('--output') + 1] == str(lms_slate_run.DEFAULT_ARTIFACT)
+
+
+def test_the_default_parts_dir_is_absolute_and_needs_no_flag(tmp_path, two_arms):
+    """`systemd --user` propagates no caller environment, so an
+    XDG_RUNTIME_DIR derived on BOTH sides would name two different
+    directories and the resume would silently do nothing. It is resolved once,
+    here in the submit layer, and passed explicitly."""
+    runner = _SubmitRecorder()
+
+    lms_slate_run.main([], runner=runner)
+
+    argv = runner.calls[0]
+    parts_value = argv[argv.index('--parts-dir') + 1]
+    assert parts_value.startswith('/')
+    assert parts_value == str(Path(parts_value).resolve())
+
+
+def test_the_committed_artifact_is_never_touched_by_the_default_cli_path(two_arms):
+    """Guard on this test suite itself: a bare `main([])` must not be able to
+    write `verification/health-report.json`, whose only legitimate source is a
+    live run on the 3090."""
+    before = lms_slate_run.DEFAULT_ARTIFACT.read_bytes()
+
+    lms_slate_run.main([], runner=_SubmitRecorder())
+
+    assert lms_slate_run.DEFAULT_ARTIFACT.read_bytes() == before
