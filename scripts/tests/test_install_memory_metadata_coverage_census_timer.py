@@ -414,6 +414,40 @@ def test_service_documents_where_the_normative_contract_lives():
 # directly and positively by the OnCalendar tests in this file.
 
 
+# ── ambient git redirection (incident 2026-08-31) ───────────────────────────
+#
+# Every git path in this file is pinned to a tmp dir, and that is NOT sufficient.
+# `git -C <tmp>` only changes DIRECTORY: GIT_DIR and its siblings skip
+# repository discovery outright, so one ambient GIT_DIR sends both this file's
+# own `git config user.*` writes and the wrapper's `git -C "$REPO" commit`
+# into whatever repository that variable names, with -C and $REPO alike inert.
+#
+# That is not hypothetical here. On 2026-08-31 a run of this file wrote
+# `[user] name=Test email=test@example.com` and `commit.gpgsign = false` -- the
+# literal values from _git_repo_harness below -- into the LIVE project_root
+# checkout's .git/config, and committed this file's placeholder artifact
+# content onto its main. GIT_CEILING_DIRECTORIES did not stop it: a ceiling
+# bounds the upward WALK, and an explicit GIT_DIR never walks.
+#
+# GIT_CEILING_DIRECTORIES is the one GIT_* name deliberately KEPT: it is the
+# suite's first-defence containment (df_pytest_isolation._df_git_ceiling_at_basetemp)
+# and dropping it here would hand the subprocess LESS protection, not more.
+#
+# Suite-wide immunity lives in df_pytest_isolation._df_git_env_hermetic. This
+# layer is deliberately redundant with it, because this file is also run
+# directly (`pytest scripts/tests/test_...py`) from rootdirs whose conftest may
+# not wire that fixture, and because the harness -- not the fixture -- is what
+# a future editor of this file will read.
+_KEEP_GIT_ENV = frozenset({'GIT_CEILING_DIRECTORIES'})
+
+
+def _scrub_git_env(env):
+    """Drop every ambient GIT_* that could retarget git away from the path given."""
+    for key in [k for k in env if k.startswith('GIT_') and k not in _KEEP_GIT_ENV]:
+        env.pop(key, None)
+    return env
+
+
 # ── the committed wrapper ───────────────────────────────────────────────────
 
 _FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
@@ -514,7 +548,7 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     repo = tmp_path / 'fake-repo'
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
 
-    env = dict(os.environ)
+    env = _scrub_git_env(dict(os.environ))
     env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
     env['REPO'] = str(repo)
     for key in _SERVICE_ENV_KEYS:
@@ -687,9 +721,14 @@ _ARTIFACTS = (
 
 
 def _git(repo, *args):
+    # env= is load-bearing, not tidiness: these are the calls that wrote
+    # `[user] name=Test` into the live checkout's .git/config on 2026-08-31.
+    # Without the scrub they inherit an ambient GIT_DIR and the `-C` below is
+    # decorative. See the _scrub_git_env block above.
     return subprocess.run(
         ['git', '-C', str(repo), *args],
         capture_output=True, text=True, check=False,
+        env=_scrub_git_env(dict(os.environ)),
     )
 
 
@@ -1007,3 +1046,133 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     flat = [' '.join(a) for a in seen]
     assert any('commit --only' in c for c in flat), flat
     assert any(' add -- ' in f'{c} ' for c in flat), flat
+
+
+# ── ambient GIT_* can never redirect this job into another repo ──────────────
+#
+# Regression guard for the 2026-08-31 incident, in which a run of THIS FILE
+# committed placeholder content onto main in the live project_root checkout and
+# wrote `[user] name=Test email=test@example.com` + `commit.gpgsign = false`
+# into its real .git/config.
+#
+# The mechanism is not a missing $REPO -- _wrapper_harness has pinned REPO to a
+# tmp dir since the file was written. It is that `git -C "$REPO"` does not mean
+# "act on $REPO": `-C` only changes directory, while GIT_DIR skips repository
+# discovery entirely, so an ambient GIT_DIR overrides BOTH the -C and the $REPO
+# and every git call lands in the repository it names. GIT_CEILING_DIRECTORIES
+# does not cover this -- a ceiling bounds the upward WALK, and GIT_DIR never
+# walks.
+#
+# INV-10 (`guards-exercise-behaviour`): these RUN the real wrapper and the real
+# harness against a decoy repository standing in for the live checkout and
+# assert the decoy is untouched. Nothing here greps the wrapper's text -- a
+# source scan would have stayed green through the entire incident, since the
+# wrapper's `git -C "$REPO"` spelling was never what was wrong.
+
+
+def _decoy_live_repo(tmp_path):
+    """A real repo standing in for the live checkout, with its own identity.
+
+    Carries the same tracked artifact paths as the real thing, so a redirected
+    `commit --only` would SUCCEED here rather than failing on an unknown
+    pathspec -- otherwise the guard could pass for the wrong reason.
+    """
+    decoy = tmp_path / 'decoy-live-checkout'
+    (decoy / 'plans').mkdir(parents=True)
+    _git(decoy, 'init', '-q', '-b', 'main')
+    _git(decoy, 'config', 'user.email', 'real-operator@example.invalid')
+    _git(decoy, 'config', 'user.name', 'Real Operator')
+    for rel in _ARTIFACTS:
+        (decoy / rel).write_text('{"real": true}\n')
+    _git(decoy, 'add', '--', *_ARTIFACTS)
+    _git(decoy, '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify',
+         '-m', 'real history')
+    return decoy
+
+
+def _decoy_state(decoy):
+    """The two things the incident actually damaged: identity, and history."""
+    return {
+        'user.email': _git(decoy, 'config', '--local', '--get', 'user.email').stdout,
+        'user.name': _git(decoy, 'config', '--local', '--get', 'user.name').stdout,
+        'gpgsign': _git(decoy, 'config', '--local', '--get', 'commit.gpgsign').stdout,
+        'log': _git(decoy, 'log', '--pretty=%H %s').stdout,
+    }
+
+
+def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_path):
+    """THE incident, reproduced end to end against a decoy.
+
+    GIT_DIR is injected via `extra_env`, which _wrapper_harness applies AFTER
+    its own scrub -- deliberately, so this exercises the WRAPPER's own
+    `unset GIT_DIR ...` (the production-side defence, which must hold when the
+    wrapper is run by systemd, a git hook, or any shell this file never touches)
+    rather than the harness's scrub.
+    """
+    decoy = _decoy_live_repo(tmp_path)
+    before = _decoy_state(decoy)
+
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+    result, state = _run_wrapper_in_git_repo(
+        tmp_path, repo, extra_env={'GIT_DIR': str(decoy / '.git')},
+    )
+
+    assert _decoy_state(decoy) == before, (
+        'the wrapper wrote into a repository named only by an ambient GIT_DIR; '
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # POSITIVE CONTROL: the run must have done its real work in the sandbox.
+    # Without this the assertion above passes just as well when the wrapper
+    # dies on line 1 and touches nothing anywhere.
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
+    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert sandbox_status.strip() == '', (
+        f'the sandbox commit did not happen, so the guard proved nothing: '
+        f'{sandbox_status!r} stdout={result.stdout!r}')
+
+
+def test_harness_git_calls_cannot_be_redirected_by_ambient_git_dir(
+        tmp_path, monkeypatch):
+    """The OTHER half of the incident: the harness's own identity writes.
+
+    `[user] name=Test email=test@example.com` and `commit.gpgsign = false` are
+    _git_repo_harness's literals, and they are what landed in the live
+    checkout's .git/config. Exercises _git/_scrub_git_env, not the wrapper.
+    """
+    decoy = _decoy_live_repo(tmp_path)
+    before = _decoy_state(decoy)
+
+    monkeypatch.setenv('GIT_DIR', str(decoy / '.git'))
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+
+    assert _decoy_state(decoy) == before, (
+        'the harness wrote its fixture identity/commits into a repository '
+        'named only by an ambient GIT_DIR')
+    # POSITIVE CONTROL: the harness really did build its own repo.
+    assert _git(repo, 'config', '--local', '--get', 'user.email').stdout.strip() \
+        == 'test@example.com'
+
+
+def test_wrapper_refuses_to_commit_when_repo_is_not_the_repository_root(tmp_path):
+    """Fail-closed backstop, independent of any GIT_* name.
+
+    The `unset` above removes the KNOWN redirection vars; this pins the
+    residual-case guard -- $REPO resolving to a repository whose root is
+    somewhere else (a nested or symlinked checkout, a $REPO pointed at a
+    subdirectory, or a redirection var git adds in a future release). The
+    wrapper must decline rather than commit into it.
+    """
+    outer = _git_repo_harness(tmp_path / 'outer')
+    before = _git(outer, 'log', '--pretty=%H %s').stdout
+
+    inner = outer / 'plans'  # a real subdirectory of a real repo, not its root
+    result, _ = _run_wrapper_in_git_repo(tmp_path, inner)
+
+    assert 'REFUSING' in result.stderr, result.stderr
+    assert _git(outer, 'log', '--pretty=%H %s').stdout == before, (
+        'the wrapper committed into the enclosing repository it was not told '
+        f'about; stderr={result.stderr!r}')
+    # Still exits 0: a refused commit must not wedge the recurring oneshot.
+    assert result.returncode == 0, result.stderr

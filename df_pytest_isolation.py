@@ -191,6 +191,26 @@ producer-side one, that ``resolve_fleet_dir()`` read against the ambient env
 lands in this run's basetemp — live in
 ``orchestrator/tests/test_fleet_dir_isolation.py``.
 
+FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+Incident 2026-08-31.  ``git -C <path>`` reads as "act on <path>" but ``-C`` only
+changes directory; ``GIT_DIR`` and its siblings SKIP repository discovery, so an
+ambient ``GIT_DIR`` redirects every such call into the repository it names with
+the ``-C`` argument inert.  139 test files here run ``git config user.*`` or
+``git commit`` against a ``tmp_path`` repo; under a leaked ``GIT_DIR`` all 139
+write somewhere else.  Measured in the live checkout: placeholder content
+committed onto ``main`` and ``[user] name=Test email=test@example.com`` plus
+``commit.gpgsign = false`` written into the real ``.git/config``.
+
+This is NOT covered by the first defence, and the two are easy to conflate.  A
+``GIT_CEILING_DIRECTORIES`` ceiling bounds the upward WALK; an explicit
+``GIT_DIR`` never walks, so the ceiling is bypassed rather than weakened
+(verified against real git: ceiling armed at the basetemp AND ``GIT_DIR`` set
+still wrote to the ``GIT_DIR`` repo).  ``_df_git_env_hermetic`` is FUNCTION
+scoped, unlike all four siblings, because its hazard is introduced MID-session
+by another test rather than present at session start — task 4966 measured
+exactly that as a 1-in-3 flake, green standalone and green in its own file.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -1582,3 +1602,100 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
         reason = leaked_fleet_heartbeat_reason(new)
         if reason is not None:
             pytest.fail(reason, pytrace=False)
+
+
+# ---------------------------------------------------------------------------
+# Ambient git redirection (incident 2026-08-31)
+# ---------------------------------------------------------------------------
+
+# The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
+# only names that change WHICH repository (or which config) a command acts on.
+# Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
+# what a commit says, never where it lands, and tests legitimately set them for
+# determinism.
+#
+# GIT_CEILING_DIRECTORIES is NOT here and must never be: it is the first
+# defence's own mechanism (:func:`_df_git_ceiling_at_basetemp`), so scrubbing it
+# would disarm the guard above this one.
+_GIT_REDIRECT_ENV = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+)
+
+# `git -c` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
+# so they cannot be enumerated by name.
+_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+
+
+def git_redirect_env(env: Iterable[str]) -> list[str]:
+    """The names in *env* that would retarget git away from the path it is given.
+
+    Pure and total over the key set, so the fixture below and any harness
+    building a subprocess env can share one definition of "redirecting" instead
+    of maintaining two lists that drift.
+    """
+    return sorted(
+        key for key in env
+        if key in _GIT_REDIRECT_ENV
+        or key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _df_git_env_hermetic():
+    """FIFTH DEFENCE — a leaked ``GIT_DIR`` can never redirect a test's git.
+
+    Incident 2026-08-31.  ``git -C <path>`` READS as "act on <path>", but ``-C``
+    only changes directory: ``GIT_DIR`` and its siblings SKIP repository
+    discovery outright, so a single ambient ``GIT_DIR`` silently redirects every
+    such call into whatever repository it names, with the ``-C`` argument inert.
+    139 test files in this repo run ``git config user.*`` / ``git commit``
+    against a ``tmp_path`` repo they created; under a leaked ``GIT_DIR`` all 139
+    write to the leaked repository instead.  Measured outcome in the live
+    checkout: placeholder content committed onto ``main``, and ``[user] name=Test
+    email=test@example.com`` plus ``commit.gpgsign = false`` written into the real
+    ``.git/config`` -- the literal values from one harness's tmp-pinned fixture.
+
+    WHY THE FIRST DEFENCE DOES NOT COVER THIS, since the two look alike and one
+    is directly above the other.  ``GIT_CEILING_DIRECTORIES`` bounds the upward
+    WALK of repository discovery.  An explicit ``GIT_DIR`` never walks, so the
+    ceiling is not weakened by the leak -- it is bypassed entirely.  Verified
+    against real git before this fixture was written: with the ceiling armed at
+    the basetemp AND ``GIT_DIR`` set, ``git -C <under-basetemp> config
+    user.email`` still wrote to the ``GIT_DIR`` repo.  The two defences cover
+    disjoint halves of "git acted on a repo the caller did not name", and
+    neither subsumes the other.
+
+    FUNCTION scope, diverging from all four siblings, and the divergence is the
+    whole point.  Their hazard is ambient state present when the session STARTS,
+    which a session-scoped fixture fixes once.  This one's hazard is a leak
+    introduced MID-SESSION -- task 4966 measured it as a 1-in-3 flake that is
+    green standalone and green when its own file runs alone, i.e. produced by an
+    earlier test in the same process mutating ``os.environ`` and not restoring
+    it.  A session-scoped scrub would run before that leaker and close nothing.
+    The cost objection those siblings answer does not apply: this is a handful of
+    dict lookups with no subprocess and no filesystem access.
+
+    Restores the pre-test value EXACTLY on teardown, including restoring absence
+    by deleting the key.  That keeps the fixture a shield rather than a cleaner:
+    a test that deliberately sets ``GIT_DIR`` for its own subprocess still sees
+    it, and a leak is contained to the test that produced it instead of being
+    silently repaired (which would hide the leaker from task 4966's hunt).
+    """
+    saved = {key: os.environ[key] for key in git_redirect_env(os.environ)}
+    for key in saved:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        for key in git_redirect_env(os.environ):
+            del os.environ[key]
+        os.environ.update(saved)

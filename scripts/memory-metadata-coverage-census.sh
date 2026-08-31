@@ -67,6 +67,31 @@
 # graded explicitly below.
 set -uo pipefail
 
+# ── AMBIENT GIT REDIRECTION IS NEUTRALISED BEFORE ANY GIT RUNS ──────────────
+#
+# Every git call below is spelled `git -C "$REPO" <verb>`, which READS as "act
+# on $REPO" but is not: `-C` only changes directory, while GIT_DIR and its
+# siblings SKIP repository discovery outright. An ambient GIT_DIR therefore
+# redirects all five call sites -- `commit --only` and the scoped `add --`
+# included -- into a repository this script was never told about, with both
+# $REPO and -C inert. Measured 2026-08-31: that is how a test run of
+# scripts/tests/test_install_memory_metadata_coverage_census_timer.py committed
+# placeholder content onto main in the live project_root checkout and rewrote
+# its .git/config identity, despite every path in that harness being pinned to
+# a tmp dir.
+#
+# GIT_CEILING_DIRECTORIES does NOT cover this (the suite-wide first defence in
+# df_pytest_isolation.py): a ceiling bounds the upward WALK, and an explicit
+# GIT_DIR never walks.
+#
+# Unsetting is correct for production too, not just under test: this wrapper
+# always means $REPO and has no legitimate use for an inherited git context.
+# The systemd unit hands it a clean env; a git hook, an interactive `git
+# commit` shell, or a test harness does not.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
+      GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+
 REPO="${REPO:-/home/leo/src/dark-factory}"
 FM="$REPO/fused-memory"
 
@@ -148,6 +173,19 @@ if [ "${CENSUS_COMMIT:-1}" != "1" ]; then
 elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     echo "memory-metadata-coverage-census: $REPO is not a git repository —" \
          "skipping the artifact commit" >&2
+elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || \
+     [ "$(cd "$REPO" 2>/dev/null && pwd -P)" != "$(cd "$repo_toplevel" 2>/dev/null && pwd -P)" ]; then
+    # FAIL CLOSED. The repository git resolves for $REPO is not $REPO itself,
+    # so this run would commit into something it was not told about. The unset
+    # above removes the known cause; this refuses on ANY residual one (a git
+    # env var added by a future git release, a symlinked or nested checkout,
+    # $REPO pointed at a subdirectory). Committing into the wrong repository is
+    # the defect; declining to commit is merely a missed nightly row, which the
+    # next run's append restores.
+    echo "memory-metadata-coverage-census: REFUSING to commit — \$REPO ($REPO)" \
+         "is not the root of the repository git resolves for it" \
+         "(${repo_toplevel:-<none>}); leaving the artifacts uncommitted" >&2
+    commit_rc=1
 elif [ -z "$(git -C "$REPO" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null)" ]; then
     # The ordinary quiet-night outcome. Checked BEFORE committing so that
     # "nothing to commit" -- which git reports with a NON-ZERO code -- is never
