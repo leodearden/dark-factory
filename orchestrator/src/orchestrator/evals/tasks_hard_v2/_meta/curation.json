@@ -69,7 +69,8 @@
   "merge_sha_availability": {
     "referenced": 20,
     "planrate_only": 19,
-    "finding": "SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean \"Merge task/<id> into main\" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for \u03b31, though it does not block \u03b21 \u2014 D9's planRate-only mechanism handles it."
+    "total": 39,
+    "finding": "Candidates that CAN carry a reference are a MAJORITY (20 of 39): each has a single landing merge under one of the two accepted subject spellings (`Merge task/<id> into main` or `Merge task/<id>: <subject>`). The other 19 of 39 landed SPLIT/direct and are planRate-only. planRate-only caps the downstream plan_quality population and is a material fact for \u03b31, though it does not block \u03b21 \u2014 D9's planRate-only mechanism handles it."
   },
   "ceilings": {
     "max_architect_turns": 120,

@@ -105,9 +105,9 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 - **Headroom**: 180 min is 6.4x the observed max-at-exhaustion (28.1 min, n=46) and 1.7x the all-time architect max (106.3 min), so the timeout provably cannot bind before the 120-turn or budget ceiling.
 - **Why it matters**: runner.py raises the eval to outcome="timeout" on asyncio.TimeoutError and deliberately does NOT taint-exclude it, so a binding timeout scores a kept 0.0 — manufacturing an artificial failure on a set already selected for being hard.
 
-## Merge-SHA availability — the SPLIT majority
+## Merge-SHA availability — how many fixtures can carry a reference
 
-SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean "Merge task/<id> into main" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for γ1, though it does not block β1 — D9's planRate-only mechanism handles it.
+Candidates that CAN carry a reference are a MAJORITY (20 of 39): each has a single landing merge under one of the two accepted subject spellings (`Merge task/<id> into main` or `Merge task/<id>: <subject>`). The other 19 of 39 landed SPLIT/direct and are planRate-only. planRate-only caps the downstream plan_quality population and is a material fact for γ1, though it does not block β1 — D9's planRate-only mechanism handles it.
 
 - `referenced` (single clean merge commit): **20**
 - `planrate_only` (SPLIT / direct-landed): **19**
