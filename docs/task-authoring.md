@@ -399,10 +399,31 @@ gate. Declaring only *unowned* paths (`README.md`, `docs/x.md`) does **not**
 count: that is no evidence of local work, so the advisory still fires.
 
 For the residual case — a task that genuinely belongs here but can declare
-no filer-owned deliverable at all — pass `metadata.routing_override_reason`
-(a non-empty string). It is the pre-existing explicit bypass and skips the
-path-scope guards entirely, both the advisory **and** the hard reject, so
-use it only when you are sure the task belongs to the submitting project.
+no filer-owned deliverable at all — pass `routing_override_reason` (a
+non-empty string) as a **top-level `submit_task` parameter**. It is the
+pre-existing explicit bypass and skips the path-scope guards entirely, both
+the advisory **and** the hard reject, so use it only when you are sure the
+task belongs to the submitting project.
+
+> **It is not a `metadata` key.** The only read is
+> `kwargs.pop('routing_override_reason')` in `TaskInterceptor.submit_task`, so
+> a caller who puts it inside `metadata` gets **no bypass at all** — the guard
+> runs and rejects exactly as if nothing had been passed. (The confusion is
+> understandable: the interceptor *writes* the key **into** metadata
+> afterwards, as the audit record of the override it already honoured.)
+
+Since task 3123 the bypass is **audited, not silent**: every use files a
+`scope_violation` escalation (id prefix `esc-task-path-guard-override`) into
+the filing project's queue, recording your reason, the project you filed
+into, and the paths that would have been flagged. (Both are rendered into
+operator views and agent briefings, so both are bounded: a runaway reason is
+clipped with an explicit marker naming the length it dropped, and a long path
+list is elided in the one-line summary while the detail keeps every entry.
+Nothing of a normally-sized justification is lost.) It fires even when
+the guard would have allowed the submission anyway — an override that turned
+out unnecessary is exactly the signal worth having. Repeating one identical
+justification folds into a single record rather than flooding the queue, so
+the cost of a genuinely recurring legitimate override stays low.
 
 None of this relaxes the rule above. A submission whose **`metadata.files`**
 mix local and foreign entries is still a hard reject — attribution is
