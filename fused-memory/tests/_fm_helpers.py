@@ -1085,7 +1085,8 @@ async def retry_until_observed(
             would read it). ``None`` means the transient re-arms itself, and
             is a supported no-op: the attempt budget and the exhaustion raise
             are unchanged.
-        attempts: Maximum number of observation attempts.
+        attempts: Maximum number of observation attempts. Must be >= 1;
+            ``attempts=1`` degenerates to a single un-retried observation.
         message: Caller diagnostic appended to the exhaustion AssertionError.
 
     Returns:
@@ -1103,7 +1104,19 @@ async def retry_until_observed(
             FalkorDB that stopped rebuilding the merged index in place would
             make every post-drop barrier task 4748 added dead weight, and a
             silent ``None`` would let that pass as an ordinary miss.
+        ValueError: *attempts* was less than 1 — raised before *observe* is
+            called even once, so a mis-configured budget can never masquerade
+            as the exhaustion AssertionError above.
     """
+    # Fail CLOSED on a mis-configured budget, before observing anything: with a
+    # bare loop, attempts=0 would make zero observations and then raise the
+    # ordinary exhaustion AssertionError below -- a barrier that gated nothing
+    # while wearing a plausible-looking failure message. Same argument
+    # await_index_operational makes for treating an empty result_set as NOT
+    # ready. ValueError (not AssertionError) so a caller catching a genuine
+    # missed observation cannot swallow a mis-configuration with it.
+    if attempts < 1:
+        raise ValueError(f'retry_until_observed: attempts must be >= 1, got {attempts!r}')
     for attempt in range(1, attempts + 1):
         result = observe()
         if inspect.isawaitable(result):
