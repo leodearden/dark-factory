@@ -231,6 +231,7 @@ __all__ = [
     'classify_agent_failure',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
+    'detect_resumable_progress',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -241,6 +242,7 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resumable_progress_for_session',
     'transcript_exists',
 ]
 
@@ -938,6 +940,148 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
                 if matched:
                     last_reap_idx = pos
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
+
+
+def detect_resumable_progress(records: list[dict] | None) -> bool:
+    """Return True when the transcript *records* hold work worth CONTINUING.
+
+    The question the cap-hit resume branch must answer after "can I reach the
+    transcript?": does that transcript record anything to continue?  A session
+    capped before it made any tool call has a perfectly reachable transcript
+    holding only a statement of intent, and resuming it injects
+    CAP_HIT_RESUME_PROMPT ("continue where you left off") pointing at nothing.
+
+    SCOPE — what this does NOT cover.  Legibility census 2026-08-16 §1.2
+    (session 4396db7a) is the ADJACENT sighting that named the failure mode; it
+    is NOT a specimen this predicate catches, and 4274 does not close it.  That
+    session spawned an Agent-tool sub-agent, and a sub-agent's turns are written
+    to a sidecar ``<session_id>/subagents/agent-*.jsonl`` carrying the PARENT's
+    ``sessionId`` — never a separately-addressable session file, and not
+    reachable by ``_resolve_transcript_path``'s ``projects/*/<id>.jsonl`` glob.
+    The parent chain that ``read_transcript_records`` DOES read therefore
+    necessarily holds the ``Task``/``Agent`` ``tool_use`` block that spawned the
+    sub-agent (measured 2026-08-29: in all 6 of 89 orchestrator transcripts that
+    spawned sub-agents, spanning CLI 2.1.215-2.1.251, that block is in the
+    non-sidechain parent chain; 0 of 89 parent files contain sidechain records
+    at all).  This predicate returns True on that shape by construction.  The
+    census declined to file a task for 1.2 (§4) and left the remedy with task
+    **2561**'s runner-side persistence protocol; that ownership stands.
+
+    What this DOES cover is the adjacent class the same RCA exposes: a
+    TOP-LEVEL session capped before it made any tool call, which
+    :func:`invoke_with_cap_retry` would otherwise hand CAP_HIT_RESUME_PROMPT's
+    false continuity claim.
+
+    "Progress" = at least one assistant ``tool_use`` block, OR more than one
+    assistant turn.  tool_use is the only durable evidence in a transcript that
+    the agent DID something rather than narrated an intention; the second
+    disjunct deliberately protects prose-only workers (synthesis, judge, review
+    agents) whose accumulated reasoning IS the thing worth resuming.
+
+    Contract — the False case is narrow BY CONSTRUCTION.  Returns False only
+    when emptiness is affirmatively PROVEN: *records* is a non-None list AND it
+    contains zero assistant ``tool_use`` blocks AND at most one assistant
+    record.  Returns True in every other case.
+
+    FAIL-SAFE DIRECTION (load-bearing, and the inverse of
+    :func:`detect_ended_awaiting_background`'s).  This predicate can only ever
+    cause a resume→fresh DOWNGRADE, and a wrong downgrade DISCARDS REAL AGENT
+    WORK — strictly worse than the confusing-but-harmless prompt it exists to
+    prevent.  So every ambiguity resolves to True (resume, today's behaviour):
+
+    - ``None`` records (unreadable/absent transcript) → True;
+    - non-dict records, non-list content, non-dict blocks, blocks missing
+      ``type``, unknown block types, unknown nestings → skipped as
+      unclassifiable, never raise, and never counted as evidence of emptiness.
+
+    Tolerant to both transcript content nestings:
+    ``record['message']['content']`` (the real CLI shape) and a flat
+    ``record['content']`` — mirroring
+    :func:`detect_ended_awaiting_background`'s walk.
+    """
+    if records is None:
+        return True
+    ambiguous = False
+    assistant_count = 0
+    tool_use_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            # Unclassifiable: this could itself have been an assistant turn, so
+            # it can never contribute to a proof of emptiness.
+            ambiguous = True
+            continue
+        if record.get('type') != 'assistant':
+            continue
+        assistant_count += 1
+        message = record.get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), list):
+            blocks = message['content']
+        elif isinstance(record.get('content'), list):
+            blocks = record['content']
+        else:
+            # An assistant record whose content shape we do not recognise may
+            # well contain tool calls we cannot see.
+            ambiguous = True
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                ambiguous = True
+                continue
+            btype = block.get('type')
+            if btype == 'tool_use':
+                tool_use_count += 1
+            elif btype != 'text':
+                # Any block type this predicate does not model (a missing
+                # 'type', 'server_tool_use', 'thinking') might be work; only a
+                # plain text block is positive evidence of prose.
+                #
+                # 'thinking' is NOT a future shape — it is in current
+                # transcripts, and it is why this guard's real-world coverage
+                # is partial.  Measured 2026-08-29 over the 89 orchestrator
+                # agent transcripts under
+                # .worktrees/*/.task/claude-config-*/projects/ (CLI
+                # 2.1.215-2.1.251): 89 of 89 contain 'thinking' blocks (1,939
+                # total), and the FIRST assistant record's only block type is
+                # 'thinking' in 29 of 89.  Replaying each transcript truncated
+                # to its first assistant record — the exact "capped before any
+                # work" shape this predicate exists for — the predicate returns
+                # False (fires) on 60 of 89 and True (silently INERT, resumes
+                # anyway) on the 29 whose opening turn is a thinking block.  Do
+                # not over-read the guard's coverage: roughly a third of the
+                # real population is unprotected today.
+                #
+                # Modelling 'thinking' as not-work would WIDEN the False branch,
+                # and a wrong widening DISCARDS REAL AGENT WORK — a design
+                # change, not a fix.  Abstaining is the safe direction and
+                # stays.
+                ambiguous = True
+    if ambiguous:
+        return True
+    return not (tool_use_count == 0 and assistant_count <= 1)
+
+
+def resumable_progress_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> bool:
+    """Return True when *session_id*'s on-disk transcript holds work worth
+    CONTINUING — the second half of cap-hit resume eligibility, after
+    :func:`transcript_exists` answers "can I reach it at all?".
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate all I/O
+    to ``read_transcript_records`` (which already owns the version-robust
+    glob-by-session-id lookup, tolerant JSONL parsing that skips the truncated
+    final line a SIGKILL leaves, and a never-raises contract), then apply the
+    pure ``detect_resumable_progress`` detector.  Never raises.
+
+    Unlike its background sibling this wrapper passes ``None`` STRAIGHT THROUGH
+    to the predicate instead of short-circuiting, because the fail-safe
+    direction is INVERTED: the background detector fails safe to False to avoid
+    downgrading a genuine success, whereas this one fails safe to True to avoid
+    discarding real work.  An unreadable transcript therefore resumes.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    return detect_resumable_progress(records)
 
 
 def ended_awaiting_background_for_session(
@@ -1758,6 +1902,25 @@ async def invoke_with_cap_retry(
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original prompt.
 
+    Resume eligibility is a TWO-PART rule, and both parts require a
+    *config_dir* (without one there is no correct place to glob for the
+    transcript, so nothing can be proven and the resume proceeds unchecked):
+
+    1. REACHABLE — a Claude CLI session is a local JSONL file at
+       ``<config_dir>/projects/*/<session_id>.jsonl`` and ``--resume`` replays
+       it, so a session whose transcript is gone resumes into an effectively
+       empty one (``transcript_exists``).
+    2. NON-EMPTY — the transcript must record work to CONTINUE: at least one
+       assistant tool call, or more than one assistant turn
+       (``resumable_progress_for_session``).  Otherwise
+       ``CAP_HIT_RESUME_PROMPT`` ("continue where you left off") would point
+       at nowhere.
+
+    Failing either part retries FRESH, which replays the real task prompt.
+    Both guards fire only on affirmative proof; every ambiguous or unreadable
+    transcript resumes, because a wrong downgrade discards real agent work.
+    The specific reason is named in the cap-hit warning (``resume_or_fresh``).
+
     *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
     When total elapsed time since the first cap hit exceeds this value,
     ``AllAccountsCappedException`` is raised so the caller can escalate.
@@ -2346,11 +2509,40 @@ async def invoke_with_cap_retry(
                     # orchestrator's own resume-eligibility guard
                     # (harness.py, 'no_transcript').
                     #
+                    # ...but reachability is NECESSARY, not SUFFICIENT (task
+                    # 4274).  A session capped before it made any tool call has
+                    # a perfectly reachable transcript holding only a statement
+                    # of intent, and resuming it injects CAP_HIT_RESUME_PROMPT
+                    # ("continue where you left off") pointing at nowhere — a
+                    # continuity claim the transcript does not support, and a
+                    # retry spent re-deriving context that never existed.
+                    #
+                    # That failure mode was NAMED by legibility census
+                    # 2026-08-16 §1.2 (session 4396db7a), but 4274 does NOT
+                    # close that finding and must not be read as closing it.
+                    # The census specimen was an Agent-tool SUB-AGENT kill: its
+                    # parent's transcript — the only one reachable here — carries
+                    # the Task/Agent tool_use that spawned it, so the guard below
+                    # returns True on it by construction (see
+                    # detect_resumable_progress's SCOPE note for the
+                    # measurement).  Census §4 explicitly declined to file a task
+                    # for 1.2 and left the remedy with task 2561's runner-side
+                    # persistence protocol.  What 4274 covers is the adjacent
+                    # class: a TOP-LEVEL session capped before its first tool
+                    # call.  So
+                    # eligibility asks TWO questions: can I reach the transcript,
+                    # AND does it record work to continue
+                    # (resumable_progress_for_session)?  That second guard only
+                    # ever downgrades resume -> fresh and a wrong downgrade
+                    # DISCARDS REAL WORK, so it fires only on affirmatively
+                    # proven emptiness; every ambiguity resumes.
+                    #
                     # config_dir is None -> resume as today: without a concrete
                     # directory there is no correct place to glob (the process
                     # default ~/.claude would be wrong for any caller under an
-                    # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
-                    # have a directory and the transcript is provably not in it".
+                    # isolated CLAUDE_CONFIG_DIR), so both vetoes are scoped to
+                    # "we have a directory and can PROVE the transcript is not
+                    # in it / carries nothing".
                     #
                     # resume_or_fresh carries the REASON, not just the verdict:
                     # it is interpolated into both cap-hit warnings below, so a
@@ -2373,6 +2565,19 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (transcript unreachable)'
+                    elif config_dir is not None and not resumable_progress_for_session(
+                        config_dir.path, result.session_id
+                    ):
+                        logger.warning(
+                            f'{label}: capped session {result.session_id} recorded no work '
+                            f'to continue (no tool calls, at most one assistant turn) — '
+                            f'retrying FRESH instead of resuming, because '
+                            f'CAP_HIT_RESUME_PROMPT would tell the agent to continue from '
+                            f'nowhere',
+                        )
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
+                        resume_or_fresh = 'fresh (no resumable progress)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
