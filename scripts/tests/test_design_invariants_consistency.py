@@ -2662,12 +2662,19 @@ def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
 # stored here, which would be one more lock-step copy of the family and stale on
 # the next invariant, exactly like the prose sites this module was written for.
 #
-# MEASURED ON BASE eba215060c, as a starting point rather than a pinned
-# constant: the scan reads 1737 files and finds 173 numbered pairings — 97 that
-# name their invariant's canonical slug exactly, 12 that use a legitimate
-# shorthand or line-wrapped prefix of it, 56 that belong to module-local INV-n
-# schemes and are confusable with nothing canonical, and 8 that contradict the
-# family. It finds 12 doc-anchored backticked citations, all canonical.
+# MEASURED ON BASE 16fd29df5698, under the tracked-file oracle (task 4971), as
+# a starting point rather than a pinned constant: the scan reads 1845 files
+# and finds 153 exactly-correct pairings, 12 legitimate shorthand prefixes, 14
+# written with reST double-backticks and 36 wrapped across a line break —
+# these four are the overlapping ANTI-VACUITY OBSERVATIONS the test below
+# gates on, not a partition, so they do not sum to a pairing total. It finds
+# 14 doc-anchored backticked citations, all canonical.
+#
+# `git ls-files` reports the `graphiti` and `mem0` submodules as gitlink
+# entries rather than descending into their trees, so their vendored upstream
+# files never reach either scan — they are not this repo's authored content,
+# and the counts above were re-measured AFTER that drop, not compensated for
+# it.
 # ---------------------------------------------------------------------------
 
 
