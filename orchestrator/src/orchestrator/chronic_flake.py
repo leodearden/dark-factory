@@ -364,7 +364,14 @@ class ChronicFlakeTaskClient(Protocol):
     and ``flake_ledger``'s ``shared``-only dependency set is preserved. Those
     two methods are NOT declared here: this module does not use them, and
     adding them would oblige every ``ChronicFlakeTaskClient`` to grow a
-    surface only the ledger needs."""
+    surface only the ledger needs.
+
+    Note the SHAPE DIFFERENCE that seam imposes: ``get_statuses`` returns a
+    ``(statuses, error)`` PAIR (``scheduler.py::SchedulerFacade.get_statuses``'
+    convention), not a bare mapping, because the ledger reads an id missing
+    from a successful read as a corroborated absence and files against it —
+    so a failed read reported as ``{}`` would be acted on as a deletion. This
+    module's own path never calls it; only the ledger's does."""
 
     async def submit_task(self, arguments: dict) -> str:
         """Submit a new task from a ``submit_task``-shaped argument block
@@ -607,24 +614,44 @@ def _extract_results_list(result: object) -> list[dict]:
     return [entry for entry in results if isinstance(entry, dict)]
 
 
-def _extract_statuses_map(result: object) -> dict[str, str]:
-    """Best-effort extraction of a ``get_statuses`` response's ``statuses`` mapping
-    from a ``dispatch_tool`` envelope (see :func:`_unwrap_dispatch_envelope`).
+def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | None]:
+    """Extract a ``get_statuses`` response's ``statuses`` mapping from a
+    ``dispatch_tool`` envelope (see :func:`_unwrap_dispatch_envelope`), as a
+    ``(statuses, error)`` pair.
 
     Written beside :func:`_extract_results_list` and over the same seam so all three
     response parsers share ONE envelope-shape policy — a second, independently-evolved
     unwrapper is exactly how one of them would silently stop handling a shape the
     others still do.
 
+    The PAIR is what keeps two things that both look like an empty mapping apart.  A
+    PRESENT ``statuses`` dict, even an empty one, is a CORROBORATED ABSENCE: the tool
+    answered and silently omits ids it does not know, so emptiness is real evidence
+    that the task is gone.  An envelope carrying no ``statuses`` key, or a non-dict
+    one, is not an answer at all.  Returning ``{}`` for BOTH is what made them
+    indistinguishable one seam away, in
+    ``orchestrator/src/orchestrator/flake_ledger.py::_ensure_owner_task``, which reads a
+    missing id as a deleted task and files a replacement de-flake task for it.
+
+    Construct-don't-raise, matching ``scheduler.py::SchedulerFacade.get_statuses``'
+    ``({}, exception)`` convention: an unreadable envelope yields ``({}, ValueError(…))``
+    describing the shape, never a raise.
+
     Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
-    hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.  A
-    non-dict ``statuses`` or an unrecognised envelope yields ``{}`` rather than raising.
+    hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.
     """
     envelope = _unwrap_dispatch_envelope(result)
-    statuses = envelope.get('statuses')
+    if 'statuses' not in envelope:
+        return {}, ValueError(
+            f'get_statuses response carries no "statuses" key (envelope keys='
+            f'{sorted(str(k) for k in envelope)!r})'
+        )
+    statuses = envelope['statuses']
     if not isinstance(statuses, dict):
-        return {}
-    return {str(key): str(value) for key, value in statuses.items()}
+        return {}, ValueError(
+            f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict'
+        )
+    return {str(key): str(value) for key, value in statuses.items()}, None
 
 
 # Per-call dispatch_tool timeout for submit_task — matches
@@ -673,16 +700,26 @@ class SchedulerChronicFlakeTaskClient:
         )
         return extract_task_id(result)
 
-    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
-        """Live ``{id: status}`` for *ids* via ``dispatch_tool('get_statuses', ...)``.
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        """Live ``{id: status}`` for *ids* via ``dispatch_tool('get_statuses', ...)``,
+        as the ``(statuses, error)`` pair
+        ``scheduler.py::SchedulerFacade.get_statuses`` already returns.
 
         Serves ``flake_ledger``'s INV-3 re-corroboration. Unknown ids are
-        silently OMITTED by the tool, and that omission is meaningful to the
+        silently OMITTED by the tool, and that omission is MEANINGFUL to the
         consumer (a corroborated absence — the task was deleted), so a
-        FAILURE must be distinguishable from it: any raise or unparseable
-        envelope degrades to ``{}`` here AND the ledger guards the call
-        separately, treating an unreadable status as no evidence at all
-        rather than as an absence.
+        FAILURE must be distinguishable from it. It is reported IN BAND, as
+        the error half: this method still never raises — its siblings
+        ``submit_task``/``commit_planning`` do not either, and that
+        consistency is deliberate — but a swallowed failure returned as a
+        bare ``{}`` is byte-identical to a real absence, and the ledger acts
+        on absences. The pair is the only thing that lets it tell them apart;
+        it returns early on a non-``None`` error, keeping the stored owner
+        and filing nothing (``flake_ledger::_ensure_owner_task``).
+
+        The CAUGHT object is handed back rather than a synthesised
+        stand-in, so the ledger's warning can carry the real cause via
+        ``exc_info``.
 
         Ids are coerced to ``str`` — the ledger's ``owner_task_id`` column is
         TEXT, and an int on the wire would match nothing.
@@ -692,11 +729,11 @@ class SchedulerChronicFlakeTaskClient:
                 'get_statuses',
                 {'project_root': self._project_root, 'ids': [str(i) for i in ids]},
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 'chronic_flake: get_statuses dispatch failed for ids=%s', list(ids), exc_info=True,
             )
-            return {}
+            return {}, exc
         return _extract_statuses_map(result)
 
     async def commit_planning(self, task_ids: list[str]) -> None:
