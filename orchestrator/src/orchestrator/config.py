@@ -2534,6 +2534,36 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    landing_git_error_rate_per_hour: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            'How many landing-evidence git_error verdicts may be produced in '
+            'a trailing hour before a blocking L1 is filed against the '
+            'landing-detector storm sentinel. STRICT exceedance: this rate '
+            'itself is quiet. git_error is the one landing reason whose '
+            'REPETITION means the DETECTOR is broken (a repo lock, a corrupt '
+            'object, an unresolvable ref) rather than the task being '
+            'unlanded, and a broken detector is silent by construction -- '
+            'every verdict it produces rejects, so it reads exactly like a '
+            'repo with nothing landed in it. The default is well above any '
+            'healthy rate (the recovery sweeps run every 900s, so a healthy '
+            'fleet produces ~0/hour) and well below a storm. Must be >= 1: at '
+            '0 a single transient git failure would page a human.'
+        ),
+    )
+    landing_git_error_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep tallying landing-evidence verdicts while '
+            'suppressing the blocking L1 the git_error rate gate files. The '
+            'same narrow-kill-switch discipline as '
+            'streak_escalation_enabled: this is the only part of the landing '
+            'storm escape that WRITES to the escalation queue, so an '
+            'operator can silence a noisy alarm without losing the per-reason '
+            'tally that explains it. Disabling suppresses new filings only.'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):

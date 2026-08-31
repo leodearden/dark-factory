@@ -9517,6 +9517,150 @@ class GitOps:
         )
         return rc == 0
 
+    async def net_diff_is_empty(
+        self, upstream: str, head: str, *, probe: dict[str, Any] | None = None,
+    ) -> bool | None:
+        """Does *head* contribute any NET change relative to its fork from *upstream*?
+
+        Answers the "no-op landing" question (task 4647, PRD
+        landed-not-done-recovery, Open question 2): a branch whose commits are
+        all real work but whose combined effect is nothing — added then
+        removed, or reverted within the branch — produces a genuine merge
+        marker on main while delivering no deliverable.  That is the task-1175
+        shape, and stamping it ``done`` records a task as delivered when
+        nothing shipped.
+
+        The computation is ``merge-base(upstream, head)..head``.  The PRD
+        Contract states the formula as ``merge-base(first_parent, tip)..tip``;
+        that is the SPECIAL CASE ``upstream = first_parent(head)``, which a
+        caller asking about a merge commit's own contribution passes directly.
+        The general ``(upstream, head)`` form is the one implemented because a
+        task branch's no-op question is about the BRANCH's net contribution to
+        main, not about its last commit's.
+
+        **TRI-STATE, deliberately, and never collapsed to a bool.** ``None``
+        means "could not be determined" — an unresolvable ref, an unreadable
+        commit, or two histories with no common ancestor.  A bool return would
+        force every git failure into one of the two answers about the TASK:
+        ``False`` would read as "the branch has real content" and ``True`` as
+        "the task delivered nothing", both of them a broken detector silently
+        re-decided as a fact.  ``branch_work_landed`` maps ``None`` to
+        ``LandingReason.git_error`` for exactly this reason.
+
+        ``git diff --quiet`` is used rather than ``--name-only``: the answer is
+        a yes/no, so no file list — and in a large landing no ~300-path set —
+        is ever materialised.  That also sidesteps the path-quoting hazard
+        :meth:`branch_content_in_main` documents below (it is NOT hardened with
+        ``-z`` / ``core.quotePath=false``, so a non-ASCII path can be
+        misparsed); a predicate that never builds a path list cannot have the
+        bug at all.
+
+        Contrast :meth:`branch_content_in_main` (the byte-identity containment
+        predicate, whose final ``git diff --quiet`` leg asks "are the touched
+        paths identical between branch and main *right now*"): that question
+        DECAYS — any later commit touching those paths flips it — whereas this
+        one asks only about the branch's own two endpoints and is unaffected by
+        anything that happens on main afterwards.
+
+        Args:
+            upstream: The ref the branch forked from (a branch name or a sha).
+            head: The branch tip (or any commit-ish) whose net contribution is
+                in question.
+            probe: Optional out-parameter.  When given, structured facts are
+                written into it for the caller's escalation body —
+                ``net_diff_head_parents`` (the head commit's parent shas, so a
+                reader can see whether the tip is a merge without re-running
+                git) and ``net_diff_merge_base``.  Optional so a caller that
+                only wants the answer need not construct a dict.
+
+        Returns:
+            ``True`` when the net diff is empty, ``False`` when it is not, and
+            ``None`` when it could not be determined.
+        """
+        # Head's parents, via the same inline `rev-list --parents -n 1` idiom
+        # _probe_commit_effect uses (there is no named get_commit_parents
+        # helper).  Its combined rc/empty-output guard is kept verbatim; where
+        # the original maps it to failure='unresolvable_commit', this maps it
+        # to the tri-state None.  This also doubles as head's resolvability
+        # check, so an unresolvable head never reaches merge-base.
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', head],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return None
+        parents = parents_out.split()[1:]
+        if probe is not None:
+            probe['net_diff_head_parents'] = parents
+
+        rc, merge_base, _ = await _run(
+            ['git', 'merge-base', upstream, head],
+            cwd=self.project_root,
+        )
+        merge_base = merge_base.strip()
+        if rc != 0 or not merge_base:
+            # An unresolvable upstream and two disconnected root histories are
+            # both indeterminate, not "not a no-op".
+            return None
+        if probe is not None:
+            probe['net_diff_merge_base'] = merge_base
+
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', merge_base, head],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        # git reserves rc 0/1 for "no differences" / "differences"; anything
+        # else is an error, and an error is not an answer.
+        return None
+
+    async def landing_merge_for(self, head: str, upstream: str) -> str | None:
+        """The MERGE COMMIT on *upstream* that brought *head* in, or None.
+
+        The oldest merge commit on the ANCESTRY PATH from *head* to
+        *upstream* — i.e. the first merge that has *head* as an ancestor.
+        Exists for one caller: :func:`~orchestrator.landing_evidence.
+        branch_work_landed`'s no-op guard, in the case where *head* is ALREADY
+        an ancestor of *upstream*.
+
+        **Why that case needs a different question.** The no-op guard asks
+        "does this branch contribute any net change relative to where it
+        forked?", and its natural baseline is ``merge-base(upstream, head)``.
+        Once the branch has merged, that formula DEGENERATES: *head* is an
+        ancestor of *upstream*, so the merge base IS *head* and the diff is
+        empty for EVERY landed branch — a landed task would be reported as a
+        no-op landing and re-dispatched forever, which is the precise defect
+        the landed-not-done PRD exists to fix.  Given this merge, the guard can
+        instead ask the PRD Contract's LITERAL form,
+        ``merge-base(first_parent, tip)..tip`` — "did this merge change
+        anything relative to main as it stood immediately before it?" — which
+        is well-defined after the fact and answers the same question.
+
+        ``--ancestry-path`` (not a plain ``--merges`` walk) is what makes the
+        result *this branch's* landing rather than merely the oldest merge in
+        the range: it restricts the walk to commits that are simultaneously
+        descendants of *head* and ancestors of *upstream*, so an unrelated
+        merge that happened to land in the same window is excluded.
+
+        Returns ``None`` when there is no such merge — a fast-forward or
+        rebase landing leaves none — and also on any git failure.  The two are
+        deliberately NOT distinguished here because the sole caller treats
+        both identically (it declines to answer the no-op question rather than
+        guessing), and it re-probes repo health itself before deciding whether
+        a refusal is ``not_landed`` or ``git_error``.
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--ancestry-path', '--merges', '--reverse',
+             f'{head}..{upstream}'],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out.strip():
+            return None
+        return out.split()[0]
+
     async def describe_commit_effect_in_main(
         self, commit_sha: str,
     ) -> CommitEffectProbe:
