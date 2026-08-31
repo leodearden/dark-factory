@@ -232,6 +232,30 @@ class LLMConfig(BaseModel):
     provider: Literal['openai', 'anthropic'] = Field(default='openai')
     model: str = Field(default='gpt-4o-mini')
     temperature: float | None = Field(default=None)
+
+    # Output-token budget per LLM request. Authoritative on EVERY arm that
+    # reads it: graphiti `client_class='openai'`, graphiti
+    # `client_class='openai_generic'`, the graphiti anthropic arm, and mem0's
+    # LLM (backends/mem0_client.py).
+    #
+    # Before task 3864 the default 'openai' arm silently substituted
+    # graphiti-core's DEFAULT_MAX_TOKENS (16384) — the configured value was
+    # accepted and dropped, because BaseOpenAIClient.__init__ re-assigns
+    # self.max_tokens from its own parameter after super().__init__ had read it
+    # off the config object. Only the constructor kwarg reaches the wire, and
+    # backends/graphiti_client.py now passes it (as the generic arm has since
+    # task 3715).
+    #
+    # The default stays 4096 DELIBERATELY. This is a SHARED knob: raising it to
+    # match the old observed behaviour of one arm would silently raise the
+    # anthropic arm and mem0 too, and Anthropic rejects a max_tokens above a
+    # model's output ceiling with a hard 400 (claude-3-opus caps at 4096).
+    #
+    # Exhaustion is LOUD, not silent: graphiti's LLM client raises
+    # `Output length exceeded max tokens <N>` (or a truncated body fails
+    # json.loads), which graphiti retries and the durable queue then
+    # dead-letters visibly. Remedy: raise this value and restart (llm.* is
+    # restart-tier — absent from config/reload.py's RELOADABLE_FIELDS).
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
