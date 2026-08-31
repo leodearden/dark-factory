@@ -368,9 +368,12 @@ class TestReadDeclineArtifacts:
 
         out = read_decline_artifacts(eval_artifacts)
         assert set(out) == set(DECLINE_KINDS)
-        assert isinstance(out[kind], dict)
+        # Bound to a local because ``kind`` is not a literal key, so a narrowing
+        # assert on ``out[kind]`` does not carry to the next statement.
+        reported = out[kind]
+        assert isinstance(reported, dict)
         # The reported_at stamp is what makes the ordering policy exact.
-        assert out[kind]['reported_at']
+        assert reported['reported_at']
         assert all(out[k] is None for k in DECLINE_KINDS if k != kind)
 
     def test_two_declines_both_come_back(self, eval_artifacts):
