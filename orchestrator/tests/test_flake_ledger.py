@@ -2682,6 +2682,166 @@ class TestOpenDebtInvariantDegrades:
         assert client.calls == []
         _assert_logged_loudly(caplog)
 
+    async def test_a_ticket_id_is_a_failed_filing_not_an_owner(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A STRUCTURALLY WRONG id is a failed filing, not a filing with an odd name.
+
+        ``chronic_flake.extract_task_id`` falls back to ``submit_task``'s NON-planning
+        two-phase response key, ``{'ticket': 'tkt_<id>'}``.  If ``planning_mode`` is ever
+        dropped, rejected, or the server falls back to the ticket path, the adapter hands
+        back a TRUTHY ``tkt_…`` string.  The falsy-id guard does not catch it, so it would
+        be stored in ``owner_task_id`` — and a ticket id is not a task id, so the very next
+        suppression's ``get_statuses(['tkt_…'])`` legitimately OMITS it,
+        ``_owner_liveness`` reads that omission as a CORROBORATED ABSENCE, and a
+        replacement is filed.  Every suppression, forever, on a path the module docstring
+        notes has no rate limit: the unbounded orphan-task loop the falsy guard exists to
+        prevent, reached through a truthy value instead.
+
+        A ticket is therefore refused AT THE BOUNDARY and the column left NULL, which is
+        the honest rendering (``flake_report`` shows the breach) rather than a pointer to
+        an id no status read will ever resolve.
+        """
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns='tkt_abc123')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert len(client.submit_calls) == 1, 'the filing itself is still attempted once'
+        assert client.commit_calls == [], 'a ticket is not a task id — nothing to release'
+        assert _owner(db_path, self.TEST_ID) is None, 'a ticket must never become an owner'
+        assert row is not None and row.owner_task_id is None
+        _assert_logged_loudly(caplog)
+        assert 'tkt_abc123' in caplog.text, 'the warning must name the id it refused'
+
+    async def test_a_ticket_id_does_not_refile_on_the_next_suppression(
+        self, tmp_path: Path
+    ) -> None:
+        """The other end of the loop the guard closes.  With the ticket REFUSED the row is
+        unowned, so the next suppression takes the fresh-filing path and files exactly
+        once more — a retry, which is bounded by the filing eventually succeeding.  Had
+        the ticket been STORED, this pass would instead have been a corroborated-absence
+        REPLACEMENT, and every later pass another one."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        ticketed = _FakeTaskClient(submit_returns='tkt_abc123')
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=ticketed, now=self.NOW)
+
+        recovered = _FakeTaskClient(submit_returns='task-907')
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=recovered, now=self.LATER
+        )
+
+        assert recovered.calls == ['submit_task', 'commit_planning'], (
+            'an unowned row is a FRESH filing — it must not consult get_statuses'
+        )
+        assert _owner(db_path, self.TEST_ID) == 'task-907'
+
+    async def test_a_lost_pointer_write_leaves_the_row_unowned_and_names_the_orphan(
+        self, tmp_path: Path, caplog, monkeypatch
+    ) -> None:
+        """The single most consequential degrade in the module, and until now the only
+        one nothing executed.  The task WAS created server-side; if the pointer write
+        fails the row stays NULL and every subsequent suppression files another — so the
+        warning has to name the id that leaked, because that string is the only trace of
+        the orphan a human can search for.
+
+        Also pins that the failure costs exactly ONE filing: no retry inside the same
+        pass, which would double the leak rather than repair it."""
+        import orchestrator.flake_ledger as fl
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient(submit_returns='task-909')
+
+        def _boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError('database is locked')
+
+        monkeypatch.setattr(fl, '_write_owner_task_id', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert len(client.submit_calls) == 1, 'exactly one filing — the leak is not doubled'
+        assert client.commit_calls == [], 'an unstorable pointer stops before commit_planning'
+        assert _owner(db_path, self.TEST_ID) is None
+        assert row is not None and row.owner_task_id is None
+        _assert_logged_loudly(caplog)
+        assert 'task-909' in caplog.text, 'the warning must name the ORPHANED task id'
+
+    async def test_the_deferred_repair_survives_a_raising_commit(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The deferred-repair branch has its OWN ``commit_planning`` guard, and nothing
+        reached it: ``test_a_failed_commit_is_retried_not_refiled`` builds its recovery
+        client with no ``commit_raises``, so the repair always succeeded there.
+
+        A repair that fails must KEEP the deferred owner rather than drop it — the task
+        exists, it is merely still parked, and the next suppression repairs it again.
+        Dropping the pointer here would orphan a real task and re-file."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+
+        client = _FakeTaskClient(
+            statuses={'task-901': 'deferred'},
+            commit_raises=RuntimeError('commit_planning failed again'),
+        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+            )
+
+        assert client.submit_calls == [], 'a deferred owner is repaired, never replaced'
+        assert client.commit_calls == [['task-901']]
+        assert _owner(db_path, self.TEST_ID) == 'task-901', 'the owner survives a failed repair'
+        assert row is not None and row.owner_task_id == 'task-901'
+        _assert_logged_loudly(caplog)
+
+    async def test_a_raising_filing_path_still_returns_the_written_row(
+        self, tmp_path: Path, caplog, monkeypatch
+    ) -> None:
+        """``None`` IS A CONTRACT, and it means "the ledger was unavailable".
+
+        The upsert commits BEFORE the owner is ensured, so by the time the filing path
+        runs the debt row is durably on disk.  If anything in that path raises out of its
+        own guards, returning ``None`` would tell every caller the write did not happen —
+        the row would then be re-opened as if fresh, and ``record_merge_flake_suppression``
+        would log a lost measurement for a measurement that was in fact durably kept.
+
+        A filing failure must degrade to "row without owner", which ``flake_report``
+        already renders as the breach it is, never to "ledger unavailable"."""
+        import orchestrator.flake_ledger as fl
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        client = _FakeTaskClient()
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError('the filing path itself blew up')
+
+        monkeypatch.setattr(fl, '_ensure_owner_task', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
+            )
+
+        assert row is not None, 'the row IS durably written — None would libel it as lost'
+        assert row.test_id == self.TEST_ID
+        assert row.owner_task_id is None
+        assert _rows(db_path, 'SELECT * FROM flake_debt WHERE test_id = ?', (self.TEST_ID,))
+        _assert_logged_loudly(caplog)
+
 
 class _RoutingStubScheduler:
     """A ``dispatch_tool``-only scheduler double that answers PER TOOL NAME, so one
