@@ -306,13 +306,23 @@ class EvalMetrics:
     #
     # ``None`` means NOT MEASURED: either a non-architect cell (disambiguated by
     # ``role_under_test``, exactly as ``plan_quality``'s null is) or a cell
-    # persisted before this field existed. Cell-level ABSENCE is NOT
-    # interchangeable with ``None`` — ``to_dict`` below is a bare ``asdict``, so
-    # every cell written by post-4760 code carries the key regardless of value,
-    # which gives "key absent" exactly ONE cause. Do not make the write
-    # conditional: the report layer's ``terminal_kind_unmeasured`` count depends
-    # on it, and collapsing the two would let a partially-measured corpus report
-    # a reassuring ``declined = 0`` for cells nobody ever asked.
+    # persisted before this field existed. A MISSING KEY means the same thing,
+    # and every consumer reads the two ALIKE: :func:`terminal_kind_of` answers
+    # ``None`` for both, and the report layer's ``terminal_kind_unmeasured``
+    # counts both. That is deliberate. Over the architect rows that count ranges
+    # on, the two shapes state ONE fact — nobody resolved this cell's terminal
+    # statement — and giving an explicit null its own silent third arm would
+    # read it back as "measured, did not decline", which is the exact collapse
+    # the counter exists to prevent.
+    #
+    # Do not make the write conditional even so. ``to_dict`` below is a bare
+    # ``asdict``, so every cell written by post-4760 code carries the key
+    # regardless of value; THAT is what keeps ``terminal_kind_unmeasured``
+    # meaning "the instrument did not exist yet" instead of "the instrument
+    # declined to say", and it is the same presence-on-every-cell property
+    # ``judged_without_reference`` depends on. A consumer that ever needs to
+    # separate the two causes can still test key PRESENCE directly — none does
+    # today, and the count above deliberately does not.
     terminal_kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -372,11 +382,16 @@ def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
 
     Returns ``None`` for BOTH a missing key and an explicit ``None`` — the two
     are indistinguishable to a consumer that only wants the kind, and both mean
-    UNMEASURED. Callers that need to tell "predates the field" from "not an
-    architect cell" must test key PRESENCE (``'terminal_kind' in metrics``)
-    directly, which is what ``report.build_plan_quality_report``'s
-    ``terminal_kind_unmeasured`` count does; see the field's docstring for why
-    that distinction is load-bearing.
+    UNMEASURED. ``report.build_plan_quality_report``'s
+    ``terminal_kind_unmeasured`` counts them TOGETHER, through this accessor,
+    on purpose: over the architect rows it counts, the two shapes state one
+    fact, and a third arm for the explicit null would read that cell back as
+    "did not decline" — see the field's docstring.
+
+    A caller that genuinely needs to separate "predates the field" from "the
+    field was written null" must test key PRESENCE (``'terminal_kind' in
+    metrics``) itself. That test means something only because the write is
+    never conditional; no caller needs it today.
 
     Pure: no I/O, no mutation.
     """

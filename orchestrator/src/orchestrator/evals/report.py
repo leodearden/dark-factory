@@ -1605,8 +1605,11 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     in ``no_plan``, so ``declined - no_plan_declined`` recovers that population
     exactly. ``declined_by_kind`` is key-sorted for the same reason
     ``cap_excluded_by_cause`` is: the kinds are not interchangeable.
-    ``terminal_kind_unmeasured`` counts the admitted cells that predate the
-    field, so a PARTIAL split never wears the appearance of a complete one.
+    ``terminal_kind_unmeasured`` counts the admitted cells whose terminal
+    statement was never resolved — read through ``terminal_kind_of``, so an
+    ABSENT key (the cell predates the field, the only cause the live instrument
+    can produce) and an explicit ``None`` count ALIKE — so a PARTIAL split never
+    wears the appearance of a complete one.
 
     ``plan_rate`` and ``mean_plan_quality`` are DELIBERATELY untouched by all of
     this: planRate keeps its exact historical derivation (``plan_steps > 0``
@@ -1719,11 +1722,14 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # ADMITTED pool ``n`` reports. A cap-tainted cell may well carry a
             # stale terminal kind, but it belongs to ``cap_excluded`` alone —
             # counting it here would describe a cell the mean beside it never
-            # saw. The keyless case is tallied separately rather than falling
-            # into the "not a decline" arm: absence means the cell's terminal
-            # statement was never measured, and reading it as "did not decline"
-            # is precisely the partial-count-wearing-a-complete-count's-clothes
-            # defect this split exists to remove.
+            # saw. The UNMEASURED case is tallied separately rather than falling
+            # into the "not a decline" arm: a cell whose terminal kind reads
+            # ``None`` — key absent (it predates the field) or written null,
+            # which ``terminal_kind_of`` deliberately does not distinguish —
+            # never had its terminal statement resolved, and reading that as
+            # "did not decline" is precisely the
+            # partial-count-wearing-a-complete-count's-clothes defect this
+            # split exists to remove.
             kind = row['terminal_kind']
             if kind is None:
                 terminal_unmeasured[cfg] += 1
@@ -1770,9 +1776,10 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # plan-then-decline cell is in ``declined`` but NOT here, so
             # ``declined - no_plan_declined`` recovers that population exactly.
             'no_plan_declined': no_plan_declined[cfg],
-            # How many of those same ``n`` cells predate the field, so a
-            # PARTIAL split is never read as a complete one. Its siblings above
-            # are counts over the MEASURED sub-population only.
+            # How many of those same ``n`` cells carry NO resolved terminal
+            # kind — in practice, cells that predate the field — so a PARTIAL
+            # split is never read as a complete one. Its siblings above are
+            # counts over the MEASURED sub-population only.
             'terminal_kind_unmeasured': terminal_unmeasured[cfg],
             # How many of those same ``n`` scored cells were judged WITHOUT a
             # reference diff (task 3628). Unlike the two counts above this one
@@ -2010,9 +2017,16 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     # failed to plan" — the exact reading this split exists to refute.
     if terminal_unmeasured:
         lines.append(
+            # "carry no resolved terminal kind", not "predate the field": the
+            # count is over ``terminal_kind_of``'s answer, which reads an
+            # absent key and an explicit null alike, so naming only the first
+            # cause would state more than the number knows. Predating the
+            # field IS the only cause the live instrument can produce — the
+            # write is unconditional — but the sentence must stay true of the
+            # count, not of today's producer.
             f'terminal kind: UNMEASURED — {terminal_unmeasured} of '
-            f'{scored_cells} scored cell(s) predate the field, so the decline '
-            f'split is PARTIAL (not measured-clean)'
+            f'{scored_cells} scored cell(s) carry no resolved terminal kind, '
+            f'so the decline split is PARTIAL (not measured-clean)'
         )
     lines.append('')
     lines.extend(_format_plan_quality_mean_section(report))

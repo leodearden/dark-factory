@@ -981,10 +981,20 @@ persisted on `metrics.py::EvalMetrics.terminal_kind`, read back through
 `to_dict` is a bare `asdict`, so the live instrument puts the key on **every**
 cell — which is what makes key ABSENCE the one unambiguous legacy signal, the
 same property `judged_without_reference` depends on. The write must never be
-made conditional. The five decline kinds (`metrics.py::DECLINE_KINDS`) are
-single-sourced against the `artifacts.TaskArtifacts.read_*` readers that produce
-them via `metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away
-from the artifacts it names.
+made conditional.
+
+The last two rows are nevertheless read back **alike**: `terminal_kind_of`
+answers `None` for both, and `terminal_kind_unmeasured` counts both. Over the
+architect cells that count ranges on, the two state one fact — nobody resolved
+this cell's terminal statement — and giving the written null its own arm would
+leave it in neither `declined` nor `terminal_kind_unmeasured`, i.e. read back as
+"measured, did not decline". Key absence stays the unambiguous legacy signal for
+a reader who tests presence directly; no consumer has to.
+
+The five decline kinds (`metrics.py::DECLINE_KINDS`) are single-sourced against
+the `artifacts.TaskArtifacts.read_*` readers that produce them via
+`metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away from the
+artifacts it names.
 
 **A DECLINE IS NOT A FAILURE.** It is the architect reading the fixture and
 correctly refusing to plan it — the same exit an architect takes on a real task,

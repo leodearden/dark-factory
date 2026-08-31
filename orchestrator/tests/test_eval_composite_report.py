@@ -2803,8 +2803,9 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
       interchangeable;
     - ``no_plan_declined`` — the intersection with ``no_plan``, i.e. THE tranche-1
       number ("47 of 47 no-plan cells were declines");
-    - ``terminal_kind_unmeasured`` — admitted cells that predate the field, so a
-      partial split never reads as a complete one.
+    - ``terminal_kind_unmeasured`` — admitted cells carrying no resolved
+      terminal kind (an absent key, or an explicit null — ``terminal_kind_of``
+      reads the two alike), so a partial split never reads as a complete one.
     """
 
     @staticmethod
@@ -2977,6 +2978,41 @@ class TestPlanQualityReportSplitsNoPlanByDecline:
         assert cfg['terminal_kind_unmeasured'] == 1
         assert cfg['declined'] == 2               # NOT 3, and NOT silently 2/5
         assert cfg['no_plan_declined'] == 2
+
+    def test_an_explicit_null_kind_is_unmeasured_too(self):
+        """Key PRESENT, value null — counted WITH the keyless cells.
+
+        ``terminal_kind_of`` answers ``None`` for an absent key and for a
+        written null alike, and this count is over that answer, so the two
+        shapes must land in the same bucket. The alternative — counting only
+        key ABSENCE — would drop this cell into neither ``declined`` nor
+        ``terminal_kind_unmeasured``, i.e. read it back as "measured, did not
+        decline", the collapse the count exists to prevent.
+
+        The live instrument cannot mint this shape on an architect cell
+        (``run_architect_eval`` always resolves a string, and the write is
+        unconditional), which is exactly why it is constructed here: the day a
+        second producer persists an architect cell with a null kind, this
+        assertion is what keeps the split honest instead of quietly partial.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        null_kinded = _kinded(
+            _arch('p9', 'arch-split', 1, plan_steps=0, plan_quality=0.0,
+                  cost_usd=0.3, duration_ms=60000),
+            None,
+        )
+        assert 'terminal_kind' in null_kinded.metrics        # PRESENT...
+        assert null_kinded.metrics['terminal_kind'] is None   # ...and null
+
+        cfg = build_plan_quality_report(
+            [*self._four_cells_three_no_plan(), null_kinded]
+        )['configs'][0]
+
+        assert cfg['n'] == 5
+        assert cfg['no_plan'] == 4
+        assert cfg['terminal_kind_unmeasured'] == 1
+        assert cfg['declined'] == 2                # NOT 3, and NOT silently 2/5
 
     def test_a_fully_measured_config_reports_zero_unmeasured(self):
         """A count that only appears when it fires cannot be read."""
