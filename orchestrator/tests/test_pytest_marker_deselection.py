@@ -763,38 +763,6 @@ class _Other:
 """
 
 
-#: Every marker-source fixture in this module, by NAME.  The family invariant
-#: below parametrizes over names rather than values because this class is
-#: created at import time, BEFORE the fixtures defined further down the module
-#: exist; ``globals()`` resolves them at call time instead.
-#:
-#: DRIFT IS CHECKED, NOT TRUSTED: this list is spelled out (so a parametrize id
-#: names a real fixture and a deliberate exclusion would be visible) and
-#: ``test_the_fixture_sweep_names_every_marker_source_in_this_module`` asserts it
-#: against the module's own globals.  It had already drifted once — every
-#: class-marked fixture the class tier was written for was missing, so the family
-#: invariant swept only the shapes that predate it.
-_MARKER_SOURCE_FIXTURE_NAMES = (
-    '_REAL_PYTESTMARK_SOURCE',
-    '_ALL_DECORATED_SOURCE',
-    '_MIXED_DECORATED_SOURCE',
-    '_ALL_CLASSES_MARKED_SOURCE',
-    '_ONE_CLASS_MARKED_SOURCE',
-    '_ONLY_HELPER_CLASSES_SOURCE',
-    '_MARKED_SOURCE',
-    '_UNMARKED_SOURCE',
-    '_ALL_DECORATED_SOURCE_WITH_CLASS',
-    '_CLASS_MARKED_SOURCE',
-    '_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE',
-    '_CLASS_MARKED_MODULE_SOURCE',
-    '_CLASS_PARTLY_MARKED_MODULE_SOURCE',
-    '_SLOW_MARKED_SOURCE',
-    '_UNMARKED_PLAIN_SOURCE',
-    '_CLASS_MARKED_SLOW_SOURCE',
-    '_SMOKE_MARKED_SOURCE',
-)
-
-
 class TestGuaranteedMarkerNames:
     """``guaranteed_marker_names(source) -> frozenset[str]``.
 
@@ -1267,46 +1235,6 @@ class TestGuaranteedMarkerNames:
             '    pass\n'
         )
         assert guaranteed_marker_names(source) == frozenset({'slow'})
-
-    @pytest.mark.parametrize('fixture_name', _MARKER_SOURCE_FIXTURE_NAMES)
-    def test_is_a_superset_of_the_module_level_tier_on_every_fixture(self, fixture_name):
-        """THE FAMILY INVARIANT, swept over every marker-source fixture in this module.
-
-        ``guaranteed_marker_names`` is a provable SUPERSET of
-        ``module_level_marker_names`` on every input, which is what makes
-        routing the composed entry point's primary tier through it STRICTLY
-        ADDITIVE: it can never refuse a target the current code accepts.
-        """
-        source = globals()[fixture_name]
-        assert module_level_marker_names(source) <= guaranteed_marker_names(source)
-
-    def test_the_fixture_sweep_names_every_marker_source_in_this_module(self):
-        """THE DRIFT GUARD for the sweep above — the invariant is only as wide as its list.
-
-        ``_MARKER_SOURCE_FIXTURE_NAMES`` is hand-maintained, and it had already
-        silently drifted: every CLASS-marked fixture added for this tier was
-        missing from it, so the one test whose whole purpose is the superset
-        guarantee was asserting it on the legacy shapes and none of the shapes
-        the tier was written for.  A regression making
-        ``guaranteed_marker_names`` return LESS than ``module_level_marker_names``
-        on a class-marked module would have gone straight through.
-
-        Deriving the list at call time instead would fix the drift and lose the
-        readable parametrize ids -- and would need a naming rule loose enough to
-        catch ``_ALL_DECORATED_SOURCE_WITH_CLASS``, which does not even end in
-        ``_SOURCE``. Checking the hand-written list against that rule keeps both.
-        """
-        discovered = {
-            name
-            for name, value in globals().items()
-            if name.startswith('_') and 'SOURCE' in name and isinstance(value, str)
-        }
-        assert discovered, 'premise: the naming rule still finds the fixtures'
-        assert discovered == set(_MARKER_SOURCE_FIXTURE_NAMES), (
-            'a marker-source fixture is missing from _MARKER_SOURCE_FIXTURE_NAMES (or vice '
-            'versa), so the family invariant no longer sweeps it: '
-            f'{sorted(discovered ^ set(_MARKER_SOURCE_FIXTURE_NAMES))}'
-        )
 
     def test_the_real_class_organised_module_in_this_repo_is_handled_soundly(self):
         """REAL-INPUT COVERAGE for the class tier — deliberately NOT a tripwire.
@@ -3036,3 +2964,81 @@ class TestTestsScriptsAllIntegrationDecoratedRealConfigRegression:
         assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
         assert 'not smoke and not integration and not warm_lane_bash' in run.reason
+
+
+class TestGuaranteedMarkerNamesFamilyInvariant:
+    """THE FAMILY INVARIANT, swept over every marker-source fixture in this module.
+
+    WHY THIS CLASS SITS AT THE MODULE TAIL.  ``parametrize`` argument values are
+    evaluated at class-creation (import) time, and the fixtures below are defined
+    THROUGHOUT the file — from ``_REAL_PYTESTMARK_SOURCE`` near the top to
+    ``_SMOKE_MARKED_SOURCE`` in the last hundred lines.  Only a definition after
+    the final binding has every value in scope, so parametrizing over the values
+    themselves is possible here and nowhere earlier.  An earlier home is what
+    forced the previous shape (parametrize over NAMES, resolve via ``globals()``
+    at call time); moving the class removes the need for that indirection
+    entirely rather than working around it.
+
+    THE ACCEPTED RESIDUAL: a fixture added later that nobody adds to this list is
+    simply not swept.  That costs COVERAGE — never correctness — and can never
+    produce a false RED.  The guard this replaced tried to close it by asserting
+    the swept set against every module global matching ``startswith('_') and
+    'SOURCE' in name``, and did not actually close it: a fixture named
+    ``_CLASS_MARKED_FIXTURE`` or ``_REAL_CLASS_SHAPE`` is invisible to that rule
+    AND to the list, so the drift recurs silently and green.  What it did buy was
+    a tripwire on cosmetics — renaming a fixture, or adding an unrelated
+    ``_SOURCE_PATH`` helper string, turned the suite RED for a non-behavioural
+    reason.  So the fix is NOT to reintroduce a naming rule, tightened or
+    otherwise: a tighter regex only deepens the same hole while widening the
+    false-RED surface.  Add new fixtures to the list by hand.
+    """
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            _REAL_PYTESTMARK_SOURCE,
+            _ALL_DECORATED_SOURCE,
+            _MIXED_DECORATED_SOURCE,
+            _ALL_CLASSES_MARKED_SOURCE,
+            _ONE_CLASS_MARKED_SOURCE,
+            _ONLY_HELPER_CLASSES_SOURCE,
+            _MARKED_SOURCE,
+            _UNMARKED_SOURCE,
+            _ALL_DECORATED_SOURCE_WITH_CLASS,
+            _CLASS_MARKED_SOURCE,
+            _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE,
+            _CLASS_MARKED_MODULE_SOURCE,
+            _CLASS_PARTLY_MARKED_MODULE_SOURCE,
+            _SLOW_MARKED_SOURCE,
+            _UNMARKED_PLAIN_SOURCE,
+            _CLASS_MARKED_SLOW_SOURCE,
+            _SMOKE_MARKED_SOURCE,
+        ],
+        ids=[
+            '_REAL_PYTESTMARK_SOURCE',
+            '_ALL_DECORATED_SOURCE',
+            '_MIXED_DECORATED_SOURCE',
+            '_ALL_CLASSES_MARKED_SOURCE',
+            '_ONE_CLASS_MARKED_SOURCE',
+            '_ONLY_HELPER_CLASSES_SOURCE',
+            '_MARKED_SOURCE',
+            '_UNMARKED_SOURCE',
+            '_ALL_DECORATED_SOURCE_WITH_CLASS',
+            '_CLASS_MARKED_SOURCE',
+            '_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE',
+            '_CLASS_MARKED_MODULE_SOURCE',
+            '_CLASS_PARTLY_MARKED_MODULE_SOURCE',
+            '_SLOW_MARKED_SOURCE',
+            '_UNMARKED_PLAIN_SOURCE',
+            '_CLASS_MARKED_SLOW_SOURCE',
+            '_SMOKE_MARKED_SOURCE',
+        ],
+    )
+    def test_is_a_superset_of_the_module_level_tier_on_every_fixture(self, source):
+        """``guaranteed_marker_names`` is a provable SUPERSET of the module-level tier.
+
+        That is what makes routing the composed entry point's primary tier
+        through it STRICTLY ADDITIVE: it can never refuse a target the current
+        code accepts.
+        """
+        assert module_level_marker_names(source) <= guaranteed_marker_names(source)
