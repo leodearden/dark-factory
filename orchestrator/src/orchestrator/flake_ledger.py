@@ -713,8 +713,12 @@ def read_occurrences(
 # same thing in remedy framing ('ROOT-CAUSE this...').  The two texts differ in FRAMING,
 # which is the entire point of §5.5: chronic_flake's presupposes a fix, and this one must
 # not.  Sharing one string would force one framing on both.  Importing `chronic_flake`
-# here would also break this module's import discipline (it depends on `shared` alone)
-# and drag `orchestrator.config` into a module the merge path calls on every suppression.
+# here would also break this module's import discipline: the dependency runs ledger ->
+# nothing-but-`shared`, and chronic_flake is the layer ABOVE, so the edge would point
+# backwards.  (It would NOT drag in `orchestrator.config`, as this comment previously
+# claimed: chronic_flake imports that only under `if TYPE_CHECKING`, and at runtime pulls
+# stdlib plus `shared.safe_io`/`shared.task_statuses` only -- measured, not assumed.  The
+# layering reason is real; the import-weight one was not.)
 # Task κ — which migrates chronic_flake onto this ledger — OWNS converging the two texts.
 NEVER_WIDEN_A_TIMEOUT = (
     'CONSTRAINT, binding: do NOT widen a timeout, lengthen a sleep, or add a retry as '
@@ -853,6 +857,16 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+# `submit_task`'s TWO-PHASE (non-planning) response names a ticket, not a task:
+# `{"ticket": "tkt_<id>"}`, which the curator resolves into a task asynchronously.
+# `chronic_flake::extract_task_id` accepts that key as a fallback, so the prefix is the
+# one machine-checkable signal that `planning_mode: True` did NOT take effect and the id
+# in hand can never be resolved by `get_statuses`.  Kept as a constant, beside the
+# Protocol whose `submit_task` docstring states the "not a ticket id" requirement in
+# prose, so the guard and the contract it enforces are read together.
+_TICKET_ID_PREFIX = 'tkt_'
+
+
 class FlakeLedgerTaskClient(Protocol):
     """The task-filing seam :func:`open_debt` needs to enforce §5.9 — declared
     STRUCTURALLY (``typing.Protocol``) so it is machine-checked (INV-1) rather than
@@ -860,8 +874,12 @@ class FlakeLedgerTaskClient(Protocol):
 
     ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient``
     is the concrete adapter.  It is NOT imported here, deliberately: this module depends
-    on ``shared`` alone, and importing ``chronic_flake`` would drag ``orchestrator.config``
-    into a module the merge path calls on every suppression.
+    on ``shared`` alone and sits BELOW ``chronic_flake``, so importing it would point the
+    dependency backwards through the layer that is meant to build on this one.  (The cost
+    is layering, not import weight -- ``chronic_flake`` imports ``orchestrator.config``
+    only under ``if TYPE_CHECKING``, so an import edge here would pull in stdlib plus
+    ``shared`` and nothing else.  Measured; an earlier version of this docstring asserted
+    the opposite.)
 
     Every method must degrade rather than raise where it can, but the ledger does not
     RELY on that — :func:`_ensure_owner_task` guards each call independently, because a
@@ -1096,6 +1114,22 @@ async def _ensure_owner_task(
             # '' would hide the breach behind a truthy-looking column value; leaving the
             # column NULL is what `flake_report` renders as the invariant breach it is.
             raise ValueError('submit_task returned no task id')
+        if new_id.startswith(_TICKET_ID_PREFIX):
+            # A STRUCTURALLY WRONG id is also a failed filing, and the falsy guard above
+            # does not catch it because a ticket id is truthy.  `chronic_flake
+            # ::extract_task_id` falls back to submit_task's NON-planning two-phase
+            # response key, `{'ticket': 'tkt_<id>'}`; if `planning_mode` is ever dropped,
+            # rejected, or the server falls back to that path, a `tkt_...` string arrives
+            # here.  Storing it is strictly WORSE than storing nothing: a ticket id is not
+            # a task id, so every later `get_statuses(['tkt_...'])` legitimately OMITS it,
+            # `_owner_liveness` reads the omission as a CORROBORATED ABSENCE, and a
+            # REPLACEMENT is filed -- on every suppression, unbounded, on a path with no
+            # rate limit (see this function's own note).  Refused here, the row simply
+            # stays unowned and the next suppression RETRIES the filing, which terminates.
+            raise ValueError(
+                f'submit_task returned a ticket id ({new_id!r}), not a task id -- '
+                'planning_mode did not take effect'
+            )
     except Exception:
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
@@ -1248,9 +1282,7 @@ async def open_debt(
             conn.close()
         if row is None:
             return None
-        return await _ensure_owner_task(
-            db_path, project_id, _to_debt_row(row), task_client=task_client
-        )
+        debt_row = _to_debt_row(row)
     except Exception:
         logger.warning(
             'flake_ledger: failed to open debt for test_id=%s (project_id=%s)',
@@ -1259,6 +1291,31 @@ async def open_debt(
             exc_info=True,
         )
         return None
+
+    # ENSURING THE OWNER IS OUTSIDE THE TRY ABOVE, AND THE BOUNDARY IS THE COMMIT.
+    # `None` is a contract -- it means "the ledger was unavailable, the measurement is
+    # lost" (see this function's docstring), and `record_merge_flake_suppression` logs it
+    # as exactly that.  By the time we get here the upsert has COMMITTED, so the debt row
+    # is durably on disk and that statement would be false.  `_ensure_owner_task` claims
+    # never to raise, but it drives a duck-typed `task_client` and does its own sqlite
+    # write, so "claims" is not "cannot": were it inside the try, one raise would report a
+    # successful write as a lost one, and the row would be re-opened as if fresh.
+    # A filing failure must degrade to "row WITHOUT an owner" -- which `flake_report`
+    # already renders as the §5.9 breach it is -- never to "no row at all".
+    try:
+        return await _ensure_owner_task(
+            db_path, project_id, debt_row, task_client=task_client
+        )
+    except Exception:
+        logger.warning(
+            'flake_ledger: opened debt for test_id=%s (project_id=%s) but enforcing the '
+            'owner invariant raised -- the debt row IS durably written and is returned '
+            'UNOWNED, which flake_report renders as the breach it is',
+            test_id,
+            project_id,
+            exc_info=True,
+        )
+        return debt_row
 
 
 async def resolve_debt(
