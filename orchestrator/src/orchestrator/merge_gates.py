@@ -1855,48 +1855,61 @@ async def _resolve_renamed_plan_path(
     *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
     delete and add commits (git pairs renames only within one commit),
     which is exactly how the reify harness-consolidation programme staged
-    its moves.  The basename searched for is taken from the LAST RESOLVED
-    HOP (``current``), not the originally declared path (``norm``): this
-    mechanism is reached precisely when the chain dead-ended on a path
-    absent from the tree, so the declared name is already known stale,
-    whereas a hop the chain got at least one step past is live evidence of
-    what the file is called now (``current == norm`` when the chain never
-    advanced, so the no-chain case is unaffected).  The fallback is
-    deliberately conservative and bounded four ways: it requires EXACTLY
-    ONE candidate; it only runs for a path that exists nowhere in the
-    branch tree; it only runs for a path with actual history under its
-    ORIGINALLY DECLARED name, checked via
-    :func:`_path_existed_in_branch_history` on ``norm`` (never ``current``,
-    which would be vacuous — a hop only exists because a commit deleted
-    it; an invented path is a stale declaration, not a rename); and a
-    resolution never passes the gate on its own — the caller additionally
-    requires the resolved path to be in the touched set.  So an ambiguous
-    or coincidental basename cannot silently satisfy the gate.
+    its moves.  TWO keys are tried, in preference order: the LAST RESOLVED
+    HOP (``current``) FIRST, then the ORIGINALLY DECLARED path (``norm``)
+    as a fallback when the hop key finds no unique candidate.  The hop is
+    tried first because it is the more RECENTLY PROVEN name — mechanism 1
+    produced authoritative git rename evidence for it — whereas ``norm`` is
+    the one name mechanism 1 already showed is stale (``current == norm``
+    when the chain never advanced, so the no-chain case tries a single key
+    that happens to equal the other).  The declared path is tried second,
+    not skipped, because a chain hop can CHANGE a file's basename and a
+    LATER hop can RESTORE it: the hop is evidence of the file's current
+    name only when it actually HAS a match, not strictly better evidence
+    in every shape.  Trying both keys makes the resolver a strict SUPERSET
+    of either single-key behaviour, recovering every resolution the
+    ``norm`` key made in production before task 4158 while keeping the
+    chained-rename resolutions the ``current`` key added.  Both keys are
+    bounded the SAME four ways: each requires EXACTLY ONE candidate; the
+    lookup only runs for a path that exists nowhere in the branch tree; it
+    only runs for a path with actual history under its ORIGINALLY DECLARED
+    name, checked via :func:`_path_existed_in_branch_history` on ``norm``
+    (never ``current``, which would be vacuous — a hop only exists because
+    a commit deleted it; an invented path is a stale declaration, not a
+    rename); and a resolution never passes the gate on its own — the
+    caller additionally requires the resolved path to be in the touched
+    set.  So an ambiguous or coincidental basename cannot silently satisfy
+    the gate on EITHER key, and trying a second key escapes none of these
+    bounds — it only widens which name they are evaluated against.
 
-    Known, ACCEPTED limitation of keying on ``current``: none of the four
-    bounds above can distinguish "the hop's file was relocated again as
-    separate delete+add commits" (the case the ``current`` key exists to
-    resolve) from "the hop's file was genuinely DELETED OUTRIGHT" (removed,
-    never re-added anywhere).  If an unrelated file elsewhere in the tree
-    happens to share the dead hop's basename, mechanism 2 resolves the
-    declared path to that unrelated file even though nothing on the branch
-    actually delivered against it.  This is NOT a new class of risk
-    introduced by keying on ``current`` — the no-chain case (``current ==
-    norm``) already has it, since a path that was committed and later
-    deleted outright still has git history under its own name, so
-    :func:`_path_existed_in_branch_history` does not stop it either; keying
-    on ``current`` only extends the SAME accepted tradeoff to chained
-    renames, where a hop's basename is more likely to be generic (``mod.rs``,
-    ``__init__.py``, ``index.ts``) than the originally declared path's.  A
-    tighter bound is possible (e.g. requiring the candidate to have been
-    ADDED at-or-after the commit that deleted ``current``) but is
-    deliberately not implemented here.  The tradeoff is bounded in practice
-    by the surrounding invariants — EXACTLY ONE candidate, the resolved
-    path must additionally be in the touched set — and every resolution
-    that passes is logged loudly at WARNING regardless of mechanism, so the
-    false-positive class this paragraph documents is never silent.  See
-    ``TestHopBasenameAcceptedTradeoff`` in the test module for the pinned
-    shape.
+    Known, ACCEPTED limitation, shared by BOTH keys: none of the four
+    bounds above can distinguish "the file was relocated again as separate
+    delete+add commits" (the case the two-key lookup exists to resolve)
+    from "the file was genuinely DELETED OUTRIGHT" (removed, never
+    re-added anywhere).  If an unrelated file elsewhere in the tree
+    happens to share a dead hop's (or the declared path's) basename,
+    mechanism 2 resolves the declared path to that unrelated file even
+    though nothing on the branch actually delivered against it.  This is
+    NOT a new class of risk introduced by trying ``current`` — the
+    no-chain case (``current == norm``) already has it, since a path that
+    was committed and later deleted outright still has git history under
+    its own name, so :func:`_path_existed_in_branch_history` does not stop
+    it either; the hop key only extends the SAME accepted tradeoff to
+    chained renames, where a hop's basename is more likely to be generic
+    (``mod.rs``, ``__init__.py``, ``index.ts``) than the originally
+    declared path's.  A tighter bound is possible (e.g. requiring the
+    candidate to have been ADDED at-or-after the commit that deleted the
+    lookup key) but is deliberately not implemented here.  The tradeoff is
+    bounded in practice by the surrounding invariants — EXACTLY ONE
+    candidate, the resolved path must additionally be in the touched set —
+    and every resolution that passes is logged loudly at WARNING regardless
+    of mechanism or key, so the false-positive class this paragraph
+    documents is never silent.  The declared-path fallback key carries the
+    identical tradeoff under the identical bounds — a coincidental
+    basename match on the declared name is exactly as unable to
+    distinguish a re-relocation from an outright deletion as one on a hop
+    is.  See ``TestHopBasenameAcceptedTradeoff`` in the test module for the
+    pinned shape on the hop key.
 
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
@@ -1972,12 +1985,14 @@ async def _resolve_renamed_plan_path(
     # Reached when no commit deleted the path (never created, or the
     # relocation predates any reachable delete), when the deleting commit
     # carried no pairable rename (separate delete+add commits), or when
-    # the chain dead-ended on a path that is absent from the tree.  The
-    # basename searched for is taken from `current` — the LAST RESOLVED
-    # HOP, which equals `norm` when the chain never advanced — because
-    # reaching this mechanism at all means the declared name is the one
-    # name we already know is stale; a hop the chain got at least one
-    # step past is strictly better evidence of the file's current name.
+    # the chain dead-ended on a path that is absent from the tree.  TWO
+    # keys are tried, in order: `current` — the LAST RESOLVED HOP, which
+    # equals `norm` when the chain never advanced — FIRST, because
+    # mechanism 1 produced authoritative git rename evidence for it; then
+    # `norm` — the ORIGINALLY DECLARED path — as a fallback, because a
+    # chain hop can CHANGE a file's basename and a LATER hop can RESTORE
+    # it, so a hop with no unique candidate is not evidence that the
+    # declared name has none.
     if not await _path_existed_in_branch_history(
         norm, branch_head, git_ops, task_id=task_id,
     ):
@@ -1993,16 +2008,46 @@ async def _resolve_renamed_plan_path(
     if live is None:
         return None
 
-    basename = posixpath.basename(current)
-    if not basename:
-        return None
-    candidates = [p for p in live if posixpath.basename(p) == basename]
-    if len(candidates) == 1:
+    # `live` is narrowed to `set[str]` above; rebind so the closure below
+    # keeps that narrowing (pyright does not carry narrowing into a nested
+    # function through the original name).
+    live_set = live
+
+    def _sole_candidate(key: str) -> str | None:
+        """The ONE tree path sharing *key*'s basename, or None.
+
+        None covers both "no candidate" and "ambiguous" — mechanism 2's
+        `len(candidates) == 1` bound applies identically to BOTH lookup
+        keys, so the fallback can never be looser than the first attempt.
+        """
+        base = posixpath.basename(key)
+        if not base:
+            return None
+        matches = [p for p in live_set if posixpath.basename(p) == base]
+        return matches[0] if len(matches) == 1 else None
+
+    # First attempt: the LAST RESOLVED HOP.  Mechanism 1 produced
+    # authoritative git rename evidence for it, whereas `norm` is the one
+    # name already PROVEN stale — so when both keys match uniquely, the
+    # hop wins.
+    hop_match = _sole_candidate(current)
+    if hop_match is not None:
         mechanism = (
             'unique basename match' if current == norm
             else f'unique basename match on {current} (after {len(shas)}-hop rename chain)'
         )
-        return candidates[0], mechanism
+        return hop_match, mechanism
+
+    # Fallback: the ORIGINALLY DECLARED path.  A chain hop can CHANGE the
+    # basename and a later hop can RESTORE it, so a hop with no candidates
+    # is not evidence that the declared name has none.
+    if current != norm:
+        declared_match = _sole_candidate(norm)
+        if declared_match is not None:
+            return declared_match, (
+                f'unique basename match on declared {norm} '
+                f'(after {len(shas)}-hop rename chain dead-ended on {current})'
+            )
 
     return None
 

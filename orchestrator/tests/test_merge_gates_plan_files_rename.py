@@ -621,10 +621,13 @@ class TestUniqueBasenameFallback:
 
 @pytest.mark.asyncio
 class TestBasenameFallbackUsesLastResolvedHop:
-    """Mechanism 2 must key its basename lookup off the LAST RESOLVED HOP
-    (``current``), not the originally declared path (``norm``) — reached
-    precisely when mechanism 1 dead-ends on a hop that changed the
-    basename, so the declared name is the one name already proven stale.
+    """Mechanism 2 must try the LAST RESOLVED HOP (``current``) as its
+    FIRST basename-lookup key — reached precisely when mechanism 1
+    dead-ends on a hop that changed the basename, so the declared name is
+    the one name already proven stale.  See
+    ``TestDeclaredBasenameFallbackWhenHopHasNoMatch`` for the fallback to
+    the originally declared path (``norm``) when the hop key finds no
+    unique candidate, and for the tie-break when both keys match.
 
     The no-chain case (``current == norm``) is already covered by
     ``TestUniqueBasenameFallback.test_delete_then_add_resolves_by_unique_basename``,
