@@ -2496,11 +2496,19 @@ async def _record_flake_observation(
     Task ζ binds a FOURTH effect on the same seam — the ``flake_debt`` row and the
     de-flake task filed against it (PRD §5.9) — and that is exactly why the binding
     stays here rather than at the three call sites.  ``task_client`` is the only
-    piece of context the three could plausibly disagree on, since it is the one the
-    worker holds and the two other ``_run_post_merge_verify`` callers do not; a
-    site that forgot it would silently stop enforcing the invariant for whichever
-    observations flow through it, with no failure anywhere.  One seam, one answer
-    to who owns the debt row.
+    piece of context the three could plausibly disagree on, since it rides on the
+    WORKER rather than on the verify: a site that forgot it would silently stop
+    enforcing the invariant for whichever observations flow through it, with no
+    failure anywhere.  One seam, one answer to who owns the debt row.
+
+    Which of the three ``_run_post_merge_verify`` callers can supply it is a fact
+    about scope, and it is worth stating precisely because an earlier version of
+    this docstring got it wrong.  ``SpeculativeMergeWorker`` (:18190) and the train
+    pipeline ``_do_train_merge`` (:7300) BOTH hold a worker and both pass it.
+    ``reverify_member_solo`` (:5956) is the only one that genuinely cannot: it takes
+    ``git_ops``/``config`` and no worker at all, so there is nothing there to read.
+    A suppression observed on that path therefore records its occurrence row and
+    opens no debt — a configuration, not a breach.
 
     Never raises (the recorder owns that guarantee), so a lost measurement can
     never fail a verify or stall the merge queue.
@@ -2567,11 +2575,14 @@ async def _run_post_merge_verify(
             flake recorder so a suppressed merge red acquires a de-flake task at
             write time (PRD task ζ, §5.9).  Threaded exactly as
             ``escalation_queue`` is, and defaulting to ``None`` for the same
-            reason: the two callers that omit it — the solo/main-tip path and
-            ``_TrainMergeHost``'s test-local reference — stay byte-identical, and
+            reason: the one caller that omits it — ``reverify_member_solo``,
+            which holds no worker to read it from — stays byte-identical, and
             with nothing wired the recorder opens no debt row rather than an
             unowned one.  ``SpeculativeMergeWorker`` passes its
-            ``_flake_task_client``.
+            ``_flake_task_client``; ``_do_train_merge`` passes the same handle
+            off the worker it is given (``getattr``, since the frozen
+            test-local ``_TrainMergeHost`` reference defines neither flake
+            handle and simply gets ``None``).
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
             NARROWED — i.e. the D2 producer inside that branch built a
@@ -7297,6 +7308,25 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
+    # Flake handles (task ζ amend): a train merge suppresses reds exactly like a
+    # single-branch one, so §5.9 must be enforced for it too — a train's masked red
+    # is no less debt.  Both handles ride on `worker`, which is already read for five
+    # other fields two lines up, so the earlier claim that this site structurally
+    # could not own a debt row was simply wrong.
+    #
+    # `getattr` rather than a `_TrainMergeHost` field because the Protocol's other
+    # implementer is the FROZEN test-local serial-worker reference (see that class's
+    # docstring), which defines neither attribute; widening the Protocol would break a
+    # file this task does not own.  The default is None, which is precisely the
+    # "nothing wired" configuration both consumers already handle.
+    #
+    # `escalation_queue` is threaded WITH it, not as a drive-by: ζ's write-time filing
+    # is a fail-soft path whose only bound on a many-distinct-tests storm is INV-4's
+    # fixed-sentinel escape, and that escape lives behind this handle.  Arming the
+    # filing at a site where the alarm is unwired is the one combination the recorder's
+    # ordering contract exists to prevent.  (It also restores the task-2307 β
+    # flock-contention escalation on this path, which was dropped here for the same
+    # unthreaded-handle reason.)
     verify_outcome = await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=worker._post_merge_verify_timeouts,
@@ -7307,6 +7337,8 @@ async def _do_train_merge(
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=event_store,
         merge_sha=merge_commit,
+        escalation_queue=getattr(worker, '_escalation_queue', None),
+        task_client=getattr(worker, '_flake_task_client', None),
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
@@ -9498,6 +9530,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # project_root, mirroring `_shadow_state_path` above.  The recorder then
         # opens no debt row at all rather than an unowned one — see
         # `orchestrator/src/orchestrator/flake_recorder.py::record_merge_flake_suppression`.
+        #
+        # Read at TWO sites: `_verify_and_advance`'s `_run_post_merge_verify` dispatch,
+        # and `_do_train_merge`'s (via `getattr`, since it takes the narrow
+        # `_TrainMergeHost` Protocol).  Both are covered by
+        # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
+        # — this construction is the one seam whose failure mode is SILENT (a site that
+        # never supplies a client stops enforcing §5.9 with nothing anywhere going red),
+        # so "the parameter is honoured" is not the same test as "the worker supplies it".
         self._flake_task_client: Any = (
             chronic_flake.SchedulerChronicFlakeTaskClient(scheduler, _root)
             if scheduler is not None and _root is not None

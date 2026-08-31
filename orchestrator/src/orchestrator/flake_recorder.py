@@ -245,13 +245,21 @@ async def record_merge_flake_suppression(
     afterwards — is what makes the invariant self-maintaining.  The COUPLING RULE it
     inherits is binding: the ledger READS task status and writes it only as part of the
     initial filing, never marking a task done, blocked or reprioritised.  With no
-    ``task_client`` wired (the CLI, and the two ``_run_post_merge_verify`` callers that
-    thread nothing) NO debt row is opened at all, and those callers stay byte-identical
-    to their pre-ζ behaviour.  ``open_debt`` itself would write the row unowned — it
-    has to, being safe for any direct caller — but ι renders an ownerless row as an
-    invariant BREACH, and a caller that structurally cannot own anything is a
-    configuration, not a breach; manufacturing rows here would swamp the one surface
-    that exists to show a filing which was attempted and failed.
+    ``task_client`` wired (the CLI, and ``merge_queue.reverify_member_solo``, which
+    holds no worker to read one from) NO debt row is opened at all, and those callers
+    stay byte-identical to their pre-ζ behaviour.  ``open_debt`` itself would write the
+    row unowned — it has to, being safe for any direct caller — but ι renders an
+    ownerless row as an invariant BREACH, and a caller that structurally cannot own
+    anything is a configuration, not a breach; manufacturing rows here would swamp the
+    one surface that exists to show a filing which was attempted and failed.
+
+    "STRUCTURALLY cannot own" is a claim about SCOPE and is worth checking before it is
+    repeated: it holds for a caller with no worker in scope, and it does NOT hold merely
+    because a call site currently passes nothing.  The train pipeline
+    (``merge_queue._do_train_merge``) was such a site — it read five other fields off
+    the worker it is handed — and it now passes the handle; treating "unthreaded" as
+    "incapable" is what let §5.9 go unenforced there while a comment asserted the
+    opposite reason.
 
     ORDER IS THE CONTRACT, not an incidental sequence — local/durable first (the
     occurrence rows), then the in-process live signals (the event, the streak), then the
