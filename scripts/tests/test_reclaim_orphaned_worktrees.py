@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1087,3 +1088,95 @@ def test_park_commit_still_commits_through_a_symlinked_parking(tmp_path):
 
     assert sha
     assert _git(parking, "rev-parse", "HEAD").stdout.strip() == sha
+
+
+# ---------------------------------------------------------------------------
+# step-20: end-to-end CLI refusal — refused_target in the JSON report, no prune
+# ---------------------------------------------------------------------------
+
+def _cli_repo_with_live_and_prunable_parkings(tmp_path):
+    """A repo with one LIVE old parking and one whose directory was deleted, so
+    ``git worktree list --porcelain`` reports a ``prunable`` admin entry.
+
+    The prunable entry is the observable for the FINAL ``git worktree prune``:
+    it is the only phase whose effect survives after the sweep, so "did the
+    prune run against this repo?" is answerable from the porcelain alone.
+    """
+    repo = _init_repo(tmp_path)
+    live = _add_parking(repo, f"2920-{TS_OLD}")
+    stale = _add_parking(repo, f"_lane-0-{TS_LANE}")
+    shutil.rmtree(stale)
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+    return repo, live, stale
+
+
+def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
+    """A ``--repo`` that is not the repository root refuses every phase — the
+    sweep AND the final prune — while still exiting 0 so the nightly timer is
+    never wedged. The refusal is carried by the JSON report's ``refused_target``
+    key, because the always-0 exit code cannot carry it and ``skipped`` alone
+    cannot distinguish 'detached branch' from 'refused target' (INV-4)."""
+    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    result = _run_cli(
+        "--repo", str(subdir),
+        "--parking-root", str(_parking_root(repo)),
+        "--now", str(CLI_NOW),
+        "--min-age-hours", "48",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert live.exists()
+    assert live.resolve() in _worktree_paths(repo)
+
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is True
+    assert report["reclaimed"] == 0
+    assert report["park_committed"] == 0
+    assert report["scanned"] > 0
+    assert report["skipped"] == report["scanned"]
+    assert LOG_PREFIX in result.stderr
+    assert "REFUSING" in result.stderr
+
+    # The final prune did NOT run against the unverified target.
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_cli_verified_run_reports_not_refused_and_still_prunes(tmp_path):
+    """NON-REGRESSION: an ordinary run reports ``refused_target`` false, still
+    reclaims, and still clears the stale admin entry."""
+    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+
+    result = _run_cli(
+        "--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48"
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is False
+    assert report["reclaimed"] == 1
+    assert not live.exists()
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_cli_symlinked_repo_behaves_exactly_like_the_direct_path_run(tmp_path):
+    """NON-REGRESSION: a ``--repo`` that is a SYMLINK to the repo root is a
+    legitimate target — reclaims, prunes, ``refused_target`` false. A guard that
+    compared literal paths would turn every symlinked deployment into a silently
+    skipped nightly."""
+    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+
+    result = _run_cli(
+        "--repo", str(link), "--now", str(CLI_NOW), "--min-age-hours", "48"
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["refused_target"] is False
+    assert report["reclaimed"] == 1
+    assert not live.exists()
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout
