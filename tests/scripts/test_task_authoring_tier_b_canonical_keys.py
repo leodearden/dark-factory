@@ -308,13 +308,20 @@ def test_every_tier_b_canonical_key_is_tier_a_blessed():
     by IMPORTING the frozenset (see the module docstring for why never by
     regexing the source).
 
-    NON-VACUITY IS PENDING MEASUREMENT AT THIS COMMIT. This guard's RED here is
-    scaffolding-shaped — the markers do not exist yet — which proves the
-    extractor runs, not that the invariant bites. The hand falsification (remove
-    ``'related_tasks'`` from ``_BLESSED_METADATA_KEYS`` with the markers in
-    place, confirm this test fails naming it, restore) is performed in the
-    commit that adds the markers, and its outcome is recorded here then. Do not
-    read this paragraph as a measurement until it says so.
+    MEASURED NON-VACUITY, not assumed. This guard's RED in development was
+    scaffolding-shaped — the markers did not exist yet — which proves the
+    extractor RUNS, not that the invariant BITES. So it was falsified by hand at
+    the commit that added the markers: with the markers in place,
+    ``'related_tasks'`` was temporarily removed from ``_BLESSED_METADATA_KEYS``
+    and this test FAILED with ``AssertionError: ... nominates ['related_tasks']
+    as canonical spelling(s), but they are NOT in _BLESSED_METADATA_KEYS``;
+    restoring the entry returned all 11 tests in this file to green. The removal
+    was never committed. So the guard demonstrably catches the real bug it was
+    written for, rather than only its own missing scaffolding.
+
+    Also measured at that commit: the extractor pulls 5 canonical keys from 4
+    table rows, confirming the ``+``-joined first cell really is split on the
+    LIVE document and not only on the synthetic one.
     """
     documented = _canonical_keys(TASK_AUTHORING_PATH.read_text(encoding="utf-8"))
 

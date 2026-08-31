@@ -1166,7 +1166,18 @@ after which the resume path nonetheless closed the task.
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
 fixed to use the canonical spelling — with one documented exception,
-`origin_finding_id`, noted under the table:
+`origin_finding_id`, noted under the table.
+
+Every key in the **Canonical** column is itself Tier-A blessed and therefore
+**silent**, so the `code=unknown_key` drift signal is **alias-only** and
+migrating to the canonical spelling actually clears the warning. That is the
+property the preamble above rests on, and it is machine-checked by
+`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` (task 4303) — a
+new row whose canonical is unblessed fails the suite rather than silently
+re-creating that task's defect, where authors were told to migrate to
+`related_tasks` and still minted a census line.
+
+<!-- tier-b-canonical-keys -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1174,6 +1185,8 @@ fixed to use the canonical spelling — with one documented exception,
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+
+<!-- /tier-b-canonical-keys -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
