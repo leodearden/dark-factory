@@ -569,14 +569,22 @@ class ReclaimOutcome:
     branch before removal (a subset relationship with ``reclaimed`` in the happy
     path); ``skipped`` — parkings NOT removed by the data-loss guard
     (detached / unresolvable branch, or an un-park-committable dirty tree);
-    ``failed`` — parkings whose removal (or processing) errored. Pure value
-    object.
+    ``failed`` — parkings whose removal (or processing) errored; ``refused`` —
+    the whole sweep declined because ``repo`` could not be verified as the root
+    of the repository git resolves for it (every record then lands in
+    ``skipped``). Pure value object.
+
+    ``refused`` is DEFAULTED so every existing construction stays valid; it is
+    surfaced as ``refused_target`` in the JSON report because ``skipped`` alone
+    cannot distinguish "detached branch" from "refused target", and the
+    always-0 exit code carries no signal at all (INV-4 loud-over-silent).
     """
 
     reclaimed: list[Path] = field(default_factory=list)
     park_committed: list[Path] = field(default_factory=list)
     skipped: list[Path] = field(default_factory=list)
     failed: list[Path] = field(default_factory=list)
+    refused: bool = False
 
 
 def reclaim_worktrees(
@@ -586,6 +594,12 @@ def reclaim_worktrees(
     dry_run: bool,
 ) -> ReclaimOutcome:
     """Reclaim each parking, in the fixed data-loss-guard order (best-effort).
+
+    Guard (0), before ANY per-record work: *repo* must be the root of the
+    repository git resolves for it (:func:`is_git_toplevel`). If it is not, the
+    WHOLE sweep is refused — one LOUD warning, ``refused=True``, every record
+    into ``skipped``, nothing removed or committed. The gate runs regardless of
+    ``dry_run`` so ``--check`` reports the same answer the real run would give.
 
     Per record: (1) require a RESOLVABLE branch (``branch is None`` — detached —
     or ``rev-parse`` fails => SKIP + LOUD, never removed); (2) in ``dry_run``,
@@ -602,6 +616,23 @@ def reclaim_worktrees(
     everything passed here is treated as eligible.
     """
     outcome = ReclaimOutcome()
+
+    # (0) Target verify — fail CLOSED before any destructive verb is reachable.
+    # A refused sweep is a MISSED nightly the next run retries; sweeping a
+    # repository the caller never named is unrecoverable.
+    if not is_git_toplevel(repo):
+        logger.warning(
+            '%s REFUSING the whole sweep — repo %s is not the root of the '
+            'repository git resolves for it; skipping all %d parking(s) '
+            '(nothing removed, nothing committed)',
+            _LOG_PREFIX,
+            repo,
+            len(records),
+        )
+        outcome.refused = True
+        outcome.skipped.extend(record.path for record in records)
+        return outcome
+
     for record in records:
         path = record.path
         branch = record.branch

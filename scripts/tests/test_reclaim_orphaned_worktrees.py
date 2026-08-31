@@ -994,8 +994,8 @@ def test_reclaim_refuses_whole_sweep_when_repo_is_not_toplevel(tmp_path, caplog)
     assert clean.exists() and dirty.exists()
     assert {clean.resolve(), dirty.resolve()} <= _worktree_paths(repo)
     assert _git(dirty, "rev-parse", "HEAD").stdout.strip() == head_before
-    assert any(LOG_PREFIX in r.message % r.args for r in caplog.records)
-    assert any("REFUSING" in r.message % r.args for r in caplog.records)
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m and str(subdir) in m for m in warn)
 
 
 def test_reclaim_refusal_also_applies_in_dry_run(tmp_path, caplog):
@@ -1003,7 +1003,9 @@ def test_reclaim_refusal_also_applies_in_dry_run(tmp_path, caplog):
     run that printed 'would reclaim' while the real run would refuse is an
     actively misleading answer — and this misconfiguration is exactly the one a
     dry run most needs to surface."""
-    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    # INFO, not WARNING: the "would reclaim" line this test asserts is ABSENT is
+    # logged at INFO, so a WARNING floor would make that half vacuously true.
+    caplog.set_level(logging.INFO, logger="reclaim_orphaned_worktrees")
     repo, clean, dirty, records = _repo_with_clean_and_dirty_parkings(tmp_path)
     subdir = repo / "subdir"
     subdir.mkdir()
@@ -1013,7 +1015,9 @@ def test_reclaim_refusal_also_applies_in_dry_run(tmp_path, caplog):
     assert outcome.refused is True
     assert _resolved(outcome.skipped) == [r.path.resolve() for r in records]
     assert outcome.reclaimed == []
-    assert any("REFUSING" in r.message % r.args for r in caplog.records)
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m for m in warn)
+    assert not any("would reclaim" in r.getMessage() for r in caplog.records)
 
 
 def test_reclaim_proceeds_normally_through_a_symlinked_repo(tmp_path):
