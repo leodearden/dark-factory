@@ -882,6 +882,91 @@ def _build_ceilings() -> dict:
     }
 
 
+# The two accepted landing-merge spellings, in the form a reader of
+# CURATION.md sees them. `_merge_subject_patterns` carries the machine form;
+# this is the same fact rendered for prose, kept beside the sentence that
+# quotes it so a third spelling is added in one place per audience.
+_MERGE_SPELLINGS_PROSE = (
+    '`Merge task/<id> into main` or `Merge task/<id>: <subject>`'
+)
+
+# Why the split matters at all. Unchanged from the sentence authored at mint
+# time — only the counts and the majority claim were ever wrong.
+_AVAILABILITY_MATERIALITY = (
+    'planRate-only caps the downstream plan_quality population and is a '
+    'material fact for γ1, though it does not block β1 — D9\'s '
+    'planRate-only mechanism handles it.'
+)
+
+
+def merge_sha_availability_block(candidates: list[dict]) -> dict:
+    """Summarise landing-merge availability over *candidates*. Pure.
+
+    Returns ``{'referenced', 'planrate_only', 'total', 'finding'}``, where
+    every number in ``finding`` is interpolated from the counts computed in
+    THIS call and the majority clause is chosen by comparing them. Counts and
+    prose therefore cannot drift apart — the same
+    writer-and-reader-share-one-derivation discipline this driver already
+    applies in ``_merge_subject_patterns`` and ``base_approximation``.
+
+    Two defects this closes, both measured on the committed manifest:
+
+    * The DENOMINATOR was ``len(rows)`` — all 41 census candidates — while
+      only the 39 ``include`` rows carry a ``mint_mode`` at all, so the
+      published counts did not sum to their own stated total (17 + 22 = 39).
+      Counting over ``decision == 'include'`` only, and deriving
+      ``planrate_only`` as the remainder, makes
+      ``referenced + planrate_only == total`` hold BY CONSTRUCTION rather than
+      by luck. The remainder is sound because ``mint_mode`` is binary
+      wherever it is set — ``_candidate_row`` and ``redrive_provenance`` both
+      derive it as ``'referenced' iff a landing merge resolved`` — and
+      ``test_hard_v2_fixture_pool.py::test_includes_declare_a_mint_mode``
+      pins that on the committed rows.
+
+    * The MAJORITY claim was authored when the census was planRate-majority
+      and never re-derived; the dual-spelling matcher moved three fixtures
+      across, leaving prose that called the SPLIT set a majority beside rows
+      saying otherwise.
+    """
+    included = [c for c in candidates if c.get('decision') == 'include']
+    total = len(included)
+    referenced = sum(1 for c in included if c.get('mint_mode') == 'referenced')
+    planrate_only = total - referenced
+
+    if planrate_only > referenced:
+        majority = (
+            f'SPLIT / direct-landed candidates are a MAJORITY '
+            f'({planrate_only} of {total}), not the minority the trial '
+            f'manifest assumed. Only {referenced} of {total} have a single '
+            f'landing merge under either accepted subject spelling '
+            f'({_MERGE_SPELLINGS_PROSE}), so only those can carry a '
+            f'reference block.'
+        )
+    elif referenced > planrate_only:
+        majority = (
+            f'Candidates that CAN carry a reference are a MAJORITY '
+            f'({referenced} of {total}): each has a single landing merge '
+            f'under one of the two accepted subject spellings '
+            f'({_MERGE_SPELLINGS_PROSE}). The other {planrate_only} of '
+            f'{total} landed SPLIT/direct and are planRate-only.'
+        )
+    else:
+        majority = (
+            f'Neither mint mode is a majority: {referenced} of {total} have '
+            f'a single landing merge under one of the two accepted subject '
+            f'spellings ({_MERGE_SPELLINGS_PROSE}) and can carry a reference '
+            f'block, and the other {planrate_only} of {total} landed '
+            f'SPLIT/direct and are planRate-only.'
+        )
+
+    return {
+        'referenced': referenced,
+        'planrate_only': planrate_only,
+        'total': total,
+        'finding': f'{majority} {_AVAILABILITY_MATERIALITY}',
+    }
+
+
 def author_manifest(census_date: str) -> dict:
     """Build the curation manifest from the live dbs + the judgement tables.
 
@@ -904,8 +989,6 @@ def author_manifest(census_date: str) -> dict:
         )
 
     rows = [_candidate_row(c) for cands in per_project.values() for c in cands]
-    referenced = sum(1 for r in rows if r.get('mint_mode') == 'referenced')
-    planrate = sum(1 for r in rows if r.get('mint_mode') == 'planrate_only')
 
     return {
         'schema_version': 1,
@@ -941,20 +1024,7 @@ def author_manifest(census_date: str) -> dict:
             'nothing here; the scan is recorded so its emptiness is a finding '
             'rather than an omission.'
         ),
-        'merge_sha_availability': {
-            'referenced': referenced,
-            'planrate_only': planrate,
-            'finding': (
-                f'SPLIT / direct-landed candidates are a MAJORITY '
-                f'({planrate}/{len(rows)}), not the minority the trial '
-                f'manifest assumed. Only {referenced} of {len(rows)} have a '
-                f'single clean "Merge task/<id> into main" commit, so only '
-                f'those can carry a reference block. This caps the '
-                f'downstream plan_quality population and is a material fact '
-                f'for γ1, though it does not block β1 — D9\'s planRate-only '
-                f'mechanism handles it.'
-            ),
-        },
+        'merge_sha_availability': merge_sha_availability_block(rows),
         'ceilings': _build_ceilings(),
         'continuity': {
             'rationale': CONTINUITY_RATIONALE,
