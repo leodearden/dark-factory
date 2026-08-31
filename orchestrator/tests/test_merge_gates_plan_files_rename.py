@@ -744,6 +744,182 @@ class TestBasenameFallbackUsesLastResolvedHop:
 
 
 @pytest.mark.asyncio
+class TestDeclaredBasenameFallbackWhenHopHasNoMatch:
+    """Mechanism 2 tries the LAST RESOLVED HOP's basename FIRST, and falls
+    BACK to the ORIGINALLY DECLARED path's basename when the hop key finds
+    no unique candidate — rather than replacing one key with the other.
+
+    ``TestBasenameFallbackUsesLastResolvedHop`` (above) pins the case where
+    the hop key must win because the declared key finds nothing.  This
+    class pins the MIRROR-IMAGE regression: a chain hop can change a file's
+    basename and a LATER hop can restore it, so a hop with zero tree
+    candidates is not evidence that the declared name has none either.
+    Measured on this worktree against real git: keying mechanism 2
+    UNCONDITIONALLY on ``current`` (task 4158 step-4) wrongly BLOCKS a
+    branch that delivered exactly what was asked, where the pre-step-4
+    code (keyed on ``norm``) correctly resolved it. Trying the hop first
+    and falling back to the declared path recovers both.
+
+    Read together with ``TestHopBasenameAcceptedTradeoff`` (below), the
+    three classes cover: hop-key wins, declared-key fallback, and the
+    accepted tradeoff both keys share.
+    """
+
+    async def test_hop_with_no_candidates_falls_back_to_the_declared_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The headline regression: the dead-end hop has no tree candidate,
+        but the ORIGINALLY DECLARED basename does — because the second hop
+        RESTORED it in a new directory.
+
+        Differs from
+        ``TestBasenameFallbackUsesLastResolvedHop.test_dead_ended_chain_resolves_on_the_hop_basename``
+        only in ``final``'s basename: there it keeps the hop's basename
+        (``topo_suite.rs``); here it restores the declared one
+        (``topo_e2e.rs``), which is exactly what an unconditional switch to
+        ``current`` cannot see.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+
+        wt = (await git_ops.create_worktree('hop-no-match-declared-fallback')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(6, 6); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='hop-no-match',
+            )
+
+        assert result.not_touched == [], (
+            'the hop basename has no tree candidate, but the DECLARED '
+            'basename does — the gate must fall back and PASS'
+        )
+        assert result.missing_from_tree == []
+        assert result.resolved_renames == {declared: final}
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert declared in msg, (
+            f'the audit trail must name the declared path that matched; got: {msg!r}'
+        )
+        assert hop1 in msg, (
+            'the audit trail must ALSO name the dead hop that was tried and '
+            f'missed, so this PASS is not confused with the hop-key path; '
+            f'got: {msg!r}'
+        )
+
+    async def test_hop_basename_wins_when_both_keys_have_a_unique_match(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+    ) -> None:
+        """Pins the ORDERING: when both keys resolve uniquely, the HOP wins.
+
+        This is the one genuinely ambiguous case the fallback introduces —
+        both ``len(candidates) == 1`` bounds are satisfied, and the
+        caller's touched-set requirement cannot break the tie because the
+        branch touches BOTH candidates.  The hop is the principled winner:
+        mechanism 1 produced AUTHORITATIVE git rename evidence for it,
+        whereas ``norm`` is the one name mechanism 1 already PROVED stale.
+        Without this test the first-try/fallback order is an accident of
+        statement order.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_suite.rs'
+        unrelated = 'crates/legacy/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+        await _commit_on_main(
+            git_repo, {unrelated: 'fn legacy() {}\n'}, 'add unrelated legacy topo_e2e',
+        )
+
+        wt = (await git_ops.create_worktree('hop-vs-declared-tiebreak')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit final\nfn topo() { assert_eq!(7, 7); }\n')
+        (wt / unrelated).write_text(
+            '// branch edit unrelated\nfn legacy() { assert_eq!(8, 8); }\n',
+        )
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='hop-vs-declared',
+        )
+
+        assert result.resolved_renames == {declared: final}, (
+            'both keys resolve uniquely and both candidates are touched — '
+            'the HOP key must win the tie, not the declared-path fallback'
+        )
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+
+    async def test_declared_basename_fallback_still_requires_uniqueness(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+    ) -> None:
+        """Two candidates sharing the DECLARED basename ⇒ still no
+        resolution: the fallback key must not be looser than the hop key.
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_e2e.rs'
+        unrelated = 'crates/legacy/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+        await _commit_on_main(
+            git_repo, {unrelated: 'fn legacy() {}\n'}, 'add unrelated legacy topo_e2e',
+        )
+
+        wt = (await git_ops.create_worktree('declared-fallback-ambiguous')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(9, 9); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='declared-fallback-ambiguous',
+        )
+
+        assert result.resolved_renames == {}, (
+            'two candidates sharing the declared basename must NOT resolve — '
+            'the len(candidates) == 1 bound applies to the fallback key '
+            'exactly as it does to the hop key'
+        )
+        assert result.not_touched == [declared]
+        assert result.missing_from_tree == [declared]
+
+
+@pytest.mark.asyncio
 class TestHopBasenameAcceptedTradeoff:
     """Documents a KNOWN, ACCEPTED limitation of keying mechanism 2's
     basename lookup on ``current`` (the last resolved hop) rather than
