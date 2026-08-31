@@ -2352,6 +2352,60 @@ class TestParseMetadataFailurePolicy:
             f'in the census; got warnings: {warnings}'
         )
 
+    def test_related_tasks_metadata_key_is_blessed(self):
+        """The canonical Tier-B cross-reference spelling must not census-warn (task 4303).
+
+        `related_tasks` is the CANONICAL spelling that docs/task-authoring.md
+        §8's Tier-B table tells authors to migrate TOWARD, yet it was itself
+        unblessed — so an author who followed the documentation exactly still
+        minted a `code=unknown_key` census line, and the drift signal could not
+        discriminate "used a deprecated alias" from "used the canonical
+        spelling". That is the defect: the table's preamble promises the
+        aliases warn *until the caller is fixed to use the canonical spelling*,
+        a promise only meaningful if migrating actually clears the warning.
+
+        BLESSED ON CORPUS-DOMINANCE GROUNDS, NOT ON A LIVE-READER CLAIM — say
+        this plainly, because the honest record is what keeps the entry alive.
+        The reader/writer trace came back NEGATIVE: no code reader, no code
+        writer, and `git log -S` finds the key has never existed in code in
+        this repo's history. It is blessed on the esc-3796-1 precedent, under
+        which the finding-provenance family and `related_memory_ids` are Tier-A
+        with no reader and no writer because THE CORPUS IS THE USAGE. A future
+        reader who greps for a reader, finds none, and prunes this entry as
+        dead would be wrong in exactly the way those entries already warn
+        against.
+
+        The census figures, the reader verdict and the bless-not-retire /
+        bless-not-type rulings are transcribed ONCE, beside the frozenset entry
+        in shared/src/shared/task_metadata.py, and deliberately not restated
+        here — a point-in-time measurement kept in three places ages into two
+        stale copies.
+
+        RED until 'related_tasks' is added to _BLESSED_METADATA_KEYS: on the
+        base tree parse_metadata returns unknown_key for it (measured, not
+        predicted), so legs 1 and 2 both fail.
+        """
+        # 1. Direct membership in the allowlist.
+        assert 'related_tasks' in task_metadata_module._BLESSED_METADATA_KEYS, (
+            'related_tasks is the canonical Tier-B spelling docs/task-authoring.md §8 '
+            'directs authors to; it must be Tier-A blessed so following the '
+            'documentation does not mint a census warning'
+        )
+
+        # 2. The behaviour that membership buys.
+        model, warnings = parse_metadata({'related_tasks': ['1', '2']}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'related_tasks'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for related_tasks; got: {offending}'
+        )
+
+        # 3. Value preservation (I1). Blessing suppresses the census LINE and
+        #    must not touch the stored value: it stays an extra='allow' key,
+        #    round-tripped verbatim, not coerced by a typed field.
+        assert model.model_dump()['related_tasks'] == ['1', '2']
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
