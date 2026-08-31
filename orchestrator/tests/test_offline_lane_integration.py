@@ -728,13 +728,25 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # ---------------------------------------------------------------------------
 
 # Helper names whose presence in a test's OWN source means that test drives
-# at least one `_run_lane`-bounded pass. Used by
-# `_lane_pass_composing_callers` below to DISCOVER the set of tests
-# `test_every_composing_caller_carries_a_timeout_override` must classify,
-# rather than relying solely on a hand-maintained table a new test can
-# silently fall outside of.
+# bounded waits its own body does not spell out. Widened by task 4203's
+# review remediation from "drives at least one `_run_lane`-bounded pass" to
+# that broader membership rule: `_run_lane` / `_run_one_lane_pass` /
+# `_drive_reds` each compose `_LANE_PASS_BOUND_SECS`-bounded passes, and
+# `_assert_never_a_gate` composes its own `_NOTE_OFFLINE_LANE_BOUND_SECS` +
+# `_NOTE_MERGE_ALL_BOUND_SECS` pair (0.5 + 15.0 = 15.5s) without any lane
+# pass at all. Used by `_lane_pass_composing_callers` below to DISCOVER the
+# set of tests `test_every_composing_caller_carries_a_timeout_override` must
+# classify, rather than relying solely on a hand-maintained table a new test
+# can silently fall outside of.
+#
+# `_assert_never_a_gate`'s absence from this set was a real hole, not a
+# hypothetical one: task 4203's own
+# `test_out_of_bound_spawn_counts_are_measured_not_asserted` reaches 15.5s of
+# bounded waits through that helper and NOTHING else, so the pre-remediation
+# net never discovered it and it ran marker-less under the 60s pyproject
+# default while requiring more than twice that.
 _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
-    {'_run_lane', '_run_one_lane_pass', '_drive_reds'},
+    {'_run_lane', '_run_one_lane_pass', '_drive_reds', '_assert_never_a_gate'},
 )
 
 
@@ -743,8 +755,9 @@ def _lane_pass_composing_callers(module_globals: dict) -> set[str]:
     `_LANE_PASS_COMPOSING_HELPER_NAMES` at least once.
 
     AST-based rather than a text/regex scan, so a PROSE mention of a helper
-    name (this module's own docstrings name all three in backticks) can
-    never register as a false positive the way a file-wide regex could —
+    name (this module's own docstrings name every member of the set in
+    backticks) can never register as a false positive the way a file-wide
+    regex could —
     only an actual `ast.Call` node naming the helper does. Deliberately does
     not resolve call arguments (e.g. whether a `_run_lane(...,
     expected_passes=N)` call's N is 1) — this is a coverage NET, not a
@@ -778,8 +791,11 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     Makes WORK item 2's open re-verification question ("does EVERY chaining
     caller carry such an override?") executable rather than prose, in two
     layers. COVERAGE: `_lane_pass_composing_callers` discovers every test
-    whose own source calls a pass-composing helper (`_run_lane`,
-    `_run_one_lane_pass`, `_drive_reds`) at all; every discovered name must
+    whose own source calls any member of `_LANE_PASS_COMPOSING_HELPER_NAMES`
+    at all — deliberately named there and not re-spelled here, so widening
+    that set (as task 4203's remediation did, adding `_assert_never_a_gate`)
+    cannot leave a stale hand-typed list behind in this docstring or in the
+    `undeclared` assertion message below; every discovered name must
     appear in EITHER `worst_case_secs` below OR `single_pass_exempt` — so a
     test added tomorrow that calls e.g. `_drive_reds(..., 3)` without a
     `@pytest.mark.timeout` marker fails this test immediately instead of
@@ -840,6 +856,14 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             + _NOTE_OFFLINE_LANE_BOUND_SECS
             + _NOTE_MERGE_ALL_BOUND_SECS
         ),
+        # Task 4203 (review remediation) — the only row whose bounded waits
+        # come entirely from `_assert_never_a_gate`: this test composes no
+        # `_run_lane` pass at all, so there is no `_LANE_PASS_BOUND_SECS`
+        # term. Discovered by the net only once `_assert_never_a_gate`
+        # joined `_LANE_PASS_COMPOSING_HELPER_NAMES`.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
     }
     # Task 4203 — the other multiplicand `_required_timeout_secs` needs per
     # composing test: its counted out-of-bound real-git spawns (never
@@ -861,6 +885,18 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         ),
         test_b3_never_a_gate: (
             _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_NEVER_A_GATE
+        ),
+        # Task 4203 (review remediation) — the ONLY row in either table that
+        # pays `_SPAWNS_PER_REPO_FIXTURE` TWICE: once for the `repo` fixture
+        # every test in this module transitively pulls, and once more for the
+        # fresh `_setup_repo` this test deliberately runs on a clean tmp_path
+        # in order to MEASURE that very constant. Its `_ControllableSuiteRunner`
+        # / `_build_worker` / `_wire_lane` setup contributes nothing further —
+        # measured to be spawn-free inside that test, not assumed.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            2 * _SPAWNS_PER_REPO_FIXTURE
             + _SPAWNS_PER_DRIVE_ADVANCE
             + _SPAWNS_PER_ASSERT_NEVER_A_GATE
         ),
@@ -886,8 +922,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     }
     undeclared = discovered - classified
     assert not undeclared, (
-        f'{sorted(undeclared)} call a pass-composing helper (_run_lane / '
-        f'_run_one_lane_pass / _drive_reds) but are classified in neither '
+        f'{sorted(undeclared)} call a bounded-wait-composing helper '
+        f'({" / ".join(sorted(_LANE_PASS_COMPOSING_HELPER_NAMES))}) but are '
+        f'classified in neither '
         f'worst_case_secs (composes past a single pass; needs its own '
         f'@pytest.mark.timeout override) nor single_pass_exempt (proven to '
         f'never exceed one bounded pass), in '
@@ -1272,10 +1309,31 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     # `runner` is required by its signature but never read in its body (see
     # this test's docstring), so a bare, never-driven instance is enough —
     # no held-in-flight `_run_lane` pass is composed here.
+    #
+    # The lane wiring itself is MEASURED to be spawn-free rather than assumed
+    # (task 4203 review remediation): this test's own `out_of_bound_spawns`
+    # row prices exactly 2x`_SPAWNS_PER_REPO_FIXTURE` +
+    # `_SPAWNS_PER_DRIVE_ADVANCE` + `_SPAWNS_PER_ASSERT_NEVER_A_GATE`, so a
+    # constructor or wiring call that quietly spawned git would inflate this
+    # test's real footprint past the timeout its own guard row sizes for it.
     calls.clear()
-    runner = _ControllableSuiteRunner()
-    worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
-    _wire_lane(harness, worker)
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        runner = _ControllableSuiteRunner()
+        worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
+        _wire_lane(harness, worker)
+
+    assert calls == [], (
+        f'constructing _ControllableSuiteRunner / _build_worker / _wire_lane '
+        f'spawned {len(calls)} real git subprocess(es) ({calls}), but this '
+        f"test's out_of_bound_spawns row in "
+        f'test_every_composing_caller_carries_a_timeout_override prices the '
+        f'lane wiring at zero. Pin the measured count in a named constant '
+        f'and add it to that row rather than letting it be absorbed '
+        f'silently — an unpriced spawn under-sizes this test\'s own '
+        f'@pytest.mark.timeout override.'
+    )
+
     with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
          patch(f'{__name__}._run', side_effect=_counting_run):
         await _assert_never_a_gate(harness, worker, runner, repo, git_ops)
