@@ -15,9 +15,12 @@ Many older test modules still carry their own copy (task 3895 migrates
 them); don't add one (task 3738).
 """
 
+import asyncio
 import os
 import re
 import sys
+import warnings
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -66,9 +69,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from _fm_helpers import (  # noqa: E402
+    _leaked_async_httpx_clients,
+    _warn_if_drain_closed_a_foreign_client,
     pydantic_spec,
+    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
+    track_async_httpx_clients,
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -91,8 +98,15 @@ from fused_memory.config.schema import (  # noqa: E402
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+
+    ``track_async_httpx_clients()`` runs HERE — at session start, before
+    collection — rather than lazily from a fixture, so clients constructed at
+    module import time are tracked too and can be reaped like any other
+    (task 4412).
+    """
     reject_unsafe_basetemp(config)
+    track_async_httpx_clients()
 
 
 @pytest.fixture(scope='session')
@@ -154,6 +168,153 @@ async def _reap_leaked_ticket_workers():
     """
     yield
     await reap_leaked_ticket_workers()
+
+
+# ---------------------------------------------------------------------------
+# Leaked async httpx client drain (task 4412) — TWO autouse arms.
+#
+# TEARDOWN ORDER IS LOAD-BEARING, and it is bought by an explicit FIXTURE
+# DEPENDENCY, not by declaration order: the async arm REQUESTS the sync arm, so
+# the sync arm is set up first and therefore torn down LAST, leaving the async
+# arm to tear down FIRST. That matters because an async test's leaked clients
+# must be closed inside that test's OWN still-open event loop — their
+# connection pool has affinity to it.
+#
+# Declaration order does NOT decide this, despite the usual same-scope rule:
+# pytest-asyncio 1.x async fixtures acquire an event-loop dependency that
+# reorders them relative to plain autouse fixtures. MEASURED on the pinned
+# toolchain before the dependency below was added: the sync arm tore down
+# FIRST, the exact inverse of what declaration order predicts, and the
+# real-I/O cohort's clients were aclose()d cross-loop from the sync arm's
+# throwaway asyncio.run loop.
+#
+# Pinned behaviourally (not as source layout) by
+# test_async_httpx_leak_isolation.py's
+# test_aaa_leaked_client_records_its_closing_loop /
+# test_aab_the_leak_was_closed_in_its_own_test_loop pair, which records which
+# loop actually did the closing.
+#
+# Measured against: python 3.13.9, pytest 9.0.3, pytest-asyncio 1.3.0
+# (asyncio_mode=strict), httpx 0.28.1, openai 2.31.0, anthropic 0.92.0. The
+# ordering is a property of pytest-asyncio's fixture graph, so a bump to any of
+# those is exactly when that pair should be re-run.
+#
+# ===========================================================================
+# CONSTRAINT: NEVER build an async openai/anthropic client in a fixture scoped
+# WIDER than `function` (module / package / session), or in a module-level
+# cache a test then drops.
+# ===========================================================================
+# The drain has no notion of ownership or age: at EVERY test's teardown it
+# closes every tracked client that is still open and resurrect-capable,
+# whoever built it. A module- or session-scoped fixture's client would
+# therefore be closed at the FIRST test's teardown, and its owner would fail
+# much later with `Cannot send a request, as the client has been closed` — in
+# an apparently unrelated test, which is the exact "blamed on an innocent
+# test" shape this drain exists to REMOVE. Measured at time of writing: no
+# fused-memory fixture holds such a client (the only module-scoped ones parse
+# JSON fixtures), so the constraint costs nothing today.
+#
+# Scoping the reap to clients created during the current test was considered
+# and REJECTED: it opens the inverse hole. A wider-scoped fixture's client
+# dropped at ITS OWN teardown is then never drained, gets GC-finalised while
+# some later test's loop is running, and resurrects as
+# create_task(self.aclose()) — precisely the flake this task retires. Trading
+# a real defence for a hypothetical one is the wrong way round, so the
+# constraint is enforced by DISCOVERABILITY instead: the sync arm snapshots
+# the already-leaked clients at SETUP and warns via
+# _fm_helpers._warn_if_drain_closed_a_foreign_client whenever the drain closed
+# one that pre-dated the current test — naming the trap at the teardown that
+# sprang it, instead of leaving it to be diagnosed from the far-away symptom.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reap_leaked_async_httpx_clients_sync():
+    """Close leaked openai/anthropic httpx clients left behind by a SYNC test.
+
+    Task 4412. For WHY an unclosed openai/anthropic client emits a ``Task
+    exception was never retrieved`` ERROR into some unrelated test's ``caplog``
+    window, and why closing it at teardown makes that record unreachable, see
+    the ONE canonical write-up of the mechanism —
+    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    restated here.
+
+    THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
+    Measured on the pinned toolchain (with a spy installed at collection time,
+    so it survives function-scoped teardown unlike a ``monkeypatch`` one): the
+    ``pytest_asyncio`` arm below DOES fire for a plain ``def test_``, in a
+    throwaway loop of its own. So this arm is not what makes the sync cohort —
+    ``test_graphiti_llm_client_construction.py``'s ``test_returns_openai_client``,
+    16 of 40 measured leaks — get drained. What it buys is a cheap,
+    version-independent backstop that does not depend on pytest-asyncio's
+    fixture graph continuing to behave that way across a bump, and that still
+    runs if the async arm is skipped or errors. Sibling precedents:
+    ``_reap_leaked_ticket_workers`` above (task 2737) and
+    ``orchestrator/tests/conftest.py``'s ``_reap_leaked_aiosqlite_connections``
+    (task 2413).
+
+    Runs LAST (the async arm requests it, so it is set up first), by which
+    point an async test's clients are already closed and this is a no-op. The
+    empty-check comes first so the ~14100-of-14147 tests that leak nothing pay
+    only a WeakSet scan and never spin up an event loop. A client that reaches
+    this arm still open never had its pool exercised on a live loop, so a
+    throwaway ``asyncio.run`` loop closes it correctly.
+
+    THE ``asyncio.run`` IS GUARDED, because this is the arm that can close a
+    client CROSS-LOOP (its throwaway loop is not the one the client's pool was
+    opened on). ``reap_leaked_async_httpx_clients`` suppresses
+    ``asyncio.TimeoutError`` and ``RuntimeError``, but a foreign-loop
+    ``aclose()`` on an anyio-backed pool can surface other types — and this is
+    a fallback path measured as never firing under the shipped ordering, so a
+    regression in it would otherwise be discovered by it erroring some
+    innocent test's teardown. A warning keeps it loud without letting the
+    BACKSTOP arm become a flake source itself.
+    """
+    # Snapshot at SETUP (this arm is set up first, before the test body runs):
+    # the clients already leaked by someone else. Weak refs, so the snapshot
+    # never keeps a client alive or changes its GC timing.
+    preexisting = weakref.WeakSet(_leaked_async_httpx_clients())
+    yield
+    if _leaked_async_httpx_clients():
+        try:
+            asyncio.run(reap_leaked_async_httpx_clients())
+        except Exception as exc:  # noqa: BLE001 — a backstop must not fail the test
+            warnings.warn(
+                f'async-httpx drain fallback failed: {exc!r}. The sync arm '
+                f'closes clients from a throwaway asyncio.run loop, so an '
+                f'exception type beyond the suppressed TimeoutError/'
+                f'RuntimeError reached it — widen the suppression in '
+                f'_fm_helpers.reap_leaked_async_httpx_clients or fix the '
+                f'ordering that sent this client to the fallback (task 4412).',
+                stacklevel=2,
+            )
+    _warn_if_drain_closed_a_foreign_client(preexisting)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
+    """Close leaked openai/anthropic httpx clients before this test's loop closes.
+
+    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    same as the sync arm above.
+
+    THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
+    Requesting the sync arm forces the sync arm to be SET UP first and so torn
+    down LAST, which gives this arm teardown PRIORITY: an async test's clients
+    are then closed inside that test's OWN still-open event loop, the
+    correct-affinity path for ``test_local_endpoint_base_url_integration.py``,
+    the only measured cohort that performs real I/O. Declaration order alone
+    does not achieve this — see the block comment above for the measurement
+    that showed the shipped order was the inverse — so do not "tidy" this
+    parameter away. It is pinned by
+    ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
+
+    Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
+    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    vast majority of tests that leak nothing.
+    """
+    yield
+    await reap_leaked_async_httpx_clients()
 
 
 @pytest.fixture
