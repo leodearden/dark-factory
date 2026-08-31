@@ -1334,6 +1334,92 @@ class TestRetryUntilObserved:
         )
 
     @pytest.mark.asyncio
+    async def test_the_miss_path_always_yields_and_never_sleeps_after_the_final_miss(self, monkeypatch):
+        """`delay` defaults to 0.0, but the miss path still AWAITS it -- so the loop always yields.
+
+        Without this, a synchronous `observe` with `reopen=None` burns the
+        whole attempt budget inside one event-loop tick: no wall-clock time
+        passes and no other coroutine runs between attempts, so a barrier
+        that gates nothing wears a plausible-looking exhaustion message. That
+        directly contradicts the documented `reopen=None` use case -- a
+        transient that re-arms ITSELF (an external producer, a periodic
+        emitter) -- since nothing can possibly re-arm it in zero time.
+
+        `await asyncio.sleep(0)` is the cheapest thing that fixes it: it costs
+        one event-loop tick and hands control back, which is exactly what a
+        self-re-arming producer needs to make progress.
+
+        The sleep is inside the between-attempts guard, alongside `reopen`,
+        for the same reason: sleeping after the FINAL miss is pure latency
+        paid on the failure path for an attempt nobody will make.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'sleep:0.0', 'observe', 'sleep:0.0', 'observe'], (
+            f'expected a yield between every pair of attempts and none after the last, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_delay_is_slept_between_attempts_after_reopen(self, monkeypatch):
+        """An explicit `delay` is slept AFTER `reopen` and BEFORE the next observation.
+
+        The order is the assertion: `reopen` opens the window, then the delay
+        gives it time to develop, then it is observed. Sleeping BEFORE the
+        re-open would spend the wait on a window that does not exist yet.
+
+        `delay` is the knob the two sibling primitives already expose as
+        `interval`; naming it differently here is deliberate, because it is
+        not a poll cadence -- it is the gap between two independent openings.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+        payload = {'rows': 2}
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        results = [None, payload]
+
+        def observe():
+            log.append('observe')
+            return results.pop(0)
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4, delay=0.25)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe', 'reopen', 'sleep:0.25', 'observe'], (
+            f'expected the delay to fall between reopen and the next observation, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_an_exception_from_observe_propagates_instead_of_counting_as_a_miss(self):
         """A raising `observe` propagates on the spot; it is NOT absorbed as a falsy observation.
 

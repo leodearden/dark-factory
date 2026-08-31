@@ -1035,6 +1035,7 @@ async def retry_until_observed(
     *,
     reopen: Callable[[], Any] | None = None,
     attempts: int = 4,
+    delay: float = 0.0,
     message: str | None = None,
 ) -> Any:
     """Observe a RACY TRANSIENT, RE-OPENING it between attempts, and return what was seen.
@@ -1073,7 +1074,23 @@ async def retry_until_observed(
     result is awaitable (``inspect.isawaitable``), awaited before use, matching
     ``poll_until``'s contract exactly so all three primitives accept the same
     callable shapes. A falsy *observe* result means "the window was not
-    observed on this attempt".
+    observed on this attempt". Only a FALSY result counts as a miss —
+    an exception from either callable propagates untouched, so a caller
+    reading a live system can still tell "the shape changed" apart from
+    "the window closed too fast" (the motivating call site's second durable
+    job depends on exactly that).
+
+    WHAT MAKES AN ATTEMPT AN ATTEMPT. Nothing here re-observes faster than
+    the caller lets it, so each attempt must be able to see a window that
+    was not open at the instant the previous one gave up. Satisfy that in
+    one of two ways: make *observe* itself a TIME-BOUNDED awaiting attempt
+    (typically a bounded :func:`poll_until`, which is what the motivating
+    call site does), or pass a non-zero *delay*. A synchronous *observe*
+    with ``reopen=None`` and ``delay=0.0`` would otherwise spend its whole
+    budget inside a single event-loop tick — a barrier that gated nothing
+    while wearing a plausible exhaustion message. The miss path always
+    awaits ``asyncio.sleep(delay)`` even at the 0.0 default, so the loop at
+    minimum YIELDS between attempts rather than starving the event loop.
 
     Args:
         observe: Zero-arg sync or async callable making ONE bounded attempt to
@@ -1087,6 +1104,13 @@ async def retry_until_observed(
             are unchanged.
         attempts: Maximum number of observation attempts. Must be >= 1;
             ``attempts=1`` degenerates to a single un-retried observation.
+        delay: Seconds slept BETWEEN attempts — after *reopen*, before the
+            next observation, so the wait is spent on a window that exists
+            rather than one not yet opened. The sibling primitives spell
+            their cadence knob ``interval``; this one is deliberately named
+            differently because it is not a poll cadence but the gap between
+            two INDEPENDENT openings. Awaited even at the 0.0 default (see
+            above) and, like *reopen*, never after the final miss.
         message: Caller diagnostic appended to the exhaustion AssertionError.
 
     Returns:
@@ -1123,17 +1147,25 @@ async def retry_until_observed(
             result = await result
         if result:
             return result
-        # Re-open ONLY between attempts:
+        # Re-open, then wait, ONLY between attempts:
         #   * not before attempt 1 -- the caller has already opened the window
         #     once, and re-opening first would silently discard that opening
         #     and double the cost of the common (observed-first-try) case;
         #   * not after the final miss -- re-arming a window nobody will look
         #     at is pure waste, and would leave the caller's subject in a
-        #     different state than it expects on the failure path.
-        if attempt < attempts and reopen is not None:
-            reopened = reopen()
-            if inspect.isawaitable(reopened):
-                await reopened
+        #     different state than it expects on the failure path; sleeping
+        #     there is pure latency on the failure path for the same reason.
+        if attempt < attempts:
+            if reopen is not None:
+                reopened = reopen()
+                if inspect.isawaitable(reopened):
+                    await reopened
+            # Unconditional, even at delay=0.0: asyncio.sleep(0) costs one
+            # event-loop tick and hands control back, which is the minimum
+            # that makes a reopen=None caller (a transient re-armed by an
+            # external producer) able to make progress at all. Placed AFTER
+            # reopen so the wait is spent on an already-open window.
+            await asyncio.sleep(delay)
     detail = f' {message}' if message else ''
     raise AssertionError(
         f'retry_until_observed: condition not observed in {attempts} attempt(s).{detail}'
