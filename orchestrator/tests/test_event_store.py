@@ -208,6 +208,65 @@ class TestMergeFinalizedEventType:
         assert rows[0][4] == 'done'
 
 
+class TestStaleL0StrandDismissedEventType:
+    """EventType.stale_l0_strand_dismissed must exist and round-trip (task 3172).
+
+    Emitted by Harness._dismiss_stale_escalations for each level-0 escalation
+    that had already been pending longer than the strand threshold when the
+    orchestrator restarted and swept it — the class that previously left no
+    trace at all beyond an indistinguishable 'benign' dismissal.
+    """
+
+    def test_stale_l0_strand_dismissed_member_exists_and_name_equals_value(self) -> None:
+        """stale_l0_strand_dismissed must exist with value == name (project convention)."""
+        assert EventType.stale_l0_strand_dismissed == 'stale_l0_strand_dismissed'
+        assert (
+            EventType.stale_l0_strand_dismissed.value
+            == EventType.stale_l0_strand_dismissed.name
+        )
+
+    def test_stale_l0_strand_dismissed_round_trip(self, tmp_path: Path) -> None:
+        """A representative strand payload round-trips through json_extract."""
+        db_path = tmp_path / 'strand_test.db'
+        store = EventStore(db_path, 'run-strand')
+        store.emit(
+            EventType.stale_l0_strand_dismissed,
+            task_id='5189',
+            data={
+                'escalation_id': 'esc-5189-7',
+                'pending_secs': 75480,
+                'severity': 'blocking',
+                'workflow_blocked': True,
+                'category': 'task_failure',
+                'agent_role': 'implementer',
+                'resolution_class': 'stale-strand',
+            },
+        )
+
+        rows = _query_all(db_path)
+        assert len(rows) == 1
+        assert rows[0]['event_type'] == 'stale_l0_strand_dismissed'
+        # Keyed on the REAL task_id so strand rows stay joinable with task_completed.
+        assert rows[0]['task_id'] == '5189'
+
+        conn = sqlite3.connect(str(db_path))
+        extracted = conn.execute(
+            "SELECT json_extract(data, '$.escalation_id'), "
+            "json_extract(data, '$.pending_secs'), "
+            "json_extract(data, '$.workflow_blocked'), "
+            "json_extract(data, '$.severity'), "
+            "json_extract(data, '$.resolution_class') "
+            "FROM events WHERE event_type = 'stale_l0_strand_dismissed'"
+        ).fetchall()
+        conn.close()
+
+        assert extracted[0][0] == 'esc-5189-7'
+        assert extracted[0][1] == 75480
+        assert extracted[0][2] == 1  # SQLite renders JSON true as 1
+        assert extracted[0][3] == 'blocking'
+        assert extracted[0][4] == 'stale-strand'
+
+
 class TestMergeBlockedEventType:
     """EventType.merge_blocked must exist and round-trip through the event store.
 

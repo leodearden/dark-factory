@@ -686,6 +686,13 @@ class TargetedReconciler:
                     claim=f"Task '{title}' has been completed",
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
+                    # PRD D3 (task 4722): the task's OWN project root, taken
+                    # from the scope this run already validated — not the
+                    # process-global `explore_codebase_root`.  58% of
+                    # historical gate openings were for non-dark_factory
+                    # projects, every one of them verified against the wrong
+                    # tree.
+                    codebase_root=Path(scope.project_root),
                 )
                 # ── verify/codebase audit row contract (task 4343) ──────────
                 # Exactly ONE *outcome* row per invocation of this branch, so
@@ -987,17 +994,30 @@ class TargetedReconciler:
                 # Fall back to direct taskmaster call when interceptor is not set
                 # (keeps existing unit-test fixtures working; the wiring-contract test
                 # in TestServerWiringContract ensures production always wires correctly).
+                #
+                # metadata_mode='additive' is LOAD-BEARING on both branches — do not
+                # drop it back to the default (task 3581). This write attaches
+                # GENERATED hints onto a row that may already carry human-authored
+                # memory_hints; the default 'merge' is shallow last-write-wins, so it
+                # replaced the whole authored memory_hints key with the stub built
+                # above — the DF-3260 clobber. 'additive' is the mode built for exactly
+                # this collision: it recursively unions the nested entities/queries
+                # lists. Stated explicitly rather than as a bare append=True so the
+                # intent is legible and it can never collide with the backend's
+                # merge+append=True contradiction guard.
                 resp: Any
                 if self.task_interceptor is not None:
                     resp = await self.task_interceptor.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
+                        metadata_mode='additive',
                         project_root=scope.project_root,
                     )
                 else:
                     resp = await self.taskmaster.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
+                        metadata_mode='additive',
                         project_root=scope.project_root,
                     )
 

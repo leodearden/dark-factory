@@ -263,6 +263,79 @@ detail as redundant.\
 """
 
 
+# Canonical finding-provenance metadata keys (esc-3796-1, task 4373).
+#
+# The recon prompts have always mandated CAPTURING a Stage-1 `finding_id`, but
+# never said WHERE to persist it on a task filed from that finding. Neither key
+# has a code writer — the PROMPT is the writer — so an unnamed key is an
+# uninstructed one, and the corpus duly forked into 64 bespoke spellings. These
+# constants are the ratified names, single-sourced: every prompt surface that
+# names a finding-provenance metadata key interpolates them, so the three
+# stages cannot drift apart and a future rename is one edit rather than a hunt.
+#
+# Deliberately plain string literals, NOT imported from
+# `shared.task_metadata`: this module imports stdlib only, and widening the
+# prompt-import path to reach the allowlist would couple prompt rendering to
+# the task-metadata package for a two-token agreement. That agreement is
+# enforced instead by tests/test_finding_provenance_prompt_guidance.py, which
+# cross-checks both constants against `parse_metadata` — where this repo
+# already puts its drift guards.
+FINDING_ID_METADATA_KEY = 'source_finding_id'
+FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
+
+# The OTHER vocabulary — and the distinction an earlier revision of this module
+# collapsed, at the cost of making the whole Stage-1 half of the provenance rule
+# a silent no-op.
+#
+# The two constants ABOVE are TASK METADATA keys: what a task filed from a
+# finding carries in its `metadata=`. The two BELOW are ASSEMBLED FLAGGED-ITEM
+# field names: what `server/recon_report.py::ReconReportState.get_assembled_report`
+# projects onto each flagged item as it hands Stage 1's report to Stage 2. The
+# relay hop and the persistence hop carry the same two values under DIFFERENT
+# names, and the earlier text told Stage 1 to relay them under the metadata
+# spellings — onto a projection that rebuilds each item field-by-field and has
+# no passthrough at all, so those fields were discarded before Stage 2 saw them.
+#
+# Plain string literals for the same reason as above: this module is stdlib-only
+# by design and does not import the server package for a two-token agreement.
+# That agreement is enforced instead by an in-process `get_assembled_report`
+# round-trip in tests/test_finding_provenance_prompt_guidance.py — the same
+# place, and the same discipline, as the `parse_metadata` cross-check that
+# guards the metadata keys.
+FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
+FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
+
+# The negative half of the vocabulary rule, single-sourced per INV-5
+# `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
+# above is: it was briefly written twice — once in the shared recon-report block
+# and once in the per-stage provenance section — so every Stage 1/2 prompt
+# carried two near-identical paragraphs that a maintainer rewording either copy
+# would not know about. It now lives HERE only; reword HERE.
+#
+# It is interpolated by `render_finding_provenance_section` alone, which is the
+# only ACTIONABLE surface (Stage 1 and Stage 2 — the stages that can cause one
+# of these keys to be written, directly or by relay). The shared block that
+# Stage 3 sees deliberately gets the NAMES without this rule: Stage 3 folds
+# DISALLOW_TASK_WRITES, so it cannot mint a variant key, and this package does
+# not tell a stage about an action it is not sanctioned to take
+# (`render_escalation_boundary_note`). A second interpolation site is not
+# forbidden — but it must interpolate this constant rather than re-type it, and
+# the assembled-prompt occurrence counts in
+# tests/test_finding_provenance_prompt_guidance.py must move with it.
+#
+# NOTE: a PLAIN (non-f) string, so the two key names are appended by the caller
+# rather than interpolated here.
+FINDING_PROVENANCE_VOCABULARY_RULE = (
+    'Those two spellings are the whole vocabulary. Never mint a per-topic '
+    'variant of either name: the corpus already forked into 64 such spellings '
+    '(e.g. `title_count_corrected_source_finding`, '
+    '`stage2_addendum_finding_latest`), which is what made finding provenance '
+    'ungreppable in the first place. A genuinely one-off annotation goes under '
+    'the `x_` namespace — silently allowed — rather than becoming a 65th '
+    'bespoke top-level key.'
+)
+
+
 def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     """Render the escalation-store boundary note for one stage.
 
@@ -305,6 +378,121 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
         else _ESCALATION_BOUNDARY_NO_ACTION
     )
     return f'{ESCALATION_BOUNDARY_NOTE} {clause}\n\n{_GATE_CLOSURE_ARCHIVE_GUIDANCE}'
+
+
+def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
+    """Render the finding-provenance section for one stage (esc-3796-1, task 4373).
+
+    Follows the :func:`render_escalation_boundary_note` /
+    :func:`render_source_completion_section` (recon_self_model.py) precedent:
+    ONE shared stage-agnostic body plus a single clause selected by a
+    keyword-only capability flag, so the shared half exists exactly once
+    (INV-5 ``no-lockstep-duplication``).
+
+    The clause is parameterized because ``submit_task`` IS in
+    ``DISALLOW_TASK_WRITES``: Stage 2 holds it and sets the keys itself, while
+    Stage 1 does not and can only relay. Naming a tool in a stage's prompt is a
+    live positive license, not inert prose, so handing Stage 1 the Stage-2 text
+    would instruct it to take an action it cannot take. Read the per-stage
+    disallow lists at their source in ``cli_stage_runner.py`` — their
+    composition is deliberately NOT restated here, because a mirrored inventory
+    in a docstring goes stale silently (exactly the failure mode that hid the
+    Stage-2 escalation-read gap until task 3163).
+
+    THE RELAY CHANNEL, as verified rather than assumed. The relay branch does
+    NOT tell Stage 1 to attach the two values to the flagged item under names of
+    its own choosing — it cannot.
+    ``server/recon_report.py::ReconReportState.get_assembled_report`` rebuilds
+    each flagged item as a fixed projection with no passthrough, and
+    ``add_finding`` accepts no ``**kwargs``, so a field Stage 1 invents is
+    discarded before Stage 2 ever sees it. What DOES survive is that projection,
+    which ``stages/task_knowledge_sync.py::_format_flagged`` json.dumps into
+    Stage 2's context unmodified. So the branch names the projected fields the
+    two ``FLAGGED_ITEM_*`` constants hold, and names ``cite_memory`` — which
+    Stage 1 does hold — as the only way to populate the citation one. The
+    projection's field list is deliberately NOT transcribed here; read it at the
+    source, for the same reason the disallow lists are not restated above.
+
+    An earlier revision of this branch asserted the opposite, that flagged items
+    are free-form objects, which made the entire Stage-1 half inert while every
+    prose-level expectation still read as satisfied. The in-process round-trip
+    in tests/test_finding_provenance_prompt_guidance.py is the guard that now
+    catches that class of claim, and it is why a channel named here must be one
+    the assembler actually emits.
+
+    One deliberate DIVERGENCE from ``render_source_completion_section``'s
+    relay branch: that one names the tool it is denying ("you do NOT hold
+    submit_task in this stage"), whereas this one does not name it at all — a
+    name surfaced to a model in a negation is still a name surfaced. That is a
+    style choice, not a capability rule (the two sections make opposite calls
+    about the same tool and both are safe); tests/test_finding_provenance_prompt_guidance.py
+    pins the token's absence from this branch, so harmonising the two sections
+    means deciding it here and moving that expectation with the edit.
+
+    Args:
+        can_file_tasks: True for Stage 2, which holds the task-write tools and
+            persists the keys itself; False for Stage 1, which holds none and
+            must relay to Stage 2.
+
+    Returns:
+        The shared provenance body plus the matching capability clause. The
+        value is interpolated into the stage f-strings at runtime, and an
+        interpolated value is never re-scanned for braces (nor is either
+        assembled prompt ever ``.format()``-ed — ``build_stage2_system_prompt``
+        does string injection, not formatting), so unlike the plain-string
+        constants above this text is under no brace-doubling constraint.
+    """
+    if can_file_tasks:
+        capability_clause = (
+            'You hold `submit_task` in this stage, so set both keys yourself. Both '
+            'values come off the flagged item you are triaging: its '
+            f'`{FLAGGED_ITEM_FINDING_ID_FIELD}` field goes into '
+            f'`metadata.{FINDING_ID_METADATA_KEY}`, and the `memory_id` of each '
+            f'entry in its `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` list into '
+            f'`metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — a list of bare '
+            'memory-id strings, NOT the citation objects themselves. Each entry '
+            f'of `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` is an object carrying '
+            '`memory_id`, `store` and a nested `metadata_fingerprint`; copying '
+            'those objects through whole writes a nested blob under a key whose '
+            'ratified shape is a flat id list. Set them in the '
+            '`metadata=` you pass to `mcp__fused-memory__submit_task` at the moment '
+            'you file the task — not as a later `update_task` repair, which leaves a '
+            'window in which the task exists with no provenance at all. Not every '
+            f'flagged item carries `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}` — some '
+            'reach you as re-projections that carry the finding id alone, or '
+            'neither — so when that field is absent or empty, OMIT '
+            f'`{FINDING_MEMORY_IDS_METADATA_KEY}` entirely rather than inventing a '
+            'value for it.'
+        )
+    else:
+        capability_clause = (
+            'You cannot file tasks in this stage (task writes are disallowed '
+            'here), so Stage 2 persists these keys, not you. Your job is to make '
+            'sure both values reach it, and they travel by different routes. The '
+            f'finding id arrives on its own, as the `{FLAGGED_ITEM_FINDING_ID_FIELD}` '
+            'field of the flagged item assembled from your finding — you do not '
+            'attach it by hand, and a field you add yourself is dropped during '
+            'assembly. The memory ids arrive ONLY if you cite them with '
+            '`mcp__recon-report__cite_memory`, which is what lands them in that '
+            f'same flagged item under `{FLAGGED_ITEM_CITED_MEMORIES_FIELD}`. A '
+            'finding whose memories were never cited reaches Stage 2 with an empty '
+            'list, and its provenance cannot be reconstructed afterwards — so cite '
+            'every memory the finding rests on, at the time you file it.'
+        )
+    return (
+        '## Finding Provenance\n'
+        'A task filed from a Stage-1 finding must carry that finding\'s provenance '
+        'under two named keys:\n'
+        f'- `metadata.{FINDING_ID_METADATA_KEY}` — the `finding_id`, captured '
+        'verbatim from the filing response. How you obtain it is governed by the '
+        '`## Verifying add_finding responses` rule; never compose or guess one.\n'
+        f'- `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` — the memory ids that '
+        'finding cites, as a flat list of bare memory-id strings (e.g. '
+        '`["90bd6ecf-..."]`), never a list of citation objects.\n\n'
+        + FINDING_PROVENANCE_VOCABULARY_RULE
+        + ' '
+        + capability_clause
+    )
 
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
@@ -440,7 +628,20 @@ def _render_recon_report_tool_guidance(
     return (
         'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
         f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
-        ' and capture the `finding_id` from the response. Then attach typed citations:\n'
+        ' and capture the `finding_id` from the response.'
+        # Names the two canonical keys for EVERY stage (Stage 3 sees only this
+        # block), and stops there: the vocabulary rule and the actionable
+        # set-them-here instruction live in FINDING_PROVENANCE_VOCABULARY_RULE /
+        # render_finding_provenance_section, which Stage 1 and Stage 2 also get.
+        # Keep this clause free of a hand-written recon-report call example — the
+        # examples around it are GENERATED from live signatures (task-2559), and
+        # test_recon_report_guidance_drift.py fails any call opener in an
+        # assembled prompt that omits `run_id=`.
+        ' When that finding\'s provenance is persisted on a task, the canonical'
+        f' metadata keys are `metadata.{FINDING_ID_METADATA_KEY}` for the'
+        ' `finding_id` captured verbatim above, and'
+        f' `metadata.{FINDING_MEMORY_IDS_METADATA_KEY}` for the memory ids that'
+        ' finding cites. Then attach typed citations:\n'
         f'- `{cite_entity_call}` —'
         ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
         f'- `{cite_edge_call}` —'

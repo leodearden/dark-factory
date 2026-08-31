@@ -8,16 +8,19 @@ raw-YAML-vs-model pass.  These tests pin the pure census engine.
 """
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 from click.testing import CliRunner
 
+import orchestrator.config
 from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     ConfigIgnoredKey,
+    ConfigKeyCensus,
     ConfigKeyCensusConfig,
     ConfigUnknownKey,
     OrchestratorConfig,
@@ -539,3 +542,272 @@ def test_config_key_census_ignore_is_green_tier():
     not in RELOADABLE_FIELDS, apply_reload would report restart_required and
     that remediation line would be a lie."""
     assert 'config_key_census.ignore' in RELOADABLE_FIELDS
+
+
+# --- (j) unparseable / unreadable config → parse_error sentinel ----------------
+#
+# The census is fail-open BY DESIGN for its non-CLI consumers: a file it cannot
+# read or parse yields empty key lists rather than raising, because load_config
+# surfaces parse errors loudly on its own path.  But an empty census then has two
+# utterly different causes — "parsed, nothing unknown" and "nothing was parsed at
+# all" — and check-config, which deliberately bypasses load_config, could not tell
+# them apart and printed the affirmative `OK:` for a config it never inspected.
+# `parse_error` is the third view that separates the two, WITHOUT changing what
+# `unknown`/`ignored` mean for anyone already reading them.
+
+_MALFORMED_YAML = 'git:\n  remote: origin\n bad_indent: [1,\n'
+# Bytes no UTF-8 decoder will accept (0xff is never a valid start byte).
+_NON_UTF8_BYTES = b'git:\n  remote: \xff\xfe origin\n'
+
+
+def test_malformed_yaml_sets_parse_error(tmp_path):
+    """Unparseable YAML must not read as a clean census — but must not raise."""
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+
+    census = census_config_keys(p)  # must NOT raise — fail-open is preserved
+
+    assert isinstance(census.parse_error, str) and census.parse_error, (
+        'expected a non-empty parse_error sentinel for malformed YAML, '
+        f'got {census.parse_error!r}'
+    )
+    # INV-2 structured-facts-at-failure: the operator gets the facts, not just a
+    # refusal — which file, and the underlying yaml diagnostic (MarkedYAMLError
+    # renders file/line/column).
+    assert str(p) in census.parse_error
+    assert 'line' in census.parse_error
+    # ...and the fail-open half is bit-for-bit intact.
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+def test_directory_path_sets_parse_error(tmp_path):
+    """A directory is reachable through --config (click.Path defaults to
+    dir_okay=True), and open() raises IsADirectoryError — an OSError."""
+    census = census_config_keys(tmp_path)
+    assert census.parse_error is not None
+    assert str(tmp_path) in census.parse_error
+    assert census.unknown == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses file permissions')
+def test_unreadable_file_sets_parse_error(tmp_path):
+    """An existing-but-unreadable file (the ORCH_CONFIG_PATH route's only guard
+    is exists()) raises PermissionError — also an OSError."""
+    p = _write_yaml(tmp_path, {'max_concurrent_tasks': 3}, name='locked.yaml')
+    p.chmod(0o000)
+    try:
+        census = census_config_keys(p)
+        assert census.parse_error is not None
+        assert str(p) in census.parse_error
+        assert census.unknown == []
+    finally:
+        p.chmod(0o644)  # so tmp_path teardown cannot fail
+
+
+def test_non_utf8_file_sets_parse_error(tmp_path):
+    """The subtlest "cannot be read at all" shape: the decode happens LAZILY
+    inside ``yaml.safe_load(f)``'s read, not in ``open()``, and the resulting
+    UnicodeDecodeError is a ValueError — neither an OSError nor a yaml.YAMLError.
+    Unless the read guard names it, it is the one unreadable file that escapes
+    both handlers and propagates out of a function contracted never to raise."""
+    p = tmp_path / 'latin1.yaml'
+    p.write_bytes(_NON_UTF8_BYTES)
+
+    census = census_config_keys(p)  # must NOT raise
+
+    assert census.parse_error is not None
+    assert str(p) in census.parse_error
+    assert census.unknown == []
+    assert census.ignored == []
+    # ...and the fail-open wrapper stays fail-open for this shape too.
+    assert census_unknown_config_keys(p) == []
+
+
+@pytest.mark.parametrize(
+    'body, kind',
+    [('- a\n- b\n', 'list'), ('hello\n', 'str')],
+    ids=['top-level-list', 'bare-scalar'],
+)
+def test_non_mapping_document_sets_parse_error(tmp_path, body, kind):
+    """A document that PARSES but is not a mapping cannot be a config at all, so
+    it must not read as clean either — the census walked nothing."""
+    p = tmp_path / 'notamapping.yaml'
+    p.write_text(body)
+
+    census = census_config_keys(p)
+
+    assert census.parse_error is not None
+    assert 'mapping' in census.parse_error
+    assert kind in census.parse_error
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+@pytest.mark.parametrize(
+    'body', ['', '# nothing here\n'], ids=['empty', 'comments-only']
+)
+def test_empty_document_is_clean_not_a_parse_error(tmp_path, body):
+    """DELIBERATE non-regression boundary: an EMPTY (or comments-only) project
+    YAML legitimately means "use all defaults" — pydantic-settings loads it
+    without complaint — so it is a genuinely CLEAN census, not a parse failure."""
+    p = tmp_path / 'empty.yaml'
+    p.write_text(body)
+
+    census = census_config_keys(p)
+
+    assert census.parse_error is None
+    assert census.unknown == []
+    assert census.ignored == []
+
+
+def test_clean_config_has_no_parse_error(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'max_concurrent_tasks': 3, 'git': {'remote': 'origin'}},
+        name='config.yaml',
+    )
+    census = census_config_keys(p)
+    assert census.parse_error is None
+    assert census.unknown == []
+
+
+def test_census_stays_fail_open_for_non_cli_consumers(tmp_path):
+    """INV-5: the public wrapper's signature and fail-open semantics are
+    UNCHANGED.  Its non-CLI callers (load_config's stash, the born-at-L2) must
+    keep seeing an empty list — not an exception — for a file that cannot be
+    parsed, because load_config raises its own loud, marked parse error."""
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+    assert census_unknown_config_keys(p) == []
+
+
+# --- (k) check-config fails CLOSED on a config it could not inspect -----------
+#
+# The single load-bearing regression claim in every one of these is
+# `'OK:' not in result.output`.  That affirmative string is what an operator
+# reads before a restart (OPERATIONS.md §6a: "Verify with check-config first"),
+# and it must never appear for a file that was not parsed at all.
+
+
+def test_check_config_malformed_yaml_exits_nonzero(tmp_path):
+    p = tmp_path / 'broken.yaml'
+    p.write_text(_MALFORMED_YAML)
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(p) in result.output
+    assert 'Error' in result.output
+    assert 'YAML' in result.output
+    # Errors go to stderr so a script's stdout capture cannot mistake the
+    # diagnostic for a report.  `result.output` is the COMBINED stream under
+    # click 8.3, so the positive on stderr alone would still pass if the
+    # diagnostic were ALSO echoed to stdout — the negative on the stdout-only
+    # view is what actually pins the split.
+    assert 'Error' in result.stderr
+    assert result.stdout == '', f'diagnostic leaked to stdout: {result.stdout!r}'
+
+
+def test_check_config_directory_path_exits_nonzero(tmp_path):
+    """click.Path(exists=True) defaults to dir_okay=True, so a directory sails
+    past the option's own guard and only open() rejects it."""
+    result = CliRunner().invoke(main, ['check-config', '--config', str(tmp_path)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(tmp_path) in result.output
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses file permissions')
+def test_check_config_unreadable_via_env_path_exits_nonzero(tmp_path, monkeypatch):
+    """The ORCH_CONFIG_PATH route's only guard is exists(), so an unreadable
+    file reaches the census with nothing in between."""
+    p = _write_yaml(tmp_path, {'max_concurrent_tasks': 3}, name='locked.yaml')
+    p.chmod(0o000)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    try:
+        result = CliRunner().invoke(main, ['check-config'])
+
+        assert result.exit_code == 1, result.output
+        assert 'OK:' not in result.output
+        assert str(p) in result.output
+    finally:
+        p.chmod(0o644)  # so tmp_path teardown cannot fail
+
+
+def test_check_config_non_mapping_document_exits_nonzero(tmp_path):
+    p = tmp_path / 'list.yaml'
+    p.write_text('- a\n- b\n')
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert 'mapping' in result.output
+
+
+def test_check_config_empty_file_still_exits_zero(tmp_path):
+    """DELIBERATE non-regression boundary: an empty project YAML means "all
+    defaults" and is a real, valid operator configuration — it must stay clean."""
+    p = tmp_path / 'empty.yaml'
+    p.write_text('')
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert 'OK:' in result.output
+
+
+def test_check_config_non_utf8_file_exits_nonzero(tmp_path):
+    """A file whose bytes are not valid UTF-8 is unreadable in the same
+    operator-visible sense as a permission-denied one, and must produce the same
+    structured diagnostic — not a Python traceback."""
+    p = tmp_path / 'latin1.yaml'
+    p.write_bytes(_NON_UTF8_BYTES)
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert str(p) in result.output
+    assert 'Error' in result.output
+    assert 'Traceback' not in result.output
+
+
+def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path, monkeypatch):
+    """The parse_error guard must return BEFORE the informational block — an
+    ORDERING claim, which needs a fixture that can actually violate it.
+
+    A real unparseable file returns ``ignored=[]`` by construction, so the
+    existing ``if census.ignored:`` guard would skip the block even with the
+    early exit deleted: such a fixture pins nothing beyond what the sibling
+    malformed-YAML test already covers.  Forcing the otherwise-unreachable
+    combination of a parse_error AND a populated ``ignored`` list is what makes
+    the ordering observable.  With nothing parsed, listing keys as "excused from
+    the census" would tell an operator the file WAS inspected and found to hold
+    deliberately-excused keys — the same false reassurance as the `OK:`.
+    """
+    p = tmp_path / 'broken_with_x.yaml'
+    p.write_text('x_custom: 1\ngit:\n  remote: origin\n bad_indent: [1,\n')
+
+    # check_config imports census_config_keys from orchestrator.config INSIDE
+    # the function body, so the lookup happens at call time and patching the
+    # module attribute takes effect.
+    monkeypatch.setattr(
+        orchestrator.config,
+        'census_config_keys',
+        lambda _path: ConfigKeyCensus(
+            [],
+            [ConfigIgnoredKey('x_custom', 'reserved_prefix')],
+            f'invalid YAML in {p}: mapping values are not allowed here',
+        ),
+    )
+
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+    assert result.exit_code == 1, result.output
+    assert 'OK:' not in result.output
+    assert 'excused from the census' not in result.output
+    assert 'x_custom' not in result.output

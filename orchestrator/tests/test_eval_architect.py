@@ -4096,10 +4096,18 @@ class TestArchitectEvalCapPatience:
 
         from orchestrator.evals import runner
 
-        # An eval campaign is a bounded, queue-blocking job, so it takes the
-        # house 30-min bound rather than the 14-day patient-AFK default a
-        # per-task implementer legitimately inherits.
-        assert 1800 <= runner._EVAL_CAP_WAIT_SANITY_SECS <= 3600
+        # An eval campaign takes its OWN bound, not the 14-day patient-AFK
+        # default a per-task implementer legitimately inherits.
+        #
+        # The floor was 1800 s until 2026-08-25 (esc-3634-1), when it was raised
+        # to 48 h. A short bound never bought what it claimed: a fully-capped
+        # pool parks in the gate's own unbounded `_open.wait()` whatever this
+        # value is, so the bound only chose how many in-flight cells were
+        # tainted first — and tainting throws away mid-cell spend that
+        # `--resume` would otherwise carry across the account switch. The floor
+        # asserted here is the 5-hour account cap the bound must be able to
+        # skate, with margin; the ceiling is still the 14-day default.
+        assert runner._EVAL_CAP_WAIT_SANITY_SECS >= 6 * 3600
         assert runner._EVAL_CAP_WAIT_SANITY_SECS < _DEFAULT_CAP_WAIT_SANITY_SECS
 
         # …and it actually REACHES the wrapper. A constant that is defined but

@@ -2701,6 +2701,103 @@ def test_section_12_reports_the_install_did_not_take_on_drift(
 
 
 # ---------------------------------------------------------------------------
+# The shared `_parity_verdict` classifier
+# ---------------------------------------------------------------------------
+#
+# The five gate blocks each answered the same two questions by hand: is the
+# checker's own tag in what it printed, and what did its exit status mean.
+# setup-host.sh answers them ONCE, in a bash helper, and each site keeps its own
+# wording and severity. This is the behavioural table for that helper.
+#
+# Sliced and run rather than read as text: the classification is the thing under
+# test, and a `[[ ]]` pattern that reads correctly can still match wrongly.
+
+_VERDICT_START = "_parity_verdict() {"
+_VERDICT_END = "\n}\n"
+
+_VERDICT_TAG = "[dashboard_unit_parity]"
+
+# The two real exit-2 imposters, verbatim in shape. Both carry BRACKETED
+# lookalikes -- argparse's flag spellings, python3's errno -- which is why they
+# are inputs here and not merely in the per-site tests: a classifier that
+# matched brackets loosely would hand the gate a verdict the checker never gave.
+_ARGPARSE_IMPOSTER = (
+    "usage: check_dashboard_unit_parity.py [-h] [--repo-root REPO_ROOT] [--fix]\n"
+    "check_dashboard_unit_parity.py: error: unrecognized arguments: --bogus"
+)
+_MISSING_SCRIPT_IMPOSTER = (
+    "python3: can't open file '/repo/scripts/check_dashboard_unit_parity.py': "
+    "[Errno 2] No such file or directory"
+)
+
+_TAGGED_REPORT = f"{_VERDICT_TAG} [ok] units match the committed copies"
+
+
+@pytest.mark.parametrize(
+    "out,status,expected",
+    [
+        # Tagged: the checker RAN and its status is a verdict about the host.
+        (_TAGGED_REPORT, 0, "parity"),
+        (_TAGGED_REPORT, 2, "absent"),
+        (_TAGGED_REPORT, 1, "finding"),
+        # Any other status is still a finding, never silently benign: 127 is
+        # `command not found` and 3 is a status no checker documents, and both
+        # mean something happened that the caller must not wave through.
+        (_TAGGED_REPORT, 127, "finding"),
+        (_TAGGED_REPORT, 3, "finding"),
+        # UNTAGGED — the load-bearing half. A status the checker never produced
+        # must not be classifiable as a verdict about the host, and that holds
+        # for EVERY status including the two that would otherwise read benign.
+        ("", 0, "unreported"),
+        ("", 1, "unreported"),
+        ("", 2, "unreported"),
+        ("[ok] parity — all required directives present.", 0, "unreported"),
+        (_ARGPARSE_IMPOSTER, 2, "unreported"),
+        (_MISSING_SCRIPT_IMPOSTER, 2, "unreported"),
+    ],
+    ids=[
+        "tagged-0-parity", "tagged-2-absent", "tagged-1-finding",
+        "tagged-127-finding", "tagged-3-finding",
+        "untagged-empty-0", "untagged-empty-1", "untagged-empty-2",
+        "untagged-legacy-marker-0",
+        "imposter-argparse-2", "imposter-missing-script-2",
+    ],
+)
+def test_parity_verdict_classifies(
+    tmp_path: pathlib.Path, out: str, status: int, expected: str
+):
+    """One classifier, four tokens: unreported | parity | absent | finding.
+
+    `unreported` outranks the status entirely — a checker whose tag is absent
+    did not report, so nothing it exited with says anything about this host.
+    Only after the tag is seen does the status get read.
+
+    The helper is sliced explicitly rather than relied on from the shared
+    preamble, so this test names its own subject and would still fail loudly if
+    the preamble stopped carrying it.
+    """
+    section = slice_section(_VERDICT_START, _VERDICT_END) + (
+        f'_parity_verdict "$OUT" "$STATUS" {_VERDICT_TAG!r}\n'
+    )
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    result = run_section(
+        tmp_path,
+        section,
+        repo_root=repo,
+        unit_dir=tmp_path / "units",
+        env_extra={"OUT": out, "STATUS": str(status)},
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.stdout.strip() == expected, (
+        f"out={out!r} status={status} -> {result.stdout.strip()!r}, "
+        f"expected {expected!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Structural sweep: no parity-checker call site may branch on a bare status
 # ---------------------------------------------------------------------------
 #
@@ -2937,3 +3034,173 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
             f"strength of an exit status the checker never produced.\n{out}\n"
             f"---\n{block}"
         )
+
+
+# ---------------------------------------------------------------------------
+# One shape at every site
+# ---------------------------------------------------------------------------
+#
+# The behavioural table above proves the classifier is RIGHT; these prove it is
+# the only classifier anyone uses. That is a separate claim, and the one a
+# half-refactor breaks: extracting the helper while leaving three sites on the
+# hand-rolled chain leaves the codebase with two shapes for one rule, so every
+# later sweep has to bless both and the next author has to guess which is
+# canonical. Task 3557 named that outcome as the reason it declined to extract
+# the helper at all rather than extract it halfway.
+#
+# Structural on purpose, unlike the behavioural sweep below it. Running a block
+# cannot see the difference between a site that called the helper and a site
+# that inlined an identical copy of it — both produce the correct verdict today
+# and only one of them stays correct when the helper changes.
+
+
+# A definition of the helper, in either of bash's two spellings.
+_DEFINITION_RE = re.compile(r"(?:function\s+)?_parity_verdict\s*(?:\(\s*\))?\s*\{")
+
+
+def test_the_verdict_helper_is_defined_exactly_once():
+    """One definition, or the sites do not share a classifier at all.
+
+    A second copy — a `_parity_verdict()` redefined lower in the file, or a
+    per-section variant — would silently win for every site below it under
+    bash's last-definition-wins rule, which is precisely the two-shapes state
+    the extraction exists to remove. The behavioural table slices the FIRST
+    definition, so a divergent second copy would not show up there.
+
+    Counted after `lstrip()`, and allowing the `function` keyword: an INDENTED
+    redefinition — inside an `if` block above the last three sites, say — is
+    still in the one shared scope and still wins for everything below it.
+    Measured: anchoring at column 0 kept the suite green with exactly such a
+    copy in place.
+    """
+    text = setup_host_text()
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
+    ]
+
+    assert len(definitions) == 1, (
+        f"`_parity_verdict` is defined {len(definitions)} times in "
+        f"setup-host.sh (lines {definitions}). Under bash's "
+        "last-definition-wins rule a second copy silently takes over every "
+        "call site below it, so the five gates would stop sharing one "
+        "classifier while every test here still passed."
+    )
+
+
+def test_the_verdict_helper_precedes_every_call_site():
+    """Defined above the first site, because bash resolves a function at CALL time.
+
+    A definition placed after a call site is not a style problem: the site runs
+    `_parity_verdict: command not found`, and under `set -e` that ABORTS the
+    installer at that line (measured: `set -euo pipefail; v="$(missing_fn a)"`
+    exits 127). Bring-up dies partway through, mid-section, with whatever the
+    earlier sections already wrote to the host left in place. The five sites
+    share one shell scope, so ONE position satisfies all of them.
+    """
+    text = setup_host_text()
+    definitions = [
+        lineno
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith("#")
+        and _DEFINITION_RE.match(line.lstrip())
+    ]
+    assert definitions, (
+        "`_parity_verdict` is not defined anywhere in setup-host.sh, so every "
+        "call site below would abort the installer with `command not found`."
+    )
+    definition = definitions[0]
+    first_site = min(lineno for lineno, _, _ in _parity_call_sites())
+
+    assert definition < first_site, (
+        f"`_parity_verdict` is defined at setup-host.sh:{definition}, BELOW "
+        f"the first parity call site at line {first_site}. Bash resolves a "
+        "function when the call runs, so that site would invoke a name that "
+        "does not exist yet."
+    )
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_routes_through_the_shared_verdict_helper(
+    lineno: int, checker: str, block: str
+):
+    """Every site classifies through `_parity_verdict`, none by hand.
+
+    Collected from the sweep, so a sixth site added tomorrow is held to this
+    rule without anyone remembering to add it here.
+
+    Matched as a CALL, not as a substring. `"_parity_verdict" in block` is
+    vacuous here and was measured so: every site declares a
+    `_<gate>_parity_verdict` variable, and each of those names CONTAINS
+    `_parity_verdict`, so the declaration alone satisfies a substring test
+    while the site classifies by hand underneath. Comments are stripped for
+    the same reason — a site whose only mention of the helper is a comment
+    saying it should use one is exactly the state this forbids.
+    """
+    code = "\n".join(
+        line for line in block.splitlines() if not line.lstrip().startswith("#")
+    )
+    called = re.search(r"(?:^|[\s;&|(`]|\$\()_parity_verdict\b", code, re.MULTILINE)
+
+    assert called is not None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) never "
+        "CALLS `_parity_verdict` (a `_<gate>_parity_verdict` variable name "
+        "does not count). It is classifying the checker's output by hand, "
+        "which is the two-shapes-for-one-rule state the shared helper exists "
+        f"to remove.\n{block}"
+    )
+
+
+# A bare status read, e.g. `[ "$_fm_parity_exit" -eq 2 ]`. Matched on the
+# VARIABLE, not on the operator alone: `_orch_install_blocked` and the verdict
+# token comparisons are legitimate arithmetic/string tests in these same
+# blocks, and forbidding the operators outright would forbid those too.
+#
+# Every way bash can interrogate that variable, not just `-eq`. An earlier
+# version matched `-eq` only, and `[ "$_x_parity_exit" = 2 ]`, `-ne`, a `case`
+# over the status and an arithmetic `(( ))` all walked past it — a guard whose
+# docstring claims the status is read in exactly one place has to mean every
+# spelling of "read", or the site just picks another one.
+#
+# `==?` deliberately carries no trailing `\b`: a word boundary after `=` never
+# matches, which silently empties that alternative while the test keeps
+# passing. The interrogation forms are the two that do not spell the variable
+# with a leading `$`.
+_BARE_STATUS_READ_RE = re.compile(
+    r"case\s+\"?\$\{?_\w*parity_exit\}?\"?"           # case "$_x_parity_exit" in
+    r"|\(\(\s*[^)\n]*_\w*parity_exit\b"               # (( _x_parity_exit == 2 ))
+    r"|\$\{?_\w*parity_exit\}?\"?\s*(?:-(?:eq|ne|gt|lt|ge|le)\b|==?)"
+)
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_no_parity_call_site_branches_on_a_bare_exit_status(
+    lineno: int, checker: str, block: str
+):
+    """The exit status is read ONCE, inside the helper, never at a site.
+
+    This is the half-refactor guard with teeth: a site could call
+    `_parity_verdict` for its logging and still branch on `-eq 2` underneath,
+    which reads as converted and behaves as it always did. The status is still
+    captured and still PASSED to the helper — that is the interface — it just
+    may not be interpreted here.
+    """
+    bare = _BARE_STATUS_READ_RE.search(block)
+
+    assert bare is None, (
+        f"The parity call site at setup-host.sh:{lineno} ({checker}) still "
+        f"branches on its raw exit status ({bare.group(0)!r} at offset "
+        f"{bare.start()}). Exit 2 is overloaded three ways, so interpreting "
+        "the status anywhere but inside `_parity_verdict` re-creates the "
+        f"defect the helper centralises.\n{block}"
+    )

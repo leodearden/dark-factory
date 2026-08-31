@@ -41,6 +41,7 @@ finally the end-to-end pin through ``run_scoped_verification``'s fallback branch
 """
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,6 +57,7 @@ from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
     module_level_marker_names,
+    per_item_marker_names,
     resolve_marker_expression,
 )
 from orchestrator.verify import run_scoped_verification
@@ -304,6 +306,318 @@ class TestModuleLevelMarkerNames:
 
 
 # ---------------------------------------------------------------------------
+# per_item_marker_names (step-1: RED)
+# ---------------------------------------------------------------------------
+
+#: The real shape at tests/scripts/test_pump_web_ui_installed_unit_parity.py:
+#: 187-223, condensed — validated by AST against the live file before any
+#: assertion here was written.  Both top-level tests carry
+#: ``@pytest.mark.integration``; the second also carries a ``skipif``.
+_ALL_DECORATED_SOURCE = """\
+import shutil
+
+import pytest
+
+SYSTEMCTL_SKIP_REASON = 'systemctl unavailable'
+
+
+@pytest.mark.integration
+def test_installed_unit_file_restart_backoff_effective() -> None:
+    pass
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which('systemctl') is None, reason=SYSTEMCTL_SKIP_REASON)
+def test_installed_unit_manager_restart_steps_effective() -> None:
+    pass
+"""
+
+#: The real shape at tests/scripts/test_know_live_installed_unit_parity.py:
+#: 122-459, condensed to one representative of each kind found there: a
+#: leading private helper (contributes nothing), an integration-decorated
+#: test, a parametrize-only test, and a bare undecorated test — validated by
+#: AST against the live file before any assertion here was written.
+_MIXED_DECORATED_SOURCE = """\
+import pytest
+
+
+def _argv_from_exec_start_show(exec_start_value: str) -> str | None:
+    return None
+
+
+@pytest.mark.integration
+def test_installed_unit_file_restart_backoff_effective() -> None:
+    pass
+
+
+@pytest.mark.parametrize('exec_start_value', ['a'])
+def test_config_arg_from_exec_start_returns_value_or_none(exec_start_value) -> None:
+    pass
+
+
+def test_argv_from_exec_start_show_extracts_argv_segment() -> None:
+    pass
+"""
+
+
+class TestPerItemMarkerNames:
+    """``per_item_marker_names(source) -> tuple[frozenset[str], ...] | None``.
+
+    THE SECOND, ADDITIVE PROOF TIER: one guaranteed (lower-bound) marker set
+    per top-level test item — ``module_level_marker_names(source)`` unioned
+    with that item's own ``pytest.mark.NAME`` decorators — but ONLY when this
+    walk can see every item pytest would collect from *source*.  Refuses
+    (returns None) whenever that is not provable; see the refusal cases in the
+    ``-- refusals --`` sub-section below (step-3) for the enumeration
+    guarantee this tier depends on.  A parsed module with zero top-level test
+    functions yields ``()``, distinct from the None refusal, and still
+    refused downstream by the caller.
+    """
+
+    def test_all_decorated_real_shape_yields_one_set_per_item_in_source_order(self):
+        """tests/scripts/test_pump_web_ui_installed_unit_parity.py — the acceptance case.
+
+        Both items are individually proven deselected by ``not integration``;
+        this is the shape that returns rc=5 today (task 4459's defect).
+        """
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE) == (
+            frozenset({'integration'}),
+            frozenset({'integration', 'skipif'}),
+        )
+
+    def test_mixed_real_shape_yields_one_set_per_test_function_only(self):
+        """tests/scripts/test_know_live_installed_unit_parity.py — the control.
+
+        The leading helper contributes nothing, and the bare test's set is
+        EMPTY — so the tuple carries no all-quantified proof and widening
+        must not fire on this shape.
+        """
+        assert per_item_marker_names(_MIXED_DECORATED_SOURCE) == (
+            frozenset({'integration'}),
+            frozenset({'parametrize'}),
+            frozenset(),
+        )
+
+    def test_module_level_pytestmark_is_unioned_into_every_items_set(self):
+        """The two tiers compose rather than compete."""
+        source = (
+            'import pytest\n\n'
+            'pytestmark = pytest.mark.slow\n\n\n'
+            '@pytest.mark.integration\n'
+            'def test_a():\n    pass\n\n\n'
+            'def test_b():\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (
+            frozenset({'slow', 'integration'}),
+            frozenset({'slow'}),
+        )
+
+    def test_zero_top_level_test_functions_yields_empty_tuple_not_none(self):
+        """Distinct from the None refusal; the caller still refuses this downstream."""
+        assert per_item_marker_names('import pytest\n\n\ndef helper():\n    pass\n') == ()
+
+    def test_item_hood_is_name_startswith_test_including_async(self):
+        """A name is an item iff it starts with ``test``; ``async def`` counts too."""
+        source = (
+            'def test_a():\n    pass\n\n\n'
+            'def testfoo():\n    pass\n\n\n'
+            'def _test_helper():\n    pass\n\n\n'
+            'def check_test():\n    pass\n\n\n'
+            'def setup_module():\n    pass\n\n\n'
+            'async def test_async_thing():\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (frozenset(), frozenset(), frozenset())
+
+    def test_non_marker_decorator_contributes_nothing_and_does_not_suppress_siblings(self):
+        source = (
+            'from unittest import mock\n\n\n'
+            "@mock.patch('os.getenv')\n"
+            '@pytest.mark.slow\n'
+            '@some_alias\n'
+            'def test_a(mock_getenv):\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (frozenset({'slow'}),)
+
+    # -- cost bound: exactly one parse per call --------------------------------
+
+    def test_does_not_re_parse_source_to_derive_the_module_level_union(self, monkeypatch):
+        """One ``ast.parse`` per call, not two.
+
+        Before this pin, deriving the module-level markers to union into each
+        item re-parsed *source* a second time via
+        ``module_level_marker_names(source)`` — wholly redundant, since this
+        function already holds a parsed tree.  Combined with the caller's own
+        primary-tier parse in ``deselecting_expression_for_targets``, a
+        fallback target used to cost THREE parses; this pins it down to two.
+        """
+        calls: list[None] = []
+        original_parse = ast.parse
+
+        def counting_parse(*args, **kwargs):
+            calls.append(None)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(ast, 'parse', counting_parse)
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE) is not None
+        assert len(calls) == 1
+
+    # -- never raises ----------------------------------------------------------
+
+    def test_none_source_is_none(self):
+        assert per_item_marker_names(None) is None
+
+    def test_syntax_error_is_none_not_a_raise(self):
+        assert per_item_marker_names('def broken(:\n') is None
+
+    # -- refusals: shapes whose items this walk cannot exhaustively see -------
+    #
+    # Every fixture carries at least one FULLY-decorated top-level
+    # `@pytest.mark.slow def test_a`, so a refusal can never pass vacuously:
+    # if the guard under test stopped firing, the function would return a
+    # non-None, all-proven `(frozenset({'slow'}), ...)` tuple instead.
+
+    def test_refuses_on_a_top_level_test_class(self):
+        """A test class is an item shape this tier does not model."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'class TestThing:\n'
+            '    @pytest.mark.slow\n'
+            '    def test_method(self):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_refuses_on_a_class_nested_below_tree_body(self):
+        """Pins that the class scan uses ``ast.walk``, not ``tree.body``."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'if True:\n'
+            '    class TestThing:\n'
+            '        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_refuses_on_a_non_test_prefixed_helper_class_too(self):
+        """DELIBERATE OVER-REFUSAL: any class refuses, not only ``Test*``-named ones.
+
+        Pytest's default ``python_classes = Test*`` would not actually
+        collect ``_Case`` as a test class, but this tier refuses on class
+        SHAPE rather than class NAME — see the enumeration-guarantee
+        docstring's over-refusal note.
+        """
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            'class _Case:\n    pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'import_line',
+        [
+            'from helpers import TestBase',
+            'import helpers as TestAlias',
+            'from helpers import Base as TestBase',
+            'from helpers import test_shared_case',
+            'import helpers as test_alias',
+            'from helpers import shared_case as test_alias',
+        ],
+    )
+    def test_refuses_when_an_import_binds_a_name_starting_with_test(self, import_line):
+        """An imported ``Test*``/``test_*`` name is collected in THIS module (case-insensitive).
+
+        Pytest's default ``python_functions = test*`` collects an imported
+        lowercase ``test_*`` FUNCTION exactly as ``python_classes = Test*``
+        collects an imported ``Test*`` class; ``asname`` wins either way.
+        """
+        source = f'{import_line}\n\n\n@pytest.mark.slow\ndef test_a():\n    pass\n'
+        assert per_item_marker_names(source) is None
+
+    def test_asname_that_does_not_start_with_test_does_not_refuse_on_that_ground_alone(self):
+        """The reverse of the parametrized case above: aliasing a ``Test*`` name AWAY."""
+        source = (
+            'from helpers import TestBase as _base\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
+    @pytest.mark.parametrize(
+        'assignment_line',
+        [
+            'test_generated = _make_case()',
+            'test_generated: object = _make_case()',
+        ],
+    )
+    def test_refuses_on_a_top_level_assignment_that_binds_a_test_prefixed_name(
+        self, assignment_line,
+    ):
+        """Pytest's default ``python_functions = test*`` collects a module
+        attribute so named however it was bound — a plain ``Assign`` or an
+        ``AnnAssign``, not only a ``def`` — and this walk cannot tell
+        statically whether ``_make_case()`` returns a callable.
+        """
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{assignment_line}\n'
+        assert per_item_marker_names(source) is None
+
+    def test_a_local_test_prefixed_assignment_inside_a_function_does_not_refuse(self):
+        """Only a TOP-LEVEL binding is pytest-collectible; a local variable is not."""
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n'
+            '    test_local = 1\n'
+            '    assert test_local == 1\n'
+        )
+        assert per_item_marker_names(source) is not None
+
+    def test_refuses_on_a_star_import(self):
+        """Bound names from ``from x import *`` are statically unknowable."""
+        source = (
+            'from helpers import *\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_refuses_when_a_test_function_is_nested_below_tree_body(self):
+        """THE UNSOUNDNESS THIS GUARD CLOSES.
+
+        An undecorated, still-SELECTED sibling hiding below ``tree.body``
+        would otherwise be invisible to the walk, and the module would
+        falsely widen.
+        """
+        source = (
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n\n\n'
+            "if sys.platform == 'linux':\n"
+            '    def test_b():\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'hook_source',
+        [
+            'def pytest_collection_modifyitems(config, items):\n    pass\n',
+            'def pytest_generate_tests(metafunc):\n    pass\n',
+        ],
+    )
+    def test_refuses_on_a_top_level_pytest_hook(self, hook_source):
+        """A hook can add items this walk never sees."""
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{hook_source}'
+        assert per_item_marker_names(source) is None
+
+    def test_an_ordinary_helper_import_does_not_refuse(self):
+        """The real shape both target modules use — the ``Test*`` guard must not be over-broad."""
+        source = (
+            'from systemd_unit_invariants import require_installed_unit\n\n\n'
+            '@pytest.mark.slow\n'
+            'def test_a():\n    pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
+
+# ---------------------------------------------------------------------------
 # expression_definitely_deselects (step-5: RED)
 # ---------------------------------------------------------------------------
 
@@ -407,6 +721,19 @@ _WARM_LANE_PYPROJECT = _pyproject(f'"{_REAL_ADDOPTS}"')
 _MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\n\ndef test_x():\n    pass\n'  # noqa: E501
 _UNMARKED_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
 
+#: The repo ROOT's real addopts, verbatim from pyproject.toml:66 — the config
+#: `_marker_deselecting_expression` actually reads for `tests/scripts` (no
+#: `--directory`, so the effective rootdir is the repo root, not the prefix).
+_ROOT_ADDOPTS = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
+_ROOT_PYPROJECT = _pyproject(f'"{_ROOT_ADDOPTS}"')
+
+#: `_ALL_DECORATED_SOURCE` (defined above, next to `TestPerItemMarkerNames`)
+#: plus a top-level test class — pins that the enumeration guarantee reaches
+#: this composed entry point, not just `per_item_marker_names` in isolation.
+_ALL_DECORATED_SOURCE_WITH_CLASS = _ALL_DECORATED_SOURCE + (
+    '\n\nclass TestThing:\n    def test_method(self):\n        pass\n'
+)
+
 
 class _RecordingReader:
     """A dict-backed ``read_source`` that RECORDS every path it is asked for.
@@ -494,6 +821,61 @@ class TestDeselectingExpressionForTargets:
             'uv run pytest tests/ -m warm_lane_bash',
             read,
         ) is None
+
+    # -- the second (per-item) proof tier, consulted as a fallback -----------
+
+    def test_all_decorated_target_widens_under_the_real_root_addopts(self):
+        """THE ACCEPTANCE CASE — the shape that returns rc=5 today (task 4459)."""
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) == 'not smoke and not integration and not warm_lane_bash'
+
+    def test_mixed_decorated_target_is_refused(self):
+        """One undecorated sibling is enough to refuse — the know_live property survives."""
+        read = _RecordingReader({'a/test_a.py': _MIXED_DECORATED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_one_mixed_target_among_all_decorated_targets_is_refused(self):
+        """ALL, not ANY — across targets, not only within a single one."""
+        read = _RecordingReader({
+            'a/test_a.py': _ALL_DECORATED_SOURCE,
+            'a/test_b.py': _MIXED_DECORATED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_all_decorated_source_with_a_test_class_is_refused(self):
+        """The enumeration guarantee reaches this composed entry point, not just the collector."""
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE_WITH_CLASS})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_module_level_tier_still_decides_on_its_own(self):
+        """UNCHANGED CONTROL: the primary tier is untouched by the new fallback tier."""
+        read_marked = _RecordingReader({'a/test_a.py': _MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read_marked,
+        ) == 'not warm_lane_bash'
+        read_unmarked = _RecordingReader({'a/test_b.py': _UNMARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_b.py'], _WARM_LANE_PYPROJECT, None, read_unmarked,
+        ) is None
+
+    def test_second_tier_does_not_double_the_per_target_reads(self):
+        """THE COST BOUND — adding a second proof tier must not double per-target reads."""
+        read = _RecordingReader({
+            'a/test_a.py': _ALL_DECORATED_SOURCE,
+            'a/test_b.py': _ALL_DECORATED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _ROOT_PYPROJECT, None, read,
+        ) == 'not smoke and not integration and not warm_lane_bash'
+        assert read.paths == ['a/test_a.py', 'a/test_b.py']
 
 
 # ---------------------------------------------------------------------------
@@ -1444,3 +1826,66 @@ class TestRunScopedVerificationWidensTheFallback:
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == ('tests/test_smoke.py',)
+
+
+class TestTestsScriptsAllIntegrationDecoratedRealConfigRegression:
+    """The task-4459 incident golden, driven against the REAL repo files.
+
+    Never hand-seeded: the root addopts, the target file's per-function
+    decorators and the ModuleConfig's commands are all read from disk, same
+    discipline as ``TestWarmLaneBashRealConfigRegression`` above.  Before this
+    task, ``uv run --project shared pytest
+    tests/scripts/test_pump_web_ui_installed_unit_parity.py`` collected 2
+    items / 2 deselected / 0 selected and exited rc=5 — a false RED on a diff
+    that touched only that (real, passing) file, because every item there is
+    marked by its own ``@pytest.mark.integration`` decorator rather than a
+    module-level ``pytestmark``.
+    """
+
+    _TARGET = 'tests/scripts/test_pump_web_ui_installed_unit_parity.py'
+
+    #: Non-vacuity guards run FIRST: the golden below must never be able to
+    #: pass because its premise evaporated (the deselection moved, or the
+    #: target file stopped being fully per-function-decorated).
+    def test_real_root_addopts_still_deselect_integration(self):
+        expr = resolve_marker_expression((REPO_ROOT / 'pyproject.toml').read_text(), None)
+        assert expr is not None, 'root addopts no longer carry a -m expression'
+        assert 'integration' in expr
+
+    def test_real_target_file_is_still_fully_decorated_with_integration(self):
+        source = (REPO_ROOT / self._TARGET).read_text()
+        items = per_item_marker_names(source)
+        assert items is not None, 'the file grew a shape this tier can no longer enumerate'
+        assert items, 'the file lost its top-level test functions'
+        assert all('integration' in item for item in items)
+
+    @staticmethod
+    def _real_module_config() -> ModuleConfig:
+        """A ModuleConfig whose commands come VERBATIM from tests/scripts/orchestrator.yaml."""
+        loaded = yaml.safe_load((REPO_ROOT / 'tests/scripts/orchestrator.yaml').read_text())
+        return ModuleConfig(
+            prefix='tests/scripts',
+            test_command=loaded['test_command'],
+            lint_command=loaded['lint_command'],
+            type_check_command=loaded['type_check_command'],
+        )
+
+    @staticmethod
+    def _read(path: str) -> str | None:
+        try:
+            return (REPO_ROOT / path).read_text()
+        except OSError:
+            return None
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_touching_only_the_all_decorated_file_widens_to_the_full_suite(self, role):
+        """Before this task, BOTH roles planned a zero-collecting FILE_SCOPED run (rc=5)."""
+        mc = self._real_module_config()
+        plan = derive_verify_plan([self._TARGET], [mc], None, self._read, role=role)
+        run = _run_for(plan, 'tests/scripts', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scoped_targets == ()
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'not smoke and not integration and not warm_lane_bash' in run.reason

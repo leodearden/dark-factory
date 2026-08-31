@@ -360,18 +360,28 @@ class TestFallbackIsDerivedFromTheSameRenderer:
             'recon_report server — update _AGENT_CALLED_REPORT_TOOLS above and '
             '_FROZEN_RECON_REPORT_SIGNATURE_SPECS in reconciliation/prompts/__init__.py.'
         )
-        # start_report is harness-called; delete_finding and
-        # write_entity_standing_decision are registered on the live server but
+        # start_report is harness-called; delete_finding,
+        # write_entity_standing_decision and repair_memory_citation are
+        # registered on the live server but
         # are never rendered by render_recon_report_tool_guidance() either (see
         # plan.json's design decision on tool scope — verified empirically
         # against get_recon_report_tool_signatures() at amendment time: these
-        # 3 plus the 9 in _AGENT_CALLED_REPORT_TOOLS are the complete live set).
+        # 4 plus the 9 in _AGENT_CALLED_REPORT_TOOLS are the complete live set).
         # Any OTHER live tool is therefore a newly-registered agent-called tool
         # the guidance would silently omit.
+        #
+        # repair_memory_citation (task 3065) is documented on the
+        # RECON_REPORT_INSTRUCTIONS surface alongside delete_finding rather than
+        # in the generated stage guidance: it is an exceptional, evidence-gated
+        # cross-run repair, not part of the routine file-a-finding loop, and
+        # Stage 3 is denied it outright. That exclusion is asserted positively by
+        # tests/server/test_recon_report_citation_repair.py::
+        # test_generated_stage_guidance_excludes_the_repair_tool.
         not_agent_guidance_tools = {
             'start_report',
             'delete_finding',
             'write_entity_standing_decision',
+            'repair_memory_citation',
         }
         undeclared = set(sigs) - not_agent_guidance_tools - set(_AGENT_CALLED_REPORT_TOOLS)
         assert not undeclared, (

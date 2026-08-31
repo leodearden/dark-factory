@@ -844,6 +844,17 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         ``suggestions`` is the pre-filtered in-scope list (already restricted
         to files inside ``locked_modules``). ``locked_modules`` is listed in
         the prompt so the agent can self-check scope before editing.
+
+        The Scope Discipline block must stay true at EVERY ``lock_depth`` this
+        orchestrator dispatches under, because one prompt string serves every
+        project. Its original wording ("creating new files inside them is
+        allowed") was authored against a package-shaped depth, where a module
+        was a directory a new file could sit inside. At a file-granular depth
+        the entries above ARE single files, so "inside them" is unsatisfiable
+        and a created path is necessarily outside the list — which is expected
+        and is not a scope violation (esc-3147-7, ruled 2026-08-24: act, then
+        auto-widen). Phrase the rules around the EDIT/CREATE distinction, which
+        holds at any depth, never around containment in a "module".
         """
         effective_tid = task_id or plan.get('task_id')
         if context is None:
@@ -909,12 +920,16 @@ This task holds locks for the following modules:
 
 {modules_list}
 
-1. Work ONLY inside these locked modules. Creating new files inside them is
-   allowed; editing files outside them is NOT.
+1. Do NOT edit an existing file that is not covered above. CREATING a new
+   file IS allowed, and is the right move when a suggestion calls for one
+   (say, extracting a shared test helper): a path that did not exist cannot
+   collide with another task's concurrent edits. Where the entries above are
+   themselves single files, a new file is necessarily outside that list —
+   that is expected, and not something to escalate.
 2. Do NOT modify the plan — it is durable at
    `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
    `.task/plan.json` is a symlink into it) and frozen for this pass.
-3. If a suggestion requires touching a file outside the locked modules,
+3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable

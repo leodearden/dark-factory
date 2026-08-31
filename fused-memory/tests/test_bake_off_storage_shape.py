@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import re
 import types
 from collections.abc import Container
 from pathlib import Path
@@ -43,6 +44,7 @@ REGISTRY_PATH = FIXTURES_DIR / 'memory_eval_topic_registry.json'
 ARM_CLAIMS_PATH = FIXTURES_DIR / 'e2_arm_claims.jsonl'
 QUERY_SET_PATH = FIXTURES_DIR / 'e2_query_set.jsonl'
 DISTRACTOR_SLAB_PATH = FIXTURES_DIR / 'e2_distractor_slab.jsonl'
+REGROWTH_INJECTION_PATH = FIXTURES_DIR / 'e2_regrowth_injection.jsonl'
 
 
 def _load_module() -> types.ModuleType:
@@ -339,6 +341,538 @@ class TestDefaultFixturePaths:
         # Nothing was copied alongside it, so a default that "exists" here
         # would mean it is pointing back at the original tree.
         assert not any(default.exists() for default in defaults)
+
+
+# ===========================================================================
+# 4012 step-1 — the regrowth-injection fixture's loader and cross-validation
+# ===========================================================================
+#
+# The +1-re-emission probe's own fixture: exactly one near-duplicate per
+# topic, re-emitting that topic's canonical claim.  Contract paths read the
+# COMMITTED fixture; error paths build tiny synthetic JSONL in tmp_path.
+# Pure — no network, no Qdrant, no key.
+
+
+def _injection_row(**overrides) -> dict:
+    """One well-formed injection row, before whatever the test breaks."""
+    row = {
+        'injection_id': 'topic-a-regrowth-01',
+        'topic': 'topic-a',
+        'cluster_id': 'cluster-a',
+        'reemits_claim_id': 'topic-a-01',
+        'text': 'a restatement of the canonical claim in different words',
+    }
+    row.update(overrides)
+    return row
+
+
+def _write_injections(path: Path, rows: list[dict]) -> Path:
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    return path
+
+
+def _synthetic_claims(mod, *rows: dict) -> list:
+    """Hand-built `ArmClaim`s, so cross-validation has an exact expectation."""
+    return [
+        mod.ArmClaim(
+            claim_id=r['claim_id'],
+            cluster_id=r['cluster_id'],
+            topic=r['topic'],
+            text=r.get('text', 'body'),
+            source_memory_id=r.get('source_memory_id', 'm'),
+            canonical=bool(r.get('canonical', False)),
+            b_arm_role=r.get('b_arm_role', 'canonical' if r.get('canonical') else 'sighting'),
+            contested=bool(r.get('contested', False)),
+        )
+        for r in rows
+    ]
+
+
+class TestLoadRegrowthInjections:
+    """`load_regrowth_injections` parses the probe's own fixture strictly."""
+
+    def test_the_committed_fixture_loads_one_injection_per_topic(self):
+        injections = _mod().load_regrowth_injections(REGROWTH_INJECTION_PATH)
+
+        assert len(injections) == 20
+        assert len({i.injection_id for i in injections}) == 20
+        for injection in injections:
+            assert injection.injection_id
+            assert injection.topic
+            assert injection.cluster_id
+            assert injection.reemits_claim_id
+            assert injection.text
+
+    def test_the_default_path_is_package_relative_and_committed(self):
+        mod = _mod()
+
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH == REGROWTH_INJECTION_PATH
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH.exists()
+
+    def test_the_default_path_follows_a_relocated_script(self, tmp_path):
+        """Package-relative, not resolved against the checkout cwd.
+
+        The same lesson `TestDefaultFixturePaths` pins for the five original
+        fixtures: a path baked in at author time works only from the tree it
+        was written in.
+        """
+        import importlib.util  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        (tmp_path / 'scripts').mkdir()
+        relocated = tmp_path / 'scripts' / SCRIPT_PATH.name
+        shutil.copy2(SCRIPT_PATH, relocated)
+
+        name = 'relocated_regrowth_bake_off'
+        spec = importlib.util.spec_from_file_location(name, relocated)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+            default = module.DEFAULT_REGROWTH_INJECTION_PATH
+        finally:
+            sys.modules.pop(name, None)
+
+        assert default.is_absolute()
+        assert default.is_relative_to(tmp_path)
+        assert not default.exists()
+
+    def test_a_duplicate_injection_id_names_the_path_line_and_id(self, tmp_path):
+        path = _write_injections(tmp_path / 'inj.jsonl', [
+            _injection_row(),
+            _injection_row(topic='topic-b', cluster_id='cluster-b'),
+        ])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        message = str(excinfo.value)
+        assert 'inj.jsonl' in message
+        assert ':2:' in message
+        assert 'topic-a-regrowth-01' in message
+
+    @pytest.mark.parametrize('field', ['topic', 'cluster_id', 'reemits_claim_id', 'text'])
+    def test_a_missing_field_names_the_path_line_and_field(self, tmp_path, field):
+        row = _injection_row()
+        row.pop(field)
+        path = _write_injections(tmp_path / 'inj.jsonl', [row])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        message = str(excinfo.value)
+        assert 'inj.jsonl' in message
+        assert ':1:' in message
+        assert field in message
+
+    def test_a_missing_injection_id_is_reported_by_name(self, tmp_path):
+        row = _injection_row()
+        row.pop('injection_id')
+        path = _write_injections(tmp_path / 'inj.jsonl', [row])
+
+        with pytest.raises(_mod().FixtureError) as excinfo:
+            _mod().load_regrowth_injections(path)
+
+        assert 'injection_id' in str(excinfo.value)
+
+
+class TestCrossValidateRegrowthInjections:
+    """The injections must AGREE with the claims fixture, not merely parse."""
+
+    def test_the_committed_fixtures_cross_validate(self):
+        mod = _mod()
+        claims = mod.load_arm_claims(ARM_CLAIMS_PATH)
+        injections = mod.load_regrowth_injections(REGROWTH_INJECTION_PATH)
+
+        mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        per_topic: dict[str, int] = {}
+        for injection in injections:
+            per_topic[injection.topic] = per_topic.get(injection.topic, 0) + 1
+        assert set(per_topic) == {c.topic for c in claims}
+        assert set(per_topic.values()) == {1}, (
+            'the "+1" in the probe name is exactly one re-emission per topic'
+        )
+
+    def test_a_topic_with_no_injection_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+            {'claim_id': 'topic-b-01', 'cluster_id': 'cluster-b', 'topic': 'topic-b',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row())]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-b' in message
+        assert _mod()._FIXTURE_DOCS in message
+
+    def test_two_injections_on_one_topic_are_a_fixture_defect(self):
+        """The quantity IS the experiment: 2 is a defect, not a bigger probe."""
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [
+            mod.RegrowthInjection(**_injection_row()),
+            mod.RegrowthInjection(**_injection_row(injection_id='topic-a-regrowth-02')),
+        ]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-a' in message
+        assert '2' in message
+
+    def test_a_cluster_id_disagreeing_with_the_claims_fixture_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(cluster_id='cluster-wrong'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'cluster-wrong' in message
+        assert 'cluster-a' in message
+
+    def test_an_unknown_topic_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [
+            mod.RegrowthInjection(**_injection_row()),
+            mod.RegrowthInjection(**_injection_row(
+                injection_id='ghost-regrowth-01', topic='ghost',
+                cluster_id='cluster-ghost', reemits_claim_id='ghost-01')),
+        ]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        assert 'ghost' in str(excinfo.value)
+
+    def test_a_reemitted_claim_that_does_not_exist_is_named(self):
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(reemits_claim_id='topic-a-99'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        assert 'topic-a-99' in str(excinfo.value)
+
+    def test_reemitting_a_non_canonical_claim_is_named(self):
+        """The re-emission must name the TRUE canonical, never a peer.
+
+        `claim_ids = [reemits_claim_id]` is what credits the injection with
+        realizing the claim it restates; pointing it at a non-canonical peer
+        would make the probe measure something other than regrowth of the
+        canonical.
+        """
+        mod = _mod()
+        claims = _synthetic_claims(
+            mod,
+            {'claim_id': 'topic-a-01', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': True},
+            {'claim_id': 'topic-a-02', 'cluster_id': 'cluster-a', 'topic': 'topic-a',
+             'canonical': False},
+        )
+        injections = [mod.RegrowthInjection(**_injection_row(reemits_claim_id='topic-a-02'))]
+
+        with pytest.raises(mod.FixtureError) as excinfo:
+            mod.cross_validate_regrowth_injections(injections=injections, claims=claims)
+
+        message = str(excinfo.value)
+        assert 'topic-a-02' in message
+        assert 'canonical' in message
+
+    def test_no_injected_body_is_byte_identical_to_the_claim_it_reemits(self):
+        """A copy would make the probe measure deduplication, not regrowth.
+
+        Inequality ONLY.  No similarity threshold is asserted anywhere — a
+        bound on how alike a re-emission may be would be a guess dressed as
+        a finding (gate G6); the fixture README reports the ratios instead.
+        """
+        mod = _mod()
+        claims = {c.claim_id: c for c in mod.load_arm_claims(ARM_CLAIMS_PATH)}
+
+        for injection in mod.load_regrowth_injections(REGROWTH_INJECTION_PATH):
+            assert injection.text != claims[injection.reemits_claim_id].text
+
+
+# ===========================================================================
+# 4012 step-3 — the injected corpus, per mode, and the TRUE-canonical invariant
+# ===========================================================================
+#
+# The probe materialises the ratified `c_peers` write shape twice more, once
+# per injection mode, with exactly one extra near-duplicate per topic.  The
+# invariant tests below are the task's "scored by TRUE canonical id per
+# 3560's correction, never by an aliased record id" requirement made
+# mechanical.  Pure — built over the committed fixtures, no embedding.
+
+
+@functools.cache
+def _injections() -> tuple:
+    return tuple(_mod().load_regrowth_injections(REGROWTH_INJECTION_PATH))
+
+
+@functools.cache
+def _regrowth_records(mode: str) -> tuple:
+    mod = _mod()
+    return tuple(mod.materialize_regrowth_injections(
+        list(_injections()),
+        _committed_inputs()['claims'],
+        _committed_inputs()['clusters'],
+        mode,
+    ))
+
+
+@functools.cache
+def _regrowth_arm(mode: str) -> tuple:
+    """`c_peers` + the injections for `mode`, in corpus order."""
+    mod = _mod()
+    return tuple(mod.regrowth_corpus(
+        list(_arm('c_peers')),
+        list(_injections()),
+        _committed_inputs()['claims'],
+        _committed_inputs()['clusters'],
+        mode=mode,
+    ))
+
+
+def _indexed(records):
+    """Returns the module's `SeededArm`; unannotated so its attributes stay
+    reachable — the dynamic `_mod()` import makes the type `Any`, and naming
+    it `object` here instead hid every field behind an attribute error."""
+    mod = _mod()
+    return mod._index_arm(
+        'c_peers', 'p', 'c', list(records), _committed_inputs()['claims'],
+    )
+
+
+class TestRegrowthModesArePinned:
+
+    def test_modes_are_pinned_by_equality_unstamped_first(self):
+        """Pinned, not derived — the convention `ARM_SHAPES`/`QUERY_KINDS` set.
+
+        `unstamped` leads because it is the case that models reality today:
+        esc-3200-3 measured exactly one topic-stamped record for the topic
+        whose re-emissions it was reading, so every organic re-emission
+        arrived with no topic key.  A reader who stops after the first row
+        has then read the real-world case, not the best case.
+        """
+        assert _mod().REGROWTH_MODES == ('unstamped', 'stamped')
+
+    def test_the_regrowth_role_is_distinct_from_every_other_role(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_ROLE == 'regrowth'
+        assert mod.REGROWTH_ROLE not in (mod.DISTRACTOR_ROLE, mod.GROUPED_ROLE)
+
+
+class TestMaterializeRegrowthInjections:
+    """One `ArmRecord` per injection, carrying exactly what a re-emission would."""
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_one_record_per_injection_in_fixture_order(self, mode):
+        records = _regrowth_records(mode)
+        injections = _injections()
+
+        assert len(records) == len(injections)
+        for record, injection in zip(records, injections, strict=True):
+            assert record.content == injection.text
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_record_ids_are_derived_dashed_uuid5s_distinct_from_the_base_arm(self, mode):
+        mod = _mod()
+        base_ids = {r.record_id for r in _arm('c_peers')}
+
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            expected = mod._derive_record_id(f'regrowth:{mode}', injection.injection_id)
+            assert record.record_id == expected
+            assert len(record.record_id) == 36 and record.record_id.count('-') == 4
+            assert record.record_id not in base_ids
+
+    def test_the_two_modes_derive_disjoint_record_ids(self):
+        unstamped = {r.record_id for r in _regrowth_records('unstamped')}
+        stamped = {r.record_id for r in _regrowth_records('stamped')}
+
+        assert not (unstamped & stamped)
+
+    def test_unstamped_carries_no_topic_key_at_all(self):
+        """`'topic' not in metadata` — NOT `metadata.get('topic') is None`.
+
+        A present-but-None topic key is a different write than no key, and
+        the pin's firing rule reads presence.  The unstamped mode models a
+        re-emission that never carried the vocabulary at all.
+        """
+        for record in _regrowth_records('unstamped'):
+            assert 'topic' not in record.metadata
+
+    def test_stamped_carries_its_injections_topic(self):
+        for record, injection in zip(_regrowth_records('stamped'), _injections(), strict=True):
+            assert record.metadata['topic'] == injection.topic
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    @pytest.mark.parametrize('key', ['canonical', 'parent_id', 'contested', 'kind'])
+    def test_neither_mode_writes_a_key_a_reemission_would_not_carry(self, mode, key):
+        for record in _regrowth_records(mode):
+            assert key not in record.metadata
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_category_matches_the_reemitted_claims_own_category(self, mode):
+        mod = _mod()
+        categories = mod._claim_categories(
+            _committed_inputs()['clusters'], _committed_inputs()['claims'],
+        )
+
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            assert record.metadata['category'] == categories[injection.reemits_claim_id]
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_bookkeeping_credits_the_reemitted_claim_and_its_cluster(self, mode):
+        for record, injection in zip(_regrowth_records(mode), _injections(), strict=True):
+            assert record.claim_ids == [injection.reemits_claim_id]
+            assert record.cluster_id == injection.cluster_id
+            assert record.role == _mod().REGROWTH_ROLE
+
+    def test_an_unknown_mode_names_the_modes_it_knows(self):
+        mod = _mod()
+
+        with pytest.raises(ValueError, match='REGROWTH_MODES|unstamped') as excinfo:
+            mod.materialize_regrowth_injections(
+                list(_injections()),
+                _committed_inputs()['claims'],
+                _committed_inputs()['clusters'],
+                'topic_stamped_and_pinned',
+            )
+
+        assert 'topic_stamped_and_pinned' in str(excinfo.value)
+
+
+class TestRegrowthCorpus:
+    """The injections go LAST, and the base list is never mutated."""
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_base_records_come_first_in_order_and_injections_are_appended(self, mode):
+        base = list(_arm('c_peers'))
+        corpus = list(_regrowth_arm(mode))
+
+        assert corpus[:len(base)] == base
+        assert corpus[len(base):] == list(_regrowth_records(mode))
+        assert len(corpus) == len(base) + len(_injections())
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_the_base_list_is_not_mutated(self, mode):
+        mod = _mod()
+        base = list(_arm('c_peers'))
+        before = len(base)
+
+        mod.regrowth_corpus(
+            base, list(_injections()), _committed_inputs()['claims'],
+            _committed_inputs()['clusters'], mode=mode,
+        )
+
+        assert len(base) == before
+
+
+class TestRegrowthPreservesTheTrueCanonical:
+    """The invariant the whole probe's credibility rests on.
+
+    `canonical_record_ids` is FIRST-MATCH-WINS over the record list, and the
+    injection deliberately carries the canonical's claim id.  Prepending it
+    would silently rename each cluster's canonical to the re-emission, and
+    every discoverability number in the block would then be scored against
+    the duplicate — the aliasing failure 3560 had to disclose after the fact
+    for `b_grouped`, and the one the task names as the thing to avoid.
+    """
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_canonical_by_cluster_is_byte_identical_to_the_uninjected_arm(self, mode):
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert injected.canonical_by_cluster == base.canonical_by_cluster
+        injected_ids = {r.record_id for r in _regrowth_records(mode)}
+        assert not (set(injected.canonical_by_cluster.values()) & injected_ids)
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_canonical_by_topic_is_byte_identical_and_does_not_raise(self, mode):
+        """A stamped injection carrying `canonical: True` would raise here.
+
+        `build_canonical_by_topic` refuses two canonicals on a topic, so this
+        pins that the materializer never writes the key.
+        """
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert list(injected.canonical_by_topic) == list(base.canonical_by_topic)
+        for topic, record in base.canonical_by_topic.items():
+            assert injected.canonical_by_topic[topic].record_id == record.record_id
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_contested_ids_are_unchanged(self, mode):
+        """An injection must not inherit contested-ness from what it re-emits.
+
+        `contested` has no writer in the live system, so a re-emission that
+        acquired it would be modelling something that cannot happen.
+        """
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        assert injected.contested_ids == base.contested_ids
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_records_by_id_gains_exactly_the_injections_and_displaces_nothing(self, mode):
+        base = _indexed(_arm('c_peers'))
+        injected = _indexed(_regrowth_arm(mode))
+
+        added = set(injected.records_by_id) - set(base.records_by_id)
+        assert added == {r.record_id for r in _regrowth_records(mode)}
+        assert len(injected.records_by_id) == len(base.records_by_id) + len(_injections())
+        for record_id, record in base.records_by_id.items():
+            assert injected.records_by_id[record_id] is record
+
+    @pytest.mark.parametrize('mode', ['unstamped', 'stamped'])
+    def test_the_injection_joins_its_clusters_sibling_set(self, mode):
+        injected = _indexed(_regrowth_arm(mode))
+
+        for record in _regrowth_records(mode):
+            assert record.record_id in injected.siblings_by_cluster[record.cluster_id]
+
+
+class TestRegrowthCorpusFingerprintsAreDistinct:
+    """The fetch cache must never replay one pass's rankings as another's."""
+
+    def test_each_injected_corpus_differs_from_the_baseline_and_from_the_other(self):
+        mod = _mod()
+        base = mod.corpus_fingerprint(list(_arm('c_peers')))
+        unstamped = mod.corpus_fingerprint(list(_regrowth_arm('unstamped')))
+        stamped = mod.corpus_fingerprint(list(_regrowth_arm('stamped')))
+
+        assert len({base, unstamped, stamped}) == 3
 
 
 # ===========================================================================
@@ -3894,6 +4428,16 @@ def _install_driver_doubles(
 #: doubles would spend seconds proving nothing extra.
 _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'utest'}
 
+#: The same run with the +1-re-emission probe OFF, for the assertions below
+#: whose subject IS the six-arm pipeline's shape — "three collections", "one
+#: fetch per arm", "this exact teardown set".  Those stay pinned to three
+#: because that is what they are about; the probed counterparts live in
+#: `TestRunBakeOffRegrowthWiring`, which owns the two injected passes.  The
+#: assertions that are about a SEAM rather than a count (the queue repoint,
+#: the api-key clear, the seeding bound, the serial fetch) deliberately keep
+#: the probe on, so they cover its passes too.
+_SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
+
 
 class TestEphemeralCollectionIdentity:
     """A collection nobody can reap is a leak, so its NAME is a contract."""
@@ -4027,7 +4571,7 @@ class TestRunBakeOffWiring:
         mod = _mod()
         _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = await mod.run_bake_off(**_SIX_ARM_RUN)
 
         service = _FakeMemoryService.instances[-1]
         assert len(_FakeMemoryService.instances) == 1
@@ -4197,7 +4741,10 @@ class TestRunBakeOffWiring:
         await mod.run_bake_off(**_SMALL_RUN)
 
         instances = _FakeMemoryService.instances[-1].mem0.instances
-        assert len(instances) == 3
+        # Every seeded project, the two INJECTED passes included: they go
+        # through the same `seed_arm`, so an unstubbed instance there is the
+        # same contended write, in a collection nobody was watching.
+        assert len(instances) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         for instance in instances.values():
             assert instance.db.add_history is not _FakeInstance._SENTINEL
             assert instance.db.add_history('anything', keyword=1) is None
@@ -4218,7 +4765,12 @@ class TestRunBakeOffWiring:
         for project_id, content in added:
             by_project.setdefault(project_id, set()).add(content)
 
-        assert len(by_project) == 3
+        # Including the two injected passes: `regrowth_corpus` is the ratified
+        # arm's records PLUS the re-emissions, so a pass that lost the slab
+        # would be ranking against a thinner field than its own baseline —
+        # and the delta would report the missing contamination, not the
+        # re-emission.
+        assert len(by_project) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         for contents in by_project.values():
             assert slab_contents <= contents
 
@@ -4320,7 +4872,13 @@ class TestRunBakeOffWiring:
         searches = _FakeMemoryService.instances[-1].mem0.searches
         issued = [(project_id, query) for project_id, query, _ in searches]
         assert len(issued) == len(set(issued))          # no query issued twice
-        assert len({project_id for project_id, _ in issued}) == 3
+        # One project per seeded corpus, the two injected passes included:
+        # the probe's THREE read arms are scored off one fetch each for the
+        # same reason the pin variants are — three ANN draws would make the
+        # read-arm comparison uncontrolled and triple its cost.
+        assert len({project_id for project_id, _ in issued}) == (
+            len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
+        )
 
     async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
         self, monkeypatch,
@@ -4381,7 +4939,10 @@ class TestRunBakeOffWiring:
         monkeypatch.setattr(mod, 'fetch_arm', _capture)
         await mod.run_bake_off(**_SMALL_RUN)
 
-        assert len(captured) == len(mod.ARM_SHAPES)  # the probe path ran per arm
+        # Per seeded corpus, injected passes included: those carry the same
+        # `status_quo`-free flat peers, but the drop is provenance-based and
+        # has to hold for a corpus the arm loop never built.
+        assert len(captured) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         # status_quo stores the alpha record verbatim under its own memory_id,
         # so this is the arm where a self-hit is even possible.  Checked
         # per-cluster: another cluster's probe record is a legitimate hit.
@@ -4398,7 +4959,7 @@ class TestRunBakeOffWiring:
         drops = _install_driver_doubles(monkeypatch)
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
-        await mod.run_bake_off(**_SMALL_RUN)
+        await mod.run_bake_off(**_SIX_ARM_RUN)
 
         assert len(drops.calls) == 2
         assert set(drops.calls[0]) == expected
@@ -4414,7 +4975,7 @@ class TestRunBakeOffWiring:
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
         with pytest.raises(RuntimeError, match='qdrant went away'):
-            await mod.run_bake_off(**_SMALL_RUN)
+            await mod.run_bake_off(**_SIX_ARM_RUN)
 
         assert set(drops.calls[-1]) == expected
         assert _FakeMemoryService.instances[-1].closed is True
@@ -4430,12 +4991,482 @@ class TestRunBakeOffWiring:
         report = await mod.run_bake_off(**_SMALL_RUN)
 
         assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
-        assert set(report) == {'schema_version', 'protocol', 'arms', 'audit_recall'}
+        assert set(report) == {
+            'schema_version', 'protocol', 'arms', 'audit_recall',
+            # v3: always present, an explicit None when the probe did not run.
+            'regrowth',
+        }
         for arm in mod.ARM_VARIANTS:
             for metric in mod._REQUIRED_ARM_METRICS:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+
+# ===========================================================================
+# step-13 — the probe's driver, CLI, cache and teardown wiring
+# ===========================================================================
+#
+# Everything the regrowth block needs that is NOT arithmetic: two more
+# ephemeral collections that the SAME teardown has to reach, two more fetch
+# passes the cache has to be able to describe and refuse when stale, and a
+# CLI switch whose default is "probe".
+#
+# The failure this section exists to catch is a leak, not a wrong number.  A
+# probe that seeds an injected corpus into a collection the `finally` does
+# not name leaves a live collection behind on every run, and the report it
+# returns looks perfect.
+#
+# Pins NO metric value (G6).
+
+
+def _regrowth_collection_names(mod, *, suffix: str) -> set[str]:
+    """The two injected passes' collections, derived exactly as the driver must."""
+    return set(mod.ephemeral_collections(
+        shapes=tuple(mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES),
+        suffix=suffix,
+    ).values())
+
+
+class TestRegrowthPassKey:
+    """The pass key names a COLLECTION, so it is a reapability contract."""
+
+    def test_each_mode_gets_its_own_key_and_none_collides_with_an_arm(self):
+        mod = _mod()
+
+        keys = [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES]
+
+        assert len(set(keys)) == len(mod.REGROWTH_MODES)
+        assert set(keys).isdisjoint(mod.ARM_SHAPES)
+
+    def test_the_key_survives_scopes_canonicalization_unchanged(self):
+        """`arm_project_id` interpolates this into a project id that `Scope`
+        lowercases and `-`->`_`s.  A key that canonicalized DIFFERENTLY would
+        name a collection under one spelling and be swept under another —
+        i.e. a collection the teardown cannot find, which is the leak."""
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        mod = _mod()
+
+        for mode in mod.REGROWTH_MODES:
+            key = mod.regrowth_pass_key(mode)
+            assert key == key.lower()
+            assert '-' not in key and '@' not in key
+            project_id = mod.arm_project_id(key, suffix='utest')
+            assert Scope(project_id=project_id).project_id == project_id
+
+    def test_the_key_names_the_mode_it_measures(self):
+        """Two collections whose names do not say which mode they hold make
+        a leaked one unattributable in the reaper's output."""
+        mod = _mod()
+
+        for mode in mod.REGROWTH_MODES:
+            assert mode in mod.regrowth_pass_key(mode)
+
+    def test_the_two_pass_collections_are_distinct_and_disjoint_from_the_arms(self):
+        mod = _mod()
+        arms = set(mod.ephemeral_collections(suffix='utest').values())
+
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        assert len(passes) == len(mod.REGROWTH_MODES)
+        assert passes.isdisjoint(arms)
+        prefix = mod.load_cleanup_script().E2_BAKEOFF_PREFIX
+        for name in passes:
+            # Under the reapable prefix or the sweep never finds it, which is
+            # the same leak the arm collections' identity test guards.
+            assert name.startswith(prefix)
+
+
+@pytest.mark.asyncio
+class TestRunBakeOffRegrowthWiring:
+    """The probe's effect on the world, measured through the same doubles."""
+
+    async def test_the_default_run_seeds_both_injected_passes(self, monkeypatch):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        seeded_projects = set(_FakeMemoryService.instances[-1].mem0._stored)
+        assert seeded_projects == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        } | {
+            mod.arm_project_id(mod.regrowth_pass_key(mode), suffix='utest')
+            for mode in mod.REGROWTH_MODES
+        }
+
+    async def test_the_default_run_returns_a_complete_regrowth_block(
+        self, monkeypatch,
+    ):
+        """Complete, not merely present: `_check_regrowth` is the gate, and
+        this asserts the DRIVER hands it something that passes."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        regrowth = report['regrowth']
+        assert regrowth is not None
+        assert regrowth['shape'] == mod.REGROWTH_SHAPE
+        assert list(regrowth['modes']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['read_arms']) == list(mod.REGROWTH_READ_ARMS)
+        for mode in mod.REGROWTH_MODES:
+            for arm in mod.REGROWTH_READ_ARMS:
+                assert set(regrowth['after'][mode][arm]) == set(
+                    mod._regrowth_metric_keys()
+                )
+                assert set(regrowth['deltas'][mode][arm]) == set(
+                    mod._regrowth_metric_keys()
+                )
+
+    async def test_the_probe_respects_the_cluster_subset(self, monkeypatch):
+        """`--clusters N` has to filter the injections too, or a smoke run
+        injects re-emissions for topics whose claims it never seeded — and
+        cross-validation, which runs over the SUBSET, would reject them."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['regrowth']['topics_injected'] == 2
+        assert report['protocol']['regrowth_injections_measured'] == 2
+
+    async def test_the_probe_records_that_it_ran_in_the_protocol_block(
+        self, monkeypatch,
+    ):
+        """Same reason `clusters_measured` is there: a reader holding the
+        artifact must not have to infer the probe's coverage from whether a
+        table looks populated."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['protocol']['regrowth_probed'] is True
+        assert report['protocol']['regrowth_injections_measured'] > 0
+
+    async def test_the_injected_collections_are_dropped_before_and_after(
+        self, monkeypatch,
+    ):
+        """THE LEAK.  A probe that seeds into a collection the `finally` does
+        not name leaves it live on every run, and the report looks perfect."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        expected = set(
+            mod.ephemeral_collections(suffix='utest').values()
+        ) | _regrowth_collection_names(mod, suffix='utest')
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(drops.calls) == 2
+        assert set(drops.calls[0]) == expected
+        assert set(drops.calls[-1]) == expected
+
+    async def test_the_injected_collections_are_dropped_when_a_query_raises(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch, search_raises_on=2)
+        expected = set(
+            mod.ephemeral_collections(suffix='utest').values()
+        ) | _regrowth_collection_names(mod, suffix='utest')
+
+        with pytest.raises(RuntimeError, match='qdrant went away'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert set(drops.calls[-1]) == expected
+
+    async def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
+        self, monkeypatch,
+    ):
+        """`regrowth=False` is a real skip, not a measured-then-discarded
+        pass: it must cost no seeding, name no extra collection, and open no
+        injection fixture."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        opened: list = []
+        real_loader = mod.load_regrowth_injections
+        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: (
+            opened.append(a), real_loader(*a, **k))[1])
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        report = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+
+        assert opened == []
+        assert drops.dropped.isdisjoint(passes)
+        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        }
+        assert report['regrowth'] is None
+        assert report['protocol']['regrowth_probed'] is False
+        assert report['protocol']['regrowth_injections_measured'] == 0
+
+    async def test_a_subset_that_retains_no_injection_is_not_published_as_probed(
+        self, monkeypatch,
+    ):
+        """The live and replay paths must decide this from the SAME value.
+
+        `--clusters N` filters the injection slab, so a subset can in
+        principle retain no injected topic.  The live driver used to publish
+        `regrowth_probed: true` for that run, with a block reading
+        `topics_injected: 0, injections_per_topic: 1` — a hard-coded 1
+        describing zero topics — while `_replay_bake_off`, which builds a
+        block only when the post-subset list is non-empty, published
+        `regrowth_probed: false` and a null block for the same run.  Both
+        paths now key on the post-subset list.
+
+        The loader and its cross-validator are doubled because the case's
+        SUBJECT is the driver's predicate, not the committed fixture: the
+        real slab covers every topic by construction (the validator enforces
+        exactly one per topic over the full claim set), so the state under
+        test is unreachable through it.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: [])
+        monkeypatch.setattr(
+            mod, 'cross_validate_regrowth_injections', lambda **k: None,
+        )
+        passes = _regrowth_collection_names(mod, suffix='utest')
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['regrowth'] is None
+        assert report['protocol']['regrowth_probed'] is False
+        assert report['protocol']['regrowth_injections_measured'] == 0
+        # And nothing was seeded or reaped for a pass that measured nothing.
+        assert drops.dropped.isdisjoint(passes)
+        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        }
+
+    async def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
+        self, monkeypatch,
+    ):
+        """Provenance for a file the run never opened is a false audit trail."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        relative = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
+
+        skipped = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+        probed = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert relative not in [
+            row['path'] for row in skipped['protocol']['fixtures']
+        ]
+        assert relative in [
+            row['path'] for row in probed['protocol']['fixtures']
+        ]
+
+    async def test_the_probe_does_not_disturb_the_six_arm_rows(self, monkeypatch):
+        """The decision table is the ratified artifact; the probe rides
+        alongside it and must not move a single one of its cells."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        without = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
+        with_probe = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert with_probe['arms'] == without['arms']
+
+
+class TestRegrowthFetchCache:
+    """The two injected passes are cacheable, and refusably stale."""
+
+    def _cache_inputs(self, mod):
+        """Two hand-built pass corpora and their `SeededArm`s, keyed by pass.
+
+        Built through `_index_arm` with `seeded.shape` left at
+        `REGROWTH_SHAPE`: the pass key names the CACHE slot and the
+        collection, never the read behaviour, so `read_path` must still see
+        `c_peers`.
+        """
+        seeded, records = {}, {}
+        for mode in mod.REGROWTH_MODES:
+            key = mod.regrowth_pass_key(mode)
+            corpus = list(_regrowth_arm(mode))
+            records[key] = corpus
+            seeded[key] = mod._index_arm(
+                mod.REGROWTH_SHAPE, f'proj_{key}', f'coll_{key}',
+                corpus, _committed_inputs()['claims'],
+            )
+        return seeded, records
+
+    def _dump(self, mod, path, records, *, fixtures=None):
+        hit = mod.ScoredHit
+        arms = {
+            key: {
+                'queries': {'q1': [
+                    hit(record=corpus[0], relevance_score=0.9),
+                    hit(record=corpus[-1], relevance_score=0.5),
+                ]},
+                'probes': {},
+            }
+            for key, corpus in records.items()
+        }
+        return mod.dump_fetches(path, arms, provenance=mod.fetch_cache_provenance(
+            records_by_shape=records,
+            fixtures=list(fixtures if fixtures is not None else [
+                ALPHA_FIXTURE_PATH, REGISTRY_PATH, ARM_CLAIMS_PATH,
+                QUERY_SET_PATH, DISTRACTOR_SLAB_PATH,
+                mod.DEFAULT_REGROWTH_INJECTION_PATH,
+            ]),
+            search_limit=10, guard_threshold=0.85,
+            embedder_model='text-embedding-3-small',
+        ))
+
+    def test_a_document_carries_the_arm_keys_and_both_pass_keys(self, tmp_path):
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+
+        path = self._dump(mod, tmp_path / 'cache.json', {**arm_records, **records})
+
+        doc = json.loads(path.read_text())
+        assert set(doc['arms']) == set(mod.ARM_SHAPES) | set(records)
+        assert set(doc['provenance']['corpus_fingerprints']) == (
+            set(mod.ARM_SHAPES) | set(records)
+        )
+        loaded = mod.load_fetches(path, seeded)
+        assert set(loaded) == set(records)
+
+    def test_a_caller_asking_only_for_the_arms_still_loads(self, tmp_path):
+        """`load_fetches` iterates the CALLER's shapes, so the extra pass keys
+        are merely a wider cache.  This is what keeps 4004's committed
+        `e2_fetch_cache.json` — read by `read_transform_selection` — loadable
+        after this task widens the dump."""
+        mod = _mod()
+        _, pass_records = self._cache_inputs(mod)
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+        path = self._dump(
+            mod, tmp_path / 'cache.json', {**arm_records, **pass_records},
+        )
+        arm_seeded = {
+            shape: mod._index_arm(
+                shape, f'p_{shape}', f'c_{shape}', arm_records[shape],
+                _committed_inputs()['claims'],
+            )
+            for shape in mod.ARM_SHAPES
+        }
+
+        loaded = mod.load_fetches(path, arm_seeded)
+
+        assert set(loaded) == set(mod.ARM_SHAPES)
+
+    def test_a_pass_replayed_over_the_other_modes_corpus_is_refused_by_name(
+        self, tmp_path,
+    ):
+        """The two injected corpora differ ONLY in a metadata key, so a
+        crossed cache still loads and every ranking still joins.  The
+        fingerprint is the only thing standing between that and a stamped
+        measurement published as an unstamped one."""
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        unstamped = mod.regrowth_pass_key('unstamped')
+        stamped = mod.regrowth_pass_key('stamped')
+        # Dumped with the two corpora SWAPPED under each other's key.
+        path = self._dump(mod, tmp_path / 'cache.json', {
+            unstamped: records[stamped], stamped: records[unstamped],
+        })
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {unstamped: seeded[unstamped]})
+
+        assert unstamped in str(excinfo.value)
+
+    def _injection_fixture_copy(self, tmp_path) -> Path:
+        """A writable copy of the committed injection slab.
+
+        Copied rather than edited in place for the reason every other
+        digest-drift test in this repo copies: mutating the real fixture
+        would fail every other test in this module and leave the tree dirty.
+        """
+        target = tmp_path / REGROWTH_INJECTION_PATH.name
+        target.write_bytes(REGROWTH_INJECTION_PATH.read_bytes())
+        return target
+
+    def test_replaying_a_pass_verifies_the_injection_fixtures_digest(
+        self, tmp_path,
+    ):
+        """The corpus fingerprint cannot catch this.
+
+        It is taken over the MATERIALIZED records, and the driver decides
+        which injections exist by reading the fixture — so an edit that
+        rewrites an injection's `text` while keeping its `injection_id`
+        leaves every id intact and the cached rankings still join cleanly.
+        The digest is the only thing between that and a measurement of a
+        re-emission nobody wrote.
+        """
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        fixture = self._injection_fixture_copy(tmp_path)
+        path = self._dump(
+            mod, tmp_path / 'cache.json', records, fixtures=[fixture],
+        )
+        rows = [
+            json.loads(line)
+            for line in fixture.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ]
+        rows[0]['text'] = rows[0]['text'] + ' and something else entirely'
+        fixture.write_text(
+            '\n'.join(json.dumps(row) for row in rows) + '\n', encoding='utf-8',
+        )
+
+        # The premise, asserted rather than described: without the guard the
+        # stale cache loads clean, because nothing else in the pipeline can
+        # see the edit.
+        assert mod.load_fetches(path, seeded)
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, seeded, expect_fixtures=[fixture])
+
+        assert REGROWTH_INJECTION_PATH.name in str(excinfo.value)
+
+    def test_an_unedited_injection_slab_replays_clean(self, tmp_path):
+        """The converse, so the refusal above is not vacuously always-on."""
+        mod = _mod()
+        seeded, records = self._cache_inputs(mod)
+        fixture = self._injection_fixture_copy(tmp_path)
+        path = self._dump(
+            mod, tmp_path / 'cache.json', records, fixtures=[fixture],
+        )
+
+        loaded = mod.load_fetches(path, seeded, expect_fixtures=[fixture])
+
+        assert set(loaded) == set(records)
+
+    def test_the_five_original_fixtures_are_checked_separately_from_the_sixth(
+        self, tmp_path,
+    ):
+        """A cache dumped WITHOUT the injection digest — 4004's committed one —
+        must still satisfy a five-fixture check.  Folding the sixth into the
+        same list would make `e2_fetch_cache.json` unloadable for the E2 arms
+        and break `read_transform_selection`, which this task does not touch."""
+        mod = _mod()
+        arm_records = {shape: list(_arm(shape)) for shape in mod.ARM_SHAPES}
+        five = [ALPHA_FIXTURE_PATH, REGISTRY_PATH, ARM_CLAIMS_PATH,
+                QUERY_SET_PATH, DISTRACTOR_SLAB_PATH]
+        path = self._dump(
+            mod, tmp_path / 'cache.json', arm_records, fixtures=five,
+        )
+        arm_seeded = {
+            shape: mod._index_arm(
+                shape, f'p_{shape}', f'c_{shape}', arm_records[shape],
+                _committed_inputs()['claims'],
+            )
+            for shape in mod.ARM_SHAPES
+        }
+
+        loaded = mod.load_fetches(path, arm_seeded, expect_fixtures=five)
+
+        assert set(loaded) == set(mod.ARM_SHAPES)
+        with pytest.raises(mod.FetchCacheError):
+            mod.load_fetches(
+                path, arm_seeded,
+                expect_fixtures=[*five, mod.DEFAULT_REGROWTH_INJECTION_PATH],
+            )
 
 
 # ===========================================================================
@@ -4531,11 +5562,12 @@ def _query(query_id='q1', *, topic='t', expects=('k0',), cluster_id='c1',
 _CHARS = ('injected:chars', len)
 
 
-def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10):
+def _measure(seeded, hits, *, pin, queries=None, probes=(), limit=10, **kwargs):
     return _mod().measure_arm(
         seeded,
         {'queries': {'q1': hits}, 'probes': {'c1': hits}},
         pin=pin,
+        **kwargs,
         queries=list(queries if queries is not None else [_query()]),
         probes=list(probes),
         estimator=_CHARS,
@@ -4958,6 +5990,2007 @@ class TestGroupedReadCanonicalCreditIsDisclosed:
             'threshold', 'max_observed_score', 'probes', 'guard_covered_probes',
             'guard_covered_category',
         }
+
+
+# ===========================================================================
+# 4012 step-5 — `read_path` can select 4004's PROMOTING pin
+# ===========================================================================
+#
+# The regrowth probe's third read arm is the transform 4004's selection table
+# picked: `read_transform_selection.apply_promoting_topic_anchor`.  It is
+# reached lazily through the sibling-script loader, never reimplemented here —
+# two copies could drift, and the point of the probe is to measure the
+# transform that was actually selected.  Pure: hand-built `ScoredHit` lists
+# with exactly-known answers, no embedding.
+
+
+class TestReadPathPromote:
+
+    def test_promote_defaults_to_false_on_read_path_and_measure_arm(self):
+        """Every existing caller and test must be unchanged by this addition.
+
+        The default is asserted BEHAVIOURALLY — omitting `promote` produces
+        the same result as passing `promote=False` — rather than off
+        `inspect.signature(...).parameters['promote'].default`.  A default
+        declared in the signature and then ignored in the body satisfies the
+        introspective form while breaking every existing caller, which is the
+        property this test is actually for.
+
+        The keyword-only half stays introspective: "cannot be passed
+        positionally" is an API-surface contract with no behavioural shadow to
+        assert, and it is what stops a future positional argument from
+        silently re-pointing an existing call site.
+        """
+        import inspect  # noqa: PLC0415
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        assert mod.read_path(seeded, hits, 5, pin=True) == mod.read_path(
+            seeded, hits, 5, pin=True, promote=False,
+        )
+        assert _measure(seeded, hits, pin=True) == _measure(
+            seeded, hits, pin=True, promote=False,
+        )
+
+        for func in (mod.read_path, mod.measure_arm):
+            parameter = inspect.signature(func).parameters['promote']
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_a_full_window_promote_puts_the_canonical_first_and_keeps_k(self):
+        """A FULL window is what distinguishes the two transforms.
+
+        `read_path` truncates AFTER the transforms, so at `len(hits) == k` the
+        additive pin's appended canonical is cut straight back off and the
+        window is unchanged.  Only a promoting transform can place it inside
+        the budget.
+        """
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        window = mod.read_path(seeded, hits, 5, pin=True, promote=True)
+
+        assert len(window) == 5
+        assert window[0].record_id == 'canon'
+        assert 'canon' not in [hit.record.record_id for hit in hits]
+
+    def test_at_a_full_window_the_additive_pin_changes_nothing(self):
+        """The contrast the probe's third arm exists to measure."""
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        additive = mod.read_path(seeded, hits, 5, pin=True, promote=False)
+
+        assert [r.record_id for r in additive] == [h.record.record_id for h in hits[:5]]
+
+    def test_pin_on_promote_off_is_byte_identical_to_todays_additive_behaviour(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for k in (5, 10, 12):
+            expected = mod.apply_topic_anchor(
+                [hit.record for hit in hits[:k]], seeded.canonical_by_topic,
+            )[:k]
+            got = mod.read_path(seeded, hits, k, pin=True, promote=False)
+            assert [r.record_id for r in got] == [r.record_id for r in expected]
+
+    def test_pin_off_promote_off_is_byte_identical_to_todays_flat_behaviour(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for k in (5, 10, 12):
+            got = mod.read_path(seeded, hits, k, pin=False, promote=False)
+            assert [r.record_id for r in got] == [h.record.record_id for h in hits[:k]]
+
+    def test_promote_without_pin_raises_naming_both_keywords(self):
+        """Promotion is a variant of the pin's firing rule, not a fourth mode.
+
+        A caller asking for `promote=True, pin=False` has a bug, and a silent
+        fourth behaviour would let it reach the decision table unnoticed.
+        """
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        with pytest.raises(ValueError) as excinfo:
+            mod.read_path(seeded, hits, 5, pin=False, promote=True)
+
+        message = str(excinfo.value)
+        assert 'promote' in message
+        assert 'pin' in message
+
+    def test_the_promoting_transform_is_reached_by_a_lazy_module_load(self):
+        """A rename in the sibling must fail HERE, by name.
+
+        Without this, `apply_promoting_topic_anchor` disappearing surfaces as
+        an `AttributeError` twenty minutes into a live run, after the seeding
+        has already been paid for.
+        """
+        mod = _mod()
+
+        script = mod.load_read_transform_script()
+
+        assert hasattr(script, 'apply_promoting_topic_anchor'), (
+            'read_transform_selection.apply_promoting_topic_anchor is gone — '
+            'the regrowth probe measures the transform 4004 selected, so a '
+            'rename there is a contract break here'
+        )
+        assert callable(script.apply_promoting_topic_anchor)
+
+    def test_read_path_routes_to_the_sibling_transform_not_a_local_copy(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+        script = mod.load_read_transform_script()
+
+        expected = script.apply_promoting_topic_anchor(
+            [hit.record for hit in hits[:5]], seeded.canonical_by_topic,
+        )[:5]
+        got = mod.read_path(seeded, hits, 5, pin=True, promote=True)
+
+        assert [r.record_id for r in got] == [r.record_id for r in expected]
+
+
+class TestMeasureArmPromote:
+
+    def test_the_pin_diagnostic_is_scored_against_the_pin_off_baseline(self):
+        """NOT against a promote=True baseline.
+
+        `_window`'s counterfactual call must stay `pin=False` (and therefore
+        promote-free by construction).  If promotion leaked into the baseline,
+        the two would agree and the diagnostic would report 0.00 for an arm
+        that reorders every window.
+
+        `n=12` so that EVERY window `_window` measures is genuinely full —
+        the k=5 pair, the k=10 pair and the guard probe's GUARD_TOP_K pair.
+        At n=5 the k=10 window has headroom, the additive pin legitimately
+        fires there, and the additive rate is 1/3 rather than 0 for a reason
+        that has nothing to do with promotion leaking.
+        """
+        seeded, hits = _full_window_arm(n=12)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+        additive = _measure(seeded, hits, pin=True, promote=False, probes=[('c1', {})])
+
+        assert promoting['pin']['enabled'] is True
+        assert promoting['pin']['window_changed_rate'] == 1.0
+        # The same windows, under the additive pin, are unchanged at a full
+        # window — so the two rates cannot both be an artifact of the closure.
+        assert additive['pin']['window_changed_rate'] == 0.0
+
+    def test_a_promoting_measurement_returns_the_full_required_metric_set(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=5)
+
+        measurement = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+
+        assert set(measurement) >= set(mod._REQUIRED_ARM_METRICS)
+        for block, keys in mod._REQUIRED_ARM_METRICS.items():
+            for key in keys:
+                assert key in measurement[block], f'{block}.{key}'
+
+    def test_the_transform_blind_stored_trio_is_unmoved_by_promotion(self):
+        """`stored_*` is measured over the RAW hits, before any `read_path`.
+
+        3560's correction is exactly this: the SCORED discoverability must be
+        blind to the read transform, or the probe reports a placement property
+        as a retrieval one.
+        """
+        seeded, hits = _full_window_arm(n=5)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+        flat = _measure(seeded, hits, pin=False, probes=[('c1', {})])
+
+        for key in ('stored_canonical_in_top_5_rate', 'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            assert promoting['discoverability'][key] == flat['discoverability'][key]
+
+    def test_the_credited_column_is_the_one_promotion_moves(self):
+        """Reported BESIDE the stored one, never alone — the pair's semantics.
+
+        Promotion places the canonical inside the window, so the credited
+        rate is a PLACEMENT property under this arm, exactly the way
+        `apply_grouped_read`'s record-id aliasing was under `b_grouped`.
+        Asserted as "the two columns disagree", not as a magnitude.
+        """
+        seeded, hits = _full_window_arm(n=5)
+
+        promoting = _measure(seeded, hits, pin=True, promote=True, probes=[('c1', {})])
+
+        assert promoting['discoverability']['canonical_in_top_5_rate'] != (
+            promoting['discoverability']['stored_canonical_in_top_5_rate']
+        )
+
+
+# ===========================================================================
+# 4012 step-7 — the per-arm measurement fan-out and the delta arithmetic
+# ===========================================================================
+#
+# `measure_regrowth_arms` is fed a `SeededArm` and a hand-built `fetched`
+# dict; `regrowth_deltas` / `regrowth_stamping_value` are fed synthetic
+# measurement dicts, so every expected number below was written by the test
+# itself.  NO threshold, bound or magnitude is asserted on any MEASURED
+# quantity anywhere in this section (gate G6).
+
+
+def _plucked(**overrides) -> dict:
+    """A flat metric projection with every `REGROWTH_METRICS` key present."""
+    values = {
+        'claim_recall.at_5': 0.5,
+        'claim_recall.at_10': 0.6,
+        'discoverability.stored_canonical_in_top_5_rate': 0.7,
+        'discoverability.stored_canonical_median_rank': 3.0,
+        'discoverability.stored_canonical_found_count': 12.0,
+        'discoverability.canonical_in_top_5_rate': 0.8,
+        'tokens_per_query.mean': 100.0,
+    }
+    values.update(overrides)
+    return values
+
+
+def _arms(**per_arm) -> dict:
+    """`{arm: plucked}` for all three read arms, overridable per arm."""
+    return {
+        arm: per_arm.get(arm, _plucked())
+        for arm in _mod().REGROWTH_READ_ARMS
+    }
+
+
+class TestRegrowthReadArmsAndMetricsArePinned:
+
+    def test_the_three_read_arms_are_pinned_by_equality_in_order(self):
+        assert _mod().REGROWTH_READ_ARMS == ('flat', 'additive_pin', 'promoting_pin')
+
+    def test_the_reported_metrics_are_pinned_by_equality(self):
+        """A metric dropped from a delta table is a metric dropped from the
+        decision — asserted by equality, exactly as `DECISION_TABLE_COLUMNS`.
+
+        The credited `canonical_in_top_5_rate` travels BESIDE the stored trio
+        and never alone: `apply_promoting_topic_anchor` injects the canonical
+        into the window, so under `promoting_pin` that column is a PLACEMENT
+        property in exactly the way `apply_grouped_read`'s was under
+        `b_grouped`.  Dropping it would hide the transform's contribution;
+        printing it alone would repeat the misreading 3560 and 4004 each had
+        to correct after publication.
+        """
+        assert _mod().REGROWTH_METRICS == (
+            ('claim_recall', 'at_5'),
+            ('claim_recall', 'at_10'),
+            ('discoverability', 'stored_canonical_in_top_5_rate'),
+            ('discoverability', 'stored_canonical_median_rank'),
+            ('discoverability', 'stored_canonical_found_count'),
+            ('discoverability', 'canonical_in_top_5_rate'),
+            ('tokens_per_query', 'mean'),
+        )
+
+    def test_the_probe_is_scoped_to_the_ratified_write_shape(self):
+        """esc-3200-3 was a SPLIT ratification: C's write shape, no transform."""
+        assert _mod().REGROWTH_SHAPE == 'c_peers'
+        assert _mod().REGROWTH_SHAPE in _mod().ARM_SHAPES
+
+
+class TestTheTwoSemanticallyNamedReadArms:
+    """The prose's control arm and selected transform, addressed BY NAME.
+
+    `_regrowth_lines` used to reach the selected transform by POSITION
+    (`REGROWTH_READ_ARMS[-1]`) and the control by hard-coded literal
+    (`'flat'`, at four call sites plus a docstring).  That is the one place
+    the module departed from its own "enumerate, never infer" discipline:
+    a reorder of the tuple silently retargeted the signal sentence at a
+    different transform, and a rename of `flat` raised a `KeyError` three
+    call sites from the tuple that named it.
+    """
+
+    def test_both_names_are_pinned_by_equality(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_CONTROL_ARM == 'flat'
+        assert mod.REGROWTH_SELECTED_ARM == 'promoting_pin'
+
+    def test_both_names_are_members_of_the_read_arm_tuple(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_CONTROL_ARM in mod.REGROWTH_READ_ARMS
+        assert mod.REGROWTH_SELECTED_ARM in mod.REGROWTH_READ_ARMS
+
+    @pytest.mark.parametrize(
+        'name', ['REGROWTH_CONTROL_ARM', 'REGROWTH_SELECTED_ARM'],
+    )
+    def test_a_dangling_name_fails_the_import_time_check(self, name, monkeypatch):
+        """A `RuntimeError` at import, not a `KeyError` at render time.
+
+        Same discipline as `_check_regrowth_cost_signs`: a raise rather than
+        an `assert`, so `python -O` cannot strip the one check standing
+        between a renamed arm and a report that dies half-rendered.
+        """
+        mod = _mod()
+        monkeypatch.setattr(mod, name, 'grouped_pin')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            mod._check_regrowth_named_arms()
+
+        assert 'grouped_pin' in str(excinfo.value)
+
+    def test_reordering_the_tuple_does_not_retarget_the_signal_sentence(
+        self, monkeypatch,
+    ):
+        """The contract the positional `[-1]` could not carry.
+
+        `REGROWTH_READ_ARMS` is pinned by equality, so a reorder fails that
+        pin — but the pin is in a different section of this file from the
+        call site, and nothing AT the call site said the LAST arm had to be
+        the selected one.  Reversed, the sentence must still name
+        `promoting_pin`.
+        """
+        mod = _mod()
+        monkeypatch.setattr(
+            mod, 'REGROWTH_READ_ARMS', tuple(reversed(mod.REGROWTH_READ_ARMS)),
+        )
+
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth(_regrowth_block())),
+            '## Regrowth deltas',
+        ))
+
+        assert "4004's selected transform (`promoting_pin`)" in section
+
+
+class TestMeasureRegrowthArms:
+    """One measurement block per read arm, routed to the right (pin, promote)."""
+
+    def _fanout(self, seeded, hits):
+        return _mod().measure_regrowth_arms(
+            seeded,
+            {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+            queries=[_query()],
+            probes=[('c1', {})],
+            estimator=_CHARS,
+            guard_threshold=0.92,
+            limit=10,
+        )
+
+    def test_one_block_per_read_arm_in_order(self):
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        assert list(blocks) == list(_mod().REGROWTH_READ_ARMS)
+
+    def test_each_block_carries_the_full_required_metric_set(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+
+        for block in self._fanout(seeded, hits).values():
+            for metric, keys in mod._REQUIRED_ARM_METRICS.items():
+                for key in keys:
+                    assert key in block[metric], f'{metric}.{key}'
+
+    def test_the_arms_are_routed_to_flat_additive_and_promoting(self):
+        """Asserted by BEHAVIOUR, not by a flag readback.
+
+        The arm gives the canonical a rank only a promoting pin can move into
+        the window — a full k=5 window with the canonical outside it — so the
+        three arms are distinguishable by what they measured.
+        """
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        assert blocks['flat']['pin']['enabled'] is False
+        assert blocks['flat']['pin']['window_changed_rate'] is None
+        assert blocks['additive_pin']['pin']['enabled'] is True
+        # A full window leaves the additive pin nowhere to put anything...
+        assert blocks['additive_pin']['pin']['window_changed_rate'] == 0.0
+        # ...while the promoting one reorders every window it touches.
+        assert blocks['promoting_pin']['pin']['enabled'] is True
+        assert blocks['promoting_pin']['pin']['window_changed_rate'] == 1.0
+
+    def test_the_transform_blind_trio_agrees_across_all_three_arms(self):
+        seeded, hits = _full_window_arm(n=12)
+
+        blocks = self._fanout(seeded, hits)
+
+        for key in ('stored_canonical_in_top_5_rate', 'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            values = {
+                arm: block['discoverability'][key] for arm, block in blocks.items()
+            }
+            assert len(set(values.values())) == 1, values
+
+
+class TestPluckRegrowthMetrics:
+
+    def test_it_projects_exactly_the_pinned_metrics_to_a_flat_dict(self):
+        mod = _mod()
+        seeded, hits = _full_window_arm(n=12)
+        measurement = _measure(seeded, hits, pin=False, probes=[('c1', {})])
+
+        plucked = mod._pluck_regrowth_metrics(measurement)
+
+        assert list(plucked) == [f'{b}.{k}' for b, k in mod.REGROWTH_METRICS]
+        for block, key in mod.REGROWTH_METRICS:
+            assert plucked[f'{block}.{key}'] == measurement[block][key]
+
+
+class TestRegrowthDeltas:
+    """`after - baseline`, exactly, with None propagated rather than zeroed."""
+
+    def test_deltas_are_after_minus_baseline_per_arm_per_metric(self):
+        mod = _mod()
+        baseline = _arms()
+        after = _arms(flat=_plucked(**{'claim_recall.at_5': 0.25}))
+
+        deltas = mod.regrowth_deltas(baseline, after)
+
+        assert list(deltas) == list(mod.REGROWTH_READ_ARMS)
+        assert deltas['flat']['claim_recall.at_5'] == pytest.approx(-0.25)
+        assert deltas['flat']['claim_recall.at_10'] == 0.0
+        assert deltas['additive_pin']['claim_recall.at_5'] == 0.0
+
+    def test_a_none_on_either_side_propagates_as_none_never_as_zero(self):
+        """The `_NO_MEASUREMENT` discipline, one layer down.
+
+        A delta table that prints "no measurement" as a measured zero says the
+        injection changed nothing — which is a finding, not an absence.
+        """
+        mod = _mod()
+        baseline = _arms(flat=_plucked(**{'claim_recall.at_5': None}))
+        after = _arms(additive_pin=_plucked(**{'claim_recall.at_10': None}))
+
+        deltas = mod.regrowth_deltas(baseline, after)
+
+        assert deltas['flat']['claim_recall.at_5'] is None
+        assert deltas['additive_pin']['claim_recall.at_10'] is None
+        assert deltas['promoting_pin']['claim_recall.at_5'] == 0.0
+
+    def test_an_arm_present_on_one_side_only_raises_naming_it(self):
+        mod = _mod()
+        baseline = _arms()
+        after = dict(_arms())
+        after.pop('promoting_pin')
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_deltas(baseline, after)
+
+        assert 'promoting_pin' in str(excinfo.value)
+
+    def test_a_metric_present_on_one_side_only_raises_naming_it(self):
+        mod = _mod()
+        baseline = _arms()
+        after = _arms()
+        after['flat'] = {
+            k: v for k, v in after['flat'].items() if k != 'tokens_per_query.mean'
+        }
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_deltas(baseline, after)
+
+        assert 'tokens_per_query.mean' in str(excinfo.value)
+
+
+class TestRegrowthStampingValue:
+    """`stamped delta - unstamped delta` — the number task 4006 is owed."""
+
+    def test_it_subtracts_the_unstamped_delta_from_the_stamped_one(self):
+        mod = _mod()
+        deltas = {
+            'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': -0.10})),
+            'stamped': _arms(flat=_plucked(**{'claim_recall.at_5': -0.02})),
+        }
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert list(value) == list(mod.REGROWTH_READ_ARMS)
+        assert value['flat']['claim_recall.at_5'] == pytest.approx(0.08)
+
+    def test_two_equal_measured_deltas_give_zero_not_none(self):
+        """Zero here is a measurement: stamping bought nothing, and said so."""
+        mod = _mod()
+        deltas = {'unstamped': _arms(), 'stamped': _arms()}
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert value['flat']['claim_recall.at_5'] == 0.0
+        assert value['flat']['claim_recall.at_5'] is not None
+
+    def test_none_propagates_through_the_stamping_value_too(self):
+        mod = _mod()
+        deltas = {
+            'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': None})),
+            'stamped': _arms(),
+        }
+
+        value = mod.regrowth_stamping_value(deltas)
+
+        assert value['flat']['claim_recall.at_5'] is None
+
+    def test_a_missing_mode_raises_naming_it(self):
+        mod = _mod()
+
+        with pytest.raises(mod.MeasurementError) as excinfo:
+            mod.regrowth_stamping_value({'unstamped': _arms()})
+
+        assert 'stamped' in str(excinfo.value)
+
+
+class TestBuildRegrowthBlock:
+
+    def _block(self):
+        mod = _mod()
+        deltas = {mode: _arms() for mode in mod.REGROWTH_MODES}
+        return mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+            injections=list(_injections()),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        ), deltas
+
+    def test_the_block_carries_its_descriptors_and_all_four_tables(self):
+        mod = _mod()
+        block, _ = self._block()
+
+        assert block['shape'] == mod.REGROWTH_SHAPE
+        assert block['read_arms'] == list(mod.REGROWTH_READ_ARMS)
+        assert block['modes'] == list(mod.REGROWTH_MODES)
+        assert block['topics_injected'] == 20
+        assert block['injections_per_topic'] == 1
+        assert block['injection_fixture'] == (
+            'fused-memory/tests/fixtures/e2_regrowth_injection.jsonl'
+        )
+        assert list(block['after']) == list(mod.REGROWTH_MODES)
+        assert list(block['deltas']) == list(mod.REGROWTH_MODES)
+        for mode in mod.REGROWTH_MODES:
+            assert list(block['after'][mode]) == list(mod.REGROWTH_READ_ARMS)
+            assert list(block['deltas'][mode]) == list(mod.REGROWTH_READ_ARMS)
+        assert list(block['stamping_value']) == list(mod.REGROWTH_READ_ARMS)
+
+    def _descriptors(self, injections):
+        mod = _mod()
+        block = mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+            injections=list(injections),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        )
+        return block['topics_injected'], block['injections_per_topic']
+
+    def test_injections_per_topic_is_derived_from_the_slab_not_typed(self):
+        """A hard-coded `1` is a descriptor that can contradict its own table.
+
+        It was literally `1`, so a slab that injected twice per topic — or
+        none at all, which a `--clusters N` subset can produce — still
+        published "1 injection each" beside the count it disagrees with.  The
+        `+1` in this probe's name is the independent variable, so the
+        artifact has to REPORT it rather than assert it.
+        """
+        injections = list(_injections())
+
+        assert self._descriptors(injections) == (20, 1)
+        assert self._descriptors(injections * 2) == (20, 2)
+
+    def test_an_empty_slab_describes_nothing_rather_than_describing_one(self):
+        """`None`, explicitly — the `protocol['replayed_from']` convention.
+
+        Zero topics with "1 injection each" is a sentence about a table that
+        is not there.  Both drivers now decline to build a block at all for
+        an empty post-subset slab, so this is the belt to that suspenders:
+        a caller that builds one anyway gets an honest descriptor.
+        """
+        assert self._descriptors([]) == (0, None)
+
+    def test_the_deltas_it_carries_are_the_arithmetic_not_a_restatement(self):
+        mod = _mod()
+        block = mod.build_regrowth_block(
+            baseline=_arms(),
+            after_by_mode={
+                'unstamped': _arms(flat=_plucked(**{'claim_recall.at_5': 0.25})),
+                'stamped': _arms(),
+            },
+            injections=list(_injections()),
+            fixture_path=REGROWTH_INJECTION_PATH,
+        )
+
+        assert block['deltas']['unstamped']['flat']['claim_recall.at_5'] == pytest.approx(-0.25)
+        assert block['deltas']['stamped']['flat']['claim_recall.at_5'] == 0.0
+        assert block['stamping_value']['flat']['claim_recall.at_5'] == pytest.approx(0.25)
+
+
+# ===========================================================================
+# 4012 step-9 — `build_report` carries the regrowth block, and refuses a
+#               partial one
+# ===========================================================================
+
+
+def _regrowth_block(**overrides) -> dict:
+    """A COMPLETE regrowth block, before whatever a test removes from it."""
+    mod = _mod()
+    block = mod.build_regrowth_block(
+        baseline=_arms(),
+        after_by_mode={mode: _arms() for mode in mod.REGROWTH_MODES},
+        injections=list(_injections()),
+        fixture_path=REGROWTH_INJECTION_PATH,
+    )
+    block.update(overrides)
+    return block
+
+
+class TestReportSchemaVersionBump:
+
+    def test_the_schema_version_is_three(self):
+        """A v2 artifact carries no regrowth block.
+
+        Diffing a v2 and a v3 artifact as if they answered the same questions
+        is exactly the misreading the version exists to prevent.
+        """
+        assert _mod().REPORT_SCHEMA_VERSION == 3
+
+
+class TestBuildReportCarriesRegrowth:
+
+    def test_a_report_built_without_the_probe_emits_an_explicit_none(self):
+        """`'regrowth' in report`, not merely falsy.
+
+        An ABSENT key would make "this build predates the probe" and "the
+        probe was skipped" the same reading — structurally the failure that
+        let 3199 reach done, whose delivered-check tested only that the
+        report exists.  The explicit `None` follows the convention
+        `protocol['replayed_from']` already set in this file.
+        """
+        report = _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert 'regrowth' in report
+        assert report['regrowth'] is None
+
+    def test_a_complete_block_is_carried_through_unchanged_and_last(self):
+        block = _regrowth_block()
+
+        report = _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+            regrowth=block,
+        )
+
+        assert report['regrowth'] == block
+        # Key order is stable so two runs stay diffable.
+        assert list(report) == [
+            'schema_version', 'protocol', 'arms', 'audit_recall', 'regrowth',
+        ]
+
+
+class TestCheckRegrowth:
+    """Every incompleteness is NAMED, never discovered as a bare KeyError."""
+
+    def _build(self, block):
+        return _mod().build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+            regrowth=block,
+        )
+
+    def test_it_is_not_invoked_at_all_when_regrowth_is_none(self, monkeypatch):
+        mod = _mod()
+        called = []
+        monkeypatch.setattr(
+            mod, '_check_regrowth', lambda block: called.append(block),
+        )
+
+        mod.build_report(
+            arms=_all_arms(), audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        assert called == []
+
+    @pytest.mark.parametrize(
+        'descriptor', ['shape', 'injection_fixture', 'topics_injected'],
+    )
+    def test_a_missing_top_level_descriptor_is_named(self, descriptor):
+        block = _regrowth_block()
+        block.pop(descriptor)
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert descriptor in str(excinfo.value)
+
+    def test_a_missing_mode_is_named(self):
+        block = _regrowth_block()
+        block['deltas'].pop('stamped')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'stamped' in str(excinfo.value)
+
+    def test_an_unknown_mode_is_named(self):
+        block = _regrowth_block()
+        block['after']['stamped_and_pinned'] = _arms()
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'stamped_and_pinned' in str(excinfo.value)
+
+    def test_a_missing_read_arm_is_named(self):
+        block = _regrowth_block()
+        block['baseline'].pop('promoting_pin')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'promoting_pin' in str(excinfo.value)
+
+    def test_an_unknown_read_arm_is_named(self):
+        block = _regrowth_block()
+        block['stamping_value']['grouped_pin'] = _plucked()
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        assert 'grouped_pin' in str(excinfo.value)
+
+    @pytest.mark.parametrize('table', ['baseline', 'stamping_value'])
+    def test_a_missing_metric_in_a_flat_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['flat'].pop('tokens_per_query.mean')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'tokens_per_query.mean' in message
+        assert 'flat' in message
+
+    @pytest.mark.parametrize('table', ['after', 'deltas'])
+    def test_a_missing_metric_in_a_per_mode_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['unstamped']['flat'].pop('claim_recall.at_5')
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_5' in message
+        assert 'unstamped' in message
+        assert 'flat' in message
+
+    @pytest.mark.parametrize('table', ['baseline', 'stamping_value'])
+    def test_an_unknown_metric_in_a_flat_table_is_named(self, table):
+        """The UNKNOWN half is actionable at the METRIC level too.
+
+        This check's docstring promises missing and unknown are collected
+        together at every level, for the reason `_check_arms` does it: a
+        misspelling produces both at once and only the unknown half says
+        WHERE the metric went.  The arm and mode levels honored that; the
+        metric level computed `absent` alone, so a renamed metric key
+        passed silently on the unknown side and the reader was told only
+        that something had vanished.
+        """
+        block = _regrowth_block()
+        block[table]['flat']['claim_recall.at_50'] = 0.0
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_50' in message
+        assert 'flat' in message
+
+    @pytest.mark.parametrize('table', ['after', 'deltas'])
+    def test_an_unknown_metric_in_a_per_mode_table_is_named(self, table):
+        block = _regrowth_block()
+        block[table]['unstamped']['flat']['tokens_per_query.median'] = 1.0
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'tokens_per_query.median' in message
+        assert 'unstamped' in message
+        assert 'flat' in message
+
+    def test_a_misspelled_metric_reports_BOTH_halves_in_one_message(self):
+        """One rename, one message, both halves — the actionable shape.
+
+        A metric key renamed in the producer without being renamed in
+        `REGROWTH_METRICS` is exactly one edit, and the pair of names in a
+        single message is what turns "a metric is missing" into "this
+        metric was spelled that way".
+        """
+        block = _regrowth_block()
+        block['baseline']['flat']['claim_recall.at5'] = (
+            block['baseline']['flat'].pop('claim_recall.at_5')
+        )
+
+        with pytest.raises(_mod().IncompleteReportError) as excinfo:
+            self._build(block)
+
+        message = str(excinfo.value)
+        assert 'claim_recall.at_5' in message
+        assert 'claim_recall.at5' in message
+
+    def test_a_none_VALUE_does_not_raise(self):
+        """`None` is a legitimate "measured, no denominator" in this pipeline.
+
+        The renderer prints it as `—`.  Only an ABSENT key means the run
+        broke.  Both directions are pinned so the check cannot drift into
+        rejecting a real measurement.
+        """
+        block = _regrowth_block()
+        block['baseline']['flat']['claim_recall.at_5'] = None
+        block['deltas']['unstamped']['flat']['claim_recall.at_5'] = None
+
+        report = self._build(block)
+
+        assert report['regrowth']['baseline']['flat']['claim_recall.at_5'] is None
+
+
+# ===========================================================================
+# 4012 step-11 — the rendered `## Regrowth deltas` section: the two tables,
+#                the per-arm bullets, the credited-vs-stored disclosure and
+#                the NOT-blind-authored disclosure in `## Protocol`.
+#
+# LANE: pure.  Every report rendered below is one the test itself built, so
+# every number asserted here was written by the test.  NO metric magnitude,
+# rate, threshold or bound is asserted anywhere in this section (gate G6);
+# what is pinned is COLUMNS, ORDER, COMPLETENESS and the None-vs-zero
+# distinction.
+# ===========================================================================
+
+
+def _report_with_regrowth(block=None, protocol=None):
+    """A full report carrying a regrowth block."""
+    mod = _mod()
+    return mod.build_report(
+        arms=_all_arms(),
+        audit_recall=_audit_recall(),
+        protocol=_protocol() if protocol is None else protocol,
+        regrowth=_regrowth_block() if block is None else block,
+    )
+
+
+def _moved_block(**after_unstamped):
+    """A block whose `unstamped`/`flat` arm MOVED, so deltas are nonzero.
+
+    Every value here is the test's own: baseline comes from `_plucked`, and
+    the override is whatever the caller passed.
+    """
+    mod = _mod()
+    return mod.build_regrowth_block(
+        baseline=_arms(),
+        after_by_mode={
+            'unstamped': _arms(flat=_plucked(**after_unstamped)),
+            'stamped': _arms(),
+        },
+        injections=list(_injections()),
+        fixture_path=REGROWTH_INJECTION_PATH,
+    )
+
+
+def _section(rendered: str, heading: str) -> list[str]:
+    """One `## ` section's lines — heading included, next heading excluded.
+
+    Located by the renderer-emitted heading rather than by a line index, for
+    the same reason `_by_kind_table` is: a paragraph added above must not
+    move the assertion off its section.
+    """
+    lines = rendered.splitlines()
+    start = lines.index(heading)
+    end = next(
+        (i for i, line in enumerate(lines[start + 1:], start + 1)
+         if line.startswith('## ')),
+        len(lines),
+    )
+    return lines[start:end]
+
+
+def _rows_under(lines: list[str], header: str) -> list[str]:
+    """The data rows of the table whose header row is exactly `header`."""
+    at = lines.index(header)
+    rows = []
+    for line in lines[at + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return rows
+
+
+def _header_row(columns) -> str:
+    return '| ' + ' | '.join(columns) + ' |'
+
+
+# ===========================================================================
+# step-17 — the signal sentence's two derived phrases
+# ===========================================================================
+#
+# `_absorption_phrase` and `_cost_phrase` are the only two places in this
+# renderer that turn a measured delta into a DIRECTIONAL CLAIM, and they sit
+# in the probe's headline sentence.  Both had zero direct coverage, and both
+# are wrong on the committed data: `_absorption_phrase` compared `abs()`, so
+# a measured GAIN of 0.0042 and a measured LOSS of 0.0042 read as "the same
+# distance from baseline", and the sentence hard-typed the verb "costs"
+# around `_gap_cell`, so a measured GAIN rendered as a cost.
+#
+# Pure — every input below is a literal this file writes, so NO measured
+# magnitude, threshold or bound is pinned (gate G6).  What is pinned is the
+# SENTENCE'S LOGIC, which stays valid whatever the next run measures.
+
+
+class TestAbsorptionPhrase:
+    """Does 4004's selected transform absorb the flat read's cost?
+
+    The question is directional, so the answer has to be computed from the
+    SIGNED cost `delta * cost_sign` — not from distance-from-baseline, which
+    cannot tell a gain from a loss.
+    """
+
+    def test_every_metric_declares_a_cost_direction(self):
+        """By EQUALITY, and covering every key `REGROWTH_METRICS` projects.
+
+        A metric with no declared direction must not be silently defaulted
+        to "higher is better": that is true of five of these seven columns
+        and false of the other two, and a default would get the exceptions
+        wrong in the one sentence a gate reads.
+        """
+        mod = _mod()
+        assert mod._REGROWTH_COST_SIGN == {
+            'claim_recall.at_5': -1,
+            'claim_recall.at_10': -1,
+            'discoverability.stored_canonical_in_top_5_rate': -1,
+            'discoverability.stored_canonical_median_rank': +1,
+            'discoverability.stored_canonical_found_count': -1,
+            'discoverability.canonical_in_top_5_rate': -1,
+            'tokens_per_query.mean': +1,
+        }
+
+    def test_its_keys_are_exactly_the_regrowth_metric_keys(self):
+        """So adding a metric without declaring its direction fails loudly."""
+        mod = _mod()
+        assert set(mod._REGROWTH_COST_SIGN) == set(mod._regrowth_metric_keys())
+
+    @pytest.mark.parametrize('flat,selected,cost_sign,expected', [
+        # Either side never measured — unchanged behaviour.
+        (None, -0.10, -1, 'not comparable'),
+        (-0.10, None, -1, 'not comparable'),
+        (None, None, +1, 'not comparable'),
+        # Neither arm moved at all.
+        (0.0, 0.0, -1, 'neither arm moved'),
+        (0.0, 0.0, +1, 'neither arm moved'),
+        # Both moved AGAINST the cost direction: nobody paid anything.
+        (+0.10, +0.20, -1, 'neither arm paid a cost'),
+        (+0.10, 0.0, -1, 'neither arm paid a cost'),
+        (-0.10, -0.20, +1, 'neither arm paid a cost'),
+        # The flat read paid; the selected transform paid nothing.
+        (-0.10, 0.0, -1, 'absorbs all of it'),
+        (+3.13, 0.0, +1, 'absorbs all of it'),
+        # The flat read paid; the selected transform GAINED — a sign flip.
+        (-0.10, +0.30, -1, 'more than absorbs it'),
+        (+3.13, -1.00, +1, 'more than absorbs it'),
+        # The flat read paid more than the selected transform did.
+        (-0.20, -0.10, -1, 'absorbs part of it'),
+        (+3.13, +1.00, +1, 'absorbs part of it'),
+        # Both paid the same.
+        (-0.10, -0.10, -1, 'does not change it'),
+        (+3.13, +3.13, +1, 'does not change it'),
+        # The selected transform paid MORE.
+        (-0.10, -0.20, -1, 'costs more than the flat read'),
+        (+1.00, +3.13, +1, 'costs more than the flat read'),
+        # The flat read GAINED while the selected transform paid.  This is
+        # the committed-data case, and the one the `abs()` form got wrong.
+        # Strictly `cost_flat < 0` — a flat read that did not move is the
+        # separate case below, not this one.
+        (+0.10, -0.30, -1, 'opposite directions'),
+        (-1.00, +3.13, +1, 'opposite directions'),
+        # The flat read did not move AT ALL while the selected transform
+        # paid.  One arm standing still is not two arms moving in opposite
+        # directions, and the sentence must not say so beside a `0.00` cell.
+        (0.0, -0.30, -1, 'had no cost to absorb'),
+        (0.0, +3.13, +1, 'had no cost to absorb'),
+    ])
+    def test_the_branch_table(self, flat, selected, cost_sign, expected):
+        phrase = _mod()._absorption_phrase(flat, selected, cost_sign=cost_sign)
+        assert expected in phrase, phrase
+
+    @pytest.mark.parametrize('flat,selected,cost_sign', [
+        (+0.10, +0.20, -1),          # neither paid — name both, not "nothing"
+        (-0.10, +0.30, -1),          # the sign flip
+        (+0.0042372881355934, -0.0042372881355934, -1),   # committed data
+        (-1.00, +3.13, +1),          # opposite directions
+        (0.0, -0.30, -1),            # flat did not move; selected paid
+    ])
+    def test_it_names_both_signed_values_wherever_the_two_arms_disagree(
+        self, flat, selected, cost_sign,
+    ):
+        """A reader told "nothing happened" when both arms GAINED, or told
+        one arm's number when the two moved in opposite directions, cannot
+        reconstruct the table from the sentence.
+        """
+        mod = _mod()
+        phrase = mod._absorption_phrase(flat, selected, cost_sign=cost_sign)
+        assert mod._gap_cell(flat) in phrase, phrase
+        assert mod._gap_cell(selected) in phrase, phrase
+
+    def test_the_committed_data_case_is_not_reported_as_no_change(self):
+        """The regression anchor, pinned by VALUE.
+
+        These two floats are the committed
+        `deltas.unstamped.{flat,promoting_pin}.claim_recall.at_5`: the flat
+        read GAINED 0.0042 while `promoting_pin` LOST 0.0042.  The `abs()`
+        form called that 'does not change it (-<0.01, the same distance from
+        baseline as the flat read)' — two opposite findings declared
+        equivalent in the probe's headline sentence.
+
+        They are literals this test carries, not a threshold on a
+        re-measurement: the assertion is about the sentence's LOGIC and
+        stays valid whatever the next run measures.
+        """
+        mod = _mod()
+        phrase = mod._absorption_phrase(
+            +0.0042372881355934, -0.0042372881355934, cost_sign=-1,
+        )
+        assert 'does not change it' not in phrase, phrase
+        assert mod._gap_cell(+0.0042372881355934) in phrase, phrase
+        assert mod._gap_cell(-0.0042372881355934) in phrase, phrase
+
+    @pytest.mark.parametrize('a,b,cost_sign', [
+        (-0.10, 0.0, -1),
+        (-0.10, -0.20, -1),
+        (+0.10, +0.20, -1),
+        (-0.10, +0.30, -1),
+        (+1.00, +3.13, +1),
+        (+0.0042372881355934, -0.0042372881355934, -1),
+    ])
+    def test_the_two_arguments_are_not_interchangeable(self, a, b, cost_sign):
+        """Symmetry is NOT claimed, so a transposed call site cannot be
+        silent: the flat read and the selected transform play different
+        roles in the sentence and swapping them must change what it says.
+        """
+        mod = _mod()
+        assert (
+            mod._absorption_phrase(a, b, cost_sign=cost_sign)
+            != mod._absorption_phrase(b, a, cost_sign=cost_sign)
+        )
+
+
+class TestCostPhrase:
+    """One delta, rendered as a cost or a gain — never hard-typed.
+
+    The committed artifact reads 'one unstamped re-emission per topic costs
+    <0.01 claim recall@5' for a measured GAIN of +0.0042, because the
+    sentence typed the word "costs" around `_gap_cell`.  The verb has to be
+    derived from the same `cost_sign` the absorption phrase branches on.
+    """
+
+    @pytest.mark.parametrize('delta,cost_sign,expected', [
+        # cost_sign -1: a NEGATIVE delta is the cost.
+        (-0.10, -1, 'costs'),
+        (+0.10, -1, 'gains'),
+        (-0.0042372881355934, -1, 'costs'),
+        (+0.0042372881355934, -1, 'gains'),
+        # cost_sign +1: a POSITIVE delta is the cost (tokens, rank).
+        (+3.13, +1, 'costs'),
+        (-3.13, +1, 'gains'),
+    ])
+    def test_the_verb_follows_the_cost_direction(
+        self, delta, cost_sign, expected,
+    ):
+        phrase = _mod()._cost_phrase(delta, cost_sign=cost_sign)
+        assert phrase.startswith(expected), phrase
+
+    @pytest.mark.parametrize('cost_sign', [-1, +1])
+    def test_an_exact_zero_did_not_move(self, cost_sign):
+        phrase = _mod()._cost_phrase(0.0, cost_sign=cost_sign)
+        assert 'does not move' in phrase, phrase
+        assert 'costs' not in phrase, phrase
+        assert 'gains' not in phrase, phrase
+
+    @pytest.mark.parametrize('cost_sign', [-1, +1])
+    def test_a_never_measured_delta_says_so(self, cost_sign):
+        """`None` is "no measurement", which is a different finding from
+        "measured zero" everywhere else in this renderer and stays different
+        here.
+        """
+        phrase = _mod()._cost_phrase(None, cost_sign=cost_sign)
+        assert 'never measured' in phrase, phrase
+        assert 'costs' not in phrase, phrase
+        assert 'gains' not in phrase, phrase
+        assert 'does not move' not in phrase, phrase
+
+    @pytest.mark.parametrize('delta,cost_sign', [
+        (-0.10, -1), (+0.10, -1), (+3.13, +1), (-3.13, +1),
+        (+0.0042372881355934, -1),
+    ])
+    def test_it_carries_the_magnitude_through_the_shared_formatter(
+        self, delta, cost_sign,
+    ):
+        """`_gap_cell` stays the number formatter — this changes the VERB,
+        not the formatting, so `<0.01` (moved, too little to round up) can
+        never come out as `0.00` (measured, did not move).
+        """
+        mod = _mod()
+        phrase = mod._cost_phrase(delta, cost_sign=cost_sign)
+        assert mod._gap_cell(abs(delta)) in phrase, phrase
+
+
+# ===========================================================================
+# step-19 — the stamping table's zeros are STRUCTURALLY FORCED
+# ===========================================================================
+#
+# THE DEFECT.  `### What topic-stamping buys` publishes `stamped delta -
+# unstamped delta` per read arm, and the prose attaches a causal claim to it
+# ("the difference is what the campaign buys against regrowth").  On the
+# committed artifact every `after.unstamped.flat` value is bit-identical to
+# `after.stamped.flat`, `stamping_value['flat']` and
+# `stamping_value['additive_pin']` are all-`0.0`, and only
+# `promoting_pin.tokens_per_query.mean` is nonzero.  A reader takes away
+# "stamping buys 0.00 everywhere" — the wrong input for task 4006.
+#
+# Those zeros are not measurements.  Three separate ceilings force them, and
+# each is mechanically checkable, so each gets a test: if a ceiling stops
+# being true the disclosure that names it must fail loudly rather than go on
+# explaining away a number that has become real.
+#
+# Pure — every number below is a literal this file wrote or a structural
+# equality between two runs of the same pure function over hand-built data.
+# NO threshold or bound on any measured quantity (G6).
+
+
+def _ceiling_arm(mode: str, *, k: int = 5):
+    """A hand-built `c_peers` arm with ONE injected re-emission, in `mode`.
+
+    The two modes differ in EXACTLY the way the real injections do — a
+    `topic` key on the injected record and nothing else — so any measured
+    difference between them is a difference a read arm expressed from
+    metadata alone.
+
+    The canonical sits LAST in the ranking, outside a `k`-window: that is
+    both what makes the additive pin have something to add (ceiling 2) and
+    what keeps every discoverability metric measurable rather than `None`
+    (`topic_discoverability` scores the RAW hits, so a canonical outside the
+    read window is still found).
+    """
+    mod = _mod()
+    canonical = _rec('canon', topic='t', canonical=True, claim_ids=['k-canon'])
+    peers = [_rec(f'p{i}', topic='t', claim_ids=[f'k{i}']) for i in range(k - 1)]
+    metadata: dict = {'category': 'procedural_knowledge'}
+    if mode == 'stamped':
+        metadata['topic'] = 't'
+    injection = mod.ArmRecord(
+        record_id='regrow-1',
+        content='the canonical claim, restated in different words',
+        metadata=metadata,
+        cluster_id='c1',
+        claim_ids=['k-canon'],
+        role=mod.REGROWTH_ROLE,
+    )
+    records = [canonical, *peers, injection]
+    seeded = _seeded(
+        'c_peers', records,
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {r.record_id for r in (*peers, injection)}},
+    )
+    ranked = [*peers, injection, canonical]
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate(ranked)]
+    return seeded, hits
+
+
+def _ceiling_base(*, k: int = 5):
+    """The same arm with NO injection — the baseline the deltas subtract."""
+    canonical = _rec('canon', topic='t', canonical=True, claim_ids=['k-canon'])
+    peers = [_rec(f'p{i}', topic='t', claim_ids=[f'k{i}']) for i in range(k - 1)]
+    seeded = _seeded(
+        'c_peers', [canonical, *peers],
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': 'canon'},
+        siblings_by_cluster={'c1': {r.record_id for r in peers}},
+    )
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate([*peers, canonical])]
+    return seeded, hits
+
+
+def _ceiling_arms(seeded, hits, *, limit: int = 5) -> dict:
+    """`measure_regrowth_arms` over one hand-built ranking, projected flat."""
+    mod = _mod()
+    return mod._plucked_regrowth_arms(mod.measure_regrowth_arms(
+        seeded,
+        {'queries': {'q1': hits}, 'probes': {'c1': hits}},
+        queries=[_query()],
+        probes=[],
+        estimator=_CHARS,
+        guard_threshold=0.92,
+        limit=limit,
+    ))
+
+
+@functools.cache
+def _ceiling_stamping_value() -> dict:
+    """`stamping_value` end to end over the hand-built pair.
+
+    Same arithmetic the artifact's table is built from — `measure_arm` is
+    pure over `(SeededArm, fetched)`, so the whole chain runs with no store.
+    """
+    mod = _mod()
+    baseline = _ceiling_arms(*_ceiling_base())
+    deltas = {
+        mode: mod.regrowth_deltas(baseline, _ceiling_arms(*_ceiling_arm(mode)))
+        for mode in mod.REGROWTH_MODES
+    }
+    return mod.regrowth_stamping_value(deltas)
+
+
+class TestTheReseedingControlPhrase:
+    """The artifact used to CLAIM a delta carried no cross-seeding noise.
+
+    It does not: `after` is measured over `c_peers_regrowth_<mode>` while the
+    baseline is measured over `c_peers`, so a baseline-vs-after delta spans
+    two seedings.  Only the three read arms within one mode are seeding-free.
+    What the artifact reports instead is the noise floor it actually has —
+    the `flat` stamping row, whose two sides are two separately seeded
+    injected collections differing only in a metadata key a flat read never
+    consults.
+    """
+
+    @staticmethod
+    def _flat(**overrides):
+        return {
+            metric: overrides.get(metric, 0.0)
+            for metric in _mod()._regrowth_metric_keys()
+        }
+
+    def test_an_all_zero_row_reports_that_re_seeding_moved_nothing(self):
+        phrase = _mod()._reseeding_control_phrase(self._flat())
+
+        assert 'exactly `0.00` on every column' in phrase, phrase
+
+    def test_a_nonzero_row_says_so_and_names_every_column_that_moved(self):
+        """The point of DERIVING it.  A typed "re-seeding contributes
+        nothing" would still read as a guarantee on the first run where it
+        stopped being true, three lines above the table that disagrees.
+
+        Every moved cell is named, not just one: the floor is per column, so
+        a reader needs the cell belonging to the column they are reading.
+        """
+        mod = _mod()
+        flat = self._flat(**{'claim_recall.at_5': -0.25,
+                             'tokens_per_query.mean': +0.10})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        assert 'did NOT come out flat' in phrase, phrase
+        assert mod._gap_cell(-0.25) in phrase, phrase
+        assert mod._gap_cell(+0.10) in phrase, phrase
+        assert 'claim recall@5' in phrase, phrase
+        assert 'tokens/query' in phrase, phrase
+
+    def test_the_floor_is_per_column_not_a_cross_unit_maximum(self):
+        """The seven metrics are in four different units, so the row must
+        never be collapsed to one scalar and published as a floor on every
+        column.  A `tokens/query` cell of `-3.13` beside an otherwise flat
+        row must not be rendered as a bound on a claim-recall delta: the
+        sentence names the ONE column that moved, says the floor is per
+        column, and does not claim that much of "any delta below" is noise.
+        """
+        mod = _mod()
+        flat = self._flat(**{'tokens_per_query.mean': -3.13})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        assert mod._gap_cell(-3.13) in phrase, phrase
+        assert 'tokens/query' in phrase, phrase
+        assert 'PER COLUMN' in phrase, phrase
+        # The old cross-unit overclaim, in the two spellings it took.
+        assert 'largest cell' not in phrase, phrase
+        assert 'any delta below' not in phrase, phrase
+        # A column that did not move is not bounded by another one's cell.
+        assert 'claim recall@5' not in phrase, phrase
+
+    def test_every_moved_column_is_named_with_the_tables_own_label(self):
+        """The floor is only usable if the reader can match a cell to the
+        column it bounds, and the stamping table's headers are
+        `REGROWTH_METRIC_LABELS` — so the sentence must use those spellings
+        rather than the internal `<block>.<key>` metric keys."""
+        mod = _mod()
+        metrics = mod._regrowth_metric_keys()
+        labels = dict(zip(metrics, mod.REGROWTH_METRIC_LABELS, strict=True))
+        flat = self._flat(**{metric: 0.5 for metric in metrics})
+
+        phrase = mod._reseeding_control_phrase(flat)
+
+        for metric in metrics:
+            assert labels[metric] in phrase, (metric, phrase)
+            assert metric not in phrase, (metric, phrase)
+
+    def test_an_unmeasured_row_says_so_rather_than_reporting_a_zero(self):
+        """`None` is "never asked", and reporting it as a clean control is
+        exactly the overclaim this function exists to stop making."""
+        mod = _mod()
+        flat = {metric: None for metric in mod._regrowth_metric_keys()}
+
+        assert 'not measured' in mod._reseeding_control_phrase(flat)
+
+    def test_the_rendered_section_carries_it_rather_than_the_old_guarantee(self):
+        """The published claim, narrowed — carried STRUCTURALLY.
+
+        The section must not tell a gate reader that a delta contains the
+        re-emission's contribution and no cross-seeding noise, a
+        methodological guarantee the two-collection design does not
+        provide.  What it may say is which comparison IS seeding-free, and
+        what the measured noise floor came out as.
+
+        That contract is enforced by the assertion below and by nothing
+        else on purpose.  This test used to also carry a NEGATIVE prose pin
+        (`'not ANN noise between two seedings' not in section`), which did
+        not guard what it claimed to: any rewording of the overclaim — "and
+        not embedding noise across two seeds", "free of cross-seeding
+        noise" — reintroduces the exact defect while leaving the pin green.
+        What actually forbids the overclaim is that the sentence is DERIVED
+        from `stamping_value` rather than typed, so there is no place for a
+        standing guarantee to live; asserting the derived phrase is present
+        is asserting that.
+        """
+        mod = _mod()
+        block = _regrowth_block()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        ))
+
+        assert mod._reseeding_control_phrase(
+            block['stamping_value'][mod.REGROWTH_CONTROL_ARM]
+        ) in section
+
+
+class TestTheStampingTableCeilings:
+    """Why two of the three rows in `### What topic-stamping buys` are zero.
+
+    Not "stamping is worth nothing" — "this arm could not express a
+    difference".  The disclosure the renderer emits states these three
+    premises in prose; these tests are the premises themselves.
+    """
+
+    # --- ceiling 1: a metadata-blind read arm ---------------------------
+
+    def test_the_two_modes_emit_byte_identical_record_text(self):
+        """mem0 embeds the record CONTENT, so the two modes are the same
+        corpus to the embedder.  Whatever a stamping campaign changes, it is
+        not what the vectors look like.
+        """
+        assert (
+            [r.content for r in _regrowth_records('unstamped')]
+            == [r.content for r in _regrowth_records('stamped')]
+        )
+
+    def test_the_two_modes_differ_in_exactly_the_topic_key(self):
+        for unstamped, stamped in zip(
+            _regrowth_records('unstamped'), _regrowth_records('stamped'),
+            strict=True,
+        ):
+            assert (set(unstamped.metadata) ^ set(stamped.metadata)) == {'topic'}
+            assert {
+                key: value for key, value in stamped.metadata.items()
+                if key != 'topic'
+            } == dict(unstamped.metadata)
+
+    def test_a_metadata_blind_read_arm_cannot_express_a_stamping_difference(self):
+        """`read_path(pin=False)` slices `hits[:k]` and consults no metadata.
+
+        So the same ranking measured under the two modes returns EQUAL
+        metrics, and it could not have been otherwise.
+        """
+        mod = _mod()
+        measured = {
+            mode: mod._pluck_regrowth_metrics(
+                _measure(*_ceiling_arm(mode), pin=False, promote=False, limit=5)
+            )
+            for mode in mod.REGROWTH_MODES
+        }
+
+        assert measured['unstamped'] == measured['stamped']
+
+    def test_the_flat_rows_stamping_value_is_zero_on_every_metric(self):
+        """The property the disclosure claims, asserted end to end.
+
+        A structural zero, not a measurement: it is the difference between
+        two runs of the same pure function over inputs that differ only in a
+        key that function never reads.
+        """
+        flat = _ceiling_stamping_value()['flat']
+
+        assert set(flat) == set(_mod()._regrowth_metric_keys())
+        assert all(value == 0.0 for value in flat.values()), flat
+
+    # --- ceiling 2: a full window has no room for an additive pin -------
+
+    def test_a_full_window_additive_pin_cannot_express_one_either(self):
+        """`apply_topic_anchor` APPENDS and `read_path` truncates AFTER.
+
+        At `len(window) == k` the pinned canonical is taken straight back
+        off — the same thing `pin changed window = 0.00` reports elsewhere
+        in this artifact — so the additive arm's window is the flat arm's
+        window in BOTH modes.
+        """
+        mod = _mod()
+        for mode in mod.REGROWTH_MODES:
+            seeded, hits = _ceiling_arm(mode)
+            assert len(hits) > 5, 'the window must be full for this ceiling'
+
+            flat = mod.read_path(seeded, hits, 5, pin=False, promote=False)
+            pinned = mod.read_path(seeded, hits, 5, pin=True, promote=False)
+
+            assert [r.record_id for r in pinned] == [r.record_id for r in flat]
+            assert 'canon' not in [r.record_id for r in pinned]
+
+    def test_the_additive_pin_rows_stamping_value_is_zero_on_every_metric(self):
+        additive = _ceiling_stamping_value()['additive_pin']
+
+        assert set(additive) == set(_mod()._regrowth_metric_keys())
+        assert all(value == 0.0 for value in additive.values()), additive
+
+    # --- ceiling 3: arm (c) stamps every peer ---------------------------
+
+    def test_arm_c_stamps_every_peer_so_the_pin_usually_fires_from_a_sibling(self):
+        """`_materialize_c_peers` sets `topic` unconditionally.
+
+        So the injection's OWN stamp can only change the pin's firing when
+        the injection is the sole windowed record for its topic.  The probe
+        therefore measures stamping value against a 100%-stamped corpus —
+        the exact inverse of the live corpus esc-3200-3 documents, where
+        `count_memories_by_metadata(topic=...)` returned 1.  That bounds
+        `promoting_pin`'s stamping value from ABOVE; the inference is what
+        the disclosure states in prose, this asserts the arm-c property it
+        rests on.
+        """
+        records = _knowledge(_arm('c_peers'))
+
+        assert records
+        for record in records:
+            assert 'topic' in record.metadata, record.record_id
+
+    def test_every_injected_record_shares_its_topic_with_the_arm_c_peers(self):
+        """The other half of the same ceiling: the injection is never alone
+        in its topic, because arm (c) already stamped every peer of the
+        cluster it belongs to.
+        """
+        stamped_topics = {
+            record.metadata['topic'] for record in _knowledge(_arm('c_peers'))
+        }
+
+        for injection in _injections():
+            assert injection.topic in stamped_topics
+
+
+class TestRenderMarkdownRegrowthSection:
+    """The operator-facing half of the probe.
+
+    The JSON block is the machine-readable record; this section is what a
+    reader of the artifact actually reads, and esc-3200-3's finding was that
+    a probe with no rendered section is indistinguishable from a probe that
+    never ran.
+    """
+
+    def test_the_section_sits_between_by_query_kind_and_d10(self):
+        """Asserted by relative index, so a section that MOVES fails here.
+
+        The operator's reading order is part of the artifact: the deltas
+        qualify the arm tables above them and are qualified by nothing in
+        D10, so a section that silently relocated would change what the
+        reader takes the numbers to mean.
+        """
+        lines = _mod().render_markdown(_report_with_regrowth()).splitlines()
+
+        assert (
+            lines.index('## By query kind')
+            < lines.index('## Regrowth deltas')
+            < lines.index('## D10 — audit-recall over the labeled fixture')
+        )
+
+    def test_the_metric_labels_line_up_one_for_one_with_the_metrics(self):
+        """A label tuple shorter than the metric tuple drops a column."""
+        mod = _mod()
+
+        assert len(mod.REGROWTH_METRIC_LABELS) == len(mod.REGROWTH_METRICS)
+        # Sliced rather than rebuilt as `(*prefix, *labels)` because that
+        # spelling trips ruff's SIM300 (a SCREAMING_SNAKE attribute on the
+        # left of a non-literal tuple reads to it as a Yoda condition).  The
+        # slice form says the same thing more directly anyway: each table is
+        # its own row-key prefix followed by the labels, in label order.
+        assert mod.REGROWTH_TABLE_COLUMNS[:2] == ('mode', 'read arm')
+        assert mod.REGROWTH_TABLE_COLUMNS[2:] == mod.REGROWTH_METRIC_LABELS
+        assert mod.REGROWTH_STAMPING_COLUMNS[:1] == ('read arm',)
+        assert mod.REGROWTH_STAMPING_COLUMNS[1:] == mod.REGROWTH_METRIC_LABELS
+
+    def test_the_delta_table_columns_are_pinned_by_equality(self):
+        """Exactly as `DECISION_TABLE_COLUMNS` is, and for the same reason:
+        a column quietly dropped from a delta table is a metric quietly
+        dropped from the decision."""
+        mod = _mod()
+
+        assert mod.REGROWTH_TABLE_COLUMNS == (
+            'mode',
+            'read arm',
+            'claim recall@5',
+            'claim recall@10',
+            'canonical in top-5 (stored)',
+            'median canonical rank (stored)',
+            'canonical found (stored)',
+            'canonical in top-5 (credited)',
+            'tokens/query',
+        )
+
+    def test_the_rendered_header_row_is_built_from_the_pinned_columns(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) in section
+
+    def test_there_is_one_row_per_mode_and_arm_in_pinned_order(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        rows = _rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+
+        assert len(rows) == len(mod.REGROWTH_MODES) * len(mod.REGROWTH_READ_ARMS)
+        assert [tuple(_cells(row)[:2]) for row in rows] == [
+            (mode, arm)
+            for mode in mod.REGROWTH_MODES
+            for arm in mod.REGROWTH_READ_ARMS
+        ]
+
+    def test_every_row_carries_a_cell_for_every_metric(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        for row in _rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS)):
+            assert len(_cells(row)) == len(mod.REGROWTH_TABLE_COLUMNS)
+
+    def test_a_metric_cell_carries_the_baseline_the_after_and_the_delta(self):
+        """All three, in the one cell the reader is looking at.
+
+        The numbers are the test's own: `_plucked` puts claim recall@5 at
+        0.5 and the override moves the injected pass to 0.25, so the cell
+        must read `0.50 → 0.25 (-0.25)` and nothing else.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['unstamped', 'flat']
+        )
+
+        recall_at_5 = _cells(row)[mod.REGROWTH_TABLE_COLUMNS.index('claim recall@5')]
+        assert recall_at_5 == '0.50 → 0.25 (-0.25)'
+
+    def test_an_unmoved_metric_renders_a_measured_zero_delta(self):
+        """`0.00` here means "measured, and it did not move" — the finding
+        the None rendering below has to stay distinguishable from."""
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['stamped', 'flat']
+        )
+
+        assert _cells(row)[2] == '0.50 → 0.50 (0.00)'
+
+    def test_a_none_metric_renders_as_no_measurement_never_zero(self):
+        """On BOTH the value and the delta, in the same cell.
+
+        A delta table that prints "never measured" as `0.00` says the
+        injection changed nothing, which is a finding rather than an
+        absence — the same discipline `_NO_MEASUREMENT` exists for.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': None})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_TABLE_COLUMNS))
+            if _cells(r)[:2] == ['unstamped', 'flat']
+        )
+
+        cell = _cells(row)[2]
+        assert cell == f'0.50 → {mod._NO_MEASUREMENT} ({mod._NO_MEASUREMENT})'
+        assert '0.00' not in cell
+
+    def test_the_stamping_table_carries_one_row_per_read_arm(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        rows = _rows_under(
+            section, _header_row(mod.REGROWTH_STAMPING_COLUMNS))
+
+        assert [_cells(row)[0] for row in rows] == list(mod.REGROWTH_READ_ARMS)
+        for row in rows:
+            assert len(_cells(row)) == len(mod.REGROWTH_STAMPING_COLUMNS)
+
+    def test_the_stamping_table_renders_stamped_minus_unstamped(self):
+        """The number task 4006's stamping campaign is owed.
+
+        Baseline and the stamped pass are identical here and the unstamped
+        pass moved by -0.25, so the stamping value is +0.25 — arithmetic
+        over values this test wrote, not a measurement.
+        """
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        row = next(
+            r for r in _rows_under(
+                section, _header_row(mod.REGROWTH_STAMPING_COLUMNS))
+            if _cells(r)[0] == 'flat'
+        )
+
+        assert _cells(row)[1] == '0.25'
+
+    def test_the_section_cites_the_task_its_stamping_table_informs(self):
+        """The task id is an IDENTIFIER a consumer keys on; the surrounding
+        prose is free to be reworded.  Pinning the word "stamp" pinned
+        nothing executable — a section gutted to the literal string
+        'stamp 4006' would have passed it.
+        """
+        mod = _mod()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )).lower()
+
+        assert '4006' in section
+
+    def test_each_read_arm_gets_exactly_one_regrowth_bullet(self):
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        for arm in mod.REGROWTH_READ_ARMS:
+            anchor = mod.regrowth_bullet_prefix(arm)
+            assert sum(
+                1 for line in section if line.startswith(anchor)
+            ) == 1, f'expected exactly one {anchor!r} bullet'
+
+    def test_the_regrowth_anchor_is_distinct_from_the_other_two(self):
+        """Three bullet lists share this document.
+
+        `pin_bullet_prefix` and `stored_gap_bullet_prefix` each assert
+        "exactly one" over their own anchor, so a regrowth bullet that
+        collided with either would break a test in a distant section rather
+        than here.
+        """
+        mod = _mod()
+
+        anchor = mod.regrowth_bullet_prefix('flat')
+        assert anchor != mod.stored_gap_bullet_prefix('flat')
+        assert anchor != mod.pin_bullet_prefix('flat')
+
+    def test_the_bullets_are_derived_from_the_block_not_typed(self):
+        """Same rule as the pin bullets: a hand-typed number about a previous
+        run silently becomes a false sentence beside the table that
+        contradicts it."""
+        mod = _mod()
+        block = _moved_block(**{'claim_recall.at_5': 0.25})
+        section = _section(
+            mod.render_markdown(_report_with_regrowth(block)),
+            '## Regrowth deltas',
+        )
+
+        bullet = next(
+            line for line in section
+            if line.startswith(mod.regrowth_bullet_prefix('flat'))
+        )
+
+        assert '-0.25' in bullet
+
+    def test_the_section_discloses_credited_versus_stored_semantics(self):
+        """Neither column can be quoted without its semantics.
+
+        Under `promoting_pin` the credited column is a PLACEMENT property —
+        the transform injects the canonical into the window — exactly as
+        `apply_grouped_read`'s was under `b_grouped`.
+
+        VERBATIM identity on the module constant, not substrings of the
+        rendered prose.  The substring form this replaced asserted `'stored'`
+        and `'promoting_pin'` were somewhere in the section — both of which
+        the delta TABLE supplies on its own (`canonical in top-5 (stored)` is
+        a column header, `promoting_pin` labels three rows), so deleting the
+        whole paragraph left it green.  A disclosure test that survives the
+        disclosure's deletion is not a disclosure test.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        assert mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE in section
+
+    def test_the_credited_semantics_sit_between_the_delta_table_and_the_next(self):
+        """Asserted by relative index, like the stamping ceiling below.
+
+        It qualifies the two `canonical in top-5` columns of the delta table,
+        so it belongs after that table and before the next heading takes the
+        reader somewhere else.  A qualifier a section away is not a qualifier
+        on this number.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        table_at = section.index(_header_row(mod.REGROWTH_TABLE_COLUMNS))
+        disclosure_at = section.index(mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE)
+        next_heading_at = section.index('### What topic-stamping buys')
+
+        assert table_at < disclosure_at < next_heading_at
+
+    def test_the_credited_semantics_are_not_emitted_with_no_table_to_qualify(self):
+        """A `--no-regrowth` run has no columns for this to be about."""
+        mod = _mod()
+
+        assert mod.REGROWTH_CREDITED_SEMANTICS_DISCLOSURE not in (
+            mod.render_markdown(_report())
+        )
+
+    def test_the_section_says_what_was_injected_and_what_the_modes_mean(self):
+        mod = _mod()
+        section = '\n'.join(_section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )).lower()
+
+        for mode in mod.REGROWTH_MODES:
+            assert mode in section
+        assert mod.REGROWTH_SHAPE in section
+
+    def test_a_run_without_the_probe_still_emits_the_heading(self):
+        """An ABSENT section is how this probe went missing the first time.
+
+        A reader of a probe-less artifact must be able to tell "skipped"
+        from "this build predates the probe", and a heading that disappears
+        makes those two identical — which is precisely what esc-3200-3 could
+        not read off the previous artifact.
+
+        `_section` locates by the heading and raises if it is absent, so the
+        emission contract is carried by the call itself.  What the skipped
+        section SAYS is operator-facing prose and free to be reworded; a
+        substring pin on it would have passed for a section gutted to the
+        literal words it pinned.  What is checked instead is that neither
+        table is there to be misread as a measurement.
+        """
+        mod = _mod()
+
+        section = _section(
+            mod.render_markdown(_report()), '## Regrowth deltas',
+        )
+
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) not in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) not in section
+
+    def test_rendering_is_byte_identical_for_identical_input(self):
+        mod = _mod()
+
+        assert (
+            mod.render_markdown(_report_with_regrowth())
+            == mod.render_markdown(_report_with_regrowth())
+        )
+
+
+    # --- step-19: the stamping table's forced zeros, disclosed -----------
+
+    def test_the_stamping_ceiling_disclosure_appears_verbatim_in_the_section(self):
+        """VERBATIM identity on a module constant, not substrings of prose.
+
+        The convention `test_the_disclosure_appears_verbatim_in_the_protocol_
+        section` already established: the constant's TEXT is operator-facing
+        prose and free to change; what is pinned is that it is there and
+        where it is.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        assert mod.REGROWTH_STAMPING_CEILING_DISCLOSURE in section
+
+    def test_it_sits_between_the_stamping_heading_and_the_stamping_table(self):
+        """Asserted by relative index: a disclosure that drifts away from the
+        number it qualifies is not a disclosure.
+        """
+        mod = _mod()
+        section = _section(
+            mod.render_markdown(_report_with_regrowth()), '## Regrowth deltas',
+        )
+
+        heading_at = section.index('### What topic-stamping buys')
+        disclosure_at = section.index(mod.REGROWTH_STAMPING_CEILING_DISCLOSURE)
+        header_at = section.index(_header_row(mod.REGROWTH_STAMPING_COLUMNS))
+
+        assert heading_at < disclosure_at < header_at
+
+    def test_it_is_not_emitted_when_there_is_no_stamping_table_to_qualify(self):
+        """Unlike the blind-authoring disclosure, which describes the probe's
+        AUTHORING and is emitted always, this one qualifies a specific table.
+        On a `--no-regrowth` run there is no table and nothing to qualify.
+        """
+        mod = _mod()
+
+        assert mod.REGROWTH_STAMPING_CEILING_DISCLOSURE not in mod.render_markdown(
+            _report())
+
+
+class TestTheNotProbedDisclosure:
+    """What an EMPTY `## Regrowth deltas` section is allowed to claim.
+
+    `regrowth=None` has TWO producers, not one.  `--no-regrowth` is the
+    obvious one; the other is a `--clusters N` subset that retained no
+    injected topic, which the driver anticipates explicitly and which
+    `probe_regrowth = bool(injections)` folds into the same `None`.  The
+    two are INDISTINGUISHABLE by the time the renderer sees them, so a
+    paragraph naming `--no-regrowth` as the cause publishes a false
+    statement about why the section is empty — in the one section whose
+    entire stated purpose is to make "skipped" legible.
+    """
+
+    def test_the_disclosure_appears_verbatim_when_the_probe_did_not_run(self):
+        mod = _mod()
+
+        section = '\n'.join(_section(
+            mod.render_markdown(_report()), '## Regrowth deltas',
+        ))
+
+        assert mod.REGROWTH_NOT_PROBED_DISCLOSURE in section
+
+    def test_it_is_not_emitted_when_the_probe_did_run(self):
+        mod = _mod()
+
+        assert mod.REGROWTH_NOT_PROBED_DISCLOSURE not in mod.render_markdown(
+            _report_with_regrowth())
+
+    def test_every_protocol_key_it_names_exists_in_the_committed_block(self):
+        """The pointer must not dangle — checked against DRIVER output.
+
+        The disclosure sends the reader to the protocol descriptors for the
+        coverage it cannot state itself, and in an empty section that
+        paragraph is the ONLY thing there.  Checked against the COMMITTED
+        artifact rather than a local fixture on purpose: a fixture would
+        agree with a stale copy of the name, whereas the committed block is
+        what `run_bake_off` actually emitted, so a descriptor renamed on
+        the driver side fails here on the next regeneration.
+
+        The names are READ OUT of the constant rather than typed here, so
+        rewording the paragraph cannot silently drop the pointer.
+        """
+        mod = _mod()
+        named = set(re.findall(
+            r'`protocol\.([a-z_]+)`', mod.REGROWTH_NOT_PROBED_DISCLOSURE,
+        ))
+
+        assert named, 'the disclosure names no protocol descriptor at all'
+        assert named <= set(_committed_report()['protocol'])
+
+    def test_it_names_the_coverage_descriptors_a_reader_needs(self):
+        """Not any protocol key — the two that answer "why is this empty".
+
+        `regrowth_probed` is the predicate, `regrowth_injections_measured`
+        is the count that separates "the flag was off" from "the subset
+        retained nothing".  Between them a reader can tell the two skip
+        routes apart, which is precisely what the prose must not assert.
+        """
+        mod = _mod()
+
+        assert '`protocol.regrowth_probed`' in mod.REGROWTH_NOT_PROBED_DISCLOSURE
+        assert '`protocol.regrowth_injections_measured`' in (
+            mod.REGROWTH_NOT_PROBED_DISCLOSURE
+        )
+
+    def test_the_two_skip_routes_render_the_same_empty_section(self):
+        """Why the wording has to be neutral, as an executable fact.
+
+        A `--no-regrowth` run and a subset that retained no injection both
+        reach the renderer as `regrowth=None` with a zero
+        `regrowth_injections_measured`, and NOTHING in the report tells
+        them apart.  If a later change threads the reason through, this
+        test fails — and the wording is then free to name it.
+        """
+        mod = _mod()
+        flag_off = _protocol()
+        flag_off['regrowth_probed'] = False
+        flag_off['regrowth_injections_measured'] = 0
+        subset_kept_none = _protocol()
+        subset_kept_none['regrowth_probed'] = False
+        subset_kept_none['regrowth_injections_measured'] = 0
+        subset_kept_none['clusters_measured'] = 1
+
+        def _section_for(protocol):
+            report = mod.build_report(
+                arms=_all_arms(), audit_recall=_audit_recall(),
+                protocol=protocol,
+            )
+            return _section(mod.render_markdown(report), '## Regrowth deltas')
+
+        assert _section_for(flag_off) == _section_for(subset_kept_none)
+
+
+class TestTheNotBlindAuthoredDisclosure:
+    """This probe does NOT carry the protection the six arms above it do."""
+
+    def test_the_disclosure_appears_verbatim_in_the_protocol_section(self):
+        mod = _mod()
+        rendered = mod.render_markdown(_report_with_regrowth())
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in rendered
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in '\n'.join(
+            _section(rendered, '## Protocol'))
+
+    def test_it_is_emitted_even_when_the_probe_was_skipped(self):
+        """The disclosure describes the probe's authoring, not its run.
+
+        A reader of a `--no-regrowth` artifact still needs to know what the
+        probe's protocol is when they go looking for its numbers.
+        """
+        mod = _mod()
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in mod.render_markdown(
+            _report())
+
+    def test_the_injection_fixture_renders_as_a_row_in_the_fixture_table(self):
+        mod = _mod()
+        protocol = _protocol()
+        protocol['fixtures'].append({
+            'path': 'fused-memory/tests/fixtures/e2_regrowth_injection.jsonl',
+            'commit': 'cafe123',
+        })
+
+        rendered = mod.render_markdown(
+            _report_with_regrowth(protocol=protocol))
+
+        assert (
+            '| `fused-memory/tests/fixtures/e2_regrowth_injection.jsonl` '
+            '| cafe123 |'
+        ) in rendered
+
+
+class TestTheInjectionFixtureIsClaimedOnlyWhenItWasRead:
+    """Provenance for a fixture the run never opened is a false audit trail."""
+
+    def test_it_is_appended_when_the_probe_ran(self):
+        mod = _mod()
+
+        paths = mod._protocol_fixture_paths(['a', 'b'], regrowth={})
+
+        assert paths[:2] == ['a', 'b']
+        assert paths[-1] == mod.DEFAULT_REGROWTH_INJECTION_PATH
+
+    def test_the_gate_is_is_not_none_rather_than_truthiness(self):
+        """An empty block is still a block that read the fixture."""
+        mod = _mod()
+
+        assert mod.DEFAULT_REGROWTH_INJECTION_PATH in mod._protocol_fixture_paths(
+            [], regrowth={})
+
+    def test_it_is_absent_when_the_probe_was_skipped(self):
+        mod = _mod()
+
+        assert mod._protocol_fixture_paths(['a', 'b'], regrowth=None) == ['a', 'b']
 
 
 class TestReadPathHoldsTheWindowBudget:
@@ -5571,6 +8604,46 @@ class TestBuildParser:
         assert args.distractors is None
         assert args.limit == _mod().DEFAULT_SEARCH_LIMIT
 
+    def test_the_default_run_probes_regrowth_and_skipping_it_is_explicit(self):
+        """Asserted by ATTRIBUTE, like every other default here.
+
+        The default is ON because the artifact this script writes is gate
+        leaf eta's input and esc-3200-3 asked for these deltas by name: a
+        probe that had to be opted INTO would go missing again exactly the
+        way it went missing the first time, and the artifact would carry no
+        trace of the omission.
+        """
+        parser = _mod().build_parser()
+
+        assert parser.parse_args([]).regrowth is True
+        assert parser.parse_args(['--no-regrowth']).regrowth is False
+
+    def test_the_probe_switch_does_not_disturb_the_cache_flags(self):
+        """`--dump-fetches`/`--replay-fetches` and their exit codes are
+        4004's contract; this task widens what they carry, not what they
+        default to."""
+        args = _mod().build_parser().parse_args(['--no-regrowth'])
+
+        assert args.dump_fetches is None
+        assert args.replay_fetches is None
+
+    def test_the_mutual_exclusion_guard_still_fires_with_the_probe_off(
+        self, tmp_path, capsys,
+    ):
+        """Exit 2, named on stderr, unchanged: a run that both dumps and
+        replays has provenance the artifact cannot describe, and turning the
+        probe off does not make that ambiguity readable."""
+        mod = _mod()
+
+        code = mod.main([
+            '--no-regrowth',
+            '--dump-fetches', str(tmp_path / 'a.json'),
+            '--replay-fetches', str(tmp_path / 'b.json'),
+        ])
+
+        assert code == 2
+        assert '--dump-fetches' in capsys.readouterr().err
+
 
 class TestMain:
     """`main(argv)` driven directly — no subprocess."""
@@ -5655,6 +8728,36 @@ class TestMain:
         # artifact gets published as if it were a fresh measurement.
         assert code == 2
 
+    @pytest.mark.parametrize(
+        ('argv', 'expected'), [([], True), (['--no-regrowth'], False)],
+    )
+    def test_the_switch_reaches_run_bake_off_rather_than_stopping_at_the_parser(
+        self, monkeypatch, tmp_path, argv, expected,
+    ):
+        """A flag the driver never receives is a flag that silently does
+        nothing — and the artifact would then say `regrowth_probed: true`
+        for a run the operator asked to skip."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        seen: list = []
+        real = mod.run_bake_off
+
+        async def _spy(**kwargs):
+            seen.append(kwargs.get('regrowth'))
+            return await real(**kwargs)
+
+        monkeypatch.setattr(mod, 'run_bake_off', _spy)
+
+        code = mod.main([
+            *argv, '--clusters', '2', '--distractors', '12',
+            '--project-suffix', 'utest',
+            '--json-out', str(tmp_path / 'r.json'),
+            '--md-out', str(tmp_path / 'r.md'),
+        ])
+
+        assert code == 0
+        assert seen == [expected]
+
 
 # ===========================================================================
 # step-20 — the ONE live end-to-end test
@@ -5681,7 +8784,7 @@ from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 @pytest.mark.integration
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 @pytest.mark.asyncio
 @qdrant_skipif()
 @pytest.mark.skipif(
@@ -5692,13 +8795,22 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     worker_id,
 ):
     """A 2-cluster / 12-distractor subset: enough to exercise every seam
-    (three collections, six variants, both read transforms, the guard replay,
-    the D10 block, both artifacts) at a fraction of a full run's wall clock."""
+    (three arm collections, six variants, both read transforms, the guard
+    replay, the D10 block, the two INJECTED regrowth passes and both
+    artifacts) at a fraction of a full run's wall clock.
+
+    The timeout covers five seed+fetch passes rather than three: the probe
+    adds one live seeding and one live fetch per injection mode.
+    """
     from qdrant_client import QdrantClient  # noqa: PLC0415
 
     mod = _mod()
     suffix = f'live_{worker_id}'
     collections = set(mod.ephemeral_collections(suffix=suffix).values())
+    # The probe's two collections are part of the teardown contract, not a
+    # separate one: a leaked injected pass is exactly as unreapable as a
+    # leaked arm, and is the failure the widened disjointness below catches.
+    collections |= _regrowth_collection_names(mod, suffix=suffix)
 
     report = await mod.run_bake_off(
         cluster_limit=2, distractor_limit=12, project_suffix=suffix,
@@ -5712,8 +8824,23 @@ async def test_a_live_two_cluster_run_reports_completely_and_leaves_nothing(
     assert report['audit_recall']['true_dup']['pairs'] > 0
     assert report['protocol']['distractor_slab_size'] == 12
 
+    # COMPLETE, not merely present.  A live run that produced an empty or
+    # half-filled block would still render a `## Regrowth deltas` section, and
+    # its blank cells read as "the injection changed nothing".
+    regrowth = report['regrowth']
+    assert regrowth is not None
+    assert report['protocol']['regrowth_probed'] is True
+    assert report['protocol']['regrowth_injections_measured'] == 2
+    for mode in mod.REGROWTH_MODES:
+        for arm in mod.REGROWTH_READ_ARMS:
+            for key in mod._regrowth_metric_keys():
+                assert key in regrowth['after'][mode][arm]
+                assert key in regrowth['deltas'][mode][arm]
+                assert key in regrowth['stamping_value'][arm]
+                assert key in regrowth['baseline'][arm]
+
     # The teardown is the half that leaks silently: a report that looks right
-    # while three collections survive is the failure this asserts against.
+    # while five collections survive is the failure this asserts against.
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     try:
         live = {col.name for col in client.get_collections().collections}
@@ -5965,6 +9092,121 @@ class TestCommittedReportJson:
         assert protocol['queries_measured'] == len(_mod().load_query_set())
         assert protocol['distractor_slab_size'] == len(_mod().load_distractor_slab())
 
+    # --- the +1-re-emission probe (task 4012) -----------------------------
+    #
+    # esc-3200-3 asked for regrowth deltas and read an artifact that had no
+    # such section.  Nothing in the tree could have caught that: 3199's
+    # delivered-check asserted only that the report EXISTS.  These are the
+    # gate it did not have — a committed run whose probe was skipped now
+    # fails in the merge lane instead of being published as complete.
+
+    def test_the_committed_run_actually_probed_regrowth(self):
+        """The absence esc-3200-3 could not read, made a test failure.
+
+        `--no-regrowth` is a legitimate flag for a smoke run, and the
+        renderer says so in words.  What it must not do is reach the
+        COMMITTED pair, because a skipped probe and a probe that ran and
+        found nothing read identically to the operator holding the artifact.
+        """
+        report = _committed_report()
+
+        assert report['regrowth'] is not None, (
+            'the committed report carries no regrowth block — the +1-'
+            're-emission probe was skipped. Regenerate with `cd fused-memory '
+            '&& uv run python scripts/bake_off_storage_shape.py` (probe on by '
+            'default; `--no-regrowth` must not reach the committed pair).'
+        )
+        assert report['protocol']['regrowth_probed'] is True
+
+    def test_the_delta_tables_cover_every_mode_and_every_read_arm(self):
+        """Pinned by EQUALITY, like `test_every_arm_variant_has_a_row` above.
+
+        A mode or a read arm quietly missing from the committed tables is a
+        row quietly missing from the decision the probe informs, and the
+        rendered table would simply be shorter — which nothing about the
+        artifact makes visible.
+        """
+        mod = _mod()
+        regrowth = _committed_report()['regrowth']
+
+        assert list(regrowth['deltas']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['after']) == list(mod.REGROWTH_MODES)
+        assert list(regrowth['baseline']) == list(mod.REGROWTH_READ_ARMS)
+        for mode in mod.REGROWTH_MODES:
+            assert list(regrowth['deltas'][mode]) == list(mod.REGROWTH_READ_ARMS), mode
+            assert list(regrowth['after'][mode]) == list(mod.REGROWTH_READ_ARMS), mode
+
+    def test_every_regrowth_table_measured_every_metric(self):
+        """The same completeness bar the arms are held to, for the same reason.
+
+        `None` is a legitimate value in the pipeline — "measured, no
+        denominator" — but in a FULL committed run it means the arm was never
+        asked, and `_regrowth_cell` renders it as `—` beside real numbers.
+
+        Keyed through `_regrowth_metric_keys()` rather than by re-spelling the
+        `<block>.<key>` join here: that helper is the ONE spelling the
+        projection, the completeness check and the renderer all share, so a
+        test that spelled it independently could pass over a table the
+        renderer cannot read.
+        """
+        mod = _mod()
+        regrowth = _committed_report()['regrowth']
+        metrics = mod._regrowth_metric_keys()
+
+        tables = [('baseline', regrowth['baseline'])]
+        for mode in mod.REGROWTH_MODES:
+            tables.append((f'after.{mode}', regrowth['after'][mode]))
+            tables.append((f'deltas.{mode}', regrowth['deltas'][mode]))
+        tables.append(('stamping_value', regrowth['stamping_value']))
+
+        for where, table in tables:
+            for arm in mod.REGROWTH_READ_ARMS:
+                assert set(table[arm]) == set(metrics), f'{where}.{arm}'
+                for metric in metrics:
+                    assert table[arm][metric] is not None, f'{where}.{arm}.{metric}'
+
+    def test_the_plus_one_in_the_probes_name_is_a_property_of_the_artifact(self):
+        """The `+1` is checkable here, not a claim in the artifact's prose.
+
+        Joined to `clusters_measured` rather than to a literal 20, so a
+        `--clusters 2` smoke artifact cannot satisfy it by carrying two
+        injections either: the probe covered every topic the run measured, or
+        it did not.
+        """
+        report = _committed_report()
+
+        assert report['regrowth']['topics_injected'] == (
+            report['protocol']['clusters_measured']
+        )
+        assert report['regrowth']['injections_per_topic'] == 1
+        assert report['protocol']['regrowth_injections_measured'] == (
+            report['regrowth']['topics_injected']
+        )
+
+    def test_it_records_the_injection_fixtures_commit(self):
+        """The disclosure's own checkable claim.
+
+        `REGROWTH_BLIND_AUTHORING_DISCLOSURE` says the injection fixture was
+        committed on its own ahead of every line of probe code and that "its
+        commit is in the fixture table below".  A disclosure pointing at a row
+        that is not there is worse than no disclosure: it reads as a trail
+        that can be followed.
+        """
+        mod = _mod()
+        report = _committed_report()
+
+        wanted = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
+        # The block and the fixture table name the same file, through the one
+        # `_repo_relative` spelling, so the audit trail cannot point at a path
+        # the probe did not read.
+        assert report['regrowth']['injection_fixture'] == wanted
+        rows = [
+            entry for entry in report['protocol']['fixtures']
+            if entry['path'] == wanted
+        ]
+        assert len(rows) == 1, f'{wanted}: {len(rows)} rows in the fixture table'
+        assert rows[0]['commit'], f'{wanted} is not committed'
+
 
 class TestCommittedReportMarkdown:
     """The operator-facing half, and its agreement with the JSON."""
@@ -6139,11 +9381,173 @@ class TestCommittedReportMarkdown:
                 f'columns match: {bullets[0]!r}'
             )
 
-    def test_it_renders_byte_identically_from_the_committed_json(self):
-        """The markdown is a pure function of the JSON, so the two cannot have
-        been edited apart — and a rerun's diff stays signal."""
+    # --- the +1-re-emission probe (task 4012) -----------------------------
+    #
+    # The JSON half above pins that the probe RAN and measured everything.
+    # This half pins that the operator can read it: the section is where the
+    # reading order puts it, its tables carry no `—`, and the disclosure that
+    # qualifies every number in it is present verbatim.
+    #
+    # `TestTheCommittedPairAgrees` below does NOT subsume these.  Both sides
+    # of that comparison go through `render_markdown`, so a renderer that
+    # dropped the section, or a JSON half that never carried it, agrees with
+    # itself perfectly.
+
+    def test_the_regrowth_section_sits_between_by_query_kind_and_d10(self):
+        """The committed artifact's reading order, not just the renderer's.
+
+        `TestRenderMarkdownRegrowthSection` asserts this over a synthetic
+        report; here it is asserted over the file the operator actually
+        opens, which is also what makes the heading's PRESENCE a merge-lane
+        gate rather than a unit-test property.
+        """
+        lines = _mod().DEFAULT_REPORT_MD.read_text(
+            encoding='utf-8').splitlines()
+
+        assert (
+            lines.index('## By query kind')
+            < lines.index('## Regrowth deltas')
+            < lines.index('## D10 — audit-recall over the labeled fixture')
+        )
+
+    def test_the_regrowth_table_headers_are_the_pinned_column_sets(self):
+        """Same contract as `test_the_table_header_is_the_pinned_column_set`.
+
+        Both tables, because both carry metric columns and a column dropped
+        from either is a metric dropped from the decision.
+        """
+        mod = _mod()
+        section = _section(
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8'),
+            '## Regrowth deltas',
+        )
+
+        assert _header_row(mod.REGROWTH_TABLE_COLUMNS) in section
+        assert _header_row(mod.REGROWTH_STAMPING_COLUMNS) in section
+
+    def test_there_is_one_regrowth_bullet_per_read_arm(self):
+        """Located by `regrowth_bullet_prefix` — the renderer's own anchor.
+
+        Same discipline as the pin and stored-gap bullets: the prose stays
+        free to change, and what is pinned is that every read arm the tables
+        report also gets a sentence a reader can find.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        for arm in mod.REGROWTH_READ_ARMS:
+            bullets = [
+                line for line in rendered.splitlines()
+                if line.startswith(mod.regrowth_bullet_prefix(arm))
+            ]
+            assert len(bullets) == 1, f'{arm}: {len(bullets)} regrowth bullets'
+
+    def test_the_not_blind_authored_disclosure_is_carried_verbatim(self):
+        """The probe's numbers are not protected the way the six arms' are.
+
+        Verbatim rather than by keyword: the disclosure is load-bearing prose
+        — it states WHY the protection is unrecoverable and what the fixture
+        commit does and does not prove — and a paraphrase that lost the
+        "partial audit trail and nothing more" qualifier would let the
+        section be read as a blind measurement.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+
+        assert mod.REGROWTH_BLIND_AUTHORING_DISCLOSURE in rendered
+
+    def test_no_regrowth_cell_in_the_committed_tables_is_unmeasured(self):
+        """`—` beside real numbers reads as a tie, exactly as in the decision
+        table above.  In a FULL committed run every cell was measured.
+
+        Substring-tested per cell, not by cell equality: a delta cell is
+        `base → after (Δ)`, so an unmeasured after or delta hides INSIDE an
+        otherwise populated-looking cell.
+        """
+        mod = _mod()
+        section = _section(
+            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8'),
+            '## Regrowth deltas',
+        )
+        rows = [
+            *_rows_under(section, _header_row(mod.REGROWTH_TABLE_COLUMNS)),
+            *_rows_under(section, _header_row(mod.REGROWTH_STAMPING_COLUMNS)),
+        ]
+
+        # Anti-vacuity: a section whose tables failed to render would make
+        # every assertion below run zero times and pass.
+        assert len(rows) == (
+            len(mod.REGROWTH_MODES) * len(mod.REGROWTH_READ_ARMS)
+            + len(mod.REGROWTH_READ_ARMS)
+        ), f'{len(rows)} regrowth rows'
+        for row in rows:
+            for cell in _cells(row):
+                assert mod._NO_MEASUREMENT not in cell, row
+
+
+class TestTheCommittedPairAgrees:
+    """The two committed halves must describe the SAME run.
+
+    `render_markdown` is byte-deterministic for identical input, and
+    `write_artifacts` renders the markdown BEFORE either atomic replace
+    precisely so the pair can never describe different runs.  Nothing
+    checked that property against the COMMITTED pair, though — so a
+    renderer edit could, and did, leave a stale markdown claiming things
+    the current code no longer says while every other committed-artifact
+    test stayed green.  Those tests assert table headers, bullet anchors,
+    a disclosure constant and the absence of `—` cells; a derived SENTENCE
+    that went stale is invisible to all of them.
+
+    This is the mechanical gate for that.  It is a pure file read, so it
+    runs in the merge lane on every commit, which is the point: it goes red
+    the moment a renderer change lands without the artifact being
+    re-rendered, rather than leaving a wrong sentence in the artifact for a
+    downstream reader to find.
+
+    Pins NO metric value, rate or bound.  What it pins is that the two
+    halves agree.
+    """
+
+    #: The step-23 re-render.  Named in the failure message because the fix
+    #: for this test is never "edit the markdown" — it is "re-render it from
+    #: the JSON", and a reader who hand-edits the prose to match reintroduces
+    #: exactly the drift this test exists to catch.
+    RE_RENDER = (
+        "cd fused-memory && uv run python -c \"\n"
+        "import json, importlib.util, sys, pathlib\n"
+        "p = pathlib.Path('scripts/bake_off_storage_shape.py')\n"
+        "spec = importlib.util.spec_from_file_location("
+        "'bake_off_storage_shape', p)\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['bake_off_storage_shape'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "report = json.loads(m.DEFAULT_REPORT_JSON.read_text(encoding='utf-8'))\n"
+        "m._atomic_write_text(m.DEFAULT_REPORT_MD, m.render_markdown(report))\n"
+        "\""
+    )
+
+    def test_the_committed_markdown_is_what_the_renderer_produces_today(self):
         mod = _mod()
 
-        assert mod.render_markdown(_committed_report()) == (
-            mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        assert mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8') == (
+            mod.render_markdown(_committed_report())
+        ), (
+            f'{mod.DEFAULT_REPORT_MD.name} is stale: it is not what the '
+            f'current renderer produces from '
+            f'{mod.DEFAULT_REPORT_JSON.name}.  The measurements have not '
+            f'changed — re-render the markdown, do NOT hand-edit it and do '
+            f'NOT re-run the bake-off:\n\n{self.RE_RENDER}'
         )
+
+    def test_rendering_the_committed_json_twice_is_byte_identical(self):
+        """The determinism contract, re-anchored on the real committed data
+        rather than a synthetic report.
+
+        The test above is only a gate if re-rendering is reproducible: a
+        renderer that varied run to run would make it flap, and the fix it
+        names would not fix anything.
+        """
+        mod = _mod()
+        report = _committed_report()
+
+        assert mod.render_markdown(report) == mod.render_markdown(report)

@@ -255,6 +255,17 @@ serialized by dependency, so no task starves on a lock). **T3 is the spine root.
   a session-registry record key, so the lookup always missed and the field was a constant — and was
   deliberately **withdrawn** under 3994. It is not an unimplemented gap: do not re-propose it
   without first making the two namespaces meet.
+  **Amended by task 4248 (the slug moved into the CLI, like the pid).** "Both verbs require the
+  claiming `--slug`" above is no longer literally true, and the "skill-prescribed lease slug" is no
+  longer skill-prescribed. `--slug` is now **optional and CLI-derived** on all three lease verbs
+  (`default_lease_slug` → `<--name>-$CLAUDE_PID`), and is an explicit operator override only —
+  3994's own argument for `--pid`, applied to the token 3994 had just made load-bearing. Ownership
+  enforcement on mutation is **UNCHANGED**: the check still runs, now against a slug derived from
+  the caller's own `$CLAUDE_PID`, so a stranger session is still `result=refused` with the lease
+  body untouched. An **underivable** slug (unresolvable `$CLAUDE_PID`, no `--slug`) exits 2 rather
+  than defaulting to `<name>-0`, which would be identical for two concurrently-degraded sessions and
+  would let each act on the other's lease. `lease-claim` also appends a trailing `slug=<resolved>`
+  diagnostic line, under the same additive-and-last rule as `holder_liveness=`.
 
 **DAG:** `T1, T2, T3` have no deps. `T4 → {T3, T2}`. `T5 → {T4, T1}`. `T6 → {T3}`. `T7 → {T3, T5}`.
 Critical path: `T3 → T4 → T5 → T7` (T2 feeds T4, T1 feeds T5, T6 parallel off T3).

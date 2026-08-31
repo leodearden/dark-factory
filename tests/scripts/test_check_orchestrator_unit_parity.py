@@ -68,6 +68,13 @@ from setup_host_parsing import (
 from setup_host_parsing import (
     declared_orchestrator_units as _units_installed_by_setup_host,
 )
+from setup_host_sections import (
+    enabled_units,
+    run_section,
+    slice_section,
+    systemctl_calls,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
@@ -1430,7 +1437,7 @@ def _anchor_index(text: str, anchor: str, what: str) -> int:
     return text.index(anchor)
 
 
-def _orchestrator_gate_block(text: str) -> str:
+def _orchestrator_gate_block(text: str | None = None) -> str:
     """Slice the gate's actual `if ... fi` construct out of setup-host.sh.
 
     Both endpoints are DERIVED, never byte counts. An earlier version of these
@@ -1442,16 +1449,16 @@ def _orchestrator_gate_block(text: str) -> str:
     capitalise the word. A test that claims a semantic property must not be
     pinned to incidental file layout.
 
-    Start: the beginning of the line carrying the first mention of the checker
-    script. End: the first column-0 `fi` after it — the gate's own `if` closes
-    there, and every `fi` nested inside it is indented.
+    Start: the `_orch_parity_script=` assignment. End: the first column-0 `fi`
+    after it — the gate's own `if` closes there, and every `fi` nested inside
+    it is indented.
+
+    *text* is accepted and IGNORED, so the module's many `_setup_host_text()`
+    callers keep reading. The shared slicer reads the file itself, which is
+    also what lets it skip comment lines.
     """
-    mention = _anchor_index(
-        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
-    )
-    start = text.rfind("\n", 0, mention) + 1
-    end = text.index("\nfi\n", mention) + len("\nfi\n")
-    return text[start:end]
+    del text
+    return slice_section(_ORCH_GATE_START, _ORCH_GATE_END)
 
 
 def _orchestrator_install_block(text: str) -> str:
@@ -1519,19 +1526,77 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     )
 
 
-def test_parity_gate_distinguishes_exit_2_from_exit_1():
-    """The branch treats 2 (not installed here) apart from 1 (actionable).
+def _verdict_arm(block: str, verdict: str) -> "re.Match[str] | None":
+    """Locate *verdict*'s own BRANCH in *block*, or None.
 
-    Matching the existing fused-memory and dashboard blocks: 2 is a benign
-    "not installed on this host, skipping", and collapsing it into the drift
-    branch would make a fresh host look like it had a supervision problem.
+    Anchored on the branch, never on a bare occurrence of the word: this
+    block's own prose contains "an absent note means the unit belongs here",
+    so a `\\babsent\\b` search passes with the arm deleted outright — measured
+    by mutation, not assumed. An assertion that survives deleting the thing it
+    names is not testing anything.
+
+    Accepts either spelling, because which reads better is a style call and
+    pinning one would reject a correct gate for a non-reason: a `case` label
+    (`absent)`, including a multi-pattern `finding | *)`) or a
+    `[ "$v" = absent ]` test.
+    """
+    return re.search(
+        rf"(?:^|[\s;(|])\b{verdict}\b\s*(?:\|\s*[^)\n]*)?\)"
+        rf"|=[=]?\s*[\"']?{verdict}\b[\"']?\s*\]",
+        block,
+        re.MULTILINE,
+    )
+
+
+def test_parity_gate_distinguishes_absent_from_a_finding():
+    """The branch treats `absent` (not installed here) apart from `finding`.
+
+    Matching the existing fused-memory and dashboard blocks: "not installed on
+    this host, skipping" is benign, and collapsing it into the drift branch
+    would make a fresh host look like it had a supervision problem.
+
+    Stated in VERDICT terms rather than as a literal `-eq 2`, because the block
+    no longer reads the status itself: it passes the status to
+    `_parity_verdict`, which owns the one place exit 2 is interpreted (that
+    centralisation is the point — 2 is overloaded three ways, and a site that
+    reads it directly re-creates the defect). The claim under test is unchanged
+    — the two states still get their own arms — only the vocabulary it is
+    expressed in has moved.
     """
     text = _setup_host_text()
     block = _orchestrator_gate_block(text)
 
-    assert "-eq 2" in block, (
-        "The orchestrator parity branch does not distinguish exit 2 "
-        "(not installed on this host) from exit 1 (actionable drift)."
+    assert "_parity_verdict" in block, (
+        "The orchestrator parity branch does not route through "
+        "`_parity_verdict`, so it is classifying an overloaded exit status by "
+        f"hand.\n{block}"
+    )
+
+    def _missing(verdict: str) -> str:
+        return (
+            f"The orchestrator parity branch has no `{verdict}` ARM. Without "
+            "one it cannot distinguish a host that never installed the units "
+            "from a host with actionable drift.\n" + block
+        )
+
+    absent_arm = _verdict_arm(block, "absent")
+    assert absent_arm is not None, _missing("absent")
+    finding_arm = _verdict_arm(block, "finding")
+    assert finding_arm is not None, _missing("finding")
+
+    # Compared by END offset, not start. _verdict_arm accepts a multi-pattern
+    # case label (it has to — the finding arm is spelled `finding | *)`), so
+    # against a COLLAPSED single arm `absent | finding | *)` both searches
+    # match, each anchored on the whitespace before its own label, and their
+    # STARTS differ while naming one and the same branch. Measured: comparing
+    # starts passed with the two arms folded together, which is the whole
+    # defect this test exists to catch and which main's `-eq 2` version did
+    # catch. Two labels on one arm end at the same `)`; two real arms do not.
+    assert absent_arm.end() != finding_arm.end(), (
+        "The orchestrator parity branch reaches the same arm for `absent` and "
+        "`finding`, collapsing the distinction this test exists to hold. A "
+        "fresh host with no orchestrator units would be reported as drift and "
+        "have its install refused.\n" + block
     )
     # Non-fatal: the gate reports and declines to install, but must never
     # abort setup-host.sh itself — five units are knowingly red on this host
@@ -1547,6 +1612,156 @@ def test_parity_gate_distinguishes_exit_2_from_exit_1():
         "non-fatal: drift declines the unit install, it does not abort the "
         "installer.\n" + block
     )
+
+
+# ---------------------------------------------------------------------------
+# The SHARED slicer must anchor on CODE and support a derived end anchor
+# ---------------------------------------------------------------------------
+#
+# This module is about to run its own slices through
+# tests/scripts/setup_host_sections.slice_section rather than its private
+# copies, and it needs two things that module does not yet do. Both are pinned
+# here because this is the suite whose slices depend on them.
+
+# The gate block's own anchor, hoisted to a module constant to match the
+# `_SECTION_8_*` / `_GATE_*` convention the dashboard and fused-memory suites
+# use. CODE, and unique to this site — the assignment the structural sweep in
+# test_check_dashboard_unit_parity.py also keys on.
+_ORCH_GATE_START = "_orch_parity_script="
+_ORCH_GATE_END = "\nfi\n"
+
+
+def test_slice_section_anchors_on_code_not_comment_prose():
+    """The start marker is located on a NON-COMMENT line.
+
+    MEASURED before the fix: `slice_section("_orch_parity_script=", "\\nfi\\n")`
+    started at setup-host.sh:146 — a COMMENT that quotes the anchor while
+    stating the harness constraint — and returned a 189-line slice reaching
+    back over real installer code, including
+    `install -m 0755 ... "$HOME/bin/..."`. A test executing that slice runs it
+    against the developer's REAL home directory: exactly the hazard the comment
+    at setup-host.sh:246-248 warns about, and which only prose prevents.
+
+    setup_host_sections' own docstring already declares "MARKERS ARE CODE, NOT
+    COMMENT PROSE", and the sweep's `_parity_call_sites` already skips
+    `line.lstrip().startswith("#")`. This makes the shared slicer agree with
+    both rather than rely on nobody quoting an anchor.
+    """
+    section = slice_section(_ORCH_GATE_START, _ORCH_GATE_END)
+
+    first = section.splitlines()[0]
+    assert not first.lstrip().startswith("#"), (
+        f"Slice starts on a COMMENT line, not the assignment:\n  {first}"
+    )
+    assert first.startswith(_ORCH_GATE_START), (
+        f"Slice must start at the {_ORCH_GATE_START!r} assignment. Got:\n  {first}"
+    )
+    assert "install -m 0755" not in section, (
+        "The slice reaches back over installer code that writes outside the "
+        "tmp tree. This section is EXECUTED by tests below."
+    )
+    assert '"$HOME/' not in section, (
+        "The slice can reach the developer's real home directory."
+    )
+
+
+def test_slice_section_end_after_runs_through_an_inner_construct():
+    """`end_after` lets a slice terminate at a LATER same-token close.
+
+    The installer slice must end at the column-0 `fi` closing the INSTALL
+    construct, not at the gate's own `fi` — which is the first one after the
+    start marker. Expressed as a third derived ANCHOR
+    (setup_host_parsing.INSTALL_LOOP_CP), deliberately not as a counted
+    occurrence: "the second `fi`" shifts silently the moment the block is
+    reflowed, whereas a missing anchor fails loudly.
+    """
+    section = slice_section(
+        _ORCH_GATE_START, _ORCH_GATE_END, end_after=_INSTALL_LOOP_CP
+    )
+
+    assert section.splitlines()[0].startswith(_ORCH_GATE_START), section.splitlines()[0]
+    assert _INSTALL_LOOP_CP in section, (
+        "end_after must carry the slice THROUGH the install loop's copy."
+    )
+    assert section.rstrip("\n").splitlines()[-1] == "fi", (
+        f"Slice must end on a column-0 `fi`. Got:\n  "
+        f"{section.rstrip(chr(10)).splitlines()[-1]!r}"
+    )
+    # ... and it genuinely ran PAST the gate's own close, which is what the
+    # keyword is for: the plain slice stops strictly earlier.
+    assert len(section) > len(slice_section(_ORCH_GATE_START, _ORCH_GATE_END)), (
+        "end_after produced no more text than the plain slice, so it did not "
+        "skip the gate's own `fi`."
+    )
+
+
+def test_slice_section_missing_end_after_marker_fails_by_name():
+    """A renamed `end_after` anchor fails LOUDLY, naming itself.
+
+    Same contract as the two existing markers. The silent alternative is a
+    slice of the wrong region that runs cleanly and produces a vacuously green
+    test — the "reported green because it never ran" failure this whole harness
+    exists to catch.
+    """
+    bogus = 'if cp "$REPO_ROOT/scripts/$_unit" "$RENAMED_DIR/"; then'
+    with pytest.raises(AssertionError, match=re.escape(bogus)):
+        slice_section(_ORCH_GATE_START, _ORCH_GATE_END, end_after=bogus)
+
+
+def test_run_section_systemctl_stub_records_its_argv(tmp_path: pathlib.Path):
+    """The shared stub RECORDS, so the ENABLE half of an install is observable.
+
+    Half of what the installer section does is `systemctl --user enable`, and a
+    per-unit gate that copied the right files while enabling the wrong set
+    would pass every file-content assertion in this module. A stub that only
+    exits 0 makes that half unobservable, so the assertions silently cover the
+    `cp` alone.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    unit_dir = tmp_path / "units"
+
+    result = run_section(
+        tmp_path,
+        "systemctl --user daemon-reload\n"
+        "systemctl --user enable some-unit.service\n",
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+    # The stub still exits 0, so a slice containing `systemctl --user enable`
+    # neither touches the host nor trips `set -e`.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    assert systemctl_calls(tmp_path) == [
+        ["--user", "daemon-reload"],
+        ["--user", "enable", "some-unit.service"],
+    ], systemctl_calls(tmp_path)
+
+    assert enabled_units(tmp_path) == ["some-unit.service"], enabled_units(tmp_path)
+
+
+def test_enabled_units_is_token_matched_not_substring_matched(
+    tmp_path: pathlib.Path,
+):
+    """`enable` naming one unit is never satisfied by a line naming another.
+
+    The property the private copy documents, pinned: a `daemon-reload` call
+    contributes NO unit, so a run that reloaded but enabled nothing cannot read
+    as a run that enabled something.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+
+    run_section(
+        tmp_path,
+        "systemctl --user daemon-reload\n",
+        repo_root=repo,
+        unit_dir=tmp_path / "units",
+    )
+
+    assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
+    assert enabled_units(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1566,23 +1781,19 @@ def test_parity_gate_distinguishes_exit_2_from_exit_1():
 def _installer_section() -> str:
     """The gate + unit-install section of setup-host.sh, verbatim.
 
-    From the line carrying the first mention of the checker through the `fi`
-    that closes the install construct — endpoints derived, so this follows a
-    reflow of the block instead of pinning one.
+    From the `_orch_parity_script=` assignment through the `fi` that closes the
+    INSTALL construct — which is why `end_after` is needed: the first column-0
+    `fi` after the start is the gate's own, and this slice must run past it.
 
-    Both anchors go through _anchor_index: every behavioural test below runs
-    this slice, so a bare `str.index` losing one of them would error out the
-    whole set with `ValueError: substring not found` instead of failing once,
-    legibly, on the literal that moved.
+    Every anchor is self-naming inside slice_section, for the same reason
+    _anchor_index exists here: every behavioural test below runs this slice, so
+    a bare `str.index` losing one would error out the whole set with
+    `ValueError: substring not found` instead of failing once, legibly, on the
+    literal that moved.
     """
-    text = _setup_host_text()
-    mention = _anchor_index(
-        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    return slice_section(
+        _ORCH_GATE_START, _ORCH_GATE_END, end_after=_INSTALL_LOOP_CP
     )
-    start = text.rfind("\n", 0, mention) + 1
-    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
-    end = text.index("\nfi\n", first_cp) + len("\nfi\n")
-    return text[start:end]
 
 
 def _fake_repo(
@@ -1601,19 +1812,13 @@ def _fake_repo(
             (REPO_ROOT / relpath).read_text(encoding="utf-8"), encoding="utf-8"
         )
     if with_checker:
-        target = repo / "scripts" / "check_orchestrator_unit_parity.py"
-        if checker_body is None:
-            for name in ("check_orchestrator_unit_parity.py", "systemd_unit_parity.py"):
-                (repo / "scripts" / name).write_text(
-                    (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-        else:
-            target.write_text(checker_body, encoding="utf-8")
+        write_checker(
+            repo,
+            "check_orchestrator_unit_parity.py",
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
     return repo
-
-
-_SYSTEMCTL_LOG = "systemctl-calls.log"
 
 
 def _run_installer_section(
@@ -1623,67 +1828,21 @@ def _run_installer_section(
     *,
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Execute the sliced section under bash with setup-host.sh's own preamble."""
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    systemctl = stub_bin / "systemctl"
-    # The stub RECORDS its argv (one call per line) before exiting 0, so the
-    # enable half of the install is observable and not merely assumed. Half of
-    # what this section does is `systemctl --user enable`, and a per-unit gate
-    # that copied the right files while enabling the wrong set would pass every
-    # file-content assertion in this module. Purely additive: tests that do not
-    # read the log are unaffected.
-    systemctl.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {tmp_path / _SYSTEMCTL_LOG}\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    systemctl.chmod(0o755)
+    """Execute the sliced section through the shared harness.
 
-    script = tmp_path / "section.sh"
-    script.write_text(
-        "set -euo pipefail\n"
-        f'REPO_ROOT="{repo}"\n'
-        f'UNIT_DIR="{unit_dir}"\n'
-        'mkdir -p "$UNIT_DIR"\n'
-        "info()  { printf '==> %s\\n' \"$*\"; }\n"
-        "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
-        "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
-        "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
-        + _installer_section(),
-        encoding="utf-8",
-    )
-
-    env = dict(os.environ)
-    env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
-    env.update(env_extra or {})
-    return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, env=env
-    )
-
-
-def _systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
-    """Every `systemctl` invocation the run made, as argv token lists."""
-    log = tmp_path / _SYSTEMCTL_LOG
-    if not log.is_file():
-        return []
-    return [
-        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
-    ]
-
-
-def _enabled_units(tmp_path: pathlib.Path) -> list[str]:
-    """The units passed to `systemctl ... enable <unit>` during the run.
-
-    Token-matched rather than substring-matched: `enable` naming one unit must
-    never be satisfied by a line naming a different one.
+    A thin wrapper: `run_section` supplies setup-host.sh's own preamble, the
+    plain-text log shims, and the recording `systemctl` stub. This module used
+    to carry private copies of all three; one preamble serves all five sliced
+    blocks, which is what lets setup-host.sh define a helper once above every
+    call site and still have each slice run.
     """
-    enabled: list[str] = []
-    for argv in _systemctl_calls(tmp_path):
-        if "enable" in argv:
-            enabled.extend(argv[argv.index("enable") + 1 :])
-    return enabled
+    return run_section(
+        tmp_path,
+        _installer_section(),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra=env_extra,
+    )
 
 
 def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
@@ -1694,6 +1853,75 @@ def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
         (unit_dir / name).write_text(
             (repo / relpath).read_text(encoding="utf-8"), encoding="utf-8"
         )
+
+
+def test_the_module_slices_come_off_the_CODE_anchor():
+    """Both slice accessors start at the assignment, not at prose about it.
+
+    RED before the migration: both anchored on the first occurrence of the
+    string "check_orchestrator_unit_parity.py", which lands inside the comment
+    at setup-host.sh:242 naming
+    `tests/scripts/test_check_orchestrator_unit_parity.py` — a SUPERSTRING of
+    the anchor. That coupling is exactly what forced setup-host.sh's standing
+    "do NOT name the parity checker's file in the prose above" constraint, a
+    rule enforced only by a comment asking people to remember it.
+
+    Asserted of the accessors themselves, whatever their implementation, so the
+    property survives however they are rewritten.
+    """
+    for name, section in (
+        ("_orchestrator_gate_block", _orchestrator_gate_block(_setup_host_text())),
+        ("_installer_section", _installer_section()),
+    ):
+        first = section.splitlines()[0]
+        assert not first.lstrip().startswith("#"), (
+            f"{name} starts on a COMMENT line:\n  {first}"
+        )
+        assert first.startswith(_ORCH_GATE_START), (
+            f"{name} must start at the {_ORCH_GATE_START!r} assignment. "
+            f"Got:\n  {first}"
+        )
+
+
+def test_the_module_slices_cannot_reach_the_real_home_directory():
+    """Neither EXECUTED slice contains a write outside the tmp tree.
+
+    setup-host.sh:246-248 names this failure — a slice whose start drifted
+    upward runs this section's `install -m 0755 ... "$HOME/bin/..."` against
+    the developer's REAL home directory — and today only prose prevents it.
+    This makes it a test.
+    """
+    for name, section in (
+        ("_orchestrator_gate_block", _orchestrator_gate_block(_setup_host_text())),
+        ("_installer_section", _installer_section()),
+    ):
+        assert "install -m 0755" not in section, (
+            f"{name} reaches back over installer code that writes outside the "
+            f"tmp tree, and this module EXECUTES it."
+        )
+        assert '"$HOME/' not in section, (
+            f"{name} can reach the developer's real home directory."
+        )
+
+
+def test_the_two_module_slices_stay_distinguishable():
+    """The gate slice stops at the gate; the installer slice runs past it.
+
+    Without this, a change that collapsed one accessor onto the other would go
+    unnoticed: every gate-only assertion would still pass against the longer
+    slice, and the tests that mean to exercise ONLY the read-only gate would
+    silently start executing the install.
+    """
+    gate = _orchestrator_gate_block(_setup_host_text())
+    installer = _installer_section()
+
+    assert _INSTALL_LOOP_CP in installer, (
+        "The installer slice must contain the install loop's copy."
+    )
+    assert _INSTALL_LOOP_CP not in gate, (
+        "The gate slice must stop at the gate's own `fi`, before the install."
+    )
+    assert len(installer) > len(gate)
 
 
 def test_installer_copies_the_units_when_the_gate_reports_parity(
@@ -1950,16 +2178,16 @@ def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
             repo / "scripts" / name
         ).read_text(encoding="utf-8")
 
-    enabled = _enabled_units(tmp_path)
+    enabled = enabled_units(tmp_path)
     assert "orchestrator-watchdog.timer" in enabled, (
         "orchestrator-watchdog.timer was copied but never enabled. A timer "
         "unit file on disk supervises nothing; enabling it is the repair the "
-        f"31.8h-stale fleet needed.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"31.8h-stale fleet needed.\ncalls: {systemctl_calls(tmp_path)}"
     )
     assert "orchestrator-watchdog.service" not in enabled, (
         "orchestrator-watchdog.service is STATIC (no [Install]) — `systemctl "
         "enable` on it is an error, not a no-op, so under `set -e` this would "
-        f"abort the installer.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"abort the installer.\ncalls: {systemctl_calls(tmp_path)}"
     )
     assert "orchestrator-reify.service" not in enabled, (
         "A unit the gate declined to install was still enabled. The skip must "
@@ -1967,11 +2195,11 @@ def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
         f"exactly the unverified state the skip refused.\nenabled: {enabled}"
     )
 
-    reload_calls = [argv for argv in _systemctl_calls(tmp_path) if "daemon-reload" in argv]
+    reload_calls = [argv for argv in systemctl_calls(tmp_path) if "daemon-reload" in argv]
     assert len(reload_calls) == 1, (
         "daemon-reload must run exactly once, AFTER the copies and BEFORE the "
         "enables — systemd must not be asked to enable a unit it has not "
-        f"re-read.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"re-read.\ncalls: {systemctl_calls(tmp_path)}"
     )
 
     assert reify.read_text(encoding="utf-8") == reify_before, (
@@ -2045,9 +2273,9 @@ def test_a_report_with_no_verdict_lines_installs_nothing(tmp_path: pathlib.Path)
         "finding because it measured nothing, not because there was nothing "
         f"to find.\n{result.stdout}"
     )
-    assert _enabled_units(tmp_path) == [], (
+    assert enabled_units(tmp_path) == [], (
         "Units were enabled on a run where nothing cleared the gate.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
     assert "SKIPPING" in result.stdout, result.stdout
 
@@ -2091,9 +2319,9 @@ def test_a_vanished_committed_unit_is_skipped_not_fatal(tmp_path: pathlib.Path):
     assert "orchestrator-know-live.service" in _warnings_naming(
         result.stdout, "orchestrator-know-live.service"
     ), f"The vanished unit was skipped silently.\n{result.stdout}"
-    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+    assert "orchestrator-know-live.service" not in enabled_units(tmp_path), (
         "A unit with no committed copy was enabled.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
 
 
@@ -2143,9 +2371,9 @@ def test_force_all_installs_even_drifted_and_unverified_units(
         f"force-ALL; the per-unit gate narrows the default, not the escape "
         f"hatch.\n{result.stdout}"
     )
-    assert unverified in _enabled_units(tmp_path), (
+    assert unverified in enabled_units(tmp_path), (
         f"{unverified} was force-installed but not enabled.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
 
 
@@ -2242,9 +2470,9 @@ def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
         "The uncopyable unit stopped its siblings from being installed.\n"
         + result.stdout
     )
-    assert "orchestrator-watchdog.timer" in _enabled_units(tmp_path), (
+    assert "orchestrator-watchdog.timer" in enabled_units(tmp_path), (
         "The run survived the failure but never reached the enable loop.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
     assert "FAILED" in _warnings_naming(
         result.stdout, "orchestrator-know-live.service"
@@ -2252,9 +2480,9 @@ def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
         "The failed copy was not reported. A unit silently not installed is "
         f"the state this whole section exists to make observable.\n{result.stdout}"
     )
-    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+    assert "orchestrator-know-live.service" not in enabled_units(tmp_path), (
         "A unit whose copy FAILED was enabled anyway — that acts on bytes "
-        f"nobody managed to write.\n{_systemctl_calls(tmp_path)}"
+        f"nobody managed to write.\n{systemctl_calls(tmp_path)}"
     )
 
 

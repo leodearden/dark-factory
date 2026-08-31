@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
+from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.validation import is_full_uuid
 
@@ -182,6 +183,24 @@ def _cited_task_key(project_id: str, task_id: str) -> str:
     return f'{project_id}:{task_id}'
 
 
+def _citation_failure_key(marker: Any) -> tuple[Any, Any, Any]:
+    """Identity of a ``citation_failures`` marker for dedupe (task 2979).
+
+    ``(memory_id, store, reason)`` — deliberately EXCLUDING ``error_type``.
+    Two ``verification_error`` markers for the same citation record the same
+    fact ("this id could not be resolved") no matter which exception class
+    surfaced it, and including ``error_type`` would let a flapping backend
+    append an unbounded run of near-identical markers across repeat passes.
+
+    Tolerates a non-dict marker (returns a key derived from its repr) so a
+    malformed entry that somehow reached the durable record can still be
+    compared instead of raising inside the write-back.
+    """
+    if not isinstance(marker, dict):
+        return (repr(marker), None, None)
+    return (marker.get('memory_id'), marker.get('store'), marker.get('reason'))
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -310,6 +329,14 @@ class _Finding:
     # cited entity carries an active decision; defaults None so old persisted
     # rows hydrate round-trip-safe via _Finding(**fd).
     standing_decision_id: str | None = None
+    # Task 2979: markers for cited memories that failed post-assembly
+    # re-verification — {memory_id, store, reason} (plus error_type on a
+    # verification_error). Written by apply_citation_verification, so a phantom
+    # claim is SURFACED rather than silently vanishing when it is stripped from
+    # cited_memories. Defaulted for the same round-trip-safety reason as
+    # standing_decision_id above: rows persisted before this field existed must
+    # still hydrate via _Finding(**fd) with no migration.
+    citation_failures: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -552,6 +579,14 @@ _ERR_SERVICE_UNAVAILABLE: dict[str, str] = {
     'error_type': 'ReconReportServiceUnavailable',
 }
 
+# task 3065: returned by repair_memory_citation when this server was built
+# without a ReconciliationJournal (reconciliation disabled). Refusing loudly
+# beats half-working: the durable blob is the only thing a repair can act on.
+_ERR_JOURNAL_UNAVAILABLE: dict[str, str] = {
+    'error': 'journal_unavailable',
+    'error_type': 'ReconReportJournalUnavailable',
+}
+
 # task 2895 β: returned by write_entity_standing_decision when the grounds value
 # is outside GROUNDS_ENUM (the ledger's ValueError). A ``hint`` carrying the
 # ledger message is added at return time.
@@ -596,6 +631,7 @@ class ReconReportState:
         memory_service: Any = None,
         task_interceptor: Any = None,
         store: Any = None,
+        journal: Any = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -640,6 +676,11 @@ class ReconReportState:
         self.known_projects: dict[str, str] = {}  # project_id → project_root
         # SQLite write-through persistence (task 2716); None = fully inert.
         self._store = store
+        # ReconciliationJournal for repair_memory_citation (task 3065) — the ONE
+        # tool here that writes outside this process's own state. None (the
+        # reconciliation-disabled server) keeps every other behaviour
+        # byte-identical and makes that tool refuse with journal_unavailable.
+        self._journal = journal
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
@@ -1365,6 +1406,120 @@ class ReconReportState:
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
+    def apply_citation_verification(
+        self, run_id: str, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Write a post-assembly citation-verification outcome back to the
+        AUTHORITATIVE findings, then persist once (task 2979).
+
+        Each entry of *results* is
+        ``{'finding_id': str, 'cited_memories': list[dict],
+        'citation_failures': list[dict]}`` — the surviving citations and the
+        failure markers that ``citation_verifier.verify_cited_memories``
+        produced for that finding. ``cited_memories`` REPLACES the finding's
+        list (the verifier returns the kept set, not a delta);
+        ``citation_failures`` is EXTENDED — so markers from an earlier pass are
+        never lost — but the extend is DEDUPED on ``(memory_id, store,
+        reason)``, which is what makes a repeat pass idempotent.
+
+        The dedupe is load-bearing, not belt-and-braces. Callers send the FULL
+        marker list off the assembled projection, not the delta this pass
+        appended, and ``get_assembled_report`` projects the already-persisted
+        ``citation_failures`` back out — so a plain extend would duplicate
+        every prior marker on any second pass over the same (run_id, stage).
+        A repeat is architecturally reachable: ``start_report`` is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke ``stage.run()`` under the same ``run_id``. ``error_type`` is
+        NOT part of the key: two verification errors for the same citation are
+        the same failure regardless of which exception class surfaced it, and
+        keying on it would let a flapping backend grow the list without bound.
+
+        Why this exists: ``get_assembled_report`` builds a fresh dict per
+        finding with ``'cited_memories': list(f.cited_memories)`` — a NEW list
+        object. Verification therefore corrects only that throwaway projection,
+        while the authoritative ``_Finding`` and its durable row (written inside
+        the CLI subprocess at add_finding/cite_memory/complete time, strictly
+        BEFORE verification runs) keep the phantom. Without this write-back the
+        report and the store permanently disagree, and whether a consumer sees
+        the phantom depends on which one it happens to read.
+
+        Findings are resolved via :meth:`_resolve_finding`, so this is
+        cross-stage capable exactly as the ``cite_*`` tools are.
+
+        **Deliberately NOT guarded by ``_ERR_ALREADY_COMPLETED``**, unlike
+        :meth:`delete_finding`. That guard exists to stop an in-flight agent
+        RETRACTING a finding after ``complete()`` cached ``flagged_count`` /
+        ``stats``. This is a harness-side integrity correction that by
+        construction runs after the subprocess has already called
+        ``complete()``, so the guard would reject every legitimate call. It is
+        also strictly narrower than a retraction: it only edits citation lists,
+        never adds or removes a finding, so the cached ``flagged_count`` stays
+        accurate.
+
+        ``_persist_run`` — which re-serialises and upserts EVERY entry of the
+        run — fires only when a finding's citation lists actually changed. The
+        common case by far is a clean run where verification resolved every
+        citation and dropped nothing; re-writing the whole run's rows to record
+        "nothing moved" is pure cost.
+
+        Never raises, and never returns an error for an unresolvable
+        ``run_id``/``finding_id`` — this is a post-hoc hygiene pass, and turning
+        a citation-hygiene miss into a failed reconciliation stage would be a
+        far worse outcome than a stale marker. Skips are logged (WARNING,
+        structured) rather than swallowed silently. Returns
+        ``{'status': 'applied', 'findings_updated': int, 'findings_changed':
+        int, 'findings_skipped': int}`` — ``findings_updated`` counts the
+        results that RESOLVED to a finding, ``findings_changed`` the subset
+        that actually mutated it (and so drove the persist).
+        """
+        updated = 0
+        changed = 0
+        skipped = 0
+        for result in results:
+            finding_id = (result or {}).get('finding_id')
+            if not finding_id:
+                skipped += 1
+                continue
+            resolved = self._resolve_finding(run_id, finding_id)
+            if resolved is None:
+                logger.warning(
+                    'recon_report: apply_citation_verification could not resolve '
+                    'run_id=%r finding_id=%r; skipping (citation correction not '
+                    'applied to the durable record)',
+                    run_id,
+                    finding_id,
+                )
+                skipped += 1
+                continue
+            _owning_entry, finding = resolved
+            new_cited = list(result.get('cited_memories') or [])
+            finding_changed = new_cited != finding.cited_memories
+            finding.cited_memories = new_cited
+            seen = {_citation_failure_key(m) for m in finding.citation_failures}
+            for marker in result.get('citation_failures') or []:
+                key = _citation_failure_key(marker)
+                if key in seen:
+                    continue
+                seen.add(key)
+                finding.citation_failures.append(marker)
+                finding_changed = True
+            updated += 1
+            changed += 1 if finding_changed else 0
+
+        # One persist for the whole batch — _persist_run upserts every entry of
+        # the run, so a per-finding call would re-write the same rows N times —
+        # and only when something actually moved, so a clean verification pass
+        # (no drops, no errors, no new markers) costs zero writes.
+        if changed:
+            self._persist_run(run_id)
+
+        return {
+            'status': 'applied',
+            'findings_updated': updated,
+            'findings_changed': changed,
+            'findings_skipped': skipped,
+        }
+
     def set_stat(
         self,
         run_id: str,
@@ -1542,6 +1697,7 @@ class ReconReportState:
                 'cited_memories': list(f.cited_memories),
                 'cited_runs': list(f.cited_runs),  # task-2595
                 'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                'citation_failures': list(f.citation_failures),  # task 2979
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1617,6 +1773,7 @@ class ReconReportState:
                     'cited_memories': list(f.cited_memories),
                     'cited_runs': list(f.cited_runs),  # task-2595
                     'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                    'citation_failures': list(f.citation_failures),  # task 2979
                 })
         return results
 
@@ -2430,6 +2587,70 @@ class ReconReportState:
         self._persist_run(run_id)
         return citation
 
+    async def repair_memory_citation(
+        self,
+        run_id: str,
+        target_run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: str,
+        replacement_memory_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Repair a dangling citation on a finding owned by a COMPLETED run (task 3065).
+
+        This tool exists because the ``cite_*`` tools structurally cannot reach
+        such a finding: they all resolve through ``_resolve_entry(run_id)``,
+        which requires a currently ACTIVE stage, and ``_resolve_finding`` keys
+        strictly on the caller's own ``run_id``. Relaxing either would not help —
+        a closed run's report state is TTL-evicted (300s by default) and its
+        shadow-store rows are deleted at run quiescence, so there is nothing left
+        to resolve against. See ``reconciliation/citation_repair``.
+
+        ``run_id`` keeps its usual meaning (the CALLER's current run) and is
+        resolved unchanged, which also supplies the ``repaired_by`` attribution;
+        ``target_run_id`` is the run that OWNS the finding. The two are
+        deliberately separate rather than one overloaded parameter.
+
+        This is the ONLY recon-report tool that writes to the reconciliation
+        journal. It never touches in-process state — no ``_persist_run``, no
+        ``_Finding`` field — so every existing behaviour here is unaffected.
+
+        The caller's entry also supplies the PROJECT the repair is confined to:
+        ``reconciliation.data_dir`` is a single per-process journal holding runs
+        for every project, so ``caller_project_id=entry.project_id`` is passed
+        down and a ``target_run_id`` owned by another project is refused with
+        ``project_mismatch`` before any Mem0 read or journal write. That keeps
+        this path inside the same containment every ``cite_*`` tool already has
+        (``cite_memory`` scopes its backend read to ``finding_entry.project_id``).
+
+        Returns ``citation_repair``'s outcome, or ``run_id_unknown`` /
+        ``journal_unavailable`` / ``service_not_configured``.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        if self._journal is None:
+            return _ERR_JOURNAL_UNAVAILABLE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        return await citation_repair.repair_memory_citation(
+            self._journal,
+            self._memory_service,
+            target_run_id=target_run_id,
+            finding_id=finding_id,
+            memory_id=memory_id,
+            store=store,
+            replacement_memory_id=replacement_memory_id,
+            repaired_by=f'run:{run_id}',
+            caller_project_id=entry.project_id,
+            # Every run this process still holds report state for is "live" for
+            # repair purposes, whatever its journal row says.
+            live_run_ids=frozenset(rid for (rid, _stage) in self._state),
+        )
+
     async def write_entity_standing_decision(
         self,
         *,
@@ -2631,7 +2852,8 @@ This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
-       cite_entity, cite_edge, cite_task, cite_memory, cite_run.
+       cite_entity, cite_edge, cite_task, cite_memory, cite_run,
+       repair_memory_citation.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2672,6 +2894,22 @@ Citation tools (call after add_finding, before or after complete):
                   (via mem0 count) and attach it.  Copy cited_run_id verbatim
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
+
+Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
+11. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
+                  replacement_memory_id=None) — re-point (or, with no
+                  replacement, drop) a citation that no longer resolves, on a
+                  finding owned by a PRIOR, ALREADY-COMPLETED run. The cite_*
+                  tools cannot reach such a finding at all: they require the
+                  owning run to have a live active stage, and a closed run's
+                  report state is TTL-evicted within minutes.
+                  run_id stays YOUR current run; target_run_id is the run that
+                  OWNS the finding — these are two different things, and
+                  passing the target's id as run_id will just fail with
+                  run_id_unknown.
+                  The cited memory must be CONFIRMED dangling and the
+                  replacement must resolve, so this repairs provenance only; it
+                  can never rewrite a live claim.
 """
 
 
@@ -2869,6 +3107,69 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         """
         return await state.cite_run(
             run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
+        )
+
+    @mcp.tool()
+    async def repair_memory_citation(
+        run_id: str,
+        target_run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: Literal['graphiti', 'mem0'],
+        replacement_memory_id: str | None = None,
+    ) -> dict:
+        """Repair a dangling citation on a PRIOR, already-completed run's finding (task 3065).
+
+        Use when a memory cited by an older run's finding no longer resolves —
+        typically because a Stage-1 consolidation superseded it. The cite_*
+        tools cannot reach such a finding: they require the owning run to have a
+        live active stage, and a closed run's report state is TTL-evicted within
+        minutes. This writes the reconciliation journal's durable
+        stage_reports blob instead.
+
+        run_id is YOUR current run (unchanged from every other tool here);
+        target_run_id is the run that OWNS the finding. Omit
+        replacement_memory_id to DROP the dangling citation instead of
+        re-pointing it.
+
+        Two invariants to understand before calling: the cited memory must be
+        CONFIRMED dangling, and the replacement must resolve. So this can only
+        ever repair provenance — it can never rewrite a live claim, and it can
+        never install a second unresolvable id.
+
+        The repair is confined to YOUR OWN project: the reconciliation journal
+        is shared across every project this process reconciles, so a
+        target_run_id owned by another project is refused (project_mismatch)
+        before any lookup or write. A genuine cross-project correction goes
+        through the out-of-band repair_recon_citation operator script.
+
+        Structured errors: invalid_uuid_shape (either id is not a canonical
+        36-char UUID); unsupported_store (only 'mem0' can be corroborated —
+        get_memory_by_id is a Mem0/Qdrant point read and would false-flag every
+        graphiti citation as dangling); target_run_not_found; project_mismatch
+        (the target run belongs to another project); finding_unknown;
+        citation_not_present (also the idempotent no-op on a re-run);
+        citation_not_dangling (the cited memory still resolves);
+        replacement_not_found; verification_error (a lookup RAISED — unknown is
+        not absent, so nothing is written); run_still_live (the target run is
+        not finished — use cite_memory/delete_finding within a live run; it
+        reports the row's own status under run_status, never under status);
+        journal_error (journal I/O raised — 'phase' says read/write/verify and
+        the hint says whether anything was written); repair_clobbered (the write
+        was made but a re-read does not show it, so another writer rewrote the
+        blob — retry when the run is quiescent); run_id_unknown;
+        journal_unavailable; service_not_configured.
+
+        On success 'status' is 'repaired'; every refusal above is keyed by
+        'error' and carries no 'status', so 'status' is safe to branch on.
+        """
+        return await state.repair_memory_citation(
+            run_id=run_id,
+            target_run_id=target_run_id,
+            finding_id=finding_id,
+            memory_id=memory_id,
+            store=store,
+            replacement_memory_id=replacement_memory_id,
         )
 
     @mcp.tool()

@@ -8,6 +8,7 @@ import enum
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -16,7 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -45,11 +46,20 @@ _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
 # Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
 # the CLI exited on argument validation before contacting the API, so nothing
-# was billed and no work was lost — a free retry.  ONE is deliberate: a single
-# rejection is consistent with a transient race delivering the prompt to the
-# child's stdin, but a SECOND consecutive one is deterministic (a genuinely
-# blank prompt, a broken argv, a wrapper that never pipes stdin) and must reach
-# a human via the normal steward/escalation path instead of looping.
+# was billed and no work was lost — a free retry.  ONE is deliberate: any
+# SECOND consecutive rejection is deterministic (a genuinely blank prompt, a
+# broken argv, a wrapper that never pipes stdin) and must reach a human via the
+# normal steward/escalation path instead of looping.
+#
+# NOTE (task 3147): this was originally written when a single rejection was
+# thought to be MOST likely a transient race delivering the prompt to the
+# child's stdin.  That race was subsequently confirmed by reproduction AND
+# structurally closed on BOTH runners — the payload is now pre-materialized
+# into an fd before execve (see _materialize_stdin), so a stalled event loop
+# can no longer starve the child.  A rejection reaching here is therefore now
+# much more likely to be the DETERMINISTIC kind.  The retry is retained as a
+# backstop for those genuinely deterministic causes, which 3147 does not make
+# impossible — it is no longer the race mitigation it was written to be.
 _MAX_CLI_INPUT_REJECTED_RETRIES = 1
 # Poll interval for the two-regime liveness watchdog in _run_subprocess.
 # Each tick reads the on-disk transcript to check for assistant turns; the
@@ -125,17 +135,32 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
-#   (run_architect_eval invocation)       One cell of a bounded, queue-blocking
-#                                         eval campaign; the 14-day default
-#                                         would park the whole campaign on a
-#                                         single capped cell.
-#                                         AllAccountsCappedException is caught
-#                                         and recorded as a `cap_exhausted:`
-#                                         marker on the cell (tainted, so the
-#                                         cell is EXCLUDED from the reported
-#                                         mean rather than scored a fabricated
-#                                         0.0), never raised.  No
+# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
+#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
+#                                         (esc-3634-1).  It is the one caller in
+#                                         this table that does NOT take the
+#                                         short house value, deliberately.  The
+#                                         short bound was justified as "fail
+#                                         loud rather than park the campaign",
+#                                         but it never prevented the park — a
+#                                         fully-capped pool blocks in the gate's
+#                                         own unbounded _open.wait() regardless
+#                                         (see SCOPE note below), so the bound
+#                                         only chose how many in-flight cells
+#                                         were tainted on the way there.  And a
+#                                         cap lands MID-cell after real spend,
+#                                         which --resume preserves across the
+#                                         account switch: waiting is ~free,
+#                                         while tainting discards that spend and
+#                                         pays it again on the re-run.  48 h
+#                                         skates the 5-hour account caps that
+#                                         produce the common short all-capped
+#                                         windows.  AllAccountsCappedException
+#                                         is still caught and recorded as a
+#                                         `cap_exhausted:` marker on the cell
+#                                         (tainted, so the cell is EXCLUDED from
+#                                         the reported mean rather than scored a
+#                                         fabricated 0.0), never raised.  No
 #                                         max_cap_retries: cooldown doubles per
 #                                         pool cycle, so a fixed count would
 #                                         give a BIGGER account pool LESS
@@ -335,8 +360,12 @@ class AgentResult:
       candidate.  ``success`` stays False (NOT salvaged); callers should raise a
       loud, un-suppressed escalation so the deny-list gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      backgrounded Bash command was still pending (launched via
-      ``run_in_background`` and never subsequently polled/killed).  The headless
+      backgrounded Bash command was still pending — launched via
+      ``run_in_background`` and never subsequently REAPED, where a reap is a
+      ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill OR a tool_use of
+      any kind whose input references the launch's id / output-file path as
+      recorded in its tool_result (task 3639; see
+      ``detect_ended_awaiting_background`` for the full contract).  The headless
       one-shot ``claude --print`` session exits subtype=success and silently
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
       downgrades ``success`` to False when this is set on an otherwise-successful
@@ -352,6 +381,33 @@ class AgentResult:
       Empty string when the invocation did not time out.  Persisted to
       ``.task/zero_output_evidence-iter{N}.json`` by the workflow's
       ``_capture_zero_output_evidence`` helper (task 1739).
+    - ``resume_fallbacks``: how many times THIS invocation armed ``--resume``
+      and had to fall back to a fresh session because the resume itself failed
+      (task 3578).  Stamped by ``invoke_with_cap_retry`` at its single return
+      point from a loop-local counter — the retry loop rebinds ``result`` on
+      every pass, so a count stamped onto a discarded attempt would be lost by
+      construction.  ``shared`` has no event store, so this field is the
+      carrier the orchestrator reads to emit ``session_resume_failed``
+      (``stage='cli'``) for a resume the CLI rejected: previously that loss was
+      invisible in runs.db, because the loop retried fresh and returned a
+      SUCCESS.  Counts fallbacks TAKEN, not resumes armed — a resume that
+      succeeded leaves it 0.
+
+      READ THE PREDICATE EXACTLY: it counts every resumed attempt this loop
+      made that then failed non-cap, which includes a resume **the loop itself
+      re-armed** after a cap hit (the cap branch sets
+      ``invoke_kwargs['resume_session_id'] = result.session_id``).  A caller
+      that never passed ``resume_session_id`` can therefore still come back
+      with a non-zero count, so a consumer asking "did the resume *I* adopted
+      survive?" must corroborate against its OWN armed session id rather than
+      treat this counter as that answer.
+    - ``resume_fallback_session_ids``: the session ids those fallbacks actually
+      dropped, oldest first, one per increment of ``resume_fallbacks``.  The
+      count alone cannot name them: ``_reset_for_fresh_retry`` regenerates the
+      pre-allocated ``session_id`` and a cap re-arm replaces the armed id with
+      ``result.session_id``, so neither the caller's id nor the final
+      ``result.session_id`` is reliably the session that was lost.  A tuple
+      (not a list) so the default is a safe immutable dataclass default.
     """
 
     success: bool
@@ -374,6 +430,8 @@ class AgentResult:
     ended_awaiting_background: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
+    resume_fallbacks: int = 0
+    resume_fallback_session_ids: tuple[str, ...] = ()
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on the
@@ -569,9 +627,175 @@ def note_unreadable_transcript(
 
 # Background-management tool names that "reap" a launched background task — a
 # poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling).  Any of these AFTER the last background launch clears the
-# abandonment verdict.
-_BACKGROUND_REAP_TOOLS = frozenset({'BashOutput', 'KillShell', 'KillBash'})
+# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
+# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
+# 3639).  All five are equally conclusive evidence that the session engaged with
+# its pending work rather than abandoning it, so any of them AFTER the last
+# background launch clears the abandonment verdict.
+_BACKGROUND_REAP_TOOLS = frozenset(
+    {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
+)
+
+# The four tools of the ``mcp__verdict-tools__`` server
+# (``orchestrator/src/orchestrator/mcp/verdict_tools.py:175-233``; prefix
+# registered at ``orchestrator/src/orchestrator/agents/roles.py:23``).  Calling
+# one writes the role's whole deliverable to ``verdicts/<role>.json``, so the
+# session is by construction not waiting on anything (task 3639).  The set is
+# explicit rather than a ``submit_*`` prefix rule: ``submit_task`` is called
+# mid-session to file follow-up work while a background command is genuinely
+# still running — exactly the abandonment task 2761 exists to catch — and
+# ``confirm_plan`` is excluded on the same reasoning.
+_TERMINAL_SUBMISSION_TOOLS = frozenset({
+    'submit_review_verdict', 'submit_completion_verdict',
+    'submit_triage', 'submit_merge_disposition',
+})
+
+
+def _tool_base_name(name: object) -> str:
+    """Return the segment of an MCP tool *name* after the last ``__``.
+
+    ``mcp__verdict-tools__submit_review_verdict`` → ``submit_review_verdict``;
+    a bare name passes through unchanged; a non-``str`` yields ``''``.  Matching
+    on the trailing segment keeps the terminal-submission set robust to the
+    server being renamed or the tool being exposed unprefixed, without
+    loosening WHICH names qualify.
+    """
+    if not isinstance(name, str):
+        return ''
+    return name.rsplit('__', 1)[-1]
+
+# Captures the output-file path from the CLI's background-launch tool_result
+# sentence: "... Output is being written to: /tmp/.../tasks/<id>.output. You
+# will be notified ...".  The trailing ``\.?`` strips the sentence-terminating
+# period without eating the path's own ``.output`` suffix (the lookahead
+# requires whitespace/end after it, which a mid-path dot never satisfies).
+_BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
+
+# Minimum length for a background identity token to be usable as a reap key.
+# The token is matched as a SUBSTRING of later tool inputs, so a short one is
+# not merely weak evidence — it is actively destructive: a 1-2 char id matches
+# essentially every serialized input, marking the first subsequent tool_use of
+# any kind as a reap and silently muting the abandonment verdict for the whole
+# transcript.  Real ``backgroundTaskId`` values sampled from transcripts are 9
+# chars (e.g. ``b1ucu6z5t``) and log paths are far longer, so 6 discards only
+# degenerate/corrupt ids while never rejecting a real one.  Note the tradeoff
+# is NOT free in the module's usual fail-safe direction: dropping a token loses
+# a reap and so makes the detector MORE likely to fire (i.e. to downgrade), the
+# direction this module otherwise avoids.  It is accepted because the floor is
+# unreachable by any observed real id — the guard is inert on real transcripts
+# — whereas the failure it prevents mutes the detector for the ENTIRE
+# transcript, which is the strictly larger loss (reviewer_comprehensive
+# amendment, task 3639).
+_MIN_BG_TOKEN_LEN = 6
+
+
+def _content_blocks(record: object) -> list:
+    """Return *record*'s content blocks, tolerating both transcript nestings.
+
+    The real CLI shape nests blocks under ``record['message']['content']``;
+    a flat ``record['content']`` is also accepted (older records and the
+    ``nested=False`` half of the detector's parametrized fixtures).  Anything
+    else — a non-dict record, a missing key, a non-list content — yields an
+    empty list rather than raising.
+
+    SOLE expression of that tolerance rule: both ``_iter_result_texts`` and
+    ``detect_ended_awaiting_background`` route through here, so a future CLI
+    nesting change is a one-line fix in one place rather than two copies that
+    can drift (reviewer_comprehensive amendment, task 3639 — previously the
+    same cascade was inlined in each).
+    """
+    if not isinstance(record, dict):
+        return []
+    message = record.get('message')
+    if isinstance(message, dict) and isinstance(message.get('content'), list):
+        return message['content']
+    content = record.get('content')
+    if isinstance(content, list):
+        return content
+    return []
+
+
+def _iter_result_texts(record: dict):
+    """Yield the text of every ``tool_result`` block in a transcript *record*.
+
+    Tolerant of both content nestings (via ``_content_blocks``) and of a block
+    ``content`` that is either a plain ``str`` or a list of
+    ``{'type': 'text', 'text': ...}`` sub-blocks.  Malformed shapes yield
+    nothing rather than raising.
+    """
+    for block in _content_blocks(record):
+        if not isinstance(block, dict) or block.get('type') != 'tool_result':
+            continue
+        content = block.get('content')
+        if isinstance(content, str):
+            yield content
+        elif isinstance(content, list):
+            for sub in content:
+                if isinstance(sub, dict) and isinstance(sub.get('text'), str):
+                    yield sub['text']
+
+
+def _iter_input_strings(value: object):
+    """Yield every ``str`` reachable inside a tool_use ``input`` *value*.
+
+    Walks dict values (and str keys) and list/tuple items depth-first; scalars
+    that are not ``str`` (``int``/``float``/``bool``/``None``) yield nothing,
+    and any other object yields its ``str()`` — preserving what
+    ``json.dumps(..., default=str)`` used to expose for an exotic leaf such as
+    a ``Path``.
+
+    Replaces serializing the whole input (reviewer_comprehensive amendment,
+    task 3639): once ``bg_tokens`` is non-empty, EVERY subsequent tool_use was
+    fully ``json.dumps``-ed, allocating a complete string copy of every
+    ``Write`` body / ``Edit`` old+new pair / ``TodoWrite`` list in the
+    transcript on each invocation-end.  Yielding the already-materialized
+    strings lets ``any()`` short-circuit on the first hit and allocates
+    nothing for the common case.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _iter_input_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_input_strings(item)
+    elif value is not None and not isinstance(value, (int, float)):
+        # bool is an int subclass, so it is covered by the isinstance above.
+        yield str(value)
+
+
+def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
+    """Add *record*'s background-launch identity tokens to *tokens*, if any.
+
+    A background launch's ``user`` tool_result record carries the task's
+    identity in TWO places; both are read (union, not either/or) so a CLI
+    version emitting only one still yields a token:
+
+    - structured — ``record['toolUseResult']['backgroundTaskId']``;
+    - text — the path captured from the ``Output is being written to: <path>``
+      sentence in the tool_result body.
+
+    The task id is a substring of the log path
+    (``/tmp/claude-1000/<slug>/<sess>/tasks/<id>.output``), so either token
+    identifies a later reference to the file.  Every access is isinstance-
+    guarded: a malformed record contributes nothing and never raises.
+
+    Tokens shorter than ``_MIN_BG_TOKEN_LEN`` are DROPPED (see that constant):
+    a degenerate id would substring-match essentially every tool input and
+    silently mute the detector altogether.
+    """
+    tur = record.get('toolUseResult')
+    if isinstance(tur, dict):
+        task_id = tur.get('backgroundTaskId')
+        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
+            tokens.add(task_id)
+    for text in _iter_result_texts(record):
+        for match in _BG_LOG_PATH_RE.findall(text):
+            if len(match) >= _MIN_BG_TOKEN_LEN:
+                tokens.add(match)
 
 
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
@@ -584,13 +808,44 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
 
     - a **launch** = a ``Bash`` tool_use whose ``input.run_in_background`` is
       truthy;
-    - a **reap** = any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use.
+    - a **reap** = either of:
+
+      * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use, or their
+        Task-tool analogues ``TaskOutput`` (collects a backgrounded
+        Task/subagent's result) and ``TaskStop`` (terminates it);
+      * a tool_use of ANY kind whose input references the background task's id
+        or output-file path, as recorded in the launch's tool_result
+        (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
+        written to: <path>`` sentence);
+      * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
+        matched on the segment after the last ``__``) — calling one writes the
+        role's whole deliverable to ``verdicts/<role>.json``, so the session has
+        finished its job and cannot still be waiting on anything.
 
     Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
     final background-management action was a launch never followed by a
     poll/kill.  Any engagement with a background task (a poll or kill after it)
     clears the verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
+
+    RCA for the second reap clause (task 3639): the original vocabulary named
+    only the three background-management tools, so the very common shape of
+    reading the bg-log directly — ``Bash tail/cat/grep <log>``, or ``Read`` /
+    ``Grep`` on that path, which the CLI's own launch message recommends ("To
+    check interim output, use Read on that file path") and which
+    ``agents/roles.py``'s wait-guidance explicitly sanctions — counted as no
+    engagement at all.  On the ``_lane-31`` specimen (four backgrounded
+    ``cargo test`` runs, each tailed, zero ``BashOutput``) the detector fired
+    and falsified ``success`` on a completed run; the measured false-positive
+    rate for the class was ~98%.  Matching on the tool_result's identity token
+    rather than on shell verbs covers the whole observed reap surface in one
+    tool-agnostic rule, with no enumeration of spellings to drift out of date.
+
+    ACCEPTED remaining gap: a launch whose own command self-redirects (e.g.
+    ``… > /tmp/x.log``) and is later tailed is NOT recognised as reaped, since
+    no CLI-issued token exists to key on and parsing the command's redirection
+    target would reintroduce exactly the fragility this rule avoids.  That
+    shape keeps today's (firing) behaviour.
 
     Fail-safe / conservative by construction — a ``success``→failure downgrade
     must NEVER re-run a genuinely complete task on ambiguous data:
@@ -614,27 +869,59 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     last_launch_idx = -1
     last_reap_idx = -1
     pos = 0  # strictly-increasing position over tool_use blocks (record- then block-order)
+    bg_tokens: set[str] = set()  # identity tokens of the launches seen so far
     for record in records:
-        if not isinstance(record, dict) or record.get('type') != 'assistant':
+        if not isinstance(record, dict):
             continue
-        message = record.get('message')
-        if isinstance(message, dict) and isinstance(message.get('content'), list):
-            blocks = message['content']
-        elif isinstance(record.get('content'), list):
-            blocks = record['content']
-        else:
+        if record.get('type') == 'user':
+            # A launch's tool_result arrives on a ``user`` record; harvest its
+            # identity tokens so later foreground references can be matched.
+            _collect_bg_tokens(record, bg_tokens)
             continue
-        for block in blocks:
+        if record.get('type') != 'assistant':
+            continue
+        for block in _content_blocks(record):
             if not isinstance(block, dict) or block.get('type') != 'tool_use':
                 continue
             pos += 1
+            # Normalize the name to ``str`` ONCE, up front, so every membership
+            # test below is on a hashable.  A block carrying a non-scalar name
+            # (``'name': ['weird']``) previously reached ``name in
+            # _BACKGROUND_REAP_TOOLS`` and raised ``TypeError: unhashable
+            # type`` — breaking this function's "malformed blocks are skipped,
+            # never raise" contract at an unguarded call site inside
+            # ``_run_subprocess``, i.e. failing the whole agent invocation
+            # (reviewer_comprehensive amendment, task 3639).  ``''`` matches no
+            # tool name, so such a block falls through to the token check —
+            # exactly its pre-normalization classification for the non-raising
+            # shapes.
             name = block.get('name')
+            if not isinstance(name, str):
+                name = ''
             if name == 'Bash':
                 inp = block.get('input')
                 if isinstance(inp, dict) and inp.get('run_in_background'):
                     last_launch_idx = pos
-            elif name in _BACKGROUND_REAP_TOOLS:
+                    continue
+            elif name in _BACKGROUND_REAP_TOOLS or (
+                _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
+            ):
                 last_reap_idx = pos
+                continue
+            # Branch order is load-bearing: launch → named reap tool →
+            # token reference.  A ``run_in_background`` Bash that happens to
+            # mention an earlier token is still classified as a LAUNCH.
+            if bg_tokens:
+                try:
+                    matched = any(
+                        token in text
+                        for text in _iter_input_strings(block.get('input'))
+                        for token in bg_tokens
+                    )
+                except Exception:  # pragma: no cover - the walk is total
+                    matched = False
+                if matched:
+                    last_reap_idx = pos
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
@@ -793,6 +1080,18 @@ def is_cli_invocation_rejected(result: AgentResult) -> bool:
     with ``turns=0``, ``cost_usd=0.0``, ``duration_ms=17331``,
     ``timed_out=False``, and empty stdout.
 
+    CAUSE CONFIRMED AND FIXED (task 3147) — do not re-investigate.  The
+    observed payload above was reproduced against the real CLI (v2.1.226) and
+    against ``_run_subprocess`` itself: the spawn path passed a bare
+    ``stdin=PIPE`` and left the prompt to be written by the EVENT LOOP after
+    ``execve``, so any loop stall past the CLI's ~3s stdin deadline lost the
+    run.  (The otherwise-puzzling multi-second ``duration_ms`` on a run that
+    never reached a turn is the CLI's teardown, which runs long AFTER it has
+    already given up on stdin.)  The fix pre-materializes the payload into an
+    fd before spawn on BOTH runners — see ``_materialize_stdin``.  What can
+    still legitimately arrive here is the deterministic family: a blank
+    prompt, a broken argv, or a wrapper that never pipes stdin.
+
     Deliberately contrasted with ``is_zero_output_timeout``: that predicate is
     keyed to the TIMEOUT family (it returns False immediately unless
     ``result.timed_out``), so it always misses this failure — which is exactly
@@ -847,11 +1146,19 @@ def require_non_blank_prompt(
     ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
-    argument).  The prompt is delivered solely by
-    ``stdin_data = prompt.encode()``, and a blank one pipes happily — the CLI
+    argument).  The prompt is delivered solely on stdin — ``stdin_data =
+    prompt.encode()``, pre-materialized into an unlinked temp file and handed
+    to the child as an already-open fd (task 3147; see ``_materialize_stdin``)
+    — and a blank one is delivered just as happily as a real one.  The CLI
     then exits on argument validation with an opaque
     "Input must be provided either through stdin or as a prompt argument"
     error, zero-cost and zero-turn, with no indication that WE sent nothing.
+
+    That argv shape is why this guard is load-bearing and why the delivery
+    mechanism may never move to argv: with no positional prompt and no ``-``
+    marker, the CLI cannot distinguish "empty input" from "no input", so both
+    a blank prompt and (before 3147) an undelivered one produced the identical
+    opaque error.  Pinned by ``test_argv_never_carries_the_user_prompt``.
 
     Called at every boundary that can originate an invocation, so the failure
     surfaces at the caller that built the blank prompt — with *context* naming
@@ -1636,6 +1943,17 @@ async def invoke_with_cap_retry(
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
     started_at = ''
     completed_at = ''
+    # Loop-local, stamped onto the RETURNED result at the single exit below
+    # (task 3578).  Must live out here rather than on any individual result:
+    # the retry loop rebinds `result` on every pass, so a count written to the
+    # failed resume's result object is discarded along with it.
+    resume_fallbacks = 0
+    # The ids those fallbacks dropped, in order — same lifetime and same
+    # reasoning as the counter above.  Kept alongside rather than derived at
+    # the exit: by then _reset_for_fresh_retry has already regenerated the
+    # pre-allocated session_id, so the lost id is unrecoverable from the
+    # returned result.
+    resume_fallback_session_ids: list[str] = []
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -1806,6 +2124,12 @@ async def invoke_with_cap_retry(
                 # argument validation BEFORE contacting the API.  The agent was
                 # never asked anything, nothing was billed and no transcript
                 # exists — so this is a free retry, not an agent failure.
+                # Since task 3147 the TRANSIENT cause (a stalled event loop
+                # missing the child's stdin deadline) is structurally closed on
+                # both runners, so what reaches here should now be the
+                # deterministic family — for which the single retry is a
+                # backstop that buys one more attempt before escalating, not a
+                # fix.  See _MAX_CLI_INPUT_REJECTED_RETRIES.
                 #
                 # POSITIONING is load-bearing in two directions:
                 # - ABOVE the heuristic cap safety-net below: the CLI's stdin
@@ -2241,6 +2565,25 @@ async def invoke_with_cap_retry(
                 # live-continuation caller's original_prompt (resume_delivers_prompt=True)
                 # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
+                    # This branch — and ONLY this branch — is the population
+                    # task 3578 measured: 28 occurrences where a resume was
+                    # armed, the CLI rejected it, and the loop retried fresh
+                    # and returned a SUCCESS, leaving no runs.db event at all.
+                    # Deliberately NOT folded in with the cap-hit
+                    # 'fresh (transcript unreachable)' path above: that one is
+                    # already visible as a cap_hit event, and counting both
+                    # here would conflate two populations with different causes.
+                    #
+                    # NOTE the armed id here is not necessarily the CALLER's:
+                    # after a cap hit this loop re-arms a resume of its own
+                    # (result.session_id), and that re-armed resume can land in
+                    # this branch too.  Record WHICH session each fallback lost
+                    # so the consumer can name it instead of guessing from a
+                    # pre-allocated id the fresh retry has already replaced.
+                    resume_fallbacks += 1
+                    resume_fallback_session_ids.append(
+                        str(invoke_kwargs['resume_session_id']),
+                    )
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
@@ -2254,6 +2597,8 @@ async def invoke_with_cap_retry(
                 break
 
     result.account_name = account_name
+    result.resume_fallbacks = resume_fallbacks
+    result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -2509,7 +2854,12 @@ async def _invoke_claude(
         strict_mcp_config=strict_mcp_config,
     )
 
-    # User prompt is piped via stdin to avoid ARG_MAX on large payloads
+    # User prompt goes over stdin, never argv, to avoid ARG_MAX on large
+    # payloads (and to keep it out of `ps` output and systemd scope names).
+    # _run_subprocess pre-materializes these bytes into an unlinked temp file
+    # BEFORE spawning, rather than writing them to a pipe afterwards, so a
+    # stalled event loop cannot make the child miss its ~3s stdin deadline
+    # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
@@ -2752,6 +3102,19 @@ def _cpu_govern_prefix(env: dict[str, str]) -> list[str]:
     process-group kill logic in ``_run_subprocess`` are unaffected.  Cargo and
     rustc children inherit the cgroup scope via fork, which is the intended
     effect for DF-1.
+
+    TIMING (task 3147): the wrapper performs TWO blocking ``systemd-run --user
+    --scope`` D-Bus round-trips — a probe plus the real exec — before the CLI
+    itself execs.  That measurably WIDENS the window between spawn and the
+    child's first read of stdin.  It was investigated as a suspect for the
+    esc-3118-1 starvation race and REFUTED as the cause (it is inert in the
+    live deployment: ``cpu_governance.exec_path`` is unset, so
+    ``resolved_exec_path()`` returns None and this function emits nothing); the
+    cause was the parent writing the prompt to a pipe AFTER ``execve``.  It is
+    harmless now that the payload is pre-materialized before spawn — and that
+    is exactly why the delivery must not be "optimized" back to a lazily-written
+    pipe: this wrapper would widen the window that fix closed.  Pinned by
+    ``TestStdinStarvationRace::test_stdin_survives_govern_and_nice_wrapper_chain``.
     """
     raw = env.pop('DF_AGENT_CPU_GOVERN', None)
     if not raw:
@@ -2804,6 +3167,87 @@ def _cpu_priority_prefix(env: dict[str, str]) -> list[str]:
     return ['nice', '-n', str(n)]
 
 
+def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
+    """Write *stdin_data* into an unlinked temp file and return it positioned at 0.
+
+    THE INVARIANT: the payload is resident in the kernel BEFORE ``execve``, so
+    the child's very first ``read(0)`` succeeds no matter how long — or how
+    badly — the parent's event loop is stalled.
+
+    This closes the race confirmed under task 3147 (esc-3118-1, and the
+    esc-3072-1 / 3111-1 / 3112-1 / 3113-1 burst that landed within 7 seconds of
+    it).  The previous shape spawned with ``stdin=PIPE`` and then handed the
+    bytes to ``communicate(input=...)``, i.e. the payload was written to the
+    child's pipe BY THE EVENT LOOP, after the child had already exec'd and
+    started counting.  The claude CLI gives up on an empty stdin after ~3s
+    ('no stdin data received in 3s') and — because its argv carries neither a
+    positional prompt nor a ``-`` stdin marker (see ``build_claude_argv``) — it
+    cannot tell "input is coming" from "there is no input", so it exits on
+    ARGUMENT VALIDATION pre-first-turn: ``turns=0``, ``cost_usd=0.0``,
+    ``timed_out=False``, empty stdout.  Any loop stall >= that deadline in the
+    window between exec and the write was silently, unrecoverably fatal, and
+    the orchestrator runs one event loop across up to 48 concurrent agents.
+
+    ``tempfile.TemporaryFile()`` is unlinked at creation (Linux ``O_TMPFILE``),
+    so the payload never appears in the filesystem namespace, needs no
+    ``temp_files`` bookkeeping or ``finally`` unlink, and its inode is
+    reclaimed when the last fd closes even if the process is killed mid-spawn.
+    A pre-filled ``os.pipe()`` was measured to close the race too but is
+    capacity-bounded (65536 bytes by default, 1 MiB ceiling via
+    ``/proc/sys/fs/pipe-max-size``): writing a larger payload would block the
+    parent BEFORE spawn with no reader attached — a deadlock strictly worse
+    than the bug.  Briefing prompts routinely exceed 64 KiB.
+
+    Raises rather than falling back to ``stdin=PIPE``.  A silent fallback would
+    reintroduce this exact race in precisely the degraded conditions (disk
+    pressure, exhausted fds) where the loop is most likely to be stalled, and
+    would do so invisibly — see the ``no-silent-fail-soft`` design invariant.
+    On failure the file is closed before re-raising so no fd is leaked.
+
+    THE RETURNED FD IS READ-ONLY.  ``tempfile.TemporaryFile()`` opens ``'w+b'``
+    (``O_RDWR``), and fd 0 is inherited by the child's WHOLE subtree — bwrap,
+    the systemd-run scope, ``nice``, the CLI, and every tool the agent itself
+    spawns.  The shape this replaced handed the child the read end of a pipe,
+    so a writable stdin would have been a silent widening of what that subtree
+    can do to its own input.  The payload is therefore re-opened ``O_RDONLY``
+    through ``/proc/self/fd/N`` — same still-unlinked inode, no filesystem
+    name, fresh description already at offset 0 — and the read-write handle is
+    closed.
+
+    That narrowing is deliberately BEST-EFFORT and logs when it is skipped,
+    which is not the same fail-soft the paragraph above forbids: the
+    race-closing invariant (payload resident in the kernel before ``execve``)
+    holds identically either way, so a host without ``/proc`` degrades to
+    today's read-write fd rather than losing every spawn.  A ``stdin=PIPE``
+    fallback would instead give up the invariant itself, which is why that one
+    raises.
+    """
+    # noqa SIM115: a context manager is exactly wrong here — the fd must
+    # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
+    # can dup it, and the caller closes the parent's handle immediately after
+    # spawn (that close is what delivers EOF to the child).
+    f = tempfile.TemporaryFile()  # noqa: SIM115
+    try:
+        f.write(stdin_data)
+        f.flush()
+        f.seek(0)  # only load-bearing on the read-write fallback arm below
+    except BaseException:
+        f.close()
+        raise
+
+    try:
+        ro = open(f'/proc/self/fd/{f.fileno()}', 'rb')  # noqa: SIM115 — see above
+    except OSError as e:
+        logger.warning(
+            f'stdin payload could not be narrowed to a read-only fd ({e}); '
+            f'handing the child the read-write handle instead. The task-3147 '
+            f'pre-materialization invariant is unaffected.'
+        )
+        return f
+    f.close()
+    return ro
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -2819,8 +3263,13 @@ async def _run_subprocess(
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
-    *stdin_data*, when set, is piped to the process's stdin.  This avoids
-    passing large payloads as command-line arguments (which hit ARG_MAX).
+    *stdin_data*, when set, is delivered on the process's stdin.  This avoids
+    passing large payloads as command-line arguments (which hit ARG_MAX).  It
+    is NOT written through a pipe by the event loop: it is pre-materialized
+    into an unlinked temp file handed to the child as an already-open fd, so
+    the payload is readable before ``execve`` and cannot be lost to an
+    event-loop stall (task 3147 — see ``_materialize_stdin``).  ``None`` leaves
+    stdin inherited from the parent.
 
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
     WORKING regime past *timeout_seconds* while the transcript keeps
@@ -2844,15 +3293,28 @@ async def _run_subprocess(
     # (PRD C-G1).
     spawn_cmd = _cpu_govern_prefix(env) + _cpu_priority_prefix(env) + cmd
 
-    proc = await asyncio.create_subprocess_exec(
-        *spawn_cmd,
-        cwd=str(cwd),
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Pre-materialize the prompt BEFORE the child exists (task 3147).  The
+    # bytes must be in the kernel before execve, or a stalled event loop can
+    # miss the CLI's ~3s stdin deadline and lose the run — see
+    # _materialize_stdin's docstring for the confirmed failure mode.
+    # stdin_data is None must still yield stdin=None (inherited).
+    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *spawn_cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's handle as soon as the child has its own dup — this
+        # is what guarantees the child sees EOF at the end of the payload.  In
+        # a `finally` so a raising create_subprocess_exec cannot leak the fd.
+        if stdin_file is not None:
+            stdin_file.close()
     # Capture pgid at spawn (pgid == pid under start_new_session).  Never
     # refresh via os.getpgid() later — the PID may be reused post-reap.
     pgid = proc.pid
@@ -2896,7 +3358,11 @@ async def _run_subprocess(
             # must not silence each other.
             unreadable_escape_fired = False
 
-            comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
+            # No `input=`: stdin was pre-materialized as a real fd before spawn
+            # (task 3147), so communicate() performs reads only.  That also keeps
+            # the SECOND communicate() inside the SIGTERM grace window below
+            # valid, since there is no PIPE for it to try to re-write.
+            comm_task = asyncio.ensure_future(proc.communicate())
 
             while True:
                 elapsed = time.monotonic() - watchdog_start

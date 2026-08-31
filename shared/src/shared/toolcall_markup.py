@@ -10,7 +10,7 @@ four, so a mis-closed ``description`` could not report its own tag and the
 write-time guard blamed whatever happened to follow it. Both names are now
 re-exports of the ones defined here; no third site enumerates the literals.
 
-## One set, two named predicates — the calibration split is PRESERVED
+## One set, FOUR named predicates — the calibration split is PRESERVED
 
 The two consumers are calibrated in opposite directions ON PURPOSE, and this
 module keeps both as NAMED PREDICATES OVER ONE LITERAL SET rather than as two
@@ -30,8 +30,30 @@ VALUE or ORDER may change here. Order is load-bearing for the prefilter:
 clauses with ``strict=True``.
 
 :func:`detect` is the third predicate over the same set — a blanket
-earliest-position scan of the UNION, which is what the boundary middleware
-consumes.
+earliest-position scan of the UNION, for callers with NO parameter in hand.
+
+:func:`detect_for` is the fourth, and it exists because the other three were
+structurally blind to the dominant leak dialect (task **4696**). The fixed set
+above echoes no INVOKED TOOL'S OWN parameter names, while :func:`repair` has
+always qualified a candidate on ``X == param`` / ``X in schema_params``. A
+value mis-closed with its own name-echoing tag — ``plan-tools`` writes
+``rationale``, ``how``, ``decision``, ``what`` — therefore matched no literal,
+every gate that asked :func:`detect` first returned ``None``, and the corrupt
+value was waved straight to disk even though the repairer standing behind that
+gate could already fix it. That asymmetry, a schema-aware repairer behind a
+schema-blind detector, WAS the silent write path. Measured over
+``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: 444 corrupted entries, of
+which **212 (48%) are invisible to the fixed set** — and **212 of 212** of
+those are caught by the SELF-NAME closer alone.
+
+:func:`detect_for` widens the scan with ``closer_for(param)`` and the callers'
+``schema_params``; it enumerates NO new literal (INV-5) because every added
+needle is built by :func:`closer_for`. :func:`detect` is deliberately left
+byte-for-byte as it was rather than growing an optional keyword: three call
+sites legitimately have no parameter in hand (:func:`repair`'s own diagnostic,
+the sweep's bare list items, prose scans), and an optional keyword would make
+each site's blindness ungreppable. The predicates split by NAME so a reader can
+see at a glance which gates are parameter-aware.
 
 ## Staged API — the consumer of :func:`repair` and :func:`detect`
 
@@ -85,6 +107,7 @@ __all__ = [
     'Repair',
     'closer_for',
     'detect',
+    'detect_for',
     'markup_override_requested',
     'repair',
     'strip_markup_override',
@@ -202,6 +225,82 @@ def detect(value: object) -> str | None:
     return match.group(0) if match is not None else None
 
 
+@lru_cache(maxsize=256)
+def _widened_re(extra_names: frozenset[str]) -> re.Pattern[str]:
+    """:data:`_ENVELOPE_RE` widened with the closer of every *extra_names* name.
+
+    ONE compiled alternation, exactly like :data:`_ENVELOPE_RE` and for exactly
+    its reason — the widened predicate sits on the same per-tool-call boundary,
+    so it must stay one pass over the value rather than becoming a loop over
+    ``6 + len(extra_names)`` needles.
+
+    :data:`ENVELOPE_LITERALS` comes FIRST so the fixed set keeps its documented
+    tuple order; the added closers are sorted so the pattern (and therefore the
+    cache) is deterministic. Neither ordering is observable today: no two
+    members can match at the same position, since every closer is
+    ``\x3c/NAME>`` and two different names differ before the bracket.
+
+    An EMPTY *extra_names* returns the module-level :data:`_ENVELOPE_RE` object
+    itself, so a caller with no usable parameter allocates nothing and gets
+    byte-identical behaviour to :func:`detect`.
+    """
+    if not extra_names:
+        return _ENVELOPE_RE
+    literals = (
+        *ENVELOPE_LITERALS,
+        *(closer_for(name) for name in sorted(extra_names)),
+    )
+    return re.compile('|'.join(re.escape(literal) for literal in literals))
+
+
+def detect_for(
+    value: object,
+    param: object,
+    schema_params: object = (),
+) -> str | None:
+    """:func:`detect`, plus the closing tag of *param* and of *schema_params*.
+
+    THE PARAMETER-AWARE GATE (task **4696**). *param* is the name the value was
+    received as and *schema_params* every parameter name of that tool — the
+    same two arguments :func:`repair` already qualifies its candidates on, so a
+    gate that asks this predicate can no longer be blind to a dialect the
+    repairer behind it can fix. See the module docstring for the measurement
+    that motivated it (212 of 444 corrupted entries invisible to the fixed set;
+    212 of those 212 caught by the SELF-NAME closer alone).
+
+    A STRICT SUPERSET of :func:`detect`: every fixed literal is still scanned,
+    still reported EARLIEST BY TEXT POSITION rather than by tuple order, and
+    still case-sensitively. Widening can only ADD needles, never shadow,
+    reorder or suppress the existing set.
+
+    NO NEW LITERAL IS ENUMERATED (INV-5). Every added needle is built by
+    :func:`closer_for`, the one place a closing tag is spelled; a name whose
+    closer is already in :data:`ENVELOPE_LITERALS` is dropped rather than
+    re-added.
+
+    Total, on the same terms as :func:`detect` and for the same reason — the
+    gates that call it must need no pre-validation. A *value* that is not a
+    non-empty ``str`` returns ``None``. A *param* that is not a non-empty
+    ``str`` is DROPPED, degrading to exactly :func:`detect`'s behaviour rather
+    than to a degenerate empty-name tag that would match prose. A
+    *schema_params* that is not a collection of names — including a bare
+    ``str``, which would iterate into CHARACTERS and manufacture one-letter
+    needles — contributes nothing, via the same fail-safe :func:`repair` uses.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    extra = _as_name_set(schema_params)
+    if isinstance(param, str) and param:
+        extra = extra | {param}
+    extra = frozenset(
+        name
+        for name in extra
+        if name and closer_for(name) not in ENVELOPE_LITERALS
+    )
+    match = _widened_re(extra).search(value)
+    return match.group(0) if match is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Repair — recovering the parameters the harness parser silently dropped.
 # ---------------------------------------------------------------------------
@@ -275,6 +374,13 @@ def _as_name_set(names: object) -> frozenset[str]:
     caller bug that must never be read as a schema) yields the EMPTY set. That
     is the fail-safe direction: an empty schema qualifies no recovered name, so
     :func:`repair` refuses rather than recovering against a phantom schema.
+
+    :func:`detect_for` is its second consumer (task 4696), deliberately so: the
+    GATE and the REPAIRER must agree on what counts as a schema, or a value the
+    gate widened onto could reach a repairer that then refuses to qualify it.
+    It is defined here rather than beside :func:`detect_for` because
+    :func:`repair` was its first consumer and this is where its fail-safe
+    direction is argued.
     """
     if isinstance(names, (str, bytes)) or not isinstance(names, Iterable):
         return frozenset()
@@ -363,15 +469,34 @@ def repair(
     itself envelope-free. Otherwise ``None`` — never a guess, and never a
     PARTIAL repair.
 
+    ONE FURTHER ACCEPT-TIME CONDITION, THE QUOTATION GUARD (task **4696**
+    review). A candidate whose tail is EMPTY, whose ``X != param``, and whose
+    closer is not one of the fixed :data:`ENVELOPE_LITERALS` is REFUSED: it
+    recovers nothing, so accepting it would merely truncate the caller's text
+    at a sibling's closing tag — prose QUOTING that tag, not an argument
+    absorbed by it. See the guard at the accept site for the census that says
+    the cross-field leak population is zero. Never a TRUNCATION dressed up as
+    a repair.
+
     NO SILENT PARTIAL REPAIR. The returned ``clean_value`` is guaranteed to
-    satisfy ``detect(clean_value) is None``. This is a contract, not an
-    accident of the scan: contract C2's middleware forwards ``clean_value`` as
-    the repaired argument, so a value that still tripped :func:`detect` would
-    re-trip the write-time tripwire downstream AND would have silently dropped
-    whatever caller arguments were hiding in the residue — the exact failure
-    this module exists to end, reintroduced by its own repairer. When the only
-    candidates that parse would leave a poisoned prefix, the honest answer is
-    ``None``.
+    satisfy ``detect_for(clean_value, param, schema_params) is None`` — and
+    therefore ``detect(clean_value) is None`` too, since the parameter-aware
+    predicate is a strict superset. This is a contract, not an accident of the
+    scan: contract C2's middleware forwards ``clean_value`` as the repaired
+    argument, so a value that still tripped the detector would re-trip the
+    write-time tripwire downstream AND would have silently dropped whatever
+    caller arguments were hiding in the residue — the exact failure this module
+    exists to end, reintroduced by its own repairer. When the only candidates
+    that parse would leave a poisoned prefix, the honest answer is ``None``.
+
+    The guard is stated against :func:`detect_for` rather than :func:`detect`
+    as of task **4696**, because the gates that consume ``clean_value`` are
+    parameter-aware: a prefix carrying a canonical closer for *param* or for a
+    *schema_params* member would re-trip ``plan_tools._carries_markup`` and the
+    sweep on the very next read. Measured over the committed corpus at that
+    task's HEAD — 504 records, 443 accepted, ZERO carrying a qualifying closer
+    in the accepted prefix — so the tightening changed no per-specimen
+    expectation; it closed the DOUBLE SELF-NAME MISCLOSE hole and nothing else.
 
     The canonical closer is always a candidate even though C1's literal wording
     does not list it. PRD section 2.1's fourth specimen mis-closes ``content``
@@ -411,6 +536,38 @@ def repair(
         recovered = _parse_tail(value[candidate.end():])
         if recovered is None:
             continue
+        # THE QUOTATION GUARD (task 4696 review). An EMPTY tail means the
+        # candidate closer sits at end-of-string with NOTHING after it, so there
+        # is no absorbed argument to recover and the "repair" degenerates to a
+        # pure TRUNCATION of the caller's own text at that tag.
+        #
+        # That truncation is right for a SELF-NAME closer (``name == param``):
+        # the value was mis-closed with its own tag and was the tool's last
+        # parameter, which is PRD boundary row B4 and the entire 212-of-212
+        # population the 2026-08-25 census measured. It is also right for the
+        # FIXED literal set, whose members trip ``detect`` and have therefore
+        # always been repaired here — this task changed nothing for them.
+        #
+        # It is WRONG for a name contributed by the WIDENING, i.e. a sibling
+        # parameter's closer that ``detect_for`` only started spelling at this
+        # task. Prose that legitimately ENDS by quoting a sibling's tag pair —
+        # ubiquitous in a repo whose plans and escalation records discuss this
+        # very markup — is not an absorbed argument, and the same census puts
+        # the genuine CROSS-FIELD leak population at ZERO. Truncating it would
+        # destroy authored text and, worse, report ``repaired`` while doing so,
+        # so nothing would ever surface it for adjudication.
+        #
+        # Refusing (rather than accepting) leaves the value BYTE-IDENTICAL and
+        # lets the caller report it — ``plan_tools`` as ``unrepairable``, the
+        # sweep as ``refused`` — into the human queue. Detection breadth is
+        # deliberately NOT narrowed: a real cross-field leak still carries a
+        # non-empty tail, still parses, and is still repaired here.
+        if (
+            not recovered
+            and name != param
+            and closer_for(name) not in ENVELOPE_LITERALS
+        ):
+            continue
         # Accept-time conditions, so a rejected candidate simply advances the
         # scan. Boundary rows B8 (recovered name not in the tool's schema) and
         # B9 (recovered name already supplied by the caller) both land here.
@@ -423,13 +580,23 @@ def repair(
         # candidate whose tail does not parse, which leaves that closer sitting
         # inside every LATER candidate's prefix — and if it is itself an
         # envelope literal, accepting would hand back a clean_value that still
-        # trips detect() while permanently dropping whatever arguments hide in
-        # the residue. `continue` rather than `return None` keeps all three
+        # trips the detector while permanently dropping whatever arguments hide
+        # in the residue. `continue` rather than `return None` keeps all three
         # refusals one shape; the outcome is identical either way because
         # candidate start positions increase monotonically, so a poisoned
         # prefix stays poisoned — but `continue` needs no such argument to be
         # correct.
-        if detect(clean_value) is not None:
+        #
+        # TASK 4696: this guard was ITSELF blind to the dominant dialect until
+        # now. It asked the param-free detect(), which spells none of the
+        # invoked tool's own parameter names — so a DOUBLE self-name misclose
+        # was accepted with the first closer still in the prefix AND the prose
+        # stranded between the two closers silently dropped. It now asks
+        # detect_for with the same (param, schema_params) the candidate
+        # qualification above uses, which is the only way the guard can be as
+        # wide as the rule it is guarding: every candidate this scan can step
+        # over is, by construction, a closer detect_for spells.
+        if detect_for(clean_value, param, schema) is not None:
             continue
 
         misclose = candidate.group(0)
@@ -441,7 +608,18 @@ def repair(
         # contain a closing tag. Hoisting a detect() above the loop would
         # instead pay a full-string scan on that overwhelmingly common no-op
         # path, at a per-tool-call middleware boundary (PRD contract C2) over
-        # values the corpus shows reaching tens of KB.
+        # values the corpus shows reaching tens of KB. That argument is
+        # unchanged by task 4696: the accept path now pays the WIDENED scan
+        # above, and the refuse path still pays neither.
+        #
+        # DELIBERATELY the BLANKET predicate, unlike the guard above (4696).
+        # `pattern` below already falls back to `misclose` when no literal is
+        # present, so it ALREADY self-heals for a name outside the literal set
+        # and detect_for here would change no observable value — while making
+        # the blanket/param-aware split at this one site harder to read. It
+        # matters that it keeps its exact current values: Repair.pattern is
+        # what mcp_markup_middleware's _reject and _forward publish as
+        # `matched_pattern`.
         detected = detect(value)
         return Repair(
             clean_value=clean_value,

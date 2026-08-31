@@ -3206,6 +3206,15 @@ class ReconciliationHarness:
 
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+        # Task 4115: the instant every heartbeat_at in filtered_task_tree was
+        # read. Stamped HERE, immediately after the fetch returns — not later,
+        # e.g. at the _maybe_remediate call below — because the S1->S3 stage
+        # loop that follows is minutes of LLM work and the remediation
+        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
+        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
+        # gate ages a cited task's heartbeat against the actual read, not a
+        # fresh clock taken well after it.
+        filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
         statuses = await self._fetch_task_count_census(project_root)
@@ -3414,10 +3423,13 @@ class ReconciliationHarness:
                     await self._spawn_judge(run_id, project_id)
 
                 # Remediation pass: thread scope resolved above (task 1163) and pass
-                # pre-fetched tree to avoid a redundant fetch (ref: task 478).
+                # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
+                # the instant it was read so the live-workflow gate ages heartbeats
+                # against that read, not a fresh clock (task 4115).
                 await self._maybe_remediate(project_id, run_id, run, tier,
                                             scope=scope,
-                                            filtered_task_tree=filtered_task_tree)
+                                            filtered_task_tree=filtered_task_tree,
+                                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
 
                 logger.info(
                     'reconciliation.run_completed',
@@ -4550,6 +4562,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed.
 
@@ -4561,6 +4574,12 @@ class ReconciliationHarness:
         the project is still in backlog mode, bounded by
         config.max_backlog_remediation_deferrals.  See the comment at the gate
         for why deferring is lossless and self-terminating.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree: it is
+        the instant that tree was read (stamped by run_full_cycle right after
+        its fetch, task 4115). This method is a pure pass-through — it forwards
+        the pair verbatim to _run_remediation_pass without re-stamping or
+        defaulting either value.
         """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
@@ -4775,6 +4794,7 @@ class ReconciliationHarness:
                 project_id, parent_run_id, to_remediate, tier,
                 scope=scope,
                 filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
@@ -4793,6 +4813,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
@@ -4805,6 +4826,17 @@ class ReconciliationHarness:
         tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree and be
+        timezone-aware: it is the instant that tree was READ (task 4115),
+        consumed below to age cited tasks' heartbeats against the read rather
+        than against a fresh clock taken after this pass's S1→S2→S3 stages.
+        Ignored when filtered_task_tree is None (the self-fetch path stamps
+        its own instant); if filtered_task_tree is given without it, or with
+        a naive (tzinfo-less) datetime, falls back to datetime.now(UTC) with a
+        WARNING log — the pre-4115 behaviour existing direct callers depend on
+        for the omitted case, extended to fail loud rather than silently
+        suppressing every escalation in the pass on a malformed one.
         """
         project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
@@ -4838,12 +4870,74 @@ class ReconciliationHarness:
             },
         )
 
-        # Use caller-supplied tree if available; otherwise fetch (ref: task 455, task 478)
-        remediation_tree = (
-            filtered_task_tree
-            if filtered_task_tree is not None
-            else await self._fetch_filtered_task_tree(project_root)
-        )
+        # Task 4115: resolve the tree and the instant it was read as ONE unit
+        # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
+        # itself), so a caller's read instant can never be paired with a tree
+        # it does not describe. Caller-supplied tree: honour the caller's read
+        # instant when given AND timezone-aware; otherwise fall back to a
+        # fresh now() with a WARNING trace — loud rather than silent, since a
+        # caller that drops or malforms the instant regresses straight back to
+        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+        # norm). A naive (tzinfo-less) instant is treated the same as a
+        # missing one rather than handed to corroboration_for_task as-is:
+        # has_live_claimant compares it against timezone-aware heartbeats, and
+        # the resulting TypeError is caught and swallowed several frames down
+        # (see the `except Exception as _corr_exc` below), which would
+        # otherwise leave corroborated=None and silently suppress every
+        # stranded-work escalation in the pass — the opposite of this gate's
+        # fail-safe direction. The WARNING fallback is otherwise exactly the
+        # pre-4115 behaviour, which the ~30 existing direct
+        # _run_remediation_pass callers that pass a tree without an instant
+        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+        # (if one was even supplied) describes a different tree, or no tree at
+        # all, and must never leak onto the tree just fetched here.
+        #
+        # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
+        # below (task_by_id, and therefore every heartbeat_at it carries) was
+        # read. It is threaded into corroboration_for_task ONLY to age-check
+        # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+        # must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
+        # minutes of LLM work, and the TTL is 10 minutes — comparable to a
+        # whole pass. Using a fresh now() there would age a heartbeat that was
+        # fresh when read past the TTL purely because the pass was slow,
+        # reporting corroborated=False for a task that is in fact live and
+        # filing a spurious stranded-work escalation — task 4115 found this
+        # happening on exactly the caller-supplied-tree path, the one
+        # production always takes (run_full_cycle threads its pre-stage-loop
+        # fetch straight through): this stamp used to be an unconditional
+        # datetime.now(UTC) taken here regardless of which tree was in play,
+        # so a caller's own (earlier, more accurate) read instant was silently
+        # discarded. Pinning the clock to the read makes the verdict "was
+        # there a fresh per-task signal in the snapshot we hold" — evaluable,
+        # and biased toward suppression (the fail-safe direction) rather than
+        # toward escalating. task_by_id's own staleness is pre-existing and
+        # orthogonal.
+        _tasks_snapshot_at: datetime
+        if filtered_task_tree is not None:
+            remediation_tree = filtered_task_tree
+            if (
+                filtered_task_tree_fetched_at is not None
+                and filtered_task_tree_fetched_at.tzinfo is not None
+            ):
+                _tasks_snapshot_at = filtered_task_tree_fetched_at
+            else:
+                logger.warning(
+                    'reconciliation.remediation_tree_read_instant_missing',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'reason': (
+                            'naive_datetime'
+                            if filtered_task_tree_fetched_at is not None
+                            else 'not_supplied'
+                        ),
+                    },
+                )
+                _tasks_snapshot_at = datetime.now(UTC)
+        else:
+            remediation_tree = await self._fetch_filtered_task_tree(project_root)
+            _tasks_snapshot_at = datetime.now(UTC)
 
         # Task 2031/2067: a {str(task_id): task dict} map derived from
         # remediation_tree in a single pass, used by the live-workflow gate below
@@ -4881,21 +4975,6 @@ class ReconciliationHarness:
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
             task_by_id[str(t.get('id'))] = t
-
-        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
-        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
-        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
-        # so it must be the snapshot's clock, not the clock at the moment the gate
-        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
-        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
-        # a fresh now() there would age a heartbeat that was fresh when read past the
-        # TTL purely because the pass was slow, reporting corroborated=False for a
-        # task that is in fact live and filing a spurious stranded-work escalation.
-        # Pinning the clock to the read makes the verdict "was there a fresh
-        # per-task signal in the snapshot we hold" — evaluable, and biased toward
-        # suppression (the fail-safe direction) rather than toward escalating.
-        # task_by_id's own staleness is pre-existing and orthogonal.
-        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 

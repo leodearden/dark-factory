@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -244,18 +245,44 @@ def _write_fake_claude_capturing_prompt_and_writing_result(
     p.chmod(0o755)
 
 
-def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
+def _wait_for_path(
+    path: pathlib.Path, timeout: float, *, require_nonempty: bool = False
+) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout.
 
     Low-level primitive only -- direct callers should prefer
     _wait_for_path_scaled (below) for a load-adaptive budget instead of a
     fixed timeout; this function remains only as its poll implementation.
+
+    require_nonempty=True additionally waits for the file's size to be
+    nonzero before returning (task 4776). Existence alone is the wrong
+    readiness signal for a file whose CONTENT the caller is about to parse:
+    a writer that creates-then-writes (e.g. a terminal publishing a pidfile
+    via separate open() and write() calls) can be observed by the poll loop
+    in the gap between the two, and `while not path.exists()` returns right
+    then -- handing the caller an existing-but-empty file. Default False
+    preserves exists-only semantics for marker files whose content is never
+    parsed (e.g. a readyfile checked only for presence).
     """
     deadline = time.monotonic() + timeout
-    while not path.exists():
+
+    def _ready() -> bool:
+        if not path.exists():
+            return False
+        if require_nonempty:
+            try:
+                return path.stat().st_size > 0
+            except OSError:
+                # Vanished between exists() and stat() (e.g. a concurrent
+                # rewrite) -- not ready yet, keep polling.
+                return False
+        return True
+
+    while not _ready():
         if time.monotonic() >= deadline:
+            what = "become non-empty" if require_nonempty else "appear"
             raise AssertionError(
-                f"Timed out after {timeout}s waiting for {path} to appear"
+                f"Timed out after {timeout}s waiting for {path} to {what}"
             )
         time.sleep(0.05)
 
@@ -289,6 +316,7 @@ def _wait_for_path_scaled(
     *,
     extra_secs: float = 0.0,
     cap_secs: int = _READINESS_WAIT_CAP_SECS,
+    require_nonempty: bool = False,
 ) -> float:
     """Wait for *path* with a load-scaled budget, and return the budget used.
 
@@ -323,9 +351,13 @@ def _wait_for_path_scaled(
     _load_scaled_grace(5) halves (up to 2*30=60s under load), so collapsing
     it onto the default single 30s cap would nearly halve its loaded-host
     protection.
+
+    require_nonempty is forwarded to _wait_for_path unchanged (task 4776):
+    it does not affect the computed budget, only the readiness predicate
+    used while spending it. See _wait_for_path's docstring.
     """
     budget = _load_scaled_grace(base_secs, cap_secs=cap_secs) + extra_secs
-    _wait_for_path(path, timeout=budget)
+    _wait_for_path(path, timeout=budget, require_nonempty=require_nonempty)
     return budget
 
 
@@ -745,7 +777,15 @@ def test_window_close_yields_129_not_hang(
     # Budgets are load-scaled (task 3486's _wait_for_path_scaled) rather than
     # fixed, since a burst-load excursion past a fixed 5.0s pidfile timeout is
     # exactly the flake that was observed here (this test, konsole lane).
-    _wait_for_path_scaled(pidfile, 5)
+    #
+    # require_nonempty=True on the pidfile (task 4776): the terminal
+    # publishes it via a separate create-then-write, and the line below
+    # immediately parses its content -- exists-only would let a
+    # still-empty read through as ValueError instead of the intended
+    # timeout/AssertionError. readyfile does NOT need it: its content
+    # (`echo ready > ...`) is never parsed, only its existence is checked,
+    # so exists-only is the correct (and cheaper) predicate there.
+    _wait_for_path_scaled(pidfile, 5, require_nonempty=True)
     _wait_for_path_scaled(readyfile, 10)
 
     leader_pid = int(pidfile.read_text().strip())
@@ -959,7 +999,12 @@ def test_window_close_129_robust_to_delayed_trap_install(
     # constant's own cap raise and keeps this gate's loaded-host protection
     # >= what it replaces. The idle-host floor is unaffected by the cap
     # either way: 5 + DELAY + 5 == _load_scaled_grace(10) + DELAY == 11.0s.
-    _wait_for_path_scaled(pidfile, 5)
+    #
+    # require_nonempty=True on the pidfile (task 4776): same create-then-write
+    # race as test_window_close_yields_129_not_hang above -- this test parses
+    # the pidfile's content immediately below. readyfile stays exists-only:
+    # its content is never parsed here either.
+    _wait_for_path_scaled(pidfile, 5, require_nonempty=True)
     _wait_for_path_scaled(readyfile, 10, extra_secs=DELAY, cap_secs=60)
 
     leader_pid = int(pidfile.read_text().strip())
@@ -1556,6 +1601,127 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
     assert _wait_for_path_scaled(existing, 10) == _READINESS_WAIT_CAP_SECS
     # ...but an explicit wider cap_secs clamps there instead.
     assert _wait_for_path_scaled(existing, 10, cap_secs=60) == 60
+
+
+# ===========================================================================
+# Task 4776: require_nonempty -- readiness gate must wait for CONTENT, not
+# just the inode
+# ===========================================================================
+# DISTINCT failure mode from every _wait_for_path_scaled flake above: those
+# all widened the TIMEOUT BUDGET (a bigger number). This one is a wrong
+# PREDICATE -- `while not path.exists()` returns the instant the inode
+# appears, but the two pidfile gates (test_window_close_yields_129_not_hang
+# and test_window_close_129_robust_to_delayed_trap_install) immediately
+# parse the file's content with `int(pidfile.read_text().strip())`. The
+# terminal publishes the pidfile via a separate create-then-write, so under
+# host contention the test can win the race against the write half and read
+# an existing-but-empty file, crashing with ValueError instead of the
+# intended AssertionError/timeout. Observed 2026-08-27 during task 4124's
+# post-merge verify: `int('')` at test_spawn_claude.py:751.
+
+
+def test_wait_for_path_require_nonempty_times_out_on_empty_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A file that exists but never gains content must still time out when
+    require_nonempty=True -- proving the exists-only predicate (which would
+    return instantly here) is not what's being exercised.
+    """
+    empty = tmp_path / "stays-empty"
+    empty.touch()
+    assert empty.exists() and empty.stat().st_size == 0
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 0\.3s"):
+        _wait_for_path(empty, timeout=0.3, require_nonempty=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.3, (
+        f"expected the full 0.3s budget to be spent waiting for content, "
+        f"only waited {elapsed:.2f}s"
+    )
+
+
+def test_wait_for_path_require_nonempty_waits_for_content_to_land(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The gate must not return the instant the (empty) inode appears --
+    it must block until a subsequent write lands content, exactly like the
+    real terminal's create-then-write pidfile publication.
+
+    Reproduces the task-4776 race directly: the file is pre-created empty
+    (winning the exists() race), and a background writer fills it in after
+    a short, deterministic delay. require_nonempty=True must not return
+    before that write happens.
+    """
+    pidfile = tmp_path / "leader.pid"
+    pidfile.touch()  # pre-created empty, exactly like the losing race window
+
+    WRITE_DELAY = 0.2
+
+    writer = threading.Timer(WRITE_DELAY, lambda: pidfile.write_text("12345\n"))
+    # Sampled BEFORE writer.start(), not after: Timer.start() blocks until
+    # the child thread has begun bootstrapping, so sampling afterward lets
+    # the timer's delay clock start ticking before ours does -- shrinking
+    # the observed elapsed below WRITE_DELAY under scheduler contention and
+    # self-inflicting exactly the kind of flake this file exists to
+    # eliminate. Starting our clock first only ever makes elapsed LARGER,
+    # which keeps the `elapsed >= WRITE_DELAY` assertion below sound instead
+    # of racy.
+    start = time.monotonic()
+    writer.start()
+    try:
+        _wait_for_path(pidfile, timeout=5.0, require_nonempty=True)
+        elapsed = time.monotonic() - start
+    finally:
+        writer.join()
+
+    assert elapsed >= WRITE_DELAY, (
+        f"returned after {elapsed:.2f}s, before the {WRITE_DELAY}s write "
+        f"landed -- require_nonempty must wait for CONTENT, not just the "
+        f"inode"
+    )
+    assert int(pidfile.read_text().strip()) == 12345
+
+
+def test_wait_for_path_scaled_forwards_require_nonempty(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both production pidfile gates
+    (test_window_close_yields_129_not_hang and
+    test_window_close_129_robust_to_delayed_trap_install) reach
+    require_nonempty=True through _wait_for_path_scaled, never through
+    _wait_for_path directly -- so the two tests above, which call
+    _wait_for_path directly, cannot catch a dropped forwarding (or a
+    default of False re-hardcoded at the call site inside
+    _wait_for_path_scaled). Mirrors the extra_secs-forwarding precedent in
+    test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base:
+    an argument must be proven to reach _wait_for_path itself, not just the
+    return value.
+
+    Idle-host load settings (mirroring
+    test_wait_for_path_scaled_idle_host_floors_at_base) keep the budget
+    floored at base_secs, so this stays fast and host-load-independent
+    instead of scaling unpredictably. An exists-only predicate would return
+    instantly on this existing-but-empty file; forwarding must make it
+    time out instead.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing_empty = tmp_path / "empty"
+    existing_empty.touch()
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="become non-empty"):
+        _wait_for_path_scaled(existing_empty, 1, require_nonempty=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 1.0, (
+        f"expected the base_secs=1 budget to be spent waiting for content "
+        f"(exists-only would have returned instantly); only waited "
+        f"{elapsed:.2f}s"
+    )
 
 
 # ===========================================================================
@@ -2843,7 +3009,14 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path_scaled(capture_file, 5)
+    # require_nonempty=True (task 4776): the fake claude above publishes
+    # capture_file via `{ ... } > capture_file` -- bash opens (creates) the
+    # redirect target before the block's echoes run, so an exists-only poll
+    # can observe an empty file and hand _parse_captured_env nothing,
+    # failing later on an unrelated-looking captured.get(...) assertion
+    # instead of the intended readiness-timeout. Same race, same fix, as
+    # the two pidfile gates this task rewired.
+    _wait_for_path_scaled(capture_file, 5, require_nonempty=True)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
@@ -3250,6 +3423,69 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     assert captured.get("CLAUDE_SPAWN_RESULT_FILE") == record.result_file, (
         f"the child must still see the result file allocated for THIS spawn "
         f"({record.result_file!r}), got {captured!r}"
+    )
+
+
+def test_owner_ppid_is_exported_and_is_the_owning_claudes_direct_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """CLAUDE_SPAWN_OWNER_PPID must name the payload shell that runs claude.
+
+    Task 4193 (L2 ruling item 4-i). This is the ownership discriminator for
+    the window BEFORE the session registry record carries a
+    ``claude_session_id`` -- measured median ~27s, p90 ~141s over the live
+    fleet, and unbounded. ``session_hooks._owner_ppid_verdict`` compares it
+    against ``_parent_pid_of(_owning_claude_pid())``, so the contract this
+    test pins is exactly: *the value the child sees equals the child's own
+    ``getppid()``*.
+
+    That holds only because ``claude`` is invoked WITHOUT ``exec`` -- an
+    implicit-exec optimisation would collapse the payload shell into the
+    claude process and break the equality silently. bash suppresses that
+    optimisation here because ``$inner`` sets traps and ends in
+    ``ec=$?; exit $ec``, but nothing in the source SAYS so, which is why it
+    is pinned by an end-to-end launch rather than by reading the string.
+
+    Also asserted: it survives ``sanitize_env`` (it is exported after the
+    namespace unset) and is present even with no title and no parent, since
+    unlike the other four exports it is gated on nothing.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    ppid_file = tmp_path / "claude_ppid.txt"
+    p_claude = bin_dir / "claude"
+    p_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f"env -0 > {capture_file!s}\n"
+        f"ps -o ppid= -p $$ | tr -d ' ' > {ppid_file!s}\n"
+        "exit 0\n"
+    )
+    p_claude.chmod(0o755)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    # Poison it: an inherited value must be overwritten by THIS spawn's, the
+    # same way the other identity exports are.
+    env["CLAUDE_SPAWN_OWNER_PPID"] = "999999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    exported = captured.get("CLAUDE_SPAWN_OWNER_PPID", "")
+    assert exported.isdigit() and int(exported) > 1, (
+        f"CLAUDE_SPAWN_OWNER_PPID must be a real pid, got {exported!r}"
+    )
+    assert exported != "999999", (
+        "the inherited value must be scrubbed and recomputed for THIS child"
+    )
+    actual_parent = ppid_file.read_text().strip()
+    assert exported == actual_parent, (
+        f"CLAUDE_SPAWN_OWNER_PPID ({exported}) must equal the launched "
+        f"claude's own direct parent pid ({actual_parent}) -- if these "
+        f"diverge, the payload shell was exec'd away and "
+        f"session_hooks._owner_ppid_verdict would misread every owner event "
+        f"as an inheritor"
     )
 
 

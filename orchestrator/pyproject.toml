@@ -12,7 +12,17 @@ description = "Agent orchestration system — decomposes PRDs into concurrent TD
 requires-python = ">=3.11,<4"
 dependencies = [
     "click>=8.0",
-    "fastmcp>=2.0",
+    # >=3.2, raised from >=2.0 by task 3690: orchestrator/mcp/verdict_tools.py
+    # now registers shared.mcp_markup_middleware.MarkupGuardMiddleware, and
+    # that module imports `fastmcp.tools.base` (a path that exists only after
+    # tool.py was renamed to base.py) and `fastmcp.server.middleware.Middleware`
+    # (absent before 2.9). Under the old >=2.0 floor a fresh resolve could hand
+    # this package a 2.x where `import shared.mcp_markup_middleware` fails
+    # OUTRIGHT rather than degrading. 3.2.2 is the version every substrate fact
+    # in that module was measured against and what uv.lock already resolves.
+    # Mirrors shared/pyproject.toml, which carries the same floor for the same
+    # reason.
+    "fastmcp>=3.2",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.0",

@@ -4,7 +4,8 @@ TestApplyMcpStartupEnv — MCP_STARTUP_TIMEOUT_MS constant and
 apply_mcp_startup_env() helper (step-1/step-2).
 
 TestJcodemunchLaunchPinned — JCODEMUNCH_COMMAND/JCODEMUNCH_ENV constants and
-mcp_config_json() regression guard (step-3/step-4).
+mcp_config_json() regression guard (step-3/step-4), including the
+JCODEMUNCH_GIT_ROOT_IDENTITY identity lever (task 4562 step-1/step-2).
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
@@ -114,6 +115,42 @@ class TestJcodemunchLaunchPinned:
         assert 'uvx' not in jc.get('command', '')
         args = jc.get('args', [])
         assert not any('uvx' in str(a) for a in args)
+
+    def test_env_sets_git_root_identity_lever(self):
+        """JCODEMUNCH_ENV pins the identity lever to the exact literal '0'.
+
+        jcodemunch's bool env parser treats '0' as False (lever ON, selecting
+        per-worktree local identity) but '1'/'true' as True (lever OFF,
+        silently reverting to the worktree-collapsing git-root default) — so
+        this must assert the literal value, not just key presence.
+        """
+        from orchestrator.mcp_lifecycle import JCODEMUNCH_ENV
+
+        assert 'JCODEMUNCH_GIT_ROOT_IDENTITY' in JCODEMUNCH_ENV
+        assert JCODEMUNCH_ENV['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
+
+    def test_mcp_config_json_carries_git_root_identity_lever(self, mock_orch_config):
+        """The identity lever reaches the generated per-agent mcp_config_json.
+
+        Asserted against a literal, not against JCODEMUNCH_ENV — but this is
+        defense-in-depth, not a coverage gap this test alone closes. The
+        neighbouring pair already fails if the lever is dropped from either
+        side: test_env_sets_git_root_identity_lever pins the literal on the
+        constant, and test_mcp_config_json_uses_constants asserts
+        jc['env'] == JCODEMUNCH_ENV (full dict equality), which breaks if the
+        constant and the generated config ever diverge. This test instead
+        guards against that equality assert being loosened to a subset check
+        later, by pinning the user-observable value directly on the
+        generated config, independent of how it got there.
+        """
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        out = lifecycle.mcp_config_json()
+
+        jc = out['mcpServers']['jcodemunch']
+        assert jc['env']['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
 
 
 # ---------------------------------------------------------------------------

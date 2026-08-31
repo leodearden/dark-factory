@@ -799,11 +799,57 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 '-p no:xdist',
             ],
             min_phrase_hits=2,
+            # The previous hint's sole instruction -- amend the canonical
+            # memory in place -- is authz-refused for every orchestrator-
+            # dispatched agent: update_memory's content-amend arm is gated to
+            # recon-stage- / curator- agent_id prefixes
+            # (Mem0UpdateConfig.content_amend_allowed_agent_prefixes), and no
+            # dispatched task/merge agent carries either. That made the block
+            # a dead end for its actual audience. Replaced with the
+            # three-outcome shape ratified 2026-08-25 (task 4738, fix A):
+            # override / skip / escalate, naming only tools this audience
+            # actually holds (search, escalate_*) and never suggesting the
+            # self-rename into curator- that skills/curate-fused-memories
+            # forbids. The structural fix -- stopping a per-cluster hint from
+            # shadowing the guard's escape hatches at all -- is the sibling
+            # fix-B task, deliberately not done here.
+            #
+            # Amendment (reviewer, task 4738): the first cut told the reader
+            # to SEARCH the bare uuid, but `search` is semantic/vector, not
+            # an id lookup -- a bare-uuid query returns noise, not that
+            # record. Reworded to a topic-phrase query with the uuid kept as
+            # a verification target, and escalate named as the fallback when
+            # it still can't be confirmed that way. Outcome (3) now names
+            # escalate_blocker/escalate_info explicitly (previously only the
+            # bare word "escalate"), matching how outcomes (1)/(2) already
+            # name an exact literal to act on.
             hint=(
                 'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
-                'pyproject.toml). Do NOT add another entry -- update/consolidate '
-                'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+                'pyproject.toml). The canonical entry is memory '
+                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51. To check it, run '
+                "search(query='pytest-xdist -n0 serial-override workaround', "
+                'project_id=...) and look for the result whose id matches that '
+                'uuid -- a bare-uuid query will not find it, since search is '
+                'semantic, not an id lookup. If you cannot confirm it that way, '
+                'treat that as case (3) below and escalate rather than guessing. '
+                'Do not try to amend it either way: content amends are '
+                'authz-gated to recon-stage- / curator- agent_ids, so that '
+                'call will refuse you. '
+                '(1) Your content is genuinely DISTINCT from that entry -- '
+                're-send this write with metadata='
+                "{'allow_near_duplicate': True}, which is open to every agent "
+                'and bypasses this block. '
+                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping '
+                'is a sanctioned outcome here, not a failure: consolidating '
+                'this cluster belongs to an interactive curation sitting '
+                'running skills/curate-fused-memories, not to you, and '
+                'renaming yourself into that role to get past this block is '
+                'forbidden by that skill. '
+                '(3) You are unsure, your content CONTRADICTS the canonical '
+                'entry, or you could not confirm it above -- escalate with '
+                'escalate_blocker (or escalate_info if you are merely '
+                'unsure). Do not retry the refused call.'
             ),
         ),
         ProceduralTopicCluster(
@@ -1825,6 +1871,37 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Topic-anchored canonical recall (task 3111): the READ-side counterpart to the
+    # write-side duplicate guards above. Consolidating a near-duplicate cluster into
+    # one canonical makes that canonical the LEAST retrievable member of its own
+    # cluster -- it is long and general, each surviving sibling is a tighter cosine
+    # match -- so at limit=5 the window fills with siblings and the record that
+    # answers the question never appears. Same ownership note as the near-dup fields
+    # above: enforced in the SERVICE read path (services/topic_anchor.py::
+    # resolve_topic_anchor_enabled + the anchoring block in MemoryService.search),
+    # colocated on ReconciliationConfig because it is the retrieval-side counterpart
+    # to the same duplicate-accretion problem Stage-1 consolidation creates, NOT
+    # because the reconciliation subsystem executes it. Read live per
+    # MemoryService.search off the shared config object, so it satisfies the
+    # reload.py live-read reload-safety rule.
+    topic_anchored_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the topic-anchored canonical pin in MemoryService.search. When '
+            "True, a search whose Mem0 results carry a metadata.topic looks up that "
+            "topic's canonical:true record and PROMOTES it to index 0 of the returned "
+            'window, flagged topic_anchored=True. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live per MemoryService.search by '
+            'resolve_topic_anchor_enabled in services/topic_anchor.py, off the shared '
+            'config object and never captured at construction, so a reload takes '
+            'effect on the next search with no restart). The promoting pin is the arm '
+            "SELECTED BY MEASUREMENT in task 4004 (plans/read-transform-selection-"
+            'report.md, recommendation.arm = promoting_pin): claim recall 1.00 at '
+            '1070.27 tokens/query against a 1181.29 baseline, dropping no ranked '
+            'records. False disables the transform entirely, so every search skips '
+            'the extra backend round-trip.'
+        ),
+    )
 
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
@@ -2136,8 +2213,11 @@ class WriteTriageConfig(BaseModel):
     of reconciliation, move these two fields to a dedicated server-owned config
     section instead of assuming colocation implies subsystem ownership") —
     write triage IS that growth, so the bands land here rather than accreting
-    onto the reconciliation submodel. PRD leaf beta adds `write_triage_enabled`
-    to this same section.
+    onto the reconciliation submodel. PRD leaf beta added that staged-rollout
+    flag to this same section, spelled `enabled` (dotted path
+    `write_triage.enabled`, matching the `mem0_update.enabled` sibling in
+    config/reload.py) — the PRD calls it `write_triage_enabled`, which is the
+    same knob under its cross-reference name.
 
     Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
     config/reload.py's `_iter_leaves` descends into per-leaf paths. An
@@ -2145,9 +2225,156 @@ class WriteTriageConfig(BaseModel):
     restart_required entry (esc-2718-1), which would force a server restart
     for every calibration run.
 
-    Every field defaults to None, and that is load-bearing: None means
+    Every CALIBRATED BAND field (t_high, t_low, calibration_report_path,
+    t_high_by_category) defaults to None, and that is load-bearing: None means
     UNCALIBRATED, which the triage router must read as fail-open to `stored`.
+    The two OPERATOR KNOBS below (`enabled`, `candidate_k`) deliberately do
+    NOT follow that rule — they are hand-set and ship with real defaults,
+    because there is no such thing as an uncalibrated kill switch, and a
+    retrieval width of None would have no fail-open reading at all.
     """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Staged-rollout flag for add_memory write triage — the PRD\'s '
+            '`write_triage_enabled` (D10). While False the two reject guards in '
+            'server/tools.py::add_memory run exactly as they do today and no '
+            'triage code executes. While True those guards RETIRE for the write '
+            'and it is routed redirect-not-reject: a restatement becomes a '
+            'sighting child of its canonical instead of a rejection. Ships FALSE '
+            'and stays False until the flip gate (task 3169) — the judge (leaf '
+            'gamma) has to land first, and until it does the middle band is '
+            'answered by a deliberate stub. This is also the one lever that '
+            'stops an in-flight triage incident, which is why it is green-tier '
+            'hot-reloadable rather than restart-only: read live off '
+            'memory_service.config.write_triage on every write, never captured '
+            'at construction.'
+        ),
+    )
+    candidate_k: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            'How many candidates the triage retrieval asks for. This is a WIDTH, '
+            'NOT a threshold: it is the rank property that caps what any band '
+            'can achieve, because a candidate that never enters the result set '
+            'cannot be scored by t_high or t_low at all. The 20 default is the '
+            'measured 69.4% same-category recall point on the live corpus (26.1% '
+            '@5, 43.9% @10, 69.4% @20, 88.5% @50) — deliberately NOT the retired '
+            "near-dup guard's hardcoded limit=5, at which three quarters of the "
+            'duplicates triage exists to catch are invisible to it. Note the '
+            'count is a TOTAL across the three Mem0-primary categories, so '
+            'effective per-category depth is lower than k. If calibration (task '
+            '3199 / leaf gamma) shows recall rather than the thresholds is the '
+            'binding constraint, 20-50 is where the remaining recall lives. '
+            'Bounded ge=1 so a 0 cannot silently disable retrieval — that would '
+            'read as "no comparable candidate" on every write and route '
+            'everything to `stored` with nothing logged. Green-tier '
+            'hot-reloadable, read live per write.'
+        ),
+    )
+
+    # --- judge knobs (leaf gamma, task 3128) -------------------------------
+    #
+    # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
+    # they ship with real defaults, and None on the two inheriting leaves means
+    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # hot-reloadable and read LIVE per middle-band write by
+    # server/write_triage_judge.py's resolvers — nothing is captured at import
+    # or construction, which is what makes the registration in
+    # config/reload.py real rather than restart-only in disguise.
+
+    judge_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill switch for write triage's LLM judge arm — the middle band "
+            'between t_low and t_high. While False that band answers `stored` '
+            'without an LLM call, exactly as leaf beta\'s deliberate stub did, '
+            'and the deterministic bands keep running. Defaults TRUE, unlike '
+            'the `enabled` sibling above, and the asymmetry is deliberate: the '
+            'judge is structurally INERT while write_triage.enabled is false '
+            '(no triage code executes at all), so it costs nothing on the '
+            'shipped config. Default-False would be an operator footgun — at '
+            'the task-3169 flip the operator would turn `enabled` on, silently '
+            'get stub behaviour, and read the resulting all-`stored` ack stream '
+            'as evidence that the corpus is novel. Its real purpose is stopping '
+            'an in-flight JUDGE incident (spend, latency, a bad model) while '
+            'leaving the deterministic bands running, which is a strictly finer '
+            'lever than `enabled` and green-tier for the same reason.'
+        ),
+    )
+    judge_provider: Literal['openai', 'anthropic'] | None = Field(
+        default=None,
+        description=(
+            'Which SDK arm the judge calls. None INHERITS llm.provider, so the '
+            'judge follows whatever model the deployment already trusts for '
+            "add_memory auto-classification rather than needing a second knob "
+            'kept in sync. Pin it only to run the judge on a different provider '
+            'from the rest of the server. An unrecognised value falls back '
+            'rather than raising — this is read on the write path, where '
+            'contract C1 forbids raising.'
+        ),
+    )
+    judge_model: str | None = Field(
+        default=None,
+        description=(
+            'The model the judge calls. None INHERITS llm.model. The PRD\'s '
+            '"haiku-class" is a cost/size class, not a vendor pin: this is a '
+            'single-turn ~2.5k-token classification with a four-word closed '
+            'output, so the smallest capable model is the right one. Whatever '
+            'is resolved here is stamped into the accuracy report\'s provenance '
+            'block by scripts/eval_write_triage_judge.py, so the operator at '
+            'the 3169 flip gate can tell which model produced the numbers.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description=(
+            'Per-call wall-clock budget for the judge, enforced with '
+            'asyncio.wait_for. NOT optional and not a tuning nicety: no LLM '
+            'call anywhere in fused-memory sets a timeout today and the openai '
+            'SDK default is 600 SECONDS, which on the synchronous add_memory '
+            'write path is a wedge rather than a degradation — the caller waits '
+            'ten minutes for a write contract C1 promises never to block. A '
+            'TimeoutError propagates into triage_write\'s fail-open arm, which '
+            'is exactly C1\'s "judge error/timeout => stored + storm counter" '
+            '(INV-4). Bounded gt=0 because a zero budget would fail every call '
+            'and read as a total judge outage caused by nothing.'
+        ),
+    )
+    judge_candidate_count: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "How many retrieved candidates reach the judge's prompt — PRD C1's "
+            '"top 3-5". Distinct from candidate_k above, which is the '
+            'RETRIEVAL width: triage retrieves k, then the judge is shown the '
+            'best few of them, because prompt tokens are the expensive resource '
+            'and a candidate ranked 15th is not going to be the one the entry '
+            'restates. The band\'s own winner is always included regardless of '
+            'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
+            'that would answer `stored` on every middle-band write, reducing '
+            'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_accuracy_report_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the JSON accuracy report measuring the judge against leaf "
+            "alpha's curator-labelled calibration fixture — the traceability "
+            'link from the judge shipped here back to the run that measured it, '
+            'exactly as calibration_report_path points at the run that produced '
+            't_high/t_low. Written by scripts/eval_write_triage_judge.py. This '
+            'is what the task-3169 flip gate reads: it is an OPERATOR input, '
+            'not a threshold, and deliberately no accuracy floor is asserted '
+            'anywhere in code or tests (PRD D10 makes the report the arbiter '
+            'and the human the gate). Package-relative, never absolute — an '
+            'absolute per-task-worktree path dangles the moment the branch '
+            'merges. Green-tier hot-reloadable via reload_config.'
+        ),
+    )
 
     t_high: float | None = Field(
         default=None,

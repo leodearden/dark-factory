@@ -112,6 +112,62 @@ print(json.dumps({
 """
 
 
+_PROBE_SPAWN_ERROR_CHILD_SRC = """
+import json
+import sys
+
+import shared  # deliberately the ONLY import, so the measurement below sees a
+               # cold package: any `import shared.usage_gate` here would bind
+               # the submodule eagerly and make the laziness check vacuous.
+
+cold = sorted(name for name in sys.modules if name.startswith('shared.'))
+mapped_to = shared._SYMBOL_MODULE.get('ProbeSpawnError')
+
+from shared import ProbeSpawnError
+
+import shared.usage_gate as usage_gate
+print(json.dumps({
+    'cold_submodules': cold,
+    'mapped_to': mapped_to,
+    'in_all': 'ProbeSpawnError' in shared.__all__,
+    'in_dir': 'ProbeSpawnError' in dir(shared),
+    'identity': ProbeSpawnError is usage_gate.ProbeSpawnError,
+}))
+"""
+
+
+def test_probe_spawn_error_resolves_lazily_from_the_package():
+    """`from shared import ProbeSpawnError` must work, and must stay lazy.
+
+    Task 4512 adds the first new name to `shared.usage_gate.__all__` since the
+    PEP-562 rewrite, and the registration is spread over three sites in
+    `shared/__init__.py` (the TYPE_CHECKING block, `_SYMBOL_MODULE`, `__all__`).
+    Missing the `_SYMBOL_MODULE` entry specifically degrades to an
+    AttributeError at first use rather than a loud import error, so it is
+    pinned directly here rather than left to
+    `test_every_public_name_resolves_and_is_the_submodule_object` — that test
+    runs in pytest's already-warm interpreter and so cannot observe the second
+    half of the contract: that a bare `import shared` still binds NO
+    submodules, i.e. that adding this name did not drag `usage_gate` (and with
+    it pydantic/aiosqlite/dotenv) into every stdlib-only importer.
+    """
+    out = run_python_child(_PROBE_SPAWN_ERROR_CHILD_SRC)
+
+    assert out['cold_submodules'] == [], (
+        'a bare `import shared` now eagerly binds submodules '
+        f'{out["cold_submodules"]} — the package is no longer lazy.'
+    )
+    assert out['mapped_to'] == 'usage_gate', (
+        "ProbeSpawnError must be registered in shared._SYMBOL_MODULE as owned "
+        f'by usage_gate, got {out["mapped_to"]!r}'
+    )
+    assert out['in_all'] is True, 'ProbeSpawnError missing from shared.__all__'
+    assert out['in_dir'] is True, 'ProbeSpawnError missing from dir(shared)'
+    assert out['identity'] is True, (
+        'shared.ProbeSpawnError is not the object exported by shared.usage_gate'
+    )
+
+
 def test_previously_eager_submodules_resolve_as_attributes():
     """`import shared; shared.usage_gate` must keep working.
 

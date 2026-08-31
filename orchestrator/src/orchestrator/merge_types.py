@@ -165,6 +165,14 @@ class TerminalOutcomeRecord:
     """Generation of the merge request that produced this record (γ2 provenance)."""
     reason: str | None = field(default=None, kw_only=True)
     """MergeOutcome.reason for failure outcomes (empty string normalized to None)."""
+    landed_via_chain: int | None = field(default=None, kw_only=True)
+    """Mirrors :attr:`MergeOutcome.landed_via_chain` (task 3186 δ) — ``1`` when
+    a deep merge-ahead chain walk landed this item, else None.
+
+    Carried here because this ring and the ``merge_finalized`` row are two
+    tiers of ONE record: the ring is documented as lossless on eviction
+    precisely because an evicted id falls through to the durable row, so a
+    field on one tier and not the other would break that equivalence."""
 
 
 class TerminalOutcomeRetention:
@@ -969,6 +977,24 @@ class MergeOutcome:
     INDETERMINATE (evidence exists) emits a row, a skipped or fail-open one
     (nothing gathered) emits none. ``None`` for callers that do not populate
     it."""
+    landed_via_chain: int | None = None
+    """``1`` on an item landed by a deep merge-ahead chain walk (task 3186 δ);
+    ``None`` for every ordinary sequential landing — the "iff landed by a chain
+    walk" half of the PRD contract.  Each of the k items a walk lands carries
+    its own ``1``, so a walk contributes exactly k.
+
+    THE UNIT IS PINNED BY A COMMITTED CONSUMER, not by prose.
+    ``scripts/merge-deep-canary-predicate.sh:89-91`` already computes
+    ``items_per = sum(landed_via_chain over all merge_finalized) / n_deep``
+    and calls the result "items landed per deep verify run".  That arithmetic
+    is only correct if the per-walk contributions SUM to the number of items
+    the walk landed — which ``1``-per-landed-item satisfies by construction.
+    Stamping the chain size k on every one of k items would report k²/n_deep
+    instead, and stamping 1-indexed positions would report k(k+1)/2; η1's
+    filter (``isinstance(..., int) and >= 1``) is also why a walk that lands
+    nothing emits no value at all rather than a ``0``.  See
+    test_merge_queue_deep_landing.py, which asserts the encoding through a
+    verbatim transcription of that predicate rather than restating it."""
 
 
 @dataclass
@@ -1203,6 +1229,17 @@ class ChainResult:
       expected outcomes and are deliberately NOT collapsed into it, so ε's
       deep-fail reader is not inflated with non-faults.
     * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+    * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
+      caller (``_deep_chain_placement``) rather than by ``build_chain``
+      itself, so it measures the FULL stall the dispatch loop pays: lane
+      acquisition, the sequential merges, and the ``asyncio.timeout`` wrapper's
+      own overhead.  ``None`` on any result ``build_chain`` returned directly
+      to a caller that did not stamp it.  γ emits it as the ``chain_build_ms``
+      field on the same ``merge_verify`` event that carries ``chain_items``,
+      because the build is awaited INLINE on the dispatch path: for its whole
+      duration ``_verifier_loop`` cannot run FINALIZE-HEAD, and that per-round
+      stall must be attributable to the chain rather than misread as verify
+      time (see the Caller-cost note on ``build_chain``).
 
     **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
     emitted for it.**  A chain conflict at position j may be a conflict with
@@ -1225,10 +1262,17 @@ class ChainResult:
     truncated_reason: str | None = None
     lane: Path | None = None
     lane_warm: bool = False
+    build_ms: int | None = None
 
     @property
     def depth(self) -> int:
-        """Number of chained links — the value γ emits as ``chain_items``."""
+        """Number of chained links — items ADDITIONAL to the dispatching one.
+
+        Off by one from the ``chain_items`` telemetry field on purpose: the
+        dispatching item is chain item #1 and is not a link, so γ emits
+        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
+        """
         return len(self.links)
 
 
@@ -1296,6 +1340,7 @@ class OutcomeKind(StrEnum):
     plan_files_not_touched = 'plan_files_not_touched'
     plan_files_narrowed = 'plan_files_narrowed'
     plan_files_cross_repo = 'plan_files_cross_repo'
+    plan_files_already_landed = 'plan_files_already_landed'
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
@@ -1397,6 +1442,49 @@ class ItemLifecycleState(StrEnum):
 
 
 @dataclass
+class VerifyWorktreeHandle:
+    """The worktree ``_run_inflight_verify`` is ACTUALLY verifying in (task 3186).
+
+    A one-field mutable box, and the shape is forced by construction order:
+    ``_dispatch_item`` creates the verify task BEFORE it builds the
+    :class:`InflightEntry` that wraps it, so the coroutine cannot simply be
+    handed the entry to write back into.  The box is created first, passed to
+    the verify as a keyword-only kwarg, and stored on the entry — so both ends
+    hold the same object and the WRITER (the warm-swap block) publishes to the
+    READER (δ's adoption) without either knowing about the other.
+
+    Named fields rather than a bare list or tuple deliberately: the field names
+    ARE the documentation of what gets published, and a positional container
+    would make the ``spec_warm`` half — which decides whether a pooled lane is
+    RELEASED or ``git worktree remove``d — a silently swappable boolean.
+
+    WHY IT EXISTS.  ``InflightEntry.merge_wt`` is the PRE-verify fact.  On the
+    LOCAL warm path ``_acquire_warm_verify_worktree`` replaces that ephemeral
+    ``_merge-<uuid>`` with the persistent ``_merge-verify`` lane (or a pooled
+    ``_spec-`` lane), deregisters the ephemeral from the liveness ledger and
+    removes it from disk — after which the entry's own field names a path that
+    no longer exists.  For an ORDINARY landing that is harmless, because the
+    PASS arm reads ``vr.merge_wt``; but δ's adopted head has NO ``vr`` (its
+    verify was torn down on the tip's authority), so without this handle the
+    adoption would land from the corpse: ``advance_main``'s retry loop would
+    ``git rebase`` against a missing cwd, the D10 ``refresh_warm_base`` gate
+    (keyed on the lane NAME) would never match, and the live lane would never
+    reach the release path at all.
+
+    Fields
+    ------
+    merge_wt  : the worktree the verify is currently using — seeded with the
+                item's own ephemeral at dispatch, overwritten by the warm swap.
+    spec_warm : ``True`` when *merge_wt* is a warm-seeded lane, i.e. the value
+                ``_release_or_cleanup`` needs to return it to the POOL instead
+                of removing it.
+    """
+
+    merge_wt: Path | None = None
+    spec_warm: bool = False
+
+
+@dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
 
@@ -1424,7 +1512,21 @@ class InflightEntry:
     item           : the SpeculativeItem being verified
     lease          : the HostLease held for this verify (None for passthroughs)
     verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
-    merge_wt       : the merge worktree path (may have been warm-swapped by _run_inflight_verify)
+    merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
+                     adoption publishes the post-verify one onto it (task
+                     3186): ``_run_inflight_verify`` never writes this field,
+                     so for every non-adopted entry it stays the ephemeral
+                     ``_merge-<uuid>`` the item was merged in, and the
+                     post-verify path is ``vr.merge_wt``.
+    verify_wt      : the :class:`VerifyWorktreeHandle` the verify task
+                     publishes its CURRENT worktree into (task 3186).  ``None``
+                     for a passthrough entry and for the hand-built entries in
+                     the test suite; readers must tolerate that.
+    spec_warm      : warmth of ``merge_wt`` once adoption has published it —
+                     the value ``_finalize_inflight`` hands
+                     ``_release_or_cleanup`` when there is no ``vr`` to read it
+                     from.  Meaningless (and never read) unless
+                     ``chain_adopted``.
     was_speculative: True if item.speculative was True at dispatch time (for slot release)
     passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
                          that are enqueued without a real verify task so finalize can deliver
@@ -1432,6 +1534,33 @@ class InflightEntry:
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
                      returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    chain          : the :class:`ChainResult` this dispatch's verify was
+                     REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
+                     ordinary adjacent-verify path.  Its READER is
+                     SpeculativeMergeWorker._land_chain_prefix (task 3186, PRD
+                     δ), the in-order CAS walk that lands ``links`` once the
+                     tip has passed; a red or errored tip still adopts nothing
+                     (see _run_inflight_verify's chain arm).  NOTE the lane
+                     referenced here is already RELEASED by the time
+                     _finalize_inflight sees this entry: _run_inflight_verify
+                     returns it to the pool in its own ``finally``, so this
+                     field is never a release handle.
+    chain_adopted  : ``True`` when δ (task 3186) claimed THIS entry for a
+                     green chain tip.  Set only on the HEAD I0 — the
+                     non-speculative trust anchor whose merge commit the
+                     speculative slot-2 item was stacked on, so the tip's
+                     cumulative tree strictly CONTAINS the head's.  PRD
+                     decision #3 makes that tip authoritative for the whole
+                     prefix, which is why the adopting exit cancels the head's
+                     own in-flight verify rather than waiting for a verdict
+                     about a subset it already has better evidence for.
+                     ``_finalize_inflight`` reads it for exactly two things:
+                     to tolerate the ``CancelledError`` that teardown produces
+                     at its ``await entry.verify_task``, and to decline a
+                     verdict that already came back RED (the PRD's
+                     "Head-fail + tip-pass" boundary row).  Never set on a
+                     chain LINK — links are landed by the walk and never had
+                     an ``InflightEntry`` at all.
     """
 
     item: SpeculativeItem
@@ -1444,6 +1573,10 @@ class InflightEntry:
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
     permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
+    chain_adopted: bool = False             # δ (task 3186): this HEAD lands on a green tip's authority
+    verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
+    spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).

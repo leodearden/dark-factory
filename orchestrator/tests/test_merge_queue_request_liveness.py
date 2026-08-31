@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -718,6 +719,57 @@ def _pass_result() -> MagicMock:
     return MagicMock(passed=True, summary='')
 
 
+class _DispatchReturnsMidVerifyRemote:
+    """Stub RemoteRunner whose `dispatch_in_flight` is a real `@property`
+    over a mutable flag — not a MagicMock snapshot — so it can genuinely
+    transition True -> False mid-verify while the awaited
+    `run_merge_verify` coroutine stays pending. Mirrors production
+    (`verify_runner.py` sets the flag live before ssh dispatch and clears
+    it in the outer `finally` once dispatch returns, while the lease may
+    still be held for post-dispatch work such as task 2822's local
+    cross-check).
+
+    Shared by every trigger-3 dispatch-transition test below (reviewer
+    finding, duplication) so the transition they all depend on cannot
+    silently drift between per-test copies. `never_release` is
+    caller-owned and gates the (never reached) post-dispatch
+    continuation; `on_dispatch_start`, if given, is called with no
+    arguments at the very top of `run_merge_verify`, before the dispatch
+    flag goes live — used by the seed-ordering pin to capture state at
+    that exact point.
+    """
+
+    name = 'remote-host'
+    is_local = False
+
+    def __init__(
+        self,
+        never_release: asyncio.Event,
+        on_dispatch_start: Callable[[], None] | None = None,
+    ) -> None:
+        self._never_release = never_release
+        self._on_dispatch_start = on_dispatch_start
+        self._dispatch_live = False
+        self.dispatch_returned = asyncio.Event()
+
+    @property
+    def dispatch_in_flight(self) -> bool:
+        return self._dispatch_live
+
+    async def run_merge_verify(self, *args: object, **kwargs: object) -> MagicMock:
+        if self._on_dispatch_start is not None:
+            self._on_dispatch_start()
+        self._dispatch_live = True  # ssh dispatch is LIVE
+        await asyncio.sleep(0.06)  # a few VERIFY_ABANDON_POLL_SECS ticks
+        self._dispatch_live = False  # dispatch RETURNS (verify_runner.py:1483)
+        self.dispatch_returned.set()
+        await self._never_release.wait()  # the (simulated) post-dispatch window
+        raise AssertionError('unreachable — never_release is never set in this test')
+
+    async def cancel_verify(self) -> int:
+        return 0
+
+
 @pytest.mark.asyncio
 class TestDeadInflightVerifyAborts:
     """SpeculativeMergeWorker._run_inflight_verify LOCAL no-progress abort
@@ -1119,6 +1171,278 @@ class TestDeadInflightVerifyAborts:
         verify_future.cancel()
         with contextlib.suppress(BaseException):
             await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_is_not_aborted_while_local_content_progresses(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Pins Abort trigger 3's union semantics for the task-2822 cross-check window: a REMOTE lease
+        whose ssh dispatch has RETURNED mid-verify (`RemoteRunner.dispatch_in_flight` True -> False,
+        cleared in `run_merge_verify`'s outer `finally`) while a local post-dispatch verify keeps
+        advancing merge_wt's content mtime must NOT be progress-aborted.
+
+        This transition is not hypothetical: it is what every remote-dispatch-then-cross-check
+        verify does in production once the ssh dispatch returns and task 2822's
+        `LocalRunner(merge_wt, ...)` cross-check takes over inside the same awaited verify_task.
+        Reify specimen mr-945466ca / task 6393: three passing ~17.4-min remote verifies discarded as
+        dead 2026-08-20 before this fix.
+
+        Uses the shared `_DispatchReturnsMidVerifyRemote` stub (a real `@property` over a mutable
+        flag, not a MagicMock snapshot) so the flag genuinely flips mid-verify while the awaited
+        coroutine stays pending — no prior remote-lease trigger-3 test in this class expressed that
+        transition.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-a', 'rcc.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        # task 2921 anti-flake pattern: strictly-increasing stub so the
+        # content-mtime arm (once it exists for remote leases) unconditionally
+        # observes fresh progress on every probe, decoupling this
+        # must-NOT-abort assertion from real wall-clock file-write timing —
+        # simulates the task-2822 cross-check writing under merge_wt without
+        # coupling to real file I/O.
+        _mtime = [1000.0]
+
+        def _always_progress(_root: Path) -> float:
+            _mtime[0] += 1.0
+            return _mtime[0]
+
+        with patch('orchestrator.merge_queue.newest_content_mtime', _always_progress):
+            verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.wait_for(runner.dispatch_returned.wait(), timeout=15.0)
+            # Let several whole budget windows elapse AFTER the dispatch flag
+            # went False, while merge_wt content keeps advancing.
+            await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+            assert not verify_future.done(), (
+                'a REMOTE lease whose ssh dispatch has RETURNED while a local '
+                'post-dispatch verify keeps writing under merge_wt must NOT '
+                'be progress-aborted (task 2822 cross-check)'
+            )
+            assert q.empty(), 'a progressing post-dispatch cross-check must not be re-queued'
+            assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
+                'no strike should be recorded while local content is progressing'
+            )
+
+            verify_future.cancel()
+            with contextlib.suppress(BaseException):
+                await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_with_real_merge_wt_writes_is_not_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Companion to the stubbed positive test above (reviewer finding, test-coverage): that test
+        patches `newest_content_mtime` with an unconditionally-increasing stub, so it cannot catch a
+        regression that made evidence A probe the wrong root (e.g. the request worktree instead of
+        merge_wt) or reintroduced a root-inode/.git-sensitive signal — the stub returns "progress"
+        regardless of what evidence A actually reads. This test performs REAL writes under merge_wt
+        — the exact tree `newest_content_mtime` walks in production — with the helper left
+        completely UNPATCHED, so it can only pass if evidence A reads the right directory with the
+        right semantics.
+
+        Deliberate exception to this class's task-2921 anti-flake convention (see the class
+        docstring): a real-write test couples the assertion to wall-clock file-write timing, which
+        the stubbed sibling test exists to avoid. Accepted here, once, to close the gap the stub
+        cannot — a genuinely wrong probe target — and mitigated by writing on every
+        VERIFY_ABANDON_POLL_SECS tick (10x more often than the no-progress budget elapses), so only
+        an extreme multi-hundred-ms event-loop stall could produce a false abort.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-real-write-a', 'rccrw.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+        progress_file = item.merge_wt / 'crosscheck-progress.txt'
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(runner.dispatch_returned.wait(), timeout=15.0)
+
+        # Real writes under merge_wt, once per poll tick, for several whole budget
+        # windows — the UNPATCHED newest_content_mtime helper must observe each one
+        # to keep suppressing the abort (no stub standing in for evidence A here).
+        for i in range(50):
+            progress_file.write_text(str(i))
+            await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS)
+
+        assert not verify_future.done(), (
+            'real writes under merge_wt during the post-dispatch window must be observed '
+            'by the unpatched newest_content_mtime helper and suppress the progress-abort, '
+            'exactly like the stubbed test above'
+        )
+        assert q.empty(), 'a progressing post-dispatch cross-check must not be re-queued'
+        assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
+            'no strike should be recorded while local content is progressing'
+        )
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
+
+    async def test_remote_lease_dispatch_returning_mid_verify_with_no_local_content_still_aborts(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The NEGATIVE TWIN to the positive test above, and the scope fence for Abort trigger 3's
+        progress union: the ONLY difference is that nothing writes under merge_wt during the
+        post-dispatch window, so `newest_content_mtime` is left completely UNPATCHED and reads the
+        real (static) merge worktree `_make_merged_item` produced.
+
+        This is the fence for the reify-5067 coasting-lease class (closed by task 2566): a remote
+        lease that is genuinely coasting — ssh child exited, or a post-dispatch probe hung — writes
+        nothing under merge_wt (RemoteRunner's only local writes are `git push`/`fetch` under
+        `.git`, which `newest_content_mtime` prunes), so widening the progress signal to a union
+        must NOT rescue it. If a future change makes this test abort late or not at all, trigger 3
+        has been silently disabled for remote leases.
+
+        The seed-ordering pin is a separate concern, split into
+        test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn below, so
+        this test stays a pure behavioural guard.
+        """
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        runner = _DispatchReturnsMidVerifyRemote(never_release)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-no-progress-a', 'rccnp.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a remote lease with no live dispatch AND no local content '
+            f'progress must still be progress-aborted, got '
+            f'status={result.status!r}'
+        )
+        assert not q.empty(), 'the coast must re-dispatch the request onto _queue'
+        assert q.get_nowait() is req
+        assert result.merge_wt is None, 'merge_wt must be cleaned on the coast abort'
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            req.task_id in r.message and 'progress' in r.message.lower()
+            for r in warnings
+        ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+    async def test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """SEED PIN, split out from the negative twin above so each test pins one invariant (the twin's
+        abort assertions hold via evidence B alone, independent of this one).
+
+        Proves `_last_content_mtime` is seeded unconditionally at verify-task creation — immediately
+        after verify_task is created, before the poll loop's first `await` — rather than lazily on
+        the first probe. Otherwise the `_last_content_mtime is None` arm would hand a genuinely
+        coasting remote lease one free budget window the first time it probes.
+
+        `newest_content_mtime` is wrapped in a recorder that still delegates to the real
+        implementation, reusing the same real static merge worktree and abort semantics as the
+        negative twin. The stub records, at the very top of `run_merge_verify` (before the dispatch
+        flag even goes live), how many times the recorder had already been called —
+        `_run_inflight_verify` creates verify_task and runs the seed call entirely synchronously
+        before its first `await`, so `run_merge_verify` cannot get a turn on the event loop until
+        after the seed call has already happened, making "at least one recorded call at that point"
+        a direct pin of the unconditional seed.
+        """
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.merge_queue import newest_content_mtime as _real_newest_content_mtime
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        mtime_calls: list[float | None] = []
+        seed_call_count_at_dispatch_start: list[int] = []
+
+        def _recording_real_mtime(root: Path) -> float | None:
+            result = _real_newest_content_mtime(root)
+            mtime_calls.append(result)
+            return result
+
+        def _on_dispatch_start() -> None:
+            # SEED PIN: record whether the seed already ran BEFORE this
+            # coroutine gets its first turn on the event loop.
+            seed_call_count_at_dispatch_start.append(len(mtime_calls))
+
+        runner = _DispatchReturnsMidVerifyRemote(
+            never_release, on_dispatch_start=_on_dispatch_start,
+        )
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-crosscheck-seed-pin-a', 'rcsp.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=runner, is_local=False)
+
+        with patch('orchestrator.merge_queue.newest_content_mtime', _recording_real_mtime):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert seed_call_count_at_dispatch_start and seed_call_count_at_dispatch_start[0] >= 1, (
+            f'_last_content_mtime must be seeded unconditionally at verify-task creation, '
+            f'strictly before run_merge_verify gets its first turn on the event loop — '
+            f'otherwise a remote lease is left with a None seed until the first probe, handing '
+            f'a genuinely coasting lease one free budget window; observed '
+            f'{seed_call_count_at_dispatch_start!r} recorder calls at that point'
+        )
+        # Sanity: the abort still lands under the recorder exactly as it does
+        # in the negative twin above (the recorder must not change behaviour).
+        assert result.status == InflightStatus.REQUEUED
 
 
 # ---------------------------------------------------------------------------

@@ -7081,6 +7081,94 @@ class TestHarnessFilteredTaskTreeWiring:
         # _fetch_filtered_task_tree must be called with the threaded project_root value.
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_remediation(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """run_full_cycle must capture the tree-read instant BEFORE the
+        S1->S2->S3 stage loop and thread it into _run_remediation_pass as
+        filtered_task_tree_fetched_at (task 4115).
+
+        The stage loop is minutes of LLM work in production and the
+        live-workflow gate's heartbeat TTL is only 10 minutes (see
+        TestRemediationSnapshotClockPinnedToTreeRead, which pins the
+        consumption half of this fix), so an implementation that re-stamps a
+        fresh now() at remediation time — rather than reusing the instant the
+        tree was actually read at — reintroduces the bug this task exists to
+        fix. run_full_cycle computes its own instant and it cannot be
+        injected from the outside the way _run_remediation_pass's can, so
+        this test instead proves the ORDERING invariant that distinguishes a
+        correct implementation from a buggy one: the threaded instant must be
+        >= the moment the fetch returned and strictly < a timestamp recorded
+        inside the stage loop that follows it. Stage 0's mock sleeps a real
+        (unpatched) 50ms BEFORE taking that stage_ran_at stamp, so the gap is
+        manufactured directly rather than resting on the incidental wall-clock
+        cost of the awaits in between (census fetch, graphiti health, index
+        drift, journal writes).
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        tree = self._make_tree()
+        fetch_state: dict = {}
+
+        async def _fetch(project_root):
+            fetch_state['fetched_returned_at'] = datetime.now(UTC)
+            return tree
+
+        harness._fetch_filtered_task_tree = _fetch
+
+        stage_state: dict = {}
+
+        async def _record_stage_ran(stage):
+            # Sleep BEFORE the stamp, not after: the assertion below is
+            # fetched_at < stage_ran_at, so the manufactured gap must land
+            # ahead of the stamp to actually pad that comparison.
+            await asyncio.sleep(0.05)
+            stage_state['stage_ran_at'] = datetime.now(UTC)
+
+        _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(
+            harness.stages[2],
+            items_flagged=[_make_finding_with_cited_task('599')],
+        )
+
+        harness._run_remediation_pass = AsyncMock()
+
+        await event_buffer.push(_make_event())
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        assert harness._run_remediation_pass.await_count == 1, (  # type: ignore[attr-defined]
+            f'Expected _run_remediation_pass to be awaited exactly once (the '
+            f"actionable finding must survive _maybe_remediate's filters); "
+            f'got {harness._run_remediation_pass.await_count} awaits'  # type: ignore[attr-defined]
+        )
+        kwargs = harness._run_remediation_pass.await_args.kwargs  # type: ignore[union-attr]
+
+        assert kwargs['filtered_task_tree'] is tree, (
+            f"Expected filtered_task_tree threaded through to be the fetched "
+            f"tree; got {kwargs['filtered_task_tree']!r}"
+        )
+        fetched_at = kwargs['filtered_task_tree_fetched_at']
+        assert fetched_at is not None, (
+            'Expected run_full_cycle to thread a non-None '
+            'filtered_task_tree_fetched_at into _run_remediation_pass'
+        )
+        assert fetched_at >= fetch_state['fetched_returned_at'], (
+            f"Expected the threaded instant ({fetched_at!r}) to be taken at or "
+            f"after _fetch_filtered_task_tree returned "
+            f"({fetch_state['fetched_returned_at']!r})"
+        )
+        assert fetched_at < stage_state['stage_ran_at'], (
+            f"Expected the threaded instant ({fetched_at!r}) to predate the "
+            f"S1->S3 stage loop ({stage_state['stage_ran_at']!r}) — an "
+            f"implementation that re-stamps a fresh now() at remediation time "
+            f"fails this ordering check"
+        )
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
@@ -12403,7 +12491,7 @@ async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, scope, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None, filtered_task_tree_fetched_at=None,
     ):
         remediation_calls.append(list(findings_arg))
 
@@ -12469,7 +12557,7 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, scope, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None, filtered_task_tree_fetched_at=None,
     ):
         remediation_calls.append(list(findings_arg))
 
@@ -13773,6 +13861,453 @@ class TestIntegrityGateInputParityWithRenderer:
         assert received == [(None, False)], (
             f'Expected task_kind=None, pure_gate=False for metadata={metadata!r}; '
             f'got {received!r}'
+        )
+
+
+# Private sentinel for TestRemediationSnapshotClockPinnedToTreeRead._run_gate_direct:
+# distinguishes "caller omitted filtered_task_tree_fetched_at entirely" (fallback
+# case) from "caller explicitly passed None" — a plain `None` default cannot
+# express that distinction.  Defined at module scope (mirrors the `_MISSING =
+# object()` local-sentinel convention used elsewhere in this file) because
+# default parameter values are evaluated once at `def` time.
+_REMEDIATION_SNAPSHOT_INSTANT_NOT_GIVEN = object()
+
+
+class TestRemediationSnapshotClockPinnedToTreeRead:
+    """The persistence-gated live-workflow gate (task 1655/2964) must age a
+    cited task's heartbeat against the instant its snapshot was actually
+    READ, not a fresh clock reading taken minutes later at gate time.
+
+    _run_remediation_pass short-circuits its own tree fetch with a
+    caller-supplied `filtered_task_tree` — the production path, threaded from
+    run_full_cycle's PRE-stage-loop fetch — but pre-task-4115 it always
+    stamped `_tasks_snapshot_at` with a fresh `datetime.now(UTC)` taken AFTER
+    the S1->S2->S3 stage loop that follows, which is minutes of LLM work away
+    from the actual tree read. Since the gate compares a cited task's
+    `heartbeat_at` against `now - DEFAULT_HEARTBEAT_TTL` (10 minutes,
+    live_workflow_detector.DEFAULT_HEARTBEAT_TTL), that gap could silently
+    age a heartbeat that was fresh at the read past the TTL and let a
+    spurious stranded-work escalation through for a task that was
+    demonstrably live at the moment the tree was read — precisely the
+    failure task 2964's clock-pinning was written to prevent, but (pre-4115)
+    only for the self-fetch path, never the (in production, always-taken)
+    caller-supplied-tree path.
+
+    These tests drive `_run_remediation_pass` DIRECTLY — rather than
+    `run_full_cycle`, which stamps its own instant and cannot be controlled
+    from the outside — to inject a `filtered_task_tree_fetched_at` and pin
+    the CONSUMPTION half of the fix. The WIRING half (does run_full_cycle
+    actually capture the pre-stage-loop instant and thread it down?) is
+    covered separately by
+    TestHarnessFilteredTaskTreeWiring.test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_remediation.
+
+    All five cases sit 9 minutes clear of the 10-minute TTL boundary in
+    either direction, so no realistic clock drift during the test can flip a
+    verdict. (The fifth, a naive-datetime instant, falls back to the same
+    fresh-now() path as the no-instant-supplied case — see
+    test_supplied_naive_instant_falls_back_to_now_with_warning.)
+    """
+
+    @staticmethod
+    async def _run_gate_direct(
+        *, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, cited_task,
+        filtered_task_tree,
+        filtered_task_tree_fetched_at=_REMEDIATION_SNAPSHOT_INSTANT_NOT_GIVEN,
+        taskmaster_tasks=None,
+    ) -> tuple[list, list, list]:
+        """Drive _run_remediation_pass's persistence-gated live-workflow gate directly.
+
+        Verbatim reuse of the setup
+        TestIntegrityGateInputParityWithRenderer._run_gate uses —
+        _make_test_harness, an EscalationQueue(tmp_path / 'esc'), the
+        read_scheduler_state/orchestrator_started_at empty-form stubs (so
+        neither of the other two corroboration signals can fire), and the
+        recurrence-threshold journal seeding loop — but calls
+        `_run_remediation_pass` directly instead of `run_full_cycle`, so the
+        caller can inject `filtered_task_tree_fetched_at` (unreachable through
+        run_full_cycle, which stamps its own instant).
+
+        `taskmaster_tasks`, when given, seeds `harness.taskmaster.get_tasks`
+        for the self-fetch case (filtered_task_tree=None).
+
+        Returns (stranded_escalations, suppression_records, received).
+        `received` records the `corroborated` kwarg forwarded to
+        is_workflow_live_for_task for each in-progress cited task checked —
+        the verdict is driven purely by corroboration, mirroring
+        TestIntegrityGateInputParityWithRenderer's corroboration tests.
+        """
+        import uuid as _uuid
+
+        from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+        import fused_memory.reconciliation.harness as harness_module
+        from fused_memory.reconciliation.harness import (
+            _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+            TierConfig,
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = esc_queue
+
+        if taskmaster_tasks is not None:
+            harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+                'tasks': taskmaster_tasks
+            }
+
+        finding = _make_finding_with_cited_task(str(cited_task['id']))
+
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _fake_is_live)
+
+        # Pin the two on-disk corroboration inputs to their empty forms — see
+        # TestIntegrityGateInputParityWithRenderer._run_gate for why these
+        # must be stubbed rather than left real (shared, pytest-unmanaged
+        # /tmp/test-project root).
+        monkeypatch.setattr(
+            harness_module, 'read_scheduler_state',
+            lambda _root: {
+                'queue': [], 'parks': {}, 'park_stacks': {},
+                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
+                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
+                'snapshot_at': None,
+            },
+        )
+        monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
+
+        # Seed threshold-1 prior completed runs carrying the finding; together
+        # with this remediation run's own persisted S3 report, the persistence
+        # count reaches _INTEGRITY_FINDING_RECURRENCE_THRESHOLD and the gate at
+        # harness.py:4791 fires.
+        n_seed = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 1
+        base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+        for i in range(n_seed):
+            rid = str(_uuid.uuid4())
+            run = ReconciliationRun(
+                id=rid,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='buffer_size:1',
+                started_at=base_time + timedelta(minutes=i),
+                events_processed=1,
+                status=RunStatus.running,
+            )
+            await journal.start_run(run)
+            await journal.update_run_stage_reports(
+                rid, {'integrity_check': {'items_flagged': [finding]}}
+            )
+            await journal.complete_run(rid, 'completed')
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2], items_flagged=[finding])
+
+        tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+        call_kwargs: dict = {
+            'scope': _scope('test-project', '/tmp/test-project'),
+            'filtered_task_tree': filtered_task_tree,
+        }
+        if filtered_task_tree_fetched_at is not _REMEDIATION_SNAPSHOT_INSTANT_NOT_GIVEN:
+            call_kwargs['filtered_task_tree_fetched_at'] = filtered_task_tree_fetched_at
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            await harness._run_remediation_pass(
+                'test-project', 'parent-run-id', [finding], tier,
+                **call_kwargs,
+            )
+
+        stranded = [
+            e for e in esc_queue.get_pending()
+            if e.category == 'recon_integrity_issue'
+            and 'Persistently unresolved' in e.summary
+        ]
+        suppressed = [
+            r for r in caplog.records
+            if r.getMessage()
+            == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+        ]
+        return stranded, suppressed, received
+
+    @pytest.mark.asyncio
+    async def test_supplied_fetch_instant_keeps_a_heartbeat_that_was_fresh_at_the_read_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a heartbeat that was fresh AT THE TREE READ stays suppressed.
+
+        fetched_at = now-21min (the tree's read instant), heartbeat_at =
+        now-22min (1 minute old at that read). Pinning the gate's clock to
+        fetched_at reads the heartbeat as 1 minute old (well inside the
+        10-minute TTL) => corroborated => suppressed. A pre-fix
+        `_run_remediation_pass` cannot even accept this call (no
+        `filtered_task_tree_fetched_at` parameter) => TypeError. An
+        implementation that merely accepts-and-ignores the kwarg still stamps
+        `_tasks_snapshot_at` from a fresh `now()` taken at gate time (close to
+        this test's own `now`) => the heartbeat reads as ~22 minutes old =>
+        uncorroborated => escalates, still failing this test. This is also the
+        first test anywhere that fails if task 2964's `now=_tasks_snapshot_at`
+        at harness.py:4864 is reverted to a fresh `now()`.
+        """
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        now = datetime.now(UTC)
+        fetched_at = now - timedelta(minutes=21)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=22)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        tree = FilteredTaskTree(active_tasks=[cited_task], total_count=1)
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=tree,
+            filtered_task_tree_fetched_at=fetched_at,
+        )
+
+        assert received == [True], (
+            f'Expected corroborated=True for a heartbeat that was fresh at the '
+            f'pinned tree-read instant; got {received!r}'
+        )
+        assert stranded == [], (
+            f'Expected the escalation to be SUPPRESSED using the pinned read '
+            f'instant; got {[e.summary for e in stranded]}'
+        )
+        assert len(suppressed) >= 1, 'Expected a suppression log for the corroborated task'
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_already_stale_at_the_read_still_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """DIFFERENTIAL — proves the pinning computes a real age rather than
+        blanket-suppressing every escalation once an instant is supplied.
+
+        Same fetched_at = now-21min, but heartbeat_at = now-40min (19 minutes
+        old at the read, clear past the 10-minute TTL) => uncorroborated =>
+        still escalates.
+        """
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        now = datetime.now(UTC)
+        fetched_at = now - timedelta(minutes=21)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=40)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        tree = FilteredTaskTree(active_tasks=[cited_task], total_count=1)
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=tree,
+            filtered_task_tree_fetched_at=fetched_at,
+        )
+
+        assert received == [False], (
+            f'Expected corroborated=False for a heartbeat already stale at the '
+            f'read; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for a heartbeat already stale '
+            'at the read'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_self_fetch_path_ignores_a_caller_supplied_instant(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """The self-fetch path (filtered_task_tree=None) must stamp its OWN
+        fresh now() and must NOT inherit an instant meant for a tree it did
+        not read — a nonsensical pairing a caller should never send, but the
+        binding must be structurally impossible to mix up regardless.
+
+        filtered_task_tree_fetched_at=now-21min is supplied anyway; the tree
+        is fetched fresh via taskmaster.get_tasks, so the heartbeat
+        (now-22min) is genuinely ~22 minutes old at gate time => escalates.
+        An implementation that honours the supplied instant regardless of
+        which tree it describes would read the heartbeat as only 1 minute
+        old and wrongly suppress, failing this test.
+        """
+        now = datetime.now(UTC)
+        fetched_at = now - timedelta(minutes=21)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=22)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=None,
+            filtered_task_tree_fetched_at=fetched_at,
+            taskmaster_tasks=[cited_task],
+        )
+
+        assert received == [False], (
+            f'Expected corroborated=False — the self-fetch path must ignore '
+            f'the caller-supplied instant and use its own fresh read; got '
+            f'{received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation: the self-fetched tree is '
+            'genuinely ~22 minutes old, past the TTL'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_supplied_tree_without_an_instant_falls_back_to_now(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """BACK-COMPAT — a caller that supplies filtered_task_tree without its
+        read instant (the ~30 existing direct _run_remediation_pass callers)
+        must keep the exact pre-4115 behaviour: fall back to a fresh now()
+        rather than raising or treating the tree as arbitrarily fresh.
+
+        heartbeat_at=now-22min, no filtered_task_tree_fetched_at kwarg at all
+        => ages against a fresh now() => ~22 minutes old => escalates.
+        """
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        now = datetime.now(UTC)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=22)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        tree = FilteredTaskTree(active_tasks=[cited_task], total_count=1)
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=tree,
+            # filtered_task_tree_fetched_at intentionally omitted.
+        )
+
+        assert received == [False], (
+            f'Expected corroborated=False — a supplied tree without its read '
+            f'instant must fall back to a fresh now(); got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation under the no-instant fallback'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_supplied_naive_instant_falls_back_to_now_with_warning(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """ROBUSTNESS — a naive (tzinfo-less) filtered_task_tree_fetched_at must be
+        treated the same as a missing one, never handed to corroboration_for_task
+        as-is.
+
+        has_live_claimant compares the instant against timezone-aware
+        heartbeats; a naive datetime raises TypeError there, which is caught
+        and swallowed several frames up, leaving corroborated=None and
+        silently SUPPRESSING every stranded-work escalation in the pass — the
+        opposite of the fail-safe direction this gate is meant to take.
+        Falling back to a fresh now() — logged at WARNING with
+        reason='naive_datetime' — keeps the gate loud and evaluable instead
+        of silently swallowing the malformed input.
+
+        heartbeat_at=now-22min, naive fetched_at supplied => falls back to a
+        fresh now() => heartbeat reads as ~22 minutes old => escalates, same
+        outcome as the no-instant-at-all case, but via the naive-datetime leg
+        of the fallback.
+        """
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        now = datetime.now(UTC)
+        naive_fetched_at = (now - timedelta(minutes=21)).replace(tzinfo=None)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=22)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        tree = FilteredTaskTree(active_tasks=[cited_task], total_count=1)
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=tree,
+            filtered_task_tree_fetched_at=naive_fetched_at,
+        )
+
+        assert received == [False], (
+            f'Expected corroborated=False — a naive instant must fall back to '
+            f'a fresh now() rather than reach corroboration_for_task as-is; '
+            f'got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation under the naive-instant fallback'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+        fallback_warnings = [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.remediation_tree_read_instant_missing'
+        ]
+        assert len(fallback_warnings) == 1, (
+            f'Expected exactly one fallback log record; got records: '
+            f'{[(r.levelno, r.getMessage()) for r in caplog.records]}'
+        )
+        assert fallback_warnings[0].levelno == logging.WARNING, (
+            f'Expected the fallback log at WARNING; got level '
+            f'{fallback_warnings[0].levelno}'
+        )
+        assert fallback_warnings[0].__dict__.get('reason') == 'naive_datetime', (
+            f"Expected reason='naive_datetime'; got "
+            f"{fallback_warnings[0].__dict__.get('reason')!r}"
         )
 
 

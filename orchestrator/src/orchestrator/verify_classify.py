@@ -221,6 +221,21 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # that is the signal to promote the sentinel to the primary contract (or to
 # lift the marker list into per-project `verify_env` config) rather than to
 # extend the alternation again.
+#
+# task 4492 IS the change-of-approach this note asked for, and it did NOT
+# come at the allowlist's expense: the list stays at THREE basenames, no
+# fourth was added, and no fourth veto was added either. What changed is the
+# LAYER — `_redact_passed_suite_blocks` scopes guard 3 to the output not
+# covered by a passing suite's attestation, so the recurring false positive
+# is removed by construction rather than by another shape-specific veto.
+#
+# That helper adds a SECOND reify coupling (run_all.sh's suite framing), so
+# weigh it against the same portability concern: it is strictly SAFER than
+# the allowlist's. An unrecognised or absent framing shape makes the helper
+# redact NOTHING, degrading to today's exact whole-output behaviour — i.e. a
+# non-reify project, or a future run_all that changes its framing, loses the
+# SCOPING and keeps full detection. The allowlist's failure mode is the
+# opposite and worse: an unrecognised emitter is a MISSED detection.
 # Trailing capture group (task 4212) added IN PLACE rather than via a second
 # line-anchored regex, so there is exactly one `^[ \t]*@@REIFY_SLOT_TIMEOUT@@`
 # literal to keep in sync with the anchoring contract above (task 3679 /
@@ -284,6 +299,171 @@ _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'failed to acquire .{1,40}? within \S+s\b',
     re.MULTILINE,
 )
+
+# task 4492 — run_all.sh suite framing, used ONLY by
+# `_redact_passed_suite_blocks` below to scope guard 3. Declared locally
+# rather than imported from `merge_shadow`/`offline_lane` (which parse
+# sibling run_all markers): this module is deliberately self-contained per
+# its docstring above, and `merge_shadow` is a much heavier module on a
+# different layer — importing it from the classifier would invert that
+# dependency for two one-line patterns.
+#
+# The OPEN pattern is anchored at hard column 0 with NO leading-whitespace
+# tolerance, matching how run_all emits it. That is not an oversight: reify
+# suites that assert on run_all's own output contract quote `--- Running: `
+# inside INDENTED `  PASS: ...` assertion prose (two such lines in the
+# task-4492 sample log), and column-0 anchoring excludes them for free.
+#
+# The CLOSE pattern uses the `^[ \t]*` tolerance of the ANCHORING CONTRACT
+# note above (cf. `_SLOT_ACQUIRE_DEADLINE_RE`, `verify._match_clock_marker`):
+# run_all emits two leading spaces, and verify output is aggregated from
+# wrappers that routinely indent captured sub-output. It adopts the shape
+# already source-verified in `offline_lane._INFRA_RESULT_FAIL_RE`, widened to
+# PASS|FAIL|SKIP, and stops before any trailing
+# ` [flaky: passed on serial retry]` suffix (run_all.sh:1792).
+#
+# ---> SIBLING ENCODING, KEEP IN SYNC (review amendment #4). This is the
+# SECOND in-repo encoding of run_all.sh's per-suite RESULT framing; the other
+# is `offline_lane._INFRA_RESULT_FAIL_RE` (offline_lane.py:102), which parses
+# the same lines for the infra confirmation runner. They intentionally
+# DIVERGE in three ways, none of them accidental:
+#
+#   * TAIL — offline_lane end-anchors (`\s*$`); this one does NOT, because the
+#     close may carry run_all's ` [flaky: ...]` suffix. Traced consequence of
+#     the open tail here: a close can only ever match EARLIER, which only ever
+#     SHRINKS a redaction window — i.e. it stays in the fail-safe direction.
+#   * SEPARATORS — offline_lane uses `\s*` between tokens; this one requires
+#     the literal single spaces run_all actually emits. Stricter, and correct
+#     per the ANCHORING CONTRACT: a looser separator is another way for quoted
+#     assertion prose to impersonate the producer.
+#   * NAME — offline_lane uses `.+?`; this one uses `[^)]+`, which cannot run
+#     past the closing paren into a ` [flaky: ...]` suffix.
+#
+# Neither site is generated from the other, so a future run_all framing change
+# must be fixed in BOTH. This cross-reference exists so that is discoverable
+# from either end. If a THIRD consumer ever appears, lift the patterns into
+# one small shared module rather than adding a fourth copy. (The reciprocal
+# `cf. verify_classify._RUN_ALL_SUITE_CLOSE_RE` comment in offline_lane.py is
+# NOT in task 4492's lock scope and is filed as follow-up work.)
+_RUN_ALL_SUITE_OPEN_RE = re.compile(r'^--- Running: (?P<name>.+?) ---[ \t]*$')
+_RUN_ALL_SUITE_CLOSE_RE = re.compile(
+    r'^[ \t]*RESULT: (?P<verdict>PASS|FAIL|SKIP) \((?P<name>[^)]+)\)'
+)
+
+
+def _redact_passed_suite_blocks(output: str) -> str:
+    """Blank the interior of every aggregated-runner suite block that closed
+    with a PASS, leaving every other byte of *output* untouched.
+
+    WHY THIS EXISTS (task 4492, the 4th recurrence of its class — siblings
+    2748 / 2821 / 3677+3679 / 4212). When a verify leg runs reify's
+    ``tests/infra/run_all.sh``, its output is the CONCATENATION of ~146
+    independent suites. Suites that TEST the slot/lock machinery necessarily
+    EXECUTE the real emitter, so their transcripts contain genuine,
+    column-0, byte-identical-to-production marker lines while reporting zero
+    failures. reify 5623 was held blocked 2026-08-09 -> 08-19 under a false
+    ``SEMAPHORE_TIMEOUT`` L1 on exactly that basis; the real cause was a
+    ``test_reify_audit_ptodo.sh`` PTODO ratchet failure named in the same
+    log's tail. No line-anchoring rule can separate those markers from a host
+    event — task 3679 already closed the mid-line-prose vector and these
+    survive it — because positionally they ARE production emissions. Only the
+    surrounding PASS attestation distinguishes them.
+
+    PRODUCER CONTRACT (reify tests/infra/run_all.sh @ c09a26b5b1), emitted
+    identically by all four paths — H2 concurrent pool (:1772, :1792-1806),
+    legacy all-serial fallback (:1840-1850), member-subset (:1274,
+    :1293-1308, the only SKIP emitter), and H9 (:1222, :1226-1228)::
+
+        --- Running: <name> ---                 (open, column 0)
+          RESULT: (PASS|FAIL|SKIP) (<name>)     (close, optional trailing
+                                                 " [flaky: passed on serial retry]")
+
+    BLOCKS ARE ATOMIC EVEN UNDER THE CONCURRENT POOL. Phase 2 buffers each
+    member's output to its own file; Phase 3 (:1767-1810) replays it under
+    its own header in discovered order via ``_ra_emit_sanitized``. So
+    concurrency cannot interleave two blocks, and a simple single-pass
+    open/close walk is sufficient. Retried members archive BOTH attempts
+    under ONE header, delimited by ``--- attempt 1 (concurrent pool) ---`` /
+    ``--- attempt 2 (serial retry) ---``; those deliberately do not match
+    ``^--- Running: `` (run_all.sh says so at :1776, to preserve its
+    one-header-per-discovered-test contract), so they are ordinary interior
+    lines here too.
+
+    FAIL-SAFE DIRECTION — the property that bounds this function's blast
+    radius. A region is redacted ONLY on a positive PASS attestation whose
+    close names the SAME suite as its open. Every other shape redacts
+    NOTHING and therefore degrades to the exact whole-output behaviour that
+    predates this function:
+
+    * ``FAIL`` — the failing suite's block is the one region that certainly
+      does carry evidence about the failure.
+    * ``SKIP`` — a skipped suite never asserted the host was healthy, so it
+      is treated as not-attested rather than as passed.
+    * NAME MISMATCH — the nesting guard. reify ships suites that test
+      run_all.sh itself and can replay its transcript; without the name
+      check a nested ``RESULT: PASS (inner)`` could close, and thus silently
+      delete the evidence inside, an OUTER block. A mismatch leaves the
+      block pending instead.
+    * UNCLOSED BLOCK (EOF, or a second open header first) — an aborted run
+      is precisely where a genuine host event surfaces, so it is never
+      treated as attested. A second open header REPLACES the pending one.
+    * NO RECOGNISED FRAMING — non-reify projects and every non-aggregated
+      tool are untouched, and this returns the INPUT OBJECT itself.
+
+    Consequently the transform can only ever REMOVE text, so a caller
+    reading the result can only ever detect LESS than it does today — never
+    more. That is what makes wiring it into guard 3's POSITIVE detectors
+    (`_classify_environmental`) safe in exactly one direction.
+
+    Splitting is on ``'\\n'`` EXPLICITLY, not ``str.splitlines``: ``^`` under
+    ``re.MULTILINE`` breaks only on ``\\n``, while ``splitlines()`` also breaks
+    on ``\\x0b``/``\\x0c``/``\\x1c``-``\\x1e``/``\\x85``/``\\u2028``/``\\u2029`` — a form
+    feed anywhere in a 900 KB merged-stderr verify log would desync this
+    function's line view from the very regexes it exists to scope.
+    ``split('\\n')``/``'\\n'.join()`` also round-trips byte-exactly on every
+    input, including the empty string and text with or without a trailing
+    newline, so "only removes text" is structurally true rather than
+    case-analysed. Redacted lines are BLANKED rather than deleted, which
+    keeps the result line-addressable against the original during triage and
+    cannot create a new adjacency between two previously-separated lines.
+    """
+    lines = output.split('\n')
+    open_index: int | None = None
+    open_name: str | None = None
+    redacted = False
+
+    for index, line in enumerate(lines):
+        opened = _RUN_ALL_SUITE_OPEN_RE.match(line)
+        if opened is not None:
+            # A second header before any close REPLACES the pending block;
+            # the earlier one is never redacted (fail-safe).
+            open_index = index
+            open_name = opened.group('name')
+            continue
+
+        closed = _RUN_ALL_SUITE_CLOSE_RE.match(line)
+        if closed is None or open_index is None:
+            continue
+        if closed.group('name') != open_name:
+            # Nesting guard: leave the block PENDING on a name mismatch, so
+            # a replayed inner transcript cannot close an outer block.
+            continue
+
+        if closed.group('verdict') == 'PASS':
+            for interior in range(open_index + 1, index):
+                if lines[interior]:
+                    lines[interior] = ''
+                    redacted = True
+        # Any name-matching close ends the block, PASS/FAIL/SKIP alike.
+        open_index = None
+        open_name = None
+
+    if not redacted:
+        # The SAME object, not an equal copy — makes "unframed output is
+        # untouched" an assertable property for callers and tests.
+        return output
+    return '\n'.join(lines)
+
 
 # Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
 # check-manifold-deps.sh) that cannot read the ephemeral merge-verify
@@ -457,6 +637,38 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     proceeds to per-tool dispatch) when none of these conditions is grounded
     in *output*.
 
+    SCOPING (task 4492). Every POSITIVE detector below reads
+    ``_redact_passed_suite_blocks(output)`` — the output with each PASSED
+    suite's interior blanked — while the one NEGATIVE/veto condition, the
+    ``_RUSTC_DIAGNOSTIC_SPAN_RE`` check on collateral shape 1, keeps reading
+    the FULL *output*. That asymmetry is deliberate and is what bounds the
+    change to ONE direction: redaction removes only positive evidence, so
+    this guard can move a classification AWAY from a guard-3 category but
+    never TOWARD one. Scoping the veto too would weaken a veto, i.e. make
+    ENV_TRANSIENT easier to reach — the false-GREEN direction that would
+    excuse a branch fault as host collateral.
+
+    THE INCIDENT. reify 5623 was held blocked 2026-08-09 -> 08-19 under a
+    false "disk pressure / SEMAPHORE_TIMEOUT" L1 — infra-hold routing instead
+    of debugfix — while the real cause was a ``test_reify_audit_ptodo.sh``
+    PTODO ratchet failure named in the same log's own tail
+    (``=== Summary: 145 discovered, 1 failed ===``). The three lines that
+    flipped the classification were emitted by suites reporting ZERO
+    failures.
+
+    WHY LINE-ANCHORING COULD NOT FIX IT, and why this needed a new layer
+    rather than a fifth veto: those suites TEST the slot/lock machinery, so
+    they EXECUTE the real emitter. Their marker lines are genuine, at column
+    0, and byte-identical to production emissions — task 3679 had already
+    closed the mid-line assertion-prose vector and these survive it. No
+    POSITIONAL rule separates them from a host event, because positionally
+    they ARE production output. Only the surrounding PASS attestation does.
+    Adding another shape-specific veto would have been the fifth turn of the
+    2748 -> 2821 -> 3679 -> 4212 treadmill; scoping the whole guard removes
+    the class by construction. See ``_redact_passed_suite_blocks`` for the
+    producer contract and its fail-safe direction, and the replayed 5623
+    fixture under ``tests/fixtures/verify_classify_run_all/``.
+
     ORDERING: DISK_FULL (ENOSPC/linker) is checked FIRST, then the
     broken-``_merge-verify``-worktree ENV_TRANSIENT checks (task 2756's
     Cargo.lock signature + task 2831's restart-collateral shapes), then the
@@ -464,6 +676,16 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     DISK_FULL/ENOSPC remains the most-specific root cause and stays first
     (see ``test_enospc_with_unreadable_lock_stays_disk_full`` and
     ``test_enospc_with_collateral_stays_disk_full``).
+
+    Task 4492 left this order UNCHANGED and it REMAINS LOAD-BEARING. Scoping
+    changes WHICH TEXT each arm reads, never the sequence they are tried in,
+    so every tie documented below is decided exactly as before — now on the
+    scoped text for the positive arms. The whole guard is scoped rather than
+    just the SEMAPHORE_TIMEOUT arm precisely so the ties stay meaningful:
+    DISK_FULL and the collateral shapes are reachable from a passing suite by
+    the same mechanism (reify ships ``df``-failure/garbage-``df`` suites, and
+    collateral shape 5 is a literal marker a test could replay), so scoping
+    one arm would have left the class alive under a different label.
 
     SEMAPHORE_TIMEOUT's last position is retained from task 2831's reorder,
     and that ordering REMAINS LOAD-BEARING (task 3679 review). Both signals
@@ -651,25 +873,51 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
     """
-    lower = output.lower()
+    # task 4492 — every POSITIVE detector below reads `scoped`, the output
+    # with each PASSED suite's interior blanked; the one NEGATIVE/veto
+    # condition (`_RUSTC_DIAGNOSTIC_SPAN_RE`) deliberately keeps reading the
+    # FULL `output`. Three constraints a reviewer should check:
+    #
+    #   1. THE VETO ASYMMETRY IS THE SAFETY PROPERTY. Redaction removes only
+    #      POSITIVE evidence, so this guard can move a classification AWAY
+    #      from a guard-3 category but never TOWARD one — no output that
+    #      classifies non-guard-3 today can start classifying guard-3.
+    #      NEVER pass `scoped` to `_RUSTC_DIAGNOSTIC_SPAN_RE`: scoping a veto
+    #      makes ENV_TRANSIENT EASIER to reach, the false-GREEN direction
+    #      that would excuse a branch fault as host collateral.
+    #   2. THE WHOLE GUARD IS SCOPED, not just the SEMAPHORE_TIMEOUT arm.
+    #      DISK_FULL and the collateral shapes are reachable from a passing
+    #      suite by the identical mechanism — reify already ships suites
+    #      exercising `df`-failure/garbage-`df` handling (the 4492 sample
+    #      log's `test_warm_lane_sizing_lifecycle.sh` D7/D8/D9), and
+    #      collateral shape 5 is a literal `=== INTERRUPTED (worktree
+    #      removed) ===` marker a test could legitimately replay. Scoping one
+    #      arm would leave the class alive under a different label — the
+    #      shape-N+1 treadmill (2748 -> 2821 -> 3679 -> 4212) this exists to end.
+    #   3. ORDERING IS UNCHANGED (DISK_FULL, the three ENV_TRANSIENT
+    #      branches, then SEMAPHORE_TIMEOUT last). The ORDERING note above
+    #      stays load-bearing; scoping changes WHICH TEXT each arm reads,
+    #      never the order they are tried in.
+    scoped = _redact_passed_suite_blocks(output)
+    lower = scoped.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
-    if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
+    if _LINKER_CONTEXT_RE.search(scoped) and _LINKER_SIGNAL_RE.search(scoped):
         return FailureCategory.DISK_FULL
-    if _VERIFY_ENV_BROKEN_RE.search(output):
+    if _VERIFY_ENV_BROKEN_RE.search(scoped):
         return FailureCategory.ENV_TRANSIENT
     if _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE.search(
-        output
-    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):
+        scoped
+    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):  # veto reads FULL output
         return FailureCategory.ENV_TRANSIENT
-    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
+    if any(pattern.search(scoped) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
         return FailureCategory.ENV_TRANSIENT
-    if is_interpreter_missing_workspace_packages(output):
+    if is_interpreter_missing_workspace_packages(scoped):
         return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
-    if _has_fatal_slot_timeout_sentinel(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+    if _has_fatal_slot_timeout_sentinel(scoped) or _SLOT_ACQUIRE_DEADLINE_RE.search(scoped):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
@@ -704,7 +952,29 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
        output" reason as guard 2 — a host condition like a full disk, a
        lock/semaphore-slot timeout, an unreadable worktree lockfile, or an
        interpreter resolved from a stripped ambient env is not a property of
-       any one tool).
+       any one tool). Task 4492: this guard's POSITIVE detectors read
+       *output* with each PASSED suite's interior blanked
+       (``_redact_passed_suite_blocks``), so a marker emitted by a suite that
+       reported zero failures is no longer evidence about the failure being
+       classified; its one veto still reads the full *output*, which keeps
+       the change able to move a classification only AWAY from a guard-3
+       category, never toward one.
+
+    SCOPING BOUNDARY — a RECORDED CHOICE, not an oversight (review amendment
+    #5). Guard 3 is the ONLY consumer of the scoped text. Guards 1/2/2.5 and
+    the whole per-tool dispatch table below still read the FULL, unscoped
+    *output*, so the same false-positive shape remains reachable under a
+    different label: a PYTEST/CARGO table pattern matching text quoted inside
+    a suite that reported zero failures classifies exactly as wrongly as the
+    slot markers did, just as e.g. TEST_FAILURE rather than SEMAPHORE_TIMEOUT.
+    Task 4492 deliberately stopped at guard 3, whose grounding is a single
+    incident and whose arms are all host-condition claims — claims an
+    aggregated runner's PASS attestation directly contradicts. Extending the
+    scoping downward is a SEPARATE decision needing per-tool evidence about
+    which patterns are position-sensitive (a pytest `FAILED ...` line quoted
+    inside a passing suite is not obviously the same case as a host marker),
+    so it is left un-taken and named here rather than silently assumed
+    covered.
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can

@@ -65,7 +65,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from _fm_helpers import pydantic_spec, reap_leaked_ticket_workers  # noqa: E402
+from _fm_helpers import (  # noqa: E402
+    pydantic_spec,
+    reap_leaked_ticket_workers,
+    resolve_xdist_worker_id,
+)
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -88,6 +92,33 @@ from fused_memory.config.schema import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+@pytest.fixture(scope='session')
+def worker_id(request) -> str:
+    """Per-worker id ('gw0', 'gw1', … or 'master') — supplied HERE, not only by xdist.
+
+    This deliberately SHADOWS pytest-xdist's own `worker_id` fixture
+    (xdist/plugin.py) for every fused-memory test.  Motivating caller: the
+    offline-deep lane's serial confirm re-run, which appends
+    `-p no:xdist -o addopts=` (orchestrator/src/orchestrator/verify_cmd.py).
+    `-p no:xdist` unregisters the plugin along with its FIXTURES — not just its
+    `-n`/`--dist` CLI options — so every test requesting `worker_id` ERRORED at
+    setup with `fixture 'worker_id' not found`, and a developer typing
+    `pytest -p no:xdist` locally hit the same wall.
+
+    Shadowing is safe precisely because `resolve_xdist_worker_id` delegates to
+    xdist's own `get_xdist_worker_id`: under a healthy `-n auto` run the value
+    returned here is produced by xdist's own function and is therefore
+    identical, while under `-p no:xdist` this is the only provider left.
+
+    `scope='session'` MATCHES xdist's own scope.  Every current consumer is
+    function-scoped, so any scope would work today — but pytest forbids a
+    broader-scoped fixture depending on a narrower one, so a function-scoped
+    shim would ScopeMismatch the first time a session- or module-scoped fixture
+    requested `worker_id`.  Not autouse: consumers request it explicitly.
+    """
+    return resolve_xdist_worker_id(request)
 
 
 @pytest.fixture(autouse=True)

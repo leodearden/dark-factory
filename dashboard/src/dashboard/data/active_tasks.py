@@ -22,7 +22,9 @@ Output shape (per task) matches ``data.js`` mock fixtures:
                                     # claimant (null/blank claimant, or a heartbeat older than
                                     # STRANDED_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
-        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot)
+        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
+                                    # None when the entry's own started is None
+                                    # (per-task read failure)
         'loops': 2,                 # TaskRuntimeEntry.loops (runtime snapshot)
         'attempts': 3,              # TaskRuntimeEntry.attempts (runtime snapshot)
         'lane': '_lane-7',          # TaskRuntimeEntry.lane, or None
@@ -189,15 +191,22 @@ def _task_uid(project: str, task_id: int) -> str:
     return f'{project}/T-{task_id}'
 
 
-def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
-    """Whole minutes between *iso* and *now* (UTC). 0 on parse failure / future.
+def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | None:
+    """Whole minutes between *iso* and *now* (UTC).
+
+    Returns ``None`` when *iso* is missing/empty — the start time is genuinely
+    UNKNOWN (the per-task artifact-read-failure signal on
+    ``TaskRuntimeEntry.started``), and fabricating ``0`` there would render as
+    '0m running' during precisely the failure this path exists to surface
+    (loud-over-silent-degradation; INV-2 structured-facts-at-failure).
+    Returns ``0`` on parse failure or a future timestamp.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results or to share one instant
     across multiple rows in an aggregation.
     """
     if not iso:
-        return 0
+        return None
     try:
         ts = datetime.fromisoformat(iso.replace('Z', '+00:00'))
     except ValueError:

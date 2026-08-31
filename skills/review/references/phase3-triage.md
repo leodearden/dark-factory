@@ -94,7 +94,8 @@ submit_result = submit_task(
         "source": "review-cycle",
         "review_id": "{timestamp}",
         "spawn_context": "review",
-        "modules": ["{affected/module/path}"],
+        # sparse is fine — the architect widens scope at plan time. File paths only (a directory is rejected); use [] to defer entirely.
+        "files": ["{affected/file/path.py}"],
         "memory_hints": {
             "search_queries": ["{relevant search query}"],
             "entity_names": ["{relevant entity}"]

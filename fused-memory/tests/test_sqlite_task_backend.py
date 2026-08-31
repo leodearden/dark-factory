@@ -575,6 +575,138 @@ async def test_set_task_claimant_no_kwargs_is_a_noop(backend, project_root):
     assert one['heartbeat_at'] is None
 
 
+# ── set_task_claimant terminal tripwire (task 4674, PRD E-3) ───────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['done', 'cancelled'])
+async def test_set_task_claimant_on_terminal_row_logs_error_and_still_persists(
+    backend, project_root, caplog, terminal_status,
+):
+    """A manual claimant mint onto a terminal row logs ONE ERROR tripwire but still persists.
+
+    PRD docs/prds/claimant-invariant-detection.md, contract E-3 / decision D-6:
+    observation, not refusal.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', terminal_status, project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-manual-mint',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].message.startswith('claimant_stamped_on_terminal')
+    assert 'task_id=1' in errors[0].message
+    assert f'status={terminal_status}' in errors[0].message
+    assert 'claimant_run_id=run-manual-mint' in errors[0].message
+    assert 'tag=master' in errors[0].message
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-manual-mint'
+    assert one['heartbeat_at'] == '2026-08-24T00:00:00+00:00'
+    assert one['status'] == terminal_status
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_heartbeat_only_tick_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """B9 negative control (PRD-named): a heartbeat-only tick on an already-terminal row
+
+    must not trip the wire — claimant_run_id is left at the _UNSET default (the wire shape
+    orchestrator/src/orchestrator/workflow.py::TaskWorkflow._claimant_heartbeat_loop
+    produces), so no claimant is persisted by this call.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            heartbeat_at='2026-08-24T00:01:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'B9 negative control: heartbeat-only tick must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['heartbeat_at'] == '2026-08-24T00:01:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_explicit_clear_on_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The release/un-claim path (harness.py, scheduler.py) fires right as a task goes
+
+    terminal and must never trip the wire — it stamps SQL NULL, not a claimant.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-live',
+        heartbeat_at='2026-08-24T00:00:00+00:00',
+    )
+    await backend.set_task_status('1', 'done', project_root=project_root)
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id=None,
+            heartbeat_at=None,
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'negative control: explicit release/clear must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_on_non_terminal_row_is_silent(
+    backend, project_root, caplog,
+):
+    """The ordinary dispatch claim onto a non-terminal row must stay silent — regression guard."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.set_task_claimant(
+            '1', project_root=project_root,
+            claimant_run_id='run-x',
+            heartbeat_at='2026-08-24T00:00:00+00:00',
+        )
+
+    tripwire_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and 'claimant_stamped_on_terminal' in r.message
+    ]
+    assert tripwire_errors == [], 'regression guard: non-terminal row must stay silent'
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-x'
+
+
 # ── set_task_status claimant extension (task 2182 step-5/6) ────────
 
 
@@ -629,7 +761,7 @@ async def test_set_task_status_without_claimant_kwargs_leaves_claimant_intact(ba
     assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
 
 
-def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
+def _make_v2_stamped_db_without_claimant_columns(db_path: Path, *, status: str = 'pending') -> None:
     """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
 
     Simulates a connection whose claimant columns never got ALTERed in —
@@ -638,6 +770,10 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
     and is skipped for an already-v2 DB), so the claimant columns stay
     absent, exercising set_task_status's fail-safe (WARNING, no error) path.
+
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
     """
     import sqlite3
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -671,7 +807,8 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
     """)
     conn.execute(
         "INSERT INTO tasks (tag, id, title, status, updated_at) "
-        "VALUES ('master', 1, 'stranded-shape task', 'pending', '2026-01-01T00:00:00.000Z')",
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
     )
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
@@ -736,6 +873,43 @@ async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog
 
     warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_columns_absent_on_terminal_row_emits_no_tripwire(
+    tmp_path, caplog,
+):
+    """A call that writes NOTHING (claimant-columns-absent fail-safe) must not trip the wire.
+
+    E-3 scopes the ERROR to a call that PERSISTS a non-NULL claimant; the fail-safe path
+    returns early before the UPDATE ever runs.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v2_stamped_db_without_claimant_columns(db_path, status='done')
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+            result = await b.set_task_claimant(
+                '1', project_root=project_root,
+                claimant_run_id='run-x', heartbeat_at='2026-08-24T00:00:00+00:00',
+            )
+    finally:
+        await b.close()
+
+    assert 'Claimant columns unavailable' in result['message']
+
+    warning_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'columns absent' in r.message
+    ]
+    assert warning_msgs, 'Expected the pre-existing fail-safe WARNING to still fire'
+
+    tripwire_msgs = [r.message for r in caplog.records if 'claimant_stamped_on_terminal' in r.message]
+    assert tripwire_msgs == [], 'A no-write fail-safe call must never trip the wire'
 
 
 # ── status vocabulary guard ─────────────────────────────────────────
@@ -5654,7 +5828,11 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
-        ('merge',    True,  'merge'),
+        # NOTE: ('merge', True) is intentionally ABSENT — that pair used to
+        # resolve to 'merge' and SHALLOW-clobber nested metadata (the task-3581 /
+        # DF-3260 memory_hints clobber); it now RAISES. See
+        # test_resolve_metadata_mode_merge_plus_append_true_raises.
+        ('additive', True,  'additive'),
         ('additive', False, 'additive'),
         ('replace',  True,  'replace'),
     ],
@@ -5697,6 +5875,39 @@ def test_resolve_metadata_mode_bare_append_false_raises():
     # 'replace' escape hatch (asserted above). Incident traceability lives in the
     # source error message and the _resolve_metadata_mode docstring, not here, so
     # a future reword that keeps the guidance but drops the tag won't break this.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_raises():
+    """metadata_mode='merge' alongside append=True is a CONTRADICTION and is
+    REJECTED (task 3581). ``append=True`` means exactly one thing — 'additive',
+    the recursive union merge — while 'merge' is shallow last-write-wins, so the
+    pair asks for two incompatible resolutions of the same write. It used to
+    resolve silently to 'merge', shallow-clobbering nested metadata: the whole
+    ``memory_hints`` key (with its authored ``entities``/``queries``) was
+    overwritten wholesale by the incoming stub — the DF-3260 clobber."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode('merge', True)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert 'additive' in msg, (
+        f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+    )
+    # NB: as with the task-2180 guard above, deliberately do NOT assert on the
+    # incident number or the full prose. The load-bearing contract is that the
+    # caller is told about the actionable 'additive' resolution; traceability
+    # lives in the source message and the _resolve_metadata_mode docstring.
+
+
+def test_resolve_metadata_mode_merge_plus_append_true_no_metadata_ok():
+    """metadata_mode='merge' + append=True with metadata_present=False (a
+    details-only write, no metadata) is NOT rejected — the task-3581 guard is
+    scoped to metadata-present writes exactly like the task-2180 one. With no
+    metadata there is nothing to clobber and ``append`` is independently driving
+    the details-append path, so the pair is not contradictory. Returns 'merge'
+    (unused by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode('merge', True, metadata_present=False) == 'merge'
 
 
 def test_resolve_metadata_mode_append_false_cosignal_replace():
@@ -5931,6 +6142,196 @@ async def test_update_task_details_only_append_false_ok(backend, project_root):
     task = await backend.get_task('1', project_root=project_root)
     assert task['details'] == 'new', (
         f'details-only append=False should replace: {task["details"]!r}'
+    )
+
+
+# ── update_task end-to-end: merge+append=True clobber guard (task 3581) ──────
+#
+# These reproduce the exact live call shape observed from the Stage-2
+# reconciliation LLM against DF task 3857:
+#   update_task(id=3857, metadata={...}, metadata_mode='merge', append=True)
+# issued against a row that already carried authored memory_hints. The pair
+# used to resolve silently to 'merge' and overwrite the whole memory_hints key.
+
+_DF3857_SEED_METADATA = {
+    'memory_hints': {
+        'entities': [],
+        'queries': [
+            'resolution for: dashboard: stop leaking CLOSE-WAIT sockets '
+            'on the escalation poller',
+        ],
+    },
+    'files': ['dashboard/src/poller.py'],
+    '_causation_id': 'caus-df3857',
+}
+
+_DF3857_INCOMING_HINTS = {
+    'memory_hints': {
+        'queries': [
+            'CLOSE_WAIT socket leak httpx client lifecycle',
+            'dashboard escalation poller connection reuse',
+        ],
+    },
+}
+
+
+async def _raw_metadata_bytes(backend, project_root, task_id: int = 1) -> str:
+    """Read the stored metadata blob verbatim, bypassing get_task's parsing."""
+    conn = await backend._get_connection(project_root)
+    cursor = await conn.execute(
+        'SELECT metadata FROM tasks WHERE id = ?', (task_id,),
+    )
+    row = await cursor.fetchone()
+    return row['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_plus_append_true_rejected_and_blob_untouched(
+    backend, project_root,
+):
+    """The contradictory metadata_mode='merge' + append=True pair is REJECTED
+    and the stored blob is left byte-for-byte intact (task 3581).
+
+    The load-bearing assertion is the second one: _resolve_metadata_mode is
+    called before ensure_connected() and before the write _txn, so a rejection
+    can never leave a half-applied write. Rejecting is therefore strictly safer
+    than the old silent 'merge', which clobbered memory_hints wholesale."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    before = await _raw_metadata_bytes(backend, project_root)
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps(_DF3857_INCOMING_HINTS),
+            metadata_mode='merge', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+
+    after = await _raw_metadata_bytes(backend, project_root)
+    assert after == before, (
+        f'rejected write must leave stored bytes untouched.\n'
+        f'before={before!r}\nafter={after!r}'
+    )
+
+    # Belt and braces on the parsed view: the authored query survives, the
+    # siblings survive, and neither incoming query was written.
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+    assert hints['queries'] == _DF3857_SEED_METADATA['memory_hints']['queries'], (
+        f'authored memory_hints.queries must be untouched: {meta}'
+    )
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+    for q in _DF3857_INCOMING_HINTS['memory_hints']['queries']:
+        assert q not in hints['queries'], f'rejected write must not land: {meta}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        pytest.param({'append': True}, id='append-true-alone'),
+        pytest.param({'metadata_mode': 'additive'}, id='metadata_mode-additive'),
+    ],
+)
+async def test_update_task_append_true_unions_nested_memory_hints(
+    backend, project_root, kwargs,
+):
+    """The positive control: the CORRECT spellings of the same intent union the
+    nested memory_hints lists instead of replacing them (task 3581).
+
+    Both ``append=True`` alone and the explicit ``metadata_mode='additive'``
+    resolve to 'additive', which recursively unions list/dict values — so the
+    pre-existing authored query survives alongside both incoming ones and the
+    top-level siblings are preserved."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        **kwargs,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    hints = meta['memory_hints']
+
+    expected_queries = (
+        _DF3857_SEED_METADATA['memory_hints']['queries']
+        + _DF3857_INCOMING_HINTS['memory_hints']['queries']
+    )
+    assert set(hints['queries']) == set(expected_queries), (
+        f'memory_hints.queries must UNION, not replace: {meta}'
+    )
+    assert len(hints['queries']) == len(expected_queries), (
+        f'union must dedup-preserve exactly one copy of each query: {meta}'
+    )
+    # The sub-field the incoming payload omitted is preserved, not dropped.
+    assert hints.get('entities') == [], f'memory_hints.entities lost: {meta}'
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_explicit_merge_without_append_still_shallow(
+    backend, project_root,
+):
+    """The guard did NOT broaden: a bare metadata_mode='merge' (no append) still
+    resolves and performs the documented shallow last-write-wins.
+
+    Many production callers legitimately use this spelling (task_interceptor,
+    citation_verifier), so the task-3581 guard must fire only on the
+    contradictory PAIR — never on 'merge' on its own."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps(_DF3857_SEED_METADATA),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps(_DF3857_INCOMING_HINTS),
+        metadata_mode='merge',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    # Shallow: the whole memory_hints key was overwritten wholesale...
+    assert meta['memory_hints'] == _DF3857_INCOMING_HINTS['memory_hints'], (
+        f"bare metadata_mode='merge' must stay shallow last-write-wins: {meta}"
+    )
+    # ...while untouched top-level siblings survive (that is what 'merge' means).
+    assert meta.get('files') == ['dashboard/src/poller.py'], f'sibling lost: {meta}'
+    assert meta.get('_causation_id') == 'caus-df3857', f'sibling lost: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_only_merge_plus_append_true_ok(backend, project_root):
+    """A details-only merge+append=True write (NO metadata) is NOT rejected —
+    the task-3581 guard is scoped to metadata-present writes, so the
+    details-append path stays green even when an inert metadata_mode='merge'
+    rides along. append=True appends to details rather than replacing it."""
+    await backend.add_task(
+        project_root=project_root, title='t', details='old',
+        metadata=json.dumps({'_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='new', metadata_mode='merge', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'new' in task['details'], (
+        f'details-only append=True should append: {task["details"]!r}'
+    )
+    assert 'old' in task['details'], (
+        f'details-only append=True must not replace: {task["details"]!r}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'a details-only write must not disturb metadata: {task["metadata"]}'
     )
 
 
