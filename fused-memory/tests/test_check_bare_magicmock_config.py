@@ -1873,8 +1873,24 @@ class TestWallClockDeadlineDebtBaseline:
     would become a hand-maintained list — the exact failure mode task 3980's
     amendment pass deleted a class list to escape.
 
-    Mirrors TestDataclassDoubleDebtBaseline one-for-one, and additionally pins that
-    the now-shared machinery keeps the three baselines strictly independent.
+    Mirrors TestDataclassDoubleDebtBaseline, and additionally pins that the
+    now-shared machinery keeps the three baselines strictly independent.
+
+    NOT one-for-one, in both directions, and the difference is deliberate:
+
+      * A sum-and-count pin (``len(debt) == 20 and sum(...) == 618``) was tried and
+        REMOVED in task 4246's amendment pass. It restated in literals what the
+        exact-paths frozenset above and the two live-census tests in
+        TestWallClockDeadlineBaselineIntegrity already enforce against the real
+        repo — and it taxed the one workflow this whole design exists to enable:
+        migrating a single wait under orchestrator/tests then meant editing three
+        literals in another package's test file before the suite went green.
+      * The live-census tests themselves have no Rule B counterpart. That IS a
+        scope escalation over the precedent, kept on purpose: Rule C's baseline is
+        a per-file BUDGET rather than Rule B's bare list, so slack above the
+        measurement is not inert — it silently licences that many new waits. The
+        cost is that an orchestrator-side edit can turn fused-memory RED, so those
+        failure messages lead with the exact edit to make, not with a diagnosis.
     """
 
     def test_debt_baseline_holds_exactly_the_measured_census_paths(self):
@@ -2155,12 +2171,21 @@ class TestWallClockDeadlineBaselineIntegrity:
                 continue
             actual = self._live_count(path, entry)
             if actual < budget:
-                slack.append(f'{entry}: recorded {budget}, found only {actual}')
+                slack.append(
+                    f"lower _WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to "
+                    f'{actual}'
+                )
         assert slack == [], (
-            'Rule C debt budgets carry slack above the live census:\n  '
+            # Lead with the EDIT, not the diagnosis: this test fires for an author
+            # who just migrated or deleted a wait under orchestrator/tests and is
+            # now staring at a RED fused-memory suite naming no file they touched.
+            'Rule C debt budgets carry slack above the live census. Apply these edits '
+            'in fused-memory/scripts/check_bare_magicmock_config.py:\n  '
             + '\n  '.join(slack)
-            + '\nLower each recorded number to the measured one — slack lets that many '
-            'new wall-clock waits land silently.'
+            + '\n(If a count reaches 0, drop the entry and its line in '
+            '_EXPECTED_WALL_CLOCK_DEBT_PATHS in this file.)\n'
+            'Why this is an error and not slack you can leave: a budget above the '
+            'measurement lets that many NEW wall-clock waits land silently.'
         )
 
     def test_no_scanned_file_outside_the_baseline_carries_a_violation(self):
@@ -2187,14 +2212,6 @@ class TestWallClockDeadlineBaselineIntegrity:
         assert unlisted == [], (
             'These scanned files carry Rule C violations but are NOT on the baseline, '
             'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
-        )
-
-    def test_the_baseline_totals_the_measured_census(self):
-        """618 violations across 20 files — the pre-1 measurement, pinned."""
-        debt = _checker._WALL_CLOCK_DEADLINE_DEBT
-        assert len(debt) == 20, f'expected 20 census files; got {len(debt)}'
-        assert sum(debt.values()) == 618, (
-            f'expected the measured 618 violations; got {sum(debt.values())}'
         )
 
 
