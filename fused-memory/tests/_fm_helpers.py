@@ -1088,10 +1088,24 @@ async def retry_until_observed(
         The observation, returned verbatim (not coerced to ``True``), matching
         ``poll_until`` / ``poll_until_stable``.
     """
-    result = observe()
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+    for attempt in range(1, attempts + 1):
+        result = observe()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            return result
+        # Re-open ONLY between attempts:
+        #   * not before attempt 1 -- the caller has already opened the window
+        #     once, and re-opening first would silently discard that opening
+        #     and double the cost of the common (observed-first-try) case;
+        #   * not after the final miss -- re-arming a window nobody will look
+        #     at is pure waste, and would leave the caller's subject in a
+        #     different state than it expects on the failure path.
+        if attempt < attempts and reopen is not None:
+            reopened = reopen()
+            if inspect.isawaitable(reopened):
+                await reopened
+    return None
 
 
 # ---------------------------------------------------------------------------
