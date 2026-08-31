@@ -955,3 +955,79 @@ def test_is_git_toplevel_false_for_missing_path_without_raising(tmp_path):
     never-raise contract maps to a non-zero rc. The predicate must inherit that
     fail-closed and NOT propagate — the sweep never raises."""
     assert row.is_git_toplevel(tmp_path / "does-not-exist") is False
+
+
+# ---------------------------------------------------------------------------
+# step-18: reclaim_worktrees refuses an unverified target
+# ---------------------------------------------------------------------------
+
+def _repo_with_clean_and_dirty_parkings(tmp_path):
+    """A repo with one CLEAN-old and one DIRTY-old parking, plus its records."""
+    repo = _init_repo(tmp_path)
+    clean = _add_parking(repo, f"2920-{TS_OLD}")
+    dirty = _add_parking(repo, f"_lane-0-{TS_LANE}", dirty=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    assert len(records) == 2
+    return repo, clean, dirty, records
+
+
+def test_reclaim_refuses_whole_sweep_when_repo_is_not_toplevel(tmp_path, caplog):
+    """A ``repo`` that is not the ROOT of the repository git resolves for it
+    refuses the ENTIRE sweep before any branch check, park-commit or removal.
+
+    git discovers the enclosing repo from a subdirectory, so without this gate
+    the sweep would happily act on a repository the caller only half-named."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo, clean, dirty, records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    head_before = _git(dirty, "rev-parse", "HEAD").stdout.strip()
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    outcome = row.reclaim_worktrees(subdir, records, dry_run=False)  # must not raise
+
+    assert outcome.refused is True
+    assert _resolved(outcome.skipped) == [r.path.resolve() for r in records]
+    assert outcome.reclaimed == []
+    assert outcome.park_committed == []
+    assert outcome.failed == []
+    # Nothing removed, nothing committed.
+    assert clean.exists() and dirty.exists()
+    assert {clean.resolve(), dirty.resolve()} <= _worktree_paths(repo)
+    assert _git(dirty, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert any(LOG_PREFIX in r.message % r.args for r in caplog.records)
+    assert any("REFUSING" in r.message % r.args for r in caplog.records)
+
+
+def test_reclaim_refusal_also_applies_in_dry_run(tmp_path, caplog):
+    """--check exists so an operator can see what the real run WOULD do. A dry
+    run that printed 'would reclaim' while the real run would refuse is an
+    actively misleading answer — and this misconfiguration is exactly the one a
+    dry run most needs to surface."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo, clean, dirty, records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    outcome = row.reclaim_worktrees(subdir, records, dry_run=True)
+
+    assert outcome.refused is True
+    assert _resolved(outcome.skipped) == [r.path.resolve() for r in records]
+    assert outcome.reclaimed == []
+    assert any("REFUSING" in r.message % r.args for r in caplog.records)
+
+
+def test_reclaim_proceeds_normally_through_a_symlinked_repo(tmp_path):
+    """NON-REGRESSION: a repo reached via a SYMLINK is a legitimate target and
+    must still be swept — the guard compares realpaths, not literal strings."""
+    repo, clean, dirty, _records = _repo_with_clean_and_dirty_parkings(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+    records = row.list_parked_worktrees(link, _parking_root(link))
+
+    outcome = row.reclaim_worktrees(link, records, dry_run=False)
+
+    assert outcome.refused is False
+    assert set(_resolved(outcome.reclaimed)) == {clean.resolve(), dirty.resolve()}
+    assert not clean.exists()
+    assert not dirty.exists()
+    assert _branch_resolves(repo, f"task/_lane-0-{TS_LANE}")
