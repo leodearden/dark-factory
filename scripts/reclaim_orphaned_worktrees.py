@@ -310,8 +310,17 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     ``git worktree prune`` in :func:`main` — so the never-raise / always-exit-0
     posture holds even under routine git contention, without each caller needing
     its own ``try/except``.
+
+    It is also where AMBIENT GIT REDIRECTION is removed
+    (:func:`scrubbed_git_env`). Every call in this module targets its
+    repository via ``cwd=``, and ``cwd=``/``-C`` only change DIRECTORY — an
+    ambient ``GIT_DIR`` skips repository discovery entirely and redirects the
+    call into whatever repository it names. The scrub belongs HERE, at the one
+    chokepoint no call site can bypass, rather than at each of the seven call
+    sites: the defect class is "a call site that forgets the guard", so fixing
+    today's seven would leave the hole open for the eighth.
     """
-    env = dict(os.environ, LC_ALL='C')
+    env = scrubbed_git_env(os.environ)
     try:
         proc = subprocess.run(
             ['git', *args],
