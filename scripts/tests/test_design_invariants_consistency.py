@@ -2615,6 +2615,43 @@ def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailabl
     assert "tracked" in message.lower(), message
 
 
+def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
+    """ANTI-REGRESSION PIN: the SHARED walker excludes untracked `.md`, not just `.py`.
+
+    `_enumeration_scan_files` has no `root` seam of its own — it hardcodes
+    `_walk_repo_files(REPO_ROOT, (".md",))` — so this exercises the shared
+    walker directly instead. `project_root` carries 3313 untracked
+    `data/**/*.md` watcher digests (task 4971), any one of which could cross
+    `_ENUMERATION_THRESHOLD` and turn `test_every_enumeration_site_is_pinned`
+    red on nothing but watcher timing — the identical flake fixed for the
+    citation scan, because both scans share this one walker.
+
+    The untracked fixture restates FOUR canonical slugs, at
+    `_ENUMERATION_THRESHOLD`: it is not merely absent-by-name, it is the exact
+    shape that would flag as an enumeration site were the walk to reach it.
+
+    Expected to PASS already on arrival — the walker is shared with
+    `_citation_scan_files`, fixed in step-2/step-6, so this is not a RED test.
+    It is kept as an explicit anti-regression PIN: a future change that
+    re-narrows the tracked-file fix back onto `_citation_scan_files` alone, or
+    that re-diverges the enumeration path onto its own filesystem walk, must
+    turn this red.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/site.md"],
+        untracked=["data/digests/digest.md"],
+    )
+    (tmp_path / "data" / "digests" / "digest.md").write_text(
+        "Restates the family: `contracts-machine-checked`, "
+        "`structured-facts-at-failure`, `corroborate-before-acting`, "
+        "`storm-escape-required`.\n",
+        encoding="utf-8",
+    )
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
+
+
 # ---------------------------------------------------------------------------
 # LIVE: the two repo-wide drift assertions
 #
