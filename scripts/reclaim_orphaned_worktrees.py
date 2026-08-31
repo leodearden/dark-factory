@@ -487,8 +487,32 @@ def park_commit(worktree: Path, reason: str) -> str | None:
     ``add -A`` together make "dirty -> park-commit -> zero content lost" a
     provable property: the content is now on the branch ref, reachable
     independently of the worktree.
+
+    SELF-GUARDED: the snapshot is only ever taken against a worktree git
+    confirms as its OWN toplevel (:func:`is_git_toplevel`), refusing with
+    ``None`` otherwise. ``git add -A`` stages from the WORKTREE ROOT regardless
+    of cwd, so an unverified target does not merely mis-scope the snapshot — it
+    commits the whole tree of whatever repository git resolved. And the very
+    flag that makes the snapshot un-strandable, ``--no-verify``, is the flag
+    that would bypass the pre-commit hooks if such a commit ever landed in the
+    wrong repository. Guarding HERE rather than trusting the caller means a
+    future caller reaching this function directly inherits the guard;
+    ``None`` is deliberate reuse of the existing failure channel, since
+    :func:`reclaim_worktrees` already treats a ``None`` park-commit as
+    "SKIP, never removed (data-loss guard)", so a refusal cannot cascade into a
+    removal.
     """
     if not is_worktree_dirty(worktree):
+        return None
+
+    if not is_git_toplevel(worktree):
+        logger.warning(
+            '%s REFUSING to park-commit %s — it is not the root of the worktree '
+            'git resolves for it; NOT staging or committing (`git add -A` would '
+            'snapshot the whole resolved tree)',
+            _LOG_PREFIX,
+            worktree,
+        )
         return None
 
     rc, _out, err = _run_git(['add', '-A'], cwd=worktree)
