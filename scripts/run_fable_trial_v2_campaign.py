@@ -347,10 +347,11 @@ def summarize_candidates(results: list[Any]) -> list[dict[str, Any]]:
     ``declined_by_kind``) is surfaced on those same terms and for that same
     reason. What it adds is the INTERPRETATION of the no-plan band, which
     ``plan_rate`` alone cannot carry: a decline is the architect taking an
-    explicit plan-tools exit — ``report_false_premise``, ``report_already_done``
-    and their three siblings — i.e. a CORRECT REFUSAL of an unplannable task,
-    not a failure to plan one. So ``no_plan == no_plan_declined`` is a POSITIVE
-    reliability result, and reading it as a planning failure inverts the finding.
+    explicit plan-tools exit — ``report_false_premise``,
+    ``report_task_already_done`` and their three siblings — i.e. a CORRECT
+    REFUSAL of an unplannable task, not a failure to plan one. So
+    ``no_plan == no_plan_declined`` is a POSITIVE reliability result, and
+    reading it as a planning failure inverts the finding.
     That is not hypothetical: tranche 1 reported an 89% planning failure over 47
     ``plan_steps = 0`` cells of which 47 were adversarially-verified-true
     declines. ``plan_rate`` itself is DELIBERATELY unchanged — it keeps its exact

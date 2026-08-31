@@ -428,8 +428,8 @@ def resolve_terminal_kind(
     **LAST TERMINAL CALL WINS** — the policy, and why it is this one. A cell can
     carry BOTH a plan and a decline: on reify_task_4026 / run e522b1b0 the
     architect confirmed a 6-step plan and then, at turn 176, called
-    ``report_already_done``. Scoring that as a planning success reports the
-    OPPOSITE of what the model itself concluded, so the LAST of the two
+    ``report_task_already_done``. Scoring that as a planning success reports
+    the OPPOSITE of what the model itself concluded, so the LAST of the two
     statements is the one this function returns. It is decided from timestamps
     both producers already write (``reported_at`` vs ``_finalized_at``, same
     format — see :func:`_parse_terminal_stamp`), so it is an exact comparison

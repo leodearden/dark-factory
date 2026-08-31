@@ -180,9 +180,9 @@ class TestResolveTerminalKind:
     # ── the ORDERING case (scope item 3): last terminal call wins ─────────
     def test_plan_then_later_decline_resolves_to_the_decline(self):
         """The reify_task_4026 / run e522b1b0 shape: a 6-step plan confirmed at
-        10:00, then ``report_already_done`` at 11:00. The model's own FINAL
-        judgement was that the task was moot, so scoring it a planning success
-        would report the opposite of what it concluded.
+        10:00, then ``report_task_already_done`` at 11:00. The model's own
+        FINAL judgement was that the task was moot, so scoring it a planning
+        success would report the opposite of what it concluded.
         """
         from orchestrator.evals.metrics import resolve_terminal_kind
 
