@@ -867,6 +867,10 @@ class FlakeLedgerTaskClient(Protocol):
     RELY on that — :func:`_ensure_owner_task` guards each call independently, because a
     partial or older adapter (one lacking a method entirely, hence ``AttributeError``) is
     a shape that really arrives.
+
+    ``get_statuses`` goes further and reports its failure IN BAND, because degrading to
+    a bare ``{}`` is not a safe degrade at this seam: an empty mapping already MEANS
+    something here (see its docstring).
     """
 
     async def submit_task(self, arguments: dict) -> str:
@@ -877,10 +881,20 @@ class FlakeLedgerTaskClient(Protocol):
         treated as a failed filing."""
         ...
 
-    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
-        """Live ``{id: status}`` for *ids*.  Unknown ids are OMITTED rather than
-        reported as a status, and the ledger reads that omission as a corroborated
-        absence."""
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        """Live ``{id: status}`` for *ids*, as a ``(statuses, error)`` pair —
+        ``scheduler.py::SchedulerFacade.get_statuses``' convention, and the shape that
+        makes the seam's FAILURE/ABSENCE distinction machine-checked (INV-1) instead of
+        resting on an adapter's exception discipline.
+
+        An unknown id is OMITTED from the mapping rather than reported as a status, and
+        the ledger reads that omission as a CORROBORATED ABSENCE — the task was deleted
+        — and files a replacement for it.  So a FAILED read must NEVER be reported as an
+        empty mapping: put it in the error half.  An implementation that swallows a
+        failure into ``{}`` is indistinguishable from a real absence at this seam, and
+        the ledger will act on it — one duplicate de-flake task per suppression, for the
+        length of the outage, with no rate limit to bound it.
+        """
         ...
 
     async def commit_planning(self, task_ids: list[str]) -> None:
@@ -909,6 +923,14 @@ def _owner_liveness(status: str | None) -> str:
     a missing entry from a SUCCESSFUL read is a corroborated absence (the task was
     deleted).  A FAILED read never reaches here — see :func:`_ensure_owner_task`, where
     an unreadable status is explicitly not treated as evidence of anything.
+
+    That last sentence is a GUARANTEE, not an aspiration, and it rests on
+    :class:`FlakeLedgerTaskClient.get_statuses` returning a ``(statuses, error)`` pair:
+    the caller returns early on a non-``None`` error, so only a successful read is
+    classified here.  It was NOT true while the adapter swallowed failures into a bare
+    ``{}`` — that arrived indistinguishable from an absence and was classified
+    ``closed``, filing a replacement task for an owner that was alive and merely
+    unread.
     """
     if not status:
         return 'closed'
@@ -998,16 +1020,31 @@ async def _ensure_owner_task(
         # says corroborate before acting.  A missed filing is cheaply recoverable — the
         # next suppression of the same test retries, and θ's age backstop catches a row
         # that stays stuck; a duplicate task tree is not.
+        #
+        # A failed read arrives in TWO shapes and both land here, on ONE code path, so
+        # the fail-safe direction cannot drift between them.  The real adapter never
+        # raises: it reports the failure as the ERROR HALF of its ``(statuses, error)``
+        # pair, because a failure returned as a bare ``{}`` is byte-identical to the
+        # corroborated absence below and would be acted on as one.  A partial or older
+        # adapter — or one returning a non-tuple, which the unpack itself rejects with a
+        # TypeError/ValueError — raises instead, which the ``except`` still catches.
+        #
+        # It is the TYPED PAIR, not the caller's exception discipline, that now makes
+        # `_owner_liveness`'s standing claim ("a FAILED read never reaches here") true
+        # through the production composition rather than merely aspirational.
+        statuses_error: Exception | None = None
         try:
-            statuses = await task_client.get_statuses([row.owner_task_id])
-        except Exception:
+            statuses, statuses_error = await task_client.get_statuses([row.owner_task_id])
+        except Exception as exc:
+            statuses, statuses_error = {}, exc
+        if statuses_error is not None:
             logger.warning(
                 'flake_ledger: could not corroborate owner %s for test_id=%s — KEEPING '
                 'the stored owner and filing nothing (an unreadable status is not '
                 'evidence the task went terminal)',
                 row.owner_task_id,
                 row.test_id,
-                exc_info=True,
+                exc_info=statuses_error,
             )
             return row
         liveness = _owner_liveness(statuses.get(row.owner_task_id))
