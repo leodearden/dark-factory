@@ -739,6 +739,130 @@ class TestContinuityBaseApproximation:
 
 
 # ---------------------------------------------------------------------------
+# merge_sha_availability_block — counts and prose from ONE derivation
+# ---------------------------------------------------------------------------
+
+# The inverted claim the committed manifest shipped: authored when the census
+# was planRate-majority and never re-derived when the dual-spelling matcher
+# flipped the balance. Pinned here as a literal so the majority clause is
+# checked against a fixed expectation rather than against the code's own
+# wording.
+_SPLIT_MAJORITY_CLAIM = 'SPLIT / direct-landed candidates are a MAJORITY'
+_REFERENCED_MAJORITY_CLAIM = 'Candidates that CAN carry a reference are a MAJORITY'
+
+# The two accepted landing-merge spellings, as a reader of CURATION.md sees
+# them (`_merge_subject_patterns` carries the machine form).
+_SPELLING_INTO_MAIN = '`Merge task/<id> into main`'
+_SPELLING_COLON = '`Merge task/<id>: <subject>`'
+
+
+def _availability_rows(referenced: int, planrate: int,
+                       excluded: int = 2) -> list[dict]:
+    """Manifest-shaped candidate rows for the availability block.
+
+    *excluded* defaults to 2 — the committed manifest's two excludes — so the
+    default shape reproduces the exact denominator defect: 41 rows, 39 of them
+    included and therefore carrying a ``mint_mode`` at all.
+    """
+    rows = [{'task_id': f'r{i}', 'project': 'reify', 'decision': 'include',
+             'mint_mode': 'referenced'} for i in range(referenced)]
+    rows += [{'task_id': f'p{i}', 'project': 'reify', 'decision': 'include',
+              'mint_mode': 'planrate_only'} for i in range(planrate)]
+    # An excluded row is never minted, so it has no mint mode. The committed
+    # manifest omits the key entirely; an explicit None is the harsher shape,
+    # and counting by `decision` must ignore both.
+    rows += [{'task_id': f'x{i}', 'project': 'reify', 'decision': 'exclude',
+              'mint_mode': None} for i in range(excluded)]
+    return rows
+
+
+class TestMergeShaAvailabilityBlock:
+    def test_counts_only_included_rows(self) -> None:
+        # The shipped defect: `author_manifest` divided by len(rows) — all 41
+        # census candidates — while only the 39 INCLUDED rows carry a
+        # mint_mode, so the two published counts did not sum to their own
+        # stated denominator (17 + 22 = 39, not 41).
+        block = driver.merge_sha_availability_block(_availability_rows(20, 19))
+        assert set(block) == {'referenced', 'planrate_only', 'total', 'finding'}
+        assert block['referenced'] == 20
+        assert block['planrate_only'] == 19
+        assert block['total'] == 39
+        assert block['referenced'] + block['planrate_only'] == block['total']
+
+    def test_finding_quotes_only_the_derived_counts(self) -> None:
+        # Every number in the sentence comes from the counts computed in the
+        # same call, so prose and counts cannot drift apart.
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        assert '20 of 39' in finding
+        assert '19 of 39' in finding
+        # The literals the stale sentence carried, measured on the committed
+        # manifest: "22/41" and "17 of 41" beside rows that say 20 and 19.
+        for stale in ('22', '17', '41'):
+            assert stale not in finding, (
+                f'finding still carries the stale literal {stale!r}: {finding}'
+            )
+
+    @pytest.mark.parametrize('referenced,planrate,split_is_majority', [
+        # The original census reality the shipped sentence was authored for.
+        (17, 22, True),
+        # The CURRENT post-redrive reality: the dual-spelling matcher moved
+        # three fixtures across, inverting the majority.
+        (20, 19, False),
+    ])
+    def test_majority_claim_tracks_the_counts(
+        self, referenced: int, planrate: int, split_is_majority: bool,
+    ) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(referenced, planrate))['finding']
+        if split_is_majority:
+            assert _SPLIT_MAJORITY_CLAIM in finding
+            assert _REFERENCED_MAJORITY_CLAIM not in finding
+        else:
+            # Absence of the INVERTED claim is the load-bearing half: a
+            # sentence that still calls the SPLIT set a majority is wrong no
+            # matter what else it says.
+            assert _SPLIT_MAJORITY_CLAIM not in finding, (
+                f'finding claims the SPLIT set is a majority at '
+                f'referenced={referenced} > planrate_only={planrate}: {finding}'
+            )
+            assert _REFERENCED_MAJORITY_CLAIM in finding
+
+    def test_a_tie_is_stated_as_a_tie(self) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(19, 19))['finding']
+        assert _SPLIT_MAJORITY_CLAIM not in finding
+        assert _REFERENCED_MAJORITY_CLAIM not in finding
+        assert 'Neither mint mode is a majority' in finding
+
+    def test_finding_names_both_accepted_spellings(self) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        assert _SPELLING_INTO_MAIN in finding
+        assert _SPELLING_COLON in finding
+        # The single-matcher sentence this task replaced must be gone: it
+        # described a check narrower than the one `find_merge_sha` now runs.
+        assert 'single clean "Merge task/<id> into main" commit' not in finding
+
+    def test_finding_keeps_the_surviving_substance(self) -> None:
+        # Correcting the counts must not quietly drop WHY the split matters.
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        for claim in ('plan_quality', 'γ1', 'β1', 'D9'):
+            assert claim in finding, f'finding dropped {claim!r}: {finding}'
+
+    def test_block_is_deterministic(self) -> None:
+        rows = _availability_rows(20, 19)
+        assert driver.merge_sha_availability_block(rows) == \
+            driver.merge_sha_availability_block(rows)
+        # Counting must not depend on row order either — the manifest's rows
+        # are grouped per project, and a regrouping is not a finding.
+        shuffled = list(reversed(rows))
+        assert driver.merge_sha_availability_block(shuffled) == \
+            driver.merge_sha_availability_block(rows)
+
+
+# ---------------------------------------------------------------------------
 # redrive_provenance — re-derive provenance WITHOUT re-censusing
 # ---------------------------------------------------------------------------
 
