@@ -24,6 +24,7 @@ two ruff measurements the decision rests on.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
@@ -628,6 +629,97 @@ class TestEscapeLatchKey:
         # one, so the two are the same key rather than a spurious re-probe.
         config.unlink()
         assert key == verify._ruff_escape_latch_key(tmp_path)
+
+
+@contextlib.contextmanager
+def _probe_unmeasurable(times: int | None):
+    """Make the probe report UNMEASURABLE for the first *times* calls.
+
+    *times* ``None`` means every call.  After the quota the patch DELEGATES to
+    the live helper — the same delegate-don't-replace shape as ``probe_spy`` —
+    so the record the assertions read afterwards is a genuine measurement of
+    the real geometry, not a fixture's idea of one.
+
+    Stands in for the probe's three real None paths: ruff momentarily
+    unavailable, the probe subprocess timing out, or its output no longer
+    formatting as ``Settings path:``.  Yields the call list.
+    """
+    calls: list[Path] = []
+    real = verify._ruff_settings_path
+
+    def flaky(worktree, target=None):
+        calls.append(Path(worktree))
+        if times is None or len(calls) <= times:
+            return None
+        return real(worktree, target)
+
+    with patch('orchestrator.verify._ruff_settings_path', new=flaky):
+        yield calls
+
+
+class TestUnmeasuredProbeDoesNotLatchSilence:
+    """The latch may suppress a MEASUREMENT, never the absence of one.
+
+    ``_RUFF_ESCAPE_REPORTED`` records the key BEFORE the probe runs, so a
+    single transient failure — ruff momentarily unavailable, one timeout —
+    permanently silences that worktree for the rest of the process, and the
+    escape it would have reported is never looked for again.  A latch is
+    entitled to suppress a repeat of something it already knows; it is not
+    entitled to suppress a question it never answered.
+
+    The converse must hold too, because two of the three None paths are
+    PERSISTENT (ruff genuinely absent; ruff no longer printing a settings
+    line): never latching a failure at all would spawn a doomed subprocess on
+    every lint leg of every module for the life of the process.  So the retry
+    is BOUNDED rather than unlimited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_is_re_probed_and_then_reported(
+        self, geometry, tmp_path, caplog,
+    ):
+        parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            _probe_unmeasurable(1) as calls,
+        ):
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+            # Correct so far: nothing was measured, so nothing is claimed.
+            assert _escape_records(caplog) == [], 'reported without measuring'
+
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        assert len(calls) == 2, (
+            f'one unmeasurable probe permanently silenced the key: {calls}'
+        )
+        records = _escape_records(caplog)
+        assert len(records) == 1, f'the real escape was never reported: {records}'
+        assert str(parent / 'pyproject.toml') in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_stops_being_spawned_at_the_cap(
+        self, geometry, tmp_path, caplog,
+    ):
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+        # Read through the module constant, never a literal, so tuning the cap
+        # stays a one-line change.
+        cap = verify._RUFF_ESCAPE_MAX_PROBE_ATTEMPTS
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            _probe_unmeasurable(None) as calls,
+        ):
+            for _ in range(cap + 3):
+                await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        assert len(calls) == cap, (
+            f'probe attempts did not plateau at the cap ({cap}): {len(calls)}'
+        )
+        # Nothing was ever measured, so nothing is ever claimed.
+        assert _escape_records(caplog) == []
 
 
 class TestProbeTargetFallback:
