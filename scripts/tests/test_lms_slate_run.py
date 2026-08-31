@@ -478,3 +478,160 @@ def test_a_clean_sweep_collects_no_failures(tmp_path, two_arms):
     failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=_FakeRunner())
 
     assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# resumability — per-arm part files
+#
+# A failed arm must not force a whole ~30 minute re-sweep.  The resume unit is
+# the part file `lms_healthcheck --arm X --output p` already writes: a full
+# HealthReport whose `arms` list holds exactly one row.  Validating it through
+# the PRODUCER'S OWN pydantic model is what stops the driver and the producer
+# ever disagreeing about what a report is.
+# ---------------------------------------------------------------------------
+
+
+def _one_row_report(arm_id):
+    """A real single-row `HealthReport`, built through the producer's model.
+
+    Hand-writing the JSON here would let this fixture drift from the schema the
+    driver actually has to accept -- and a drifted fixture makes the resume
+    test pass against a part shape that never occurs.
+    """
+    import lms_healthcheck
+
+    return lms_healthcheck.HealthReport(
+        schema_version=lms_healthcheck.REPORT_SCHEMA_VERSION,
+        measured_at='2026-08-31T00:00:00+00:00',
+        gpu=lms_healthcheck.GpuBlock(
+            name='NVIDIA GeForce RTX 3090', driver_version='580.00', total_mib=24576,
+        ),
+        arms=[lms_healthcheck.ArmRow(
+            arm_id=arm_id,
+            axis='llm',
+            stack='vllm',
+            endpoint='http://127.0.0.1:8410/v1',
+            served_model_name=arm_id,
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='',
+            latency_ms=1.0,
+            measured_at='2026-08-31T00:00:00+00:00',
+            arm_footprint_mib=1024,
+            reasoning='off',
+        )],
+        vram=lms_healthcheck.VramBlock(
+            total_mib=24576, used_mib=8192, free_mib=16384,
+            baseline_mib=7168, budget_mib=17408, arm_footprint_mib=1024,
+            used_gib=8.0, free_gib=16.0, baseline_gib=7.0, budget_gib=17.0,
+            arm_footprint_gib=1.0, nominal_ceiling_gib=19.5,
+            operating_budget_gib=17.0, headroom_gib=16.0,
+            verdict='PASS', reason='',
+        ),
+        overall='PASS',
+    )
+
+
+def _write_part(parts_dir, arm_id, text=None):
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    path = parts_dir / f'{arm_id}.json'
+    if text is None:
+        text = _one_row_report(arm_id).model_dump_json()
+    path.write_text(text)
+    return path
+
+
+def test_an_arm_with_a_valid_part_is_skipped_entirely(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    stages = runner.stages()
+    assert not [s for s in stages if s[-1] == 'arm-one' or s == ('healthcheck', 'arm-one')]
+    assert ('ctl', 'start', 'arm-two') in stages
+    assert ('healthcheck', 'arm-two') in stages
+
+
+@pytest.mark.parametrize('body', [
+    '',
+    'not json at all',
+    '{"schema_version": 5}',
+])
+def test_an_unusable_part_is_not_trusted_and_the_arm_is_re_run(tmp_path, two_arms, body):
+    """A half-written part from a killed sweep is the realistic failure. It
+    must fall through to a re-run, never be read as a completed arm."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=body)
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_a_valid_part_describing_a_different_arm_is_not_accepted(tmp_path, two_arms):
+    """The file name says arm-one; the row inside says arm-two. Trusting the
+    name would let a mis-copied part stand in for an arm never measured."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=_one_row_report('arm-two').model_dump_json())
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_part_is_complete_accepts_the_producers_own_output(tmp_path):
+    path = _write_part(tmp_path / 'parts', 'arm-one')
+
+    assert lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def test_part_is_complete_returns_false_for_a_missing_file_rather_than_raising(tmp_path):
+    """An OSError here would abort the sweep on the ordinary first-run case."""
+    assert not lms_slate_run.part_is_complete(tmp_path / 'nope.json', 'arm-one')
+
+
+def test_a_multi_row_report_is_not_a_part(tmp_path):
+    """A merged artifact accidentally dropped into the parts dir is not a
+    part: resuming off it would skip an arm whose row came from elsewhere."""
+    import lms_healthcheck
+
+    single = _one_row_report('arm-one')
+    merged = lms_healthcheck.HealthReport(
+        schema_version=single.schema_version,
+        measured_at=single.measured_at,
+        gpu=single.gpu,
+        arms=[*single.arms, _one_row_report('arm-two').arms[0]],
+        vram=single.vram,
+        overall=single.overall,
+    )
+    path = tmp_path / 'arm-one.json'
+    path.write_text(merged.model_dump_json())
+
+    assert not lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def test_force_re_runs_an_arm_that_already_has_a_valid_part(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, force=True, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_a_skip_says_which_part_it_is_reusing(tmp_path, two_arms, capsys):
+    """A resumed sweep that silently does less looks identical to one that
+    measured everything."""
+    parts_dir = tmp_path / 'parts'
+    path = _write_part(parts_dir, 'arm-one')
+
+    lms_slate_run.sweep_arms(parts_dir, runner=_FakeRunner())
+
+    out = capsys.readouterr().out
+    assert 'arm-one' in out
+    assert str(path) in out
