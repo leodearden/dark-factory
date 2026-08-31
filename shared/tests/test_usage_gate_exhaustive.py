@@ -2227,11 +2227,18 @@ class TestReleaseProbeSlot:
         assert acct.capped is True  # capped flag untouched
 
     async def test_near_cap_via_detect_cap_hit_releases_probe(self):
-        """``_handle_near_cap_warning`` never transitions phase in EITHER scope,
-        so this arm strands an UNSCOPED near-cap too — the same invariant.
+        """Near-cap detected while PROBE_IN_FLIGHT must still release the probe
+        claim: ``_handle_near_cap_warning`` is annotation-only and never
+        transitions phase, so only ``detect_cap_hit``'s explicit release
+        reopens the gate. Scoped counterpart:
+        ``test_usage_gate_scope_attribution.py::TestScopedCapHitReleasesProbeSlot``.
         """
         gate = make_gate(['a'])
         acct = gate._accounts[0]
+        # Legacy boolean shim: bypasses _transition, so no resume-probe
+        # background task spawns (make_gate only AsyncMocks _run_probe);
+        # before_invoke() then takes the real `if acct.probing:` branch and
+        # performs the genuine PROBING -> PROBE_IN_FLIGHT claim.
         acct.probing = True
         lease = await gate.before_invoke(scope=None)
         assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
