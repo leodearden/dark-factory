@@ -51,8 +51,10 @@ CONTRIBUTING.md's existing ``lint-command-mirror`` block.
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
-synced verify worktree. This module is stdlib-only (``os``, ``re``, ``pathlib``)
-plus ``pytest``.
+synced verify worktree. This module is stdlib-only (``re``, ``subprocess``,
+``pathlib``) plus ``pytest``. Both scans shell out to the ``git`` binary (task
+4971) for their tracked-file oracle — see ``_walk_repo_files`` — which is
+guaranteed present in any git worktree this module runs inside.
 
 EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
 naming its ``source`` rather than returning an empty list. An extractor that
@@ -64,7 +66,6 @@ edit; the live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -444,11 +445,15 @@ _EXCLUDED_TREES = (
 
 _EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
 
-# Not repo content: build output and vendored trees. Dot-directories are pruned
-# by name rather than listed, which is what keeps the walk cheap in the main
-# checkout — `.worktrees/` there holds a full copy of the repo per in-flight task
-# (an unpruned `**/*.md` glob over it did not finish in 120s), and `.git`,
-# `.venv`, `.task` and `.pytest_cache` are the same shape of dead weight.
+# Not repo content: build output and vendored trees. Dot-directories are
+# pruned by name rather than listed, matching `.git`, `.venv`, `.task` and
+# `.pytest_cache` alike. Most of these never reach `git ls-files` at all,
+# since they are gitignored — task 4971 re-sourced the walk from the
+# tracked-file list, which is what keeps `.worktrees/` (a full repo copy per
+# in-flight task; an unpruned filesystem glob over it did not finish in 120s)
+# out cheaply, measured at 0.025s. But `.claude/` IS tracked, so the
+# dot-prefix rule still has to run explicitly on top of the tracked list
+# rather than being retired now that the walk no longer touches the disk tree.
 _PRUNED_DIR_NAMES = frozenset({"node_modules", "__pycache__", "site-packages", "venv"})
 
 
@@ -475,30 +480,44 @@ _THIS_MODULE = Path(__file__).resolve()
 
 
 def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
-    """Every file under *root* ending in one of *suffixes*, excluded trees pruned.
+    """Every TRACKED file under *root* ending in one of *suffixes*, filtered.
 
     ONE walker behind both scans. Two walks that had to agree on a prune policy
     byte-for-byte would be the lock-step duplication INV-5 forbids — in the very
     module that enforces that family — and the copy would drift the first time an
     exclusion was added to one of them.
 
-    Walks with ``os.walk`` and PRUNES excluded directories in place rather than
-    globbing everything and filtering the result. The distinction is not cosmetic:
-    ``REPO_ROOT.glob("**/*.md")`` in the main checkout descends into ``.worktrees/``
-    — one full repo copy per in-flight task — and did not finish inside 120s when
-    measured. Pruning keeps the same walk at well under a second there.
+    Sourced from ``git ls-files``, never a filesystem walk (task 4971): an
+    untracked file — gitignored watcher output, a stray scratch file — must not
+    be able to flip either scan's verdict on nothing but local working-tree
+    state. MEASURED incident: the citation scan went red in project_root over
+    five backticked tokens in an untracked ``data/escalations/*`` digest, and
+    stayed green in an otherwise-identical worktree with no ``data/`` at all —
+    the verdict was a property of watcher timing, not of repo content.
+
+    Every exclusion below is still applied, component-wise, ON TOP of the
+    tracked list: trackedness is not a substitute for the policy, since some
+    excluded trees (``docs/prds/``, ``.claude/``) are themselves TRACKED and
+    gitignore says nothing about them (measured: the bare tracked list would
+    add 339 such files back).
     """
+    pathspecs = [f"*{suffix}" for suffix in suffixes]
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--", *pathspecs],
+        cwd=root, capture_output=True, text=True, check=True, timeout=60,
+    ).stdout
+
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        directory = Path(dirpath)
-        dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if not name.startswith(".")
-            and name not in _PRUNED_DIR_NAMES
-            and not _in_excluded_tree(directory / name, root)
-        )
-        found.extend(directory / name for name in filenames if name.endswith(suffixes))
+    for relative in listing.split("\0"):
+        if not relative or not relative.endswith(suffixes):
+            continue
+        parent_parts = Path(relative).parts[:-1]
+        if any(part.startswith(".") or part in _PRUNED_DIR_NAMES for part in parent_parts):
+            continue
+        path = root / relative
+        if _in_excluded_tree(path, root):
+            continue
+        found.append(path)
     return sorted(found)
 
 
@@ -519,7 +538,10 @@ def _citation_scan_files(root: Path = REPO_ROOT) -> list[Path]:
     ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` structurally out of
     reach: it carries the phantom slug, but it is a CAPTURED replay corpus
     regenerated only by ``shared/tests/toolcall_markup_corpus_extract.py``, so a
-    report against it would invite a hand-edit that corrupts the fixture.
+    report against it would invite a hand-edit that corrupts the fixture. The
+    same filter also drops the ``graphiti``/``mem0`` submodule gitlink entries
+    that the tracked-file walk (task 4971) returns instead of descending into:
+    they are vendored upstream code, not this repo's authored content.
     """
     found = [path for path in _walk_repo_files(root, (".py", ".md")) if path != _THIS_MODULE]
     assert found, (
