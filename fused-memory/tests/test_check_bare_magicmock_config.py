@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import shutil
 import subprocess
 import sys
@@ -2013,6 +2014,39 @@ class TestWallClockDeadlineDebtBaseline:
             'Rule B must still build its overrun message through _debt_overrun_msg '
             'with byte-identical text after the debt helpers were parameterised'
         )
+
+    def test_the_overrun_builder_is_required_and_keyword_only(self):
+        """A future Rule D must not be able to inherit Rule B's remedy by omission.
+
+        The parameter briefly carried ``= None`` with a ``_debt_overrun_msg``
+        fallback. Both call sites passed it, so the fallback was dead — but a
+        fourth rule calling ``_apply_debt_budget(found, budget)`` would have
+        silently prescribed ``_fake_verify_result`` for a wall-clock overrun,
+        with no type error and no failing test. Requiredness is the whole guard,
+        so it is pinned here rather than trusted.
+        """
+        param = inspect.signature(_checker._apply_debt_budget).parameters[
+            'build_overrun_msg'
+        ]
+        assert param.default is inspect.Parameter.empty, (
+            'build_overrun_msg must have NO default: a defaulted message builder '
+            "hands the next rule some other rule's remedy"
+        )
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            'build_overrun_msg must be keyword-only so a positional argument can '
+            'never land in it by accident'
+        )
+        with pytest.raises(TypeError):
+            _checker._apply_debt_budget([], 1)  # type: ignore[call-arg]
+
+    def test_each_rule_passes_its_own_overrun_builder(self):
+        """The two live call sites are wired to their own builders, not each other's."""
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        for builder in ('_debt_overrun_msg', '_wall_clock_overrun_msg'):
+            assert f'build_overrun_msg={builder}' in source, (
+                f'expected a call site passing build_overrun_msg={builder}; the '
+                'builders must stay paired with their own rule'
+            )
 
 
 class TestDebtBaselineIsolation:

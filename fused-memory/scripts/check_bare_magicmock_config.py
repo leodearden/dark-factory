@@ -219,7 +219,8 @@ sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
 
 ---------------------------------------------------------------------------
 
-This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys, typing) so
+This script is intentionally stdlib-only (ast, argparse, collections.abc, pathlib, re,
+sys, typing) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
@@ -232,6 +233,7 @@ import argparse
 import ast
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
@@ -520,15 +522,22 @@ def _debt_overrun_msg(budget: int, found: int) -> str:
 
 
 def _apply_debt_budget(
-    found: list[Violation], budget: int | None, overrun_msg: str | None = None
+    found: list[Violation],
+    budget: int | None,
+    *,
+    build_overrun_msg: Callable[[int, int], str],
 ) -> list[Violation]:
     """Filter one rule's violations for a debt file down to just its budget overrun.
 
-    *overrun_msg* is prebuilt by the caller (task 4246) rather than derived here,
-    because each rule's overrun carries its OWN remedy: telling a Rule C overrun to
-    migrate onto ``_fake_verify_result`` would send the reader down a dead end.  It
-    is only consulted on the over-budget branch, so callers may pass None when they
-    have no debt entry.
+    *build_overrun_msg* is the caller's own ``(budget, found) -> str`` message
+    builder, REQUIRED and keyword-only (task 4246 amendment pass).  Each rule's
+    overrun carries its OWN remedy — telling a Rule C overrun to migrate onto
+    ``_fake_verify_result`` would send the reader down a dead end — so there is
+    deliberately no default: a future Rule D that forgets the argument fails at the
+    call, rather than silently inheriting Rule B's remedy with no type error and no
+    test failure.  It is passed as a builder rather than a built string so the
+    over-budget-only computation stays lazy and no caller has to invent a value for
+    the *budget is None* branch, where it is never consulted.
 
     - Not a debt file (*budget* is None) → every violation is reported unchanged.
     - At or under budget → silence: this is the grandfathering the baseline exists for.
@@ -545,7 +554,7 @@ def _apply_debt_budget(
     if len(found) <= budget:
         return []
     ordered = sorted(found, key=lambda v: (v.lineno, v.col_offset))
-    message = overrun_msg if overrun_msg is not None else _debt_overrun_msg(budget, len(ordered))
+    message = build_overrun_msg(budget, len(ordered))
     return [v._replace(message=message) for v in ordered[budget:]]
 
 
@@ -1062,18 +1071,12 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     # Rule C's is wait_responsive / MERGE_RESULT_TIMEOUT.
     violations.extend(
         _apply_debt_budget(
-            dataclass_doubles,
-            debt_budget,
-            None if debt_budget is None else _debt_overrun_msg(debt_budget, len(dataclass_doubles)),
+            dataclass_doubles, debt_budget, build_overrun_msg=_debt_overrun_msg
         )
     )
     violations.extend(
         _apply_debt_budget(
-            wall_clock,
-            wall_clock_budget,
-            None
-            if wall_clock_budget is None
-            else _wall_clock_overrun_msg(wall_clock_budget, len(wall_clock)),
+            wall_clock, wall_clock_budget, build_overrun_msg=_wall_clock_overrun_msg
         )
     )
 
