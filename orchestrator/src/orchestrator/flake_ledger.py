@@ -957,25 +957,71 @@ def _owner_liveness(status: str | None) -> str:
     return 'closed' if status in TERMINAL else 'open'
 
 
-def _write_owner_task_id(db_path: Path, test_id: str, owner_task_id: str) -> None:
-    """Point *test_id*'s debt row at *owner_task_id*.
+class _OwnerClaimLost(RuntimeError):
+    """The conditional owner UPDATE matched no row — another lane won the claim, or the
+    row is gone.  Raised by :func:`_write_owner_task_id` so the filed task is reported as
+    the ORPHAN it is, instead of a success line for a pointer that never landed."""
+
+
+def _write_owner_task_id(
+    db_path: Path, test_id: str, owner_task_id: str, *, expected_owner: str | None,
+) -> None:
+    """CLAIM *test_id*'s debt row for *owner_task_id*, conditionally on
+    *expected_owner* still being what is on disk.
 
     Exists so :func:`_ensure_owner_task` never hand-rolls an UPDATE at a call site —
     contract 1 of the module docstring ("writes go only through this API") applies
     inside the module too, since a second spelling of this statement is exactly how the
     column would drift.
 
-    Raises on a ledger failure, deliberately: the sole caller wraps the whole filing in
-    its own guard and knows how to degrade loudly, and swallowing here would report a
+    CONDITIONAL, AND THE CONDITION IS THE POINT.  The caller decided to write this
+    pointer by READING ``row.owner_task_id`` (from ``open_debt``'s read-back), then
+    awaiting a task filing — so between the read and this write sit at least two
+    ``await`` points, and every ``open_debt`` call is one.  Two merge lanes suppressing
+    the same test in one event loop genuinely interleave there.  An UNCONDITIONAL
+    ``SET owner_task_id = ?`` would be exactly the read-modify-write race §5.1 chose
+    SQLite to avoid (see ``open_debt``'s single-statement upsert, which carries that
+    reasoning), reintroduced inside the ledger itself on the one column §5.9's whole
+    dedup rests on: the loser would silently clobber the winner's pointer, and the
+    winner's task — a real, non-terminal task — would never be referenced again.
+
+    So the WHERE clause carries the expectation:
+
+    * ``expected_owner is None`` — a FRESH claim, guarded by ``owner_task_id IS NULL``.
+      A concurrent lane that already claimed the row wins, and this filing is the orphan.
+    * ``expected_owner`` set — a REPLACEMENT for the terminal/absent owner the caller
+      corroborated, guarded by ``owner_task_id = <that id>``.  If it changed underneath,
+      what is there now was not corroborated by this call and must not be overwritten.
+
+    Raises on a ledger failure, and on a matched-zero-rows claim
+    (:class:`_OwnerClaimLost`), deliberately: the sole caller wraps the whole filing in
+    its own guard and knows how to degrade loudly, and swallowing either would report a
     filing as recorded when the pointer never landed.
     """
     conn = _open(db_path)
     try:
-        conn.execute(
-            'UPDATE flake_debt SET owner_task_id = ? WHERE test_id = ?',
-            (owner_task_id, test_id),
-        )
+        if expected_owner is None:
+            cursor = conn.execute(
+                'UPDATE flake_debt SET owner_task_id = ? '
+                'WHERE test_id = ? AND owner_task_id IS NULL',
+                (owner_task_id, test_id),
+            )
+        else:
+            cursor = conn.execute(
+                'UPDATE flake_debt SET owner_task_id = ? '
+                'WHERE test_id = ? AND owner_task_id = ?',
+                (owner_task_id, test_id, expected_owner),
+            )
         conn.commit()
+        if cursor.rowcount == 0:
+            # Not a ledger failure — a LOST CLAIM.  Distinguished from an OperationalError
+            # because the remedy differs: nothing is retried here, and the next
+            # suppression will corroborate whatever owner did land rather than file again.
+            raise _OwnerClaimLost(
+                f'owner claim for test_id={test_id!r} matched no row '
+                f'(expected owner {expected_owner!r}); another lane claimed it first, '
+                f'or the row is gone'
+            )
     finally:
         conn.close()
 
@@ -1148,8 +1194,30 @@ async def _ensure_owner_task(
     # `deferred` task, which ι renders (owner shown) and which the `deferred` branch
     # above repairs on the next suppression.  Same principle as the recorder's "durable
     # row first, lose the recoverable half".
+    #
+    # The claim is CONDITIONAL on what this call actually corroborated — NULL for a fresh
+    # filing, the terminal id for a replacement — because `row` is a snapshot taken
+    # before two awaits (the status read and the filing) and a concurrent lane may have
+    # claimed the row in between.  See `_write_owner_task_id`.
+    prior_owner = row.owner_task_id or None
     try:
-        _write_owner_task_id(db_path, row.test_id, new_id)
+        _write_owner_task_id(db_path, row.test_id, new_id, expected_owner=prior_owner)
+    except _OwnerClaimLost:
+        # The task exists server-side and nothing will ever reference it, so the warning
+        # NAMES it: that string is the only trace a human can search for.  Deliberately
+        # not a clobber and deliberately not a retry — the row now carries some other
+        # lane's owner (or is gone), and the next suppression corroborates THAT rather
+        # than filing again, so the leak is one task, not a loop.
+        logger.warning(
+            'flake_ledger: filed de-flake task %s for test_id=%s but LOST the owner claim '
+            '(expected owner %r) — another merge lane owns the row, so this task is '
+            'ORPHANED; the winner is left in place rather than clobbered',
+            new_id,
+            row.test_id,
+            prior_owner,
+            exc_info=True,
+        )
+        return row
     except Exception:
         logger.warning(
             'flake_ledger: filed de-flake task %s for test_id=%s but could not store the '
@@ -1180,11 +1248,20 @@ async def _ensure_owner_task(
         row.test_id,
         project_id,
     )
-    # Re-read so the caller sees the row as STORED rather than a locally-patched copy.
-    # `dataclasses.replace` is the fallback only for a degraded re-read, where returning
-    # the id we just wrote is strictly more honest than dropping it.
-    refreshed = read_debt(db_path, row.test_id)
-    return refreshed if refreshed is not None else replace(row, owner_task_id=new_id)
+    # No re-read.  After a ROWCOUNT-CHECKED conditional UPDATE, `new_id` is exactly what
+    # is in that column on disk — so patching the one column this function owns is not a
+    # "local copy" of the row, it is the row.
+    #
+    # This used to `read_debt` and fall back to `replace(...)` only on a `None` return,
+    # which was wrong in both directions: `read_debt` returns `None` for a DEGRADED READ
+    # and for a GENUINELY ABSENT row alike (it catches and logs), so the fallback also
+    # fired when the row had been deleted underneath us — handing the caller a row
+    # asserting an ownership the database does not hold.  That is the same
+    # present-vs-absent conflation the `(statuses, error)` pair was introduced to
+    # eliminate one function away.  It also cost a THIRD connection on the owned path
+    # (upsert, UPDATE, re-read), each paying the full five-pragma durability triad on
+    # the merge path — the cost `TestOneConnectionPerCall` exists to bound.
+    return replace(row, owner_task_id=new_id)
 
 
 async def open_debt(
