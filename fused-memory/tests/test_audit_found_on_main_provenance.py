@@ -555,7 +555,54 @@ class TestCitationGatePositiveArmStampChoice:
         )
         assert '4924' in extract_cited_task_ids(audit.commit_message)
         verdict, _reasons = classify(audit)
-        assert verdict != 'misattributed'
+        # The concrete verdict, not the class-file's usual `!= 'misattributed'`:
+        # that weaker convention exists for the pre-step-12 interim verdicts (see
+        # the TestClassifyMisattributed banner) and does not apply here. The claim
+        # being made is "the citing-sha stamp audits CLEAN", so a regression that
+        # started returning `unverifiable` — or `deliverable_absent`, which
+        # `check_found_on_main_spurious_rate.py::_SPURIOUS_VERDICTS` gates on
+        # exactly like `misattributed` — must fail here rather than pass.
+        assert verdict == 'ok'
+
+    def test_sibling_covered_citing_sha_still_audits_deliverable_absent(self):
+        """The residual exposure the fix does NOT close, pinned so it stays visible.
+
+        On a SIBLING-covered landing the citing commit is the sibling's, and its
+        diff need not touch this task's declared files. Misattribution is gone
+        (the subject cites 4924 by construction), but `deliverable_absent` is
+        reachable — and `check_found_on_main_spurious_rate.py::_SPURIOUS_VERDICTS`
+        counts it as spurious just like `misattributed`, so the fix trades one
+        spurious verdict for a narrower one rather than eliminating both.
+
+        This is why `skills/_shared/deriving-landed-sha.md`'s citation gate tells
+        the agent to prefer, among subject-citing rows, one whose diff touches the
+        task's declared files, and to say so in the `note` when none does.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+            declared_files=['skills/_shared/deriving-landed-sha.md'],
+            commit_files=['skills/merge-queue/SKILL.md'],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'deliverable_absent'
+        assert any('deriving-landed-sha.md' in r for r in reasons)
+
+    def test_citing_sha_whose_diff_touches_a_declared_file_audits_ok(self):
+        """The row the runbook tells the agent to PREFER audits clean.
+
+        Same sibling-covered shape as above, except the selected citing row's
+        diff does touch a declared file — which is the whole content of the
+        gate's "prefer a row whose diff touches the declared files" advice.
+        """
+        audit = _audit(
+            task_id='4924', is_ancestor=True,
+            commit_message='impl(4701): sweep provenance (#4924)',
+            declared_files=['skills/_shared/deriving-landed-sha.md'],
+            commit_files=['skills/_shared/deriving-landed-sha.md', 'skills/unblock/SKILL.md'],
+        )
+        verdict, _reasons = classify(audit)
+        assert verdict == 'ok'
 
 
 # ===========================================================================
