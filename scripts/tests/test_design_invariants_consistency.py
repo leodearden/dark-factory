@@ -2569,6 +2569,33 @@ def test_citation_scan_files_skips_index_entries_absent_from_the_worktree(
         path.read_text(encoding="utf-8")
 
 
+def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A non-repo root must RAISE, actionably — never fall back to a filesystem walk.
+
+    `tmp_path` is deliberately never made into a git repo here. Verified
+    `git -C <non-repo> ls-files` exits non-zero with `fatal: not a git
+    repository` and does not walk up to a parent repo, so this is a real
+    failure mode (a stray root, a not-yet-initialised checkout), not a
+    contrived one. A silent filesystem fall-back here would restore the exact
+    incident this task fixes, and do so precisely where nobody is watching —
+    `no-silent-fail-soft` is a canonical slug in the family this module
+    enforces. Asserts on the STRUCTURED facts a reader needs to act (the
+    offending root, and that the scan sources from tracked files), never on
+    git's raw stderr wording, which is the git binary's implementation detail,
+    not this module's contract (`structured-facts-at-failure`). Must FAIL
+    against step-2/step-4, where `check=True` surfaces a bare
+    `subprocess.CalledProcessError` naming neither.
+    """
+    with pytest.raises(Exception) as excinfo:
+        _walk_repo_files(tmp_path, (".py", ".md"))
+
+    message = str(excinfo.value)
+    assert str(tmp_path) in message, message
+    assert "tracked" in message.lower(), message
+
+
 # ---------------------------------------------------------------------------
 # LIVE: the two repo-wide drift assertions
 #
