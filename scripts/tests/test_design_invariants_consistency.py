@@ -2479,6 +2479,42 @@ def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> No
     assert "no files" in str(excinfo.value).lower()
 
 
+def test_citation_scan_files_ignores_untracked_files(tmp_path: Path) -> None:
+    """Reproduces task 4971 hermetically: an untracked file must not be scanned.
+
+    `project_root`'s gitignored `/data/` holds live escalation-watcher output.
+    `_citation_scan_files` used to walk the filesystem, so a digest the watcher
+    had just rewritten under `data/escalations/afk-digest.md` was scanned too —
+    and it happened to carry several backticked `esc-<task>-<n>` tokens beside
+    a `design-invariants.md` mention, which the citation guard's anchor logic
+    reads exactly like a slug citation. The guard went red over five "phantom"
+    citations that were never committed, while an otherwise-identical worktree
+    with no `data/` directory at all stayed green — the verdict was a property
+    of watcher timing, not of repo content.
+
+    The untracked fixture below is not merely absent-by-name: its body is the
+    same shape (an anchor mention within `_CITATION_WINDOW` lines of backticked
+    tokens), so it would actively surface as phantom citations were the scan to
+    reach it. Must FAIL against the os.walk-based walker, which returns both
+    files with no regard for git's index.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/legibility/note.md"],
+        untracked=["data/escalations/afk-digest.md"],
+    )
+    (tmp_path / "data" / "escalations" / "afk-digest.md").write_text(
+        "Filed against `docs/legibility/design-invariants.md`'s citation guard:\n"
+        "`esc-3381-7`, `esc-3780-3`, `esc-3815-4`, `esc-4293-3`, `esc-4184-4`.\n",
+        encoding="utf-8",
+    )
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert tmp_path / "docs" / "legibility" / "note.md" in scanned
+    assert tmp_path / "data" / "escalations" / "afk-digest.md" not in scanned
+
+
 # ---------------------------------------------------------------------------
 # LIVE: the two repo-wide drift assertions
 #
