@@ -2188,6 +2188,12 @@ entries:
     manifested_phase: recon
     invariant_violated: JSON schema validation and StructuredOutput type safety
     note: Recon agent generated StructuredOutput with embedded XML parameter syntax (<parameter name="issue">) in JSON payload, causing InputValidationError at tool invocation. Same root confusion as oneoff-20260709 (XML tags in wrong output format) but detected immediately at parse time rather than persisting downstream.
+  - date: '2026-08-27'
+    project: dark_factory
+    session: dd0b8fe1-3f82-4a09-9abe-95a3bb13fad2
+    origin_phase: unknown
+    manifested_phase: architect
+    note: create_plan's 'analysis' field carried unrepairable raw MCP envelope markup (matched_pattern '</description>', the same leaked tag as the entry's original example); guard refused the call outright (esc-plan-tools-markup-residue-6) rather than letting it ship downstream, consistent with the 08-28 memory that this guard is now live on plan-tools/verdict-tools — but the underlying leak-into-tool-argument behavior this entry describes still recurs.
 - id: oneoff-2026-07-10
   title: install-hooks.sh run inside a task worktree baked ephemeral .worktrees/2288 paths into global ~/.claude/settings.json, and the idempotency check skips rather than repairs dead entr
   severity: low
@@ -3081,6 +3087,12 @@ entries:
     manifested_phase: verify
     invariant_violated: Bash tool multi-line command parsing
     note: 'Turn 39 Bash command with heredoc structure containing embedded newlines + echo statements produces ''cat: echo: No such file or directory'', characteristic of heredoc flattening. Command: META=...\necho ===\ncat $META && echo && echo... Parser error suggests payload got mangled.'
+  - date: '2026-08-27'
+    project: dark_factory
+    session: dd0b8fe1-3f82-4a09-9abe-95a3bb13fad2
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'A multi-line `python3 -c "..."` script passed to Bash had its newlines collapsed onto one physical line (statements run together with only a space, no semicolon/newline), producing ''IndentationError: unexpected indent'' when checking .task/plan.json''s confirmation state — a direct manifestation of the ''flattening'' bug this entry references, this time actually executing (not blocked by the static-analysis pre-check) and corrupting the script instead.'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
   severity: medium
@@ -3181,6 +3193,12 @@ entries:
     origin_phase: merge
     manifested_phase: merge
     note: Two resolve_ticket calls timed out at turns 279–280, forcing polling of merge_status without outcome signal from the timeout itself.
+  - date: '2026-08-27'
+    project: dark_factory
+    session: 01234699-e565-4ad3-8e79-fb6403f7964a
+    origin_phase: unknown
+    manifested_phase: merge
+    note: resolve_ticket on tkt_0RSYRASN5XF55XM2P2Y5AJW89P returned only 'The operation timed out.' (turn 278) with no outcome signal, mid-/unblock of a merge-queue halt (esc-3517-4) — exact match to the recorded resolve_ticket-timeout candidate.
 - id: entry-cand-20260722-9
   title: Recon action-provenance logger records target='?' for write_journal add/delete ops
   severity: medium
@@ -3609,6 +3627,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest for session 9b21ee24 (score 0.0, n_user_turns=0, all signal_counts=0, size_bytes=378) renders as nothing but the standard injected system-reminder boilerplate — deferred-tool list, agent-type list, fused-memory MCP instructions, skills list — with zero actual conversation content surfaced. Confirms the known pattern of the digest pipeline collapsing a near-empty/trivial session down to harness boilerplate rather than any real substance, making it indistinguishable from a session where nothing happened vs. one where the extractor simply failed to capture content.
+  - date: '2026-08-28'
+    project: dark_factory
+    session: a990b329-e45c-4050-8238-b06ee79fa662
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Session a990b329 (interactive, worktree 4740): 377 bytes, score 0.0, n_user_turns=0, all signal_counts zero. The entire captured digest body is generic system-reminder injection boilerplate — deferred-tool list, agent-type roster, MCP server usage instructions, full skills catalog — with no visible actual session substance, matching the known digest-collapses-to-boilerplate pattern.'
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -5496,6 +5520,12 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Digest 'User Corrections' section mislabels the trickle-coder's initial task-framing prompt ('You are the periodic-census verifier for the dark-factory agent-confusion codebook...') as a user-provided correction when it is a system-injected verification mandate from the trickle-coder system.
+  - date: '2026-08-31'
+    project: dark_factory
+    session: d517380a-83af-4674-b3e6-33f28b4898c7
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session's sole captured 'User Correction' (turn 3, n_user_turns=1) is actually the injected task-framing prompt for a review-suggestion settled/deferred adjudication task in worktree 3187 — instructions telling the agent that a CURRENT suggestion resembling a PRIOR-ROUND one is not automatically 'settled' (it may be merely DEFERRED and still open). All signal_counts read 0 (no tool_error/self_correct/not_found/df_guard/interrupt/designed_outcome), confirming no genuine human correction occurred in this session — the digest pipeline mislabeled the task's own dispatch/framing prompt as a 'User Correction', matching the established recurring digest-mislabeling pattern.
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -6472,6 +6502,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Not Found signal rendered as bare template '(turn 41) no such file or directory' with no context about which file path or which command produced the error
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 27c9ab0f-ee52-468c-8238-829608c5fd82
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest is 412 bytes, n_user_turns=0, single df_guard=1 signal; the Guard Trips section renders as the bare template '(turn 3) blocked:' with nothing after the colon — the actual blocked-message substring was dropped, leaving the guard trip contentless.
+  - date: '2026-08-26'
+    project: dark_factory
+    session: 3b90f113-0c0a-4782-8e7d-ab9f05eab392
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's Guard Trips section renders two entries as bare 'blocked:' with the matched substring/detail dropped (turns 36, 48), and the Not Found section is just the literal string 'no such file or directory' with no path — both are bare-template renderings of guard/not-found signals.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -7892,6 +7934,12 @@ entries:
     manifested_phase: ops
     invariant_violated: digest score and 'User Corrections' label should track session signal_counts
     note: Session has score=5.0 with all signal_counts at 0 (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome all zero); score/label assignment decoupled from actual signal evidence
+  - date: '2026-08-30'
+    project: dark_factory
+    session: d9e15590-08b7-4486-a096-ad5fe6c348bc
+    origin_phase: review
+    manifested_phase: unknown
+    note: Digest scores this session 5.0 and populates a '## User Corrections' section with genuine reviewer blocking-issue content (a one-sided/two-sided binomial p-value mislabeling in plans/fable-architect-trial-v2-decision-2026-08-30.md §9), yet every individual signal_count (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome) reads 0 — the score and the 'User Corrections' label are decoupled from the session's own signal counters, matching the known score/label-vs-signal_counts decoupling pattern.
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -8517,6 +8565,18 @@ entries:
     origin_phase: architect
     manifested_phase: implement
     note: 'Turns 151, 166: Worktree cwd persists as /home/leo/src/dark-factory/.worktrees/4559 across turns. Agent issues relative-path commands (cd orchestrator, read orchestrator/tests/test_ewa_replay.py) that fail with ENOENT. Exact match to documented pattern.'
+  - date: '2026-08-30'
+    project: dark_factory
+    session: 529974d8-1c0c-406a-88ef-2a91b0c01eb7
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'Task-4717 worktree session: `Bash({"command": "cd fused-memory && grep -n ..."})` failed with ''No such file or directory'' despite cwd metadata showing the worktree root, where a top-level fused-memory/ dir should exist — consistent with Bash''s cwd persisting silently across the session''s prior turns (50+ turns in) so the shell was no longer at the assumed root when the relative `cd` ran. Same underlying cause as the logged PRD-commit pathspec case, different concrete command (cd/grep vs git commit --only).'
+  - date: '2026-08-27'
+    project: dark_factory
+    session: 7bed7d8e-0004-41fa-bd04-c11ef9f7d4bd
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'Same root cause (Bash tool cwd persists silently across turns) but a new manifestation: after an earlier untruncated turn evidently `cd`''d into fused-memory/, turn 43''s `sed ... fused-memory/scripts/audit_wrong_binding_edges.py` and turn 44''s `cd fused-memory && grep ...` both fail ''No such file or directory'' because the path is now double-relative / already-current-dir — not the git-commit --only pathspec case the entry was originally filed under, generalizing it beyond PRD-doc commits to any relative-path Bash invocation mid-worktree-session.'
 - id: entry-cand-20260730-31
   title: Digest 'User Corrections' extraction mislabels an orchestrated-task session's injected memory-search context block as a correction
   severity: medium
@@ -11474,6 +11534,30 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated worktree task exits with 'no such file or directory' (turn 23) and carries zero diagnostic signals beyond the not_found flag. No file path, stack trace, or command context captured.
+  - date: '2026-08-28'
+    project: dark_factory
+    session: 513d8216-b217-4aba-bfde-014986b9d9b1
+    origin_phase: unknown
+    manifested_phase: implement
+    note: orchestrated-task session in .worktrees/4189 with a single not_found signal ("does not exist", turn 23) and zero other diagnostic content — matches the pattern of an orchestrated worktree task hitting a missing-path/not-found condition with no other diagnostic signal to disambiguate cause.
+  - date: '2026-08-27'
+    project: dark_factory
+    session: dc466392-fc7f-4f18-9d06-bea5fd4174ce
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated-task session in worktree .worktrees/2979, turn 58: `cd fused-memory && sed -n ...` fails with ''No such file or directory''. Digest is only 735 bytes with zero user turns and no signal beyond the single tool_error/not_found pair — same thin-evidence shape as the matched entry: an orchestrated worktree task hitting ''no such file or directory'' with no other diagnostic context to pin down phase or root cause (cwd drift vs. worktree layout gap).'
+  - date: '2026-08-27'
+    project: dark_factory
+    session: eec0abb7-7b3d-49fa-90e9-dbe021763aa7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in .worktrees/3187 with score 4.0, n_user_turns=0, and every signal_count at zero except not_found=4 ('does not exist' x2, 'no such file or directory', 'modulenotfounderror') — an essentially content-free digest matching the already-logged pattern of orchestrated worktree tasks firing repeated not-found signals with no other diagnostic context to attribute a phase or cause.
+  - date: '2026-08-27'
+    project: dark_factory
+    session: aa6edcdf-8977-4063-97fb-a2694e22ef5c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: orchestrated-task session cwd'd into .worktrees/3540 issued a grep against relative paths orchestrator/src, shared/src, and orchestrator/src/orchestrator/artifacts.py; all three came back 'No such file or directory' (exit 2), and that single error neighborhood is the entire 908-byte session with n_user_turns=0 and no other diagnostic signal — matches the pattern of an orchestrated worktree task firing repeated not-found errors with nothing else to go on.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
