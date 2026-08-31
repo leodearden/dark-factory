@@ -312,13 +312,20 @@ async def bulk_vector_graph():
     # field below removes the Entity index record entirely instead of
     # rebuilding it, and the window this fixture exists to open never opens.
     await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
-    # (task 4748) At this seed size the initial HNSW build measured 1.3-2.8s
-    # across loadavg ~96-185 on 32 cores, well inside await_index_operational's
-    # default 10s budget -- no override needed. If this fixture's seed size
-    # is ever raised, re-measure the build time before assuming the default
-    # still covers it (see TestDropRebuildWindow's measurement table; at
-    # 50,000 nodes the same build measured 8.5-9.2s and needed timeout_s=60).
-    await await_index_operational(graph)
+    # (task 4748, re-budgeted task 4972) At this seed size the initial HNSW
+    # build measured 1.3-2.8s across loadavg ~96-185 on 32 cores -- but that
+    # is the UNCONTENDED figure. Under 16-way FalkorDB contention the same
+    # build measured 2.87-24.45s (median 14.47s), i.e. a 10-17x multiplier
+    # that blows straight through await_index_operational's 10s default, so
+    # this call site now carries an explicit timeout_s=20. The default itself
+    # is deliberately left alone: every OTHER caller in the suite barriers a
+    # 1-node graph where the build finishes before the first poll, and raising
+    # the default globally would buy them nothing while slowing genuine
+    # failure reporting everywhere. If this fixture's seed size is ever
+    # raised, re-measure before assuming even 20s covers it (see
+    # TestDropRebuildWindow's measurement table; at 50,000 nodes the same
+    # build measured 8.5-9.2s UNCONTENDED and needed timeout_s=60).
+    await await_index_operational(graph, timeout_s=20)
     try:
         yield graph
     finally:
@@ -387,16 +394,44 @@ async def _reopen_rebuild_window(graph) -> None:
     4. re-``DROP`` -- which is what actually opens the window the next attempt
        observes.
     """
-    await await_index_operational(graph)
+    # Both barriers carry timeout_s=20 for the same measured reason as the
+    # fixture's build barrier and the test's final one: they gate the SAME
+    # 10,000-node graph, where 16-way FalkorDB contention pushed the build to
+    # 2.87-24.45s and the post-drop rebuild to 0.00-22.86s, past the 10s
+    # default. A barrier raising here aborts the whole retry (reopen failures
+    # propagate; retry_until_observed only absorbs a falsy OBSERVATION), so an
+    # under-budgeted barrier would reintroduce the contention flake this task
+    # removes.
+    await await_index_operational(graph, timeout_s=20)
     await graph.query(
         'CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) '
         "OPTIONS {dimension: 4, similarityFunction: 'cosine'}"
     )
-    await await_index_operational(graph)
+    await await_index_operational(graph, timeout_s=20)
     await graph.query('DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)')
 
 
-@pytest.mark.timeout(30)
+# 150, overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
+# (pytest-timeout resolves via get_closest_marker, so the module mark still
+# correctly governs TestDropVectorIndicesLive above, which runs on the 1-node
+# live_vector_graph and is fast). Two reasons this headroom is not optional:
+#
+#   * FAILURE MODE. fused-memory/pyproject.toml sets timeout_method='thread',
+#     whose handler ends in os._exit(1) -- that kills the whole xdist worker
+#     rather than failing one test. So the mark must sit comfortably ABOVE the
+#     sum of barrier budgets that can plausibly run long, or a stalled barrier
+#     takes the worker down instead of raising a clean AssertionError.
+#   * MEASURED COST. Under 16-way FalkorDB contention the 10,000-node HNSW
+#     build measured 2.87-24.45s (median 14.47s) and the post-drop rebuild
+#     0.00-22.86s (median 10.60s) -- both timed out against
+#     await_index_operational's 10s default, which is why the bulk-graph
+#     barriers below carry an explicit timeout_s=20.
+#
+# Realistic post-fix worst case with 5 attempts is ~27s (5 x 2.0s poll +
+# 4 x ~1.3s reopen + fixture; reopen measured 1.12-1.42s, median 1.27s), and
+# even two sequential 20s barrier timeouts (40s) now surface as a clean
+# AssertionError well inside 150.
+@pytest.mark.timeout(150)
 class TestDropRebuildWindow:
     """PREMISE PIN for the post-DROP rebuild window — task 4748.
 
@@ -532,7 +567,11 @@ class TestDropRebuildWindow:
             raise AssertionError(f'{exc} Last saw {last_rows!r}.') from exc
 
         # (c) The barrier is SUFFICIENT: once satisfied, the phantom is gone.
-        await await_index_operational(graph)
+        # timeout_s=20, not the 10s default, for the same measured reason as
+        # the fixture's build barrier: under 16-way FalkorDB contention the
+        # post-drop rebuild measured 0.00-22.86s (median 10.60s) on this
+        # 10,000-node graph, so the default has no headroom here.
+        await await_index_operational(graph, timeout_s=20)
 
         result = await graph.query('CALL db.indexes()')
         entity_rows = _entity_index_rows(result)
