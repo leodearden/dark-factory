@@ -907,14 +907,24 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
 
     # ── get_statuses ──────────────────────────────────────────────────────────
+    #
+    # The return shape is the ``(statuses, error)`` PAIR that
+    # ``scheduler.py::SchedulerFacade.get_statuses`` already uses for exactly this
+    # reason: ``({id: status}, None)`` on success, ``({}, exception)`` on any failure.
+    # Before the pair, a FAILED read and a CORROBORATED ABSENCE both arrived at the
+    # ledger as ``{}`` — byte-identical — and the ledger acted on the second reading,
+    # filing a duplicate de-flake task per suppression through a transient MCP outage.
+    # The three-way distinction below (known / corroborated-absent / unreadable) is the
+    # whole point of the shape, so each case is pinned separately.
 
     @pytest.mark.asyncio
     async def test_get_statuses_dispatches_project_root_and_ids(self):
         scheduler, client = await self._client({'statuses': {'42': 'pending', '43': 'done'}})
-        result = await client.get_statuses(['42', '43'])
+        statuses, error = await client.get_statuses(['42', '43'])
         assert scheduler.calls[0][0] == 'get_statuses'
         assert scheduler.calls[0][1] == {'project_root': '/proj', 'ids': ['42', '43']}
-        assert result == {'42': 'pending', '43': 'done'}
+        assert statuses == {'42': 'pending', '43': 'done'}
+        assert error is None
 
     @pytest.mark.asyncio
     async def test_get_statuses_coerces_ids_to_str(self):
@@ -938,10 +948,20 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         ids=['direct', 'structured_content', 'result', 'content_text_block'],
     )
     async def test_get_statuses_handles_every_envelope_shape(self, envelope):
-        """The same four shapes ``_unwrap_dispatch_envelope`` already normalises for
-        id-extraction and search results — one envelope policy, three parsers."""
+        """(a) SUCCESS, ids known.  The same four shapes ``_unwrap_dispatch_envelope``
+        already normalises for id-extraction and search results — one envelope policy,
+        three parsers — and every one of them reports ``error is None``."""
         _, client = await self._client(envelope)
-        assert await client.get_statuses(['42']) == {'42': 'pending'}
+        assert await client.get_statuses(['42']) == ({'42': 'pending'}, None)
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_well_formed_empty_mapping_is_a_corroborated_absence(self):
+        """(b) SUCCESS, ids UNKNOWN.  ``get_statuses`` silently OMITS ids it does not
+        know, so a well-formed ``{'statuses': {}}`` is REAL EVIDENCE that the task is
+        gone — the one case where an empty mapping means something — and it must arrive
+        with ``error is None`` so the ledger still files a replacement."""
+        _, client = await self._client({'statuses': {}})
+        assert await client.get_statuses(['42']) == ({}, None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -949,18 +969,26 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         [{'unexpected': 'shape'}, {'statuses': ['not', 'a', 'dict']}, None, ['not', 'a', 'dict']],
         ids=['unrecognised', 'non_dict_statuses', 'none', 'list'],
     )
-    async def test_get_statuses_degrades_to_empty_mapping(self, envelope):
+    async def test_get_statuses_unparseable_envelope_reports_an_error(self, envelope):
+        """(c) FAILURE, envelope half.  An envelope this parser does not recognise is
+        NOT a corroborated absence — nothing was read — so it must be reported in band
+        rather than degrade to the same ``{}`` case (b) produces.  Still never raises."""
         _, client = await self._client(envelope)
-        assert await client.get_statuses(['42']) == {}
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert isinstance(error, Exception)
 
     @pytest.mark.asyncio
-    async def test_get_statuses_degrades_when_dispatch_raises(self):
-        """Never raises: the ledger reads an empty mapping as a corroborated absence
-        ONLY on a successful call, so this must degrade at the adapter rather than
-        propagate — and the ledger's own guard is the second line, not the first."""
-        _, client = await self._client(None, raises=RuntimeError('mcp down'))
-        assert await client.get_statuses(['42']) == {}
-
+    async def test_get_statuses_reports_the_raised_object_when_dispatch_raises(self):
+        """(c) FAILURE, raise half.  Never raises — the adapter's siblings
+        ``submit_task``/``commit_planning`` do not either, and consistency there is
+        deliberate — but the CAUGHT OBJECT is handed back so the ledger can log the real
+        cause with ``exc_info`` instead of a synthesised stand-in."""
+        raised = RuntimeError('mcp down')
+        _, client = await self._client(None, raises=raised)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert error is raised
     # ── commit_planning ───────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
@@ -1065,3 +1093,60 @@ class TestExtractTaskId:
     def test_unrecognised_shape_returns_empty_string(self):
         from orchestrator.chronic_flake import extract_task_id
         assert extract_task_id({'unexpected': 'shape'}) == ''
+
+
+class TestExtractStatusesMap:
+    """``_extract_statuses_map``: the ``get_statuses`` response parser, returning the
+    same ``(value, error)`` pair ``scheduler.py::SchedulerFacade.get_statuses`` uses.
+
+    Its whole job is to keep two things that both LOOK like an empty mapping apart:
+    a PRESENT-but-empty ``statuses`` dict (a corroborated absence — the tool answered,
+    and it does not know the id) and an envelope it could not read at all (no answer).
+    Collapsing both to ``{}`` is what let a transient MCP outage read as "the owning
+    task was deleted" one seam away, in ``flake_ledger._ensure_owner_task``.
+    """
+
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            {'statuses': {'42': 'pending'}},
+            {'structuredContent': {'statuses': {'42': 'pending'}}},
+            {'result': {'statuses': {'42': 'pending'}}},
+            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
+        ],
+        ids=['direct', 'structured_content', 'result', 'content_text_block'],
+    )
+    def test_present_mapping_parses_with_no_error(self, envelope):
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map(envelope) == ({'42': 'pending'}, None)
+
+    def test_present_but_empty_mapping_is_not_an_error(self):
+        """The corroborated absence.  ``error is None`` is what tells the ledger this
+        emptiness is evidence rather than a failure to read."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map({'statuses': {}}) == ({}, None)
+
+    def test_keys_and_values_are_coerced_to_str(self):
+        """The tool returns JSON, but a caller may hand ints; the ledger looks the id
+        up as a ``str``."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map({'statuses': {42: 'pending'}}) == ({'42': 'pending'}, None)
+
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            {'unexpected': 'shape'},
+            {'statuses': ['not', 'a', 'dict']},
+            {'statuses': None},
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=['missing_key', 'non_dict_statuses', 'null_statuses', 'none', 'list'],
+    )
+    def test_missing_or_non_dict_statuses_reports_an_error(self, envelope):
+        """A MISSING key or a non-dict value means nothing was read.  Construct-don't-
+        raise, matching ``SchedulerFacade``'s ``({}, exception)`` convention."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        statuses, error = _extract_statuses_map(envelope)
+        assert statuses == {}
+        assert isinstance(error, Exception)
