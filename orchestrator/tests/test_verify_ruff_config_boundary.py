@@ -25,6 +25,7 @@ two ruff measurements the decision rests on.
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -538,6 +539,95 @@ class TestLatchIsKeyedOnTheWorktreeBASE:
         )
         # ...and having measured it, it is sound, so no SECOND record appears.
         assert len(_escape_records(caplog)) == 1
+
+
+class TestEscapeLatchKey:
+    """Unit-pin ``_ruff_escape_latch_key``'s four load-bearing properties.
+
+    The end-to-end pair above proves the latch re-measures a recycled path, but
+    it cannot localise WHICH property of the key delivered that: a refactor
+    could satisfy it while quietly dropping a config spelling, or by keying on
+    an mtime stat that re-probes on every untouched run.  These assert the
+    properties directly.
+
+    Keys are compared with ``==`` only, never destructured, so the tuple layout
+    stays free to change.
+    """
+
+    def test_key_is_stable_when_nothing_changes(self, tmp_path):
+        # The property that keeps the per-module and per-retry dedup working —
+        # and the reason the fingerprint is a CONTENT digest rather than an
+        # mtime/size stat: a rewrite with identical bytes is not a base change.
+        _write_project(tmp_path, 'wtproj', declares_ruff=False)
+        first = verify._ruff_escape_latch_key(tmp_path)
+
+        assert verify._ruff_escape_latch_key(tmp_path) == first
+
+        _write_project(tmp_path, 'wtproj', declares_ruff=False)
+        assert verify._ruff_escape_latch_key(tmp_path) == first, (
+            'a byte-identical rewrite changed the key; the fingerprint is '
+            'reading metadata rather than content'
+        )
+
+    @pytest.mark.parametrize('name', ['.ruff.toml', 'ruff.toml', 'pyproject.toml'])
+    def test_each_root_config_spelling_discriminates(self, tmp_path, name):
+        # Asserted once per SPELLING because ruff's per-directory precedence is
+        # .ruff.toml > ruff.toml > pyproject.toml[tool.ruff]: a base carrying
+        # only a root ruff.toml halts the walk just as effectively, so a
+        # pyproject-only fingerprint would miss that base change entirely.
+        absent = verify._ruff_escape_latch_key(tmp_path)
+        path = tmp_path / name
+
+        path.write_text('[tool.ruff]\nline-length = 100\n')
+        created = verify._ruff_escape_latch_key(tmp_path)
+        assert created != absent, f'creating {name} did not change the key'
+
+        path.write_text('[tool.ruff]\nline-length = 120\n')
+        edited = verify._ruff_escape_latch_key(tmp_path)
+        assert edited != created, f'editing {name} did not change the key'
+
+        path.unlink()
+        removed = verify._ruff_escape_latch_key(tmp_path)
+        assert removed != edited, f'removing {name} did not change the key'
+        assert removed == absent
+
+    def test_key_is_path_sensitive(self, tmp_path):
+        # Two lanes can hold byte-identical configs while being different
+        # worktrees, so the resolved path stays part of the identity.
+        first = tmp_path / 'lane-0'
+        second = tmp_path / 'lane-1'
+        first.mkdir()
+        second.mkdir()
+        _write_project(first, 'proj', declares_ruff=True)
+        _write_project(second, 'proj', declares_ruff=True)
+
+        assert verify._ruff_escape_latch_key(first) != verify._ruff_escape_latch_key(second)
+
+    def test_missing_worktree_still_yields_a_key(self, tmp_path):
+        # TOTAL: this runs on the verify hot path, so it must be structurally
+        # incapable of reddening a leg.
+        missing = tmp_path / 'nope'
+
+        assert verify._ruff_escape_latch_key(missing) == verify._ruff_escape_latch_key(missing)
+
+    def test_unreadable_root_config_still_yields_a_key(self, tmp_path):
+        if os.geteuid() == 0:
+            # Explicit rather than an unconditional skip: under a non-root uid
+            # this case MUST run, and only root's chmod bypass excuses it.
+            pytest.skip('running as root: chmod 000 does not make a file unreadable')
+        _write_project(tmp_path, 'wtproj', declares_ruff=True)
+        config = tmp_path / 'pyproject.toml'
+        config.chmod(0o000)
+        try:
+            key = verify._ruff_escape_latch_key(tmp_path)
+            assert key == verify._ruff_escape_latch_key(tmp_path)
+        finally:
+            config.chmod(0o644)
+
+        # An unreadable config carries no halt decision, exactly like an absent
+        # one, so the two are the same key rather than a spurious re-probe.
+        config.unlink()
+        assert key == verify._ruff_escape_latch_key(tmp_path)
 
 
 class TestProbeTargetFallback:
