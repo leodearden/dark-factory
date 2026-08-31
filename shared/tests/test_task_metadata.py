@@ -2406,6 +2406,55 @@ class TestParseMetadataFailurePolicy:
         #    round-tripped verbatim, not coerced by a typed field.
         assert model.model_dump()['related_tasks'] == ['1', '2']
 
+    @pytest.mark.parametrize(
+        'alias', ['related_task', 'related_df_tasks', 'related_task_examples']
+    )
+    def test_related_tasks_aliases_still_warn(self, alias):
+        """The three cross-reference aliases must KEEP emitting unknown_key (task 4303).
+
+        The negative half of ``test_related_tasks_metadata_key_is_blessed``, and
+        the assertion the Tier-B row now actually rests on. Task 4303 blessed the
+        CANONICAL spelling, so from here the drift signal for this family lives
+        ENTIRELY in these three aliases — before that, the canonical warned too
+        and `code=unknown_key` could not discriminate "used a deprecated alias"
+        from "used the spelling docs/task-authoring.md §8 told me to use".
+
+        BORN GREEN BY DESIGN, and that is the point: this is a regression lock,
+        not a defect reproduction. Verified on the base tree — all three aliases
+        already warn correctly. Its falsifier is a FUTURE change that blesses one
+        of them (or promotes it to a typed `TaskMetadata` field), which would
+        void the Tier-B table's drift contract with no other test failing and
+        leave an operator's `grep code=unknown_key` silently returning nothing.
+        Modelled directly on `test_finding_provenance_near_miss_aliases_still_warn`
+        above, whose docstring makes exactly this argument for its own family.
+
+        Parametrized rather than looped inside one test so a single regressed
+        alias is isolated BY NAME in the failure output. Both properties were
+        measured, not assumed: temporarily blessing `related_df_tasks` failed
+        exactly one case, reported as
+        `test_related_tasks_aliases_still_warn[related_df_tasks]`, while the
+        other two stayed green. The temporary blessing was not committed.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test, not
+        a documentation meta-test.
+
+        Scoped key-exact to the three spellings the Tier-B row lists, and nothing
+        beyond them. In particular NOT `related_task_ids`: that is a different
+        key entirely, it lives in MEMORY metadata rather than task metadata, and
+        it has a live reader at
+        `fused-memory/scripts/audit_duplicate_memories.py::
+        liveness_snapshot_subject_task_ids`. Pulling it into this family is the
+        `related_task*` wildcard mistake task 4303 removed from the frozenset
+        header comment.
+        """
+        _, warnings = parse_metadata({alias: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert alias in unknown_key_fields, (
+            f'{alias} must stay unblessed so its drift line keeps appearing in '
+            f'the census; got warnings: {warnings}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
