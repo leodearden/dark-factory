@@ -517,6 +517,15 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
         path = root / relative
         if _in_excluded_tree(path, root):
             continue
+        # `git ls-files` reads the INDEX, not the worktree: a path can be
+        # listed while missing on disk (routine mid-rebase or mid-merge).
+        # Dropping it here is safe — a file absent from the worktree has no
+        # content to scan — rather than letting a downstream `read_text` raise
+        # `FileNotFoundError` for a reason unrelated to citation drift (task
+        # 4971). The aggregate anti-vacuity guards still cover the case where
+        # the skew is large enough to matter.
+        if not path.is_file():
+            continue
         found.append(path)
     return sorted(found)
 
