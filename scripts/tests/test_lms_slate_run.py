@@ -635,3 +635,145 @@ def test_a_skip_says_which_part_it_is_reusing(tmp_path, two_arms, capsys):
     out = capsys.readouterr().out
     assert 'arm-one' in out
     assert str(path) in out
+
+
+# ---------------------------------------------------------------------------
+# the artifact is written by `lms_healthcheck --merge`, never by this driver
+#
+# `merge_reports`' manifest-coverage check is THE enforcement point against an
+# artifact assembled from a partial slate — it refuses by NAME ("arms [...]
+# carry no row ... would describe a NARROWER slate than the manifest
+# commissions while reading as a complete one") and writes nothing.  The driver
+# must route into it rather than pre-empting it, and must not be able to
+# bypass it.
+# ---------------------------------------------------------------------------
+
+
+def _merge_call(runner):
+    return next(a for a in runner.calls if _stage_key(a) == ('merge',))
+
+
+def test_the_sweep_ends_in_exactly_one_merge(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    merges = [a for a in runner.calls if _stage_key(a) == ('merge',)]
+    assert len(merges) == 1
+    assert runner.calls[-1] is merges[0]
+
+
+def test_the_merge_writes_the_artifact_and_the_driver_never_does(tmp_path, two_arms):
+    output = tmp_path / 'health-report.json'
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, output, runner=runner)
+
+    argv = _merge_call(runner)
+    assert argv[argv.index('--output') + 1] == str(output)
+    # The runner is a fake: nothing actually ran. If the artifact exists, the
+    # driver wrote it itself -- which is the fabrication this task must not do.
+    assert not output.exists()
+
+
+def test_the_driver_never_calls_merge_reports_as_a_library():
+    """`merge_reports`' `expected_arm_ids` parameter DEFAULTS TO None, which
+    SKIPS the coverage check entirely. A library call is one forgotten keyword
+    away from writing exactly the short artifact that must never exist, so the
+    binding is pinned ABSENT rather than merely unused.
+
+    Prose ABOUT `merge_reports` is deliberately still allowed — the module
+    explains why it shells out instead — so this asserts on the binding and the
+    call, not on the mention.
+    """
+    source = lms_slate_run.MODULE_PATH.read_text()
+
+    assert not hasattr(lms_slate_run, 'merge_reports')
+    assert 'merge_reports(' not in source
+
+
+def test_only_the_parts_that_exist_on_disk_are_passed_to_the_merge(tmp_path, two_arms):
+    """Passing a manifest-derived path that does not exist would route the
+    refusal through an OSError on a missing file. Passing only what exists
+    routes it through the coverage check, which names the uncovered arms."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    merged = argv[argv.index('--merge') + 1:argv.index('--output')]
+    assert merged == [str(parts_dir / 'arm-two.json')]
+
+
+def test_the_merged_parts_are_in_manifest_order(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    merged = argv[argv.index('--merge') + 1:argv.index('--output')]
+    assert merged == [str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json')]
+
+
+def test_a_partial_set_still_reaches_the_merge_rather_than_being_pre_empted(
+    tmp_path, two_arms,
+):
+    """The driver adds no coverage check of its own. A second check could
+    drift from the manifest and would then either block a legitimate merge or,
+    worse, permit a short artifact that reads as a complete slate."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner(codes={('merge',): 6})
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) in runner.stages()
+    assert code != 0
+
+
+def test_zero_parts_still_reaches_the_merge(tmp_path, two_arms):
+    """The all-arms-failed case. Skipping the merge here would end a totally
+    failed sweep with no refusal recorded anywhere."""
+    runner = _FakeRunner(
+        codes={('ctl', 'start', 'arm-one'): 4, ('ctl', 'start', 'arm-two'): 4,
+               ('merge',): 6},
+    )
+
+    code = lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    argv = _merge_call(runner)
+    assert argv[argv.index('--merge') + 1:argv.index('--output')] == []
+    assert code != 0
+
+
+def test_a_clean_sweep_and_a_clean_merge_return_zero(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two')
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    assert code == 0
+
+
+def test_a_failed_arm_makes_the_run_non_zero_even_when_the_merge_succeeds(
+    tmp_path, two_arms,
+):
+    """`--merge` can only judge the parts it was handed. An arm that failed
+    and left no part is invisible to a merge that happened to be given a
+    complete set from a previous run."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner(codes={('ctl', 'start', 'arm-one'): 4})
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert code != 0
