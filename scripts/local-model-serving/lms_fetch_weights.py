@@ -62,7 +62,25 @@ def resolve_hf_token(env: dict[str, str]) -> str:
     return token
 
 
-def _transient_unit_prefix(unit: str, setenv: list[str]) -> list[str]:
+def transient_unit_prefix(unit: str, setenv: list[str]) -> list[str]:
+    """The single authored source of this repo's PRD-hazard-11 compliant argv.
+
+    PUBLIC on purpose (task 4301).  The PRD binds long runs to transient
+    `systemd --user` units -- "Long runs in transient `systemd --user` units,
+    never bare background shells", hazard 11 of
+    `plans/local-memory-models-eval-prd.md` -- and every module that starts one
+    builds its argv HERE rather than authoring its own copy.  A second authored
+    copy is how the two flags a re-derivation most often drops (`--collect` and
+    `--working-directory`, both defended by the comments below) come back: one
+    copy gets fixed and the other quietly keeps the bug.
+
+    `systemd-run --user` propagates NONE of the caller's environment (measured
+    and recorded at orchestrator/src/orchestrator/proc_supervision.py:91-92), so
+    every variable the payload needs must arrive as an explicit `--setenv=K=V`
+    in *setenv*.  Anything unstated is silently ABSENT inside the unit -- not
+    empty, not inherited -- which is why callers pass an allowlist rather than
+    assuming the unit sees what they see.
+    """
     return [
         'systemd-run', '--user',
         # Reap the unit once it finishes so a re-run is not blocked by the
@@ -105,12 +123,12 @@ def fetch_argv(arm: ArmEntry, env: dict[str, str] | None = None) -> list[str]:
     else:
         setenv.append(f'--setenv=HF_HOME={HOST_HF_CACHE}')
 
-    return _transient_unit_prefix(fetch_unit_name(arm), setenv) + payload
+    return transient_unit_prefix(fetch_unit_name(arm), setenv) + payload
 
 
 def pull_image_argv(arm: ArmEntry) -> list[str]:
     """The transient-unit argv that pulls one arm's serving image."""
-    return _transient_unit_prefix(pull_unit_name(arm), []) + [
+    return transient_unit_prefix(pull_unit_name(arm), []) + [
         'docker', 'pull', image_ref(arm),
     ]
 
