@@ -1882,6 +1882,19 @@ class TestDeriveVerifyPlanFallbackPath:
         bare-default else-branch below it does — would misrepresent what
         actually executes.
 
+        The touched path is root-owning (``tests/`` carries no
+        ``pyproject.toml`` of its own), so ``_build_fallback_config`` would
+        reach this same config-verbatim branch for it too —
+        ``_single_subproject_prefix`` disqualifies ``tests/`` for lacking an
+        owning ``pyproject.toml``, so neither of its pure-/mixed-subproject
+        branches (which DO file/subproject-scope a real configured suite,
+        ahead of the verbatim branch in that function) intercepts it. A
+        subproject-owned path like ``shared/tests/...`` would NOT reach the
+        verbatim branch there, even though ``derive_verify_plan`` — pure and
+        worktree-blind — treats both identically; picking a path where the
+        two agree keeps this docstring's claim honest about what actually
+        executes.
+
         The parametrized sweep
         (``test_fallback_path_scoped_targets_nonempty_exactly_for_file_scoped_runs``,
         ids ``fallback/real-suite`` x ``collectable-test``) DOES execute this
@@ -1896,13 +1909,14 @@ class TestDeriveVerifyPlanFallbackPath:
         """
         config = OrchestratorConfig(project_root=Path('/fake'), test_command=ROOT_TEST_COMMAND)
         plan = derive_verify_plan(
-            ['shared/tests/test_widget.py'], [], config, fake_worktree_reader,
+            ['tests/test_widget.py'], [], config, fake_worktree_reader,
         )
         run = _run_for(plan, '__fallback__', 'pytest:')
         assert run is not None
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.scoped_targets == ()
         assert run.cmd == parse_config_command(config.test_command)
+        assert 'verbatim' in run.reason
 
 
 # ---------------------------------------------------------------------------
@@ -2515,16 +2529,11 @@ class TestPlanRecordScopedTargets:
         absent rather than inert: crossing it in would re-run each case five
         times under ids naming a dimension nothing reads.
 
-        Coverage boundary: the ``fallback/real-suite`` x ``collectable-test``
-        case DOES execute the ``collectable_tests`` + ``has_real_suite``
-        fidelity branch, but this sweep pins only the scope-consistency
-        invariant above — a regression to the pre-fix FILE_SCOPED
-        (with populated ``scoped_targets``) shape satisfies that invariant
-        too. The fidelity pin itself (exact command equality against the
-        unmodified parsed configured suite) lives in
+        Fidelity pin for the ``fallback/real-suite`` x ``collectable-test``
+        case (this sweep executes that branch but pins only the
+        scope-consistency invariant above) lives in
         ``TestDeriveVerifyPlanFallbackPath
-        .test_collectable_tests_with_configured_suite_run_verbatim_unscoped``,
-        not here.
+        .test_collectable_tests_with_configured_suite_run_verbatim_unscoped``.
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
