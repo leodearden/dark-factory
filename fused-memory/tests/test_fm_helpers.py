@@ -1328,6 +1328,63 @@ class TestRetryUntilObserved:
             f'expected exactly 3 observations with no reopen, got {log!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_attempts_one_degenerates_to_a_single_un_retried_observation(self):
+        """`attempts=1` observes exactly once, never reopens, and still raises on a miss.
+
+        That is EXACTLY the semantics of the un-retried single observation
+        this helper replaces at the live call site, which makes
+        retry_until_observed a strict generalisation of that code rather than
+        a behaviour change wearing a new name.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=1)
+
+        assert log == ['observe'], (
+            f'expected exactly one observation and no reopen, got {log!r}'
+        )
+
+    @pytest.mark.parametrize('bad_attempts', [0, -1])
+    @pytest.mark.asyncio
+    async def test_non_positive_attempts_raises_value_error_without_observing(self, bad_attempts):
+        """THE LOUD-OVER-SILENT GUARD: `attempts` < 1 is a ValueError, raised before any observation.
+
+        With a bare loop, `attempts=0` observes ZERO times and then raises the
+        ordinary exhaustion AssertionError -- a barrier that gated nothing
+        while reporting a plausible-looking failure. That is precisely the
+        silent-no-op class await_index_operational's empty-`result_set` note
+        already guards against in this same module.
+
+        ValueError, deliberately NOT AssertionError: a caller that catches the
+        exhaustion error to handle a genuine missed observation must not
+        swallow a mis-configuration with it. The zero-call assertion is what
+        proves the guard runs BEFORE the loop rather than being an
+        after-the-fact relabelling of the exhaustion path.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(ValueError, match='attempts'):
+            await retry_until_observed(observe, attempts=bad_attempts)
+
+        assert log == [], f'expected no observation at all, got {log!r}'
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
