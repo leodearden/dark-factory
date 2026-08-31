@@ -388,3 +388,93 @@ def test_the_helper_script_paths_are_the_sibling_modules():
     assert serving_dir / 'lms_healthcheck.py' == lms_slate_run.HEALTHCHECK_PATH
     assert lms_slate_run.CTL_PATH.exists()
     assert lms_slate_run.HEALTHCHECK_PATH.exists()
+
+
+# ---------------------------------------------------------------------------
+# a failed arm still releases the card
+#
+# This is what makes a ~30 minute sweep survivable.  `lms_ctl start` refuses
+# (exit 4) rather than evicting, so ONE arm left running by a failed
+# healthcheck poisons every arm after it: one bad arm becomes six spurious
+# refusals, and the operator reads a slate of failures that never happened.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_healthcheck_still_stops_its_arm(tmp_path, two_arms):
+    """Exit 8 is `EXIT_STALE_BASELINE` — the healthcheck wrote no file, so
+    nothing downstream will notice this arm unless the stop happens anyway."""
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'stop', 'arm-one') in runner.stages()
+
+
+def test_a_failing_arm_does_not_abandon_the_rest_of_the_sweep(tmp_path, two_arms):
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-two') in stages
+    assert ('healthcheck', 'arm-two') in stages
+
+
+def test_a_raising_healthcheck_still_stops_its_arm(tmp_path, two_arms):
+    """The guarantee is try/finally, not `if rc`.  A runner that RAISES —
+    OSError on a missing interpreter, a KeyboardInterrupt mid-sweep — must
+    still release the card, or the next run starts against a held one."""
+    runner = _FakeRunner(raises={('healthcheck', 'arm-one'): OSError('boom')})
+
+    with pytest.raises(OSError):
+        lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'stop', 'arm-one') in runner.stages()
+
+
+def test_an_arm_that_never_became_ready_is_not_probed_but_is_still_stopped(
+    tmp_path, two_arms,
+):
+    """Probing an arm that never came ready only produces a misleading FAIL
+    row: it would record "the model is broken" for a model that never loaded."""
+    runner = _FakeRunner(codes={('ctl', 'wait-ready', 'arm-one'): 1})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('healthcheck', 'arm-one') not in stages
+    assert ('ctl', 'stop', 'arm-one') in stages
+    assert ('ctl', 'start', 'arm-two') in stages
+
+
+def test_a_refused_start_is_not_waited_on_or_probed_but_is_still_stopped(
+    tmp_path, two_arms,
+):
+    """Exit 4 is `EXIT_ARM_REFUSED`: nothing was started. The stop is issued
+    anyway — it is idempotent, and skipping it here would make the guarantee
+    conditional on correctly guessing which failures left the card held."""
+    runner = _FakeRunner(codes={('ctl', 'start', 'arm-one'): 4})
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'wait-ready', 'arm-one') not in stages
+    assert ('healthcheck', 'arm-one') not in stages
+    assert ('ctl', 'stop', 'arm-one') in stages
+
+
+def test_per_arm_failures_are_collected_and_reported_by_arm_id(tmp_path, two_arms):
+    """A sweep that failed somewhere must say WHERE.  A bare non-zero exit
+    sends an operator back through 30 minutes of journal to find out which arm
+    and which stage."""
+    runner = _FakeRunner(codes={('healthcheck', 'arm-one'): 8})
+
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    assert failures == [('arm-one', 'healthcheck', 8)]
+
+
+def test_a_clean_sweep_collects_no_failures(tmp_path, two_arms):
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=_FakeRunner())
+
+    assert failures == []
