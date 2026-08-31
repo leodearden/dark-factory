@@ -1164,6 +1164,78 @@ class TestRetryUntilObserved:
         assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
         assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
 
+    @pytest.mark.asyncio
+    async def test_two_misses_then_an_observation_reopens_exactly_between_attempts(self):
+        """THE BEHAVIOUR THIS BARRIER EXISTS FOR: a missed window is RE-OPENED and observed again.
+
+        `observe` misses on attempts 1 and 2, then observes on attempt 3. The
+        ORDER assertion is the load-bearing one and is what call counts alone
+        cannot express:
+
+        * `reopen` is never called BEFORE the first attempt -- the caller has
+          already opened the window once, and re-opening first would silently
+          discard that opening and double the cost of the common case;
+        * `reopen` is called exactly ONCE BETWEEN attempts -- an extra
+          re-opening would leave the graph in a state the caller did not ask
+          for, and a missing one would re-observe a window that already closed.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected reopen to fire exactly once BETWEEN attempts and never '
+            f'before the first one, got {log!r}'
+        )
+        assert log.count('observe') == 3, f'expected exactly 3 observations, got {log!r}'
+        assert log.count('reopen') == 2, f'expected exactly 2 reopens, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_reopen_is_awaited_between_attempts(self):
+        """A coroutine-function `reopen` is awaited, matching the sync/async symmetry of `observe`.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is silently discarded, so a helper that failed to await would
+        still produce the right CALL ORDER while never actually re-opening the
+        window -- the log entry proves the coroutine BODY ran, not merely that
+        the callable was invoked.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        async def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        async def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected the awaited reopen to fire exactly once between attempts, got {log!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
