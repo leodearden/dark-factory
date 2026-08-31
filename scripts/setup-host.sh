@@ -880,6 +880,13 @@ fi
 # says so, which is the recoverable direction: stale but intact.
 _dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
+# Set to 1 only by the branch that actually rendered. The section's closing line
+# and the enable below are worded off it rather than printed unconditionally:
+# `fail` here is a printf, not an exit, so without this every degraded path
+# still reached a green "Dashboard units installed" — a line asserting exactly
+# what the FAIL lines above it had just denied.
+_dash_rendered=0
+
 if [ ! -f "$_dash_render_script" ]; then
   fail "Dashboard unit renderer missing: $_dash_render_script"
   fail "  NOT rendering it the old way — a plain template render would strip"
@@ -892,13 +899,15 @@ elif python3 "$_dash_render_script" \
        --repo-root "$REPO_ROOT" \
        --uv-path   "$UV_PATH" \
        --output    "$UNIT_DIR/dark-factory-dashboard.service"; then
+  _dash_rendered=1
   ok "Dashboard service unit rendered (host-local Environment= values preserved — see the [dashboard_unit_render] lines above)"
 else
   # The renderer RAN and refused. Without this branch the `elif` chain simply
-  # falls through with status 0 and says nothing — while the section's closing
-  # "Dashboard units installed" line still prints, which reads as confirmation
-  # that the unit was written. That is the same reports-green-because-it-never-
-  # ran failure the parity gate above exists to remove, one construct over.
+  # falls through with status 0 and says nothing about the unit that did not get
+  # written — the same reports-green-because-it-never-ran failure the parity
+  # gate above exists to remove, one construct over. Leaving `_dash_rendered` at
+  # 0 is the other half: it is what keeps the section's closing line from
+  # claiming the install happened.
   fail "Dashboard service unit render FAILED — see the [dashboard_unit_render]"
   fail "  report above for which step refused and why."
   fail "  $UNIT_DIR/dark-factory-dashboard.service was left UNTOUCHED: this"
@@ -914,9 +923,30 @@ cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.timer" "$UNIT_DIR/"
 
 systemctl --user daemon-reload
-systemctl --user enable dark-factory-dashboard
+# GUARDED on the unit existing, not on `_dash_rendered`: a failed render on a
+# host that already HAS the unit must still leave it enabled (stale but
+# supervised is the recoverable direction this whole construct chooses). The
+# combination the guard exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist is a non-zero exit,
+# and under this file's `set -e` that aborts the entire installer before the
+# watchdog TIMER is enabled and before every later section. The two branches
+# above promise "the watchdog units below still install"; this is what makes
+# that promise true rather than true-only-when-a-unit-was-already-there.
+if [ -f "$UNIT_DIR/dark-factory-dashboard.service" ]; then
+  systemctl --user enable dark-factory-dashboard
+else
+  fail "dark-factory-dashboard NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The watchdog timer below still is."
+fi
 systemctl --user enable dark-factory-dashboard-watchdog.timer
-ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+if [ "$_dash_rendered" = "1" ]; then
+  ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+else
+  warn "Dashboard watchdog units installed; the dashboard SERVICE unit was NOT"
+  warn "  rendered — see the FAIL lines above. Whatever copy this host already"
+  warn "  had is untouched and still enabled; a bare host has none."
+fi
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code skill symlinks

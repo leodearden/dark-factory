@@ -2353,11 +2353,20 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 
 # Anchored on the block's hoisted `_dash_parity_script=` assignment — CODE, and
 # unique to this site — so a reworded section comment cannot turn CI red for no
-# behavioural change. The end anchor is the install's own `ok` line, because
-# this slice must cover the render/cp/enable that FOLLOWS the gate: whether the
-# units still land is half of what these tests assert.
+# behavioural change. The slice must cover the render/cp/enable that FOLLOWS the
+# gate: whether the units still land is half of what these tests assert.
+#
+# THE END IS TWO ANCHORS, not one. The install's own `ok` line no longer ends
+# the section — it is now one branch of an `if [ "$_dash_rendered" = "1" ]`,
+# because a closing line that prints unconditionally asserted the install had
+# happened even on the paths that had just FAILED to render. Ending the slice at
+# that `ok` would therefore cut the section off inside the construct, and bash
+# would refuse the fragment for a missing `fi`. So the `ok` becomes `end_after`
+# — the "run THROUGH this" anchor slice_section already has for exactly this
+# shape — and the slice ends at the column-0 `fi` that closes it.
 _SECTION_8_START = "_dash_parity_script="
-_SECTION_8_END = 'ok "Dashboard units installed'
+_SECTION_8_END_AFTER = 'ok "Dashboard units installed'
+_SECTION_8_END = "\nfi\n"
 
 # The argparse-shaped stub: exit 2, usage-shaped stderr, and no
 # [dashboard_unit_parity] report — what renaming a flag would actually produce.
@@ -2428,7 +2437,9 @@ def _run_section_8(
     """Run the section-8 slice. UV_PATH is set upstream in the real script."""
     return run_section(
         tmp_path,
-        slice_section(_SECTION_8_START, _SECTION_8_END),
+        slice_section(
+            _SECTION_8_START, _SECTION_8_END, end_after=_SECTION_8_END_AFTER
+        ),
         repo_root=repo,
         unit_dir=unit_dir,
         env_extra={"UV_PATH": "/usr/bin/uv"},
@@ -2831,7 +2842,18 @@ def _assert_render_degraded_loudly(
         "dark-factory-dashboard",
         "dark-factory-dashboard-watchdog.timer",
     ], enabled_units(tmp_path)
-    assert "OK Dashboard units installed" in result.stdout, (
+
+    # 6. And the section's CLOSING line does not contradict all of the above.
+    #    It used to print `OK Dashboard units installed` unconditionally — the
+    #    one green line an operator scanning section 8 actually looks for,
+    #    asserting the install that the FAIL lines directly above it had just
+    #    said did not happen. Reaching the end of the section is still asserted;
+    #    what changed is that the line now reports which end it reached.
+    assert "OK Dashboard units installed" not in result.stdout, (
+        "The closing line still claims the units were installed after a render "
+        f"that did not happen.\n{result.stdout}"
+    )
+    assert "WARN Dashboard watchdog units installed" in result.stdout, (
         f"section 8 did not reach its closing line.\n{result.stdout}"
     )
 
@@ -2844,8 +2866,9 @@ def test_section_8_render_failure_leaves_the_installed_unit_intact(
     This is the `elif ...; then ok` construct's blind spot: with no else branch,
     a failing render falls out of the if-chain with status 0 and the operator is
     told nothing at all about the unit that did not get written — while the
-    section's closing "Dashboard units installed" line still prints, which reads
-    as confirmation that it did.
+    section's closing line, which used to print unconditionally, read as
+    confirmation that it did. Both halves are asserted by the helper: the
+    failure is reported, and the closing line no longer claims otherwise.
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
@@ -2880,6 +2903,51 @@ def test_section_8_missing_renderer_does_not_clobber_host_local_values(
     result = _run_section_8(tmp_path, repo, unit_dir)
 
     _assert_render_degraded_loudly(tmp_path, repo, unit_dir, before, result)
+
+
+def test_section_8_bare_host_with_a_failed_render_still_installs_the_watchdog(
+    tmp_path: pathlib.Path,
+):
+    """GREENFIELD plus a failed render — the case both other degradation tests miss.
+
+    They each SEED an existing dashboard unit, so `systemctl --user enable
+    dark-factory-dashboard` always had a unit to name. On a BARE host with no
+    render there is none, and the real `systemctl` exits non-zero for a unit
+    that does not exist — which, under setup-host.sh's `set -euo pipefail`,
+    aborts the whole installer before the watchdog TIMER is enabled and before
+    every later section. That is the opposite of what both failure branches
+    promise ("The watchdog units below still install"), and it was reachable
+    only after the render stopped being a `sed >` that always produced a file.
+
+    The harness `systemctl` stub exits 0 for everything, so this cannot assert
+    the abort directly — it asserts the GUARD, which is the part that is ours:
+    the installer does not ask systemd to enable a unit that is not there, and
+    the timer is enabled regardless. Both are visible in the recorded argv.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+        _FAILING_RENDERER, encoding="utf-8"
+    )
+    unit_dir = tmp_path / "bare-unit-dir"
+    unit_dir.mkdir()
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert not (unit_dir / _DASHBOARD_SERVICE).exists(), (
+        "a failed render must not leave a dashboard unit behind"
+    )
+    # The watchdog supervision lands, which is the whole promise.
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        assert (unit_dir / name).is_file(), f"{name} was not copied"
+    assert enabled_units(tmp_path) == ["dark-factory-dashboard-watchdog.timer"], (
+        enabled_units(tmp_path)
+    )
+    assert "FAIL dark-factory-dashboard NOT enabled" in result.stdout, (
+        f"the skipped enable must be reported, not silent.\n{result.stdout}"
+    )
+    assert "OK Dashboard units installed" not in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
