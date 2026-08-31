@@ -1444,6 +1444,18 @@ class TestDeclaredReferentsEndToEnd:
     Each case is one row of the PRD's own table, in the order that table
     states them, so a reader can check the implementation against the spec by
     reading the ids.
+
+    `add_memory` carries the full table because it is the tool with all three
+    rungs live (declared > metadata > derived). `add_episode` gets the two rows
+    that are not merely a repeat of a seam test: the accepted declaration and
+    the rejected one. Those two are what the between-the-seams gap can actually
+    hide — a `declared_referents` kwarg the tool forwards under a name the
+    producer no longer reads would leave BOTH seam suites green (each asserts
+    its own side of the name) and land the write stamped `derived` in silence,
+    and a gate whose block the tool returns while still enqueueing is invisible
+    to a return-value assertion. The rungs BELOW tier 1 are deliberately not
+    repeated here: `add_episode` persists no metadata, so its metadata rung is
+    structurally dead and is pinned as such at the producer.
     """
 
     @pytest.fixture
@@ -1548,3 +1560,57 @@ class TestDeclaredReferentsEndToEnd:
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
         }
+
+    @pytest.mark.asyncio
+    async def test_add_episode_declared_and_corroborated_lands_as_declared(
+        self, server, service,
+    ):
+        """The same accepted-declaration row, through the OTHER write tool.
+
+        PRD Open Question 3 was resolved by giving both tools `entities` in one
+        leaf on the grounds that their gate stacks do not diverge. That claim
+        is only checkable end to end: the seam tests assert the tool forwards
+        `declared_referents` and (separately) that the producer stamps what it
+        is handed, and neither can see the hop between them.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'entities': [{'kind': 'task', 'id': 3127}],
+            },
+        )
+
+        assert 'error' not in result, f'the episode was blocked: {result!r}'
+        assert service.durable_queue.enqueue.call_count == 1, (
+            f'{service.durable_queue.enqueue.call_args_list!r}'
+        )
+        assert self._referents(service) == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_add_episode_headline_conflict_enqueues_nothing_at_all(
+        self, server, service,
+    ):
+        """The rejection's payoff at `add_episode`, where it is worth strictly
+        more than at `add_memory`: an ingested episode runs Graphiti's full
+        extraction, so a misattributed one deposits edges nobody declared. The
+        block alone does not prove that did not happen — only the absence of an
+        enqueue does.
+        """
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the fix for Task 3127 landed',
+                'project_id': 'dark_factory',
+                'entities': [{'kind': 'task', 'id': 3129}],
+            },
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        assert result.get('conflicts') == ['Task 3129'], f'{result!r}'
+        assert result.get('content_referents') == ['Task 3127'], f'{result!r}'
+        service.durable_queue.enqueue.assert_not_called()
