@@ -1184,6 +1184,18 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     )
 
 
+@pytest.mark.timeout(120)  # task 4203 review remediation: the ONLY marker-carrying test
+# in this module composing NO _run_lane pass -- its whole bounded term is
+# _assert_never_a_gate's _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS =
+# 15.5s. Out-of-bound term = 21 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (the repo fixture
+# AND the fresh _setup_repo measured against below -- the only doubled fixture term in
+# either module), plus _SPAWNS_PER_DRIVE_ADVANCE (4) and _SPAWNS_PER_ASSERT_NEVER_A_GATE
+# (7); 21 x _MEASURED_SPAWN_LATENCY_SECS = 98.91s, required = 114.41s. 120 is the next
+# multiple of the 60s pyproject grid at or above that -- the same rule that derived b7's
+# 360 (see _required_timeout_secs' docstring for the model). Unlike a hand-maintained
+# comment this value is ENFORCED: this test now has its own row in
+# test_every_composing_caller_carries_a_timeout_override, which fails if the marker ever
+# drops below required.
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
@@ -1210,13 +1222,19 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     `_assert_never_a_gate` accepts a `runner` argument but never reads it in
     its own body (the parameter only documents an already-satisfied
     precondition of its real caller) — its git-spawn count is therefore
-    unaffected by whether a pass is actually held in flight. Composing an
-    actual `_run_lane` pass here would also wrongly register THIS test in
-    `_lane_pass_composing_callers`' AST net (it scans for literal calls to
-    `_run_lane` / `_run_one_lane_pass` / `_drive_reds` by name), forcing it
-    into `worst_case_secs` and a `@pytest.mark.timeout` override it does not
-    need — this test's own real-git footprint stays the marker-less shape
-    the docstring below describes.
+    unaffected by whether a pass is actually held in flight. Composing a real
+    pass here would only add a further `_LANE_PASS_BOUND_SECS` of bounded wait
+    plus its in-window spawns, for zero additional measurement value.
+
+    (An earlier revision justified that choice differently — a real pass
+    "would also wrongly register THIS test in `_lane_pass_composing_callers`'
+    AST net, forcing it into `worst_case_secs` and a `@pytest.mark.timeout`
+    override it does not need". That reasoning inverted once the reviewer
+    amendment added the `_assert_never_a_gate` measurement: THAT helper is
+    itself in `_LANE_PASS_COMPOSING_HELPER_NAMES`, so this test is already in
+    the net, already classified in `worst_case_secs`, and does need the
+    override it now carries. The decision survives on the reason above; only
+    its justification changed.)
 
     SEAM VERIFICATION (must hold before a single monkeypatch target can be
     trusted to observe every spawn): this module does ``from
@@ -1255,15 +1273,19 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     model silently mispricing every composing test that calls
     `_drive_advance` (directly or via `_drive_reds`).
 
-    No `@pytest.mark.timeout` override: this test has zero bounded waits,
-    and its real-git footprint (one `_drive_advance` plus one fresh
-    `_setup_repo`, on top of the `repo` fixture's own `_setup_repo`) is the
-    same real-git shape — fixture plus a handful of git spawns — the
-    marker-less B1/B4/B6 tests already carry unmarked; see this module's
-    `_MARKERLESS_CEILING_FRACTION` comment and
-    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`'s own
-    docstring for why that shape is accepted for the marker-less population
-    as a whole rather than gated per-test.
+    CARRIES `@pytest.mark.timeout(120)` — it is NOT marker-less. An earlier
+    revision of this paragraph claimed this test had "zero bounded waits" and
+    the same real-git shape the marker-less B1/B4/B6 tests carry unmarked.
+    The reviewer amendment that added the `_assert_never_a_gate` measurement
+    above falsified BOTH clauses: that helper composes 15.5s of bounded waits
+    (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`), and at
+    21 out-of-bound spawns this test does ~2.3x the real-git work of a
+    B1/B4/B6 test (9 each: the `repo` fixture plus one `_drive_advance`).
+    `_required_timeout_secs` puts the requirement at 114.41s — nearly twice
+    the 60s pyproject default this test would otherwise have run under. See
+    the marker comment above for the worked derivation; the value is enforced
+    by `test_every_composing_caller_carries_a_timeout_override`'s row for
+    this test, not by this prose.
     """
     import orchestrator.git_ops as git_ops_mod
 
