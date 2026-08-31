@@ -150,6 +150,17 @@ def slate_argv(
 # ---------------------------------------------------------------------------
 
 
+def part_path(parts_dir: str | Path, arm_id: str) -> Path:
+    """Where one arm's report part lives.
+
+    A "part" is not a distinct format: it is a full `HealthReport` JSON whose
+    `arms` list holds exactly one row, which is what
+    `lms_healthcheck --arm X --output p` already writes.  Reusing that shape
+    means the resume unit and the `--merge` input are the same file.
+    """
+    return Path(parts_dir) / f'{arm_id}.json'
+
+
 def ctl_argv(verb: str, arm_id: str, *extra: str) -> list[str]:
     """One `lms_ctl.py` invocation.
 
@@ -168,14 +179,18 @@ def healthcheck_argv(*args: str) -> list[str]:
     return [sys.executable, str(HEALTHCHECK_PATH), *args]
 
 
-def run_slate(
+def sweep_arms(
     parts_dir: str | Path,
-    output: str | Path,
     *,
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> int:
+) -> list[tuple[str, str, int]]:
     """Sweep every arm the manifest commissions, one at a time.
+
+    Returns the per-arm failures as `(arm_id, stage, returncode)` rather than
+    raising on the first one: the loop must reach every arm, and a bare
+    non-zero exit would send an operator back through ~30 minutes of journal to
+    find out which arm and which stage.
 
     Arm order and identity come from `load_arms().arms`, never a hardcoded
     list, so an eighth arm added to `arms.yaml` is swept without touching this
@@ -184,22 +199,67 @@ def run_slate(
     *runner* is the seam that keeps the tests offline: it defaults to
     `subprocess.run` and is injected as a recorder in `test_lms_slate_run.py`,
     so no test can start an arm or touch the card.
-
-    *output* is the slate artifact path.  It is not written here -- the merge
-    step that consumes it lands in a later commit, and even then it is
-    `lms_healthcheck --merge` that writes, never this module.
     """
     parts = Path(parts_dir)
     parts.mkdir(parents=True, exist_ok=True)
+    failures: list[tuple[str, str, int]] = []
 
     for arm in load_arms().arms:
         print(f'\n=== {arm.arm_id} ===', flush=True)
-        runner(ctl_argv('start', arm.arm_id))
-        runner(ctl_argv('wait-ready', arm.arm_id, '--timeout', str(ready_timeout)))
-        runner(healthcheck_argv(
-            '--arm', arm.arm_id,
-            '--output', str(parts / f'{arm.arm_id}.json'),
-        ))
-        runner(ctl_argv('stop', arm.arm_id))
+        try:
+            started = runner(ctl_argv('start', arm.arm_id)).returncode
+            if started:
+                failures.append((arm.arm_id, 'start', started))
+                continue
 
+            ready = runner(ctl_argv(
+                'wait-ready', arm.arm_id, '--timeout', str(ready_timeout),
+            )).returncode
+            if ready:
+                # Deliberately NOT probed.  A healthcheck against an arm that
+                # never came ready records a FAIL row blaming the model for
+                # never having loaded, which is worse than the absent row a
+                # skip leaves -- an absent row is what `merge_reports`'
+                # coverage check refuses on, loudly and by name.
+                failures.append((arm.arm_id, 'wait-ready', ready))
+                continue
+
+            probed = runner(healthcheck_argv(
+                '--arm', arm.arm_id,
+                '--output', str(part_path(parts, arm.arm_id)),
+            )).returncode
+            if probed:
+                failures.append((arm.arm_id, 'healthcheck', probed))
+        finally:
+            # try/FINALLY, not `if rc`.  `lms_ctl start` is exclusive by
+            # default and REFUSES (exit 4) when a sibling holds the card
+            # instead of evicting it, so ONE arm left running poisons every
+            # arm after it: one bad arm becomes six spurious refusals.  The
+            # release therefore cannot be conditional on correctly guessing
+            # which failures left the card held -- including the raising
+            # kind (a missing interpreter, a KeyboardInterrupt mid-sweep).
+            #
+            # `stop` deliberately leaves this arm's VRAM baseline file behind.
+            # Per-arm baselines accumulate in the runtime dir by design, and
+            # the merge reads REPORTS, not baselines.
+            runner(ctl_argv('stop', arm.arm_id))
+
+    return failures
+
+
+def run_slate(
+    parts_dir: str | Path,
+    output: str | Path,
+    *,
+    ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> int:
+    """Sweep the slate, then assemble the artifact from the parts it produced.
+
+    *output* is the slate artifact path.  It is never written by this module --
+    see the merge step for why that separation is load-bearing.
+    """
+    failures = sweep_arms(parts_dir, ready_timeout=ready_timeout, runner=runner)
+    for arm_id, stage, code in failures:
+        print(f'lms_slate_run: {arm_id}: {stage} failed (exit {code})', file=sys.stderr)
     return 0
