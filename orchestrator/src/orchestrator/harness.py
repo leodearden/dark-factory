@@ -3529,7 +3529,14 @@ class Harness:
 
         Totally fail-safe (I3): every ambiguous or broken input degrades to a
         non-empty (ineligible) set so the caller falls back to a fresh
-        dispatch — this method NEVER raises.
+        dispatch — this method NEVER raises. A *session* that is not a dict at
+        all (a sidecar that parsed as JSON but is not an object) is a STATED
+        case of that contract, not an accident of branch order: it returns
+        ``{'stale', 'no_transcript'}`` from an explicit guard, so the claim
+        above is backed by a visible branch a future edit cannot silently
+        remove. ``_adopt_recovered_session`` rejects such a sidecar before it
+        can reach here; the two guards are deliberate belt-and-braces —
+        adoption is the reachability boundary, this is the contract.
 
         The reason VOCABULARY, each leg independent of the others:
           - 'disabled'      — the session_resume kill switch is off (B6). The
@@ -3568,6 +3575,29 @@ class Harness:
         cfg = self.config.session_resume
         if not cfg.enabled:
             return frozenset({'disabled'})  # the feature, not the session
+        if not isinstance(session, dict):
+            # A sidecar that parsed as JSON but is not an object is not a
+            # session: fail-safe ineligible, and BY-DESIGN so one corrupt file
+            # cannot page an operator through the INV-4 storm escape.
+            #
+            # EXPLICIT, not emergent. The predecessor
+            # `_session_resume_eligible` was total for this input only by
+            # ACCIDENT of first-match ordering: `session['started_at']` raised
+            # TypeError into the freshness leg's own `except` and returned
+            # early, before any `.get` ran. A composite predicate does not
+            # return early by construction, so it cannot inherit that accident
+            # — without this branch the cap leg's `session.get(...)` raises
+            # AttributeError straight through the I3 contract above.
+            #
+            # {'stale', 'no_transcript'} rather than a new token: both are
+            # already in `_BY_DESIGN_SESSION_RESUME_REASONS`, so the reason
+            # VOCABULARY stays closed (the structural test asserting the
+            # constant covers exactly what this method can produce needs no
+            # re-classification) and a corrupt sidecar degrades to a quiet,
+            # telemetry-carrying fresh dispatch. Both are also true of it on
+            # their own terms: nothing dates the session and nothing
+            # corroborates it.
+            return frozenset({'stale', 'no_transcript'})
         reasons: set[str] = set()
         # Freshness — any parse failure or absent started_at is 'stale'.
         try:
