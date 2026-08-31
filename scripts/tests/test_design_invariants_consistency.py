@@ -502,10 +502,29 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
     add 339 such files back).
     """
     pathspecs = [f"*{suffix}" for suffix in suffixes]
-    listing = subprocess.run(
-        ["git", "ls-files", "-z", "--", *pathspecs],
-        cwd=root, capture_output=True, text=True, check=True, timeout=60,
-    ).stdout
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z", "--", *pathspecs],
+            cwd=root, capture_output=True, text=True, check=True, timeout=60,
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        # No filesystem-walk fallback here, ever (task 4971): this walker's
+        # entire purpose is that a scan's verdict comes from TRACKED files
+        # only, never from local working-tree state — falling back to
+        # `os.walk` on a failed oracle would silently restore the exact
+        # incident this task fixed, in precisely the situation nobody is
+        # watching for it (`no-silent-fail-soft`). A bare
+        # `CalledProcessError` is not enough either: it carries git's terse
+        # stderr but names neither the root nor the contract
+        # (`structured-facts-at-failure`).
+        raise RuntimeError(
+            f"the tracked-file scan of {root} failed (task 4971): `git ls-files -z "
+            f"-- {' '.join(pathspecs)}` exited {exc.returncode} — "
+            f"{exc.stderr.strip() if exc.stderr else '(no stderr)'}. This walker "
+            f"sources every scan from TRACKED files only, by design, so {root} must "
+            f"be a git repository (or a subdirectory of one) for the scan to run at "
+            f"all — there is no filesystem-walk fallback."
+        ) from exc
 
     found: list[Path] = []
     for relative in listing.split("\0"):
