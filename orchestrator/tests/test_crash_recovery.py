@@ -1955,6 +1955,69 @@ class TestSessionResumeReasons:
         assert 'no_transcript' in reasons
         assert 'reseeded' not in reasons
 
+    @pytest.mark.parametrize(
+        'bad_session',
+        [['a'], 'str', 7, 3.5, True, [], ()],
+        ids=['list', 'str', 'int', 'float', 'bool', 'empty-list', 'tuple'],
+    )
+    def test_non_dict_session_is_total_and_stays_by_design(
+        self, harness: Harness, tmp_path: Path, bad_session
+    ):
+        """(f3) I3 totality for a sidecar that PARSED as JSON but is not an
+        OBJECT — a truncated/garbage ``agent_session.json`` holding ``[]``,
+        ``"str"`` or ``7``.
+
+        The predecessor ``_session_resume_eligible`` was total for this input
+        only by ACCIDENT of first-match ordering: ``session['started_at']``
+        raised ``TypeError`` straight into the freshness leg's own ``except``,
+        which returned ``(False, 'stale')`` before any ``.get`` ran. A
+        composite predicate does not return early by construction, so it
+        cannot inherit that accident — it falls through to
+        ``session.get('resume_count', 0)`` and raises ``AttributeError``,
+        contradicting the docstring's "this method NEVER raises".
+
+        Four properties, because "does not raise" alone would be satisfied by
+        a spurious eligibility:
+          - NON-EMPTY, so the caller degrades to a fresh dispatch rather than
+            resuming a corrupt session;
+          - a ``frozenset`` of ``str``, the declared return shape;
+          - a SUBSET of the by-design vocabulary, so one corrupt sidecar can
+            never feed the INV-4 storm streak and page an operator.
+        """
+        from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
+
+        harness.config.session_resume = SessionResumeConfig()
+
+        reasons = harness._session_resume_reasons(bad_session, str(tmp_path))
+
+        assert isinstance(reasons, frozenset)
+        assert all(isinstance(r, str) for r in reasons)
+        assert reasons, (
+            'a non-dict session must be INELIGIBLE (non-empty reasons): the '
+            'empty set is the eligibility predicate, so returning it here '
+            'would resume a corrupt sidecar'
+        )
+        assert reasons <= _BY_DESIGN_SESSION_RESUME_REASONS, (
+            f'a corrupt sidecar reported {sorted(reasons)}, which escapes '
+            '_BY_DESIGN_SESSION_RESUME_REASONS and would therefore feed the '
+            'fallback-storm streak — one garbage file must not page an operator'
+        )
+
+    def test_disabled_still_wins_over_a_non_dict_session(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(f4) The kill switch short-circuits BEFORE the non-dict degradation.
+
+        Pins the guard's placement — after ``enabled``, before the freshness
+        leg — executably, so D2's "'disabled' is returned ALONE" exemption
+        cannot silently widen into a mixed set when the session is garbage.
+        """
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+
+        reasons = harness._session_resume_reasons(['a'], str(tmp_path))
+
+        assert reasons == frozenset({'disabled'})
+
 
 @pytest.mark.asyncio
 class TestSessionResumeGuard:
