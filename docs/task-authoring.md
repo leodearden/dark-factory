@@ -1323,9 +1323,13 @@ apparent enum is not the thing writers are actually held to.
 
 Two `unknown_key` sources are known, measured, and deliberately left
 open. They are recorded here so the next reader does not re-measure them.
-All counts are a snapshot of a **growing** corpus (4204 tasks carried dict
-metadata at the latest measurement, up from 3553 when this section was
-first written), not an invariant.
+All counts are a snapshot of a **growing** corpus, not an invariant: 4748
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
+first written. Across that corpus 1516 tasks emit at least one
+`unknown_key` line, 3130 lines over 1028 distinct spellings. The *per-gap*
+counts in the table below are still the 2026-08-18 figures and were **not**
+re-measured — only the corpus total was.
 
 | Gap | Measured | Owner |
 |---|---|---|
@@ -1343,6 +1347,43 @@ convention" above. See the frozenset entry in
 **Semantics** (what the key actually does at submit): §4's
 "`execution_class` routes to a HUMAN" subsection — blessing changed the
 key's census standing, not its dispatch consequence.
+
+**`related_tasks` was never a row here, and is now CLOSED** — task 4303
+blessed it into Tier-A. Recorded in the same shape as the
+`execution_class` row above so a reader arriving from an older revision
+does not re-open the fork: it was **decided, not deferred**. It was the
+largest single `unknown_key` contributor in the corpus and, unusually, the
+*canonical* Tier-B spelling §8 tells authors to migrate toward — so
+following the documentation still minted a census line. Blessing rather
+than retiring, in one line: it is the documented migration target for three
+live aliases, it is corpus-dominant on the `esc-3796-1` precedent, and
+retirement is structurally blocked today because ~70% of its carriers hold
+`done_provenance` and are unwritable under the floor described below —
+sweeping only the writable remainder is the same "fifth of the benefit"
+vocabulary fork ruled out for task 4302 just below. See the frozenset entry
+in `shared/src/shared/task_metadata.py` for the census, the value-shape
+split and the (negative) reader verdict; they are deliberately not restated
+here. **Operator consequence:**
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` now refuses
+`related_tasks` as a Tier-A blessed key (`--force` overrides).
+
+**`delivered_checks` is NOT a census leak — it is a measurement artifact,**
+and it is recorded here precisely so the next census-runner does not
+re-derive it. A raw census will show it near the top (313 tasks on
+2026-08-31), but `delivered_checks` is a **registered submodel**
+(`shared/src/shared/capability_manifest.py`), and registration happens as
+an **import-order side effect**. A standalone script that never imported
+`shared.capability_manifest` therefore counts it as unknown. The live write
+path *does* reach the registration —
+`fused-memory/src/fused_memory/server/tools.py` imports
+`fused_memory.server.manifest_stamping`, which imports
+`shared.capability_manifest` at module level — so no real write emits the
+warning and there is nothing to fix. Measured both ways: with the module
+imported, `parse_metadata({'delivered_checks': []})` emits zero warnings.
+**Operational corollary, and it generalises beyond this key:** anyone
+re-running a task-metadata census must import the submodel registrations
+first, or they will measure phantom leaks. The corpus totals quoted above
+were measured with them imported.
 
 **The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
 a ~30-task metadata rewrite has a very different blast radius from one
