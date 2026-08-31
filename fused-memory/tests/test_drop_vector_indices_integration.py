@@ -276,14 +276,22 @@ class TestDropVectorIndicesLive:
 async def bulk_vector_graph():
     """Seed a throwaway 10,000-node graph with a mixed VECTOR+RANGE Entity index.
 
-    Backs TestDropRebuildWindow below — see its docstring for the measurement
-    that justifies 10,000 as the seed size now that the class polls for the
-    phantom instead of requiring it on a single un-polled read. 1,000 was
-    tried first and rejected: re-measured empirically (task 4748 amendment
-    pass, loadavg ~185 on 32 cores) at only 12/15 phantom sightings even WITH
-    polling, i.e. the window can fail to open at all at that size, which no
-    poll interval can fix. 10,000 measured 25/25 in the same conditions,
-    every one on the very first post-drop read. The mixed index
+    Backs TestDropRebuildWindow below — see its docstring for the measurements
+    that justify 10,000 as the seed size. 1,000 was tried first and rejected:
+    re-measured empirically (task 4748 amendment pass, loadavg ~185 on 32
+    cores) at only 12/15 phantom sightings even WITH polling, i.e. the window
+    can fail to open at all at that size, which no poll interval can fix.
+    50,000 was rejected too — it makes the window near-certain but costs
+    8.5-9.2s to build UNCONTENDED against a measured 10-17x contention
+    multiplier, trading an observation flake for a barrier-timeout flake.
+
+    10,000 is NOT a size at which the window always opens, and the claim that
+    it "measured 25/25 ... every one on the very first post-drop read" is
+    RETRACTED by task 4972: that batch was taken at normal scheduling
+    priority, and under the offline lane's own ``nice -n 19 ionice -c3``
+    the first-attempt rate is 28/30 = 93.3%. What makes 10,000 the right size
+    is that the class RE-OPENS the window up to five times rather than
+    needing it on one try, which keeps the happy path at ~1.4s. The mixed index
     (``name_embedding`` VECTOR merged with ``name`` RANGE, both on
     ``:Entity``) is what makes the class's ``DROP VECTOR INDEX`` a REBUILD
     rather than a removal: FalkorDB keeps the label's index record alive to
@@ -433,22 +441,36 @@ async def _reopen_rebuild_window(graph) -> None:
 # AssertionError well inside 150.
 @pytest.mark.timeout(150)
 class TestDropRebuildWindow:
-    """PREMISE PIN for the post-DROP rebuild window — task 4748.
+    """PREMISE PIN for the post-DROP rebuild window — task 4748, de-flaked by task 4972.
 
     This is NOT a red-first TDD test; it is expected to PASS on introduction.
-    A timing race cannot be reliably RED-tested: at small seed sizes the
-    phantom this test pins only shows up in a fraction of single-shot reads
-    (see the measurement table below), so a test built to fail without the
-    fix would itself be a new flake — the exact defect this task removes.
-    This mirrors test_list_indices_integration.py::TestCallDbIndexesOverRoQuery
+    A timing race cannot be reliably RED-tested: the phantom this test pins
+    only shows up in a fraction of single-shot reads (see the measurements
+    below), so a test built to fail without the fix would itself be a new
+    flake — the exact defect task 4972 removed from this very test. This
+    mirrors test_list_indices_integration.py::TestCallDbIndexesOverRoQuery
     .test_db_indexes_result_shape_matches_the_barriers_assumptions (task
     3377's build-side pin), which rejects the same idea for the same reason.
+    What makes "expected to PASS" actually TRUE is not that the window is
+    certain to open — it is not — but that the window is RE-OPENED up to five
+    times and observed each time, and that exhausting all five still raises
+    loudly (see ``retry_until_observed`` and ``_reopen_rebuild_window``).
 
-    Its durable job: fail loudly if a future FalkorDB upgrade either (a)
-    removes the drop-side rebuild transient that every barrier task 4748 added
-    exists to close — making them dead weight — or (b) changes the column
-    names or the exact 'OPERATIONAL' ready sentinel await_index_operational
-    depends on.
+    Its TWO durable jobs, both preserved by the retry:
+
+    (a) fail loudly if a future FalkorDB upgrade removes the drop-side
+        rebuild transient that every barrier task 4748 added exists to close,
+        making them dead weight. Bounded retry is what keeps this job alive:
+        the END STATE alone cannot tell "rebuilt too fast to see" from "no
+        longer rebuilds asynchronously" — both land on one Entity row with no
+        VECTOR — but five independent openings all failing to show the
+        transient is strong evidence it is genuinely gone, and that still
+        raises rather than passing quietly;
+    (b) fail loudly if it changes the column names or the exact
+        'OPERATIONAL' ready sentinel await_index_operational depends on. This
+        job is why ``_observe_phantom_window`` narrows its catch to
+        poll_until's own timeout string instead of swallowing every
+        AssertionError as a miss.
 
     MEASURED (task 4748, nice -n 19, loadavg ~96 on 32 cores, FalkorDB module
     v41800): after ``DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)``
@@ -467,21 +489,61 @@ class TestDropRebuildWindow:
         50,000     7/7                        0.21-0.75s
         200,000    3/3                        ~0.73s
 
-    A single un-polled read is only deterministic at 50,000+ nodes, which is
-    why bulk_vector_graph originally seeded that many. Polling for the
-    phantom within a bounded deadline (below) removes the single-shot timing
-    dependence, but does NOT make the window open on every trial at every
-    seed size -- re-measured directly (task 4748 amendment pass, loadavg
-    ~185 on 32 cores, 15 trials/size): 1,000 nodes hit only 12/15 (80%) even
-    WITH a 5ms-interval/5s-deadline poll, because on a miss the window never
-    opened at all rather than merely being hard to catch -- no poll interval
-    fixes an absent window. 10,000 nodes hit 25/25 (2 batches), every single
-    time on the very first post-drop read. That is why bulk_vector_graph
-    seeds 10,000 nodes, not the 1,000 a first pass at this fix tried: it is
-    still ~3-6x cheaper to seed and build than 50,000 (1.3-2.8s vs
-    8.5-9.2s) while being the smallest size this task could empirically
-    confirm never drops the phantom. A stuck poll still raises loudly at its
-    deadline; it does not silently pass.
+    RETRACTED (task 4972). This docstring used to claim 10,000 nodes measured
+    "25/25 ... every one on the very first post-drop read", and concluded
+    that 10,000 was "the smallest size this task could empirically confirm
+    never drops the phantom". Both are wrong, and the second is what made
+    this test a ~7% flake in the offline lane. Re-measured under the lane's
+    ACTUAL conditions — ``DF_VERIFY_ROLE=offline nice -n 19 ionice -c3``,
+    serial (``-p no:xdist -o addopts=``), loadavg ~92-471 on 32 cores — the
+    FIRST-attempt observation rate at 10,000 nodes is 28/30 = 93.3%, with a
+    second 8-trial batch at 6/8. The original 25/25 was taken at NORMAL
+    scheduling priority, and that still reproduces (20/20 serial, un-niced).
+    It is the NICENESS, not the seed size, that exposes the race.
+
+    THE MECHANISM, stated as the measurement it is. On a miss the window is
+    not merely hard to catch — it never opens at all. The first post-DROP
+    read, taken 6.8 ms after ``DROP`` returned, already showed ONE Entity
+    row, already ``'OPERATIONAL'``, and it stayed that way across all 167
+    polls of a 5 s deadline; the ``DROP`` round-trip on that trial was
+    49.7 ms against 0.6-35 ms typical. FalkorDB had completed the merged-index
+    rebuild INSIDE the ``DROP`` call. This EXTENDS rather than contradicts
+    the principle this docstring already stated correctly — "no poll interval
+    fixes an absent window". What was wrong was inferring from it that a
+    large enough seed makes the window CERTAIN. The only lever that acts on
+    an absent window is to open a new one.
+
+    WHY SEED SIZE IS NOT THE LEVER, so a future reader does not retry it.
+    50,000 nodes does widen the window to 0.21-0.75s, far past any client
+    scheduling jitter — but it costs 8.5-9.2s to build UNCONTENDED, against a
+    measured 10-17x contention multiplier on the 10,000-node build (1.3s
+    serial vs 2.87-24.45s under 16-way FalkorDB contention). At 50,000 that
+    projects well past any sane barrier budget or pytest timeout, trading a
+    ~7% observation flake for a barrier-timeout flake plus the
+    ``os._exit(1)`` xdist-worker kill that ``timeout_method='thread'`` ends
+    in. Retrying at 10,000 keeps the happy path at ~1.4s and pays only on a
+    miss. 1,000 nodes is likewise rejected: 12/15 (80%) even WITH a
+    5ms-interval/5s-deadline poll.
+
+    VALIDATION of the task-4972 fix, all on this branch, FalkorDB module
+    v41800, 32 cores:
+
+    * pre-fix baseline, lane conditions, loadavg 141-471: 13/15 — the two
+      failures both reported ``last saw [({'name': ['RANGE']},
+      'OPERATIONAL')]``, i.e. exactly the absent-window signature above;
+    * post-fix, same command, 30 consecutive trials at loadavg ~143:
+      30/30, in-test wall time 2.73s min / 3.34s median / 7.64s max (the max
+      is a trial that paid the retry);
+    * the re-open path probed directly, 10 trials: the window was observed
+      10/10 on the first attempt, 10/10 after re-open #1 and 10/10 after
+      re-open #2 (30/30 per-attempt), proving a RE-OPENED window is caught as
+      reliably as the original rather than the re-open merely burning budget.
+      Re-open cost 1.12-1.42s, median 1.27s;
+    * the lane's exact confirmation command
+      (``DF_VERIFY_ROLE=offline nice -n 19 ionice -c3 pytest -m integration
+      -p no:xdist -o addopts= -q``): 61 passed in 130.06s;
+    * the default parallel run (``pytest -m integration``, ``-n auto --dist
+      loadgroup``): 61 passed in 89.58s.
     """
 
     @pytest.mark.asyncio
