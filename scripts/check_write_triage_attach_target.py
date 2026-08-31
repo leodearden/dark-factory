@@ -90,10 +90,24 @@ _NONCE_IDS = ('probe-nonce-alpha-9f13', 'probe-nonce-beta-4c07')
 #: from free-text diagnostics that happens to be interpolated — the name is the
 #: only thing separating them. Target-named parameters are also tried FIRST, so
 #: a module carrying both reaches the real one.
-_TARGET_NAME_RE = re.compile(
-    r'target|attach|canonical|winner|chosen|selected|primary|candidate_id',
-    re.IGNORECASE,
-)
+#:
+#: DELIBERATELY NARROW, from a measured false PASS. This set used to include
+#: ``canonical|winner|chosen|selected|primary`` — the BAND's vocabulary, for
+#: things the band already tracks for other reasons. ``canonical`` was the
+#: hole: ``build_judge_prompt(content, candidates, canonical_id=None)`` that
+#: merely interpolates the band canonical into a header line is an ordinary
+#: prompt-legibility change binding no verdict to any candidate, and it PASSED
+#: — authorising the production ``write_triage.enabled`` flip on a change that
+#: establishes nothing. The ``_echo_forgiven_note`` WARN did not mitigate it:
+#: the gate shell greps only for the PASS marker, so no operator ever sees the
+#: warning on a passing run.
+#:
+#: Only ``attach``/``target``/``candidate_id`` survive — spellings that can
+#: name the attach target and little else. Note the cost of narrowing is
+#: bounded: a parameter that genuinely MARKS the target (matches its argument
+#: against the slate) never reaches the echo control at all, so the name
+#: matters ONLY for header-style renderings that interpolate the id verbatim.
+_TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 
 
 class _Unverifiable(Exception):
