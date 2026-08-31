@@ -462,11 +462,12 @@ class TestEscapeProbeIsGated:
 class TestLatchIsKeyedOnTheWorktreeBASE:
     """A recycled worktree PATH must be re-measured when its BASE changes.
 
-    Falsifies the premise the latch was built on, stated verbatim in the
-    comment above ``_RUFF_ESCAPE_REPORTED``: "The answer is a property of the
-    worktree's base, which cannot change under a running orchestrator."  It
-    can.  Worktree PATHS are recycled across bases within one orchestrator
-    process, by three distinct mechanisms:
+    Falsifies the premise the latch was ORIGINALLY built on, quoted verbatim
+    from the comment above ``_RUFF_ESCAPE_REPORTED`` as it stood before this
+    guard landed: "The answer is a property of the worktree's base, which
+    cannot change under a running orchestrator."  It can.  Worktree PATHS are
+    recycled across bases within one orchestrator process, by three distinct
+    mechanisms:
 
     * warm lanes — fixed directories ``<worktree_base>/_lane-<k>`` handed out
       task after task by ``warm_lane_pool.py::WarmLanePool.try_acquire`` /

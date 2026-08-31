@@ -3919,15 +3919,78 @@ _RUFF_ESCAPE_REMEDIATION = (
     "merge main forward so this branch's own root pyproject.toml declares "
     '[tool.ruff]'
 )
-# One-record-per-WORKTREE latch, module-level on purpose.  ``verify_all_modules``
-# gathers one ``run_verification`` per module config (and the merge lane fans out
-# similarly), so a latch scoped to a single call would still emit the same
-# multi-line WARNING — and spawn the same probe — once per module for one
-# worktree.  The answer is a property of the worktree's base, which cannot change
-# under a running orchestrator, so the process-lifetime key is the honest scope:
-# at most one probe and one record per worktree per fleet-deploy window.  Keyed
-# on the RESOLVED path so ``.worktrees/77`` and its symlinked spelling collapse.
-_RUFF_ESCAPE_REPORTED: set[str] = set()
+# The worktree-ROOT config files whose presence decides whether ruff's walk-up
+# halts at the boundary, in ruff's own per-directory precedence order.
+_RUFF_ROOT_CONFIG_NAMES: tuple[str, ...] = ('.ruff.toml', 'ruff.toml', 'pyproject.toml')
+
+# (resolved worktree path, per-root-config content digests).
+_RuffEscapeLatchKey = tuple[str, tuple[str | None, ...]]
+
+
+def _ruff_escape_latch_key(worktree: Path) -> _RuffEscapeLatchKey:
+    """Identity for the escape latch: the worktree PATH plus its BASE's config.
+
+    The path alone is not an identity for the question the latch suppresses.
+    A worktree path is recycled across DIFFERENT bases within one orchestrator
+    process, and re-measuring is exactly what those recycles require.  So the
+    key carries a fingerprint of the base's root config alongside the path.
+
+    ``base_fingerprint`` digests each name in ``_RUFF_ROOT_CONFIG_NAMES`` at the
+    worktree root, in that fixed order, as ``None`` (absent or unreadable) or a
+    sha256 hex digest of its bytes.  A CONTENT digest rather than an
+    ``st_mtime_ns``/``st_size`` stat because identical config bytes provably
+    mean an identical halt decision: a rewrite-to-identical-content, or a lane
+    reset that leaves the file untouched, must NOT re-probe, which is what
+    keeps the per-module and per-retry dedup working.
+
+    SUBPROCESS-FREE on purpose.  This runs on the verify hot path, before the
+    latch check, so it must not spawn — which also rules out identifying the
+    base by ``git rev-parse HEAD``: ``run_verification`` carries no commit sha,
+    so that would cost a spawn per lint leg per module.
+
+    TOTAL AND NON-RAISING like every other helper here: an unreadable file
+    degrades to ``None`` for that entry, and an unresolvable worktree to its
+    raw path.
+    """
+    root = Path(worktree)
+    try:
+        resolved = str(root.resolve())
+    except OSError:
+        resolved = str(root)
+    digests: list[str | None] = []
+    for name in _RUFF_ROOT_CONFIG_NAMES:
+        try:
+            digests.append(hashlib.sha256((root / name).read_bytes()).hexdigest())
+        except OSError:
+            digests.append(None)
+    return resolved, tuple(digests)
+
+
+# One-record-per-(WORKTREE, BASE) latch, module-level on purpose.
+# ``verify_all_modules`` gathers one ``run_verification`` per module config (and
+# the merge lane fans out similarly), so a latch scoped to a single call would
+# still emit the same multi-line WARNING — and spawn the same probe — once per
+# module for one worktree.
+#
+# The scope is process-lifetime, but the KEY is not the path alone: a worktree
+# PATH is recycled across different bases inside one process, by warm lanes
+# (fixed ``_lane-<k>`` dirs handed out task after task by
+# ``warm_lane_pool.py::WarmLanePool.try_acquire``/``.release``, re-pointed by
+# ``git_ops.py::GitOps._reset_warm_lane``'s ``git checkout -f -B``), by the fixed
+# persistent ``git_ops.py::PERSISTENT_MERGE_WORKTREE_NAME`` worktree reset per
+# merge commit, and by per-task dirs reused when a task id recurs
+# (``git_ops.py::GitOps.create_worktree``).  A path-only key would let the FIRST
+# task to occupy a lane decide, for the rest of the fleet-deploy window, whether
+# every later task on it is measured at all.  So the key carries the base's
+# root-config fingerprint too (``_ruff_escape_latch_key``); the path half stays
+# RESOLVED so ``.worktrees/77`` and its symlinked spelling still collapse.
+#
+# ONE documented residual: the fingerprint covers the worktree ROOT's config
+# files only.  A base change confined to an INTERMEDIATE directory's config, or
+# to which ``.py`` file ``_ruff_probe_target`` falls back on, is not caught and
+# stays suppressed for the process.  That is bounded and strictly better than a
+# path-only key, and is stated rather than papered over.
+_RUFF_ESCAPE_REPORTED: set[_RuffEscapeLatchKey] = set()
 
 
 async def _report_ruff_config_escape(worktree: Path) -> None:
@@ -3950,10 +4013,7 @@ async def _report_ruff_config_escape(worktree: Path) -> None:
 
     Structurally non-fatal — nothing here propagates.
     """
-    try:
-        key = str(Path(worktree).resolve())
-    except OSError:
-        key = str(worktree)
+    key = _ruff_escape_latch_key(Path(worktree))
     if key in _RUFF_ESCAPE_REPORTED:
         return
     _RUFF_ESCAPE_REPORTED.add(key)
