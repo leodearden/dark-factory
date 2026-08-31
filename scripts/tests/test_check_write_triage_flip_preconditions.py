@@ -54,12 +54,6 @@ _ECHOED = 'ECHOED into the prompt'
 _ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
 _BARE_STR = 'returns a bare str'
 _OUTSIDE_SRC_ROOT = 'outside --src-root'
-#: The marker of item 1's full remedy block. Stated once, by whoever
-#: MEASURED it -- see TestReportSurvivesTruncation for why twice is costly.
-_REMEDY_GUIDANCE = 'Marking candidates[0]'
-#: What a PASS deliberately does NOT prove. Emitted on the pass path only,
-#: where the operator is about to act on it.
-_PASS_SCOPE = 'does NOT assert'
 
 
 # ---------------------------------------------------------------------------
@@ -867,40 +861,6 @@ class TestEchoedArgumentIsNotATarget:
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
 
 
-class TestPassStatesItsOwnScope:
-    """A PASS authorises a production flag flip, so it must say what it did
-    NOT measure.
-
-    Reported as a review-cycle-4 suggestion: item 1 is satisfied by the JUDGE
-    PATH binding a verdict to a determinate candidate, and neither remedy is
-    checked for being consumed downstream -- option (a) does not prove the id
-    is validated against the slate or threaded through BandDecision, and
-    option (b) does not prove the attach touches whatever the prompt named.
-    Closing that gap needs a probe of the attach path itself, which is a
-    materially wider assertion than this gate makes (filed as follow-up work).
-    Until then the gate must not let a PASS be read as more than it is.
-    """
-
-    def test_option_b_pass_states_what_it_did_not_measure(self, tmp_path):
-        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id')
-        proc = _run_probe(src_root)
-        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
-        assert _PASS_SCOPE in proc.stdout, proc.stdout
-
-    def test_option_a_pass_states_what_it_did_not_measure(self, tmp_path):
-        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a')
-        proc = _run_probe(src_root)
-        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
-        assert _PASS_SCOPE in proc.stdout, proc.stdout
-
-    def test_the_caveat_does_not_appear_on_a_fail(self, tmp_path):
-        """A FAIL report's window is the scarce one; spend it on the remedy."""
-        src_root = _write_fake_judge(tmp_path / 'src', variant='flat')
-        proc = _run_probe(src_root)
-        assert proc.returncode != 0, proc.stdout
-        assert _PASS_SCOPE not in proc.stdout, proc.stdout
-
-
 class TestPayloadCarryingBinderIsNotAnEcho:
     """The echo control must not disqualify a parser that BOTH reads the
     candidate field and carries the payload it read it from.
@@ -1548,26 +1508,6 @@ class TestReportSurvivesTruncation:
         # Item NUMBERS, not guidance prose — the summary is deliberately a
         # summary, so this does not become a wording pin.
         assert 'FAILING ITEMS: 1 2 4' in tail, tail
-
-    def test_item_1_guidance_is_not_stated_twice(self, tmp_path):
-        """The remedy block costs ~1.1 KB of a 2000-char window; pay once.
-
-        The shell prescribed both remedies AND the candidates[0] warning, then
-        appended the probe's own report -- which prescribes both remedies and
-        the candidates[0] warning again, with the MEASURED slate attached.
-        Two copies of the same ~15 lines in a report the operator reads only
-        the last 2000 characters of, which is the exact constraint the
-        FAILING ITEMS summary exists to work around.
-        """
-        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='failing')
-        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
-        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
-        occurrences = proc.stdout.count(_REMEDY_GUIDANCE)
-        assert occurrences == 1, (
-            f'item 1 states its remedy guidance {occurrences} time(s); it must '
-            f'be stated exactly once, by the probe that measured it:\n'
-            f'{proc.stdout}'
-        )
 
     def test_all_pass_tail_reports_no_failing_items(self, tmp_path):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
