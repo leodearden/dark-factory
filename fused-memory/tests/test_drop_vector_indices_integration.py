@@ -45,12 +45,15 @@ a caller that re-reads the catalog after a drop, can land in it.
 from __future__ import annotations
 
 import contextlib
+import sys
+import time
 
 import pytest
 import pytest_asyncio
 from _fm_helpers import (
     FALKOR_HOST,
     FALKOR_PORT,
+    IndexHeaderError,
     await_index_operational,
     falkor_skipif,
     poll_until,
@@ -272,6 +275,62 @@ class TestDropVectorIndicesLive:
             await backend.close()
 
 
+# ---------------------------------------------------------------------------
+# TestDropRebuildWindow's real-time budgets (task 4748; re-derived task 4972,
+# amendment pass). Named constants rather than inline literals because the
+# class-level pytest.mark.timeout below is only sound as ARITHMETIC over them,
+# and an invariant nobody can recompute is an invariant nobody maintains.
+# ---------------------------------------------------------------------------
+
+#: Per-barrier budget for every await_index_operational on the 10,000-node bulk
+#: graph. 30, not await_index_operational's 10s default and not the 20 this
+#: task first shipped: under 16-way FalkorDB contention the initial HNSW build
+#: measured 2.87-24.45s (median 14.47s) and the post-drop rebuild 0.00-22.86s
+#: (median 10.60s), so 20 sits BELOW both measured maxima and would trade this
+#: task's observation flake for a barrier-timeout flake. 30 clears both with
+#: ~20% headroom. The default itself is deliberately left alone: every OTHER
+#: barrier in the suite gates a 1-node graph where the build finishes before
+#: the first poll, and raising the default globally would buy them nothing
+#: while slowing genuine failure reporting everywhere.
+_BULK_BARRIER_S = 30.0
+
+#: Deadline for ONE observation attempt. 2.0s is >2x the worst detect latency
+#: ever measured (0.86s, under 16-way FalkorDB contention), and when the window
+#: IS open it is caught on the very first read (measured first-read gap
+#: 0.002-0.29s) -- so a shorter per-attempt deadline buys cheaper MISSES
+#: without risking a truncated observation.
+_OBSERVE_ATTEMPT_S = 2.0
+
+#: Independent openings observed before giving up. Measured per-attempt
+#: observation is 30/33 = 90.9% under the offline lane's own scheduling, so 5
+#: puts the residual miss probability at ~5e-6, and still <=1e-3 under the
+#: pessimistic 75% seen in one 8-trial batch (attempts are not perfectly
+#: independent).
+_OBSERVE_ATTEMPTS = 5
+
+#: WALL-CLOCK ceiling on the whole retry phase, enforced by shrinking each
+#: re-open barrier to the time actually left (see _reopen_rebuild_window).
+#:
+#: Bounding the retry in attempts ALONE is not enough, because the attempt
+#: count multiplies the barrier budgets: 5 attempts x 4 re-opens x 2 barriers
+#: is 240s of budget that a slow-but-SUCCEEDING barrier can walk through
+#: without any of them ever raising. pytest-timeout runs with
+#: timeout_method='thread' here, whose handler ends in os._exit(1) and kills
+#: the whole xdist worker, so "walks past the class mark" is not a test
+#: failure -- it takes unrelated tests down with it. A wall-clock bound is
+#: what makes the class mark below checkable arithmetic instead of a guess.
+#:
+#: 100s against a measured retry-phase cost of median 0.10s / max 8.20s, i.e.
+#: >12x the worst observed. It binds only when barriers are running tens of
+#: seconds each -- and that is the regime where it costs least, because a
+#: FalkorDB slow enough to spend 100s on re-opens is also one whose rebuild
+#: window is WIDE (the 50,000-node measurements show a slower rebuild means a
+#: longer window), so the first attempt is near-certain to have observed it
+#: already. Exhausting this budget raises its OWN diagnosis, never job (a)'s
+#: "FalkorDB stopped rebuilding" -- see _reopen_rebuild_window.
+_RETRY_PHASE_BUDGET_S = 100.0
+
+
 @pytest_asyncio.fixture
 async def bulk_vector_graph():
     """Seed a throwaway 10,000-node graph with a mixed VECTOR+RANGE Entity index.
@@ -325,15 +384,12 @@ async def bulk_vector_graph():
     # is the UNCONTENDED figure. Under 16-way FalkorDB contention the same
     # build measured 2.87-24.45s (median 14.47s), i.e. a 10-17x multiplier
     # that blows straight through await_index_operational's 10s default, so
-    # this call site now carries an explicit timeout_s=20. The default itself
-    # is deliberately left alone: every OTHER caller in the suite barriers a
-    # 1-node graph where the build finishes before the first poll, and raising
-    # the default globally would buy them nothing while slowing genuine
-    # failure reporting everywhere. If this fixture's seed size is ever
-    # raised, re-measure before assuming even 20s covers it (see
+    # this call site carries an explicit budget above that measured maximum
+    # (see _BULK_BARRIER_S for why 30 and not 20). If this fixture's seed
+    # size is ever raised, re-measure before assuming even 30s covers it (see
     # TestDropRebuildWindow's measurement table; at 50,000 nodes the same
     # build measured 8.5-9.2s UNCONTENDED and needed timeout_s=60).
-    await await_index_operational(graph, timeout_s=20)
+    await await_index_operational(graph, timeout_s=_BULK_BARRIER_S)
     try:
         yield graph
     finally:
@@ -351,13 +407,25 @@ def _entity_index_rows(result) -> list[tuple[dict, str]]:
     — the code path this module's barriers protect — for the same reason
     ``_vector_properties`` above hand-rolls its own read: a bug in the helper
     under test must not be able to make its own verification pass.
+
+    Raises:
+        IndexHeaderError: ``CALL db.indexes()`` no longer exposes one of the
+            label/types/status columns. A DISTINCT TYPE, not a bare ``assert``,
+            because ``_observe_phantom_window`` below has to tell this apart
+            from an ordinary missed window — and a caller that discriminates
+            by exception TYPE cannot be broken by someone rewording a message,
+            which discriminating by message text can. This is the same
+            two-modes-one-string collapse ``await_index_operational`` already
+            uses ``IndexHeaderError`` to prevent, reused rather than re-forked
+            so the blessed name a caller catches stays one name.
     """
     header_names = [col[1] for col in result.header]
     for col in ('label', 'types', 'status'):
-        assert col in header_names, (
-            f'CALL db.indexes() has no {col!r} column (header={header_names}); '
-            'await_index_operational cannot be trusted.'
-        )
+        if col not in header_names:
+            raise IndexHeaderError(
+                f'CALL db.indexes() has no {col!r} column (header={header_names}); '
+                'await_index_operational cannot be trusted.'
+            )
     label_idx = header_names.index('label')
     types_idx = header_names.index('types')
     status_idx = header_names.index('status')
@@ -368,18 +436,12 @@ def _entity_index_rows(result) -> list[tuple[dict, str]]:
     ]
 
 
-#: The exact ``poll_until`` timeout message used by the phantom observation
-#: below, so a MISSED WINDOW can be told apart by value from any other
-#: AssertionError raised inside the predicate (see ``_observe_phantom_window``).
-_MISSED_WINDOW = 'phantom rebuild window not observed within this attempt'
-
-
 def _row_has_vector(types: dict) -> bool:
     """True if any property in a raw db.indexes() 'types' dict carries VECTOR."""
     return any(_types_contain(raw, 'VECTOR') for raw in types.values())
 
 
-async def _reopen_rebuild_window(graph) -> None:
+async def _reopen_rebuild_window(graph, deadline: float | None = None) -> None:
     """Re-open the post-DROP rebuild window by re-merging, then re-dropping, the VECTOR index.
 
     The ``reopen`` half of the ``retry_until_observed`` call in
@@ -401,45 +463,163 @@ async def _reopen_rebuild_window(graph) -> None:
        dropping an under-construction index is not the state under test;
     4. re-``DROP`` -- which is what actually opens the window the next attempt
        observes.
+
+    Args:
+        graph: The live bulk graph to re-open the window on.
+        deadline: ``time.monotonic()`` value the whole RETRY PHASE must finish
+            by, or ``None`` for no wall-clock bound. Each barrier below is
+            shrunk to the time actually left, and a re-open that starts with
+            none left raises immediately. This is what makes the class-level
+            ``pytest.mark.timeout`` sound arithmetic rather than a guess: see
+            :data:`_RETRY_PHASE_BUDGET_S`.
     """
-    # Both barriers carry timeout_s=20 for the same measured reason as the
-    # fixture's build barrier and the test's final one: they gate the SAME
-    # 10,000-node graph, where 16-way FalkorDB contention pushed the build to
-    # 2.87-24.45s and the post-drop rebuild to 0.00-22.86s, past the 10s
-    # default. A barrier raising here aborts the whole retry (reopen failures
-    # propagate; retry_until_observed only absorbs a falsy OBSERVATION), so an
+    # Both barriers gate the SAME 10,000-node graph as the fixture's build
+    # barrier and the test's final one, and carry the same _BULK_BARRIER_S
+    # budget for the same measured reason (16-way FalkorDB contention pushed
+    # the build to 2.87-24.45s and the post-drop rebuild to 0.00-22.86s, past
+    # await_index_operational's 10s default).
+    #
+    # A barrier raising here aborts the WHOLE retry -- reopen failures
+    # propagate; retry_until_observed only absorbs a falsy OBSERVATION (pinned
+    # by test_fm_helpers.py::TestRetryUntilObserved
+    # ::test_an_exception_from_reopen_aborts_the_retry_rather_than_being
+    # _retried_around). That is deliberate: continuing to observe a window
+    # that was never successfully re-opened would burn the budget and then
+    # report the wrong diagnosis. It is also why the budget matters -- an
     # under-budgeted barrier would reintroduce the contention flake this task
     # removes.
-    await await_index_operational(graph, timeout_s=20)
+    def _budget() -> float:
+        """Seconds this barrier may spend: the full budget, or whatever is left."""
+        if deadline is None:
+            return _BULK_BARRIER_S
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            # Its OWN diagnosis, deliberately not job (a)'s. Running out of
+            # wall clock while barriers crawl means FalkorDB is contended, not
+            # that it stopped rebuilding the merged index in place -- and
+            # reporting the latter for the former is exactly the
+            # two-modes-one-string collapse this module keeps guarding
+            # against.
+            raise AssertionError(
+                f'the {_RETRY_PHASE_BUDGET_S}s retry-phase budget was spent before this '
+                'window could be re-opened. That is FalkorDB running slow (index '
+                'barriers crawling under contention), NOT evidence the drop-side '
+                'rebuild window is gone -- do not read this as the "stopped '
+                'rebuilding in place" failure this class also reports.'
+            )
+        return min(_BULK_BARRIER_S, remaining)
+
+    await await_index_operational(graph, timeout_s=_budget())
     await graph.query(
         'CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) '
         "OPTIONS {dimension: 4, similarityFunction: 'cosine'}"
     )
-    await await_index_operational(graph, timeout_s=20)
+    await await_index_operational(graph, timeout_s=_budget())
     await graph.query('DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)')
 
 
-# 150, overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
+class TestReopenRebuildWindowBudget:
+    """The wall-clock guard on ``_reopen_rebuild_window`` — deterministic, no FalkorDB.
+
+    Needs no live graph because an expired *deadline* is refused BEFORE the
+    first barrier runs, which is the whole point: the guard must fire without
+    spending anything. ``graph=None`` is therefore load-bearing evidence, not
+    a shortcut — a guard that touched the graph first could not use it.
+
+    (The module-level ``falkor_skipif`` still skips this with the rest of the
+    module when FalkorDB is down. That is deliberate: the budget it pins only
+    exists to bound a live run, so pinning it in isolation would buy nothing.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_expired_deadline_is_refused_before_any_barrier_runs(self):
+        """An exhausted retry-phase budget raises its OWN diagnosis, never job (a)'s.
+
+        Two things are pinned, and the second matters more than the first:
+
+        * it raises rather than starting a barrier it has no time for
+          (``graph=None`` proves nothing was touched — a barrier call would
+          have raised AttributeError instead);
+        * the message says CONTENDED, not "stopped rebuilding". Running out of
+          wall clock means FalkorDB is slow, and reporting that as the
+          drop-side rebuild window being gone is exactly the
+          two-modes-one-string collapse this module keeps guarding against.
+        """
+        expired = time.monotonic() - 1.0
+
+        with pytest.raises(AssertionError, match='retry-phase budget was spent'):
+            await _reopen_rebuild_window(None, deadline=expired)
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_leaves_the_full_barrier_budget(self, monkeypatch):
+        """``deadline=None`` means unbounded: the barrier gets the full _BULK_BARRIER_S.
+
+        The default has to stay the un-shrunk budget so the helper is still
+        usable outside the retry phase, and so a caller that forgets the
+        deadline gets the SAFE behaviour (a full budget) rather than a
+        silently truncated barrier.
+
+        Asserted through the recorded ``timeout_s`` rather than wall clock, so
+        this cannot itself become the next timing flake.
+        """
+        budgets: list[float] = []
+
+        async def fake_barrier(_graph, timeout_s=10.0):
+            budgets.append(timeout_s)
+
+        async def fake_query(_statement):
+            return None
+
+        class _Graph:
+            query = staticmethod(fake_query)
+
+        monkeypatch.setattr(sys.modules[__name__], 'await_index_operational', fake_barrier)
+        await _reopen_rebuild_window(_Graph(), deadline=None)
+
+        assert budgets == [_BULK_BARRIER_S, _BULK_BARRIER_S], (
+            f'expected both barriers to get the full budget, got {budgets!r}'
+        )
+
+
+# 240, overriding the module-level pytest.mark.timeout(30) for THIS CLASS ONLY
 # (pytest-timeout resolves via get_closest_marker, so the module mark still
 # correctly governs TestDropVectorIndicesLive above, which runs on the 1-node
-# live_vector_graph and is fast). Two reasons this headroom is not optional:
+# live_vector_graph and is fast).
 #
-#   * FAILURE MODE. fused-memory/pyproject.toml sets timeout_method='thread',
-#     whose handler ends in os._exit(1) -- that kills the whole xdist worker
-#     rather than failing one test. So the mark must sit comfortably ABOVE the
-#     sum of barrier budgets that can plausibly run long, or a stalled barrier
-#     takes the worker down instead of raising a clean AssertionError.
-#   * MEASURED COST. Under 16-way FalkorDB contention the 10,000-node HNSW
-#     build measured 2.87-24.45s (median 14.47s) and the post-drop rebuild
-#     0.00-22.86s (median 10.60s) -- both timed out against
-#     await_index_operational's 10s default, which is why the bulk-graph
-#     barriers below carry an explicit timeout_s=20.
+# FAILURE MODE, which is why the number must be derived and not eyeballed.
+# fused-memory/pyproject.toml sets timeout_method='thread', whose handler ends
+# in os._exit(1) -- that kills the whole xdist worker rather than failing one
+# test, taking unrelated tests with it. And pytest-timeout runs here with
+# func_only=False (see the module pytestmark above), so FIXTURE SETUP counts
+# against the mark too. So the mark must sit above the arithmetic worst case
+# of every budget this class can spend, INCLUDING barriers that merely run
+# long while still succeeding -- a 25s barrier inside a 30s budget never
+# raises the clean AssertionError, it just walks the clock.
 #
-# Realistic post-fix worst case with 5 attempts is ~27s (5 x 2.0s poll +
-# 4 x ~1.3s reopen + fixture; reopen measured 1.12-1.42s, median 1.27s), and
-# even two sequential 20s barrier timeouts (40s) now surface as a clean
-# AssertionError well inside 150.
-@pytest.mark.timeout(150)
+# THE ARITHMETIC, worst case, all constants defined above the bulk fixture:
+#
+#   fixture seed queries (unbarriered CREATEs)             <=  30s  (allowance)
+#   fixture build barrier            _BULK_BARRIER_S       <=  30s
+#   retry phase                      _RETRY_PHASE_BUDGET_S <= 100s  (wall-bounded)
+#     + the last observation, which may start just inside
+#       the deadline           _OBSERVE_ATTEMPT_S          <=   2s
+#   final post-drop barrier          _BULK_BARRIER_S       <=  30s
+#                                                          --------
+#                                                             192s
+#
+# 240 leaves ~48s of slack over that ceiling. The retry phase is the term that
+# used to be unbounded: 5 attempts x 4 re-opens x 2 barriers is 240s of budget
+# on its own, which is why _reopen_rebuild_window shrinks each barrier to the
+# wall clock actually left rather than letting the attempt count multiply the
+# per-barrier budget. Whenever any of those constants changes, recompute this
+# sum -- that is the invariant, not the literal 240.
+#
+# MEASURED COST, for contrast with the ceiling above: the realistic post-fix
+# case is ~7s (5 x 2.0s poll + 4 x ~1.3s reopen, reopen measured 1.12-1.42s /
+# median 1.27s, plus the fixture), and 30 consecutive lane-condition trials ran
+# 2.73s min / 3.34s median / 7.64s max in-test. The headroom is for the
+# contended tail, not the expected spend.
+@pytest.mark.timeout(240)
 class TestDropRebuildWindow:
     """PREMISE PIN for the post-DROP rebuild window — task 4748, de-flaked by task 4972.
 
@@ -468,9 +648,8 @@ class TestDropRebuildWindow:
         raises rather than passing quietly;
     (b) fail loudly if it changes the column names or the exact
         'OPERATIONAL' ready sentinel await_index_operational depends on. This
-        job is why ``_observe_phantom_window`` narrows its catch to
-        poll_until's own timeout string instead of swallowing every
-        AssertionError as a miss.
+        job is why ``_observe_phantom_window`` re-raises ``IndexHeaderError``
+        by TYPE instead of swallowing every AssertionError as a miss.
 
     MEASURED (task 4748, nice -n 19, loadavg ~96 on 32 cores, FalkorDB module
     v41800): after ``DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)``
@@ -574,45 +753,57 @@ class TestDropRebuildWindow:
         # ONE bounded attempt to catch the window. The 5ms interval is
         # deliberately tight against the measured 52-135ms window at 10,000
         # nodes -- a round trip costs ~0.2ms, so this buys many reads inside
-        # the window rather than one. 2.0s (down from 5.0s) is >2x the worst
-        # detect latency ever measured (0.86s, under 16-way FalkorDB
-        # contention), and when the window IS open it is caught on the very
-        # first read (measured first-read gap 0.002-0.29s) -- so a shorter
-        # per-attempt deadline buys cheaper MISSES without risking a
-        # truncated observation.
+        # the window rather than one. See _OBSERVE_ATTEMPT_S for why the
+        # per-attempt deadline came down from 5.0s to 2.0s.
         async def _observe_phantom_window():
             try:
                 return await poll_until(
-                    _phantom_rows, timeout=2.0, interval=0.005, message=_MISSED_WINDOW,
+                    _phantom_rows,
+                    timeout=_OBSERVE_ATTEMPT_S,
+                    interval=0.005,
+                    message='phantom rebuild window not observed within this attempt',
                 )
-            except AssertionError as exc:
-                if str(exc) != _MISSED_WINDOW:
-                    # NOT a missed window: _entity_index_rows asserts the
-                    # label/types/status columns exist, and that failure is
-                    # durable job (b) -- FalkorDB changed its result shape.
-                    # Swallowing it as a miss would spend the whole retry
-                    # budget and then report job (a)'s "stopped rebuilding"
-                    # diagnosis for a completely different defect, the same
-                    # two-modes-one-string collapse IndexHeaderError exists to
-                    # prevent in await_index_operational.
-                    raise
+            except IndexHeaderError:
+                # NOT a missed window: _entity_index_rows raises this when
+                # FalkorDB no longer exposes the label/types/status columns,
+                # which is durable job (b). Swallowing it as a miss would
+                # spend the whole retry budget and then report job (a)'s
+                # "stopped rebuilding" diagnosis for a completely different
+                # defect -- the two-modes-one-string collapse
+                # IndexHeaderError exists to prevent.
+                #
+                # Discriminated by TYPE, never by comparing str(exc) against
+                # poll_until's pass-through message: poll_until happens to
+                # re-raise the caller's message verbatim today, but that is
+                # not a contract it documents, and its sibling
+                # poll_until_stable already decorates one of its two failure
+                # messages. A message-equality guard would flip to re-raising
+                # EVERY ordinary miss the moment poll_until gained a prefix,
+                # silently undoing this whole de-flake with no unit test
+                # anywhere to catch it.
+                raise
+            except AssertionError:
+                # poll_until's own deadline: the window did not open for this
+                # attempt. Feed it to the retry rather than failing the test.
                 return None
 
         # The window is a RACE, not merely a narrow target: on a miss FalkorDB
         # had already finished the rebuild INSIDE the DROP round-trip, so no
         # interval and no deadline on a single attempt can help (see the class
-        # docstring). Re-open it and look again -- 5 times, measured
-        # per-attempt observation 30/33 = 90.9% under the offline lane's own
-        # `nice -n 19 ionice -c3` serial scheduling, so the residual miss
-        # probability is ~5e-6, and still <=1e-3 under the pessimistic 75%
-        # seen in one 8-trial batch (attempts are not perfectly independent).
-        # Cost is paid only on a miss: measured retry-phase cost median 0.10s,
-        # max 8.20s.
+        # docstring). Re-open it and look again -- see _OBSERVE_ATTEMPTS for
+        # why five times. Cost is paid only on a miss: measured retry-phase
+        # cost median 0.10s, max 8.20s.
+        #
+        # The deadline is taken HERE, not inside the reopen, so it bounds the
+        # whole phase rather than restarting per re-open. Attempts alone do
+        # not bound wall clock (see _RETRY_PHASE_BUDGET_S and the class-level
+        # timeout arithmetic above); this is what does.
+        retry_deadline = time.monotonic() + _RETRY_PHASE_BUDGET_S
         try:
             await retry_until_observed(
                 _observe_phantom_window,
-                reopen=lambda: _reopen_rebuild_window(graph),
-                attempts=5,
+                reopen=lambda: _reopen_rebuild_window(graph, deadline=retry_deadline),
+                attempts=_OBSERVE_ATTEMPTS,
                 message=(
                     'Expected the drop-side rebuild phantom (>1 Entity row, one '
                     'still VECTOR-typed, one not yet OPERATIONAL), each attempt '
@@ -629,11 +820,14 @@ class TestDropRebuildWindow:
             raise AssertionError(f'{exc} Last saw {last_rows!r}.') from exc
 
         # (c) The barrier is SUFFICIENT: once satisfied, the phantom is gone.
-        # timeout_s=20, not the 10s default, for the same measured reason as
-        # the fixture's build barrier: under 16-way FalkorDB contention the
+        # _BULK_BARRIER_S, not the 10s default, for the same measured reason
+        # as the fixture's build barrier: under 16-way FalkorDB contention the
         # post-drop rebuild measured 0.00-22.86s (median 10.60s) on this
-        # 10,000-node graph, so the default has no headroom here.
-        await await_index_operational(graph, timeout_s=20)
+        # 10,000-node graph, so the default has no headroom here. This one is
+        # NOT deadline-shrunk -- it is the assertion the test exists to make,
+        # not part of the retry phase, and truncating it would turn a slow
+        # rebuild into a false "the barrier is not sufficient" failure.
+        await await_index_operational(graph, timeout_s=_BULK_BARRIER_S)
 
         result = await graph.query('CALL db.indexes()')
         entity_rows = _entity_index_rows(result)
