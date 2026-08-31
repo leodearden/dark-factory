@@ -1146,7 +1146,11 @@ def render_curation_md(manifest: dict) -> str:
     add(f'- **Why it matters**: {derivation["why_it_matters"]}')
     add('')
 
-    add('## Merge-SHA availability — the SPLIT majority')
+    # Count-neutral by construction: the hardcoded heading asserted the
+    # majority independently of the counts, so it would have shipped the
+    # inverted claim even beside a corrected `finding`. The ONE place the
+    # majority is claimed is now that single derived sentence.
+    add('## Merge-SHA availability — how many fixtures can carry a reference')
     add('')
     add(manifest['merge_sha_availability']['finding'])
     add('')
@@ -1302,15 +1306,16 @@ def redrive_provenance(manifest: dict, resolve) -> tuple[dict, list[dict]]:
             'after': after,
         })
 
-    # The availability summary is a COUNT over the rows this function just
-    # rewrote; leaving it stale would make the manifest disagree with itself.
-    availability = new.get('merge_sha_availability')
-    if isinstance(availability, dict):
-        modes = [r.get('mint_mode') for r in new['candidates']
-                 if r.get('decision') == 'include']
-        availability['referenced'] = sum(1 for m in modes if m == 'referenced')
-        availability['planrate_only'] = sum(
-            1 for m in modes if m == 'planrate_only')
+    # The availability summary — the counts AND the sentence that quotes them
+    # — is a DERIVATION over the rows this function just rewrote. Recomputing
+    # only the two integers is exactly what shipped a manifest whose prose
+    # denied its own counts, so the WHOLE block is regenerated from the
+    # shared helper: the stale-prose failure mode is structurally unreachable
+    # rather than merely re-tested. A manifest carrying no availability block
+    # does not gain one — --redrive re-derives what a manifest already has.
+    if isinstance(new.get('merge_sha_availability'), dict):
+        new['merge_sha_availability'] = merge_sha_availability_block(
+            new['candidates'])
 
     return new, changes
 
@@ -1337,6 +1342,7 @@ def run_redrive() -> int:
             f'(--author).'
         )
     manifest = json.loads(CURATION_JSON.read_text())
+    was_finding = (manifest.get('merge_sha_availability') or {}).get('finding')
     new, changes = redrive_provenance(manifest, _production_redrive_resolver)
     CURATION_JSON.write_text(json.dumps(new, indent=2) + '\n')
 
@@ -1349,8 +1355,16 @@ def run_redrive() -> int:
     availability = new.get('merge_sha_availability') or {}
     print(f'redrove {len(changes)} row(s) in {CURATION_JSON} '
           f'(referenced={availability.get("referenced")}, '
-          f'planrate_only={availability.get("planrate_only")}); '
+          f'planrate_only={availability.get("planrate_only")}, '
+          f'total={availability.get("total")}); '
           f'no row was added, dropped or re-adjudicated')
+    # The summary SENTENCE is regenerated too, so an operator sees it move
+    # here rather than discovering it in a diff after the fact.
+    now_finding = availability.get('finding')
+    if now_finding != was_finding:
+        print('  merge_sha_availability.finding rewritten:')
+        print(f'    was: {was_finding}')
+        print(f'    now: {now_finding}')
     return 0
 
 
