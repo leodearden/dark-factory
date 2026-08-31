@@ -1035,3 +1035,55 @@ def test_reclaim_proceeds_normally_through_a_symlinked_repo(tmp_path):
     assert not clean.exists()
     assert not dirty.exists()
     assert _branch_resolves(repo, f"task/_lane-0-{TS_LANE}")
+
+
+# ---------------------------------------------------------------------------
+# step-19: park_commit self-guards its own destructive verbs
+# ---------------------------------------------------------------------------
+
+def test_park_commit_refuses_a_worktree_it_cannot_verify(tmp_path, caplog):
+    """``git add -A`` stages from the WORKTREE ROOT regardless of cwd, so an
+    unverified target does not merely mis-scope the snapshot — it commits the
+    whole tree of whatever repository git resolved. park_commit self-guards
+    rather than trusting its caller to have checked."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    subdir = parking / "sub"
+    subdir.mkdir()
+    (subdir / "more-wip.txt").write_text("nested uncommitted work\n")
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    assert row.park_commit(subdir, "reclaim") is None  # must not raise
+
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before
+    assert _git(parking, "status", "--porcelain").stdout.strip()  # still dirty
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING" in m and str(subdir) in m for m in warn)
+
+
+def test_park_commit_still_commits_a_verified_dirty_parking(tmp_path):
+    """NON-REGRESSION: the guard must not disarm the ordinary happy path."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    sha = row.park_commit(parking, "reclaim")
+
+    assert sha and sha != head_before
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == sha
+    assert not _git(parking, "status", "--porcelain").stdout.strip()
+
+
+def test_park_commit_still_commits_through_a_symlinked_parking(tmp_path):
+    """NON-REGRESSION: a parking reached via a SYMLINK is a legitimate target —
+    the guard realpath-compares, so it must not false-refuse here."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    link = tmp_path / "parking-link"
+    link.symlink_to(parking)
+
+    sha = row.park_commit(link, "reclaim")
+
+    assert sha
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == sha
