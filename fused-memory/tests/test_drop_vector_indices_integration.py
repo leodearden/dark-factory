@@ -723,6 +723,27 @@ class TestDropRebuildWindow:
       -p no:xdist -o addopts= -q``): 61 passed in 130.06s;
     * the default parallel run (``pytest -m integration``, ``-n auto --dist
       loadgroup``): 61 passed in 89.58s.
+
+    RE-VALIDATED after the task-4972 amendment pass (barrier budgets raised
+    from 20s to 30s, the retry phase given a 100s wall-clock bound, and the
+    class mark re-derived from that arithmetic — see ``_BULK_BARRIER_S`` and
+    ``_RETRY_PHASE_BUDGET_S``):
+
+    * 25 consecutive trials of this test under the lane's exact command,
+      loadavg 57-149: 25/25, in-test 1.53s min / 2.10s median / 5.36s max —
+      i.e. the raised budgets are pure headroom, not spend, and nothing here
+      comes within 20x of the 240s class mark;
+    * the lane's exact confirmation command, loadavg ~99: 63 passed in
+      399.29s (63, not 61: the amendment added two deterministic tests for
+      the new deadline guard);
+    * the default parallel run: 63 passed in 147.46s.
+
+    One trial in that batch took 42.59s of WALL clock against 3.23s of
+    in-test time — 39s of interpreter and conftest import under loadavg ~148.
+    Worth knowing when reading a slow lane run: that overhead lands BEFORE
+    pytest-timeout's per-test clock starts, so it does not eat the class
+    mark, and a wall-clock stopwatch on this test will disagree with the
+    budget arithmetic by tens of seconds on a loaded box.
     """
 
     @pytest.mark.asyncio
