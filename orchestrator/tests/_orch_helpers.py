@@ -1680,3 +1680,34 @@ def require_orchestrator_inifile(pytestconfig, *, subject: str) -> None:
         f'exactly one inifile (never merging across workspace members), so '
         f'this is an invocation artifact (e.g. a root-bound run), not drift'
     )
+
+
+def mcp_tool_envelope(payload: object) -> dict:
+    """The JSON-RPC body ``Scheduler.dispatch_tool`` ACTUALLY returns for a
+    successful ``tools/call``, wrapping *payload* — the tool's own return value.
+
+    ``dispatch_tool`` hands back ``McpSession._raw_call``'s parsed response
+    verbatim (``mcp_lifecycle.py::McpSession.call_tool`` returns it unmodified),
+    so a fake that answers with a bare ``{'statuses': …}`` is speaking a shape the
+    transport never emits.  That substitution is not a harmless simplification: it
+    is what let a one-level envelope unwrapper in
+    ``chronic_flake.py::_unwrap_dispatch_envelope`` ship while ~30 tests stayed
+    green over it, because a bare payload needs zero unwrap steps and the real
+    body needs two.
+
+    Build every ``dispatch_tool`` fake response through this helper so the fakes
+    speak the production shape BY CONSTRUCTION, and keep the bare-dict spellings
+    only as explicitly-labelled legacy/tolerated cases.
+
+    Both ``structuredContent`` and the ``content`` text block are populated,
+    which is what a real server sends when the tool declares an output schema.
+    """
+    return {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(payload)}],
+            'structuredContent': payload,
+            'isError': False,
+        },
+    }

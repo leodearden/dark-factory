@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import yaml
-from _orch_helpers import pydantic_spec
+from _orch_helpers import mcp_tool_envelope, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 
@@ -849,6 +849,41 @@ class TestSchedulerChronicFlakeTaskClient:
         assert result == 'tkt_xyz'
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('payload', 'expected'),
+        [
+            ({'task_id': '4242', 'status': 'deferred'}, '4242'),
+            ({'ticket': 'tkt_abc123'}, 'tkt_abc123'),
+        ],
+        ids=['planning_mode_task_id', 'two_phase_ticket'],
+    )
+    async def test_submit_task_extracts_from_the_production_jsonrpc_body(
+        self, payload, expected,
+    ):
+        """THE SHAPE PRODUCTION ACTUALLY SENDS — the sibling shape tests above all
+        drive ALREADY-UNWRAPPED spellings, and every one of them passed while this
+        one returned ``''``.
+
+        ``dispatch_tool`` returns ``McpSession._raw_call``'s JSON-RPC body verbatim,
+        so the payload sits TWO layers down (``result`` -> ``structuredContent`` /
+        ``content[].text``), not one.  An empty id here is not cosmetic for the
+        ledger seam: ``flake_ledger::_ensure_owner_task`` treats a falsy id as a
+        FAILED filing and leaves ``owner_task_id`` NULL — while the server really did
+        create the task — so the next suppression of the same test files another, with
+        no rate limit on that path.  Unbounded orphan tasks, and §5.9 never satisfiable
+        in production.
+        """
+        _, client = await self._client(mcp_tool_envelope(payload))
+        assert await client.submit_task({'title': 't'}) == expected
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_extracts_from_the_production_jsonrpc_body(self):
+        """The third parser over the same seam, against the same real body."""
+        rows = [{'title': 'De-flake test_a.sh', 'status': 'pending'}]
+        _, client = await self._client(mcp_tool_envelope({'results': rows}))
+        assert await client.search_tasks('test_a.sh') == rows
+
+    @pytest.mark.asyncio
     async def test_submit_task_unrecognised_shape_returns_empty_string(self):
         scheduler, client = await self._client({'unexpected': 'shape'})
         result = await client.submit_task({'title': 't'})
@@ -940,17 +975,33 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
     @pytest.mark.parametrize(
         'envelope',
         [
+            mcp_tool_envelope({'statuses': {'42': 'pending'}}),
             {'statuses': {'42': 'pending'}},
             {'structuredContent': {'statuses': {'42': 'pending'}}},
             {'result': {'statuses': {'42': 'pending'}}},
             {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
         ],
-        ids=['direct', 'structured_content', 'result', 'content_text_block'],
+        ids=[
+            'production_jsonrpc_body',
+            'direct',
+            'structured_content',
+            'result',
+            'content_text_block',
+        ],
     )
     async def test_get_statuses_handles_every_envelope_shape(self, envelope):
-        """(a) SUCCESS, ids known.  The same four shapes ``_unwrap_dispatch_envelope``
-        already normalises for id-extraction and search results — one envelope policy,
-        three parsers — and every one of them reports ``error is None``."""
+        """(a) SUCCESS, ids known.  Every shape ``_unwrap_dispatch_envelope``
+        normalises for id-extraction and search results — one envelope policy, three
+        parsers — reports ``error is None``.
+
+        THE FIRST CASE IS THE ONLY ONE PRODUCTION EVER SENDS, and it is listed first
+        for that reason.  The other four are already-unwrapped spellings this seam
+        tolerates because fakes and the eval-mode ``_StubMcpSession`` produce them;
+        ``{'result': {'statuses': …}}`` in particular is a shape the transport never
+        emits — the real inner ``result`` carries ``content``/``structuredContent``/
+        ``isError``, never the payload keys directly.  A suite made only of those
+        four is what let the one-level unwrapper ship: it passed every one of them
+        and failed the sole shape that matters."""
         _, client = await self._client(envelope)
         assert await client.get_statuses(['42']) == ({'42': 'pending'}, None)
 

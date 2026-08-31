@@ -547,25 +547,18 @@ async def maybe_file_chronic_flake_tasks(
 # ---------------------------------------------------------------------------
 
 
-def _unwrap_dispatch_envelope(result: object) -> dict:
-    """Best-effort unwrap of a ``dispatch_tool`` response down to the
-    underlying tool's own returned dict, tolerating whichever transport
-    shape it happens to hand back.
+def _envelope_descend_once(envelope: dict) -> dict | None:
+    """ONE unwrap step, or ``None`` when *envelope* carries no transport layer.
 
-    Generalises ``Harness._extract_task_id``'s envelope normalisation
-    (``{'task_id': ...}`` direct, ``{'structuredContent': {...}}`` /
-    ``{'result': {...}}`` nested, or a ``content`` list of text blocks
-    carrying JSON) so both id-extraction (:func:`extract_task_id`) and
-    results-list extraction (search_tasks) share one seam. Returns ``{}``
-    for a non-dict *result* or when no known shape unwraps.
+    Split out of :func:`_unwrap_dispatch_envelope` so the LOOP and the STEP are
+    separately readable: the step knows the three transport spellings, the loop
+    knows how deep to go.
     """
-    if not isinstance(result, dict):
-        return {}
     for key in ('structuredContent', 'result'):
-        inner = result.get(key)
+        inner = envelope.get(key)
         if isinstance(inner, dict):
             return inner
-    content = result.get('content')
+    content = envelope.get('content')
     if isinstance(content, list):
         for chunk in content:
             if isinstance(chunk, dict) and chunk.get('type') == 'text':
@@ -575,7 +568,61 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
                     continue
                 if isinstance(parsed, dict):
                     return parsed
-    return result
+    return None
+
+
+# An MCP tools/call response nests at most JSON-RPC-body -> result ->
+# structuredContent/content-text.  Three steps is that depth with a step to
+# spare; the cap exists only so a pathological self-referential shape cannot
+# spin, never as a real limit.
+_MAX_ENVELOPE_DEPTH = 3
+
+
+def _unwrap_dispatch_envelope(result: object) -> dict:
+    """Best-effort unwrap of a ``dispatch_tool`` response down to the
+    underlying tool's own returned dict, tolerating whichever transport
+    shape it happens to hand back.
+
+    Generalises ``Harness._extract_task_id``'s envelope normalisation
+    (``{'task_id': ...}`` direct, ``{'structuredContent': {...}}`` /
+    ``{'result': {...}}`` nested, or a ``content`` list of text blocks
+    carrying JSON) so all three parsers here — :func:`extract_task_id`,
+    :func:`_extract_results_list`, :func:`_extract_statuses_map` — share
+    one seam. Returns ``{}`` for a non-dict *result* or when no known shape
+    unwraps.
+
+    UNWRAPS ITERATIVELY, and that is the whole correctness of it.  The
+    production shape is TWO layers deep, not one: ``dispatch_tool`` hands back
+    ``McpSession._raw_call``'s JSON-RPC BODY verbatim —
+    ``{'jsonrpc': '2.0', 'id': N, 'result': {'content': [{'type': 'text',
+    'text': '{"statuses": …}'}], 'structuredContent': {…}, 'isError': False}}``
+    — so a single step lands on the INNER RESULT, whose keys are
+    ``content``/``structuredContent``/``isError`` and never the payload's own.
+    A one-step unwrapper therefore returns a dict in which every payload key is
+    absent, which each parser above reads as a well-formed envelope that simply
+    does not carry its key: ``extract_task_id`` returned ``''`` and
+    ``_extract_statuses_map`` returned an error, on EVERY successful production
+    call.  Corroborated by ``scheduler.py::SchedulerFacade.get_statuses``, which
+    parses the very same ``dispatch_tool`` result with
+    ``shared.mcp_envelope.parse_tool_result(result, 'statuses', dict)`` — a
+    parser that requires exactly ``result['result']['content'][i]['text']``.
+
+    The loop STOPS at the first dict no transport key descends out of, so the
+    already-unwrapped shapes the fakes and the eval-mode ``_StubMcpSession``
+    hand back (a bare ``{'statuses': …}``) are returned untouched, exactly as
+    before.  ``shared.mcp_envelope.parse_tool_result`` is deliberately NOT used
+    in its place: it accepts ONLY the strict ``result.content[].text`` spelling
+    and would reject every bare-dict shape this seam exists to tolerate.
+    """
+    if not isinstance(result, dict):
+        return {}
+    envelope = result
+    for _ in range(_MAX_ENVELOPE_DEPTH):
+        inner = _envelope_descend_once(envelope)
+        if inner is None or inner is envelope:
+            break
+        envelope = inner
+    return envelope
 
 
 def extract_task_id(result: object) -> str:
@@ -590,9 +637,20 @@ def extract_task_id(result: object) -> str:
     actual two-phase response, ``{"ticket": "tkt_<id>"}`` — plus the
     ``structuredContent``/``content``-text-block nested shapes via
     :func:`_unwrap_dispatch_envelope`. Never raises; an
-    unrecognised/unparseable envelope returns ``''``. This id is
-    **log-only** (see the module docstring's dedup-layer note) — never
-    relied on for correctness.
+    unrecognised/unparseable envelope returns ``''``.
+
+    LOAD-BEARING FOR ONE CONSUMER, log-only for the other, and the difference
+    is why :func:`_unwrap_dispatch_envelope` must handle the production shape.
+    For THIS module's own filing path the id is log-only (see the module
+    docstring's dedup-layer note) — a wrong id there costs a log line, and the
+    ``FilingLedger`` rate limit still bounds duplicates.  For
+    ``flake_ledger::_ensure_owner_task`` it is the ``owner_task_id`` the §5.9
+    invariant is STORED AGAINST, and that path has no rate limit: an empty id
+    is treated there as a failed filing, so a server-side task really was
+    created while the row stays NULL, and the next suppression of the same test
+    files another.  An unbounded orphan-task loop is the failure mode, which is
+    why the ``''`` return must mean "the tool did not name one", never "the
+    parser did not reach the payload".
     """
     envelope = _unwrap_dispatch_envelope(result)
     for key in ('task_id', 'ticket'):

@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from _orch_helpers import mcp_tool_envelope
 
 # Column order is pinned, not merely presence: run_store.py:53-58 establishes
 # physical-column-order parity between a freshly-created DB and an ALTER-migrated
@@ -2694,18 +2695,44 @@ class _RoutingStubScheduler:
     ``calls`` records ``(name, arguments)`` for every dispatch, which is what lets a
     test assert NO ``submit_task`` ever reached the wire — the strongest available
     statement of "no duplicate was filed", stronger than counting rows afterwards.
+
+    RESPONSES ARE THE TOOL'S OWN PAYLOAD AND ARE WRAPPED IN THE PRODUCTION JSON-RPC
+    BODY BY CONSTRUCTION (:func:`_orch_helpers.mcp_tool_envelope`).  This class exists
+    to prove the COMPOSED path, and a double that answers with a bare ``{'task_id': …}``
+    silently stops proving it: the real transport nests the payload two layers down, so
+    a bare dict needs zero unwrap steps where production needs two.  A one-level
+    unwrapper in ``chronic_flake::_unwrap_dispatch_envelope`` passed this entire class
+    while returning ``''`` for every real ``submit_task`` — the exact seam defect the
+    class was written to catch.  Wrapping is the DEFAULT so a future test cannot
+    reintroduce the substitution by omission.
+
+    ``raw=True`` opts out, for the tests that drive a DELIBERATELY MALFORMED response —
+    there the response shape itself is the fixture and wrapping it would destroy the
+    thing under test.
     """
 
-    def __init__(self, responses: dict[str, object], raises: BaseException | None = None):
+    def __init__(
+        self,
+        responses: dict[str, object],
+        raises: BaseException | None = None,
+        *,
+        raw: bool = False,
+    ):
         self.responses = responses
         self.raises = raises
+        self.raw = raw
         self.calls: list[tuple[str, dict]] = []
 
     async def dispatch_tool(self, name, arguments, *, timeout=15):
         self.calls.append((name, arguments))
         if self.raises is not None:
             raise self.raises
-        return self.responses.get(name)
+        if name not in self.responses:
+            # An unconfigured tool answers with nothing at all — not an envelope
+            # carrying ``null``, which would assert a shape no test set up.
+            return None
+        payload = self.responses[name]
+        return payload if self.raw else mcp_tool_envelope(payload)
 
     @property
     def dispatched(self) -> list[str]:
@@ -2796,7 +2823,7 @@ class TestOpenDebtOverTheRealAdapter:
 
         db_path = tmp_path / 'runs.db'
         await self._seed(db_path)
-        scheduler = _RoutingStubScheduler({'get_statuses': envelope})
+        scheduler = _RoutingStubScheduler({'get_statuses': envelope}, raw=True)
 
         await open_debt(
             db_path,
