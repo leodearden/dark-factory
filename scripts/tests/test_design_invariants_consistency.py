@@ -2537,6 +2537,29 @@ def test_citation_scan_files_ignores_untracked_files(tmp_path: Path) -> None:
     assert tmp_path / "data" / "escalations" / "afk-digest.md" not in scanned
 
 
+def test_citation_scan_files_skips_index_entries_absent_from_the_worktree(
+    tmp_path: Path,
+) -> None:
+    """A deleted-but-tracked index entry must be dropped, not crash the scan.
+
+    `git ls-files` keeps listing a path after it is deleted from the working
+    tree — verified in a scratch repo, and routine in a mid-rebase or
+    mid-merge tree. Left unguarded, mapping every index entry straight to
+    `root / relative` hands `_live_citations`/`_live_alias_pairs` a path whose
+    `read_text` raises `FileNotFoundError`, crashing the guard for a reason
+    that has nothing to do with citation drift. Must FAIL against the step-2
+    walker, which performs no `is_file()` check.
+    """
+    _write_scan_tree(tmp_path, ["keep.md", "gone.md"])
+    (tmp_path / "gone.md").unlink()
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert scanned == [tmp_path / "keep.md"]
+    for path in scanned:
+        path.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # LIVE: the two repo-wide drift assertions
 #
