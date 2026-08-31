@@ -361,6 +361,32 @@ class TestEscapeIsReportedLoudly:
         assert result.passed is True
 
 
+@pytest.fixture
+def probe_spy():
+    """Count probes while leaving the LIVE helper running underneath.
+
+    Module-scoped rather than class-scoped because two classes need it —
+    ``TestEscapeProbeIsGated`` (the probe must not fire more often than the
+    latch allows) and ``TestLatchIsKeyedOnTheWorktreeBASE`` (it must fire
+    AGAIN when the base changes).  pytest resolves module-level fixtures for
+    tests in nested classes, so the requesting tests are unchanged.
+
+    Delegates rather than replaces on purpose: the records the surrounding
+    assertions read stay genuine measurements, so a test can pin the probe
+    COUNT and the emitted RECORD in the same run without either one being a
+    mock asserting against itself.
+    """
+    calls: list[Path] = []
+    real = verify._ruff_settings_path
+
+    def counting(worktree, target=None):
+        calls.append(Path(worktree))
+        return real(worktree, target)
+
+    with patch('orchestrator.verify._ruff_settings_path', new=counting):
+        yield calls
+
+
 class TestEscapeProbeIsGated:
     """The probe must fire on a RUFF LINT leg and nowhere else.
 
@@ -372,18 +398,6 @@ class TestEscapeProbeIsGated:
     spy that delegates to the live helper rather than replacing it — the record
     the other tests read stays genuine.
     """
-
-    @pytest.fixture
-    def probe_spy(self):
-        calls: list[Path] = []
-        real = verify._ruff_settings_path
-
-        def counting(worktree, target=None):
-            calls.append(Path(worktree))
-            return real(worktree, target)
-
-        with patch('orchestrator.verify._ruff_settings_path', new=counting):
-            yield calls
 
     @pytest.mark.asyncio
     async def test_non_ruff_lint_command_never_probes(
@@ -442,6 +456,86 @@ class TestEscapeProbeIsGated:
             )
 
         assert len(probe_spy) == 1, f'probed once per module: {probe_spy}'
+        assert len(_escape_records(caplog)) == 1
+
+
+class TestLatchIsKeyedOnTheWorktreeBASE:
+    """A recycled worktree PATH must be re-measured when its BASE changes.
+
+    Falsifies the premise the latch was built on, stated verbatim in the
+    comment above ``_RUFF_ESCAPE_REPORTED``: "The answer is a property of the
+    worktree's base, which cannot change under a running orchestrator."  It
+    can.  Worktree PATHS are recycled across bases within one orchestrator
+    process, by three distinct mechanisms:
+
+    * warm lanes — fixed directories ``<worktree_base>/_lane-<k>`` handed out
+      task after task by ``warm_lane_pool.py::WarmLanePool.try_acquire`` /
+      ``.release``, with ``git_ops.py::GitOps._reset_warm_lane`` re-pointing
+      the SAME dir at a different branch and commit via
+      ``git checkout -f -B <branch> <commit>``;
+    * the single persistent merge-verify worktree
+      (``git_ops.py::PERSISTENT_MERGE_WORKTREE_NAME``, a fixed
+      ``<worktree_base>/_merge-verify``), reset per merge commit;
+    * per-task directories reused when a task id recurs
+      (``git_ops.py::GitOps.create_worktree``'s reuse path).
+
+    So the path is not an identity for the question being asked.  Keying the
+    latch on it alone means the FIRST task to occupy a lane decides, for the
+    rest of the fleet-deploy window, whether every later task on that lane is
+    measured at all.  Both directions are pinned below because they fail
+    differently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sound_then_escaping_base_is_reported(
+        self, geometry, tmp_path, caplog,
+    ):
+        # The fleet-critical direction. A lane whose first task had a sound
+        # base latches SILENT, and every escaping task that later lands on
+        # that same lane inherits the silence — the diagnostic is suppressed
+        # for exactly the geometry it exists to report.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=True)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+            assert _escape_records(caplog) == [], 'a sound base must stay silent'
+
+            # The lane is re-pointed at a different base: same path, different
+            # root config. In production this is _reset_warm_lane's
+            # ``git checkout -f -B``; in-place rewrite is its local equivalent.
+            _write_project(worktree, 'wtproj', declares_ruff=False)
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        records = _escape_records(caplog)
+        assert len(records) == 1, (
+            f'the escaping base on the recycled path was not reported: {records}'
+        )
+        assert str(worktree) in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_escaping_then_sound_base_is_remeasured(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        # The opposite direction, and the reason this test asserts the PROBE
+        # COUNT rather than the record count: a latched key emits nothing
+        # either way, so "no second record" passes VACUOUSLY under the
+        # path-only key. The observable difference is that the second run must
+        # actually MEASURE the new base before concluding it is sound.
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+            assert len(_escape_records(caplog)) == 1
+
+            _write_project(worktree, 'wtproj', declares_ruff=True)
+            await _verify_with_stubbed_spawn(worktree, tmp_path, lint_rc=0)
+
+        assert len(probe_spy) == 2, (
+            f'the new base was never measured; the latch suppressed it: {probe_spy}'
+        )
+        # ...and having measured it, it is sound, so no SECOND record appears.
         assert len(_escape_records(caplog)) == 1
 
 
