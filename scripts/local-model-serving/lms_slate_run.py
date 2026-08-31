@@ -52,6 +52,7 @@ from pathlib import Path
 import lms_fetch_weights
 import lms_vram
 from lms_ctl import DEFAULT_READY_TIMEOUT_S
+from lms_healthcheck import HealthReport
 from lms_manifest import load_arms
 from lms_serve import REPO_ROOT
 
@@ -161,6 +162,32 @@ def part_path(parts_dir: str | Path, arm_id: str) -> Path:
     return Path(parts_dir) / f'{arm_id}.json'
 
 
+def part_is_complete(path: str | Path, arm_id: str) -> bool:
+    """True only when *path* is a usable part for *arm_id*.
+
+    Validated through the PRODUCER'S OWN pydantic model rather than an ad-hoc
+    key check, so a part and `lms_healthcheck` can never disagree about what a
+    report is: if the producer's schema changes, an old part stops validating
+    here and the arm is re-measured instead of silently reused.
+
+    The row's `arm_id` is checked against the one asked for rather than trusted
+    from the FILE NAME -- a mis-copied part would otherwise stand in for an arm
+    that was never measured.  Exactly one row, because a multi-row report is a
+    merged artifact, not a part; resuming off one would skip an arm whose row
+    came from somewhere else entirely.
+
+    Any failure returns False (re-run) and never propagates.  The common case
+    is the ordinary first run, where the file simply does not exist; the
+    interesting one is a half-written part from a killed sweep, which is what
+    a resume must fall through on rather than trust.
+    """
+    try:
+        report = HealthReport.model_validate_json(Path(path).read_text())
+    except (OSError, ValueError):
+        return False
+    return len(report.arms) == 1 and report.arms[0].arm_id == arm_id
+
+
 def ctl_argv(verb: str, arm_id: str, *extra: str) -> list[str]:
     """One `lms_ctl.py` invocation.
 
@@ -183,6 +210,7 @@ def sweep_arms(
     parts_dir: str | Path,
     *,
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
+    force: bool = False,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> list[tuple[str, str, int]]:
     """Sweep every arm the manifest commissions, one at a time.
@@ -196,6 +224,10 @@ def sweep_arms(
     list, so an eighth arm added to `arms.yaml` is swept without touching this
     file.
 
+    RESUMABLE: an arm that already has a valid part on disk is skipped
+    entirely, so a sweep killed at arm six re-measures one arm and not seven.
+    *force* re-measures every arm regardless.
+
     *runner* is the seam that keeps the tests offline: it defaults to
     `subprocess.run` and is injected as a recorder in `test_lms_slate_run.py`,
     so no test can start an arm or touch the card.
@@ -205,6 +237,13 @@ def sweep_arms(
     failures: list[tuple[str, str, int]] = []
 
     for arm in load_arms().arms:
+        existing = part_path(parts, arm.arm_id)
+        if not force and part_is_complete(existing, arm.arm_id):
+            # Named, not silent: a resumed sweep that quietly does less looks
+            # identical to one that measured everything.
+            print(f'\n=== {arm.arm_id} === SKIPPED, reusing {existing}', flush=True)
+            continue
+
         print(f'\n=== {arm.arm_id} ===', flush=True)
         try:
             started = runner(ctl_argv('start', arm.arm_id)).returncode
@@ -252,6 +291,7 @@ def run_slate(
     output: str | Path,
     *,
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
+    force: bool = False,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> int:
     """Sweep the slate, then assemble the artifact from the parts it produced.
@@ -259,7 +299,9 @@ def run_slate(
     *output* is the slate artifact path.  It is never written by this module --
     see the merge step for why that separation is load-bearing.
     """
-    failures = sweep_arms(parts_dir, ready_timeout=ready_timeout, runner=runner)
+    failures = sweep_arms(
+        parts_dir, ready_timeout=ready_timeout, force=force, runner=runner,
+    )
     for arm_id, stage, code in failures:
         print(f'lms_slate_run: {arm_id}: {stage} failed (exit {code})', file=sys.stderr)
     return 0
