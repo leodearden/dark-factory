@@ -93,16 +93,20 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     MergeLivenessAssessment,
     MergeLivenessConfigError,
     PersistentWorktreeConfigError,
+    SerialLaneAssessment,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_unreachable,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     _verify_host_unreachable_sentinel,
     acquire_chain_build_lane,
+    alarm_serial_lane_breach,
     check_merge_liveness_margin,
+    check_serial_lane_tripwire,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
+    per_host_inflight_bound,
     release_chain_build_lane,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
@@ -16201,6 +16205,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ItemLifecycleState.VERIFYING, live_obj=entry,
         )
         self._inflight.append(entry)
+
+        # ── PRD C4 / task 2930 η: serial-lane tripwire (DETECTION ONLY) ──
+        # Runs AFTER the append (never before) so no existing transition or
+        # append semantics shift and the just-appended entry IS counted.
+        #
+        # `_frozen_inflight_entries()`, not a raw `self._inflight` scan:
+        # `_finalize_inflight` pops the head via `_inflight_popleft` BEFORE
+        # awaiting the long verify, so an entry can still be verifying while
+        # absent from `_inflight`.  Counting `_inflight` alone would MISS
+        # exactly the overlap C4 exists to catch.  Reusing the helper also
+        # avoids restating the frozen-window definition (INV-5).
+        #
+        # `self._host_allocator.host_names` is a PROPERTY ACCESS, NOT A CALL.
+        # `HostAllocator.host_names` is decorated `@property`; writing
+        # `host_names()` raises `TypeError: 'list' object is not callable`,
+        # which the fail-open arm below would SWALLOW SILENTLY — the tripwire
+        # would be permanently dead in production while unit tests that leave
+        # `_host_allocator = None` still passed.  This expression is lifted
+        # VERBATIM from this file's own `snapshot()` occupancy block, `is not
+        # None` guard included.  test_merge_serial_lane_tripwire.py's
+        # `test_real_host_allocator_does_not_break_the_hook` is the regression
+        # guard that keeps it honest.
+        #
+        # `except Exception` fail-open: merge_queue.py is the #1-reliability
+        # file and a tripwire bug must never wedge dispatch.  Two corollaries
+        # worth stating out loud: (i) enforcement can NEVER be added here by
+        # making the alarm raise — this arm would swallow it silently; and
+        # (ii) any future edit inside the `try` must be covered by a test that
+        # exercises it with a real allocator, or it can rot invisibly.
+        #
+        # No hard block: the append already happened above; this block has no
+        # `return`, no `raise`, and no veto.
+        try:
+            _local = sum(
+                1 for _e in self._frozen_inflight_entries()
+                if getattr(_e.lease, 'is_local', False)
+            )
+            _hosts = (
+                len(self._host_allocator.host_names)
+                if self._host_allocator is not None else 1
+            )
+            alarm_serial_lane_breach(
+                check_serial_lane_tripwire(
+                    _local,
+                    merge_ahead_bound=self._speculation_depth,
+                    num_hosts=_hosts,
+                ),
+                event_store=self._event_store,
+                task_id=entry.item.request.task_id,
+                branch=entry.item.request.branch.bare_id,
+                request_id=entry.item.request.request_id,
+                host=getattr(entry.lease, 'name', None),
+            )
+        except Exception:
+            logger.warning('serial-lane tripwire check failed', exc_info=True)
 
     def _inflight_popleft(self) -> InflightEntry:
         """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).

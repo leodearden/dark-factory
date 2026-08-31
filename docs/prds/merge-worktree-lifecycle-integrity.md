@@ -135,4 +135,4 @@ Dispatching a second concurrent *local* merge verify while `_MERGE_AHEAD_BOUND`-
 1. **Reject error-code string + payload field names** — align with existing MCP error envelope conventions. Decide in δ.
 2. **`RemovalOutcome` representation** (enum vs str literals) — match git_ops house style. Decide in α.
 3. **Registry keying** — `branch.bare_id` vs full ref for the recovery path; confirm 1604's existing key. Decide in γ.
-4. **C4 event name** (`merge_serial_lane_violation`?) — match EventType naming. Decide in η.
+4. **C4 event name** — RESOLVED in η (task 2930): `EventType.merge_serial_lane_breached`. The tentative `merge_serial_lane_violation` was rejected: no member of the `EventType` enum contains `violation`, `tripwire`, or `guard`; the house shape is `<subject>_<past-participle-outcome>` and every guard/detection precedent uses a participle or condition suffix (`merge_blocked`, `merge_flake_suppressed`, `verify_cross_check_mismatch`, `external_dep_gate_held`, `dispatch_deferred`, `recovery_vetoed`, `verdict_voided`). Sole emit site: `merge_liveness.alarm_serial_lane_breach`, reached from `SpeculativeMergeWorker._inflight_append`.
