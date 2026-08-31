@@ -729,26 +729,30 @@ uv run --project orchestrator orchestrator check-config \
     --config /path/to/dark-factory-orchestrator.yaml
 ```
 
-Three outcomes:
+Exit codes:
 
-- exit **1** — at least one genuinely-unknown key was found;
-- exit **1** — the file could not be read or parsed **at all**: malformed
-  YAML, a directory, an unreadable file (permission-denied, or bytes that
-  are not valid UTF-8), or a top-level document that is not a mapping. A
-  census of nothing is not a clean census, so the gate refuses to print
-  `OK` and instead names the file and the underlying fault (a YAML error
-  renders line and column);
-- exit **0** — otherwise, *including* when excused keys were listed, and
-  including a legitimately **empty** project YAML (which means "use all
-  defaults").
+| Code | Meaning |
+|---|---|
+| **0** | No unknown keys and no *hard* ignore-entry findings. Excused keys and **advisory** findings are still listed — they are exit-neutral. A legitimately **empty** project YAML (meaning "use all defaults") is a clean result and lands here. |
+| **1** | At least one genuinely-unknown key, **or** the file could not be read or parsed *at all*. **Dominates 2** when both are present, so the two signals stay distinguishable to a caller. |
+| **2** | No unknown keys, but at least one **hard** ignore-entry finding (see *Auditing the reasons* below). |
+
+The unparseable half of exit **1** covers malformed YAML, a directory, an
+unreadable file (permission-denied, or bytes that are not valid UTF-8), and
+a top-level document that is not a mapping. A census of nothing is not a
+clean census, so the gate refuses to print `OK` and instead names the file
+and the underlying fault (a YAML error renders line and column). It returns
+there **before** the excused-key listing and the ignore-entry audit alike —
+both are vacuous for a file that was never parsed.
 
 It calls the census directly rather than building a validated config, so it
 still reports phantom keys when the config has an unrelated value-level
 validation error that a full load would raise on first.
 
-The second case is what makes "Verify with `check-config` first" (under
-[Clearing the escalation](#clearing-the-escalation), below) trustworthy:
-the gate speaks for a config only when it actually inspected one.
+That fail-closed behaviour is what makes "Verify with `check-config`
+first" (under [Clearing the escalation](#clearing-the-escalation), below)
+trustworthy: the gate speaks for a config only when it actually inspected
+one.
 
 Each unknown key may carry a placement hint (`→ did you mean
 git.spare_warm_lanes?`). **Hints are advisory**: a hint is a *name* match
@@ -768,22 +772,104 @@ at the same point in the walk:
 | Reserved `x_` / `x-` name prefix | any depth, case-insensitive, no config ceremony | **new** non-orchestrator knobs — mirrors the task-metadata Tier-C `x_` namespace in `docs/task-authoring.md` |
 | `config_key_census.ignore` | dotted paths in the same YAML, fnmatch globs | **existing** key names other tooling already greps for, where renaming would be a breaking change |
 
+An ignore entry is an **assertion** that some non-orchestrator consumer
+reads the key, so it must carry a `reason:` naming that consumer:
+
 ```yaml
 config_key_census:
   ignore:
-    - 'cpu_governance.*'      # `*` spans dots → whole namespace
-    - 'fairness.scheduler_v2' # exact path
-    - 'warm_lane_pool'        # top-level dict key — MUST be exact
+    - path: 'cpu_governance.*'      # `*` spans dots → whole namespace
+      reason: read verbatim by scripts/cpu-governed-exec.sh
+    - path: 'warm_lane_pool'        # top-level dict key — MUST be exact
+      reason: temporary — pending #5908, which deletes this entry
+    - 'fairness.scheduler_v2'       # bare form: accepted, reports as debt
 ```
 
 > **fnmatch trap:** `<name>.*` does **not** match the bare parent key
 > `<name>`. Opting out a top-level dict key requires listing it exactly.
 > Getting this wrong leaves the L2 firing.
 
-Excused keys are still **listed by `check-config`** with their reason (at
-exit 0) and reported as `ignored_config_keys` by `reload_config`, so an
-over-broad glob stays auditable instead of becoming an invisible blind
+> **Order matters:** matching is **first-match-wins**, so a specific entry
+> listed before a broad glob keeps its own reason.
+
+Excused keys are **listed by `check-config`** with both their
+classification label (`reserved prefix` / `config_key_census.ignore`) and
+the operator `reason:` you wrote — or an explicit `no reason given
+(undocumented debt)` marker when there is none — and reported as
+`ignored_config_keys` by `reload_config` (the reason travels as `note`), so
+an over-broad glob stays auditable instead of becoming an invisible blind
 spot.
+
+### Auditing the reasons
+
+A bare-string entry is an **unfalsifiable** claim: nothing re-checks it, and
+the grammar cannot express "temporary, until task X lands". `check-config`
+therefore grades every reason. The citation grammar and this taxonomy are
+adopted from reify's `docs/prds/reify-audit-ptodo-detector.md` §8 rather
+than invented separately; `skills/review-briefing/SKILL.md` states the same
+invariant in prose.
+
+The canonical citation form is **`#NNNN`**, strictly.
+
+| Kind | Trigger | Severity |
+|---|---|---|
+| `unreasoned` | bare string, or a blank `reason:` | advisory |
+| `malformed-cite` | only a non-canonical form (`task 5908`, `task-5`) | advisory |
+| `unknown-id` | `#NNNN` parses but the id is absent from the task DB | advisory |
+| `parked-on-anchor` | cited task is non-terminal but `metadata.do_not_complete` | advisory |
+| `self-refuting` | the reason names dark-factory / the orchestrator / `OrchestratorConfig` as the consumer | **hard** |
+| `missing-cite` | not-yet-landed prose (`pending`, `until … lands`, `will be …`) with no `#NNNN` | **hard** |
+| `orphaned` | every cited task has closed (`done` / `cancelled`) | **hard** |
+
+Advisory kinds are exit-neutral **by design**: the grandfathered bare
+entries surface as visible debt without turning a currently-green config
+red on upgrade, and a task-DB sync artifact (`unknown-id`) can never
+hard-fail a gate.
+
+**Why `self-refuting` is rejected outright.** dark-factory owns the schema,
+so a key dark-factory consumed would be a *field on the model*, hence
+classified `known`, hence never in need of an ignore entry. Membership in
+the ignore list therefore **proves** dark-factory does not read the key —
+an entry claiming otherwise is wrong by construction. The remedy is the
+schema-field route: add the key to the model, don't excuse it. This is the
+check that *could* have caught reify's `cpu_governance.DF_AGENT_CPU_GOVERN`
+weeks before the outage was found by hand — but only under two conditions
+that do not hold today: the reasoned form would have to be **mandatory**
+(that entry is a bare string, so as shipped it grades `unreasoned`, advisory,
+and nothing else), and its author would have to have written a reason that
+names dark-factory as the consumer. The grader reads the `reason:` prose
+only — never the key name — so a `DF_`-prefixed key is never itself the
+evidence.
+
+**Why an orphaned citation is its own diagnostic** (and exit **2**) rather
+than being reclassified as an `unknown` key: reclassifying would wire an
+unrelated task-status change into a gate that can hard-fail orchestrator
+startup, and would make the census signature non-deterministic w.r.t. the
+YAML — the same file would produce different signatures on different days,
+re-filing the L2 as statuses move. The census stays a **pure function of
+the config file**; the born-at-L2 stays keyed on unknown keys alone.
+
+**When the task DB is unavailable** — no `project_root`, or a machine
+without that project's `.taskmaster/tasks/tasks.db`, which is the normal
+case when linting another project's YAML — the liveness kinds
+(`orphaned` / `unknown-id` / `parked-on-anchor`) simply **do not fire**,
+while the structural kinds are still reported in full. Absence means
+"cannot know", never "clean"; a breadcrumb names the path that was looked
+for. The audit is loudest where it knows most, never where it knows least.
+
+`load_config` logs a WARNING for **hard** findings on every startup and
+every hot-reload. Advisory findings are deliberately not logged there — a
+warning that always fires is one operators learn to ignore.
+
+### The sanctioned alternative: `verify_env`
+
+Before adding an ignore entry at all, check whether the value belongs in
+`verify_env:`. It is a **dict DATA field**, so `_walk_unknown_keys`
+deliberately does not descend into it — arbitrary keys there are operator
+data, never phantom keys. A value a project wants handed to
+framework-spawned processes belongs there rather than as a bespoke
+top-level key that then needs excusing. reify already carries ~10 custom
+keys under `verify_env:` with no census entries and no noise.
 
 ### Worked example: a mixed-consumer namespace
 
@@ -800,6 +886,15 @@ it correctly — the top-level key is an unrelated reify-owned *dict*.
 Following the hint would feed a dict to a bool field and hard-fail config
 validation, taking the unit down. It belongs in the allowlist (listed
 exactly), not moved.
+
+Its five entries are all still the **bare** form, so `check-config` reports
+them as `unreasoned` debt (advisory — exit stays 0). That cleanup is owned
+by reify task **#5908**, which deletes `cpu_governance.DF_AGENT_CPU_GOVERN`
+outright — the entry asserted dark-factory did not read the key while it
+was added in the expectation that it would, which is what made the
+CPU-governance outage permanent and silent — and gives the remaining
+`cpu_governance.*` entries real reasons. dark-factory ships the mechanism
+only; it does not edit reify's YAML.
 
 ### Clearing the escalation
 

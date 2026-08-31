@@ -29,6 +29,16 @@ from pydantic_settings import (
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
+# Strictly one-way (config -> config_census_ignore): the census-ignore grammar
+# and audit are kept OUT of this already-oversized module, and that module
+# depends only on stdlib plus shared/, so there is no cycle.
+from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for the drift test)
+    CENSUS_IGNORE_ENTRY_KEYS,
+    HARD_KINDS,
+    CensusIgnoreSpec,
+    audit_census_ignore_entries,
+    parse_census_ignore_entries,
+)
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
 logger = logging.getLogger(__name__)
@@ -2804,12 +2814,25 @@ class ConfigIgnoredKey(NamedTuple):
 
     Ignored keys are excluded from ``.unknown`` and therefore from the census
     signature and the born-at-L2, but are still reported informationally by
-    ``orchestrator check-config`` (at exit 0) so an over-broad glob stays
-    auditable rather than becoming an invisible blind spot.
+    ``orchestrator check-config`` so an over-broad glob stays auditable rather
+    than becoming an invisible blind spot.
+
+    ``note`` is the OPERATOR's justification — the ``reason:`` text of the
+    matching ``config_key_census.ignore`` entry, naming who actually consumes
+    the key (task 3395).  It is ``None`` for a reserved-prefix key (nobody
+    asserted anything about it) and for an un-reasoned bare-string entry, which
+    ``check-config`` then reports as debt.  Do not confuse it with ``reason``
+    above, which is the CLASSIFICATION label.
+
+    ``note`` is deliberately appended LAST and DEFAULTED so every existing
+    two-argument construction and tuple-equality assertion stays valid, and so
+    ``harness.py``'s ``ik._asdict()`` carries it into the hot-reload report
+    with no harness change.
     """
 
     path: str
     reason: str
+    note: str | None = None
 
 
 class ConfigKeyCensus(NamedTuple):
@@ -2837,6 +2860,43 @@ class ConfigKeyCensus(NamedTuple):
     parse_error: str | None = None
 
 
+class CensusIgnoreEntry(BaseModel):
+    """The REASONED form of a ``config_key_census.ignore`` entry (task 3395).
+
+    An ignore entry is an ASSERTION that some non-OrchestratorConfig consumer
+    reads the key.  In the bare-string form that assertion is unfalsifiable and
+    never re-checked — the failure mode behind reify's
+    ``cpu_governance.DF_AGENT_CPU_GOVERN`` entry, which was added on the
+    expectation that dark-factory eventually WOULD read the key and thereby
+    made the resulting outage permanent and silent.
+
+    ``reason`` names the actual consumer, so the claim can be checked by a
+    reader and audited by ``audit_census_ignore_entries``.
+
+    NOTE the field names here are pinned to
+    ``config_census_ignore.CENSUS_IGNORE_ENTRY_KEYS`` by a drift test: the raw
+    tree parser cannot use this validated model (it must keep working when the
+    config has an unrelated value-level validation error), so the two sites
+    must agree byte-for-byte on the key names.
+    """
+
+    path: str = Field(
+        description='Dotted key path, matched with fnmatch.fnmatchcase (globs allowed).'
+    )
+    reason: str = Field(
+        description=(
+            'Who actually consumes this key, e.g. "read verbatim by '
+            'scripts/cpu-governed-exec.sh". If the consumer has NOT landed yet, '
+            'the reason MUST cite its tracking task in the canonical form #NNNN '
+            '— an uncited "pending" claim has no expiry and cannot be audited. '
+            'A reason naming dark-factory / the orchestrator / OrchestratorConfig '
+            'as the consumer is rejected outright: dark-factory owns the schema, '
+            'so a key it consumed would be a FIELD on the model and would never '
+            'need excusing.'
+        )
+    )
+
+
 class ConfigKeyCensusConfig(BaseModel):
     """Operator escape hatch for the unknown-config-key census.
 
@@ -2846,18 +2906,26 @@ class ConfigKeyCensusConfig(BaseModel):
     trade one born-at-L2 for another.
     """
 
-    ignore: list[str] = Field(
+    ignore: list[str | CensusIgnoreEntry] = Field(
         default_factory=list,
         description=(
             'Dotted paths of project-YAML keys that are deliberately present for '
             'NON-OrchestratorConfig consumers (e.g. keys read by the project\'s own '
             'scripts) and must therefore not be reported as unknown config keys. '
+            'PREFER the reasoned mapping form `{path: <glob>, reason: <who reads '
+            'it>}`: an entry is an assertion about a consumer, and a bare string '
+            'makes that assertion unfalsifiable. A bare string is still accepted '
+            'for back-compat but reports as un-reasoned DEBT in check-config. If '
+            'the consumer has not landed yet, the reason must cite its tracking '
+            'task as `#NNNN` so the entry can be re-checked when that task closes '
+            '— an uncited "pending" reason is a hard finding. '
             'Entries are matched against the dotted key path with '
             'fnmatch.fnmatchcase, so shell-style globs work — NOTE that `*` spans '
             'dots, so `cpu_governance.*` opts out that whole namespace. The '
             'converse fnmatch trap: `<name>.*` does NOT match the bare parent key '
             '`<name>`, so opting out a top-level dict key requires listing it '
-            'exactly. Prefer renaming a new non-orchestrator knob under the '
+            'exactly. Matching is FIRST-match-wins, so source order is '
+            'load-bearing. Prefer renaming a new non-orchestrator knob under the '
             'reserved `x_`/`x-` prefix (auto-excused at any depth, no config '
             'ceremony) and reserve this list for existing key names that other '
             'tooling already greps for.'
@@ -5021,7 +5089,7 @@ def _walk_unknown_keys(
     model_cls: type[BaseModel],
     prefix: str,
     shadow_index: dict[str, list[str]],
-    ignore_patterns: tuple[str, ...],
+    ignore_specs: tuple[CensusIgnoreSpec, ...],
     ignored: list[ConfigIgnoredKey],
 ) -> list[ConfigUnknownKey]:
     """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
@@ -5049,9 +5117,20 @@ def _walk_unknown_keys(
         match = fields_lower.get(key_lower)
         if match is None:
             if key_lower.startswith(_CENSUS_RESERVED_PREFIXES):
-                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix'))
-            elif any(fnmatch.fnmatchcase(dotted, pat) for pat in ignore_patterns):
-                ignored.append(ConfigIgnoredKey(dotted, 'allowlist'))
+                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix', None))
+            elif (
+                spec := next(
+                    (
+                        s
+                        for s in ignore_specs
+                        if fnmatch.fnmatchcase(dotted, s.pattern)
+                    ),
+                    None,
+                )
+            ) is not None:
+                # FIRST match wins, so a specific entry's justification is never
+                # overwritten by a broader glob listed after it.
+                ignored.append(ConfigIgnoredKey(dotted, 'allowlist', spec.reason))
             else:
                 candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
                 hint = ' or '.join(candidates) if candidates else None
@@ -5062,29 +5141,28 @@ def _walk_unknown_keys(
         if sub is not None and isinstance(value, dict):
             unknown.extend(
                 _walk_unknown_keys(
-                    value, sub, dotted + '.', shadow_index, ignore_patterns, ignored
+                    value, sub, dotted + '.', shadow_index, ignore_specs, ignored
                 )
             )
     return unknown
 
 
-def _census_ignore_patterns(tree: dict[Any, Any]) -> tuple[str, ...]:
+def _census_ignore_specs(tree: dict[Any, Any]) -> tuple[CensusIgnoreSpec, ...]:
     """Read ``config_key_census.ignore`` off the RAW project tree, fail-open.
 
     Read from the raw tree rather than a validated OrchestratorConfig so the
     census keeps working when the config has an unrelated value-level validation
     error (the same reason check-config calls the census directly).  A malformed
-    hatch — non-dict block, non-list ``ignore``, non-str entries — degrades to
-    "no allowlist" instead of raising: a broken escape hatch must never take out
-    the census that surfaces real phantom keys.
+    hatch — non-dict block, non-list ``ignore``, non-str/non-mapping entries —
+    degrades to "no allowlist" instead of raising: a broken escape hatch must
+    never take out the census that surfaces real phantom keys.
+
+    Thin adapter over ``parse_census_ignore_entries`` so there is still exactly
+    ONE reader of ``config_key_census.ignore`` off the raw tree; the grammar
+    (bare string vs reasoned ``{path, reason}`` mapping) lives in
+    ``config_census_ignore``.
     """
-    block = tree.get('config_key_census')
-    if not isinstance(block, dict):
-        return ()
-    raw = block.get('ignore')
-    if not isinstance(raw, list):
-        return ()
-    return tuple(entry for entry in raw if isinstance(entry, str))
+    return tuple(parse_census_ignore_entries(tree))
 
 
 def census_config_keys(config_path: Path) -> ConfigKeyCensus:
@@ -5136,7 +5214,7 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     ignored: list[ConfigIgnoredKey] = []
     unknown = _walk_unknown_keys(
         tree, OrchestratorConfig, '', shadow_index,
-        _census_ignore_patterns(tree), ignored,
+        _census_ignore_specs(tree), ignored,
     )
     return ConfigKeyCensus(unknown, ignored)
 
@@ -5257,6 +5335,44 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 uk.path + (f' (did you mean {uk.shadow_hint}?)' if uk.shadow_hint else '')
                 for uk in census
             ),
+        )
+
+    # An ignore entry is an ASSERTION about a non-orchestrator consumer that is
+    # otherwise never re-checked (task 3395).  Warn on HARD findings only —
+    # advisory ones (un-reasoned grandfathered entries in particular) would fire
+    # on every startup of an already-green unit, and a warning that always fires
+    # is one operators learn to ignore.
+    #
+    # This ONE call site covers startup AND hot-reload: Harness.reload_config
+    # obtains its `fresh` config from load_config, so no harness.py edit is
+    # needed for the loud path (nor for the reload report — ConfigIgnoredKey's
+    # new `note` rides along via the existing ik._asdict()).  The born-at-L2
+    # deliberately stays keyed on unknown keys ALONE, per the L2-decoupling
+    # decision: an unrelated task-status change must never be able to shift the
+    # census signature or hard-fail startup.
+    try:
+        hard_findings = [
+            f for f in audit_census_ignore_entries(config_path) if f.kind in HARD_KINDS
+        ]
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately broad but ALWAYS logged at WARNING, never a silent
+        # swallow (which is what shared/tests/test_silent_fallthrough_gate.py
+        # ratchets against).  Breadth is the point here: load_config runs on
+        # every startup and every hot-reload, and no defect in an advisory lint
+        # may be allowed to take either down — while the degradation still
+        # announces itself.
+        logger.warning(
+            'Config %s: census-ignore audit failed (%s) — entry findings SKIPPED',
+            config_path, exc,
+        )
+        hard_findings = []
+    if hard_findings:
+        logger.warning(
+            'Config %s has %d config_key_census.ignore entry finding(s) that '
+            'need action: %s',
+            config_path,
+            len(hard_findings),
+            '; '.join(f'{f.kind}: {f.detail}' for f in hard_findings),
         )
     return config
 

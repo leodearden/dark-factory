@@ -480,15 +480,24 @@ fairness:
 # a whole namespace.  TRAP: `<name>.*` does NOT match the bare parent key
 # `<name>`, so a top-level dict key must be listed EXACTLY.
 #
-# Excused keys stay listed by check-config (at exit 0) and in reload_config's
+# Excused keys stay listed by check-config and in reload_config's
 # `ignored_config_keys`, so an over-broad glob remains auditable.
+#
+# PREFER the reasoned mapping form.  An entry is an ASSERTION that some
+# non-orchestrator consumer reads the key; a bare string makes that assertion
+# unfalsifiable and nothing ever re-checks it.  A bare string still works but
+# check-config reports it as un-reasoned DEBT (advisory, exit 0).  If the
+# consumer has NOT landed yet, the reason MUST cite its tracking task as
+# `#NNNN` — an uncited "pending" claim has no expiry (hard finding, exit 2).
 # See OPERATIONS.md §6a.
 config_key_census:
   ignore: []
   # ignore:
-  #   - 'cpu_governance.*'       # whole namespace
-  #   - 'fairness.scheduler_v2'  # exact path
-  #   - 'warm_lane_pool'         # top-level dict key — must be exact
+  #   - path: 'cpu_governance.*'          # whole namespace
+  #     reason: read verbatim by scripts/cpu-governed-exec.sh
+  #   - path: 'warm_lane_pool'            # top-level dict key — must be exact
+  #     reason: temporary — pending #5908, which deletes this entry
+  #   - 'fairness.scheduler_v2'           # bare form: accepted, reports as debt
 
 # Starvation watchdog (task 1880).
 #
