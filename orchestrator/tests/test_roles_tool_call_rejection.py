@@ -41,7 +41,10 @@ constant's prose, never a regex over wording, never a byte-size figure.
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.agents.roles import (
+    _TOOL_CALL_REJECTION_KNOWN_SHAPES,
     BACKGROUND_WAIT_GUIDANCE,
     MISSING_REQUIRED_PARAMETER_REJECTION,
     ROLES,
@@ -277,14 +280,37 @@ def test_guidance_placement_is_structural() -> None:
 
 
 def test_missing_required_parameter_shape_is_composed_into_the_splice_unit() -> None:
-    """``TOOL_CALL_REJECTION_GUIDANCE`` carries the third shape too.
+    """``TOOL_CALL_REJECTION_GUIDANCE`` carries BOTH composed halves.
 
-    Mirrors `test_combined_guidance_composes_both_rules`. The composed
-    constant is the SINGLE splice unit and the two halves must never be
-    spliced apart: a role that received only the two known shapes would
-    mis-route a missing-required-parameter rejection into the deferred-tool
-    bullet, which is the exact confusion this task closes.
+    Mirrors `test_combined_guidance_composes_both_rules`, which asserts BOTH
+    halves of its splice unit rather than only the newer one. An
+    earlier revision of this test pinned only the new half: a future prompt
+    refactor could empty or drop `_TOOL_CALL_REJECTION_KNOWN_SHAPES` and
+    every other test in this module would stay green —
+    `test_tool_call_rejection_guidance_is_nonempty` passes because the new
+    half alone keeps the composed constant non-empty, and every per-role
+    containment/count/placement test compares against whatever
+    `TOOL_CALL_REJECTION_GUIDANCE` currently is. That would silently delete
+    the two original census-4273 shapes from all 8 role prompts with green
+    CI — the exact silent-removal regression this module's docstring names
+    as its motivating risk. Both halves are asserted here so neither can be
+    dropped unnoticed.
     """
+    assert _TOOL_CALL_REJECTION_KNOWN_SHAPES.strip(), (
+        '_TOOL_CALL_REJECTION_KNOWN_SHAPES is empty. The containment '
+        'assertion below still passes when it is — the empty string is a '
+        'substring of anything — so this assertion is the sole guard '
+        'against the census-4273 shapes being silently dropped from the '
+        'splice unit.'
+    )
+    assert _TOOL_CALL_REJECTION_KNOWN_SHAPES in TOOL_CALL_REJECTION_GUIDANCE, (
+        'TOOL_CALL_REJECTION_GUIDANCE no longer contains '
+        '_TOOL_CALL_REJECTION_KNOWN_SHAPES. The composed halves must NEVER be '
+        'spliced apart: dropping this half would silently remove the '
+        'census-4273 shapes (unparseable JSON, deferred-tool parameter) from '
+        'every spliced role while every other test in this module stayed '
+        'green.'
+    )
     assert MISSING_REQUIRED_PARAMETER_REJECTION in TOOL_CALL_REJECTION_GUIDANCE, (
         'TOOL_CALL_REJECTION_GUIDANCE no longer contains '
         'MISSING_REQUIRED_PARAMETER_REJECTION. The two halves must NEVER be '
@@ -318,6 +344,34 @@ def test_missing_required_parameter_shape_appears_exactly_once_per_role() -> Non
         'TOOL_CALL_REJECTION_GUIDANCE splice itself is missing from that role; '
         'a count of 2 means a stale bare `+ MISSING_REQUIRED_PARAMETER_REJECTION` '
         'tail survives beside it — delete the tail, it is now redundant.'
+    )
+
+
+@pytest.mark.parametrize(
+    'name',
+    ['_TOOL_CALL_REJECTION_KNOWN_SHAPES', 'MISSING_REQUIRED_PARAMETER_REJECTION'],
+)
+def test_tool_call_rejection_halves_have_no_literal_braces(name: str) -> None:
+    """No literal ``{``/``}`` in EITHER half of the splice unit.
+
+    Mirrors `test_wait_pattern_constants_have_no_literal_braces`. The
+    pre-existing brace check in this module (see
+    `test_missing_required_parameter_shape_is_a_nonempty_brace_free_constant`)
+    covered only `MISSING_REQUIRED_PARAMETER_REJECTION`, leaving
+    `_TOOL_CALL_REJECTION_KNOWN_SHAPES` unchecked even though it reaches the
+    same 8 role prompts by the same plain `+` concatenation. Parametrizing
+    over both halves closes that asymmetry.
+    """
+    value = {
+        '_TOOL_CALL_REJECTION_KNOWN_SHAPES': _TOOL_CALL_REJECTION_KNOWN_SHAPES,
+        'MISSING_REQUIRED_PARAMETER_REJECTION': MISSING_REQUIRED_PARAMETER_REJECTION,
+    }[name]
+
+    assert '{' not in value and '}' not in value, (
+        f'{name} contains a literal brace. Role prompts are deliberately not '
+        'f-strings, but both halves of TOOL_CALL_REJECTION_GUIDANCE are held '
+        'brace-free defensively so the splice unit stays interpolation-safe '
+        'if a future site needs it.'
     )
 
 
