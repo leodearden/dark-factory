@@ -5397,3 +5397,245 @@ async def test_unblock_metadata_failure_does_not_downgrade_applied(
         if r.name == 'fused_memory.reconciliation.targeted' and r.levelno >= logging.WARNING
     ]
     assert warns, 'Expected a warning logged for the metadata-stamp failure'
+
+
+# ── task-4903: the metadata stamp must be CLASSIFIED, not just try/except'd ──
+#
+# ``TaskInterceptor.update_task``'s gates do NOT raise: the _backlog_gate
+# BacklogVerdict, the lock-charter rejection and the write-authority floor all
+# return early with a rejection dict. A bare ``try/except Exception`` around
+# the stamp therefore sees nothing under a deep reconciliation backlog --
+# exactly the condition under which this sweep is most likely to run -- and
+# the action still claims ``dependent_unblock_applied`` with no warning and no
+# journal row. ``interceptor_write_succeeded`` is the module's single
+# sanctioned classifier (task_interceptor.py::interceptor_write_succeeded).
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_gate_rejection_is_not_reported_as_stamped(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, caplog,
+):
+    """A gate rejection of the metadata stamp must be classified, not swallowed.
+
+    ``BacklogVerdict.to_error_dict()`` (recon_write_policy.py::BacklogVerdict)
+    returns ``{'error': <rendered msg>, 'error_type': 'ReconciliationBacklog
+    Exceeded', ...}`` -- note there is **no** ``success`` key, and it does not
+    raise, so the helper's ``try/except`` catches nothing.
+
+    The status flip itself genuinely landed, so the action must stay
+    ``dependent_unblock_applied`` (the contract pinned by
+    ``test_unblock_metadata_failure_does_not_downgrade_applied``) -- but it
+    must additionally carry ``metadata_stamp='rejected'`` so the audit does
+    not overstate what landed.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(return_value={
+        'error': 'ReconciliationBacklogExceeded: backlog depth 512 exceeds limit',
+        'error_type': 'ReconciliationBacklogExceeded',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A rejected metadata stamp must not downgrade a landed status flip, '
+        f'got: {actions[0]!r}'
+    )
+    assert actions[0].get('metadata_stamp') == 'rejected', (
+        f'Expected metadata_stamp="rejected" so the audit does not claim the '
+        f'stamp landed, got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    detail = stamp_skips[0]['detail']
+    assert detail.get('task_id') == '2', f'Expected task_id="2", got: {detail!r}'
+    assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+        f'Expected the stable error_type code (preferred over the rendered '
+        f'error message), got: {detail!r}'
+    )
+
+    warns = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.targeted' and r.levelno >= logging.WARNING
+    ]
+    assert warns, 'Expected a warning logged for the rejected metadata stamp'
+
+    # The status write is entirely unaffected by the stamp rejection.
+    status_writes = [
+        a for a in journal_actions
+        if a['action_type'] == 'write' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert len(status_writes) == 1, (
+        f'Expected exactly one write/set_task_status row, got: {status_writes}'
+    )
+    status_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert not status_skips, (
+        f'A metadata-stamp rejection must not emit a set_task_status skip row, '
+        f'got: {status_skips}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_success_writes_journal_row(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """The symmetric positive row: a landed stamp gets its own 'write' row.
+
+    ``metadata_stamp`` is a pure exception-signal -- absent when the stamp
+    landed, mirroring ``hints_attached``, which carries no status field
+    (targeted.py, task 1136/1184).
+    """
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'Expected dependent_unblock_applied, got: {actions[0]!r}'
+    )
+    assert 'metadata_stamp' not in actions[0], (
+        f'metadata_stamp must be absent when the stamp landed, got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_writes = [
+        a for a in journal_actions
+        if a['action_type'] == 'write' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_writes) == 1, (
+        f'Expected exactly one write/update_task row, got: {stamp_writes}'
+    )
+    detail = stamp_writes[0]['detail']
+    assert detail.get('task_id') == '2', f'Expected task_id="2", got: {detail!r}'
+    assert detail.get('satisfied_by') == '1', (
+        f'Expected satisfied_by="1", got: {detail!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_exception_marks_action(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, caplog,
+):
+    """A *raising* stamp is marked 'failed' -- deliberately distinct from the
+    'rejected' marker a gate rejection produces, so an operator can tell an
+    infrastructure fault apart from a policy refusal.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(
+        side_effect=RuntimeError('db locked'),
+    )
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A raising metadata stamp must not downgrade a landed status flip, '
+        f'got: {actions[0]!r}'
+    )
+    assert actions[0].get('metadata_stamp') == 'failed', (
+        f'Expected metadata_stamp="failed" (distinct from "rejected"), '
+        f'got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    assert 'db locked' in str(stamp_skips[0]['detail'].get('error')), (
+        f'Expected the exception text in the skip row, '
+        f'got: {stamp_skips[0]["detail"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """A non-dict response is always a failure.
+
+    ``interceptor_write_succeeded(None)`` is False -- the contract is
+    centralised at task_interceptor.py::interceptor_write_succeeded, and a
+    hand-rolled truthiness check would misclassify it.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(return_value=None)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0].get('metadata_stamp') == 'rejected', (
+        f'A non-dict update_task response must classify as rejected, '
+        f'got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    assert stamp_skips[0]['detail'].get('error') == 'unknown', (
+        f"Expected the 'unknown' fallback for a non-dict response, "
+        f'got: {stamp_skips[0]["detail"]!r}'
+    )
