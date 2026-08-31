@@ -1284,7 +1284,12 @@ class TestRetryUntilObserved:
         """
         from _fm_helpers import retry_until_observed
 
-        with pytest.raises(AssertionError, match='7'):
+        # match=r'in 7 attempt\(s\)', not a bare '7': a lone digit matches
+        # anywhere in the message -- a timeout value, a count of something
+        # else, a future prefix -- so it would pass on a message that had
+        # stopped naming the ATTEMPT COUNT, which is the only thing this test
+        # exists to pin.
+        with pytest.raises(AssertionError, match=r'in 7 attempt\(s\)'):
             await retry_until_observed(lambda: None, attempts=7)
 
     @pytest.mark.asyncio
@@ -1326,6 +1331,78 @@ class TestRetryUntilObserved:
 
         assert log == ['observe', 'observe', 'observe'], (
             f'expected exactly 3 observations with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_observe_propagates_instead_of_counting_as_a_miss(self):
+        """A raising `observe` propagates on the spot; it is NOT absorbed as a falsy observation.
+
+        This is the contract the motivating live call site's SECOND durable
+        job rests on. There, `observe` reads `CALL db.indexes()` and raises
+        IndexHeaderError when FalkorDB no longer exposes the label/types/status
+        columns the barriers depend on. Absorbing that as an ordinary miss
+        would spend the whole attempt budget re-opening a window nobody can
+        read, and then report the FIRST durable job's diagnosis ("FalkorDB
+        stopped rebuilding the merged index in place") for a completely
+        different defect -- the two-modes-one-string collapse IndexHeaderError
+        exists to prevent.
+
+        Only a FALSY observation means "missed". Every other outcome is the
+        caller's to see. Pinned here because a future edit wrapping the loop
+        body in a broad try/except would leave every other test in this class
+        green while silently deleting that guarantee.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('CALL db.indexes() changed shape')
+
+        def observe():
+            log.append('observe')
+            raise boom
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe'], (
+            f'expected the raise to abort on the FIRST attempt with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_reopen_aborts_the_retry_rather_than_being_retried_around(self):
+        """A raising `reopen` propagates after the first miss; the retry does not continue past it.
+
+        The live call site's `reopen` re-creates and re-drops a real index and
+        holds two index-readiness barriers, any of which can raise. If those
+        failures were swallowed and retried around, the helper would keep
+        observing a window that was never successfully re-opened and then
+        report exhaustion -- again the wrong diagnosis for the actual defect.
+        `_reopen_rebuild_window`'s comment asserts this in prose; this test is
+        what makes it checkable.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('could not re-create the vector index')
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+            raise boom
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe', 'reopen'], (
+            f'expected exactly one observation and one failed reopen, got {log!r}'
         )
 
     @pytest.mark.asyncio
