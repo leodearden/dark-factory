@@ -134,3 +134,78 @@ def test_the_payload_is_not_a_shell(tmp_path):
 
     assert payload[0] not in ('sh', 'bash', '/bin/sh', '/bin/bash')
     assert '-c' not in payload
+
+
+# ---------------------------------------------------------------------------
+# the env allowlist — the subtlest hazard of the transient-unit form
+#
+# `systemd --user` propagates NONE of the caller's environment, so anything
+# unstated is silently ABSENT inside the unit: not empty, not inherited.  The
+# consequence is specific and quiet.  `lms_ctl start` writes the VRAM baseline
+# through `lms_vram.baseline_dir()`, which reads `$LMS_BASELINE_DIR`; the
+# healthcheck reads it back through the same function.  If the two disagree the
+# healthcheck exits 8 (`EXIT_STALE_BASELINE`) and writes no file at all -- so
+# the whole sweep produces nothing, and the reason is a variable nobody
+# mentioned.
+#
+# The other direction matters just as much: the list is a WHITELIST, never a
+# copy of os.environ.  A blanket copy would push OPENAI_API_KEY, HF_TOKEN and
+# the rest into the unit's recorded systemd properties and the journal.
+# ---------------------------------------------------------------------------
+
+
+def test_a_set_baseline_dir_is_propagated_into_the_unit(tmp_path):
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json',
+        env={'LMS_BASELINE_DIR': '/run/user/1000/lms-baselines'},
+    )
+
+    assert '--setenv=LMS_BASELINE_DIR=/run/user/1000/lms-baselines' in argv
+
+
+def test_an_absent_baseline_dir_emits_no_setenv_at_all(tmp_path):
+    """Not an empty one.  `''` is not "unset" to `os.environ.get(...)`'s
+    fallback, so an empty setenv would send `baseline_dir()` to Path('') --
+    a different directory than the default it was supposed to fall back to."""
+    argv = lms_slate_run.slate_argv(tmp_path / 'parts', tmp_path / 'out.json', env={})
+
+    assert not any(a.startswith('--setenv=LMS_BASELINE_DIR') for a in argv)
+
+
+def test_the_propagated_key_is_the_one_lms_vram_actually_reads():
+    """Pinned against `lms_vram`'s own constant rather than a literal, so a
+    rename there cannot leave this driver propagating a dead name."""
+    import lms_vram
+
+    assert lms_vram.BASELINE_DIR_ENV in lms_slate_run.PROPAGATED_ENV_KEYS
+
+
+@pytest.mark.parametrize('secret_key', ['OPENAI_API_KEY', 'HF_TOKEN', 'VIRTUAL_ENV'])
+def test_unlisted_caller_variables_never_reach_the_unit(tmp_path, secret_key):
+    """A whitelist, not a passthrough: `systemd-run --setenv` puts a value in
+    the unit's recorded properties and the journal, so a blanket copy of
+    os.environ is a secret-leak surface for zero benefit."""
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'out.json',
+        env={
+            'LMS_BASELINE_DIR': '/run/user/1000/lms-baselines',
+            secret_key: 'sensitive-measured-value',
+        },
+    )
+
+    assert not any(secret_key in element for element in argv)
+    assert not any('sensitive-measured-value' in element for element in argv)
+
+
+def test_the_allowlist_is_a_whitelist_not_a_copy_of_os_environ(tmp_path, monkeypatch):
+    """The default env is the real one; with no injected dict the ONLY
+    setenv flags that may appear are allowlisted keys."""
+    monkeypatch.setenv('LMS_SLATE_RUN_CANARY', 'must-not-propagate')
+
+    argv = lms_slate_run.slate_argv(tmp_path / 'parts', tmp_path / 'out.json')
+
+    setenvs = [a for a in argv if a.startswith('--setenv=')]
+    for flag in setenvs:
+        key = flag[len('--setenv='):].split('=', 1)[0]
+        assert key in lms_slate_run.PROPAGATED_ENV_KEYS, f'{key} is not allowlisted'
+    assert not any('must-not-propagate' in element for element in argv)
