@@ -748,15 +748,16 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
         )
     unreached: list[str] = []
     for label, caller in _parse_callers(parse, slate):
-        holds, reason = _option_a_under(module, caller, key, first, last)
-        if holds:
-            return True, reason
-        if reason is None:
+        outcome = _option_a_under(module, caller, key, first, last)
+        if outcome is None:
             # This convention never got a payload PAST the call boundary, so it
             # asserted nothing. Keep it only as a fallback diagnostic; another
             # convention may still reach the parser.
             unreached.append(label)
             continue
+        holds, reason = outcome
+        if holds:
+            return True, reason
         # A convention that REACHED the parser rendered a real verdict on it.
         # That finding is the actionable one, so it outranks every "the call
         # signature did not match" note from the conventions that did not.
@@ -773,16 +774,27 @@ def _option_a_under(
     key: str,
     first: str,
     last: str,
-) -> tuple[bool, str | None]:
-    """``(holds, reason)`` for ONE calling convention.
+) -> tuple[bool, str] | None:
+    """``(holds, reason)`` for ONE calling convention, or ``None``.
 
     *parse* is a single-argument adapter from ``_parse_callers``; every call
     below goes through it, so the convention is fixed for the whole evaluation
     (including the ``_echoes_payload`` control).
 
-    ``reason is None`` means the convention never reached the parser — every
-    payload raised — which is not a verdict about the invariant. The caller
-    tries the next convention rather than reporting a failure.
+    A ``None`` RETURN — not a ``None`` reason — means the convention never
+    reached the parser, every payload having raised, which is not a verdict
+    about the invariant. The caller tries the next convention rather than
+    reporting a failure it did not measure.
+
+    WHY THE WHOLE RETURN AND NOT THE REASON. The earlier ``(False, None)``
+    spelling made the two fields correlated-but-unchecked: nothing except a
+    docstring stopped a later edit returning ``(True, None)``, which the
+    driver's ``reason is None`` arm would then have silently filed as
+    'this convention asserted nothing' — dropping a SATISFIED verdict on the
+    floor and failing the gate closed against a correct fix. That is exactly
+    the silent-degradation shape this gate exists to catch, so the state is
+    made unrepresentable instead of merely documented: a reason now exists if
+    and only if a verdict does, and the type checker enforces it.
     """
     saw_bare_str = False
     inert: list[str] = []
@@ -861,10 +873,10 @@ def _option_a_under(
     if inert:
         return False, 'inconclusive — ' + _first_few(inert)
     # Every payload raised: this convention asserted nothing. Signal that with
-    # None so the driver moves on to the next one instead of reporting a
-    # failure it did not measure.
+    # a None RETURN so the driver moves on to the next one instead of reporting
+    # a failure it did not measure.
     logger.debug('option (a): no payload reached the parser (%s)', _first_few(errors))
-    return False, None
+    return None
 
 
 def _first_few(reasons: list[str], limit: int = 3) -> str:
