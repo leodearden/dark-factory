@@ -469,8 +469,7 @@ MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
         'its sample and its percentile spread live ONCE — in '
         'MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and '
         'POST_CAP_ORCHESTRATOR_GREEN_SECS in '
-        'tests/scripts/test_fallback_verify_config.py, which a guard there ties '
-        "to the repo-root yaml's republished copy. Read them there. A number "
+        'tests/scripts/test_fallback_verify_config.py. Read them there. A number '
         'copied into this justification would be one more copy to raise in '
         'lockstep, and the one that used to sit here went stale exactly that '
         'way. The re-measurement makes the deferral MORE justified, not less: '

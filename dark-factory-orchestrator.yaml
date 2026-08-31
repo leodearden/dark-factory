@@ -592,24 +592,14 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # median green full-suite cost stepped from 691.40s to 1765.95s — ~2.6x. The
 # four 2026-07-31 figures were NOT re-measured and are 28 days older.
 #
-# DO NOT REFLOW the table below. It is parsed by tests/scripts/
-# test_fallback_verify_config.py::test_published_yaml_segment_table_matches
-# _the_python_measurement_table, which ties these figures to
-# MEASURED_FLEET_SEGMENT_SECS in that file so the two copies of one
-# measurement cannot drift apart. Load-bearing: each entry staying one
-# comment line of four-plus spaces, then its name, then its float; and the
-# total line keeping its `<-` marker. NOT load-bearing: the parenthetical
-# gloss on each entry, the ordering, and every word of prose around the
-# block — reword those freely. Change a number here and you must change it
-# there, in the SAME commit.
-#
-#     shared         120.21   (2582 passed)
-#     escalation     123.29   (898 passed)
-#     orchestrator  1765.95   (median of 28 green full-suite runs, 2026-08-22..2026-08-28)
-#     fused-memory   123.87   (8658 passed)
-#     tests/scripts  105.00   (lowest of four independent runs, 105-127s)
-#                   -------
-#                   2238.32s   <- five of eight segments; already > the old 1800
+# NO PER-SEGMENT FIGURE IS RESTATED HERE, deliberately (task 4902). Each
+# segment's value, its measurement date, its sample size and — for
+# orchestrator — its percentile spread live ONCE, in
+# MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and
+# POST_CAP_ORCHESTRATOR_GREEN_SECS in tests/scripts/
+# test_fallback_verify_config.py. Read them there: a number copied into this
+# comment would be one more copy to raise in lockstep — the same reason the
+# per-module budgets below are not copied here either.
 #
 # dashboard, sampler and cockpit are absent because the run timed out at
 # 1800.66s before dashboard even started, so 2238.32 is a measured LOWER BOUND
@@ -624,7 +614,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # measured plus the three unmeasured ones estimated rather than silently costed
 # at zero:
 #
-#     measured floor (five segments, above)       2238.32
+#     measured floor (five segments, summed from
+#                   MEASURED_FLEET_SEGMENT_SECS)  2238.32
 #     + scripts/tests (task 3384, lowest of local
 #                   runs, 1184 passed)                ~113
 #     + dashboard  1393 collected @ ~0.137 s/test  ~190
@@ -763,11 +754,10 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # So the table still cannot measure itself, and 4902 built no detector that
 # would let it. What changed is only this: nothing performs the re-measurement
 # AUTOMATICALLY, task 4902 performed it once by hand, and the two copies of the
-# table can no longer drift apart — tests/scripts/test_fallback_verify_config.py::
-# test_published_yaml_segment_table_matches_the_python_measurement_table parses
-# the block above and asserts it equals MEASURED_FLEET_SEGMENT_SECS entry for
-# entry, total included. Reflowing the block fails that guard loudly rather than
-# disabling it. Each entry's age and sample now live in
+# table can no longer drift apart because there is no longer a second copy —
+# 4902 first tried to POLICE the duplicate with a guard that parsed this
+# comment block, then deleted the duplicate instead, which is the remedy the
+# per-module budgets above already use. Each entry's age and sample now live in
 # MEASURED_FLEET_SEGMENT_PROVENANCE beside the table, so which epoch a figure
 # came from is readable without archaeology.
 #

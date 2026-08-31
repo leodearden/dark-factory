@@ -300,9 +300,8 @@ class TestRunSegmentedSharedDeadline:
 
     The figures are deliberately NOT copied into this docstring. They live once,
     in MEASURED_FLEET_SEGMENT_SECS / POST_CAP_ORCHESTRATOR_GREEN_SECS in
-    tests/scripts/test_fallback_verify_config.py, republished in
-    dark-factory-orchestrator.yaml and tied to it by a guard there; a number
-    restated here would be one more copy to raise in lockstep.
+    tests/scripts/test_fallback_verify_config.py; a number restated here would
+    be one more copy to raise in lockstep.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the
     UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
