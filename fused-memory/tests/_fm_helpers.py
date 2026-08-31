@@ -1080,13 +1080,29 @@ async def retry_until_observed(
             observe the transient. Returns a truthy observation, or falsy for a
             miss. Typically itself a bounded ``poll_until``.
         reopen: Zero-arg sync or async callable that re-opens the transient,
-            called only BETWEEN attempts.
+            called only BETWEEN attempts — never before the first (the caller
+            has already opened the window) and never after the last (nobody
+            would read it). ``None`` means the transient re-arms itself, and
+            is a supported no-op: the attempt budget and the exhaustion raise
+            are unchanged.
         attempts: Maximum number of observation attempts.
         message: Caller diagnostic appended to the exhaustion AssertionError.
 
     Returns:
         The observation, returned verbatim (not coerced to ``True``), matching
         ``poll_until`` / ``poll_until_stable``.
+
+    Raises:
+        AssertionError: The transient was not observed in any of *attempts*
+            independent openings — the message names the attempt count and
+            carries the caller's *message*. This helper RAISES rather than
+            returning ``None`` because exhausting the budget is the one signal
+            it must never swallow: it is the evidence that the transient is
+            genuinely GONE rather than merely hard to catch. At the motivating
+            call site that distinction IS the test's primary durable job — a
+            FalkorDB that stopped rebuilding the merged index in place would
+            make every post-drop barrier task 4748 added dead weight, and a
+            silent ``None`` would let that pass as an ordinary miss.
     """
     for attempt in range(1, attempts + 1):
         result = observe()
@@ -1105,7 +1121,10 @@ async def retry_until_observed(
             reopened = reopen()
             if inspect.isawaitable(reopened):
                 await reopened
-    return None
+    detail = f' {message}' if message else ''
+    raise AssertionError(
+        f'retry_until_observed: condition not observed in {attempts} attempt(s).{detail}'
+    )
 
 
 # ---------------------------------------------------------------------------
