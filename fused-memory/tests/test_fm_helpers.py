@@ -1236,6 +1236,98 @@ class TestRetryUntilObserved:
             f'expected the awaited reopen to fire exactly once between attempts, got {log!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_exhausting_every_attempt_raises_after_spending_the_whole_budget(self):
+        """An always-missing `observe` raises AssertionError, having spent its whole budget.
+
+        This is what preserves the motivating live test's PRIMARY durable job:
+        fail loudly if FalkorDB ever stops opening the rebuild window at all.
+        Returning None on exhaustion would let that failure be read as an
+        ordinary miss and silently swallowed by the caller, leaving every
+        post-drop barrier task 4748 added as undetected dead weight.
+
+        AssertionError, not a bespoke type, matches the family convention --
+        poll_until and poll_until_stable both raise AssertionError on timeout.
+
+        The call-count assertions prove the helper spent its budget rather
+        than giving up early, and that it did not re-arm a window nobody
+        would read: exactly `attempts` observations and exactly
+        `attempts - 1` reopens.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert log.count('observe') == 5, f'expected exactly 5 observations, got {log!r}'
+        assert log.count('reopen') == 4, f'expected exactly 4 reopens, got {log!r}'
+        assert log[-1] == 'observe', (
+            f'expected the final act to be an observation, not a reopen nobody reads: {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_message_names_the_attempt_count(self):
+        """The raised message names how many attempts were made.
+
+        Without the count an operator cannot tell a one-shot miss from a
+        budget genuinely spent, which is the whole distinction that makes
+        exhaustion evidence the transient is GONE rather than hard to catch.
+        """
+        from _fm_helpers import retry_until_observed
+
+        with pytest.raises(AssertionError, match='7'):
+            await retry_until_observed(lambda: None, attempts=7)
+
+    @pytest.mark.asyncio
+    async def test_caller_message_survives_verbatim_into_the_exhaustion_error(self):
+        """A caller-supplied `message` appears verbatim in the raised AssertionError.
+
+        Matches poll_until's caller-message contract, and matters here for a
+        concrete reason: the live call site's message is the "see this class
+        docstring before deleting these barriers" guidance, and it must
+        survive into the failure an operator actually reads.
+        """
+        from _fm_helpers import retry_until_observed
+
+        with pytest.raises(AssertionError, match='see this class docstring before deleting'):
+            await retry_until_observed(
+                lambda: None,
+                attempts=2,
+                message='see this class docstring before deleting them',
+            )
+
+    @pytest.mark.asyncio
+    async def test_reopen_none_is_a_supported_no_op_re_arm(self):
+        """`reopen=None` still makes exactly `attempts` observations and still raises.
+
+        Supports a transient that re-arms ITSELF (an external producer, a
+        periodic emitter): there is nothing for the caller to do between
+        attempts, but the budget and the loud exhaustion must be identical.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'observe', 'observe'], (
+            f'expected exactly 3 observations with no reopen, got {log!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
