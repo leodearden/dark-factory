@@ -54,6 +54,7 @@ from _fm_helpers import (
     await_index_operational,
     falkor_skipif,
     poll_until,
+    retry_until_observed,
     unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
@@ -352,9 +353,47 @@ def _entity_index_rows(result) -> list[tuple[dict, str]]:
     ]
 
 
+#: The exact ``poll_until`` timeout message used by the phantom observation
+#: below, so a MISSED WINDOW can be told apart by value from any other
+#: AssertionError raised inside the predicate (see ``_observe_phantom_window``).
+_MISSED_WINDOW = 'phantom rebuild window not observed within this attempt'
+
+
 def _row_has_vector(types: dict) -> bool:
     """True if any property in a raw db.indexes() 'types' dict carries VECTOR."""
     return any(_types_contain(raw, 'VECTOR') for raw in types.values())
+
+
+async def _reopen_rebuild_window(graph) -> None:
+    """Re-open the post-DROP rebuild window by re-merging, then re-dropping, the VECTOR index.
+
+    The ``reopen`` half of the ``retry_until_observed`` call in
+    TestDropRebuildWindow below. The window it re-opens is a genuine RACE: on
+    a miss FalkorDB had already finished the rebuild inside the ``DROP``
+    round-trip, so there is nothing left for any client-side poll to catch and
+    the ONLY remedy is a fresh opening (see the class docstring for the
+    measurement).
+
+    The four steps run in exactly this order, and the ORDER IS LOAD-BEARING:
+
+    1. settle -- the missed attempt's own ``DROP`` may still have a rebuild in
+       flight. Creating a vector index into an in-flight rebuild races it, so
+       this barrier must come BEFORE the create, not after it;
+    2. re-``CREATE VECTOR INDEX`` on ``(n:Entity) ON (n.name_embedding)`` --
+       the module's exact statement, which re-merges the VECTOR field with the
+       ``name`` RANGE index that ``DROP VECTOR INDEX`` deliberately spared;
+    3. settle again -- the HNSW build is asynchronous (task 3377), and
+       dropping an under-construction index is not the state under test;
+    4. re-``DROP`` -- which is what actually opens the window the next attempt
+       observes.
+    """
+    await await_index_operational(graph)
+    await graph.query(
+        'CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) '
+        "OPTIONS {dimension: 4, similarityFunction: 'cosine'}"
+    )
+    await await_index_operational(graph)
+    await graph.query('DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)')
 
 
 @pytest.mark.timeout(30)
@@ -435,26 +474,62 @@ class TestDropRebuildWindow:
             )
             return rows if is_phantom else None
 
-        # A single un-polled read is only deterministic at 50,000+ nodes (see
-        # class docstring); polling within a bounded deadline is what lets
-        # bulk_vector_graph's seed size be 10,000 instead of that -- but NOT
-        # the 1,000 a first pass at this fix tried, which measured only
-        # 12/15 phantom sightings even polled (the window can fail to open
-        # at all, not just be hard to catch). The 5ms interval is deliberately
-        # tight against the measured 52-135ms window at 10,000 nodes — a
-        # round trip costs ~0.2ms, so this buys many attempts inside the
-        # window rather than one.
+        # ONE bounded attempt to catch the window. The 5ms interval is
+        # deliberately tight against the measured 52-135ms window at 10,000
+        # nodes -- a round trip costs ~0.2ms, so this buys many reads inside
+        # the window rather than one. 2.0s (down from 5.0s) is >2x the worst
+        # detect latency ever measured (0.86s, under 16-way FalkorDB
+        # contention), and when the window IS open it is caught on the very
+        # first read (measured first-read gap 0.002-0.29s) -- so a shorter
+        # per-attempt deadline buys cheaper MISSES without risking a
+        # truncated observation.
+        async def _observe_phantom_window():
+            try:
+                return await poll_until(
+                    _phantom_rows, timeout=2.0, interval=0.005, message=_MISSED_WINDOW,
+                )
+            except AssertionError as exc:
+                if str(exc) != _MISSED_WINDOW:
+                    # NOT a missed window: _entity_index_rows asserts the
+                    # label/types/status columns exist, and that failure is
+                    # durable job (b) -- FalkorDB changed its result shape.
+                    # Swallowing it as a miss would spend the whole retry
+                    # budget and then report job (a)'s "stopped rebuilding"
+                    # diagnosis for a completely different defect, the same
+                    # two-modes-one-string collapse IndexHeaderError exists to
+                    # prevent in await_index_operational.
+                    raise
+                return None
+
+        # The window is a RACE, not merely a narrow target: on a miss FalkorDB
+        # had already finished the rebuild INSIDE the DROP round-trip, so no
+        # interval and no deadline on a single attempt can help (see the class
+        # docstring). Re-open it and look again -- 5 times, measured
+        # per-attempt observation 30/33 = 90.9% under the offline lane's own
+        # `nice -n 19 ionice -c3` serial scheduling, so the residual miss
+        # probability is ~5e-6, and still <=1e-3 under the pessimistic 75%
+        # seen in one 8-trial batch (attempts are not perfectly independent).
+        # Cost is paid only on a miss: measured retry-phase cost median 0.10s,
+        # max 8.20s.
         try:
-            await poll_until(_phantom_rows, timeout=5.0, interval=0.005)
+            await retry_until_observed(
+                _observe_phantom_window,
+                reopen=lambda: _reopen_rebuild_window(graph),
+                attempts=5,
+                message=(
+                    'Expected the drop-side rebuild phantom (>1 Entity row, one '
+                    'still VECTOR-typed, one not yet OPERATIONAL), each attempt '
+                    'against an INDEPENDENTLY re-opened window (re-create then '
+                    're-drop the merged VECTOR+RANGE index). If FalkorDB has '
+                    'stopped rebuilding the merged index in place, every '
+                    'post-drop barrier this task (4748) added is dead weight -- '
+                    'see this class docstring before deleting them.'
+                ),
+            )
         except AssertionError as exc:
-            raise AssertionError(
-                'expected the drop-side rebuild phantom (>1 Entity row, one '
-                'still VECTOR-typed, one not yet OPERATIONAL) within 5s but '
-                f'last saw {last_rows!r}. If FalkorDB has stopped rebuilding '
-                'the merged index in place, every post-drop barrier this '
-                'task (4748) added is dead weight -- see this class '
-                'docstring before deleting them.'
-            ) from exc
+            # last_rows is only known once the attempts have run, so it cannot
+            # ride in on `message`; chain it on instead.
+            raise AssertionError(f'{exc} Last saw {last_rows!r}.') from exc
 
         # (c) The barrier is SUFFICIENT: once satisfied, the phantom is gone.
         await await_index_operational(graph)
