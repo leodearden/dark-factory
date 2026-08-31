@@ -43,11 +43,14 @@ cannot describe two different procedures.  (3) A wedged HTTP client or a
 """
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 import lms_fetch_weights
 import lms_vram
@@ -71,6 +74,19 @@ MODULE_PATH = Path(__file__).resolve()
 #: none of the caller's venv.
 CTL_PATH = MODULE_PATH.parent / 'lms_ctl.py'
 HEALTHCHECK_PATH = MODULE_PATH.parent / 'lms_healthcheck.py'
+
+
+class CompletedLike(Protocol):
+    """The one thing this module reads off a finished subprocess."""
+
+    @property
+    def returncode(self) -> int: ...
+
+
+#: The subprocess seam.  Narrowed to "takes an argv, has a returncode" rather
+#: than pinned to `subprocess.run` itself, so a test can inject a recorder and
+#: keep the whole suite offline: no arm started, no card touched.
+Runner = Callable[[list[str]], CompletedLike]
 
 #: The caller variables that reach the unit, as an ALLOWLIST rather than a copy
 #: of `os.environ`.
@@ -211,7 +227,7 @@ def sweep_arms(
     *,
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
     force: bool = False,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Runner = subprocess.run,
 ) -> list[tuple[str, str, int]]:
     """Sweep every arm the manifest commissions, one at a time.
 
@@ -309,7 +325,7 @@ def run_slate(
     *,
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
     force: bool = False,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Runner = subprocess.run,
 ) -> int:
     """Sweep the slate, then assemble the artifact from the parts it produced.
 
@@ -345,3 +361,93 @@ def run_slate(
     # judge the parts it was handed, so an arm that failed and left no part is
     # invisible to a merge handed a complete set from a previous run.
     return merged or (1 if failures else 0)
+
+
+# ---------------------------------------------------------------------------
+# the submit layer
+# ---------------------------------------------------------------------------
+
+
+def default_parts_dir(env: dict[str, str] | None = None) -> Path:
+    """Where per-arm parts live by default.
+
+    `$XDG_RUNTIME_DIR` by preference, matching `lms_vram.baseline_dir()`: parts
+    belong to one boot's run, and a tmpfs that empties on reboot says so by
+    construction.  Resolved ONCE, here in the submit layer, and passed to the
+    unit as an explicit absolute path -- `systemd --user` propagates no caller
+    environment, so deriving it again inside the unit is how the two layers end
+    up reading different directories and a resume silently does nothing.
+    """
+    environment = dict(os.environ) if env is None else env
+    runtime = environment.get('XDG_RUNTIME_DIR')
+    root = Path(runtime) if runtime else Path(tempfile.gettempdir())
+    return root / 'lms-slate-parts'
+
+
+def _submit(
+    argv: list[str],
+    *,
+    dry_run: bool,
+    runner: Runner = subprocess.run,
+) -> int:
+    """Echo the compliant command, then run it unless this is a dry run."""
+    print(' '.join(argv), flush=True)
+    if dry_run:
+        # Deliberately NO `journalctl` follow hint here.  Pointing an operator
+        # at a unit that was never created sends them to watch nothing,
+        # indefinitely.
+        return 0
+
+    code = runner(argv).returncode
+    if code == 0:
+        print(f'\nfollow this transient unit with:\n'
+              f'    journalctl --user -u {SLATE_UNIT_NAME} -f')
+    return code
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    runner: Runner = subprocess.run,
+) -> int:
+    parser = argparse.ArgumentParser(
+        prog='lms_slate_run',
+        description='Run the whole arm slate in a transient systemd --user unit.',
+    )
+    parser.add_argument(
+        '--in-unit', action='store_true',
+        help='run the sweep HERE rather than submitting a unit. Passed by the '
+             'unit\'s own payload; also the guard that stops a unit from '
+             'recursively submitting another one.',
+    )
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument(
+        '--force', action='store_true',
+        help='re-measure every arm, even one that already has a valid part',
+    )
+    parser.add_argument('--parts-dir', help='where per-arm report parts live')
+    parser.add_argument('--output', help='the slate artifact to assemble')
+    parser.add_argument('--ready-timeout', type=float, default=DEFAULT_READY_TIMEOUT_S)
+    args = parser.parse_args(argv)
+
+    parts_dir = Path(args.parts_dir) if args.parts_dir else default_parts_dir()
+    output = Path(args.output) if args.output else DEFAULT_ARTIFACT
+
+    if args.in_unit:
+        return run_slate(
+            parts_dir, output,
+            ready_timeout=args.ready_timeout, force=args.force, runner=runner,
+        )
+
+    return _submit(
+        slate_argv(
+            parts_dir, output,
+            ready_timeout=args.ready_timeout, force=args.force,
+        ),
+        dry_run=args.dry_run,
+        runner=runner,
+    )
+
+
+if __name__ == '__main__':  # pragma: no cover - process entry point
+    raise SystemExit(main())

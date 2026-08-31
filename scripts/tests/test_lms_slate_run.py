@@ -222,6 +222,11 @@ def test_the_allowlist_is_a_whitelist_not_a_copy_of_os_environ(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
+class _FakeCompleted:
+    def __init__(self, returncode: int):
+        self.returncode = returncode
+
+
 class _FakeRunner:
     """Records every argv and returns a scripted returncode.
 
@@ -234,7 +239,7 @@ class _FakeRunner:
         self._codes = dict(codes or {})
         self._raises = dict(raises or {})
 
-    def __call__(self, argv, **kwargs):
+    def __call__(self, argv: list[str]) -> _FakeCompleted:
         self.calls.append(list(argv))
         key = _stage_key(argv)
         if key in self._raises:
@@ -243,11 +248,6 @@ class _FakeRunner:
 
     def stages(self):
         return [_stage_key(argv) for argv in self.calls]
-
-
-class _FakeCompleted:
-    def __init__(self, returncode):
-        self.returncode = returncode
 
 
 def _stage_key(argv):
@@ -796,7 +796,7 @@ class _SubmitRecorder:
         self.calls: list[list[str]] = []
         self._returncode = returncode
 
-    def __call__(self, argv, **kwargs):
+    def __call__(self, argv: list[str]) -> _FakeCompleted:
         self.calls.append(list(argv))
         return _FakeCompleted(self._returncode)
 
