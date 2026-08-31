@@ -585,6 +585,121 @@ class TestRecoverCrashedTasks:
         assert len(cleanup_calls) == 2
 
 
+
+@pytest.mark.asyncio
+class TestAdoptNonDictSidecar:
+    """A sidecar that PARSED as JSON but is not an OBJECT must be rejected at
+    ADOPTION — the reachability boundary — not merely survived downstream.
+
+    ``_adopt_recovered_session`` is the SOLE writer of ``_recovered_sessions``
+    (harness.py::Harness._adopt_recovered_session), so it is the one place that
+    can make the ``_run_slot`` guard's ``recovered_session.get('session_id')``
+    sound. Today it does ``json.loads`` with NO dict validation and stores the
+    payload verbatim, so a truncated/garbage ``agent_session.json`` holding
+    ``[]``, ``"str"`` or ``7`` reaches the dispatch path intact.
+
+    Two live consequences, both contradicting docstrings already in the tree:
+      - the no-plan-lane call site does ``session_data.get('task_id')`` with no
+        enclosing try/except, so a non-dict raises straight out of
+        ``_recover_crashed_tasks`` — a method whose own docstring promises
+        "Never raises" and promises it reads the sidecar "as a RAW dict". That
+        one is PRE-EXISTING, not introduced by task 3728;
+      - ``_run_slot``'s guard builds ``resume_event_data`` from
+        ``recovered_session.get(...)`` immediately after the predicate call, so
+        the same payload raises there too — which is why the method-level guard
+        alone does not restore the guard's observable "never a stall, never a
+        scheduler-visible error" contract.
+    """
+
+    @pytest.mark.parametrize(
+        'payload', [[], 'str', 7], ids=['list', 'str', 'int'],
+    )
+    @pytest.mark.parametrize(
+        'task_id', ['35', None], ids=['keyed-by-task-id', 'no-plan-lane'],
+    )
+    async def test_non_dict_sidecar_is_not_adopted(
+        self, harness: Harness, caplog, payload, task_id
+    ):
+        """BOTH keying paths reject the payload, adopt nothing, and say why.
+
+        Parametrized over the two ``task_id`` arities because they are the two
+        branches of the single ``key = task_id if task_id is not None else
+        session_data.get('task_id')`` line: only a check placed BEFORE it
+        covers both, and the ``None`` arity is the one that raises today.
+        """
+        wt = _setup_worktree(harness.git_ops.worktree_base, '35')
+        task_dir = wt / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(payload))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert adopted is None
+        assert harness._recovered_sessions == {}
+        assert harness._recovered_session_config_dirs == {}
+        assert any(
+            type(payload).__name__ in rec.getMessage() for rec in caplog.records
+        ), (
+            f'expected a warning naming the offending type '
+            f'{type(payload).__name__!r}; got: {caplog.text!r}'
+        )
+
+    async def test_recover_crashed_tasks_survives_a_non_dict_sidecar(
+        self, harness: Harness
+    ):
+        """The no-plan lane drives the live unguarded ``.get`` through the real
+        ``_recover_crashed_tasks``, whose docstring promises it never raises.
+        """
+        wt = harness.git_ops.worktree_base / '90'
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(['a']))
+
+        await harness._recover_crashed_tasks()  # must not raise
+
+        assert harness._recovered_sessions == {}
+        assert '90' not in harness._preserved_worktrees
+
+    async def test_non_dict_sidecar_degrades_to_a_fresh_dispatch(
+        self, harness: Harness
+    ):
+        """END-TO-END (I3): a corrupt sidecar on disk yields a FRESH dispatch —
+        ``_run_slot`` completes, and hands ``resume_session_id=None`` to the
+        workflow.
+
+        Driven through the REAL adoption path rather than by injecting the
+        non-dict straight into ``_recovered_sessions``, because adoption is the
+        sole writer of that map and therefore the only place a fix can make
+        this assertion hold; injecting past it would pin a guard that, by the
+        deliberate two-guard design, does not exist. RED today for exactly the
+        reason this class exists: the payload IS adopted, so the guard's
+        ``recovered_session.get('session_id')`` sees a list.
+        """
+        wt = _setup_worktree(harness.git_ops.worktree_base, '91')
+        task_dir = wt / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'agent_session.json').write_text(json.dumps(['a']))
+        harness._adopt_recovered_session(wt, '91')
+
+        assignment = MagicMock()
+        assignment.task_id = '91'
+        assignment.task = {'title': 'task 91'}
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+            mock_wf = AsyncMock()
+            mock_wf.run.return_value = MagicMock(value='done')
+            mock_wf.metrics = MagicMock(
+                total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
+            )
+            MockWorkflow.return_value = mock_wf
+            await harness._run_slot(assignment, sem)  # must not raise
+
+        assert MockWorkflow.call_args.kwargs['resume_session_id'] is None
+
+
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
     """Worktree with a plan AND a .task/metadata.json carrying ``title``."""
     wt = _setup_worktree(base, task_id, plan)
