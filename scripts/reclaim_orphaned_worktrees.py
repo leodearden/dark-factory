@@ -85,6 +85,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -218,6 +219,79 @@ def select_reclaimable(
         else:
             keep.append(record)
     return ReclaimDecision(keep=keep, reclaim=reclaim)
+
+
+# The git env vars that retarget git away from the path it is given (incident
+# 2026-08-31). Deliberately NARROW: only names that change WHICH repository (or
+# which config) a command acts on.
+#
+# WHY THIS MODULE IS EXPOSED. Every git call here targets via ``cwd=`` (and
+# ``-C`` would be no better): both only change DIRECTORY, while ``GIT_DIR`` and
+# its siblings SKIP repository discovery outright. So a single ambient
+# ``GIT_DIR`` silently redirects EVERY call in this module — ``worktree list``,
+# ``add -A``, ``commit --no-verify``, ``worktree remove --force``,
+# ``worktree prune`` — into whatever repository it names, with ``--repo`` /
+# ``--parking-root`` / ``cwd`` inert. Measured on the pre-guard script: under
+# ``GIT_DIR=<decoy>/.git`` with ``--repo <sandbox>``, ``git worktree list``
+# enumerated the DECOY's worktrees, the parking-root band guard passed them, and
+# ``worktree remove --force`` DESTROYED a decoy-owned worktree — while the
+# sandbox named by ``--repo`` was never swept at all.
+#
+# ``GIT_CEILING_DIRECTORIES`` cannot catch this and is deliberately PRESERVED: a
+# ceiling bounds the upward WALK of repository discovery, and an explicit
+# ``GIT_DIR`` never walks, so the ceiling is bypassed rather than weakened —
+# and it is the mechanism of a DIFFERENT defence
+# (``df_pytest_isolation._df_git_ceiling_at_basetemp``, incident esc-3072-3),
+# which scrubbing it here would disarm whenever this script runs under the
+# suite. The identity vars (``GIT_AUTHOR_*`` / ``GIT_COMMITTER_*``) are
+# preserved for the same narrowness: they change what a park-commit SAYS, never
+# where it lands.
+#
+# DUPLICATED, NOT IMPORTED, from ``df_pytest_isolation._GIT_REDIRECT_ENV``:
+# this module is STDLIB-ONLY by design (see the module docstring — the systemd
+# wrapper runs plain ``python3`` with no ``uv``/service env) and that module
+# imports pytest, so importing it would break the nightly unit outright.
+# ``scripts/memory-metadata-coverage-census.sh`` carries a third copy for the
+# same reason. The duplication is pinned against drift by
+# ``test_scrubbed_git_env_matches_shared_redirect_classifier``.
+_GIT_REDIRECT_ENV = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+)
+
+# ``git -c`` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0,
+# ...), so they cannot be enumerated by name.
+_GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+
+
+def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """A copy of *environ* with every git-REDIRECTING name removed, ``LC_ALL=C``.
+
+    Pure: *environ* (in production ``os.environ``) is never mutated. Drops every
+    name in :data:`_GIT_REDIRECT_ENV` and every name carrying a
+    :data:`_GIT_REDIRECT_ENV_PREFIXES` prefix; keeps everything else verbatim
+    (the unit's ``PATH``/``HOME``, the ceiling, the identity vars) and forces
+    ``LC_ALL=C`` so porcelain output stays locale-stable.
+
+    A targeted removal, NOT a hermetic env rebuild — see the block comment above
+    for which names retarget git and why the two preserved families do not.
+    """
+    scrubbed = {
+        key: value
+        for key, value in environ.items()
+        if key not in _GIT_REDIRECT_ENV
+        and not key.startswith(_GIT_REDIRECT_ENV_PREFIXES)
+    }
+    scrubbed['LC_ALL'] = 'C'
+    return scrubbed
 
 
 def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
