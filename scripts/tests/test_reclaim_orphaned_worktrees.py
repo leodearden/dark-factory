@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -594,14 +595,21 @@ def test_reclaim_remove_failure_counted_siblings_continue(tmp_path, monkeypatch)
 # step-15: end-to-end CLI via subprocess (JSON on stdout / LOUD logs on stderr)
 # ---------------------------------------------------------------------------
 
-def _run_cli(*args: str) -> subprocess.CompletedProcess:
+def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Drive the reclaim CLI as a real subprocess. stdout carries the JSON
-    report; stderr carries the LOUD human log lines."""
+    report; stderr carries the LOUD human log lines.
+
+    ``env`` hands the child a full replacement environment — used by the
+    leaked-GIT_DIR regression below to poison the child WITHOUT mutating this
+    process's ``os.environ`` (which the suite's own git-hermeticity fixtures
+    own). ``None`` inherits, exactly as before.
+    """
     return subprocess.run(
         ["python3", str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
 
 
@@ -782,3 +790,102 @@ def test_scrubbed_git_env_matches_shared_redirect_classifier():
 
     scrubbed = row.scrubbed_git_env(derived)
     assert [name for name in redirecting if name in scrubbed] == []
+
+
+def test_run_git_chokepoint_scrubs_ambient_redirection(tmp_path, monkeypatch):
+    """The scrub is reached at the SINGLE chokepoint: the env handed to
+    ``subprocess.run`` carries no redirecting name, whatever the ambient one
+    holds. Asserted at ``_run_git`` (not per call site) because the defect class
+    is "a call site that forgets the guard" — fixing today's seven leaves the
+    hole open for the eighth."""
+    recorded: dict[str, dict[str, str]] = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(*_args, **kwargs):
+        recorded["env"] = kwargs["env"]
+        return _Completed()
+
+    for name, value in {**POISONED_GIT_ENV, **PRESERVED_GIT_ENV}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    monkeypatch.setattr(row.subprocess, "run", fake_run)
+
+    row._run_git(["status", "--porcelain"], cwd=tmp_path)
+
+    env = recorded["env"]
+    for name in POISONED_GIT_ENV:
+        assert name not in env, f"{name} reached git through the chokepoint"
+    for name, value in PRESERVED_GIT_ENV.items():
+        assert env[name] == value, f"{name} must survive to git"
+    assert env["LC_ALL"] == "C"
+
+
+def _decoy_and_sandbox(tmp_path):
+    """A DECOY repo owning a DIRTY worktree registered under the SANDBOX's
+    parking root, plus the sandbox's own eligible parking.
+
+    Reproduces the measured incident layout: ``git worktree list`` under a
+    leaked ``GIT_DIR`` enumerates the DECOY's worktrees, and the parking-root
+    band guard passes the decoy-owned one because it physically sits under the
+    sandbox's quarantine base.
+    """
+    decoy_base = tmp_path / "decoy"
+    decoy_base.mkdir()
+    decoy = _init_repo(decoy_base)
+
+    sandbox_base = tmp_path / "sandbox"
+    sandbox_base.mkdir()
+    sandbox = _init_repo(sandbox_base)
+
+    own = _add_parking(sandbox, f"2920-{TS_OLD}")
+
+    decoy_parking = _parking_root(sandbox) / f"d1-{TS_OLD}"
+    _git(decoy, "worktree", "add", "-q", "-b", f"task/d1-{TS_OLD}", str(decoy_parking))
+    (decoy_parking / "wip.txt").write_text("decoy work\n")
+
+    return decoy, sandbox, own, decoy_parking
+
+
+def _ref_snapshot(repo: Path) -> str:
+    """Every ref and its sha — a whole-repo mutation detector."""
+    return _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+
+
+def test_cli_leaked_git_dir_never_touches_the_decoy_repository(tmp_path):
+    """END-TO-END REGRESSION (incident 2026-08-31). Under an ambient
+    ``GIT_DIR`` naming a DECOY repository, the sweep must act ONLY on the repo
+    ``--repo`` names.
+
+    Measured on the pre-guard script, BOTH halves failed: the decoy's registered
+    worktree was park-committed into the decoy and then destroyed by
+    ``git worktree remove --force``, while the sandbox's own eligible parking
+    was never swept — the JSON report nonetheless claiming ``reclaimed=1``.
+    """
+    decoy, sandbox, own, decoy_parking = _decoy_and_sandbox(tmp_path)
+    decoy_refs_before = _ref_snapshot(decoy)
+
+    result = _run_cli(
+        "--repo", str(sandbox),
+        "--now", str(CLI_NOW),
+        "--min-age-hours", "48",
+        env=dict(os.environ, GIT_DIR=str(decoy / ".git")),
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    # THE DECOY IS UNTOUCHED: no redirected commit landed, nothing was removed.
+    assert _ref_snapshot(decoy) == decoy_refs_before
+    assert decoy_parking.exists()
+    assert decoy_parking.resolve() in _worktree_paths(decoy)
+
+    # POSITIVE CONTROL: the repository --repo actually named WAS swept, so the
+    # guard refuses the wrong target rather than refusing everything.
+    assert not own.exists()
+    assert _branch_resolves(sandbox, f"task/2920-{TS_OLD}")
+    report = json.loads(result.stdout)
+    assert report["reclaimed"] == 1
+    assert report["reclaimed_paths"] == [str(own.resolve())]
