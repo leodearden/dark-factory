@@ -1019,6 +1019,82 @@ async def poll_until_stable(
 
 
 # ---------------------------------------------------------------------------
+# Shared retry_until_observed() observation barrier (task 4972)
+# ---------------------------------------------------------------------------
+#
+# The THIRD member of the barrier family above, placed beside its two siblings
+# for the same reason poll_until_stable was placed beside poll_until: picking
+# the wrong one is the defect this exists to prevent -- see the docstring's
+# decision rule. Public (no leading underscore) for the reason this module
+# already documents for poll_until / poll_until_stable: it is imported
+# cross-module.
+# ---------------------------------------------------------------------------
+
+async def retry_until_observed(
+    observe: Callable[[], Any],
+    *,
+    reopen: Callable[[], Any] | None = None,
+    attempts: int = 4,
+    message: str | None = None,
+) -> Any:
+    """Observe a RACY TRANSIENT, RE-OPENING it between attempts, and return what was seen.
+
+    Choosing between this and its two siblings — the whole point of having
+    three:
+
+    * :func:`poll_until` is a **liveness** barrier. Correct when the assertion
+      that follows is "X happened".
+    * :func:`poll_until_stable` is a **settle** barrier. Required when the
+      assertion that follows is an exact count or an "exactly once" claim.
+    * ``retry_until_observed`` is an **observation** barrier. **Required** when
+      the condition is a racy TRANSIENT that may close before any client read
+      can see it — the case both siblings structurally cannot handle, because
+      each only ever looks at ONE opening of the window.
+
+    The discriminator, stated plainly: reach for this only when a miss means
+    the window never opened *for this attempt*, so no interval and no deadline
+    on a single attempt can help — there is nothing left to observe. The only
+    lever that acts on an absent window is to open a new one, which is what
+    *reopen* does.
+
+    The motivating call site is
+    ``tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow``,
+    which observes the rebuild window FalkorDB opens when ``DROP VECTOR INDEX``
+    leaves a merged index's other fields behind. Measured under the offline
+    lane's own scheduling (``nice -n 19 ionice -c3``, serial): the window was
+    observable on 28 of 30 first attempts. On a miss it was not merely hard to
+    catch — the first post-DROP read, taken 6.8 ms after ``DROP`` returned,
+    already showed ONE Entity row, already ``OPERATIONAL``, and it stayed that
+    way for the whole deadline. FalkorDB had completed the rebuild inside the
+    ``DROP`` round-trip; the window never opened at all.
+
+    *observe* and *reopen* may each be a plain sync callable or an
+    async/coroutine function — either way called with no arguments and, if the
+    result is awaitable (``inspect.isawaitable``), awaited before use, matching
+    ``poll_until``'s contract exactly so all three primitives accept the same
+    callable shapes. A falsy *observe* result means "the window was not
+    observed on this attempt".
+
+    Args:
+        observe: Zero-arg sync or async callable making ONE bounded attempt to
+            observe the transient. Returns a truthy observation, or falsy for a
+            miss. Typically itself a bounded ``poll_until``.
+        reopen: Zero-arg sync or async callable that re-opens the transient,
+            called only BETWEEN attempts.
+        attempts: Maximum number of observation attempts.
+        message: Caller diagnostic appended to the exhaustion AssertionError.
+
+    Returns:
+        The observation, returned verbatim (not coerced to ``True``), matching
+        ``poll_until`` / ``poll_until_stable``.
+    """
+    result = observe()
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Shared FalkorDB index-readiness barrier (task 3377; extracted from task 3334)
 # ---------------------------------------------------------------------------
 #
