@@ -33,15 +33,37 @@ it "would couple this suite to prose in two skill docs that legitimately
 get rewritten" -- the same docs task 4924 edits.  The real-git tests here
 are what actually protect the change.
 
-Only ``DEFAULT_COMMIT_CITATION_PATTERN`` is imported: a plain module
-constant, so no ``GitOps`` construction and no config are needed.  The
-two-step matching of
-``orchestrator/src/orchestrator/git_ops.py::GitOps.find_task_citation_commit``
-is replicated exactly as ``skills/_shared/deriving-landed-sha.md``'s
-step-4 citation gate transcribes it into shell: ``git log main
---extended-regexp --grep=<pattern>`` as a coarse full-message pre-filter,
-then the same pattern compiled as a Python ``re`` re-applied to each
-candidate's SUBJECT alone, most-recent-first, first match wins.
+Every citation-gate claim here is made TWICE against the same repo, and
+the two are asserted to AGREE:
+
+1. through the REAL
+   ``orchestrator/src/orchestrator/git_ops.py::GitOps.find_task_citation_commit``
+   (``_real_citation_walk``), so the pin tracks production rather than a
+   frozen copy of it; and
+2. through ``_citation_walk``, a transcription of what
+   ``skills/_shared/deriving-landed-sha.md``'s step-4 citation gate tells
+   an agent to TYPE -- ``git log main --extended-regexp --grep=<pattern>``
+   as a coarse full-message pre-filter, then the same pattern re-applied
+   to each candidate's SUBJECT alone, most-recent-first, first match wins.
+
+The shell form is deliberately NOT byte-identical to the method: the
+method reads ``-z`` NUL-separated records, while the runbook prescribes a
+human-readable ``--format='%H %s'`` listing an agent eyeballs. That gap is
+exactly why the two are asserted to agree instead of the transcription
+standing alone. Should the walk's semantics move under either of them --
+the subject-anchoring work that
+``fused-memory/scripts/audit_found_on_main_provenance.py``'s header tracks
+as ``plans/found-on-main-provenance-integrity-prd.md`` label delta, a
+``--max-count`` cap, a narrowed pattern -- the disagreement fails HERE,
+where the runbook edit that must follow is one file away, instead of both
+copies passing quietly while the behaviour this fix rests on has moved.
+
+``GitOps`` is constructed directly from a default ``GitConfig``, the way
+``orchestrator/tests/test_git_ops.py::TestFindTaskCitationCommit`` does
+through its ``git_ops``/``git_repo`` fixtures; those fixtures are not
+reused here because each test builds its own purpose-shaped history. The
+async method is driven with ``asyncio.run`` so these stay ordinary sync
+tests.
 
 No sleeps, no network, no skips: if git is unavailable these fail loudly
 rather than silently skipping (the repo's no-silent-fail-soft invariant).
@@ -49,11 +71,13 @@ rather than silently skipping (the repo's no-silent-fail-soft invariant).
 
 from __future__ import annotations
 
+import asyncio
 import re
 import subprocess
 from pathlib import Path
 
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
 
 TASK_ID = '4924'
 
@@ -94,12 +118,29 @@ def _new_repo(root: Path) -> None:
     _git(root, 'init', '-b', 'main')
 
 
+def _real_citation_walk(root: Path, tid: str) -> str | None:
+    """Drive the REAL `GitOps.find_task_citation_commit` over *root*.
+
+    A default `GitConfig` (main_branch='main', branch_prefix='task/',
+    commit_citation_pattern=None -> DEFAULT_COMMIT_CITATION_PATTERN) is
+    everything the method reads, so no fixture plumbing is needed.
+    `asyncio.run` keeps the callers ordinary sync tests.
+    """
+    git_ops = GitOps(GitConfig(main_branch='main', branch_prefix='task/'), root)
+    return asyncio.run(git_ops.find_task_citation_commit(tid))
+
+
 def _citation_walk(root: Path, tid: str) -> str | None:
-    """The shell form of `GitOps.find_task_citation_commit`, verbatim.
+    """The citation gate as `skills/_shared/deriving-landed-sha.md` spells it in SHELL.
 
     Coarse `--grep` full-message pre-filter, then re-test each candidate's
     SUBJECT with the same pattern compiled as a Python `re`, walking
     most-recent-first; the first subject match wins.
+
+    NOT a copy of the method -- that one reads `-z` NUL-separated records,
+    while the runbook prescribes a readable listing. Callers assert this
+    AGREES with `_real_citation_walk` on the same repo, which is what
+    keeps the runbook's transcription honest as production moves.
     """
     pattern_str = DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(tid))
     compiled = re.compile(pattern_str)
@@ -167,9 +208,17 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
     ) == '', 'expected no ancestry-path merge candidate for a branch that never advanced'
 
     # Step 4's citation gate nevertheless fires POSITIVE -- off the sibling.
-    assert _citation_walk(root, TASK_ID) == sibling, (
-        'expected the citation walk to select the sibling commit; the whole defect is '
-        'that this arm cannot tell a sibling-covered landing from a fast-forward'
+    # Claimed through the REAL method, then through the runbook's shell
+    # transcription, then that the two agree (see this module's docstring).
+    assert _real_citation_walk(root, TASK_ID) == sibling, (
+        'expected GitOps.find_task_citation_commit to select the sibling commit; the '
+        'whole defect is that this arm cannot tell a sibling-covered landing from a '
+        'fast-forward'
+    )
+    assert _citation_walk(root, TASK_ID) == _real_citation_walk(root, TASK_ID), (
+        "the runbook's shell citation gate and GitOps.find_task_citation_commit must "
+        'agree; a disagreement means production moved and '
+        'skills/_shared/deriving-landed-sha.md step 4 needs the same change'
     )
 
     # ...and the sha the PRE-FIX ladder would have stamped is worthless.
@@ -211,9 +260,14 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
     _git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
     assert _git(root, 'rev-parse', 'main') == trailing
 
-    assert _citation_walk(root, TASK_ID) == citing, (
-        'the walk must select this branch\'s own citing commit, not the trailing '
-        'non-citing tip'
+    assert _real_citation_walk(root, TASK_ID) == citing, (
+        'GitOps.find_task_citation_commit must select this branch\'s own citing '
+        'commit, not the trailing non-citing tip'
+    )
+    assert _citation_walk(root, TASK_ID) == _real_citation_walk(root, TASK_ID), (
+        "the runbook's shell citation gate and GitOps.find_task_citation_commit must "
+        'agree; a disagreement means production moved and '
+        'skills/_shared/deriving-landed-sha.md step 4 needs the same change'
     )
 
     tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
