@@ -693,7 +693,10 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
 
     Construct-don't-raise, matching ``scheduler.py::SchedulerFacade.get_statuses``'
     ``({}, exception)`` convention: an unreadable envelope yields ``({}, ValueError(…))``
-    describing the shape, never a raise.
+    describing the shape, never a raise.  That facade parses the SAME tool's response
+    with ``shared.mcp_envelope.parse_tool_result`` instead — a deliberate, named
+    non-convergence whose reasons and shape divergences are recorded on
+    :meth:`SchedulerChronicFlakeTaskClient.get_statuses`.
 
     Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
     hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.
@@ -781,6 +784,33 @@ class SchedulerChronicFlakeTaskClient:
 
         Ids are coerced to ``str`` — the ledger's ``owner_task_id`` column is
         TEXT, and an int on the wire would match nothing.
+
+        A SECOND IMPLEMENTATION OF ONE TOOL CALL, KNOWINGLY.
+        ``scheduler.py::SchedulerFacade.get_statuses`` dispatches the same
+        tool with the same arguments and returns the same ``(statuses,
+        error)`` pair, and in production the object wrapped here IS the real
+        ``Scheduler``, which already exposes it.  Delegating to it when
+        present (``hasattr``-and-call, falling back to this body for
+        ``dispatch_tool``-only doubles) was considered and REJECTED, because
+        it would put the two parsers on opposite sides of the test boundary:
+        production would run ``parse_tool_result``, every fake and the
+        eval-mode ``_StubMcpSession`` would run this one, and the parser
+        production actually executes would be exercised by no test at all.
+        That is the same structural escape
+        ``test_flake_ledger.py::TestOpenDebtOverTheRealAdapter`` was added to
+        close — each side proved against a double encoding its own
+        assumption, with the disagreement living in the seam between them.
+        The duplication is the cheaper failure: it is one function, tested,
+        and the seam it serves is duck-typed over ``dispatch_tool`` ALONE.
+
+        THE TWO PARSERS ARE NOT INTERCHANGEABLE, so do not "converge" them
+        without reading both.  ``parse_tool_result`` accepts ONLY the strict
+        ``result['result']['content'][i]['text']`` spelling and would reject
+        every bare-dict shape this seam exists to tolerate; it also unwraps a
+        ``{'data': {…}}`` layer that :func:`_unwrap_dispatch_envelope` does
+        not; and this path coerces keys and values to ``str`` where the
+        facade returns whatever the tool sent.  A shape added to one is not a
+        shape handled by the other.
         """
         try:
             result = await self._scheduler.dispatch_tool(
