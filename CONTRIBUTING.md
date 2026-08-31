@@ -231,10 +231,16 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
     deadline expiry on such a wait fails a test whose pipeline completed
-    correctly. Selection is by call **shape** alone: there is no class list and
-    no budget threshold deciding which sites are scanned, and the teardown join
-    in `_stop_worker` is exempt structurally (a bare `ast.Name` target), not by
-    name. Twenty files carry pre-existing debt, grandfathered in the script's
+    correctly. No class list and no budget threshold decides which sites are
+    scanned, and the teardown join in `_stop_worker` is exempt structurally (a
+    bare `ast.Name` target), not by name. The two legs differ, though: the
+    `req.result` leg is pure **shape**, while the barrier leg additionally
+    requires a receiver `Name` starting with `gate` — a naming convention
+    standing in for "this is an `asyncio.Event`", with a measured
+    false-negative surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites
+    it cannot see. That gap is documented, not closed: `wait_responsive` lives
+    in `orchestrator/tests/_orch_helpers.py` and three of the seven scanned
+    packages cannot import it. See the script's Rule C docstring. Twenty files carry pre-existing debt, grandfathered in the script's
     `_WALL_CLOCK_DEADLINE_DEBT` baseline; like Rule B's it is **shrink-only**
     and opt-out, so a new offending file fails the gate by default. Unlike
     Rule B's it is a **budget** rather than a bare list — a listed file is

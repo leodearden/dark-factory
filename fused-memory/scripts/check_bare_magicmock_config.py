@@ -167,8 +167,36 @@ the dependence.  Task 2376's earlier sweep expressed its policy as "literals up 
 and the lone ``timeout=25.0`` sat just above it, surviving as one of the three measured
 failures — a policy expressed as a list, or as a threshold, cannot catch what is
 outside it.  Task 3980's own amendment pass then deleted a hand-maintained five-class
-frozenset for the same reason.  So selection here is by call SHAPE alone: there is no
-class list, no name table and no budget threshold deciding which sites are scanned.
+frozenset for the same reason.  So no class list and no budget threshold decides which
+sites are scanned.
+
+The two legs are NOT equally shape-selected, and the difference is a real coverage
+boundary rather than a detail (recorded by task 4246's amendment pass, which found the
+flat claim "selection is by call shape alone" overstated):
+
+  * The ``req.result`` leg IS pure shape — ``ast.Attribute`` with ``attr == 'result'``,
+    any receiver, any scope, any file.
+  * The ``gate*.wait()`` leg additionally requires the receiver to be a bare ``Name``
+    whose id starts with ``gate``.  That IS name-based selection.  It stands in for
+    "this is an ``asyncio.Event`` barrier", which the AST cannot distinguish from any
+    other ``.wait()`` (``proc.wait()``, ``threading.Event.wait()``, a ``Condition``);
+    the convention is universal in the module the file-local guard was ported from.
+
+MEASURED false-negative surface of that prefix, over the seven scanned tests/ dirs:
+102 ``asyncio.wait_for(<expr>.wait(), ...)`` sites across 36 files whose receiver is
+not a gate-prefixed Name — 60 under orchestrator/tests (``done.wait()``,
+``verify_started.wait()``, ``drive.first_dispatched.wait()``), 24 under
+dashboard/tests, 18 under fused-memory/tests.  Rule C sees none of them.
+
+Dropping the prefix was considered and DECLINED on a measurement, not a preference:
+the remedy this rule names — ``wait_responsive`` — is defined in
+``orchestrator/tests/_orch_helpers.py`` and exists nowhere else, so flagging the 42
+dashboard/fused-memory sites would emit a rejection naming a helper those packages
+cannot import, and grandfather them into a shrink-only baseline they have no way to
+shrink.  Scoping the wider leg to orchestrator/tests would reintroduce exactly the
+a-list-decides-coverage failure mode the paragraph above rejects.  So the gap is
+documented here rather than asserted away; closing it needs ``wait_responsive`` (or an
+equivalent) reachable from every scanned package first.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
 ``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
@@ -697,7 +725,15 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         the event the test is waiting for; a deadline here fails a test whose
         merge pipeline completed correctly.
       * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier.  Already
-        event-driven; only its deadline is wall-clock.
+        event-driven; only its deadline is wall-clock.  NOTE the asymmetry: this
+        leg is NOT pure shape.  The ``gate`` name prefix is a naming convention
+        standing in for "this is an Event", because the AST cannot tell an
+        ``Event.wait()`` from a ``proc.wait()``.  It therefore has a real,
+        measured false-negative surface — 102 ``asyncio.wait_for(<expr>.wait())``
+        sites across 36 files in the scanned dirs are invisible to it.  See the
+        Rule C section of the module docstring for the census and for why
+        dropping the prefix was declined (``wait_responsive``, the remedy this
+        rule names, exists only under orchestrator/tests).
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
@@ -705,9 +741,10 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
     ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
     TimeoutError — so it cannot manufacture the flake task 3980 fixed, and
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call
-    distinction is what makes that exclusion STRUCTURAL rather than a
+    distinction is what makes THAT exclusion structural rather than a
     hand-maintained name list, which is what lets this rule scan every scope of
-    every file the nine call sites reach.
+    every file the nine call sites reach.  (It is an exclusion, not a selector:
+    the only name-based *selection* here is the ``gate`` prefix above.)
 
     Ported unchanged in behaviour from the file-local guard this rule replaced
     (task 3980, orchestrator/tests/test_merge_speculation.py).

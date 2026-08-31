@@ -1446,6 +1446,14 @@ class TestWallClockLoadBearingTarget:
     the test waits for) and a ``gate*.wait()`` ``asyncio.Event`` barrier
     (already event-driven; only its deadline is wall-clock).
 
+    The two legs are NOT symmetric and these tests pin the asymmetry rather than
+    hiding it: ``.result`` is selected by pure shape, while the barrier leg also
+    demands a receiver Name starting with ``gate`` — a naming convention, with a
+    measured false-negative surface (102 ``asyncio.wait_for(<expr>.wait())``
+    sites across the scanned dirs). Task 4246's amendment pass declined to drop
+    the prefix because the remedy the rule names, ``wait_responsive``, exists
+    only under orchestrator/tests; see the script's Rule C docstring.
+
     The Name negative is the load-bearing one: it is what keeps the
     ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
     inside ``contextlib.suppress``, asserting nothing — exempt STRUCTURALLY by
@@ -1493,7 +1501,12 @@ class TestWallClockLoadBearingTarget:
         assert _checker._load_bearing_wait_target(_expr('obj.results')) is None
 
     def test_non_gate_name_wait_call_is_not_load_bearing(self):
-        """``notagate.wait()`` → None (the receiver Name must start with 'gate')."""
+        """``notagate.wait()`` → None (the receiver Name must start with 'gate').
+
+        This pins a KNOWN false negative, not a desired exclusion: a real
+        ``done.wait()`` barrier is invisible for the same reason. It is here so
+        the boundary is measured rather than assumed — see the class docstring.
+        """
         assert _checker._load_bearing_wait_target(_expr('notagate.wait()')) is None
 
     def test_wrong_method_on_a_gate_is_not_load_bearing(self):

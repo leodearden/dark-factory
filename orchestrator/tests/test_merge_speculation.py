@@ -3871,12 +3871,20 @@ class TestTimeoutMarkCoverage:
 # A load-bearing target is `X.result` (a MergeRequest.result future) or
 # `gate*.wait()` (an asyncio.Event barrier); the `_stop_worker` teardown join
 # below is exempt because its target is a bare Name, not because anything lists
-# it. There is no class list, no name table and no budget threshold deciding
-# which sites are scanned — task 2376's sweep expressed its policy as "literals
-# up to 15" and the lone `timeout=25.0` sat just above it, surviving as one of
-# the three measured failures; task 3980's own amendment pass then deleted a
-# hand-maintained five-class frozenset for the same reason. A list cannot catch
-# what is outside it, and a threshold is just another list.
+# it. No class list and no budget threshold decides which sites are scanned —
+# task 2376's sweep expressed its policy as "literals up to 15" and the lone
+# `timeout=25.0` sat just above it, surviving as one of the three measured
+# failures; task 3980's own amendment pass then deleted a hand-maintained
+# five-class frozenset for the same reason. A list cannot catch what is outside
+# it, and a threshold is just another list.
+#
+# One honest asymmetry, recorded by task 4246's amendment pass rather than
+# glossed: the `.result` leg is pure shape, but the barrier leg also requires a
+# receiver Name starting with `gate` — a naming convention (universal in THIS
+# module, which is why the guard could carry it while it lived here) standing in
+# for "this is an asyncio.Event". Repo-wide it has a measured false-negative
+# surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites. The checker's
+# Rule C docstring carries the census and why dropping the prefix was declined.
 #
 # Deleting the local copy was gated on a two-sided proof, not on this module
 # merely passing: fused-memory/tests/test_check_bare_magicmock_config.py::
