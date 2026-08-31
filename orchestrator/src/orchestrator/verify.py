@@ -3920,7 +3920,15 @@ _RUFF_ESCAPE_REMEDIATION = (
     '[tool.ruff]'
 )
 # The worktree-ROOT config files whose presence decides whether ruff's walk-up
-# halts at the boundary, in ruff's own per-directory precedence order.
+# halts at the boundary, listed in ruff's own per-directory precedence order:
+# ``.ruff.toml`` > ``ruff.toml`` > ``pyproject.toml[tool.ruff]``.  All THREE are
+# fingerprinted, not just the pyproject: a base carrying only a root
+# ``ruff.toml`` halts the walk exactly as effectively, so a pyproject-only
+# fingerprint would read that base as config-less and miss the change outright.
+# Measured on ruff 0.15.9 in both directions — with all three present the
+# settings path is the ``.ruff.toml``; with the parent declaring [tool.ruff] and
+# the worktree root declaring only a bare ``ruff.toml``, the walk stops at the
+# worktree.
 _RUFF_ROOT_CONFIG_NAMES: tuple[str, ...] = ('.ruff.toml', 'ruff.toml', 'pyproject.toml')
 
 # (resolved worktree path, per-root-config content digests).
