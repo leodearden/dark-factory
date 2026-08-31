@@ -669,6 +669,42 @@ def _verdict_words(module: Any) -> tuple[str, ...]:
     return ('distinct', 'restates', 'amends', 'contests')
 
 
+def _parse_callers(parse: Any, slate: list[Any]) -> list[tuple[str, Any]]:
+    """Every calling convention an option-(a) ``parse_judge_verdict`` may demand.
+
+    WHY THIS EXISTS. The probe used to call ``parse(raw)`` and nothing else.
+    But the STRICTEST option (a) — the one the gate's own failure text
+    prescribed, "validate it against the slate in parse_judge_verdict" — takes
+    the slate as a REQUIRED positional: ``parse_judge_verdict(raw,
+    candidates)``. Every payload then raised ``TypeError`` before the parser
+    ran, option (a) reported 'accepted no probe payload', and control fell
+    through to option (b), which a correct option-(a) fix has no reason to
+    satisfy. Measured: a complete option-(a) fix exited 1 and would have left
+    task 3169 permanently re-blocked — the very defect this gate exists to
+    remove, reproduced one level down.
+
+    THE SLATE IS PASSED IN BOTH SHAPES because a validating parser may compare
+    against ids or against the candidate objects, and there is no way to know
+    which from the outside. Positional first, then by each plausible keyword.
+    The probe's payloads name the slate's OWN ids (``first``/``last``), so a
+    parser that validates membership accepts them.
+
+    Ordered least-assuming first: the single-argument call is tried before any
+    slate is supplied, so a parser that never wanted one is never handed one.
+    """
+    ids = [str(getattr(candidate, 'id', candidate)) for candidate in slate]
+    objects = list(slate)
+    callers: list[tuple[str, Any]] = [('parse(raw)', lambda raw: parse(raw))]
+    for shape, value in (('ids', ids), ('candidates', objects)):
+        callers.append((f'parse(raw, <slate {shape}>)', lambda raw, v=value: parse(raw, v)))
+        for keyword in ('candidates', 'candidate_ids'):
+            callers.append((
+                f'parse(raw, {keyword}=<slate {shape}>)',
+                lambda raw, k=keyword, v=value: parse(raw, **{k: v}),
+            ))
+    return callers
+
+
 def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
     """``(holds, reason)`` for the option-(a) branch.
 
@@ -679,8 +715,11 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
     return on a payload that named no candidate — is inconclusive and falls
     through to option (b).
 
-    A raise on every payload is INCONCLUSIVE, not a failure: a stricter
-    option-(a) parser may demand a slate argument this probe cannot supply.
+    A raise on every CALLING CONVENTION is INCONCLUSIVE, not a failure. The
+    conventions themselves are no longer assumed: ``_parse_callers`` supplies
+    the slate positionally and by keyword, so a parser that VALIDATES against
+    the slate — the strictest option (a), and the one the gate's own text
+    prescribed — is exercised rather than rejected at the call boundary.
     """
     parse = getattr(module, 'parse_judge_verdict', None)
     if parse is None:
@@ -693,6 +732,44 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
             'inconclusive — the slate carries fewer than two distinct candidate '
             'ids, so no two payloads differing only in the id can be built'
         )
+    unreached: list[str] = []
+    for label, caller in _parse_callers(parse, slate):
+        holds, reason = _option_a_under(module, caller, key, first, last)
+        if holds:
+            return True, reason
+        if reason is None:
+            # This convention never got a payload PAST the call boundary, so it
+            # asserted nothing. Keep it only as a fallback diagnostic; another
+            # convention may still reach the parser.
+            unreached.append(label)
+            continue
+        # A convention that REACHED the parser rendered a real verdict on it.
+        # That finding is the actionable one, so it outranks every "the call
+        # signature did not match" note from the conventions that did not.
+        return False, reason
+    return False, (
+        f'inconclusive — parse_judge_verdict accepted no probe payload under any '
+        f'calling convention ({_first_few(unreached, limit=len(unreached))})'
+    )
+
+
+def _option_a_under(
+    module: Any,
+    parse: Any,
+    key: str,
+    first: str,
+    last: str,
+) -> tuple[bool, str | None]:
+    """``(holds, reason)`` for ONE calling convention.
+
+    *parse* is a single-argument adapter from ``_parse_callers``; every call
+    below goes through it, so the convention is fixed for the whole evaluation
+    (including the ``_echoes_payload`` control).
+
+    ``reason is None`` means the convention never reached the parser — every
+    payload raised — which is not a verdict about the invariant. The caller
+    tries the next convention rather than reporting a failure.
+    """
     saw_bare_str = False
     inert: list[str] = []
     errors: list[str] = []
@@ -769,10 +846,11 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
         )
     if inert:
         return False, 'inconclusive — ' + _first_few(inert)
-    return False, (
-        f'inconclusive — parse_judge_verdict accepted no probe payload '
-        f'({_first_few(errors)})'
-    )
+    # Every payload raised: this convention asserted nothing. Signal that with
+    # None so the driver moves on to the next one instead of reporting a
+    # failure it did not measure.
+    logger.debug('option (a): no payload reached the parser (%s)', _first_few(errors))
+    return False, None
 
 
 def _first_few(reasons: list[str], limit: int = 3) -> str:
