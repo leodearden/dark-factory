@@ -437,6 +437,58 @@ def parse_judge_verdict(raw, candidate_ids=None):
         raise ValueError('verdict names a candidate outside the slate')
     return (verdict, candidate_id)
 ''',
+    # The STRICTEST option (a), and the exact shape the gate's own old failure
+    # text prescribed: "validate it against the slate in parse_judge_verdict".
+    # The slate argument is REQUIRED POSITIONALLY, so a single-argument call
+    # raises TypeError before the parser is ever exercised. Reviewer-reported
+    # false FAIL: the probe called `parse(raw)` only, reported option (a)
+    # "accepted no probe payload", fell through to option (b) -- which this
+    # (correctly untouched) flat prompt cannot satisfy -- and exited 1. A
+    # complete, correct option-(a) fix landing on main would have left the gate
+    # failing closed forever and task 3169 permanently re-blocked.
+    'option_a_validating': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw, candidates):
+    payload = json.loads(raw)
+    word = payload.get(VERDICT_KEY)
+    verdict = JUDGE_VERDICTS.get(str(word).strip().lower())
+    if verdict is None:
+        raise ValueError('not a judge verdict word')
+    candidate_id = payload.get('candidate_id')
+    known = {getattr(c, 'id', c) for c in candidates}
+    if candidate_id not in known:
+        raise ValueError('verdict names a candidate outside the slate')
+    return (verdict, candidate_id)
+''',
+    # An UNRELATED prompt-legibility change wearing a target-ish name. The band
+    # canonical is interpolated into a header line; nothing binds any verdict to
+    # any candidate, the candidate list stays flat and undifferentiated, and
+    # parse_judge_verdict still returns a bare str. Reviewer-reported false
+    # PASS: `canonical` was in _TARGET_NAME_RE, so the echo control was forgiven
+    # and the probe printed "option (b): satisfied ... via 'canonical_id'" and
+    # exited 0 -- authorising the production flip on a change that establishes
+    # nothing.
+    'unrelated_canonical_header': r"""
+
+def build_judge_prompt(content, candidates, canonical_id=None):
+    lines = ['NEW ENTRY:', str(content), '']
+    lines.append('BAND CANONICAL: ' + str(canonical_id))
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+""",
     # A FALSE PASS in the option-(b) half, symmetric to `echoes_payload` in the
     # option-(a) half. The extra parameter is free-text diagnostics that is
     # merely INTERPOLATED into the prompt; nothing in the module binds a verdict
@@ -1107,6 +1159,41 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, f'probe failed a strict option (a):\n{proc.stdout}\n{proc.stderr}'
         assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_slate_validating_parser_passes_option_a(self, tmp_path):
+        """The gate must not fail the very remedy its own text prescribed.
+
+        The old failure text said "validate it against the slate in
+        parse_judge_verdict", which is the signature ``parse_judge_verdict(raw,
+        candidates)`` — the slate REQUIRED, not defaulted. Calling it with one
+        argument raises ``TypeError`` before the parser runs, so every probe
+        payload was rejected, option (a) reported 'accepted no probe payload',
+        and control fell through to an option (b) this (correctly untouched)
+        flat prompt cannot satisfy. Measured before the fix: exit 1 with
+        'the attach target is INDETERMINATE'. A complete option-(a) fix landing
+        on main would have left the gate failing closed forever and task 3169
+        permanently re-blocked."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='option_a_validating')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe failed a slate-validating option (a):\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_unrelated_canonical_header_does_not_satisfy_option_b(self, tmp_path):
+        """A target-ISH name is not a target. ``canonical_id`` interpolated into
+        a header is an ordinary prompt-legibility change: it binds no verdict to
+        any candidate, and ``parse_judge_verdict`` still returns a bare str.
+        Reviewer-reported false PASS — ``canonical`` was in the forgiven-name
+        set, so the echo control waved it through and the probe exited 0,
+        authorising the production ``write_triage.enabled`` flip on a change
+        that establishes nothing."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='unrelated_canonical_header')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, (
+            f'an unrelated canonical header passed the gate:\n{proc.stdout}'
+        )
+        assert _INDETERMINATE in proc.stdout, proc.stdout
 
     def test_idless_non_scalar_return_does_not_satisfy_option_a(self, tmp_path):
         """A non-scalar return is a SHAPE that COULD carry a candidate id, never
