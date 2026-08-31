@@ -1072,6 +1072,36 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         _, client = await self._client(None, raises=RuntimeError('mcp down'))
         assert await client.commit_planning(['42']) is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope({'success': True}), {'success': True}],
+        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
+    )
+    async def test_commit_planning_is_SILENT_on_success(self, envelope, caplog):
+        """THE NEGATIVE CONTROL, and the only assertion that can catch a warning which
+        fires unconditionally.
+
+        The failure-envelope test above asserts a warning is PRESENT; nothing asserted it
+        is ABSENT on success, so an implementation that warned every time passed the whole
+        suite.  That was not hypothetical: this confirmation reads ``envelope.get(
+        'success')`` off the SHARED unwrapper, and while that unwrapper took one step it
+        landed on the inner MCP result — whose keys are ``content``/``structuredContent``/
+        ``isError`` — so ``get('success')`` was ``None`` and the "did not confirm success
+        … they may still be deferred" WARNING fired on every SUCCESSFUL commit_planning.
+        A permanent false alarm on a line an operator is meant to act on.
+
+        Parametrized over the real JSON-RPC body FIRST, because that is the shape that was
+        broken; the bare payload is the already-unwrapped spelling the fakes produce.
+        """
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake'] == [], (
+            'a SUCCESSFUL commit_planning must log nothing: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
     # ── submit_task's project_root injection ──────────────────────────────────
 
     @pytest.mark.asyncio

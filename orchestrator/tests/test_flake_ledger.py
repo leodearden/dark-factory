@@ -10,6 +10,16 @@ promotes "marked with '@pytest.mark.asyncio' but it is not an async function" to
 ERROR-level filterwarning, so a sync ``def test_`` inside an ``@pytest.mark.asyncio``
 class is a collection FAILURE, not a warning.  The ledger API is deliberately
 mixed-colour (sync writer/readers, async debt functions); the split is structural.
+
+That guard is ROOTDIR-DEPENDENT, and worth stating because the two spellings disagree.
+pytest reads exactly ONE inifile, the rootdir's.  The canonical invocation —
+``cd orchestrator && uv run pytest tests/``, which is what this repo's configured
+``test_command`` runs — resolves rootdir to ``orchestrator/`` and the guard holds.  An
+invocation whose arguments SPAN packages (``pytest orchestrator/tests/ shared/``) walks
+rootdir up to the repo root instead, where ``pyproject.toml`` sets ``asyncio_mode =
+"auto"`` — under which a sync test in an async class is silently collected and run.  So
+treat the split as a convention this file maintains deliberately, not as something the
+inifile enforces on every possible invocation.
 """
 
 from __future__ import annotations

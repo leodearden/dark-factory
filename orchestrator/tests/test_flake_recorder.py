@@ -629,13 +629,19 @@ class TestRecordOpensDebt:
         consulted against the stored id — rather than short-circuiting on a non-NULL
         column, which is INV-3's whole point.
 
-        The ``could not corroborate`` assertion is what keeps that claim HONEST.  A
-        failed corroboration ALSO files nothing and ALSO leaves one row, so the three
-        count assertions below are satisfied identically by the degrade branch — this
+        The QUIET-LEDGER assertion is what keeps that claim HONEST.  A failed
+        corroboration ALSO files nothing, ALSO leaves one row, and ALSO records the same
+        ``statuses_calls`` — the fake logs the call before the caller's unpack fails — so
+        every count assertion below is satisfied identically by the degrade branch.  This
         test passed vacuously for exactly that reason while the fake's ``get_statuses``
-        returned a bare dict and every unpack raised into the ``except``.  Asserting
-        the warning is ABSENT is the only thing that pins the pass to the live-owner
-        dedup branch, so a regression re-filing against a LIVE owner cannot stay green.
+        returned a bare dict.  Pinning the pass to the live-owner dedup branch needs a
+        signal only the degrade path emits, and that is a WARNING from the ledger.
+
+        Asserted STRUCTURALLY — by level and logger name, not by matching the warning's
+        prose.  A negative substring match (``'could not corroborate' not in caplog.text``)
+        would go silently vacuous the moment that log line is reworded, reverting this
+        test to precisely the always-passing state it exists to prevent; a negative
+        assertion is only as good as its ability to fail.
         """
         client = _FakeLedgerTaskClient()
         s1 = _suppression(test_ids=self.ONE_ID, observed_at='2026-08-22T12:00:00+00:00')
@@ -645,9 +651,13 @@ class TestRecordOpensDebt:
             await _record(_result(s1), tmp_path, task_client=client)
             await _record(_result(s2), tmp_path, task_client=client)
 
-        assert 'could not corroborate' not in caplog.text, (
+        ledger_warnings = [
+            r for r in caplog.get_records('call')
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.flake_ledger'
+        ]
+        assert ledger_warnings == [], (
             'the second pass degraded instead of corroborating, so the dedup branch '
-            f'under test never ran: {caplog.text}'
+            f'under test never ran: {[r.getMessage() for r in ledger_warnings]}'
         )
 
         rows = list_open_debt(ledger_db_path(tmp_path))
@@ -655,6 +665,100 @@ class TestRecordOpensDebt:
         assert rows[0].open_count == 1, 'a repeat while still open is not a re-open'
         assert len(client.submit_calls) == 1, client.submit_calls
         assert client.statuses_calls == [[rows[0].owner_task_id]], client.statuses_calls
+
+    async def test_a_raising_open_debt_for_one_test_does_not_cost_the_other(
+        self, tmp_path: Path, caplog, monkeypatch,
+    ) -> None:
+        """The source's own headline claim, finally executed: "ONE GUARD PER TEST, not
+        one for the batch: a two-test observation is two independent defects, and a
+        filing that fails for one must not cost the other its owner".
+
+        WHAT THE GUARD ACTUALLY PROTECTS AGAINST, which is narrower than it first looks.
+        A failing task CLIENT cannot reach ``_guarded_async`` at all — ``open_debt`` is
+        fail-soft and swallows that internally, so the loop continues either way.  A test
+        driven through a raising client therefore CANNOT distinguish a per-test guard
+        from one shared ``try`` around the whole loop (verified: collapsing them keeps
+        such a test green).  The guard earns its keep only against ``open_debt`` ITSELF
+        raising — a shape it claims never to produce, which is exactly why the guard is
+        there and exactly why it needs a test that reaches it.
+
+        So ``open_debt`` is monkeypatched to raise for the FIRST id and to behave
+        normally for the second.  Under one shared guard the raise aborts the loop and
+        the second test silently loses an owner it could have had; under one guard per
+        test it costs precisely one signal.
+        """
+        import orchestrator.flake_recorder as fr
+
+        first, second = _IDS
+        real_open_debt = fr.open_debt
+
+        async def _raises_for_first(db_path, project_id, test_id, **kwargs):
+            if test_id == first:
+                raise RuntimeError('open_debt itself blew up for this test')
+            return await real_open_debt(db_path, project_id, test_id, **kwargs)
+
+        monkeypatch.setattr(fr, 'open_debt', _raises_for_first)
+        client = _FakeLedgerTaskClient()
+
+        with caplog.at_level(logging.WARNING):
+            await _record(_result(_suppression(test_ids=_IDS)), tmp_path, task_client=client)
+
+        rows = {r.test_id: r for r in list_open_debt(ledger_db_path(tmp_path))}
+        assert second in rows, (
+            'the SECOND test must still get its row — a shared guard aborts the loop on '
+            f'the first raise and never reaches it: {sorted(rows)}'
+        )
+        assert rows[second].owner_task_id is not None, 'and it must still be OWNED'
+        assert len(client.submit_calls) == 1, (
+            f'exactly the second test was filed: {client.submit_calls}'
+        )
+        lost = [
+            r for r in caplog.get_records('call')
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.flake_recorder'
+        ]
+        assert len(lost) == 1, (
+            'one failure costs exactly one signal: '
+            f'{[r.getMessage() for r in lost]}'
+        )
+        assert '[debt]' in lost[0].getMessage(), lost[0].getMessage()
+
+    async def test_a_suppression_whose_test_ids_explode_still_completes(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The ``_guarded('debt-test-ids', ...)`` guard, which nothing reached.
+
+        ``FlakeSuppression`` rides the wire with no runtime validation, so reading
+        ``s.test_ids`` is itself a fallible operation on a malformed object — and it
+        happens OUTSIDE the per-test loop, so an unguarded raise there would take the
+        whole recorder down rather than costing one signal.  B12 says that must cost the
+        merge nothing.
+        """
+        s = _suppression(test_ids=self.ONE_ID)
+
+        class _Exploding:
+            def __getattr__(self, name: str):
+                return getattr(s, name)
+
+            @property
+            def test_ids(self):
+                raise TypeError('test_ids is not iterable on this wire object')
+
+        client = _FakeLedgerTaskClient()
+
+        with caplog.at_level(logging.WARNING):
+            # DELIBERATE protocol violation: a malformed wire object whose `test_ids`
+            # raises is exactly the shape this guard exists for.
+            await _record(
+                _result(_Exploding()),  # type: ignore[arg-type]
+                tmp_path,
+                task_client=client,
+            )
+
+        assert client.submit_calls == [], 'nothing was carried, so nothing is filed'
+        assert list_open_debt(ledger_db_path(tmp_path)) == [], 'no rows without carried ids'
+        assert '[debt-test-ids]' in caplog.text, (
+            f'the lost signal must name the guard that caught it: {caplog.text}'
+        )
 
     # -- (d) INV-4's escape survives the new path, and runs BEFORE it ---------
 

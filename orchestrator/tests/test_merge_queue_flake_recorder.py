@@ -491,7 +491,15 @@ class _ExplodingTaskClient:
         self.calls.append('submit_task')
         raise RuntimeError('mcp dispatch failed')
 
-    async def get_statuses(self, ids: list[str]) -> dict[str, str]:
+    async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        # The PAIR, matching `flake_ledger.FlakeLedgerTaskClient`.  It raises rather than
+        # returning, so the annotation is unreachable at runtime and was previously wrong
+        # (`dict[str, str]`) without any test noticing.  That is a latent silent-pass, not
+        # a cosmetic slip: the Protocol is structural, so nothing catches the drift, and
+        # the first test to seed an OWNER here would have unpacked a bare dict, raised
+        # ValueError inside `_ensure_owner_task`'s guard, and routed into the degrade
+        # branch — a green test proving nothing, which is the exact hazard
+        # test_flake_recorder.py's `_FakeLedgerTaskClient` docstring documents.
         self.calls.append('get_statuses')
         raise RuntimeError('mcp dispatch failed')
 
