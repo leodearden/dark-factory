@@ -335,6 +335,40 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def is_git_toplevel(path: Path) -> bool:
+    """Whether git resolves *path* itself as the root of the repository it acts on.
+
+    ``git rev-parse --show-toplevel`` under *path*, realpath-compared to *path*
+    on BOTH sides (so a legitimately SYMLINKED checkout passes, while a
+    SUBDIRECTORY — whose toplevel is the enclosing repo — does not). Any
+    non-zero rc, empty output, or ``OSError`` from either ``.resolve()`` is
+    ``False``: fail CLOSED, since "cannot prove the target" and "proved the
+    wrong target" carry the same risk of acting on a repository the caller
+    never named. Inherits never-raise from :func:`_run_git`.
+
+    QUIET by design — it never logs. Each call site owns the single LOUD
+    refusal line so the message can name the action refused.
+
+    THIS IS NOT THE ``GIT_DIR`` DEFENCE — :func:`scrubbed_git_env` is. MEASURED
+    against real git: with ``cwd=<sandbox>`` and ``GIT_DIR=<decoy>/.git``,
+    ``--show-toplevel`` returns ``<sandbox>`` (rc 0) — git treats cwd as the
+    work tree when ``GIT_DIR`` is set and ``GIT_WORK_TREE`` is not — while
+    ``--git-common-dir`` returns ``<decoy>/.git``. So this check PASSES under
+    the exact leak it appears to guard against. It is the residual backstop for
+    the causes the scrub cannot remove: a redirecting git env var added by a
+    future git release, a nested or symlinked checkout, a ``--repo`` pointing at
+    a subdirectory. The same true-but-easily-misread property as fbfeacdd00's
+    census guard. DO NOT delete the scrub believing this subsumes it.
+    """
+    rc, out, _err = _run_git(['rev-parse', '--show-toplevel'], cwd=path)
+    if rc != 0 or not out.strip():
+        return False
+    try:
+        return Path(out.strip()).resolve() == Path(path).resolve()
+    except OSError:
+        return False
+
+
 def _is_under(path: Path, root: Path) -> bool:
     """Whether *path* is *root* itself or a descendant of it (band guard)."""
     try:
