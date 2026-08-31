@@ -889,3 +889,69 @@ def test_cli_leaked_git_dir_never_touches_the_decoy_repository(tmp_path):
     report = json.loads(result.stdout)
     assert report["reclaimed"] == 1
     assert report["reclaimed_paths"] == [str(own.resolve())]
+
+
+# ---------------------------------------------------------------------------
+# step-17: residual fail-closed target verify — is_git_toplevel(path)
+# ---------------------------------------------------------------------------
+
+def test_is_git_toplevel_true_for_repo_root(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert row.is_git_toplevel(repo) is True
+
+
+def test_is_git_toplevel_true_for_registered_parking(tmp_path):
+    """A LINKED worktree resolves its OWN path as toplevel (measured), so a
+    per-parking verify is sound — park_commit can self-guard the worktree it is
+    about to `add -A` from."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+
+    assert row.is_git_toplevel(parking) is True
+
+
+def test_is_git_toplevel_true_through_a_symlink(tmp_path):
+    """A repo reached via a SYMLINK passes. ``--show-toplevel`` reports the REAL
+    path, so BOTH sides must be realpath-resolved before comparison — comparing
+    the literal strings would false-refuse a legitimately symlinked checkout,
+    turning the guard into an outage."""
+    repo = _init_repo(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(repo)
+
+    assert row.is_git_toplevel(link) is True
+
+
+def test_is_git_toplevel_false_for_subdirectory_of_repo(tmp_path):
+    """The misconfiguration this guard exists to catch: git happily discovers
+    the ENCLOSING repo from a subdirectory, so the sweep would act on a
+    repository the caller only half-named."""
+    repo = _init_repo(tmp_path)
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    assert row.is_git_toplevel(subdir) is False
+
+
+def test_is_git_toplevel_false_for_subdirectory_inside_parking(tmp_path):
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    subdir = parking / "sub"
+    subdir.mkdir()
+
+    assert row.is_git_toplevel(subdir) is False
+
+
+def test_is_git_toplevel_false_for_non_repository(tmp_path):
+    """``rev-parse`` exits 128 outside a repository — fail CLOSED."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    assert row.is_git_toplevel(plain) is False
+
+
+def test_is_git_toplevel_false_for_missing_path_without_raising(tmp_path):
+    """A vanished target reaches ``_run_git``'s OSError path, which the module's
+    never-raise contract maps to a non-zero rc. The predicate must inherit that
+    fail-closed and NOT propagate — the sweep never raises."""
+    assert row.is_git_toplevel(tmp_path / "does-not-exist") is False
