@@ -209,3 +209,182 @@ def test_the_allowlist_is_a_whitelist_not_a_copy_of_os_environ(tmp_path, monkeyp
         key = flag[len('--setenv='):].split('=', 1)[0]
         assert key in lms_slate_run.PROPAGATED_ENV_KEYS, f'{key} is not allowlisted'
     assert not any('must-not-propagate' in element for element in argv)
+
+
+# ---------------------------------------------------------------------------
+# the in-unit sweep — one arm at a time, strictly serialized
+#
+# `lms_ctl start` is exclusive BY DEFAULT and REFUSES (exit 4) when a sibling
+# arm holds the card; it never evicts.  So overlapping two arms does not
+# degrade to a slow sweep, it produces a refusal — which makes the ordering
+# below a correctness property rather than a stylistic one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRunner:
+    """Records every argv and returns a scripted returncode.
+
+    Stands in for `subprocess.run`, which is how every test in this file stays
+    offline: no arm is started and no card is touched.
+    """
+
+    def __init__(self, codes=None, raises=None):
+        self.calls: list[list[str]] = []
+        self._codes = dict(codes or {})
+        self._raises = dict(raises or {})
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        key = _stage_key(argv)
+        if key in self._raises:
+            raise self._raises[key]
+        return _FakeCompleted(self._codes.get(key, 0))
+
+    def stages(self):
+        return [_stage_key(argv) for argv in self.calls]
+
+
+class _FakeCompleted:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def _stage_key(argv):
+    """('ctl', verb, arm_id) / ('healthcheck', arm_id) / ('merge',)."""
+    if str(lms_slate_run.CTL_PATH) in argv:
+        tail = argv[argv.index(str(lms_slate_run.CTL_PATH)) + 1:]
+        return ('ctl', tail[0], tail[1] if len(tail) > 1 else None)
+    if str(lms_slate_run.HEALTHCHECK_PATH) in argv:
+        if '--merge' in argv:
+            return ('merge',)
+        return ('healthcheck', argv[argv.index('--arm') + 1])
+    raise AssertionError(f'unrecognised argv: {argv}')
+
+
+class _FakeArm:
+    def __init__(self, arm_id):
+        self.arm_id = arm_id
+
+
+class _FakeManifest:
+    def __init__(self, *arm_ids):
+        self.arms = [_FakeArm(a) for a in arm_ids]
+
+    def arm_ids(self):
+        return [a.arm_id for a in self.arms]
+
+
+@pytest.fixture
+def two_arms(monkeypatch):
+    manifest = _FakeManifest('arm-one', 'arm-two')
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    return manifest
+
+
+def test_each_arm_runs_start_wait_healthcheck_stop_in_that_order(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert runner.stages()[:8] == [
+        ('ctl', 'start', 'arm-one'),
+        ('ctl', 'wait-ready', 'arm-one'),
+        ('healthcheck', 'arm-one'),
+        ('ctl', 'stop', 'arm-one'),
+        ('ctl', 'start', 'arm-two'),
+        ('ctl', 'wait-ready', 'arm-two'),
+        ('healthcheck', 'arm-two'),
+        ('ctl', 'stop', 'arm-two'),
+    ]
+
+
+def test_the_arms_are_strictly_serialized(tmp_path, two_arms):
+    """Arm two's `start` may appear only AFTER arm one's `stop`.  Overlapping
+    them does not merely slow the sweep: `lms_ctl start` refuses rather than
+    evicting, so arm two would fail with exit 4 on a healthy card."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    stages = runner.stages()
+    assert stages.index(('ctl', 'start', 'arm-two')) > stages.index(
+        ('ctl', 'stop', 'arm-one')
+    )
+
+
+def test_start_is_left_exclusive(tmp_path, two_arms):
+    """`--no-exclusive` would let a second arm onto a card that fits one.  The
+    sweep never needs it: it stops each arm before starting the next."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    for argv in runner.calls:
+        assert '--no-exclusive' not in argv
+
+
+def test_wait_ready_carries_the_ready_timeout(tmp_path, two_arms):
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', ready_timeout=42.0, runner=runner,
+    )
+
+    waits = [a for a in runner.calls if _stage_key(a)[:2] == ('ctl', 'wait-ready')]
+    assert waits
+    for argv in waits:
+        assert argv[argv.index('--timeout') + 1] == '42.0'
+
+
+def test_the_default_ready_timeout_is_the_one_lms_ctl_documents():
+    """Pinned against `lms_ctl`'s constant, not a literal: a driver that
+    silently waited less than the CLI's own default would report arms as
+    not-ready that were merely slow to load."""
+    import lms_ctl
+
+    assert lms_slate_run.DEFAULT_READY_TIMEOUT_S == lms_ctl.DEFAULT_READY_TIMEOUT_S
+
+
+def test_each_arms_healthcheck_writes_its_own_part_file(tmp_path, two_arms):
+    parts_dir = tmp_path / 'parts'
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    for arm_id in ('arm-one', 'arm-two'):
+        argv = next(a for a in runner.calls if _stage_key(a) == ('healthcheck', arm_id))
+        assert argv[argv.index('--output') + 1] == str(parts_dir / f'{arm_id}.json')
+
+
+def test_the_parts_directory_is_created(tmp_path, two_arms):
+    parts_dir = tmp_path / 'nested' / 'parts'
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    assert parts_dir.is_dir()
+
+
+def test_every_helper_script_is_invoked_by_absolute_path_with_sys_executable(
+    tmp_path, two_arms,
+):
+    """The unit has a minimal PATH and none of the caller's venv, so a bare
+    `python` or a relative script path resolves to something nobody reviewed --
+    or to nothing."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert runner.calls
+    for argv in runner.calls:
+        assert argv[0] == sys.executable
+        assert argv[1].startswith('/')
+        assert argv[1] in (str(lms_slate_run.CTL_PATH), str(lms_slate_run.HEALTHCHECK_PATH))
+
+
+def test_the_helper_script_paths_are_the_sibling_modules():
+    assert lms_slate_run.CTL_PATH == lms_slate_run.MODULE_PATH.parent / 'lms_ctl.py'
+    assert lms_slate_run.CTL_PATH.exists()
+    assert lms_slate_run.HEALTHCHECK_PATH == (
+        lms_slate_run.MODULE_PATH.parent / 'lms_healthcheck.py'
+    )
+    assert lms_slate_run.HEALTHCHECK_PATH.exists()
