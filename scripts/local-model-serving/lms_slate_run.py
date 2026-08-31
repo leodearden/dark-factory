@@ -44,11 +44,15 @@ cannot describe two different procedures.  (3) A wedged HTTP client or a
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import lms_fetch_weights
 import lms_vram
+from lms_ctl import DEFAULT_READY_TIMEOUT_S
+from lms_manifest import load_arms
 from lms_serve import REPO_ROOT
 
 #: The transient unit the whole sweep runs in.  Quoted verbatim by the
@@ -60,6 +64,12 @@ SLATE_UNIT_NAME = 'lms-slate-run'
 #: runs with a minimal PATH and none of the caller's venv, so neither a
 #: relative path nor a bare module name resolves inside it.
 MODULE_PATH = Path(__file__).resolve()
+
+#: The two sibling CLIs the sweep drives, by absolute path for the same reason
+#: the payload names `sys.executable`: the unit inherits a minimal PATH and
+#: none of the caller's venv.
+CTL_PATH = MODULE_PATH.parent / 'lms_ctl.py'
+HEALTHCHECK_PATH = MODULE_PATH.parent / 'lms_healthcheck.py'
 
 #: The caller variables that reach the unit, as an ALLOWLIST rather than a copy
 #: of `os.environ`.
@@ -133,3 +143,63 @@ def slate_argv(
     return lms_fetch_weights.transient_unit_prefix(
         SLATE_UNIT_NAME, _setenv_flags(environment),
     ) + payload
+
+
+# ---------------------------------------------------------------------------
+# the in-unit sweep
+# ---------------------------------------------------------------------------
+
+
+def ctl_argv(verb: str, arm_id: str, *extra: str) -> list[str]:
+    """One `lms_ctl.py` invocation.
+
+    Note what is NOT here: `--no-exclusive`.  `lms_ctl start` is exclusive by
+    default and REFUSES (exit 4) when another arm holds the card rather than
+    evicting it, and the sweep depends on that -- it is what turns "two arms
+    overlapped" from a silently-degraded measurement into a loud refusal.  The
+    sweep never needs the flag because it stops each arm before starting the
+    next.
+    """
+    return [sys.executable, str(CTL_PATH), verb, arm_id, *extra]
+
+
+def healthcheck_argv(*args: str) -> list[str]:
+    """One `lms_healthcheck.py` invocation."""
+    return [sys.executable, str(HEALTHCHECK_PATH), *args]
+
+
+def run_slate(
+    parts_dir: str | Path,
+    output: str | Path,
+    *,
+    ready_timeout: float = DEFAULT_READY_TIMEOUT_S,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> int:
+    """Sweep every arm the manifest commissions, one at a time.
+
+    Arm order and identity come from `load_arms().arms`, never a hardcoded
+    list, so an eighth arm added to `arms.yaml` is swept without touching this
+    file.
+
+    *runner* is the seam that keeps the tests offline: it defaults to
+    `subprocess.run` and is injected as a recorder in `test_lms_slate_run.py`,
+    so no test can start an arm or touch the card.
+
+    *output* is the slate artifact path.  It is not written here -- the merge
+    step that consumes it lands in a later commit, and even then it is
+    `lms_healthcheck --merge` that writes, never this module.
+    """
+    parts = Path(parts_dir)
+    parts.mkdir(parents=True, exist_ok=True)
+
+    for arm in load_arms().arms:
+        print(f'\n=== {arm.arm_id} ===', flush=True)
+        runner(ctl_argv('start', arm.arm_id))
+        runner(ctl_argv('wait-ready', arm.arm_id, '--timeout', str(ready_timeout)))
+        runner(healthcheck_argv(
+            '--arm', arm.arm_id,
+            '--output', str(parts / f'{arm.arm_id}.json'),
+        ))
+        runner(ctl_argv('stop', arm.arm_id))
+
+    return 0

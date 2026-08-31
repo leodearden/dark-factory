@@ -382,9 +382,9 @@ def test_every_helper_script_is_invoked_by_absolute_path_with_sys_executable(
 
 
 def test_the_helper_script_paths_are_the_sibling_modules():
-    assert lms_slate_run.CTL_PATH == lms_slate_run.MODULE_PATH.parent / 'lms_ctl.py'
+    serving_dir = lms_slate_run.MODULE_PATH.parent
+
+    assert serving_dir / 'lms_ctl.py' == lms_slate_run.CTL_PATH
+    assert serving_dir / 'lms_healthcheck.py' == lms_slate_run.HEALTHCHECK_PATH
     assert lms_slate_run.CTL_PATH.exists()
-    assert lms_slate_run.HEALTHCHECK_PATH == (
-        lms_slate_run.MODULE_PATH.parent / 'lms_healthcheck.py'
-    )
     assert lms_slate_run.HEALTHCHECK_PATH.exists()
