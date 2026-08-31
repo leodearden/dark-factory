@@ -43,10 +43,12 @@ cannot describe two different procedures.  (3) A wedged HTTP client or a
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import lms_fetch_weights
+import lms_vram
 from lms_serve import REPO_ROOT
 
 #: The transient unit the whole sweep runs in.  Quoted verbatim by the
@@ -58,6 +60,36 @@ SLATE_UNIT_NAME = 'lms-slate-run'
 #: runs with a minimal PATH and none of the caller's venv, so neither a
 #: relative path nor a bare module name resolves inside it.
 MODULE_PATH = Path(__file__).resolve()
+
+#: The caller variables that reach the unit, as an ALLOWLIST rather than a copy
+#: of `os.environ`.
+#:
+#: `LMS_BASELINE_DIR` earns its place: `lms_ctl start` writes the VRAM baseline
+#: through `lms_vram.baseline_dir()`, which reads this variable, and
+#: `lms_healthcheck` reads the baseline back through the same function.  If the
+#: two disagree the healthcheck exits 8 (`EXIT_STALE_BASELINE`) and writes no
+#: file at all -- so a ~30 minute sweep produces nothing, and the cause is a
+#: variable nobody mentioned.  Pinned to `lms_vram`'s own constant so a rename
+#: there cannot leave this driver propagating a dead name.
+#:
+#: A whitelist and not a blanket copy, because `systemd-run --setenv` records
+#: the value in the unit's systemd properties and the journal: copying
+#: `os.environ` would push `OPENAI_API_KEY`, `HF_TOKEN` and `VIRTUAL_ENV` into
+#: both, a secret-leak surface for zero benefit.  `lms_fetch_weights` already
+#: sets exactly the two variables it needs, deliberately; this follows it.
+PROPAGATED_ENV_KEYS = (lms_vram.BASELINE_DIR_ENV,)
+
+
+def _setenv_flags(env: dict[str, str]) -> list[str]:
+    """One `--setenv=K=V` per allowlisted key PRESENT in *env*.
+
+    An absent key emits NOTHING rather than an empty flag.  `''` is not
+    "unset" to a consumer's `os.environ.get(...)` fallback: an empty
+    `LMS_BASELINE_DIR` would send `lms_vram.baseline_dir()` to `Path('')`
+    instead of the `$XDG_RUNTIME_DIR` default it was supposed to fall back to.
+    """
+    return [f'--setenv={key}={env[key]}' for key in PROPAGATED_ENV_KEYS if key in env]
+
 
 #: The slate artifact.  Written by `lms_healthcheck --merge`, never by this
 #: module -- see the merge step for why that separation is load-bearing.
@@ -82,10 +114,11 @@ def slate_argv(
     nothing: `systemd --user` propagates no caller environment, so an
     `XDG_RUNTIME_DIR`-derived path is not the same path on both sides.
 
-    *env* is the caller environment the unit's `--setenv=` allowlist is read
-    from, injectable so the allowlist is assertable offline.  It is accepted
-    but not yet read; the allowlist itself lands in the next commit.
+    *env* is the caller environment the `--setenv=` allowlist is read from,
+    injectable so the allowlist is assertable offline.
     """
+    environment = dict(os.environ) if env is None else env
+
     payload = [
         sys.executable, str(MODULE_PATH),
         '--in-unit',
@@ -97,4 +130,6 @@ def slate_argv(
     if force:
         payload.append('--force')
 
-    return lms_fetch_weights.transient_unit_prefix(SLATE_UNIT_NAME, []) + payload
+    return lms_fetch_weights.transient_unit_prefix(
+        SLATE_UNIT_NAME, _setenv_flags(environment),
+    ) + payload
