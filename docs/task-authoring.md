@@ -1007,8 +1007,8 @@ capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
-related_memory_ids, spawned_from, program, program_stream, stream,
-cross_repo, cross_repo_project, human_curator_gate,
+related_memory_ids, related_tasks, spawned_from, program, program_stream,
+stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class
 ```

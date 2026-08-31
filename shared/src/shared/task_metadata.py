@@ -984,11 +984,20 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # before_done_verified_pid are the DeterministicRunner's own stamps
 # (CLAUDE.md "Deterministic task kind").
 #
-# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, related_task*) and
-# Tier-C ad-hoc/timestamped one-off keys are deliberately NOT included here
-# — they keep emitting unknown_key as a greppable drift signal; see
-# CLAUDE.md "Task metadata vocabulary & census" for the documented
-# consolidation convention.
+# Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, and the three
+# `related_tasks` aliases — `related_task`, `related_df_tasks`,
+# `related_task_examples`) and Tier-C ad-hoc/timestamped one-off keys are
+# deliberately NOT included here — they keep emitting unknown_key as a
+# greppable drift signal; see CLAUDE.md "Task metadata vocabulary &
+# census" for the documented consolidation convention.
+#
+# That alias list is spelled key-exact rather than globbed. It carried a
+# `related_task*` wildcard until task 4303, which went false the moment
+# `related_tasks` was blessed below and was independently hazardous: the
+# glob also sweeps in `related_task_ids`, a DIFFERENT key with a live
+# reader in `fused-memory/scripts/audit_duplicate_memories.py::
+# liveness_snapshot_subject_task_ids`, and one that is MEMORY metadata
+# rather than task metadata.
 _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         'source',
@@ -1096,6 +1105,74 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # greps for a code writer, finds none, and prunes the entry as dead
         # would be wrong in the same way.
         'related_memory_ids',
+        # `related_tasks` is the canonical Tier-B cross-reference spelling
+        # (task 4303). docs/task-authoring.md §8's Tier-B table already
+        # designates it the key authors migrate TOWARD, with `related_task`,
+        # `related_df_tasks` and `related_task_examples` as the warning
+        # aliases — but the canonical itself was unblessed, so an author who
+        # followed the documentation exactly still minted a `code=unknown_key`
+        # census line, and the drift signal could not discriminate "used an
+        # alias" from "used the canonical spelling". It was the SOLE violation
+        # of that invariant: prd_path, prd_task_label, invariants and
+        # source_finding_id — every other key in the table's Canonical column
+        # — were already blessed. The invariant is now machine-pinned by
+        # tests/scripts/test_task_authoring_tier_b_canonical_keys.py.
+        #
+        # THE READER VERDICT IS NEGATIVE, AND THE ENTRY IS BLESSED ANYWAY.
+        # There is no code reader, no code writer, and `git log -S` over every
+        # source tree shows the key has never existed in code in this repo's
+        # history. Unlike `related_memory_ids` above — whose writer is the
+        # recon Stage 1/2 PROMPT after task 4373 — no live prompt instructs it
+        # either. The empirical writer is an LLM prose convention; the corpus
+        # `source` values are review-suggestion-backfill 144,
+        # prd-decomposition 17, escalation-info 15, agent-followup 9,
+        # unblock-triage 8, escalation-watcher 7, reconciliation-stage2 6, with
+        # 162 carrying no `source` at all. As with the finding-provenance
+        # family above, a future reader who greps for a reader or a writer,
+        # finds none, and prunes this entry as dead would be WRONG: the corpus
+        # IS the usage. It is blessed on the esc-3796-1 corpus-dominance
+        # precedent, under which `source_finding_id` was blessed at 120 tasks.
+        #
+        # Census (2026-08-31, measured with the submodel registrations
+        # imported): 469 of 4748 dict-metadata tasks carry it — rank #1 among
+        # unknown_key spellings, against 209 for the next contributor
+        # (`merge_first_enqueued_at`). 326 of those carriers (69.5%) also carry
+        # `done_provenance`. Value shapes: 432 list, 37 bare str. Status split:
+        # done 328, cancelled 22, pending 94, deferred 15, in-progress 10.
+        # These are a point-in-time snapshot of a GROWING corpus, not an
+        # invariant — the count moved 437 (2026-08-16) -> 445 -> 469 across
+        # three measurements, and carriers were still being written on the day
+        # of the last one. As with the entries above, this comment is
+        # deliberately their SINGLE in-repo copy: the dedicated test's
+        # docstring and docs/task-authoring.md §8 cite it rather than restate
+        # the figures, because a measurement kept in three places ages into two
+        # stale copies.
+        #
+        # BLESSED RATHER THAN RETIRED, so the fork is not re-litigated. Two
+        # measured reasons beyond the precedent. (1) docs §8 designates this
+        # the canonical spelling authors migrate toward, so retiring it inverts
+        # live authoring guidance for four spellings at once and leaves the
+        # three aliases with nowhere to migrate. (2) Retirement is structurally
+        # impossible today: ~70% of carriers hold `done_provenance` and are
+        # unwritable under the presence-only write-authority floor until task
+        # 3777 lands, and sweeping only the writable remainder is exactly the
+        # vocabulary fork docs §8 already rules out for task 4302 as "a fifth
+        # of the benefit".
+        #
+        # BLESSED RATHER THAN PROMOTED TO A TYPED FIELD, which is the
+        # non-obvious half and the same argument that decided `execution_class`
+        # below. The corpus values are heterogeneous — 432 list against 37
+        # bare str — so a typed `list[str]` would raise on every metadata
+        # write to those 37 under direction='write', enforce=True, permanently,
+        # because most are terminal and unrepairable under the same
+        # `done_provenance` floor that blocks the retirement sweep.
+        #
+        # INTENDED CONSEQUENCE: `validate_migration_keys` in
+        # fused-memory/scripts/migrate_task_metadata_to_x_namespace.py refuses
+        # Tier-A blessed keys, so that script will now refuse to x_-namespace
+        # this key (--force overrides). Correct under this ruling — it closes
+        # the retirement path in code, not merely in prose.
+        'related_tasks',
         'spawned_from',
         'program',
         'program_stream',
