@@ -668,10 +668,23 @@ async def _drive_infra_reds(
 # ---------------------------------------------------------------------------
 
 # This module's own copy of `test_offline_lane_integration.py`'s helper-name
-# set (see that module for the full rationale). `_drive_infra_reds` replaces
-# `_drive_reds` — this module's own multi-pass chaining helper.
+# set (see that module for the full rationale, including task 4203's review
+# remediation widening its membership rule from "drives at least one
+# `_run_lane`-bounded pass" to "drives bounded waits its own body does not
+# spell out"). Two members are substituted for this module's own spellings:
+# `_drive_infra_reds` replaces `_drive_reds` (this module's multi-pass
+# chaining helper), and `_assert_infra_never_a_gate` replaces
+# `_assert_never_a_gate` (this module's copy of the never-a-gate assertion,
+# carrying the same `_NOTE_OFFLINE_LANE_BOUND_SECS` +
+# `_NOTE_MERGE_ALL_BOUND_SECS` = 15.5s of bounded waits without any lane pass
+# at all).
 _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
-    {'_run_lane', '_run_one_lane_pass', '_drive_infra_reds'},
+    {
+        '_run_lane',
+        '_run_one_lane_pass',
+        '_drive_infra_reds',
+        '_assert_infra_never_a_gate',
+    },
 )
 
 
@@ -712,10 +725,13 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     siblings — this module's own `_run_lane` docstring says it was "Adapted
     verbatim from test_offline_lane_integration.py"). See that sibling test
     for the full rationale on: why coverage is DISCOVERED via
-    `_lane_pass_composing_callers` rather than relying solely on a
-    hand-maintained table (a test added tomorrow that calls
-    `_drive_infra_reds(..., 3)` without a marker must fail this test, not
-    pass it silently); why correlation between a marker and a SPECIFIC
+    `_lane_pass_composing_callers` — over every member of
+    `_LANE_PASS_COMPOSING_HELPER_NAMES`, deliberately named there rather than
+    re-spelled here so widening that set cannot strand a stale hand-typed
+    list in this docstring or in the `undeclared` assertion message below —
+    rather than relying solely on a hand-maintained table (a test added
+    tomorrow that calls `_drive_infra_reds(..., 3)` without a marker must
+    fail this test, not pass it silently); why correlation between a marker and a SPECIFIC
     test's value is done via `fn.pytestmark` introspection rather than the
     coarse `_TIMEOUT_MARKER_RE` file-wide regex scan
     `test_lane_lock_leak_guard.py`'s sibling invariant uses; and why a
@@ -752,6 +768,14 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             + _NOTE_OFFLINE_LANE_BOUND_SECS
             + _NOTE_MERGE_ALL_BOUND_SECS
         ),
+        # Task 4203 (review remediation) — this module's copy of the
+        # sibling's row for the same test: the only row here whose bounded
+        # waits come entirely from `_assert_infra_never_a_gate`, with no
+        # `_LANE_PASS_BOUND_SECS` term at all. Discovered by the net only
+        # once that helper joined `_LANE_PASS_COMPOSING_HELPER_NAMES`.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
     }
     # Task 4203 — this module's own copy of the sibling's out_of_bound_spawns
     # table (see that module for the full rationale). ib4 drives exactly n x
@@ -767,6 +791,18 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         ),
         test_ib2_infra_run_in_flight_never_gates_merge: (
             _SPAWNS_PER_REPO_FIXTURE
+            + _SPAWNS_PER_DRIVE_ADVANCE
+            + _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE
+        ),
+        # Task 4203 (review remediation) — the ONLY row in either module's
+        # table that pays `_SPAWNS_PER_REPO_FIXTURE` TWICE: once for the
+        # `repo` fixture every test here transitively pulls, and once more
+        # for the fresh `_setup_repo` this test deliberately runs on a clean
+        # tmp_path in order to MEASURE that very constant. Its
+        # `_build_infra_worker` / `_wire_lane` setup contributes nothing
+        # further — measured to be spawn-free inside that test, not assumed.
+        test_out_of_bound_spawn_counts_are_measured_not_asserted: (
+            2 * _SPAWNS_PER_REPO_FIXTURE
             + _SPAWNS_PER_DRIVE_ADVANCE
             + _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE
         ),
@@ -792,8 +828,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     }
     undeclared = discovered - classified
     assert not undeclared, (
-        f'{sorted(undeclared)} call a pass-composing helper (_run_lane / '
-        f'_run_one_lane_pass / _drive_infra_reds) but are classified in '
+        f'{sorted(undeclared)} call a bounded-wait-composing helper '
+        f'({" / ".join(sorted(_LANE_PASS_COMPOSING_HELPER_NAMES))}) but are '
+        f'classified in '
         f'neither worst_case_secs (composes past a single pass; needs its '
         f'own @pytest.mark.timeout override) nor single_pass_exempt (proven '
         f'to never exceed one bounded pass), in '
@@ -1077,9 +1114,32 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     # test's docstring), so `_build_infra_worker` is left on its default
     # `infra_runner` — this measurement never triggers a run, so which seam
     # it would have used is immaterial.
+    #
+    # The lane wiring is MEASURED to be spawn-free rather than assumed (task
+    # 4203 review remediation), and measured HERE rather than inherited from
+    # the sibling's result: this module's copy constructs
+    # `_build_infra_worker` on its DEFAULT `infra_runner`, where the sibling
+    # passes an explicit `_ControllableSuiteRunner` — a genuine difference in
+    # what gets constructed, so symmetry of the spawn count is exactly the
+    # thing that must not be assumed. This test's own `out_of_bound_spawns`
+    # row prices the wiring at zero.
     calls.clear()
-    worker = _build_infra_worker(git_ops, tmp_path)
-    _wire_lane(harness, worker)
+    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
+         patch(f'{__name__}._run', side_effect=_counting_run):
+        worker = _build_infra_worker(git_ops, tmp_path)
+        _wire_lane(harness, worker)
+
+    assert calls == [], (
+        f'constructing _build_infra_worker (on its default infra_runner) / '
+        f'_wire_lane spawned {len(calls)} real git subprocess(es) ({calls}), '
+        f"but this test's out_of_bound_spawns row in "
+        f'test_every_composing_caller_carries_a_timeout_override prices the '
+        f'lane wiring at zero. Pin the measured count in a named constant '
+        f'and add it to that row rather than letting it be absorbed '
+        f"silently — an unpriced spawn under-sizes this test's own "
+        f'@pytest.mark.timeout override.'
+    )
+
     with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
          patch(f'{__name__}._run', side_effect=_counting_run):
         await _assert_infra_never_a_gate(harness, worker, repo, git_ops)
