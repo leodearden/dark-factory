@@ -479,13 +479,14 @@ Conventions:
 - Always include project_id on every call (scopes data isolation).
 - Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
-- Before writing a procedural_knowledge memory, search first for an existing entry on the same
-  workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
-  at write time with two guards: (1) a deterministic topic-cluster guard that soft-blocks a write
-  matching a known-contradictory topic cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected)
-  — do not add another entry; consolidate/update the existing entries or add context to the human gate
-  task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
-  high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
+- Before writing a procedural_knowledge or preferences_and_norms memory, search first for an existing
+  entry on the same workflow/gotcha/norm and update or skip instead of writing a near-duplicate.
+  add_memory enforces this at write time with up to two guards: (1) a deterministic topic-cluster
+  guard — covering BOTH categories — that soft-blocks a write matching a known-contradictory topic
+  cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do not add another entry;
+  consolidate/update the existing entries or add context to the human gate task named in the hint;
+  and (2) a cosine guard, scoped to procedural_knowledge only, that soft-blocks a write matching an
+  existing entry at high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
   metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
   agents are exempt from both. Both guards apply only while write_triage.enabled is false (the
   shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
@@ -1642,6 +1643,19 @@ def create_mcp_server(
             'observations_and_summaries',
             'entities_and_relations',
             'temporal_facts',
+        }
+    )
+    # Categories the deterministic topic-cluster pre-check covers (task 3430).
+    # ENUMERATED rather than composed from MEM0_PRIMARY the way _TRIAGED_CATEGORIES
+    # is: observations_and_summaries is deliberately excluded here — extending to
+    # it is sibling task 4729's call, with its own false-positive analysis this
+    # task has not done. This frozenset is the one-line widening point for 4729.
+    # Built from `.value` (not string literals) so a category rename cannot
+    # silently break the gate.
+    _TOPIC_GUARD_GATED_CATEGORIES = frozenset(
+        {
+            MemoryCategory.procedural_knowledge.value,
+            MemoryCategory.preferences_and_norms.value,
         }
     )
 
@@ -3018,11 +3032,13 @@ def create_mcp_server(
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
-        Before writing a procedural_knowledge memory, search first for an
-        existing entry covering the same workflow/gotcha and update or skip
-        instead of writing a near-duplicate. procedural_knowledge writes are
-        soft-blocked at write time by two guards: (1) a deterministic
-        topic-cluster guard that fires FIRST when the content matches a
+        Before writing a procedural_knowledge or preferences_and_norms memory,
+        search first for an existing entry covering the same workflow/gotcha/
+        norm and update or skip instead of writing a near-duplicate.
+        procedural_knowledge writes are soft-blocked at write time by two
+        guards, the first of which also covers preferences_and_norms (see
+        below): (1) a deterministic topic-cluster guard that fires FIRST when
+        the content matches a
         known-contradictory topic cluster
         (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do NOT
         add another entry; consolidate/update the existing entries for that
@@ -3031,9 +3047,12 @@ def create_mcp_server(
         existing entry at high similarity
         (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either,
         override with metadata={'allow_near_duplicate': True} only when the
-        content is genuinely distinct. Both guards only cover writes with an
-        explicit category='procedural_knowledge' (a category=None write that
-        auto-classifies to procedural_knowledge is not covered), share the
+        content is genuinely distinct. The topic-cluster guard (1) covers
+        writes with an explicit category='procedural_knowledge' OR
+        category='preferences_and_norms'; the cosine near-duplicate guard (2)
+        remains scoped to an explicit category='procedural_knowledge' write
+        only (a category=None write that auto-classifies to
+        procedural_knowledge is covered by neither). Both guards share the
         procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
         recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
         entry that is expected to closely resemble the duplicates it
@@ -3296,29 +3315,69 @@ def create_mcp_server(
         # `routed == stored` for a topic match, and a real judge may answer
         # otherwise. That assertion is EXPECTED to change with this arm — it
         # pins the retirement of the soft-block, not the outcome `stored`.
+        # Shared exemptions for both dup-guard blocks below (task 3430 review,
+        # reviewer_comprehensive #1 duplication): hoisted to a single source
+        # of truth so a future new exemption (another agent-id carve-out, a
+        # triage-mode tweak) is a one-place edit instead of two conjunct
+        # chains that can silently drift apart. Deliberately EXCLUDES the
+        # category predicate and the resolve_near_dup_guard_enabled() call:
+        # each block below still spells out its own `category in/== ...`
+        # conjunct ahead of the resolver call, so a write in a category
+        # neither block gates still never calls resolve_near_dup_guard_enabled
+        # — identical short-circuit behaviour to before this hoist, and the
+        # cosine block's behaviour for procedural_knowledge stays provably
+        # unchanged (same truth table, same call count, order of the pure
+        # boolean reads is immaterial since none of them has a side effect).
+        dup_guard_base_exempt = (
+            not triage_enabled and not allow_near_duplicate and not is_recon_stage_agent
+        )
         if (
-            not triage_enabled
-            and category == 'procedural_knowledge'
-            and not allow_near_duplicate
-            and not is_recon_stage_agent
+            dup_guard_base_exempt
+            and category in _TOPIC_GUARD_GATED_CATEGORIES
             and resolve_near_dup_guard_enabled(memory_service)
         ):
-            # Deterministic topic-keyed pre-check (task 2845): if the content
-            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # Deterministic topic-keyed pre-check (task 2845; widened in task
+            # 3430 to also gate preferences_and_norms): if the content matches
+            # a known-contradictory topic cluster, soft-block BEFORE the
             # cosine search. This is strictly cheaper (no embedding round-trip)
             # and catches same-topic paraphrases the cosine guard misses. On no
-            # match (or an empty/unconfigured clusters list) fall through to the
-            # existing cosine path unchanged. Shares the allow_near_duplicate /
-            # recon-stage exemptions and the enabled kill-switch above with the
-            # cosine guard.
+            # match (or an empty/unconfigured clusters list) fall through — to
+            # the cosine path below for procedural_knowledge, or straight
+            # through to the write for any other _TOPIC_GUARD_GATED_CATEGORIES
+            # member. Shares the allow_near_duplicate / recon-stage exemptions
+            # and the enabled kill-switch with the cosine guard below.
+            #
+            # TOPIC-keyed rather than category-keyed: unlike the cosine guard
+            # below, this check is not scoped to a single category — it covers
+            # every category in _TOPIC_GUARD_GATED_CATEGORIES.
             topic_clusters = resolve_topic_guard_clusters(memory_service)
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
                     matched_cluster, matched_phrases = topic_match
-                    return build_topic_cluster_block(
-                        agent_id, content, matched_cluster, matched_phrases
-                    )
+                    return {
+                        **build_topic_cluster_block(
+                            agent_id, content, matched_cluster, matched_phrases
+                        ),
+                        'category': category,
+                    }
+        # Cosine near-duplicate search — kept procedural_knowledge-only. Unlike
+        # the topic pre-check above (task 3430 widened that one to also cover
+        # preferences_and_norms), this path stays scoped to procedural_knowledge:
+        # the search(categories=['procedural_knowledge'], stores=['mem0'])
+        # round-trip below and find_near_duplicate_memory's category filter are
+        # both procedural-specific, and deciding whether/how to compare a
+        # preferences_and_norms write against procedural (or preferences)
+        # entries is a separate cost/semantics decision this task does not
+        # make. Reuses dup_guard_base_exempt from the block above (the shared
+        # exemptions) and re-spells only its own category predicate, so this
+        # block's behaviour for procedural_knowledge stays provably unchanged
+        # by the split.
+        if (
+            dup_guard_base_exempt
+            and category == 'procedural_knowledge'
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
