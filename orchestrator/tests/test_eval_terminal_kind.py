@@ -251,6 +251,59 @@ class TestResolveTerminalKind:
         assert resolve_terminal_kind({}, dict(reversed(list(
             declines.items())))) == first
 
+    @pytest.mark.parametrize('unorderable', [
+        pytest.param(None, id='missing'),
+        pytest.param('', id='empty'),
+        pytest.param('whenever', id='unparseable'),
+    ])
+    def test_an_unorderable_decline_beats_a_LATER_stamped_one(
+            self, unorderable):
+        """MIXED stamps — the input that distinguishes the two branches.
+
+        The sibling cases above parametrise BOTH declines with the same stamp
+        value, so they exercise only the all-orderable and all-unorderable
+        ends. This is the middle: one decline placed in time, one not. The
+        documented rule is that an unorderable stamp SORTS LAST — i.e. wins —
+        because a decline nobody can place in time is exactly the ambiguity
+        ``resolve_terminal_kind`` resolves toward, so an unstamped
+        ``already_done`` beats a ``ready_to_merge`` stamped an hour later. A
+        refactor that instead IGNORED the unorderable decline and took the
+        greatest stamp among the rest would return ``ready_to_merge`` — and,
+        with only the same-stamp cases pinned, would stay green.
+        """
+        from orchestrator.evals.metrics import resolve_terminal_kind
+
+        declines = {
+            'already_done': _decline(unorderable),
+            'ready_to_merge': _decline('2026-08-26T11:00:00+00:00'),
+        }
+        assert resolve_terminal_kind({}, declines) == 'already_done'
+        # ...independently of dict insertion order,
+        assert resolve_terminal_kind({}, dict(reversed(list(
+            declines.items())))) == 'already_done'
+        # ...and the plan can never be shown to be later than a decline that
+        # cannot be placed in time, so it does not win either.
+        assert resolve_terminal_kind(
+            _plan(steps=6, finalized_at='2026-08-26T23:00:00+00:00'),
+            declines,
+        ) == 'already_done'
+
+    def test_several_unorderable_declines_break_by_fixed_precedence(self):
+        """Two unplaceable declines: the DECLINE_KINDS order decides, and the
+        stamped third is still not consulted."""
+        from orchestrator.evals.metrics import DECLINE_KINDS, resolve_terminal_kind
+
+        declines = {
+            'unactionable': _decline(None),
+            'blocking_dependency': _decline(None),
+            'ready_to_merge': _decline('2026-08-26T11:00:00+00:00'),
+        }
+        assert DECLINE_KINDS.index('blocking_dependency') < DECLINE_KINDS.index(
+            'unactionable')
+        assert resolve_terminal_kind({}, declines) == 'blocking_dependency'
+        assert resolve_terminal_kind({}, dict(reversed(list(
+            declines.items())))) == 'blocking_dependency'
+
     @pytest.mark.parametrize('stamp', [
         pytest.param(None, id='missing'),
         pytest.param('', id='empty'),
