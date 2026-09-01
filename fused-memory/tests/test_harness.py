@@ -3685,7 +3685,7 @@ async def test_remediation_payload_assembly():
     stage.remediation_findings = _make_s3_findings()[:2]  # actionable only
     stage.prior_s3_findings = None
 
-    payload = stage._assemble_remediation_payload()
+    payload = await stage._assemble_remediation_payload()
     assert 'Remediation Run' in payload
     assert 'Targeted Memory Fixes' in payload
     assert 'Stale edge' in payload
@@ -14187,7 +14187,7 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
 
         received: list[bool | None] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append(kw.get('corroborated'))
             return kw.get('corroborated') is not False
 

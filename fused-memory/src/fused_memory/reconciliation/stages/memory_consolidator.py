@@ -906,7 +906,7 @@ class MemoryConsolidator(BaseStage):
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
-            return self._assemble_remediation_payload()
+            return await self._assemble_remediation_payload()
 
         # 1. Episodes since last reconciliation
         try:
@@ -1197,7 +1197,7 @@ Review the above data and perform memory consolidation:
             f'Total: {auth_total}, Done: {auth_done}{divergence_note}\n'
         )
 
-    def _assemble_remediation_payload(self) -> str:
+    async def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
@@ -1205,7 +1205,7 @@ Review the above data and perform memory consolidation:
         # (task 3839, gate 3833). The harness DOES set filtered_task_tree on remediation
         # passes (_configure_consolidator, harness.py:3949-3953), so this renders for real;
         # it is not a no-op. Returns '' when nothing is live, keeping the payload tight.
-        live_workflow_section = self._build_live_workflow_section()
+        live_workflow_section = await self._build_live_workflow_section()
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
 
