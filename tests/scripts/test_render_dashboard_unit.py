@@ -1321,3 +1321,243 @@ def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monke
     captured = capsys.readouterr()
     assert "was NOT modified" in captured.err, captured.err
     assert captured.err.count(_TAG) == len(captured.err.strip().splitlines())
+
+
+# ---------------------------------------------------------------------------
+# --unit fused-memory — the second unit, end to end  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+# ACCEPTANCE 1 and 2 at the library/CLI layer, against the REAL committed
+# scripts/fused-memory.service.template rather than a stand-in. The installer
+# layer (setup-host.sh section 4) is covered separately in
+# tests/scripts/test_check_fused_memory_unit_parity.py, which owns the
+# subprocess harness this module deliberately does not have.
+#
+# Everything here goes through tmp_path and in-process `main(argv)` — this
+# module's docstring pins "ALL FIXTURES ARE tmp_path OR IN-MEMORY STRINGS" and
+# it contains zero subprocess calls. Keep it that way.
+
+FUSED_TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
+
+_FM_TAG = "[fused_memory_unit_render]"
+
+# The three Environment= values the fused-memory template RENDERS from
+# __REPO_ROOT__, and which must therefore be RE-DERIVED rather than preserved:
+# pinning them at a previous checkout would leave the server reading the OLD
+# config while WorkingDirectory= moved to the new one.
+_FM_RENDERED_ENV = ("PROJECT_ROOT", "CONFIG_PATH", "TASKMASTER_DIR")
+
+
+def _fm_rendered(repo_root=_OLD_ROOT, uv_path=_NEW_UV):
+    """The committed fused-memory template rendered at *repo_root*."""
+    return _render_template(
+        FUSED_TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=repo_root,
+        uv_path=uv_path,
+    )
+
+
+def _fm_installed_with_nine_roots(repo_root=_OLD_ROOT):
+    """A realistic INSTALLED fused-memory unit carrying nine reconciliation roots.
+
+    Built BY RENDERING the committed template and substituting, never
+    hand-written — the same rule _installed_with_nine_roots follows, and it
+    matters more here: the multi-root value is precisely the thing whose real
+    shape is under test, and a hand-made fixture can drift into a shape the real
+    installer would never produce.
+    """
+    text = _fm_rendered(repo_root)
+    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
+    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
+    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+
+
+def _fm_cli(tmp_path, *, output_text=None, repo_root=_NEW_ROOT, unit="fused-memory"):
+    """A tmp copy of the REAL fused-memory template (+ optional installed unit)."""
+    template = tmp_path / "fused-memory.service.template"
+    template.write_text(
+        FUSED_TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    output = tmp_path / "unit" / "fused-memory.service"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output_text is not None:
+        output.write_text(output_text, encoding="utf-8")
+    argv = []
+    if unit is not None:
+        argv += ["--unit", unit]
+    argv += [
+        "--template", str(template),
+        "--repo-root", repo_root,
+        "--uv-path", _NEW_UV,
+        "--output", str(output),
+    ]
+    return argv, output
+
+
+def test_fused_memory_render_preserves_the_nine_roots_across_a_moved_checkout(
+    tmp_path, capsys
+):
+    """(a) ACCEPTANCE 1: the reconciliation scope survives a re-provision.
+
+    The realistic case the defect destroyed: the checkout moved, and this host
+    had nine project roots registered into its INSTALLED fused-memory unit.
+    Under the old `sed ... > "$UNIT_DIR/fused-memory.service"` every one of those
+    re-runs collapsed the set to a single root — and on THIS unit that is not a
+    dashboard view setting: fused_memory/models/scope.py reads it as
+    KNOWN_PROJECT_ROOTS_ENV, so eight projects would start failing
+    reconciliation with UnknownProjectError.
+    """
+    argv, output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _env_line(text, _KNOWN_ROOTS) == NINE_ROOTS
+    for root in NINE_ROOTS.split(","):
+        assert root in text, f"{root} did not survive the re-render"
+    capsys.readouterr()
+
+
+def test_fused_memory_render_re_derives_the_repo_root_bearing_values(tmp_path, capsys):
+    """(b) The preserve set is a strict SUBSET, not "keep whatever was there".
+
+    Direct analogue of test_render_unit_re_derives_project_root_rather_than
+    _preserving_it, retargeted from DASHBOARD_PROJECT_ROOT to this template's
+    three rendered values. Preserving them would pin the fused-memory server's
+    config and project root at the OLD checkout while WorkingDirectory= moved to
+    the new one — a server reading a config that no longer describes where it is
+    running, which is strictly worse than the stale unit it replaced.
+    """
+    argv, output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _directive(text, "WorkingDirectory") == _NEW_ROOT
+    for name in _FM_RENDERED_ENV:
+        value = _env_line(text, name)
+        assert value.startswith(_NEW_ROOT), (
+            f"Environment={name}={value} still points at the OLD checkout; it is "
+            f"rendered from __REPO_ROOT__ and must be re-derived at {_NEW_ROOT}."
+        )
+        assert _OLD_ROOT not in value, f"Environment={name}={value}"
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text
+    capsys.readouterr()
+
+
+def test_fused_memory_greenfield_matches_a_plain_render_of_the_template(
+    tmp_path, capsys
+):
+    """(c) ACCEPTANCE 2: a host with no installed unit gets the committed default.
+
+    BYTE-IDENTICAL to a plain render, which is the strongest available spelling
+    of "at parity": preservation is a strict addition on top of the render, so
+    with nothing to preserve the renderer must produce exactly what the template
+    says — no reordering, no synthesized line, no dropped comment.
+    """
+    argv, output = _fm_cli(tmp_path)
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert text == _fm_rendered(_NEW_ROOT), (
+        "the greenfield render is not byte-identical to a plain render of the "
+        "committed template"
+    )
+    assert _env_line(text, _KNOWN_ROOTS) == _NEW_ROOT
+    capsys.readouterr()
+
+
+def test_fused_memory_run_is_tagged_only_as_fused_memory(tmp_path, capsys):
+    """(d) TAG ROUTING: the operator's only handle on which unit a line is about.
+
+    Both units are rendered by this same script in the same bring-up run, and
+    setup-host.sh routes an operator to a report BY TAG. A fused-memory line
+    printed under [dashboard_unit_render] would send someone reading a long log
+    to the wrong unit — the one whose DASHBOARD_KNOWN_PROJECT_ROOTS is merely a
+    dashboard view, while the one that actually governs reconciliation went
+    unexamined.
+
+    Checked on BOTH streams: the success path's preserved/skipped report on
+    stdout, and a failure path's report on stderr.
+    """
+    argv, _output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+    assert _main(argv) == 0
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    assert lines, "the run emitted nothing to tag"
+    assert all(line.startswith(_FM_TAG) for line in lines), out
+    assert _TAG not in out, out
+
+    # The failure path prints on stderr and must route the same way.
+    bad_argv, _bad_output = _fm_cli(tmp_path / "missing-template")
+    (tmp_path / "missing-template" / "fused-memory.service.template").unlink()
+    assert _main(bad_argv) == 1
+    err = capsys.readouterr().err
+    err_lines = err.strip().splitlines()
+    assert err_lines, "the failing run emitted nothing to tag"
+    assert all(line.startswith(_FM_TAG) for line in err_lines), err
+    assert _TAG not in err, err
+
+
+def test_dashboard_run_is_still_tagged_only_as_dashboard(tmp_path, capsys):
+    """(d, converse) --unit dashboard must not leak the fused-memory tag."""
+    argv, _output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+    assert _main(["--unit", "dashboard", *argv]) == 0
+
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    assert lines, "the run emitted nothing to tag"
+    assert all(line.startswith(_TAG) for line in lines), out
+    assert _FM_TAG not in out, out
+
+
+def test_omitting_unit_is_exactly_the_dashboard_behaviour(tmp_path, capsys):
+    """(e) BACK-COMPAT: setup-host.sh section 8 passes no --unit and must not change.
+
+    Task 4793's call site and its whole suite predate --unit. The default is the
+    dashboard, and "default" has to mean the dashboard's preserve set AND its
+    tag — a default that silently selected an empty preserve set would render as
+    the clobber this module exists to remove, while still exiting 0.
+    """
+    argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _env_line(text, _KNOWN_ROOTS) == NINE_ROOTS
+    out = capsys.readouterr().out
+    assert all(line.startswith(_TAG) for line in out.strip().splitlines()), out
+
+
+def test_an_unknown_unit_is_rejected_rather_than_defaulted(tmp_path, capsys):
+    """(f) An unrecognised --unit must NOT fall back to a mismatched preserve set.
+
+    Silently defaulting would be the worst available failure: `--unit fused_memory`
+    (underscore) would render the fused-memory template with the DASHBOARD spec,
+    report success under the dashboard tag, and — because the two specs happen to
+    share the one preserve name today — LOOK correct, right up until the sets
+    diverge. argparse `choices` makes it a usage error instead.
+    """
+    argv, output = _fm_cli(
+        tmp_path, output_text=_fm_installed_with_nine_roots(), unit="fused_memory"
+    )
+    before = output.read_bytes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        _main(argv)
+
+    assert excinfo.value.code == 2, excinfo.value.code
+    assert output.read_bytes() == before, "a rejected --unit still wrote the unit"
+
+    # The rejection must be about the VALUE, not about the flag. Without this
+    # the test passes on a build that has no --unit flag at all (argparse exits
+    # 2 for an unrecognized argument too), so it would go green before the
+    # feature exists and stay green if the flag were later deleted. The phrase
+    # is argparse's, matched negatively so the assertion does not pin its
+    # wording for the passing case.
+    err = capsys.readouterr().err
+    assert "unrecognized arguments" not in err, (
+        "--unit was rejected as an unknown FLAG rather than as an unknown "
+        f"unit name: {err}"
+    )
+    assert "fused_memory" in err, err
