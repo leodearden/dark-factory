@@ -947,15 +947,29 @@ def test_the_untracked_retry_is_decided_by_gits_message_not_its_volume(
     ]
 
     assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
+    # THE HONEST-FAILURE ASSERTION, checked FIRST -- same ordering as the
+    # honest-failure assertion in test_wrapper_never_invokes_a_forbidden_git_verb
+    # below (commit-step confirmed before argv is trusted). On the regression
+    # this test guards against, `commit_out` is padded on EVERY commit
+    # attempt, including the failed first one whose message the wrapper
+    # echoes to stderr on the `failed` branch -- so a stderr TAIL slice on
+    # that failure is a wall of padding, not a diagnostic (confirmed
+    # empirically). The commit-step token names the branch directly instead.
+    observed_step = _commit_step(result)
+    assert observed_step == 'committed', (
+        f'expected commit-step=committed, observed {observed_step!r}; '
+        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
     # The scoped retry actually fired for THIS run -- the branch under test,
     # not merely "the script survived". Same substring idiom as the pooled
     # guard below (' add -- ' padded on both sides so a bare `add` verb never
-    # matches), scoped to this one run's own recorded argv.
+    # matches), scoped to this one run's own recorded argv. Checked only once
+    # the commit-step assertion above has confirmed this run actually
+    # committed, so a decline and a missing substring can never again be
+    # conflated into the same failure.
     flat = [' '.join(a) for a in recorded]
     assert any(' add -- ' in f'{c} ' for c in flat), (
-        f'the scoped `git add --` retry never fired for this run: {flat!r}; '
-        f'stderr={result.stderr[-2000:]!r}')
+        f'the scoped `git add --` retry never fired for this run: {flat!r}')
     assert 'committed the regenerated artifacts' in result.stdout, result.stdout
     assert 'commit=0' in result.stdout, result.stdout
     # All three landed in the one retried commit -- the retry stayed scoped.
@@ -1073,7 +1087,7 @@ def _parse_commit_step(line):
 
 
 def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
-    """Of the wrapper's five commit-step outcomes, THREE narrate `commit=0` on
+    """Of the wrapper's five commit-step outcomes, FOUR narrate `commit=0` on
     the final done(...) line -- which reads as success while nothing was
     committed. In an unattended nightly whose journal is its only readable
     surface, "declined" and "committed" being indistinguishable in the
@@ -1083,9 +1097,13 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
     Drives the REAL wrapper into all five branches with the harnesses already
     established in this file (INV-10 `guards-exercise-behaviour`: no
     source-text scanning) and asserts every done(...) line carries a
-    `commit-step=<token>` field, and that the five tokens are PAIRWISE
-    DISTINCT -- so a wrapper that emits one constant token, or omits the
-    field on some branches, fails here rather than passing by coincidence.
+    `commit-step=<token>` field EQUAL TO the token that branch is contracted
+    to emit -- `scenarios`'s own keys double as the expected tokens, so the
+    mapping assertion below checks each branch against ITSELF, not merely
+    against its neighbours. A pairwise-distinctness check would still pass if
+    two branches emitted each other's token under swapped names (verified by
+    mutation: renaming `skipped:disabled` <-> `skipped:not-a-git-repo`'s
+    tokens left a same-shaped distinctness check green); this catches that.
     """
     scenarios = {}
 
@@ -1131,9 +1149,12 @@ def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
             f'{line!r}')
         tokens[label] = token
 
-    assert len(set(tokens.values())) == len(tokens), (
-        f'commit-step tokens must be pairwise distinct, one per branch: '
-        f'{tokens!r}')
+    # The MAPPING, not merely distinctness: `scenarios`'s keys are the tokens
+    # each branch is contracted to emit, so this fails if a branch narrates
+    # the wrong (if still distinct) token -- e.g. two branches swapping
+    # tokens under different names, which a pairwise-distinctness check
+    # cannot see (distinctness follows for free here, from distinct keys).
+    assert tokens == {label: label for label in scenarios}, tokens
 
 
 # The forbidden-git-verb guard, asserted on the argv the wrapper ACTUALLY
@@ -1223,32 +1244,42 @@ def _commit_step(result):
     return token if token is not None else '<unreported>'
 
 
-def test_the_commit_step_reader_reports_a_decline_as_a_decline(tmp_path):
+def test_the_commit_step_reader_reports_a_decline_as_a_decline():
     """Pin the reader before trusting it, in the shape this file already
     established for `_forbidden_reason` just above:
-    `test_the_forbidden_reason_helper_actually_fires` pins the detector, and
-    the real test (`test_wrapper_never_invokes_a_forbidden_git_verb`, below)
-    supplies the subject. `_commit_step` gets the same treatment here.
+    `test_the_forbidden_reason_helper_actually_fires` pins the detector
+    against cheap SYNTHETIC input, and the real test
+    (`test_wrapper_never_invokes_a_forbidden_git_verb`, below) supplies the
+    subject. `_commit_step` gets the same treatment here -- driven against
+    literal done(...) narration, not real wrapper runs.
 
-    Driven against REAL wrapper runs, not synthetic strings -- matching this
-    file's settled preference for recorded/observed behaviour over a text
-    scan (see the rationale at the top of the forbidden-git-verb guard).
+    Real-wrapper coverage of these three branches already exists elsewhere:
+    `test_the_wrapper_names_which_commit_step_branch_it_took`'s
+    branch->token mapping assertion, and the honest-failure assertion in
+    `test_wrapper_never_invokes_a_forbidden_git_verb`. Re-driving a real git
+    repo and subprocess three more times here would prove the same behaviour
+    a fourth and fifth time rather than a new one -- `_commit_step` is a
+    six-line pure-string helper (`_done_line` + `_parse_commit_step` + a
+    sentinel), and synthetic input pins its parsing directly.
     """
-    committed_repo = _git_repo_harness(tmp_path / 'committed')
-    result, _ = _run_wrapper_in_git_repo(tmp_path / 'committed', committed_repo)
-    assert _commit_step(result) == 'committed', (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    def _stub(stdout):
+        return subprocess.CompletedProcess(
+            args=['bash'], returncode=0, stdout=stdout, stderr='')
 
-    outer = _git_repo_harness(tmp_path / 'outer')
-    inner = outer / 'plans'  # a real subdirectory, not the repo root
-    result, _ = _run_wrapper_in_git_repo(tmp_path / 'outer', inner)
-    assert _commit_step(result) == 'refused:repo-not-toplevel', (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    committed = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 '
+        'commit-step=committed)\n')
+    assert _commit_step(committed) == 'committed'
 
-    quiet_repo = _git_repo_harness(tmp_path / 'quiet', dirty=False)
-    result, _ = _run_wrapper_in_git_repo(tmp_path / 'quiet', quiet_repo)
-    assert _commit_step(result) == 'skipped:no-drift', (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    refused = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=1 '
+        'commit-step=refused:repo-not-toplevel)\n')
+    assert _commit_step(refused) == 'refused:repo-not-toplevel'
+
+    no_drift = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 '
+        'commit-step=skipped:no-drift)\n')
+    assert _commit_step(no_drift) == 'skipped:no-drift'
 
     # A non-wrapper input carrying no narration at all must degrade to the
     # named sentinel instead of raising -- an IndexError here would make the

@@ -240,7 +240,7 @@ fi
 # `commit-step=` is appended AFTER `commit=$commit_rc` so every existing
 # `'commit=0' in ...` / `'commit=1' in ...` substring check keeps matching.
 # `commit_rc` keeps its own meaning ("did the commit step fail?"); the token
-# is orthogonal ("which branch ran?") -- three of the six tokens narrate
+# is orthogonal ("which branch ran?") -- four of the six tokens narrate
 # commit=0, which is exactly what made "declined" and "committed" ambiguous
 # in the journal before this field existed.
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
