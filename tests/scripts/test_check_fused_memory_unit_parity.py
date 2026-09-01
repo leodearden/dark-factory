@@ -958,3 +958,204 @@ def test_gate_reports_skip_when_the_unit_is_genuinely_not_installed(
     assert "FAIL " not in result.stdout, (
         f"A genuine 'not installed' is a real verdict.\n{result.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# ACCEPTANCE 3 — the checker, INCLUDING --fix, cannot undo the preservation
+# (step-7)
+# ---------------------------------------------------------------------------
+# Task 4796 made setup-host.sh render this unit through
+# scripts/render_dashboard_unit.py so a host's extra
+# DASHBOARD_KNOWN_PROJECT_ROOTS entries survive a re-provision. The obvious
+# question is whether THIS checker then undoes it on the next run.
+#
+# It does not, and the reason is structural rather than incidental:
+# DASHBOARD_KNOWN_PROJECT_ROOTS is absent from REQUIRED_SERVICE_DIRECTIVES, and
+# fix_unit_text only APPENDS missing members of `required` — "Never removes or
+# reorders any existing line". So (i) and (ii) below are expected to pass the
+# moment they are written. They are REGRESSION GUARDS over a latent property,
+# not a red-to-green cycle, and (iii) is what makes them load-bearing rather
+# than decorative: it demonstrates that the hazard they forbid is real.
+#
+# THE HAZARD. REQUIRED_SERVICE_DIRECTIVES' own comment says "Extend this list to
+# guard additional safety flags". Add
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=<repo_root>` there and, on a
+# correctly-preserved MULTI-root host, find_drift's exact WHOLE-LINE membership
+# reports it missing — so --fix appends the single-root line after the last
+# [Service] line, where systemd's LAST-WINS silently beats the preserved value.
+# On the unit that governs reconciliation, and invisibly: the checker then
+# exits 0. No code inside either module can prevent an edit to a constant in
+# the other, which is why the instrument is a cross-module invariant test.
+
+_PRESERVED_NAME = "DASHBOARD_KNOWN_PROJECT_ROOTS"
+
+# The nine project roots measured on this host, the value the old truncating
+# `sed ... > "$UNIT_DIR/fused-memory.service"` collapsed to one on every
+# re-run. Spelled here rather than imported from
+# tests/scripts/test_render_dashboard_unit.py: a test module importing another
+# test module makes collection order load-bearing, and this is fixture data
+# whose only contract is "more than one root, realistically shaped".
+_MULTI_ROOTS = ",".join(
+    f"/home/leo/src/{name}"
+    for name in (
+        "dark-factory",
+        "reify",
+        "autopilot-video",
+        "autotrade",
+        "know-live",
+        "solar-challenge",
+        "mission-control",
+        "solar-challenge-platform",
+        "pump-web-ui",
+    )
+)
+
+_FM_REPO_ROOT = "/home/leo/src/dark-factory"
+_FM_UV_PATH = "/home/leo/.local/bin/uv"
+
+
+def _render_fused_unit(repo_root: str = _FM_REPO_ROOT) -> str:
+    """The committed template rendered — through the REAL renderer's substitution."""
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.render_template(
+        TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=repo_root,
+        uv_path=_FM_UV_PATH,
+    )
+
+
+def _multi_root_unit(repo_root: str = _FM_REPO_ROOT) -> str:
+    """A correctly-configured host's installed unit: rendered, then nine roots in.
+
+    Built BY RENDERING rather than hand-written, so the fixture cannot drift
+    into a shape the real installer would never produce — the multi-root line's
+    real shape is the whole subject here.
+    """
+    text = _render_fused_unit(repo_root)
+    single = f"Environment={_PRESERVED_NAME}={repo_root}"
+    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
+    return text.replace(single, f"Environment={_PRESERVED_NAME}={_MULTI_ROOTS}")
+
+
+def _known_roots_lines(text: str) -> list[str]:
+    prefix = f"Environment={_PRESERVED_NAME}="
+    return [line for line in text.splitlines() if line.strip().startswith(prefix)]
+
+
+def test_checker_and_fix_leave_a_multi_root_unit_untouched(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """(i) BEHAVIOURAL: a correctly-preserved host sees neither drift nor a correction.
+
+    Run BOTH ways against the same fixture, because they fail differently:
+    a plain run that reported drift would send the operator to `--fix`, and a
+    `--fix` run that rewrote or appended would re-clobber the value the
+    installer had just preserved.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _multi_root_unit())
+    before = installed.read_bytes()
+
+    assert mod.main(["--installed", str(installed), "--template", str(TEMPLATE_PATH)]) == 0
+    out = capsys.readouterr().out
+    assert "[ok]" in out and "parity" in out, out
+
+    assert (
+        mod.main(
+            ["--installed", str(installed), "--template", str(TEMPLATE_PATH), "--fix"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    after = installed.read_text(encoding="utf-8")
+    assert _known_roots_lines(after) == _known_roots_lines(
+        _multi_root_unit()
+    ), "--fix changed the preserved line"
+    assert _MULTI_ROOTS in after, "--fix dropped this host's extra project roots"
+    assert installed.read_bytes() == before, "--fix rewrote a unit that was at parity"
+    assert mod.find_drift(after) == [], mod.find_drift(after)
+
+
+def test_preserved_names_are_disjoint_from_required_service_directives():
+    """(ii) THE INVARIANT, across BOTH modules and EVERY registered unit.
+
+    No name any unit's spec preserves may appear as the VARIABLE of an exact
+    `Environment=<NAME>=...` entry on this checker's required list. The two
+    mechanisms are incompatible by construction: preservation says "this value
+    is the host's", exact whole-line membership says "this value is the
+    committed one", and when they disagree --fix wins by appending last.
+
+    Iterates render_dashboard_unit.UNITS rather than naming one variable, so a
+    third unit — or a second preserved name on an existing one — is covered the
+    day it is registered.
+
+    Held HERE rather than by an import in either module: check_* and render_*
+    deliberately do not import each other (see render_dashboard_unit's module
+    docstring — a cross-module import would ImportError under the section-8
+    tmp-repo tests that replace one of them with a stub).
+    """
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    preserved = {
+        name
+        for spec in render_dashboard_unit.UNITS.values()
+        for name in spec.host_local_environment
+    }
+    required_env_vars = {
+        directive[len("Environment=") :].split("=", 1)[0]
+        for directive in mod.REQUIRED_SERVICE_DIRECTIVES
+        if directive.startswith("Environment=") and "=" in directive[len("Environment=") :]
+    }
+
+    overlap = preserved & required_env_vars
+    assert not overlap, (
+        f"{sorted(overlap)} is BOTH preserved by scripts/render_dashboard_unit.py "
+        "and exact-matched by REQUIRED_SERVICE_DIRECTIVES. On a host whose value "
+        "differs from the committed one, find_drift reports the required line as "
+        "missing and --fix APPENDS it after the last [Service] line, where "
+        "systemd's last-wins silently beats the preserved value — and the "
+        "checker then exits 0. See "
+        "test_a_required_known_project_roots_line_would_reclobber for the "
+        "demonstration."
+    )
+
+
+def test_a_required_known_project_roots_line_would_reclobber():
+    """(iii) THE DEMONSTRATION that makes (ii) load-bearing rather than decorative.
+
+    An invariant nobody can see the point of gets deleted as pedantry. This runs
+    the forbidden configuration and shows the damage.
+
+    The hypothetical extension is passed through fix_unit_text's EXISTING
+    `required` parameter rather than by mutating the module constant: monkeypatching
+    a module-level tuple would leak into whatever ran next in the same process,
+    and the parameter is the supported way to ask "what would this list do?".
+    """
+    mod = _load_checker()
+    unit = _multi_root_unit()
+    assert len(_known_roots_lines(unit)) == 1, "fixture should start with one line"
+
+    single_root_line = f"Environment={_PRESERVED_NAME}={_FM_REPO_ROOT}"
+    fixed = mod.fix_unit_text(
+        unit,
+        required=(*mod.REQUIRED_SERVICE_DIRECTIVES, single_root_line),
+    )
+
+    lines = _known_roots_lines(fixed)
+    assert len(lines) == 2, (
+        f"expected the hypothetical required line to be APPENDED alongside the "
+        f"host's, found {len(lines)}: {lines}"
+    )
+    assert lines[0].strip() == f"Environment={_PRESERVED_NAME}={_MULTI_ROOTS}", lines
+    assert lines[-1].strip() == single_root_line, (
+        "the appended single-root line is not LAST, which is the only reason "
+        f"this is a silent clobber under systemd's last-wins: {lines}"
+    )
+
+    # And the checker would then report the clobbered unit as being at parity,
+    # which is what makes the loss invisible rather than merely bad.
+    assert mod.find_drift(fixed, (*mod.REQUIRED_SERVICE_DIRECTIVES, single_root_line)) == []
