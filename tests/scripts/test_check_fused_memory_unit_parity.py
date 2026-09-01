@@ -1249,12 +1249,42 @@ def _run_section_4(
 
 
 def _fm_calls(tmp_path: pathlib.Path) -> list[list[str]]:
-    """Every systemctl call naming the fused-memory unit."""
+    """Every systemctl call naming the fused-memory unit.
+
+    Filters on argv tokens, so `daemon-reload` — which names no unit — is
+    deliberately NOT visible here. Assertions about it go through
+    `systemctl_calls` directly; see `_verbs`.
+    """
     return [
         argv
         for argv in systemctl_calls(tmp_path)
         if any(tok.startswith("fused-memory") for tok in argv)
     ]
+
+
+def _verbs(tmp_path: pathlib.Path) -> list[str]:
+    """The systemctl SUBCOMMAND of each call, in order.
+
+    Every call in this section is `systemctl --user <verb> [unit]`, and the
+    harness's stub logs `"$*"` — the arguments WITHOUT argv[0] — so the verb is
+    the second recorded token. Named separately from `_fm_calls` because the
+    verb that matters most here, `daemon-reload`, carries no unit name and is
+    therefore invisible to a unit-token filter.
+    """
+    return [argv[1] for argv in systemctl_calls(tmp_path) if len(argv) > 1]
+
+
+def _write_env(repo: pathlib.Path) -> pathlib.Path:
+    """Create `fused-memory/.env`, the file section 4 gates the RESTART on.
+
+    Without it `[ -f "$REPO_ROOT/fused-memory/.env" ]` is false and the
+    destructive half of the section never runs — which would make every
+    "the gate suppressed the restart" assertion vacuously true.
+    """
+    env = repo / "fused-memory" / ".env"
+    env.parent.mkdir(parents=True, exist_ok=True)
+    env.write_text("OPENAI_API_KEY=stub\n", encoding="utf-8")
+    return env
 
 
 def test_section_4_never_redirects_into_the_unit_file():
@@ -1328,12 +1358,22 @@ def test_section_4_missing_renderer_leaves_the_unit_alone(tmp_path: pathlib.Path
 
     The systemctl assertion is the other half. `fail` in setup-host.sh is a
     printf, not an exit, so without the `_fm_rendered` flag the section would
-    still reach `enable` (targeting a unit that does not exist on a greenfield
-    host) and `restart` — bouncing the server that backs the orchestrators, the
-    dashboard and this session's own MCP tooling on the strength of an install
-    that did not happen.
+    still reach `restart` — bouncing the server that backs the orchestrators,
+    the dashboard and this session's own MCP tooling on the strength of an
+    install that did not happen.
+
+    `.env` IS CREATED HERE ON PURPOSE. `restart` is gated on it as well as on
+    `_fm_rendered`, so without the file the "no restart" assertion would be
+    satisfied by the wrong gate and would stay green even if `_fm_rendered` were
+    deleted outright.
+
+    ENABLE IS STILL EXPECTED. It is guarded on the unit FILE existing, not on
+    `_fm_rendered` — this host has one, so it stays supervised. Gating `enable`
+    on the flag would be a regression against the pre-4796 code, which enabled
+    unconditionally; see the comment at that guard in setup-host.sh.
     """
     repo = _section_4_repo(tmp_path, with_renderer=False)
+    _write_env(repo)
     unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))
     before = (unit_dir / _FM_SERVICE).read_bytes()
 
@@ -1343,7 +1383,15 @@ def test_section_4_missing_renderer_leaves_the_unit_alone(tmp_path: pathlib.Path
         "the missing-renderer path modified the installed unit"
     )
     assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
-    assert _fm_calls(tmp_path) == [], _fm_calls(tmp_path)
+    assert "restart" not in _verbs(tmp_path), (
+        "a render that never happened restarted the server anyway: "
+        f"{systemctl_calls(tmp_path)}"
+    )
+    assert "daemon-reload" in _verbs(tmp_path), systemctl_calls(tmp_path)
+    assert "fused-memory" in enabled_units(tmp_path), (
+        "a host that already HAS the unit must be left with it ENABLED even "
+        f"when the render fails: {systemctl_calls(tmp_path)}"
+    )
 
 
 def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
@@ -1352,8 +1400,14 @@ def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
     The `elif ...; then ok` construct's blind spot: with no else branch a failing
     render falls out of the chain with status 0 and the operator is told nothing
     about the unit that did not get written.
+
+    `.env` present, for the reason given on the missing-renderer test above: it
+    is what makes "no restart" an assertion about `_fm_rendered` rather than
+    about a file the fixture happened not to create. `enable` is still expected
+    — it is guarded on the unit existing, not on the flag.
     """
     repo = _section_4_repo(tmp_path)
+    _write_env(repo)
     (repo / "scripts" / "render_dashboard_unit.py").write_text(
         _FAILING_FM_RENDERER, encoding="utf-8"
     )
@@ -1366,4 +1420,92 @@ def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
         "a refused render modified the installed unit"
     )
     assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
-    assert _fm_calls(tmp_path) == [], _fm_calls(tmp_path)
+    assert "restart" not in _verbs(tmp_path), (
+        "a refused render restarted the server anyway: "
+        f"{systemctl_calls(tmp_path)}"
+    )
+    assert "fused-memory" in enabled_units(tmp_path), systemctl_calls(tmp_path)
+
+
+def test_section_4_restarts_when_the_render_succeeded_and_env_exists(
+    tmp_path: pathlib.Path,
+):
+    """The POSITIVE half of the `_fm_rendered` gate: a real install DOES restart.
+
+    Without this the three degraded-path tests above are all satisfied by a
+    section that never restarts under any condition — "no restart on failure" is
+    only meaningful next to "restart on success". This is also the only test that
+    reaches the section's closing `ok` line.
+
+    The restart is the destructive step (it severs the MCP tooling of whatever
+    session is running the installer), so it is asserted as an EXACT argv rather
+    than a substring: `restart` naming some other unit must not satisfy it.
+    """
+    repo = _section_4_repo(tmp_path)
+    _write_env(repo)
+    unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    calls = systemctl_calls(tmp_path)
+    assert ["--user", "restart", "fused-memory"] in calls, calls
+    assert ["--user", "daemon-reload"] in calls, calls
+    assert "fused-memory" in enabled_units(tmp_path), calls
+    # The render still preserved this host's roots on the way through.
+    assert _MULTI_ROOTS in (unit_dir / _FM_SERVICE).read_text(encoding="utf-8")
+    assert "installed and started" in result.stdout, result.stdout
+
+
+def test_section_4_greenfield_without_env_does_not_restart(tmp_path: pathlib.Path):
+    """A fresh host has no secrets yet: install and enable, but never start.
+
+    Pins that the `.env` gate is still the one deciding whether the server is
+    touched — the flag added by this task narrows that decision, it does not
+    replace it.
+    """
+    repo = _section_4_repo(tmp_path)  # no fused-memory/.env
+    unit_dir = _gate_unit_dir(tmp_path)
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "restart" not in _verbs(tmp_path), systemctl_calls(tmp_path)
+    assert "fused-memory" in enabled_units(tmp_path), systemctl_calls(tmp_path)
+    assert "WARN" in result.stdout, result.stdout
+
+
+def test_section_4_bare_host_with_no_renderer_does_not_abort_the_installer(
+    tmp_path: pathlib.Path,
+):
+    """The combination the `[ -f ... ]` enable guard exists for.
+
+    Nothing to render FROM and nothing already installed, so there is no unit to
+    enable. `systemctl --user enable` on a nonexistent unit exits non-zero on a
+    real host, and under setup-host.sh's `set -e` that would abort the whole
+    installer before every later section — the missing-renderer branch's own
+    promise that "the sections below still run" would be false exactly when it
+    is needed. The section must instead say so and keep going.
+
+    The harness's `systemctl` stub always exits 0, so this cannot be asserted by
+    watching the exit status of the enable itself; what is asserted is that the
+    section took the `else` branch — no enable was attempted at all — and still
+    finished cleanly.
+    """
+    repo = _section_4_repo(tmp_path, with_renderer=False)
+    _write_env(repo)
+    unit_dir = _gate_unit_dir(tmp_path)  # bare: no fused-memory.service
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        f"the section aborted instead of continuing:\n{result.stderr}"
+    )
+    assert not (unit_dir / _FM_SERVICE).exists(), (
+        "the missing-renderer path wrote a unit anyway"
+    )
+    assert _fm_calls(tmp_path) == [], (
+        "there is no unit file, so nothing may be enabled or restarted: "
+        f"{systemctl_calls(tmp_path)}"
+    )
+    assert "NOT enabled" in result.stdout, result.stdout

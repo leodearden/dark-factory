@@ -227,14 +227,26 @@ UV_PATH="$(command -v uv)"
 # the unit ALONE and says so, which is the recoverable direction: stale but
 # intact is fixable on the next run; de-registered from reconciliation is not
 # noticed until projects start failing with UnknownProjectError.
+#
+# KEEP IN STEP WITH SECTION 8's `_dash_render_script=` BLOCK. The two are
+# deliberately parallel: same hoisted `_<x>_render_script=` anchor, same
+# `_<x>_rendered=0` flag, same missing-renderer / rendered / refused three-way,
+# same "daemon-reload always, enable on the unit EXISTING, the destructive step
+# on the flag" gate split. They are not factored into one helper because every
+# message differs (this unit governs reconciliation; that one governs a view)
+# and a helper would have to signal WHICH failure occurred back to the call site
+# through an exit code, reproducing the three-way at both ends. The cost of that
+# choice is drift, so: a change to the control flow or the failure modes here
+# belongs in BOTH sites. The one INTENTIONAL divergence is documented at the
+# `restart` gate below — section 8 has no equivalent because the dashboard is
+# started by hand and never restarted by this script.
 _fm_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
-# Set to 1 only by the branch that actually rendered. The systemctl calls below
-# are gated on it rather than run unconditionally as they used to be: `fail`
-# here is a printf, not an exit, so on a greenfield host an ungated `enable`
-# would target a unit that does not exist, and an ungated `restart` would bounce
-# the server backing the orchestrators, the dashboard and this session's own MCP
-# tooling — on the strength of an install that did not happen.
+# Set to 1 only by the branch that actually rendered. `fail` here is a printf,
+# not an exit, so without this flag every degraded path still reached the
+# `restart` below and the green "installed and started" line under it — bouncing
+# the server that backs the orchestrators, the dashboard and this session's own
+# MCP tooling on the strength of an install that did not happen.
 _fm_rendered=0
 
 if [ ! -f "$_fm_render_script" ]; then
@@ -265,10 +277,42 @@ else
   fail "  run. Re-run this script once the cause is fixed."
 fi
 
-if [ "$_fm_rendered" = "1" ]; then
-  systemctl --user daemon-reload
-  systemctl --user enable fused-memory
+# UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
+# a no-op when nothing changed, and skipping it on a degraded path would leave
+# systemd reading a stale generation of whatever unit IS on disk.
+systemctl --user daemon-reload
 
+# GUARDED on the unit EXISTING, not on `_fm_rendered` — the same split section 8
+# makes, for the same reasons. (1) A failed render on a host that already HAS the
+# unit must still leave it enabled: stale but supervised is the recoverable
+# direction this whole construct chooses, and `enable` is idempotent and cheap.
+# Before this gate existed the pre-4796 code enabled unconditionally, so gating
+# `enable` on `_fm_rendered` would have been a silent REGRESSION on exactly the
+# render-refused path (renderer missing, or apply_preserved refusing a value that
+# cannot round-trip through one Environment= line). (2) The combination the guard
+# genuinely exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist exits non-zero, and
+# under this file's `set -e` that aborts the entire installer before every later
+# section. Both FAIL branches above promise "the sections below still run"; this
+# is what makes that promise true rather than true-only-when-a-unit-was-there.
+if [ -f "$UNIT_DIR/fused-memory.service" ]; then
+  systemctl --user enable fused-memory
+else
+  fail "fused-memory NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The sections below still run."
+fi
+
+# THE RESTART, and ONLY the restart, stays gated on `_fm_rendered`. This is the
+# one deliberate divergence from section 8 (which has no restart at all — the
+# dashboard is started by hand). `enable` is idempotent bookkeeping; `restart`
+# bounces the server backing the orchestrators, the dashboard and this session's
+# own MCP tooling. On a path where nothing was written that outage buys exactly
+# nothing: the on-disk unit is unchanged, so the running process already matches
+# it. The closing `ok` is inside the gate for the same reason it is in section 8
+# — a green "installed and started" would assert precisely what the FAIL lines
+# above it had just denied.
+if [ "$_fm_rendered" = "1" ]; then
   # Only start if .env exists (needs secrets)
   if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
     systemctl --user restart fused-memory
@@ -980,6 +1024,16 @@ fi
 # path where nobody is left watching for it — the post-install gate cannot see
 # this variable's value. A missing renderer therefore leaves the unit ALONE and
 # says so, which is the recoverable direction: stale but intact.
+#
+# KEEP IN STEP WITH SECTION 4's `_fm_render_script=` BLOCK (task 4796), which is
+# the same construct for fused-memory.service: same anchor shape, same
+# `_<x>_rendered=0` flag, same three-way, same "daemon-reload always, enable on
+# the unit EXISTING, the rest on the flag" gate split. Deliberately two copies
+# rather than one helper — every message differs and a helper would have to
+# signal WHICH failure occurred back through an exit code — so a change to the
+# control flow or the failure modes here belongs in BOTH sites. Section 4's
+# extra `restart` gate has no counterpart here on purpose: the dashboard is
+# started by hand, never restarted by this script.
 _dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
 # Set to 1 only by the branch that actually rendered. The section's closing line
