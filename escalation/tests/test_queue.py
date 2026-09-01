@@ -3940,8 +3940,10 @@ class TestStampTriage:
 
 class TestUpdatedAtStamp:
     """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
-    append path, left untouched by its no-op path, and never touched by stamp_triage
-    (an annotation must not masquerade as a content change)."""
+    append path, left untouched by its no-op path, never touched by stamp_triage
+    (an annotation must not masquerade as a content change), and bumped by
+    attach_dedupe_child (a fold IS a content change — recurrence count up, possible
+    severity promotion)."""
 
     def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
         esc = Escalation(
@@ -3992,6 +3994,86 @@ class TestUpdatedAtStamp:
         assert result.updated_at is None, (
             f'Expected updated_at to stay None after stamp_triage, got {result.updated_at!r}'
         )
+
+    def _make_pending_parent(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Seed a PENDING dedupe parent.
+
+        attach_dedupe_child loads from the queue ROOT only and returns None for
+        archived parents, so this record must stay pending — hence a plain
+        submit and no resolve.  Seeded at ``info`` so the fold below also
+        exercises the max_severity promotion that makes the staleness bump
+        load-bearing.
+        """
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_attach_dedupe_child_sets_updated_at_on_a_triaged_parent(self, tmp_path: Path):
+        """(d) A dedupe fold IS a substantive change, so it must bump updated_at.
+
+        The contract this defends: a triaged pending parent that then folds in
+        duplicates gains recurrence count (``dedupe_count``) and can be promoted
+        info->blocking by ``max_severity``, yet used to read ``updated_at is
+        None``.  An L1/L2 rotation applying the "updated_at is not None and is
+        newer than triaged_at" re-verify rule (the triage quad in models.py;
+        skills/escalation-watcher/SKILL.md) would therefore trust the now-stale
+        triage note and skip re-assessing a record that has materially changed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_pending_parent(queue)
+        assert parent.updated_at is None
+        assert parent.triaged_at is None
+
+        stamped = queue.stamp_triage(
+            parent.id,
+            triaged_by='escalation-watcher-auto',
+            triage_note='verified predicate + probe',
+        )
+        assert stamped is not None
+
+        # Re-pin the existing stamp_triage contract as THIS test's precondition:
+        # an annotation stamps triaged_at and leaves updated_at alone, so the
+        # bump asserted below can only have come from the fold.
+        after_triage = queue.get(parent.id)
+        assert after_triage is not None
+        assert after_triage.triaged_at is not None
+        assert after_triage.updated_at is None, (
+            'Precondition: stamp_triage must not bump updated_at, got '
+            f'{after_triage.updated_at!r}'
+        )
+
+        result = queue.attach_dedupe_child(parent.id, 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.updated_at is not None, (
+            'Expected attach_dedupe_child to stamp updated_at: a fold raises '
+            'dedupe_count and can promote severity, so a parent reading '
+            'updated_at=None after folding makes an L1/L2 rotation trust a '
+            'stale triage note and skip re-assessing it'
+        )
+        assert result.triaged_at is not None
+        assert result.updated_at > result.triaged_at, (
+            "The watcher's stamp-then-skip protocol keys off STRICTLY newer, so "
+            f'updated_at ({result.updated_at!r}) must exceed triaged_at '
+            f'({result.triaged_at!r})'
+        )
+
+        # The same two properties must hold on the PERSISTED record, not only on
+        # the returned object.
+        from_disk = queue.get(parent.id)
+        assert from_disk is not None
+        assert from_disk.updated_at is not None, (
+            'Expected the bump to be durable, not only on the returned object'
+        )
+        assert from_disk.triaged_at is not None
+        assert from_disk.updated_at > from_disk.triaged_at
 
 
 class TestResolveCascade:
