@@ -445,22 +445,88 @@ class TestNonSharedToolsAreNotAdvertisedToEveryStage:
         )
 
     @pytest.mark.parametrize(
-        'prompt_label,prompt_text',
+        'prompt_label,prompt_text,disallowed_attr',
         [
-            ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT),
-            ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT),
+            ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT, 'STAGE1_DISALLOWED'),
+            ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT, 'STAGE3_DISALLOWED'),
         ],
     )
-    def test_stage_gated_tools_absent_from_denying_stage_prompts(self, prompt_label, prompt_text):
-        """The end-to-end version: scan the ASSEMBLED prompts of the stages that deny it."""
-        for tool_name in sorted(STAGE_GATED_REPORT_TOOLS):
+    def test_stage_gated_tools_absent_from_denying_stage_prompts(
+        self, prompt_label, prompt_text, disallowed_attr
+    ):
+        """The end-to-end version: scan the ASSEMBLED prompts of the stages that deny it.
+
+        Absence is asserted PER (tool, stage), read off that stage's actual
+        disallow list — NOT for every stage-gated tool in every non-Stage-2
+        prompt. The blanket form was correct only while
+        write_entity_standing_decision was the sole stage-gated tool (denied in
+        Stage 1 AND Stage 3, so "stage-gated" and "denied here" coincided).
+        repair_memory_citation (task 3065) broke that coincidence: it is denied
+        in Stage 3 ONLY, via DISALLOW_RECON_REPORT_JOURNAL_WRITES, and Stage 1
+        genuinely HOLDS it (Stage 1's supersessions are what strand the
+        citation — see the carve-out note in cli_stage_runner.py).
+
+        So the blanket assertion would have required Stage 1's prompt to stay
+        silent about a tool Stage 1 can actually call. That is precisely the
+        held-but-unadvertised defect esc-3391-1 /
+        test_recon_amend_tool_advertisement.py exists to catch — a guard
+        MANDATING the bug it was written to prevent, and failing the correct fix
+        (task 4395) with a message that misattributes the denial to
+        DISALLOW_RECON_REPORT_LEDGER_WRITES, a list repair_memory_citation is
+        not in.
+
+        The converse — a HELD stage-gated tool must be NAMED in that stage's
+        prompt — is deliberately NOT asserted here: it fails today for both
+        tools in all three of their holdings, and closing that gap is task
+        4395's deliverable, not this guard's.
+        """
+        from fused_memory.reconciliation import cli_stage_runner
+
+        denied_here = {
+            name.removeprefix('mcp__recon-report__')
+            for name in getattr(cli_stage_runner, disallowed_attr)
+        }
+        for tool_name in sorted(STAGE_GATED_REPORT_TOOLS & denied_here):
             assert tool_name not in prompt_text, (
-                f'{prompt_label} names `{tool_name}`, but that stage DENIES it via '
-                'DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py). Naming a '
-                'denied tool in a stage prompt tells the agent about an action it cannot '
-                'take, and the denial surfaces as a silently missing tool rather than an '
-                'explanation.'
+                f'{prompt_label} names `{tool_name}`, but that stage DENIES it '
+                f'({disallowed_attr} in cli_stage_runner.py). Naming a denied tool in a '
+                'stage prompt tells the agent about an action it cannot take, and the '
+                'denial surfaces as a silently missing tool rather than an explanation.'
             )
+
+    def test_the_absence_guard_is_scoped_to_actually_denying_stages(self):
+        """The guard above must not fire for a stage-gated tool the stage HOLDS.
+
+        Without this, the per-(tool, stage) scoping could silently regress to
+        the blanket form and nobody would notice until task 4395 tried to
+        advertise repair_memory_citation to Stage 1 and was blocked by a guard
+        asserting the opposite of the truth. Pins the asymmetry that motivated
+        the scoping: at least one stage-gated tool is denied by strictly fewer
+        than all of the denying-stage prompts this class scans.
+        """
+        from fused_memory.reconciliation import cli_stage_runner
+
+        stage1_denied = {
+            name.removeprefix('mcp__recon-report__')
+            for name in cli_stage_runner.STAGE1_DISALLOWED
+        }
+        stage3_denied = {
+            name.removeprefix('mcp__recon-report__')
+            for name in cli_stage_runner.STAGE3_DISALLOWED
+        }
+        held_by_stage1 = STAGE_GATED_REPORT_TOOLS - stage1_denied
+        assert held_by_stage1, (
+            'Every stage-gated tool is now denied in Stage 1, so the per-(tool, stage) '
+            'scoping above has no case that distinguishes it from the old blanket form. '
+            'That is not a failure — but re-read this class before simplifying it back, '
+            'because the scoping is what lets a tool HELD by a denying-stage prompt be '
+            'advertised there (task 4395).'
+        )
+        assert held_by_stage1 <= stage3_denied, (
+            f'{held_by_stage1} is stage-gated and held by Stage 1, but is not denied in '
+            'Stage 3 either — so it is denied by NO stage this class scans and does not '
+            'belong in STAGE_GATED_REPORT_TOOLS at all. Reclassify it as shared guidance.'
+        )
 
 
 class TestRendererCoversEverySignatureItIsGiven:
