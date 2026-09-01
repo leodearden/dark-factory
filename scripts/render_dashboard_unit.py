@@ -492,18 +492,34 @@ def render_unit(
     return apply_preserved(rendered, preserved), preserved, skipped
 
 
-def _log(message: str, *, stream=None) -> None:
+def _log(message: str, *, stream=None, log_tag: str = LOG_TAG) -> None:
     """Print *message* prefixed with the log tag.
 
     Every line this script emits goes through here, on stdout and stderr alike
     — pinned by test_main_every_emitted_line_carries_the_log_tag. Same shape
     and same reason as check_dashboard_unit_parity._log.
+
+    *log_tag* IS THREADED, NOT GLOBAL (task 4796). Since one script now renders
+    two units, the tag varies per invocation — but rebinding the module-global
+    ``LOG_TAG`` from ``main`` would make every call site's output depend on
+    argument-parsing order, invisibly at the call site, and would leak across an
+    in-process second call (which is exactly how this module's suite invokes the
+    CLI). An explicit parameter defaulting to ``LOG_TAG`` keeps the dashboard's
+    behaviour and every existing call site unchanged.
     """
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
+    print(f"[{log_tag}] {message}", file=stream if stream is not None else sys.stdout)
 
 
 def main(argv: "Sequence[str] | None" = None) -> int:
-    """Render the dashboard unit into --output, preserving host-local values.
+    """Render the --unit's template into --output, preserving host-local values.
+
+    WHICH UNIT is chosen by ``--unit`` off the ``UNITS`` registry, defaulting to
+    ``dashboard`` so the call site that predates the flag (setup-host.sh section
+    8) is unchanged. The unit decides exactly two things — the preserve set and
+    the log tag — and both are read off the spec here rather than from module
+    state: the tag is passed to every ``_log`` call explicitly, never by
+    rebinding the global, so a second in-process call cannot inherit the first
+    one's tag. Everything else below is unit-neutral.
 
     READING AND WRITING THE SAME PATH IS THE INTENDED PRODUCTION CALL:
     setup-host.sh passes the installed unit as --output, and this reads that
@@ -526,7 +542,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     NamedTemporaryFile is 0600, so replacing without restoring would silently
     re-permission a unit this tool exists to leave alone.
 
-    ``--no-preserve`` renders the template and nothing else. It is for
+    ``--no-preserve`` renders the template and nothing else — it empties the
+    preserve SET rather than merely skipping the read, so the names are not then
+    reported as absent from a file this run never opened. It is for
     REGENERATING THE REPO-SIDE committed copy, where preserving is exactly
     wrong: there the --output being read is the artifact under regeneration, so
     a stale committed value would be carried straight back into the "fresh"
@@ -538,10 +556,23 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Render dark-factory-dashboard.service from its template, "
-            "preserving host-local Environment= values already present in "
-            "--output."
+            "Render a dark-factory systemd unit from its template, preserving "
+            "host-local Environment= values already present in --output. "
+            "--unit selects WHICH unit (and therefore which values are "
+            "host-local): dark-factory-dashboard.service or fused-memory.service."
         )
+    )
+    parser.add_argument(
+        "--unit",
+        choices=sorted(UNITS),
+        default="dashboard",
+        help=(
+            "Which unit is being rendered. Selects the preserve set and the log "
+            "tag from the UNITS registry. Defaults to the dashboard, so the "
+            "call site that predates this flag is unchanged. `choices` is what "
+            "makes an unknown value a USAGE ERROR rather than a silent fallback "
+            "to a preserve set that does not match the unit being written."
+        ),
     )
     parser.add_argument("--template", required=True, help="Path to the .template file")
     parser.add_argument("--repo-root", required=True, help="Value for __REPO_ROOT__")
@@ -565,24 +596,34 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # The whole of what is unit-specific, resolved once. Everything below is
+    # unit-neutral and reads only `spec`.
+    spec = UNITS[args.unit]
+    log_tag = spec.log_tag
+
     template_path = pathlib.Path(args.template)
     output_path = pathlib.Path(args.output)
 
     try:
         template_text = template_path.read_text(encoding="utf-8")
     except OSError as exc:
-        _log(f"FAILED: cannot read template {template_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"FAILED: cannot read template {template_path}: {exc}",
+            stream=sys.stderr,
+            log_tag=log_tag,
+        )
         _log(
             f"  {output_path} was NOT modified — it keeps whatever this host "
             "already had.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
     # The installed side. An absent --output is the greenfield case, not an
     # error: there is simply nothing to preserve.
     installed_text = ""
-    names: tuple[str, ...] = HOST_LOCAL_ENVIRONMENT
+    names: tuple[str, ...] = spec.host_local_environment
     if args.no_preserve:
         # Not merely "read nothing": the preserve SET is emptied too, so the
         # names do not then get reported as absent-from-the-installed-unit,
@@ -590,7 +631,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         names = ()
         _log(
             f"--no-preserve: rendering the template as-is; no host-local "
-            f"Environment= values were read from {output_path}"
+            f"Environment= values were read from {output_path}",
+            log_tag=log_tag,
         )
     elif output_path.is_file():
         try:
@@ -599,11 +641,13 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             _log(
                 f"FAILED: cannot read the installed unit {output_path}: {exc}",
                 stream=sys.stderr,
+                log_tag=log_tag,
             )
             _log(
                 "  Refusing to render over a unit whose host-local values "
                 "could not be read.",
                 stream=sys.stderr,
+                log_tag=log_tag,
             )
             return 1
 
@@ -616,11 +660,12 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             names=names,
         )
     except ValueError as exc:
-        _log(f"FAILED: {exc}", stream=sys.stderr)
+        _log(f"FAILED: {exc}", stream=sys.stderr, log_tag=log_tag)
         _log(
             f"  {output_path} was NOT modified — its host-local values are "
             "intact and the unit may simply be stale.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
@@ -629,11 +674,14 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # structurally incapable of saying anything about its value: these lines are
     # the only record that the variable was handled at all.
     for name, value in preserved.items():
-        _log(f"preserved host-local Environment={name}={value}")
+        _log(f"preserved host-local Environment={name}={value}", log_tag=log_tag)
     for name, code in skipped.items():
         # The CODE is emitted as a bracketed token beside the sentence: stable
         # for anything matching on it, while the prose stays free to change.
-        _log(f"default used for Environment={name} [{code}]: {_SKIP_SENTENCE[code]}")
+        _log(
+            f"default used for Environment={name} [{code}]: {_SKIP_SENTENCE[code]}",
+            log_tag=log_tag,
+        )
 
     # `temp_name` is bound INSIDE the `with` but read in the `except`, so it is
     # declared here and assigned before the write: a failing `handle.write`
@@ -669,15 +717,20 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         if temp_name is not None:
             with contextlib.suppress(OSError):
                 os.unlink(temp_name)
-        _log(f"FAILED: cannot write {output_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"FAILED: cannot write {output_path}: {exc}",
+            stream=sys.stderr,
+            log_tag=log_tag,
+        )
         _log(
             f"  {output_path} was NOT modified — the write goes through a temp "
             "file and a rename, so it is byte-unchanged.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
-    _log(f"rendered {output_path}")
+    _log(f"rendered {output_path}", log_tag=log_tag)
     return 0
 
 

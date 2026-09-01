@@ -1372,7 +1372,13 @@ def _fm_installed_with_nine_roots(repo_root=_OLD_ROOT):
 
 
 def _fm_cli(tmp_path, *, output_text=None, repo_root=_NEW_ROOT, unit="fused-memory"):
-    """A tmp copy of the REAL fused-memory template (+ optional installed unit)."""
+    """A tmp copy of the REAL fused-memory template (+ optional installed unit).
+
+    *tmp_path* is created if absent, so a caller can pass a SUBDIRECTORY of the
+    pytest tmp_path to get an isolated scratch area (the tag-routing test builds
+    a second, deliberately broken, one that way).
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
     template = tmp_path / "fused-memory.service.template"
     template.write_text(
         FUSED_TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
