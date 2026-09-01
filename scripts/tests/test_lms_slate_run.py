@@ -18,7 +18,9 @@ PRD hazard 11 -- "long runs in transient `systemd --user` units, never bare
 background shells" -- is enforced here as a CHECKED PROPERTY of the built
 argv, mirroring `test_lms_fetch_weights.py`'s treatment of hazard 5.
 """
+import ast
 import sys
+import tempfile
 from pathlib import Path
 
 import lms_fetch_weights
@@ -815,6 +817,33 @@ def test_the_merge_writes_the_artifact_and_the_driver_never_does(tmp_path, two_a
     assert not output.exists()
 
 
+def _bound_and_called_names(tree):
+    """Every name the module IMPORTS and every name it CALLS, at any scope.
+
+    An AST walk rather than a substring scan over the source text.  The scan it
+    replaces was coupled to prose: this module discusses `merge_reports` at
+    length (it has to explain why it shells out instead), so a future comment
+    written as ``merge_reports(parts, expected_arm_ids=...)`` would have failed
+    it with no defect present.  The walk also catches what the scan's companion
+    `hasattr` check could not -- a FUNCTION-LOCAL `from lms_healthcheck import
+    merge_reports`, which binds no module attribute at all.
+    """
+    imported: set[str] = set()
+    called: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update((a.asname or a.name).split('.')[0] for a in node.names)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    return imported, called
+
+
 def test_the_driver_never_calls_merge_reports_as_a_library():
     """`merge_reports`' `expected_arm_ids` parameter DEFAULTS TO None, which
     SKIPS the coverage check entirely. A library call is one forgotten keyword
@@ -822,13 +851,43 @@ def test_the_driver_never_calls_merge_reports_as_a_library():
     binding is pinned ABSENT rather than merely unused.
 
     Prose ABOUT `merge_reports` is deliberately still allowed — the module
-    explains why it shells out instead — so this asserts on the binding and the
-    call, not on the mention.
+    explains why it shells out instead — so this asserts on the AST: no import
+    binding that name at any scope, and no call to it.
     """
-    source = lms_slate_run.MODULE_PATH.read_text()
+    tree = ast.parse(lms_slate_run.MODULE_PATH.read_text())
+    imported, called = _bound_and_called_names(tree)
 
+    assert 'merge_reports' not in imported
+    assert 'merge_reports' not in called
     assert not hasattr(lms_slate_run, 'merge_reports')
-    assert 'merge_reports(' not in source
+
+
+def test_the_ast_guard_would_catch_a_function_local_import():
+    """Guard on the guard.  The check it replaced -- a `merge_reports(` scan
+    plus a module-level `hasattr` -- is pinned here as INSUFFICIENT against the
+    shape it most needs to catch, so a future simplification back to it cannot
+    look equivalent."""
+    sneaky = ast.parse(
+        'def run():\n'
+        '    from lms_healthcheck import merge_reports\n'
+        '    return merge_reports(parts)\n'
+    )
+    imported, called = _bound_and_called_names(sneaky)
+
+    assert 'merge_reports' in imported
+    assert 'merge_reports' in called
+
+
+def test_the_ast_guard_tolerates_prose_about_merge_reports():
+    """The constraint is a binding, not a mention: a comment or docstring
+    naming `merge_reports(...)` must not fail the guard."""
+    prosaic = ast.parse(
+        '"""Never call merge_reports(parts, expected_arm_ids=None) here."""\n'
+        '# merge_reports(parts) would skip the coverage check\n'
+    )
+    imported, called = _bound_and_called_names(prosaic)
+
+    assert 'merge_reports' not in imported | called
 
 
 def test_only_the_parts_that_exist_on_disk_are_passed_to_the_merge(tmp_path, two_arms):
@@ -1244,6 +1303,32 @@ def test_the_default_parts_dir_is_absolute_and_needs_no_flag(tmp_path, two_arms)
     parts_value = argv[argv.index('--parts-dir') + 1]
     assert parts_value.startswith('/')
     assert parts_value == str(Path(parts_value).resolve())
+
+
+def test_the_default_parts_dir_prefers_the_runtime_dir(tmp_path):
+    """The property the docstring argues for: parts belong to ONE boot's run,
+    and a tmpfs that empties on reboot says so by construction."""
+    assert lms_slate_run.default_parts_dir(
+        {'XDG_RUNTIME_DIR': '/run/user/1000'},
+    ) == Path('/run/user/1000/lms-slate-parts')
+
+
+def test_the_default_parts_dir_falls_back_to_the_temp_dir(tmp_path):
+    """On a host with no `XDG_RUNTIME_DIR` this fallback is the WHOLE
+    behaviour. It must not be `Path('')`, which would put the parts in the
+    unit's working directory -- the repo root."""
+    assert lms_slate_run.default_parts_dir({}) == (
+        Path(tempfile.gettempdir()) / 'lms-slate-parts'
+    )
+
+
+def test_an_empty_runtime_dir_is_not_treated_as_a_directory():
+    """`''` is not "unset" to `dict.get`, but it is not a directory either;
+    treating it as one would resolve the parts dir to `lms-slate-parts`
+    RELATIVE to wherever the unit happens to be working."""
+    assert lms_slate_run.default_parts_dir({'XDG_RUNTIME_DIR': ''}) == (
+        Path(tempfile.gettempdir()) / 'lms-slate-parts'
+    )
 
 
 def test_the_committed_artifact_is_never_touched_by_the_default_cli_path(two_arms):
