@@ -1076,6 +1076,57 @@ def test_park_commit_still_commits_a_verified_dirty_parking(tmp_path):
     assert not _git(parking, "status", "--porcelain").stdout.strip()
 
 
+def test_reclaim_skips_a_parking_whose_park_commit_refuses(tmp_path, caplog, monkeypatch):
+    """THE COMPOSITION THAT MUST NOT BE DESTRUCTIVE: a park-commit refusal must
+    NOT cascade into a removal.
+
+    ``park_commit``'s guard returns ``None``, deliberately reusing the failure
+    channel :func:`reclaim_worktrees` already treats as "SKIP, never removed
+    (data-loss guard)". The two are tested in isolation elsewhere — step-19
+    proves the refusal, step-18 the sweep-level one — but nothing drove the two
+    TOGETHER, and this is the one composition where a mistake destroys content:
+    a parking whose dirty state was never snapshotted, removed anyway.
+
+    It is also the only guard whose reachability depends on a RACE rather than
+    on a misconfigured ``repo`` — the sweep's own gate passed, so a parking that
+    stops verifying between the sweep entry and its own park-commit (replaced,
+    unmounted, its admin file rewritten) is the live path. Simulated by making
+    the target verify answer truthfully for ``repo`` and False for the parking.
+    """
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    assert len(records) == 1
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+    truthful = row.is_git_toplevel
+
+    def refuses_the_parking(path):
+        if Path(path).resolve() == parking.resolve():
+            return False
+        return truthful(path)
+
+    monkeypatch.setattr(row, "is_git_toplevel", refuses_the_parking)
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)  # must not raise
+
+    # The refusal landed in the data-loss-guard channel, not the removal one.
+    assert outcome.refused is False  # the SWEEP was not refused — this parking was
+    assert _resolved(outcome.skipped) == [parking.resolve()]
+    assert outcome.reclaimed == []
+    assert outcome.park_committed == []
+    assert outcome.failed == []
+    # ...and nothing was destroyed: still on disk, still registered, still dirty,
+    # still on the same commit (no snapshot was taken, so none may be lost).
+    assert parking.exists()
+    assert parking.resolve() in _worktree_paths(repo)
+    assert _git(parking, "status", "--porcelain").stdout.strip()
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and "REFUSING to park-commit" in m for m in warn)
+    assert any(LOG_PREFIX in m and "SKIP" in m and "NOT removing" in m for m in warn)
+
+
 def test_park_commit_still_commits_through_a_symlinked_parking(tmp_path):
     """NON-REGRESSION: a parking reached via a SYMLINK is a legitimate target —
     the guard realpath-compares, so it must not false-refuse here."""
