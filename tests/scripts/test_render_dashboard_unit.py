@@ -773,33 +773,64 @@ def test_host_local_environment_excludes_project_root():
     )
 
 
-def test_host_local_environment_names_are_declared_in_the_committed_template():
-    """(d) STALENESS GUARD: a typo must not rot into a preserve-nothing no-op.
+def test_every_unit_spec_names_a_committed_template():
+    """(d.i) The registry is self-describing: every spec names a template that EXISTS.
+
+    `template` is repo-relative, so this also pins that nobody stored an absolute
+    or host-specific path in a constant the whole fleet shares. Checked before the
+    staleness guard below, which reads these files: a missing template should fail
+    as "the registry names a file that is not there", not as an unrelated OSError
+    inside the guard.
+    """
+    for key, spec in _units().items():
+        path = REPO_ROOT / spec.template
+        assert path.is_file(), (
+            f"UNITS[{key!r}].template is {spec.template!r}, which does not resolve "
+            f"to a file under {REPO_ROOT}. Expected a repo-relative path to the "
+            "committed .template this unit is rendered from."
+        )
+
+
+def test_every_preserved_name_is_declared_exactly_once_in_its_units_template():
+    """(d.ii) STALENESS GUARD: a typo must not rot into a preserve-nothing no-op.
 
     Mirrors test_divergence_allowlist_names_are_declared_in_a_committed_unit.
-    A misspelled name here would be absent from every installed unit forever,
-    so preserved_values would skip it on every host, the render would take the
-    default every time, and the renderer would report success while doing
-    exactly what the `sed >` it replaced did.
+    A misspelled name in a preserve set would be absent from every installed unit
+    forever, so preserved_values would skip it on every host, the render would
+    take the default every time, and the renderer would report success while
+    doing exactly what the `sed >` it replaced did.
+
+    ITERATES THE REGISTRY rather than checking the dashboard alone (task 4796).
+    Pairing each preserve set with its OWN template is the whole point: the two
+    templates declare overlapping but not identical Environment= sets, so a name
+    valid for one unit can be a silent no-op on the other. Registering a third
+    unit is then automatically guarded, which a per-unit copy of this test would
+    not give.
+
+    EXACTLY ONE MATCHING LINE, not merely "the reader can see the name", because
+    that is precisely `apply_preserved`'s precondition — it raises on both zero
+    (the template changed shape, so the preserved value is dropped on the floor)
+    and more than one (ambiguous; systemd's last-wins hides which was chosen).
+    The stricter line-shaped form also catches the multi-assignment spelling
+    `Environment=FOO=1 NAME=2`, which environment_map reads happily and
+    apply_preserved cannot rewrite. Without this guard that failure is discovered
+    ON A REAL HOST by an operator mid-bring-up, not by CI.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
-
-    declared = set(
-        systemd_unit_parity.environment_map(
-            systemd_unit_parity.parse_unit_directives(
-                TEMPLATE_PATH.read_text(encoding="utf-8")
-            ),
-            "Service",
-        )
-    )
-
-    for name in _host_local():
-        assert name in declared, (
-            f"HOST_LOCAL_ENVIRONMENT names {name}, but "
-            f"{TEMPLATE_PATH} declares no such Environment= variable. Declared: "
-            f"{sorted(declared)}. A name nobody sets is preserved on no host, "
-            "forever, while the renderer still reports success."
-        )
+    for key, spec in _units().items():
+        text = (REPO_ROOT / spec.template).read_text(encoding="utf-8")
+        for name in spec.host_local_environment:
+            prefix = f"Environment={name}="
+            matches = [
+                line for line in text.splitlines() if line.strip().startswith(prefix)
+            ]
+            assert len(matches) == 1, (
+                f"UNITS[{key!r}] preserves {name}, but {spec.template} has "
+                f"{len(matches)} line(s) beginning {prefix!r}. Zero means the "
+                "value is read off the host and silently dropped while the "
+                "install reports success; more than one is ambiguous under "
+                "systemd's last-wins. apply_preserved raises either way — on the "
+                "host, mid-bring-up, rather than here."
+            )
 
 
 # ---------------------------------------------------------------------------
