@@ -1207,8 +1207,22 @@ def test_the_forbidden_reason_helper_actually_fires():
         assert _forbidden_reason(argv) is None, f'{argv!r} false-positived'
 
 
-# MUST FAIL with a NameError until the GREEN step adds the module-level
-# `_commit_step` reader (next to `_forbidden_reason` above).
+def _commit_step(result):
+    """The wrapper's own `commit-step=<token>` verdict for one run.
+
+    Parses it out of the wrapper's final `done (...)` narration in
+    `result.stdout + result.stderr`, reusing `_done_line` / `_parse_commit_step`
+    above. Returns the sentinel '<unreported>' -- NEVER raises -- when the
+    done(...) line or the field itself is absent, because this helper's whole
+    job is to make a bad run REPORTABLE rather than to die on an unrelated
+    exception (an IndexError would give a guard failure that names nothing).
+    """
+    combined = result.stdout + result.stderr
+    line = _done_line(combined)
+    token = _parse_commit_step(line) if line else None
+    return token if token is not None else '<unreported>'
+
+
 def test_the_commit_step_reader_reports_a_decline_as_a_decline(tmp_path):
     """Pin the reader before trusting it, in the shape this file already
     established for `_forbidden_reason` just above:
@@ -1251,13 +1265,31 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     every worktree, and the merge worker's advance path also consumes it
     (incident 13674d3c68), so a stash here can be popped out from under an
     unrelated process.
+
+    Each scenario's evidence stays SEPARATE rather than pooled. Pooling used
+    to let an environmental/precondition decline in one iteration hide behind
+    a healthy run in another: the old anti-vacuity check only proved that a
+    scoped commit and the add-- retry happened SOMEWHERE across all three
+    runs, so a run whose retry silently declined (the printf|grep -q SIGPIPE
+    misread pinned elsewhere in this file) could still pass as long as
+    ANOTHER iteration produced that substring -- and if it ever did trip, the
+    failure dumped a saferepr-truncated pooled list naming neither the
+    iteration nor the branch (esc-3647-3). Each iteration now asserts its OWN
+    commit-step branch and, only once that is confirmed, its OWN argv -- so a
+    precondition decline fails HERE, AS a decline, naming which iteration and
+    which branch, instead of surviving to a pooled check it was never meant
+    to satisfy. The anti-vacuity INTENT is unchanged: the guard still proves
+    the scoped-commit path and the add-- retry path were genuinely exercised.
     """
-    seen = []
-    for label, kwargs in (
-        ('already-tracked artifacts', {}),
-        ('first-ever run, untracked (exercises the add-- retry)', {'tracked': False}),
-        ('a quiet night with no drift', {'dirty': False}),
-    ):
+    scenarios = (
+        # (label, _git_repo_harness kwargs, expected commit-step,
+        #  a git-argv substring that scenario's OWN run must contain)
+        ('already-tracked artifacts', {}, 'committed', 'commit --only'),
+        ('first-ever run, untracked (exercises the add-- retry)',
+         {'tracked': False}, 'committed', ' add -- '),
+        ('a quiet night with no drift', {'dirty': False}, 'skipped:no-drift', None),
+    )
+    for label, kwargs, expected_step, expect_substring in scenarios:
         repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
         env, _ = _wrapper_harness(tmp_path, record_git=True)
         env['REPO'] = str(repo)
@@ -1274,17 +1306,31 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
         # shape: if the shim recorded nothing the wrapper never reached git and
         # every "no forbidden verb" assertion below would hold vacuously.
         assert recorded, f'{label}: the wrapper invoked git zero times'
-        seen.extend(recorded)
         for argv in recorded:
             reason = _forbidden_reason(argv)
             assert reason is None, f'{label}: `git {" ".join(argv)}` — {reason}'
 
-    # The scoped-commit form is the whole point, and the retry path really was
-    # reached -- so the clean run above is evidence about the git surface that
-    # matters, not about a wrapper that quietly did nothing.
-    flat = [' '.join(a) for a in seen]
-    assert any('commit --only' in c for c in flat), flat
-    assert any(' add -- ' in f'{c} ' for c in flat), flat
+        # THE HONEST-FAILURE ASSERTION. This is what actually flaked -- the
+        # untracked iteration's retry silently skipped under the SIGPIPE
+        # misread -- and it now fails HERE, naming the iteration, the branch
+        # it was built for, and the branch it actually took, rather than
+        # surviving to a pooled check that could not tell a decline in THIS
+        # iteration from a healthy run in a different one.
+        observed_step = _commit_step(result)
+        assert observed_step == expected_step, (
+            f'{label}: expected commit-step={expected_step!r}, observed '
+            f'{observed_step!r}; recorded={recorded!r} '
+            f'stderr={result.stderr[-2000:]!r}')
+
+        if expect_substring is not None:
+            # Only checked once the commit-step assertion above has already
+            # confirmed this iteration actually committed -- so a missing
+            # substring and a declined commit can never again be conflated
+            # into the same failure.
+            flat = [' '.join(a) for a in recorded]
+            assert any(expect_substring in f'{c} ' for c in flat), (
+                f'{label}: no git call recorded containing {expect_substring!r}: '
+                f'{flat!r}')
 
 
 # ── ambient GIT_* can never redirect this job into another repo ──────────────
