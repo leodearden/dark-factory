@@ -45,12 +45,23 @@ the recorded census date, and would change pool membership as a side effect of
 a bug fix. See `scripts/mint_hard_v2_fixtures.py::redrive_provenance`. Follow a
 redrive with `--mint` and `--render`.
 
-`--base-distance-report` prints the per-fixture before/after table of how far
-each `pre_task_commit` sits from the task's true branch point, measured as the
+`--base-distance-report` prints the per-fixture table of how far each
+`pre_task_commit` sits from the task's true branch point, measured as the
 symmetric difference `git rev-list --count <branch-point>...<base>` (both plain
 and `--first-parent`, which differ by roughly 3x on this history). It REPORTS
 measured distances and asserts nothing against a threshold. See
 `scripts/mint_hard_v2_fixtures.py::base_distance_rows`.
+
+It is a **pre-redrive** tool: `after` is always what a redrive would produce
+right now, so run it BEFORE `--redrive` and it previews (and records) the
+movement; run it after and it compares the redriven rows with themselves and
+correctly reports none. The measurement that motivated the mode therefore does
+not live in a live run — it is committed at
+[`_meta/base-distance-report.md`](_meta/base-distance-report.md), whose header
+carries the exact two commands that reproduce it. Pass `--before-manifest
+<path>` to read the `before` side from an earlier manifest (extracted from git
+history with `git show <rev>:…/curation.json`) instead of the committed one;
+that is what makes the artifact regenerable rather than hand-transcribed.
 
 ## Why this directory can never leak into a default eval run
 
@@ -97,9 +108,28 @@ the second), and the single derivation both are matched from is
 `orchestrator/src/orchestrator/git_ops.py::_merge_subject`'s
 writer-and-reader-share-one-derivation discipline.
 
+Two scopings keep a commit that never landed from answering as a landing
+merge, both in `::find_merge_sha`. The walk is over **`main`**, not `--all`, so
+a merge living only on a side or remote branch cannot answer at all. And
+`--grep` is used only as a coarse pre-filter, with each candidate's **subject**
+re-tested against the same pattern in Python: git applies `^`/`$` per LINE
+across the whole message, so a body line quoting a merge subject would
+otherwise match. Both mirror
+`orchestrator/src/orchestrator/git_ops.py::GitOps.find_task_citation_commit`,
+which defends the same trap for the same reason. Measured over all 39 include
+rows, the three matcher variants agree on every row — this is hardening, not a
+correction.
+
 - **`referenced`** — the candidate has exactly one clean landing merge under
   either spelling, so `(pre, post)` = `(M^1, M)` resolves and a real
   `reference` block is captured.
+
+  The landed `verify_outcome` these carry is MEASURED, not assumed:
+  `provenance.post_commit_reachable_from_main` records `git merge-base
+  --is-ancestor` at mint time, and a `false` there downgrades the outcome to
+  `{source: 'landed_branch_tip', passed: null, …}` exactly as the continuity
+  path does. The reference diff is unaffected — it is captured from the
+  pre/post SHAs directly — so only the gate claim is withdrawn.
 - **`planrate_only`** — the candidate landed SPLIT/direct (no single landing
   merge under EITHER spelling), so no landed `post` SHA exists. These fixtures
   carry **no** `reference` key at all and instead stamp

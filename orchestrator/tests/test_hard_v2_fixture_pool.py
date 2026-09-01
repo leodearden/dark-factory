@@ -499,6 +499,26 @@ class TestMintedPool:
                 assert prov.get('base_approximation_reason', '').strip(), \
                     f'{f["id"]}: approximated with no reason'
 
+    def test_no_landed_gate_claim_rests_on_an_unmeasured_premise(
+        self, pool: list[dict],
+    ) -> None:
+        # `{source: 'landed', passed: true}` asserts "the task merged to main
+        # => its gates passed at the post commit". Every fixture making that
+        # claim must carry the MEASUREMENT that establishes it, not just the
+        # claim — the continuity path has always done so, and the referenced
+        # path must too, since a reader of the JSON cannot see how the merge
+        # was resolved.
+        for f in pool:
+            outcome = f.get('verify_outcome') or {}
+            if outcome.get('source') != 'landed':
+                continue
+            reachable = f['provenance'].get('post_commit_reachable_from_main')
+            assert reachable is True, (
+                f'{f["id"]} claims verify_outcome {outcome.get("source")!r} '
+                f'with passed={outcome.get("passed")!r} but records '
+                f'post_commit_reachable_from_main={reachable!r}'
+            )
+
     def test_merge_derived_bases_are_not_marked_approximated(
         self, pool: list[dict],
     ) -> None:
@@ -513,16 +533,31 @@ class TestMintedPool:
         # unavailable when no single landing merge exists under EITHER
         # accepted subject spelling — the same check that produced the claim.
         driver = _load_driver()
+        checked = 0
         for f in pool:
             if 'reference_unavailable' not in f['provenance']:
                 continue
             root = Path(f['project_root'])
             if not (root / '.git').exists():
-                pytest.skip(f'{root} is not checked out on this machine')
+                # `continue`, NOT `pytest.skip`: skipping from inside the loop
+                # aborts the whole test at the first absent checkout and
+                # discards the assertions already made for the checkouts that
+                # ARE present — so on a machine with reify but not know-live,
+                # the reify invariant would silently stop being checked while
+                # the test reported as skipped.
+                continue
             task_id = f['id'].split('_task_', 1)[1]
             assert driver.find_merge_sha(root, task_id) is None, (
                 f'{f["id"]} claims reference_unavailable but a single landing '
                 f'merge resolves in {root}'
+            )
+            checked += 1
+        if checked == 0:
+            # Only now is "nothing was checkable" the honest report: no
+            # fixture's source checkout is present on this machine.
+            pytest.skip(
+                'no reference_unavailable fixture has its source checkout on '
+                'this machine, so the invariant could not be measured'
             )
 
     def test_task_4026_resolves_its_landing_merge(

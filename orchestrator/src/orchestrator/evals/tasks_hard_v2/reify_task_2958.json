@@ -25,6 +25,7 @@
     "baseline_source": "merge_first_parent",
     "base_is_approximated": false,
     "task_status": "done",
+    "post_commit_reachable_from_main": true,
     "eval_branch_pinned": false,
     "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_2958) failed: Command git update-ref refs/heads/evals/reify_task_2958 d0329771710c4be09f18088fdd3390c3eeb6fa12 failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_2958': cannot lock ref 'refs/heads/evals/reify_task_2958': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_2958.lock': Permission denied",
     "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."

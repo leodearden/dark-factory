@@ -118,9 +118,13 @@ A landing merge is accepted under EITHER subject spelling — `Merge task/<id> i
 
 ## Is the base a true branch point, or an approximation?
 
-Every fixture carries a bool `provenance.base_is_approximated`, and every approximated one carries a `base_approximation_reason` naming what was measured. ONLY `baseline_source: merge_first_parent` is the task's true branch point (`M^1` of its landing merge). Every weaker rung is an approximation whose error is unbounded and — absent a landing merge to measure against — unknowable, so a readout that depends on the base being the real branch point should EXCLUDE those fixtures rather than average them in. See `mint_hard_v2_fixtures.py::base_approximation`, and `--base-distance-report` for the measured per-fixture distances.
+Every fixture carries a bool `provenance.base_is_approximated`; the rule, the rationale and what a readout should do about it are stated once, in `README.md` under the same heading. Derived from the rows in this manifest:
 
-Continuity fixtures sit outside the rung table — their base is inherited, not ladder-resolved — so `mint_hard_v2_fixtures.py::_mint_continuity_one` MEASURES the flag instead: does the inherited `pre_task_commit` equal `M^1` of the task's landing merge? The merge it compared against is recorded in `provenance.base_verified_against_merge` (`null` when none exists). Their commits are carried verbatim regardless; the marking is observational, never corrective.
+- ladder-resolved bases that ARE the true branch point (`baseline_source: merge_first_parent`, i.e. `M^1` of the landing merge): **20**
+- ladder-resolved bases that are an APPROXIMATION (any weaker rung): **19**
+- continuity fixtures, whose inherited base is outside the rung table and is MEASURED against the landing merge at mint time rather than read off a label: **3** (see `provenance.base_verified_against_merge` in each fixture)
+
+Per-fixture distances from the true branch point: `_meta/base-distance-report.md`, regenerable with `--base-distance-report`.
 
 ## Continuity back-fill
 
