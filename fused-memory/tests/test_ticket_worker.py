@@ -70,10 +70,18 @@ async def _poll_ticket_resolved(
 
     NOTE: the `task_created` journal event is emitted *after* the terminal
     write (task_interceptor.py:3812 single path / 4190 batch path), so this
-    is NOT a barrier for journal assertions — pair it with `poll_until_stable`
-    on the event count (settle=0.2), as every caller in this file that
-    asserts an *exact* event count now does (task 3697 introduced the
-    pattern; task 4307 swept the two remaining liveness-poll sites onto it).
+    is NOT a barrier for journal assertions — pair it with
+    `_poll_journal_settled` (a `poll_until_stable` settle barrier on the
+    event count, settle=0.2), as every caller in this file asserting an
+    exact *non-zero* event count now does (task 3697 introduced the
+    pattern; task 4307 swept the two remaining liveness-poll sites onto it
+    and extracted the shared helper). The one exact-count caller that does
+    NOT pair with it, `test_worker_tm_add_task_failure_marks_ticket_failed`,
+    asserts a *zero* count: it needs no second barrier since the emission
+    is guarded by `status == 'created'` (no event is ever built on that
+    path), and it structurally could not use `poll_until_stable`, which
+    treats a falsy (zero) sample as not-yet-ready and would spin for the
+    full timeout.
 
     The 10s default is deliberately well inside the 60s pytest-timeout
     (pyproject.toml), whose thread method os._exit(1)s the whole xdist
@@ -89,6 +97,64 @@ async def _poll_ticket_resolved(
         message=f'worker did not resolve {what} ({ticket_id})',
     )
 
+
+async def _poll_journal_settled(
+    journal_calls: list, event_type, *, settle: float = 0.2, timeout: float = 10.0,
+):
+    """SETTLE barrier for an exact *event_type* count in *journal_calls*.
+
+    Pairs with `_poll_ticket_resolved` as a second barrier: the
+    `task_created` journal event is emitted *after* the ticket's terminal
+    write (task_interceptor.py:3812 single path / 4190 batch path), so a
+    resolved ticket does not by itself mean the event has landed in
+    *journal_calls* yet.
+
+    SETTLE, not liveness: wait for the *count* to STOP CHANGING, not
+    merely become non-zero. Every caller of this helper goes on to assert
+    an exact, non-zero event count, and a liveness poll (`poll_until`)
+    returns at the *first* matching event — so a duplicate arriving
+    milliseconds later would be structurally invisible. The duplicate is
+    concrete, not hypothetical: `task_created` is emitted from two
+    distinct paths (task_interceptor.py:3786-3795 and 4164-4173), both of
+    which persist the terminal ticket row *before* emitting, so neither a
+    ticket-row predicate nor a first-event predicate closes the emission
+    window — only a settle window does.
+
+    `settle=0.2` restores exactly the width of the `asyncio.sleep(0.2)`
+    this poll family replaced — but measured from the first matching
+    event rather than from submit_task, so a late-scheduled worker under
+    `-n auto` no longer eats the window. Raising *settle* is the correct
+    response to a suspected missed duplicate (see `poll_until_stable`'s
+    own docstring for the general liveness-vs-settle decision rule).
+
+    Extracted (task 4307) from three call sites that had each grown an
+    identical inline `poll_until_stable` block:
+    `test_worker_created_path_emits_journal_event` (task 3697, the
+    original), `test_worker_post_create_failure_still_resolves_as_created`
+    and `test_worker_record_task_failure_still_resolves_as_created`.
+
+    NOT usable for a *zero*-count assertion: `poll_until_stable` treats a
+    falsy sample as not-yet-ready, so a caller expecting zero events would
+    spin for the full *timeout* every time. See
+    `test_worker_tm_add_task_failure_marks_ticket_failed`, which asserts a
+    zero count and does not use this helper.
+
+    Args:
+        journal_calls: The list a test's `capturing_journal` shim appends
+            `_journal` calls into.
+        event_type: The `EventType` member to count.
+        settle: Forwarded to `poll_until_stable`.
+        timeout: Forwarded to `poll_until_stable`.
+
+    Returns:
+        The settled count (always >= 1 given the zero-count caveat above).
+    """
+    return await poll_until_stable(
+        lambda: sum(1 for e in journal_calls if getattr(e, 'type', None) == event_type),
+        settle=settle,
+        timeout=timeout,
+        message=f'worker did not journal a {event_type} event',
+    )
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -676,27 +742,9 @@ async def test_worker_created_path_emits_journal_event(
         # timeout first.
         await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        # SETTLE barrier, not a liveness poll: wait for the task_created count
-        # to STOP CHANGING, not merely to become non-zero.  The assertion below
-        # is an exact count, and a liveness poll returns at the *first* event —
-        # so a duplicate arriving milliseconds later would be structurally
-        # invisible.  The duplicate is concrete: task_created is emitted from
-        # two distinct paths (task_interceptor.py:3786-3795 and 4164-4173),
-        # both of which persist the terminal ticket row *before* emitting, so
-        # neither a ticket-row predicate nor a first-event predicate closes the
-        # emission window.  settle=0.2 restores exactly the width of the
-        # `asyncio.sleep(0.2)` this poll replaced — but measured from the first
-        # event rather than from submit_task, so a late-scheduled worker under
-        # `-n auto` no longer eats the window.
-        await poll_until_stable(
-            lambda: sum(
-                1 for e in journal_calls
-                if getattr(e, 'type', None) == EventType.task_created
-            ),
-            settle=0.2,
-            timeout=10.0,
-            message='worker did not journal a task_created event',
-        )
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # Exactly one task_created event must have been journalled
     task_created_events = [
@@ -1085,21 +1133,9 @@ async def test_worker_post_create_failure_still_resolves_as_created(
 
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        # SETTLE barrier, not a liveness poll: the assertion below is an
-        # exact task_created count, and a liveness poll returns at the
-        # *first* event — so a duplicate arriving milliseconds later would
-        # be structurally invisible (task 3697; task 4307 closed the same
-        # gap here). See test_worker_created_path_emits_journal_event for
-        # the fuller rationale.
-        await poll_until_stable(
-            lambda: sum(
-                1 for e in journal_calls
-                if getattr(e, 'type', None) == EventType.task_created
-            ),
-            settle=0.2,
-            timeout=10.0,
-            message='worker did not journal a task_created event',
-        )
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -1177,21 +1213,9 @@ async def test_worker_record_task_failure_still_resolves_as_created(
 
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        # SETTLE barrier, not a liveness poll: the assertion below is an
-        # exact task_created count, and a liveness poll returns at the
-        # *first* event — so a duplicate arriving milliseconds later would
-        # be structurally invisible (task 3697; task 4307 closed the same
-        # gap here). See test_worker_created_path_emits_journal_event for
-        # the fuller rationale.
-        await poll_until_stable(
-            lambda: sum(
-                1 for e in journal_calls
-                if getattr(e, 'type', None) == EventType.task_created
-            ),
-            settle=0.2,
-            timeout=10.0,
-            message='worker did not journal a task_created event',
-        )
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
