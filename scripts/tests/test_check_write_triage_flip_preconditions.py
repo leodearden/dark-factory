@@ -568,6 +568,76 @@ def parse_judge_verdict(raw):
 """
 
 
+# A REAL option (b) whose target parameter is reachable only by ALSO supplying
+# a REQUIRED parameter that sits between the slate and it. Reviewer-reported
+# false FAIL (cycle 5): the probe called `fn(content, slate, **{target: value})`
+# and supplied nothing for the intervening required parameter, so every attempt
+# raised TypeError('missing 1 required positional argument'), the non-target
+# parameter rendered instead, and a correct fix was reported INDETERMINATE --
+# re-blocking task 3169 against a valid fix, one signature shape down from the
+# defect this whole probe exists to remove.
+_VARIANT_TAILS['required_intervening_target'] = r"""
+
+def build_judge_prompt(content, candidates, verdict_words, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'VERDICT WORDS: ' + str(verdict_words)]
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+
+# The same defect one turn harder, on two axes: the required intervening
+# parameter is KEYWORD-ONLY (so it is missing whatever the target's position
+# is), and it is ITERATED rather than str()'d -- so the first placeholder the
+# probe tries (None) raises TypeError of its own and the ladder has to advance
+# to one that is iterable. A placeholder ladder that stopped at None would
+# report this correct fix as INDETERMINATE too.
+_VARIANT_TAILS['required_keyword_only_target'] = r"""
+
+def build_judge_prompt(content, candidates, *, verdict_words, attach_target_id=None):
+    lines = ['NEW ENTRY:', str(content), '', 'WORDS: ' + ', '.join(verdict_words)]
+    lines.append('EXISTING CANDIDATES:')
+    for candidate in candidates:
+        mark = '  <-- ATTACH TARGET' if candidate.id == attach_target_id else ''
+        lines.append('- id: ' + str(candidate.id) + mark)
+        lines.append('  text: ' + str(candidate.content))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
+
+# A target-NAMED parameter that cannot be exercised at all, alongside a
+# free-text one that renders happily. Nothing was ever MEASURED about the
+# invariant here -- the only parameter that could have decided it never ran --
+# so the honest verdict is UNVERIFIABLE (which still fails closed), not the
+# factual assertion that the attach target is INDETERMINATE.
+_VARIANT_TAILS['target_parameter_always_raises'] = r"""
+
+def build_judge_prompt(content, candidates, footer_note=None, attach_target_id=None):
+    if attach_target_id is not None:
+        raise RuntimeError('fixture: the target parameter cannot be rendered')
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    if footer_note is not None:
+        lines.append('NOTE: ' + str(footer_note))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw):
+    return _parse_bare_str(raw)
+"""
+
 # The winner-rescue APPEND is a MECHANISM, not the invariant. These two
 # variants redefine select_judge_candidates to plain top-n, shadowing the
 # preamble's, so the hoisted parent's evidence child never enters the slate.
@@ -1254,6 +1324,62 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode != 0, f'option (a) branch passed main:\n{proc.stdout}'
         assert _INDETERMINATE in proc.stdout, proc.stdout
+
+
+class TestRequiredInterveningParameters:
+    """Reaching the target parameter must not depend on every OTHER parameter
+    being optional.
+
+    Reviewer-reported false FAIL (cycle 5). ``_target_parameters``' own
+    docstring says the target's POSITION is a mechanism the invariant does not
+    depend on, but the call site only delivered that for defaulted or
+    keyword-only intervening parameters: it passed the first two arguments and
+    the target, and nothing else. A correct option (b) spelled
+    ``build_judge_prompt(content, candidates, verdict_words,
+    attach_target_id=None)`` therefore raised ``TypeError`` on every attempt,
+    fell through to the non-target parameter, and was reported INDETERMINATE.
+    """
+
+    def test_required_positional_intervening_parameter_still_passes(self, tmp_path):
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='required_intervening_target',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe failed a valid fix whose target sits behind a REQUIRED '
+            f'parameter:\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+        assert "'attach_target_id'" in proc.stdout, proc.stdout
+
+    def test_required_keyword_only_parameter_forces_the_placeholder_ladder(self, tmp_path):
+        """The first placeholder is rejected by the fixture, so a one-value
+        ladder is not enough."""
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='required_keyword_only_target',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe failed a valid fix whose required intervening parameter is '
+            f'iterated:\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _SWAP_HELD in proc.stdout, proc.stdout
+
+    def test_unreachable_target_parameter_is_unverifiable_not_indeterminate(self, tmp_path):
+        """Fails closed either way — but says what it actually measured.
+
+        A target-NAMED parameter that never rendered decided nothing. Asserting
+        INDETERMINATE there states a fact the run did not establish, and points
+        the reader at the wrong remedy.
+        """
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='target_parameter_always_raises',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'probe passed an unrenderable target:\n{proc.stdout}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+        assert _INDETERMINATE not in proc.stdout, proc.stdout
+        assert "'attach_target_id'" in proc.stdout, proc.stdout
 
 
 # ---------------------------------------------------------------------------
