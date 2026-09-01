@@ -833,6 +833,120 @@ def test_every_preserved_name_is_declared_exactly_once_in_its_units_template():
             )
 
 
+SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
+RENDERER_BASENAME = "render_dashboard_unit.py"
+
+
+def _render_invocations() -> list[dict[str, str]]:
+    """Every `python3 <renderer> …` call in scripts/setup-host.sh, as a flag map.
+
+    Backslash continuations are joined first — both call sites span six physical
+    lines — and comment lines are dropped, so a comment QUOTING an invocation is
+    prose about the code rather than a third call site. That is the same
+    markers-are-code rule tests/scripts/setup_host_sections.py._find_in_code
+    enforces, and for the same reason: setup-host.sh's own comments quote these
+    commands.
+
+    A call is identified by BOTH a command token naming the renderer (the
+    hoisted `_<x>_render_script` variable, or the basename literally) AND a
+    `--template` flag. Each half is needed: the `_<x>_render_script=` assignment
+    lines name the renderer but invoke nothing, and section 12's parity check
+    passes `--template` to a different script entirely.
+
+    Reads setup-host.sh as TEXT. This module runs no subprocess and installs
+    nothing; the file is a committed repo-side source, like the templates the
+    guards above read.
+    """
+    import shlex
+
+    joined = SETUP_HOST_PATH.read_text(encoding="utf-8").replace("\\\n", " ")
+    calls: list[dict[str, str]] = []
+    for line in joined.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:  # an unbalanced quote elsewhere in the installer
+            continue
+        names_renderer = any(
+            tok.endswith("_render_script") or tok.endswith(RENDERER_BASENAME)
+            for tok in tokens
+        )
+        if not (names_renderer and "--template" in tokens):
+            continue
+        flags = {
+            tok: tokens[i + 1]
+            for i, tok in enumerate(tokens[:-1])
+            if tok.startswith("--")
+        }
+        calls.append(flags)
+    return calls
+
+
+def test_setup_host_renders_each_unit_from_the_template_its_spec_names():
+    """(d.iii) The COUPLING the two guards above rest on, pinned rather than assumed.
+
+    `UnitRenderSpec.template` is consumed only by tests. That is fine — it is
+    policy, like the preserve set beside it — but it makes the staleness guard's
+    value entirely conditional on `UNITS[u].template` being the same file
+    setup-host.sh actually passes as `--template` for `--unit u`. Without this
+    test the guard would happily validate a preserve set against a template the
+    installer no longer uses, and report green while the host preserved nothing.
+
+    The blast radius of the mismatch is bounded — a template that does not
+    declare the preserved name makes `apply_preserved` RAISE rather than
+    silently preserve nothing — so this closes a design gap, not a live bug. But
+    it closes it where it opens: at the pairing, not at the symptom.
+
+    ALSO PINS COVERAGE IN THE OTHER DIRECTION: every registered unit must have a
+    call site. A key added to UNITS that setup-host.sh never renders is a
+    registry entry nobody installs from, and would quietly widen what every
+    registry-iterating guard in this module claims to cover.
+
+    The absent-`--unit` default is spelled here exactly as argparse resolves it,
+    because section 8 deliberately passes no `--unit` at all — that is what keeps
+    task 4793's call site byte-unchanged, and it means the dashboard's pairing is
+    only checked if this test models the default rather than requiring the flag.
+    """
+    units = _units()
+    calls = _render_invocations()
+    assert calls, (
+        f"no renderer invocation found in {SETUP_HOST_PATH}. The installer is "
+        "the only production consumer of this registry; a slice that finds "
+        "nothing makes this test vacuously green."
+    )
+
+    seen: set[str] = set()
+    for flags in calls:
+        unit = flags.get("--unit", _DASHBOARD)  # argparse's default
+        assert unit in units, (
+            f"setup-host.sh renders --unit {unit!r}, which UNITS does not "
+            f"register (registered: {sorted(units)})."
+        )
+        seen.add(unit)
+
+        template = flags["--template"]
+        prefix = "$REPO_ROOT/"
+        assert template.startswith(prefix), (
+            f"--template for --unit {unit!r} is {template!r}; expected a path "
+            "built from $REPO_ROOT so the render reads the checkout being "
+            "INSTALLED rather than some other tree."
+        )
+        assert template[len(prefix) :] == units[unit].template, (
+            f"setup-host.sh renders --unit {unit!r} from "
+            f"{template[len(prefix):]!r}, but UNITS[{unit!r}].template names "
+            f"{units[unit].template!r}. The staleness guard checks the preserve "
+            "set against the registry's template, so this mismatch would let it "
+            "validate a file the installer does not use."
+        )
+
+    assert seen == set(units), (
+        f"UNITS registers {sorted(units)} but setup-host.sh renders "
+        f"{sorted(seen)}. A registered unit with no call site is installed by "
+        "nobody, while still widening every guard that iterates this registry."
+    )
+
+
 # ---------------------------------------------------------------------------
 # render_unit — the end-to-end composition  (step-9 / step-10)
 # ---------------------------------------------------------------------------

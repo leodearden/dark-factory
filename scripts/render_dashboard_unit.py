@@ -243,7 +243,12 @@ class UnitRenderSpec:
     # test_every_preserved_name_is_declared_exactly_once_in_its_units_template).
     # A preserve set checked against the WRONG unit's template would pass while
     # preserving nothing on the host, since the two templates declare overlapping
-    # but not identical Environment= sets.
+    # but not identical Environment= sets. MEASURED: pointing this field at the
+    # other unit's template leaves that staleness guard GREEN — which is why the
+    # field is also pinned to what setup-host.sh actually passes as --template
+    # for this --unit, by ::test_setup_host_renders_each_unit_from_the_template_
+    # its_spec_names in the same module. No production code reads this field, so
+    # that pairing is the whole of its meaning.
     #
     # --template STAYS A REQUIRED CLI FLAG and is deliberately NOT defaulted from
     # this field. Do not "tidy" that into a default: setup-host.sh passes an
