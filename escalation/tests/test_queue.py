@@ -5221,12 +5221,11 @@ class TestPatchResolutionMetadataLock:
                     env=env,
                 )
                 launched.append(proc)
-                try:
-                    # Returns fast when the sidecar is FREE (the unlocked bug);
-                    # times out when the patch is correctly holding it.
+                # Returns fast when the sidecar is FREE (the unlocked bug);
+                # times out when the patch is correctly holding it.  Either way
+                # the real write below runs — the timeout IS the green path.
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    pass
             real_write(path, json_text, durable=durable)
 
         monkeypatch.setattr(queue, '_atomic_write_path', interposing_write)

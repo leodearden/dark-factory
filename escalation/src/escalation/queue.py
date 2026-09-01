@@ -1746,36 +1746,52 @@ class EscalationQueue:
 
         Returns the updated Escalation on success, or the unmodified Escalation when
         called with no patch arguments (both resolved_by and resolution_turns are None).
+
+        Locking: the WHOLE read-modify-write — locate, parse, guard, mutate,
+        write — is serialized per-id by ``escalation_id_lock``, matching every
+        other mutator in this module.  The load-bearing reason is NOT that the
+        two patched fields need it in isolation (they are idempotent overwrites,
+        not increments): it is that this is an RMW on the FULL record, so an
+        unlocked interleave with any of the locked mutators drops the loser's
+        change WHOLESALE — every field its in-memory copy carried, not merely
+        the patched pair.  The sidecar ``{escalation_id}.json.lock`` is the
+        correct target BECAUSE ``_atomic_write_path`` is tmp+rename (a writer
+        that flock()s the data-file path binds to a stale inode — see
+        ``escalation_id_lock``'s PRD-D3 rationale), and it lives in
+        ``queue_dir`` regardless of whether the record currently sits in the
+        root or under ``archive/YYYY-MM-DD/``.
+        Pinned by ``tests/test_queue.py::TestPatchResolutionMetadataLock``.
         """
-        # Locate the file (shared helper — same root-first, archive-fallback,
-        # newest-by-date logic as get()).
-        path = self._locate_path(escalation_id)
-        if path is None:
-            return None
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            # Locate the file (shared helper — same root-first, archive-fallback,
+            # newest-by-date logic as get()).
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
 
-        # Parse
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-            return None
+            # Parse
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
 
-        # Guard: only patch resolved/dismissed escalations
-        if esc.status not in ('resolved', 'dismissed'):
-            return None
+            # Guard: only patch resolved/dismissed escalations
+            if esc.status not in ('resolved', 'dismissed'):
+                return None
 
-        # No-op early return: nothing to patch — avoid disk I/O when both args are None.
-        if resolved_by is None and resolution_turns is None:
-            return esc
+            # No-op early return: nothing to patch — avoid disk I/O when both args are None.
+            if resolved_by is None and resolution_turns is None:
+                return esc
 
-        # Apply patches
-        if resolved_by is not None:
-            esc.resolved_by = resolved_by
-        if resolution_turns is not None:
-            esc.resolution_turns = resolution_turns
+            # Apply patches
+            if resolved_by is not None:
+                esc.resolved_by = resolved_by
+            if resolution_turns is not None:
+                esc.resolution_turns = resolution_turns
 
-        # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
-        self._atomic_write_path(path, esc.to_json())
+            # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
+            self._atomic_write_path(path, esc.to_json())
         return esc
 
     def note_suppressed_refile(self, escalation_id: str) -> Escalation | None:
@@ -1815,10 +1831,14 @@ class EscalationQueue:
         named operator query for "resolutions absorbing refiles" is genuine
         follow-up work and is filed as such rather than being silently assumed.
 
-        Locking: unlike ``patch_resolution_metadata`` above (a last-write-wins
-        field SET) this is a genuine INCREMENT, so the whole read-modify-write
-        runs under ``escalation_id_lock`` — a concurrent same-id bump from
-        another harness/worker process must not be lost.  The lock sidecar
+        Locking: the whole read-modify-write runs under ``escalation_id_lock``
+        — a concurrent same-id bump from another harness/worker process must not
+        be lost.  ``patch_resolution_metadata`` above takes the same lock (task
+        4885); what still distinguishes the two is why the lock matters MORE
+        here.  That method's patched fields are last-write-wins SETs, so a lost
+        write is at least idempotent under retry, whereas a lost INCREMENT is
+        invisible in the final value — the counter simply under-reports forever,
+        and under exactly the load that makes a storm likely.  The lock sidecar
         lives in ``queue_dir`` and is stable regardless of whether the record
         currently sits in the root or the archive.
 
