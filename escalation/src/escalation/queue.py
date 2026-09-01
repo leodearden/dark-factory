@@ -154,6 +154,41 @@ _MAX_AMENDMENT_OPTIONS = 6
 # (`len(list) + truncated`) never plateaus.
 _MAX_ROOT_CAUSE_VARIANTS = 20
 
+# Hard cap on the NUMBER of Escalation.dedupe_children entries (see
+# attach_dedupe_child, the SOLE writer and sole trimmer).
+# WHY A BOUND IS NEEDED AT ALL: `DedupeConfig.for_gate_backlog()` sets
+# `infra_dedupe_window_secs=float('inf')` BY DESIGN — a 300h-old gate MUST still
+# fold — so nothing ever ages a gate-backlog parent out.  It gains one child id
+# per Stage-1 cycle for as long as a human has not decided, and that whole record
+# is then read and parsed by `get_pending()` on EVERY subsequent dedupe scan, so
+# an unbounded list taxes the scan that produced it.
+# Sizing is ARITHMETIC, not assertion: each entry is one escalation id
+# `esc-{key}-{n}` (the longest live key family is `ticket-janitor`, so <= ~30
+# chars, + ~3 bytes of JSON quoting/comma), hence
+#
+#   whole list <= 200 * ~33 bytes                              ~=  6.6 KB
+#
+# — the same envelope as `root_cause_variants` (~7 KB) and far under
+# `amendments` (~88 KB).
+# _MAX_DEDUPE_CHILDREN_HEAD is the HEAD-RETENTION reserve, and it is what makes
+# this list's policy DIFFERENT from the two above.  `amendments` can shed purely
+# oldest-first because the ORIGINAL framing is not in that list at all (it lives
+# in the record's own immutable root_cause/detail/options/summary).
+# `dedupe_children` has no such external anchor: the ids that ESTABLISHED the
+# fold are the list's only record of where the parent came from.  On the very
+# case this cap exists for — a gate-backlog parent folding for weeks — pure
+# oldest-shed would erase the fold's origin and leave a window of only-recent
+# ids, the least useful provenance possible for a record whose whole problem is
+# that it is old.  Head + tail keeps both the origin and the current activity.
+# Past the cap the OLDEST NON-HEAD ids are shed, each drop counted in the
+# record's `dedupe_children_truncated`, so the TRUE provenance total
+# (`len(children) + truncated`) never plateaus and the loss is a durable
+# structured fact rather than log-only.
+# `dedupe_count` is NOT capped and must never be — it is the recurrence SIGNAL
+# (task 3522); `dedupe_children` is PROVENANCE.  The cap separates the two.
+_MAX_DEDUPE_CHILDREN = 200
+_MAX_DEDUPE_CHILDREN_HEAD = 20
+
 
 class AmendmentOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.add_members_to_l2` call did to ``amendments``.
@@ -1587,7 +1622,11 @@ class EscalationQueue:
         not-eligible and return ``None`` without any mutation.
 
         On a successful attach:
-        - ``parent.dedupe_children`` gains *child_id* (appended).
+        - ``parent.dedupe_children`` gains *child_id* (appended), and is capped
+          at ``_MAX_DEDUPE_CHILDREN`` entries: past the cap the OLDEST NON-HEAD
+          ids are shed (the first ``_MAX_DEDUPE_CHILDREN_HEAD`` are always
+          retained), each drop counted in ``parent.dedupe_children_truncated``
+          so the TRUE provenance total stays readable from the record.
         - ``parent.dedupe_count`` is incremented by 1.
         - ``parent.severity`` is promoted via
           ``max_severity(parent.severity, child_severity)``; never demoted.
@@ -1618,6 +1657,13 @@ class EscalationQueue:
            invariant is that ``submit_or_dedupe`` can match successive folds
            to the same canonical parent by fingerprint without the parent ever
            losing its fingerprint identity after the first write.
+
+        3. ``dedupe_count`` is NEVER capped, trimmed or reset.  It is the
+           recurrence SIGNAL; ``dedupe_children`` is PROVENANCE, and only the
+           latter is bounded (``_MAX_DEDUPE_CHILDREN``).  The cap separates the
+           two deliberately — a drain that sorts the longest-rotting gates by
+           ``dedupe_count``, and ``sweep._pick_richer`` which ranks on it, must
+           not be silently blunted by a provenance bound.
         """
         with escalation_id_lock(self.queue_dir, parent_id):
             path = self.queue_dir / f'{parent_id}.json'
@@ -1629,7 +1675,34 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse parent escalation {parent_id}: {e}')
                 return None
             parent.dedupe_children.append(child_id)
+            # Incremented BEFORE the trim below purely so the shed WARNING can
+            # report THIS attach's count: a message whose job is to assert
+            # "dedupe_count is unaffected" must not quote a value one behind.
             parent.dedupe_count += 1
+            # Enforce the cap in the SAME critical section, so the trim lands in
+            # the same single _rewrite as the append and there is no durable
+            # window in which an over-cap list exists.  HEAD-PRESERVING: the
+            # first _MAX_DEDUPE_CHILDREN_HEAD ids established the fold and are
+            # the only record of where this parent came from, so unlike
+            # `amendments` this list is NOT shed purely oldest-first.  In steady
+            # state `shed == 1`, so the del is O(cap) with no whole-list reslice.
+            if len(parent.dedupe_children) > _MAX_DEDUPE_CHILDREN:
+                shed = len(parent.dedupe_children) - _MAX_DEDUPE_CHILDREN
+                del parent.dedupe_children[
+                    _MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + shed
+                ]
+                parent.dedupe_children_truncated += shed
+                logger.warning(
+                    'attach_dedupe_child: %s shed %d oldest non-head child id(s) '
+                    'at the _MAX_DEDUPE_CHILDREN=%d cap (running total '
+                    'truncated=%d); the TRUE provenance total is still '
+                    'len(children)+truncated=%d, and dedupe_count=%d is '
+                    'unaffected',
+                    parent_id, shed, _MAX_DEDUPE_CHILDREN,
+                    parent.dedupe_children_truncated,
+                    len(parent.dedupe_children) + parent.dedupe_children_truncated,
+                    parent.dedupe_count,
+                )
             parent.severity = max_severity(parent.severity, child_severity)
             # Bump the "changed since triaged" signal — a fold is a substantive
             # change (recurrence count up, possible severity promotion), which is
