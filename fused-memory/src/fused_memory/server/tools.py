@@ -3369,6 +3369,20 @@ def create_mcp_server(
         or passing [] to record that you considered referents and none applied,
         always succeeds.
 
+        Two halves of that, and they have DIFFERENT scopes — the rejection is
+        universal, the recording is not. Every add_memory call is checked for a
+        declared/prose conflict, whatever its category. But a declaration is
+        RECORDED only on a write that reaches Graphiti — an
+        entities_and_relations, temporal_facts or decisions_and_rationale
+        category, or dual_write=True. On a Mem0-primary write
+        (procedural_knowledge, preferences_and_norms,
+        observations_and_summaries) the referent set has nowhere to live: your
+        `entities` is validated against the content and then discarded, and
+        nothing downstream can tell it apart from a call that omitted the
+        parameter. So on those three categories `entities` buys you the
+        typo-catch and nothing else — which is still worth having, but do not
+        expect it to steer retrieval.
+
         Content carrying a raw MCP envelope fragment is REJECTED outright
         (error_type=mcp_markup_detected, or mcp_markup_unrepairable when the
         residue cannot be parsed) — a harness serialization bug has been leaking
@@ -3422,7 +3436,11 @@ def create_mcp_server(
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
                       remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds.
+                      parameter always succeeds. RECORDED only on a write that
+                      reaches Graphiti (a GRAPHITI_PRIMARY category, or
+                      dual_write=True); on a Mem0-primary category it is
+                      checked for a conflict and then discarded — see the
+                      scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)

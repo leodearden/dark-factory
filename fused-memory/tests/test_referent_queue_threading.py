@@ -606,6 +606,101 @@ class TestAddMemoryStampsDeclaredReferents:
         assert json.loads(json.dumps(payload['referents'])) == payload['referents']
 
 
+class TestADeclarationIsScopedToTheGraphitiLeg:
+    """A declaration is RECORDED only on a write that reaches Graphiti.
+
+    `resolve_referents` is called inside `if write_graphiti:`, so on a
+    MEM0_PRIMARY category without `dual_write` the caller's declaration is
+    accepted and then discarded: no resolution, no encoded set, no counter
+    increment.  That is deliberate — the referent set is a field on the
+    Graphiti queue payload, and a Mem0-primary write produces no queue row to
+    carry it and no edges for leaf zeta to verify it against — but it was
+    stated nowhere and pinned by nothing, and every other test in this file
+    uses a GRAPHITI_PRIMARY category, so the hole was invisible.  These rows
+    make the scope a decision on the record.
+
+    The consequence leaf IOTA must price in: its declaration-rate denominator
+    is "every Graphiti write", NOT "every add_memory call".  Mem0-primary
+    traffic is outside the counter entirely rather than counted as undeclared.
+
+    The tool-boundary `entities_gate` is category-INDEPENDENT and still rejects
+    a CONFLICTING declaration on this path — pinned separately in
+    tests/server/test_entities_gate_ingestion.py.  Absence is never rejected,
+    so an agent that omits `entities` cannot lose a write here either way.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'category',
+        ['procedural_knowledge', 'preferences_and_norms', 'observations_and_summaries'],
+    )
+    async def test_a_declaration_on_a_mem0_primary_write_is_discarded(
+        self, service, category
+    ):
+        before = service.referent_source_counts()
+
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category=category,
+            project_id='dark_factory',
+            dual_write=False,
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        # No queue row, so nothing carries the declaration...
+        service.durable_queue.enqueue.assert_not_called()
+        # ...and the 'declared' bucket leaf iota reads never moves.
+        assert service.referent_source_counts() == before
+
+    @pytest.mark.asyncio
+    async def test_the_declaration_is_indistinguishable_from_its_absence_there(
+        self, service
+    ):
+        """The precise shape of the loss: on a Mem0-primary write, declaring
+        and not declaring leave IDENTICAL observable state.  Nothing
+        downstream can tell the two apart — which is why the docstrings must
+        not promise that a declaration is honoured here."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+        declared_calls = service.durable_queue.enqueue.call_args_list[:]
+        declared_counts = service.referent_source_counts()
+
+        service.durable_queue.enqueue.reset_mock()
+
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+
+        assert service.durable_queue.enqueue.call_args_list == declared_calls == []
+        assert service.referent_source_counts() == declared_counts
+
+    @pytest.mark.asyncio
+    async def test_dual_write_is_the_documented_way_to_get_it_recorded(self, service):
+        """`dual_write=True` puts a Mem0-primary category back on the Graphiti
+        leg, and the declaration is stamped exactly as it is for a
+        GRAPHITI_PRIMARY one.  This is the escape hatch the corrected
+        docstrings name, so it is pinned rather than left as folklore."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            dual_write=True,
+            declared_referents=[{'kind': 'task', 'id': 3129}],
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'declared',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+
 class TestAddEpisodeStampsReferents:
     """The second producer. `add_episode` deliberately never persists a
     metadata argument — the same fact that forced task 3142's

@@ -6207,6 +6207,40 @@ class MemoryService:
         and none applied" versus "the agent never looked" signal leaf iota
         counts, so nothing on this path may collapse one onto the other.
 
+        SCOPED TO THE GRAPHITI LEG, and say it plainly because the three
+        sentences above read as if it were universal: a declaration is
+        RESOLVED, encoded and stamped only on a write that actually reaches
+        Graphiti — a ``GRAPHITI_PRIMARY`` category, or ``dual_write=True``. On
+        a Mem0-primary write (``procedural_knowledge``,
+        ``preferences_and_norms``, ``observations_and_summaries``) the
+        ``resolve_referents`` call below never runs, no referent set is
+        encoded, and ``_referent_source_counts`` never increments. The
+        declaration is accepted and then discarded.
+
+        That is deliberate, not an oversight, and it follows from where the
+        referent set LIVES: it is a field on the Graphiti queue payload, read
+        by ``_execute_graphiti_write`` and verified against the resulting edges
+        by leaf zeta. A Mem0-primary write produces no queue row and no edges,
+        so there is nothing to stamp it onto and nothing for zeta to check.
+        Resolving anyway would compute a set with no destination. The
+        consequence leaf iota must price in: its declaration-rate denominator
+        is "every Graphiti write", NOT "every add_memory call", so the
+        Mem0-primary share of traffic is outside the counter entirely rather
+        than counted as undeclared. Widening that denominator is iota's call to
+        make, and needs a second counting site — it is not a thing this method
+        can fix by moving one call.
+
+        The tool-boundary ``entities_gate`` is category-INDEPENDENT and does
+        run on this path (pinned by
+        ``tests/server/test_entities_gate_ingestion.py::...
+        test_the_gate_is_category_independent``), so a CONFLICTING declaration
+        on a Mem0-primary write is still rejected even though an agreeing one
+        would have been inert. That asymmetry is intended: the gate polices
+        whether the caller's stated referents match its own prose, which is a
+        fact about the caller and not about routing. It costs nothing an
+        undeclaring caller pays — absence is never rejected, so an agent that
+        omits ``entities`` (``/reflect`` as shipped) cannot lose a write here.
+
         Deliberately UNVALIDATED here: gamma's ``_declared_referents`` owns the
         TOTAL ``InputValidationError`` contract, and a direct service caller
         that passes a malformed list gets that raise — which is correct. The
