@@ -29,7 +29,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -164,7 +164,9 @@ class _StatusWriteNotPersisted(Exception):
     rather than just building the error dict inline — lets ``_txn``'s
     ``except`` clause roll back the whole transaction first, so on the
     atomic writer a mismatch rolls back the metadata merge too (both-or-
-    neither). Always caught by the same method that raised it and mapped to
+    neither). Raised by the shared :meth:`SqliteTaskBackend._write_status_and_verify`
+    tail and always caught by the public method that invoked it
+    (``set_task_status`` / ``set_status_and_stamp_audit``) and mapped to
     :meth:`to_error_dict`; never escapes to a caller.
     """
 
@@ -1920,6 +1922,7 @@ class SqliteTaskBackend:
     async def _write_status_and_verify(
         self,
         conn: aiosqlite.Connection,
+        *,
         set_columns: list[str],
         set_values: list[Any],
         tag: str,
@@ -1953,7 +1956,16 @@ class SqliteTaskBackend:
         far, including a metadata merge on the atomic writer) and mapped to
         an explicit ``{'success': False, 'error': 'status_write_not_persisted',
         ...}`` error dict.
+
+        Does not mutate the caller's ``set_columns``/``set_values`` lists —
+        the claimant tri-state columns are appended to local copies.
         """
+        # Copy rather than append in place: callers build these lists fresh
+        # per call today, but the helper should not rely on that — mutating
+        # caller-owned lists in place is a surprising contract for a shared
+        # tail to hold.
+        set_columns = [*set_columns]
+        set_values = [*set_values]
         if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
             if self._claimant_columns_cache.get(project_root, False):
                 if claimant_run_id is not _UNSET:
@@ -2072,58 +2084,21 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, _now()]
-                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                    if self._claimant_columns_cache.get(project_root, False):
-                        if claimant_run_id is not _UNSET:
-                            set_columns.append('claimant_run_id = ?')
-                            set_values.append(claimant_run_id)
-                        if heartbeat_at is not _UNSET:
-                            set_columns.append('heartbeat_at = ?')
-                            set_values.append(heartbeat_at)
-                    else:
-                        logger.warning(
-                            'set_task_status: claimant_run_id/heartbeat_at columns absent '
-                            '(pre-migration connection) — writing status only for '
-                            'task_id=%s project_root=%s',
-                            task_id, project_root,
-                        )
-
-                try:
-                    await self._apply_status_row_update(
-                        conn, set_columns, set_values, tag, tid,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # Only the candidate_key partial UNIQUE index is mapped to a
-                    # typed collision (mirrors add_task's collision mapping); any
-                    # other integrity violation is unrelated and re-raised
-                    # untouched. Reachable via the narrow un-cancel path (see the
-                    # docstring above). Nothing in this transaction has been
-                    # written yet — this is the first write statement — so this
-                    # survivor lookup sees the same state a post-rollback read
-                    # would (this row's own candidate_key/status are unaffected,
-                    # having never been applied).
-                    if row_candidate_key is None or 'candidate_key' not in str(exc):
-                        raise
-                    survivor_cursor = await conn.execute(
-                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                        (tag, row_candidate_key),
-                    )
-                    survivor = await survivor_cursor.fetchone()
-                    raise DuplicateCandidateKeyError(
-                        existing_id=survivor['id'] if survivor is not None else None,
-                        existing_status=survivor['status'] if survivor is not None else None,
-                        tag=tag,
-                        candidate_key=row_candidate_key,
-                    ) from exc
-
-                verify_cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                persisted_status = await self._write_status_and_verify(
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_task_status',
+                    write_desc='status',
                 )
-                verify_row = await verify_cursor.fetchone()
-                persisted_status = verify_row['status'] if verify_row is not None else None
-                if persisted_status != status:
-                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
         return {
@@ -2206,49 +2181,21 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, _now()]
-                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                    if self._claimant_columns_cache.get(project_root, False):
-                        if claimant_run_id is not _UNSET:
-                            set_columns.append('claimant_run_id = ?')
-                            set_values.append(claimant_run_id)
-                        if heartbeat_at is not _UNSET:
-                            set_columns.append('heartbeat_at = ?')
-                            set_values.append(heartbeat_at)
-                    else:
-                        logger.warning(
-                            'set_status_and_stamp_audit: claimant_run_id/heartbeat_at '
-                            'columns absent (pre-migration connection) — writing '
-                            'status+metadata only for task_id=%s project_root=%s',
-                            task_id, project_root,
-                        )
-
-                try:
-                    await self._apply_status_row_update(
-                        conn, set_columns, set_values, tag, tid,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    if row_candidate_key is None or 'candidate_key' not in str(exc):
-                        raise
-                    survivor_cursor = await conn.execute(
-                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                        (tag, row_candidate_key),
-                    )
-                    survivor = await survivor_cursor.fetchone()
-                    raise DuplicateCandidateKeyError(
-                        existing_id=survivor['id'] if survivor is not None else None,
-                        existing_status=survivor['status'] if survivor is not None else None,
-                        tag=tag,
-                        candidate_key=row_candidate_key,
-                    ) from exc
-
-                verify_cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                persisted_status = await self._write_status_and_verify(
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_status_and_stamp_audit',
+                    write_desc='status+metadata',
                 )
-                verify_row = await verify_cursor.fetchone()
-                persisted_status = verify_row['status'] if verify_row is not None else None
-                if persisted_status != status:
-                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
         return {
@@ -2278,20 +2225,29 @@ class SqliteTaskBackend:
         ``None`` clears it to NULL, and the default ``_UNSET`` leaves it
         untouched. Fails safe (WARNING, no write, no error) when the
         claimant columns are absent from a not-yet-migrated connection.
+
+        Terminal-claimant tripwire (task 4674, PRD
+        ``docs/prds/claimant-invariant-detection.md`` D-6/E-3): when a call
+        persists a non-NULL ``claimant_run_id`` onto a row whose status is
+        in ``shared.task_statuses.TERMINAL``, logs one ERROR beginning with
+        the discriminator ``claimant_stamped_on_terminal``. Observation,
+        not refusal — the write still succeeds.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT id FROM tasks WHERE tag = ? AND id = ?',
+                'SELECT id, status FROM tasks WHERE tag = ? AND id = ?',
                 (tag, tid),
             )
-            if (await cursor.fetchone()) is None:
+            row = await cursor.fetchone()
+            if row is None:
                 raise TaskmasterError(
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
+            row_status = row[1]
 
             set_columns: list[str] = []
             set_values: list[Any] = []
@@ -2320,6 +2276,26 @@ class SqliteTaskBackend:
                 f'UPDATE tasks SET {set_clause} WHERE tag = ? AND id = ?',
                 set_values,
             )
+
+            # Emit AFTER the UPDATE, not beside the SELECT above: the two
+            # early returns between them (no-kwargs no-op; claimant-columns-
+            # absent fail-safe) write NOTHING, and E-3 scopes the ERROR to a
+            # call that actually PERSISTS a non-NULL claimant. Emitting
+            # earlier would fire this tripwire for a write that never
+            # happened — do not hoist it back up.
+            #
+            # Gate on NULL-ness, not truthiness: an empty-string claimant is
+            # non-NULL and is an anomalous mint worth observing.
+            stamps_non_null_claimant = (
+                claimant_run_id is not _UNSET and claimant_run_id is not None
+            )
+            if stamps_non_null_claimant and row_status in TERMINAL:
+                logger.error(
+                    'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
+                    'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
+                    'tag=%s project_root=%s',
+                    task_id, row_status, claimant_run_id, tag, project_root,
+                )
         return {
             'id': task_id,
             'message': f'Updated claimant fields for task {task_id}',
@@ -3287,7 +3263,20 @@ def _resolve_metadata_mode(
     """Resolve the effective metadata merge mode from the two input signals.
 
     Precedence (high → low):
-    1. ``metadata_mode`` — explicit tri-state wins unconditionally.
+    1. ``metadata_mode`` — explicit tri-state wins, with ONE carve-out:
+       ``metadata_mode='merge'`` alongside ``append=True`` is **rejected**
+       as a contradiction (the task-3581 nested-metadata clobber,
+       2026-08-11). ``append=True`` means exactly one thing — 'additive' —
+       so the pair asks for two incompatible resolutions of the same
+       write, and silently picking 'merge' shallow-overwrote nested keys
+       (a whole ``memory_hints`` blob, authored ``entities``/``queries``
+       and all, replaced by an incoming stub). Like the rule-2 rejection
+       below this is scoped to ``metadata_present`` writes — with no
+       metadata there is nothing to clobber and ``append`` is driving the
+       details-append path instead. The other explicit/append combinations
+       are unchanged: ``('replace', True)`` stays honored (the sanctioned
+       destructive co-signal rule 2 points callers at) and
+       ``('additive', False)`` stays 'additive'.
     2. ``append`` legacy shim — True → 'additive'. A bare ``append=False``
        (no explicit ``metadata_mode``) is **rejected** when
        ``metadata_present`` is True: it used to resolve to a silent
@@ -3302,10 +3291,12 @@ def _resolve_metadata_mode(
        the details-append path in the backend.
     3. Default — 'merge' (shallow last-write-wins) when both are None.
 
-    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
-    unrecognised ``metadata_mode`` value AND for a bare ``append=False``
-    metadata write (both loud over silent). ``metadata_present`` defaults to
-    True (fail-safe strict) so any future 2-arg caller gets the guard.
+    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) in three
+    cases, all loud over silent: an unrecognised ``metadata_mode`` value; the
+    contradictory ``metadata_mode='merge'`` + ``append=True`` pair (rule 1);
+    and a bare ``append=False`` metadata write (rule 2). ``metadata_present``
+    defaults to True (fail-safe strict) so any future 2-arg caller gets the
+    guards.
     """
     if metadata_mode is not None:
         if metadata_mode not in _METADATA_MODES:
@@ -3313,6 +3304,35 @@ def _resolve_metadata_mode(
                 'TASKMASTER_TOOL_ERROR',
                 f"Invalid metadata_mode {metadata_mode!r}; "
                 f"must be one of {sorted(_METADATA_MODES)}.",
+            )
+        if metadata_mode == 'merge' and append is True and metadata_present:
+            # Contradiction: 'merge' is shallow last-write-wins while
+            # append=True means 'additive' (recursive union). Silently
+            # honoring 'merge' clobbered nested metadata wholesale — the
+            # task-3581 / DF-3260 memory_hints clobber.
+            #
+            # Scoped to metadata-present writes, exactly like the task-2180
+            # guard below: with no metadata there is nothing to merge, so
+            # metadata_mode is inert and ``append`` means something else
+            # entirely (it independently drives the details/prompt-append
+            # path). A details-only update_task(details=..., append=True)
+            # that happens to also carry metadata_mode='merge' is not
+            # contradictory and must NOT be rejected.
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                "Refusing a contradictory metadata_mode='merge' + append=True "
+                "write: append=True asks for the ADDITIVE union merge while "
+                "metadata_mode='merge' asks for a SHALLOW last-write-wins "
+                "overwrite, and there is no coherent way to do both. Resolving "
+                "it silently to 'merge' overwrote nested keys wholesale — a "
+                "task's whole memory_hints blob (authored entities/queries and "
+                "all) replaced by the incoming stub instead of unioned with it "
+                "(the task-3581 nested-metadata clobber). State intent "
+                "explicitly: pass metadata_mode='additive' (or append=True "
+                "alone) to UNION nested list/dict fields like memory_hints into "
+                "the existing blob, or drop append and keep "
+                "metadata_mode='merge' to CONFIRM a shallow top-level "
+                "last-write-wins overwrite.",
             )
         return metadata_mode
     if append is True:

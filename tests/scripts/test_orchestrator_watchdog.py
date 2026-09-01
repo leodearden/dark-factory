@@ -1602,6 +1602,92 @@ def test_fleet_dir_default_matches_across_tiers() -> None:
     )
 
 
+def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
+    """restart-orchestrator.sh's target-unit default must not diverge.
+
+    Three mirrors of one unit name that cannot import each other: the
+    watchdog's WATCHED table (Python, and the deployed watchdog's own idea of
+    which unit is the dark-factory orchestrator — already port-pinned against
+    the real escalation configs by test_watched_ports_match_escalation_configs
+    above), restart-orchestrator.sh's SERVICE default (bash, stdlib-free) and
+    restart-all-orchestrators.sh's SELF_UNIT default (bash — the same unit, for
+    the same fleet, never previously pinned against the table).
+
+    WHY THIS EXISTS, and why it is not optional: task 3950 made the restart
+    script's target env-overridable (`ORCH_RESTART_UNIT`) so its two
+    fake-systemctl harnesses could stop putting a REAL unit name in front of
+    whatever `systemctl` resolves to. That retired the only two assertions in
+    the repo that pinned the production default —
+    scripts/tests/test_restart_orchestrator.py::UNIT and
+    scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT — which now hold
+    synthetic names the fixtures themselves supply. Without this pin the
+    default would be wholly UNPINNED: a future edit could retarget the script
+    at any unit and every test would stay green.
+
+    THE DECISION THIS ENCODES, not merely the mismatch: restart-orchestrator.sh
+    is invoked by operators and by `task_kind='deterministic'` before_done
+    scripts to restart THE dark-factory orchestrator. A drifted default does not
+    fail loudly — it silently restarts the WRONG unit, or none at all, while
+    reporting success against whatever it did restart.
+
+    A CHARACTERIZATION PIN, not a RED test: the production values are already
+    correct and must not change. Isolate a test by SETTING ORCH_RESTART_UNIT to
+    a synthetic `orchestrator-fake*` unit (df_pytest_isolation.synthetic_unit),
+    never by changing this default.
+    """
+    wdog = _load_watchdog()
+
+    # The canonical in-repo source: what the deployed watchdog actually
+    # restarts for the dark-factory escalation port.
+    port_to_unit = {port: unit for port, unit in wdog.WATCHED}
+    assert 8102 in port_to_unit, (
+        "No WATCHED entry for the dark-factory escalation port 8102 -- did the "
+        "table's port change? This pin derives the expected unit name from it."
+    )
+    expected = port_to_unit[8102]
+
+    drift_note = (
+        "\nrestart-orchestrator.sh is invoked by operators and by "
+        "task_kind='deterministic' before_done scripts to restart THE "
+        "dark-factory orchestrator, so a drifted default silently restarts the "
+        "WRONG unit (or none) while reporting success. This pin is the ONLY "
+        "remaining coverage of that default: task 3950 made it overridable and "
+        "thereby retired the two harness literals "
+        "(scripts/tests/test_restart_orchestrator.py::UNIT, "
+        "scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT) that were "
+        "previously its only pins. Isolate a test by SETTING ORCH_RESTART_UNIT "
+        "to a synthetic orchestrator-fake* unit instead of changing this value."
+    )
+
+    # --- bash mirror 1: restart-orchestrator.sh SERVICE default (task 3950) ---
+    restart_src = (REPO_ROOT / "scripts" / "restart-orchestrator.sh").read_text()
+    match = re.search(r'SERVICE="\$\{ORCH_RESTART_UNIT:-([^}]+)\}"', restart_src)
+    assert match is not None, (
+        "restart-orchestrator.sh SERVICE default pattern not found -- did its "
+        "literal shape change? Update this regex to match. (A pin that silently "
+        "stops finding its target is worse than no pin.)"
+    )
+    assert match.group(1) == expected, (
+        f"restart-orchestrator.sh SERVICE default {match.group(1)!r} has drifted "
+        f"from the watchdog WATCHED table's unit for port 8102 ({expected!r})."
+        + drift_note
+    )
+
+    # --- bash mirror 2: restart-all-orchestrators.sh SELF_UNIT default ---
+    fleet_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    self_match = re.search(r'SELF_UNIT="\$\{SELF_UNIT:-([^}]+)\}"', fleet_src)
+    assert self_match is not None, (
+        "restart-all-orchestrators.sh SELF_UNIT default pattern not found -- did "
+        "its literal shape change? Update this regex to match."
+    )
+    assert self_match.group(1) == expected, (
+        f"restart-all-orchestrators.sh SELF_UNIT default {self_match.group(1)!r} "
+        f"has drifted from the watchdog WATCHED table's unit for port 8102 "
+        f"({expected!r}); it names the same unit for the same fleet -- the unit "
+        "the fleet script restarts LAST, as its own." + drift_note
+    )
+
+
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4232,6 +4318,107 @@ def test_fused_memory_constants_exposed() -> None:
     assert "/health" in wdog.FUSED_MEMORY_HEALTH_URL
 
 
+def test_fused_memory_alive_constants_exposed() -> None:
+    """The module exposes a /alive URL + timeout DISTINCT from the /health pair.
+
+    The kill decision fetches /alive (task 3765); /health remains the readiness
+    signal for --report's recon-busy column and the recon gate. The two are
+    separate constants, not a rename — assert both survive.
+    """
+    wdog = _load_watchdog()
+    assert hasattr(wdog, "FUSED_MEMORY_ALIVE_URL"), (
+        "Module must expose a FUSED_MEMORY_ALIVE_URL constant"
+    )
+    assert hasattr(wdog, "FUSED_MEMORY_ALIVE_TIMEOUT_SECS"), (
+        "Module must expose a FUSED_MEMORY_ALIVE_TIMEOUT_SECS constant"
+    )
+    assert str(wdog.FUSED_MEMORY_PORT) in wdog.FUSED_MEMORY_ALIVE_URL, (
+        f"FUSED_MEMORY_ALIVE_URL ({wdog.FUSED_MEMORY_ALIVE_URL!r}) must be built "
+        f"from FUSED_MEMORY_PORT ({wdog.FUSED_MEMORY_PORT})"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_URL.endswith("/alive"), (
+        f"FUSED_MEMORY_ALIVE_URL must target /alive; got {wdog.FUSED_MEMORY_ALIVE_URL!r}"
+    )
+    # NOT a rename: /health must still exist for the recon-busy gate.
+    assert wdog.FUSED_MEMORY_HEALTH_URL.endswith("/health"), (
+        f"FUSED_MEMORY_HEALTH_URL must still target /health; got "
+        f"{wdog.FUSED_MEMORY_HEALTH_URL!r}"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_URL != wdog.FUSED_MEMORY_HEALTH_URL, (
+        "the aliveness and readiness URLs must stay distinct"
+    )
+    assert isinstance(wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS, (int, float)), (
+        f"FUSED_MEMORY_ALIVE_TIMEOUT_SECS must be numeric; got "
+        f"{wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS!r}"
+    )
+    assert wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS > 0, (
+        f"FUSED_MEMORY_ALIVE_TIMEOUT_SECS must be positive; got "
+        f"{wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS!r}"
+    )
+
+
+def test_watchdog_probed_routes_are_registered_in_fused_memory_server() -> None:
+    """Every URL this watchdog probes must be a route fused-memory actually serves.
+
+    Cross-package wire-contract guard, sitting alongside (not replacing) the
+    config.yaml port guard below and copying its structure, including the
+    fail-open skip. Neither side can import the other: tests/scripts/ runs
+    under `uv run --project shared pytest tests/scripts/`, whose environment
+    does not carry the fused-memory package, and orchestrator-watchdog.py is a
+    stdlib-only systemd oneshot that could not import it at runtime either. So
+    the server's routes are read as TEXT out of its @mcp.custom_route
+    decorators.
+
+    WHAT THIS DOES AND DOES NOT PROTECT (the tempting reading is wrong, and
+    getting it wrong invites a harmful "fix"). A typo'd path 404s, and
+    probe_health treats ANY HTTP response — 404 included — as ALIVE. That does
+    NOT blind the kill decision: a 404 is still SERVED BY THE ASYNCIO LOOP, so
+    a genuinely wedged loop fails to answer a mistyped path exactly as it fails
+    to answer a correct one, and is still classified 'wedged' and killed. A
+    typo only degrades the probe from "zero-I/O route served" to "router 404
+    served" — both valid liveness signals, restart behaviour unchanged. (Which
+    is also why the rollout window, watchdog deployed from the repo before
+    fused-memory.service restarts carrying /alive, is safe rather than
+    dangerous.)
+
+    So this guard exists to keep the probe pointed at the INTENDED zero-I/O
+    route — i.e. to stop the kill decision quietly drifting back onto a
+    load-bearing one — not to stop the detector going blind. Do not "harden"
+    probe_health into rejecting non-200 on the strength of this test: that
+    would resurrect the false-wedge class task 3765 removed, because /health's
+    503-means-degraded-but-alive would start reading as dead.
+    """
+    wdog = _load_watchdog()
+
+    tools_path = (
+        REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "server" / "tools.py"
+    )
+    if not tools_path.exists():
+        pytest.skip(f"{tools_path} not reachable in this environment")
+
+    registered = set(
+        re.findall(r"""@mcp\.custom_route\(\s*['"]([^'"]+)['"]""", tools_path.read_text())
+    )
+    # A zero-match regex must fail LOUDLY rather than pass vacuously: a change
+    # to the decorator syntax is itself the drift this test exists to catch.
+    assert registered, (
+        f"no @mcp.custom_route(...) registrations found in {tools_path} — the "
+        "decorator syntax changed and this drift guard has gone blind"
+    )
+
+    import urllib.parse  # noqa: PLC0415
+
+    for const_name in ("FUSED_MEMORY_ALIVE_URL", "FUSED_MEMORY_HEALTH_URL"):
+        path = urllib.parse.urlsplit(getattr(wdog, const_name)).path
+        assert path in registered, (
+            f"{const_name} probes {path!r}, which scripts/orchestrator-watchdog.py "
+            f"expects but {tools_path} does not register "
+            f"(registered routes: {sorted(registered)}). These two files live in "
+            "packages that cannot import each other, so this text guard is the "
+            "only thing holding the contract."
+        )
+
+
 def test_fused_memory_port_matches_configured_server_port() -> None:
     """FUSED_MEMORY_PORT must equal fused-memory/config/config.yaml's server.port.
 
@@ -4278,7 +4465,10 @@ def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeHealthResponse(200)
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is True
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is True
+    )
 
 
 def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4297,7 +4487,10 @@ def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> N
         )
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is True
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_HEALTH_URL, wdog.FUSED_MEMORY_HEALTH_TIMEOUT_SECS)
+        is True
+    )
 
 
 def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4308,7 +4501,10 @@ def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> Non
         raise wdog.urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4319,7 +4515,10 @@ def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatc
         raise ConnectionRefusedError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4334,7 +4533,10 @@ def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         raise TimeoutError("timed out")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4342,13 +4544,140 @@ def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _install_url_dispatching_urlopen(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: dict[str, object],
+) -> list[str]:
+    """Fake urlopen that answers PER URL; returns the list of urls it was asked for.
+
+    *outcomes* maps a url to what that fetch does: an int status code (returned
+    as a _FakeHealthResponse), an Exception instance (raised), or a callable
+    (invoked with the url — e.g. pytest.fail, for "this url must never be
+    fetched"). An unmapped url fails the test outright.
+
+    This is what makes "probed /alive and NEVER /health" assertable: the two
+    routes have opposite cost profiles (zero-I/O vs two backing-store
+    round-trips), so which one the KILL decision fetches is the whole point of
+    task 3765 and cannot be checked by a url-blind stub.
+    """
+    asked: list[str] = []
+
+    def fake_urlopen(url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        asked.append(url)
+        if url not in outcomes:
+            pytest.fail(f"unexpected fetch of {url!r} (mapped: {sorted(outcomes)})")
+        outcome = outcomes[url]
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(url)
+        if not isinstance(outcome, int):
+            pytest.fail(
+                f"outcome for {url!r} must be an int status code, an Exception "
+                f"instance, or a callable — got {outcome!r}"
+            )
+        return _FakeHealthResponse(outcome)
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    return asked
+
+
+def test_liveness_verdict_probes_alive_not_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE CRUX: the kill decision fetches /alive, and /health not at all.
+
+    /health awaits two sequential backing-store round-trips, which makes any
+    verdict drawn from it a LOAD measurement rather than a liveness one. The
+    url list is asserted by equality (not membership) so a "fetch both, prefer
+    /alive" implementation — which would keep the backing-store cost on the
+    kill path — fails here too.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    asked = _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_ALIVE_URL: 200,
+            wdog.FUSED_MEMORY_HEALTH_URL: lambda url: pytest.fail(
+                f"the kill decision must NOT fetch {url} — it awaits two "
+                "backing-store round-trips, making the verdict a load measurement"
+            ),
+        },
+    )
+
+    assert wdog._fused_memory_liveness_verdict() == "healthy"
+    assert asked == [wdog.FUSED_MEMORY_ALIVE_URL], (
+        f"expected exactly one fetch, of /alive; got {asked!r}"
+    )
+
+
+def test_liveness_verdict_healthy_when_backing_store_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """USER-OBSERVABLE SIGNAL: a dead FalkorDB must NOT read as a wedged loop.
+
+    /health hangs past its budget (the backing-store probe never returns) while
+    /alive answers immediately — the event loop is serving fine. The verdict
+    must be 'healthy': restarting would not fix a down store, would flap the
+    single shared instance all 7 orchestrators depend on, and would cancel
+    in-flight reconciliation work for nothing.
+
+    On the pre-task-3765 code this exact fake yields 'wedged'. That is the
+    entire defect.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    # probe_health()'s no-response branch calls log(), which shells out to
+    # `systemd-cat`; no-op it so this test stays hermetic.
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_ALIVE_URL: 200,
+            wdog.FUSED_MEMORY_HEALTH_URL: TimeoutError("timed out"),
+        },
+    )
+
+    assert wdog._fused_memory_liveness_verdict() == "healthy"
+
+
+def test_liveness_verdict_wedged_when_alive_unanswered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely hung asyncio loop is STILL caught — the task-1731/2713 intent.
+
+    /alive is served by the same event loop as /health, so when the loop is
+    wedged nothing answers it either. Repointing the probe at a zero-I/O route
+    removes the false positives without removing the detector.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {wdog.FUSED_MEMORY_ALIVE_URL: TimeoutError("timed out")},
+    )
+
+    assert wdog._fused_memory_liveness_verdict() == "wedged"
+
+
 def test_liveness_verdict_port_down(monkeypatch: pytest.MonkeyPatch) -> None:
     """_fused_memory_liveness_verdict returns 'port-down' when probe_port is False."""
     wdog = _load_watchdog()
 
     monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    # *a/**k, not a bare `lambda:` — the verdict passes url/timeout to
+    # probe_health (task 3765), and a zero-arg stub would raise TypeError.
+    # fused_memory_liveness_pass()'s blanket try/except swallows that into a
+    # silent "no restart", so the guard below would stop guarding while still
+    # appearing to pass.
     monkeypatch.setattr(
-        wdog, "probe_health", lambda: pytest.fail("probe_health must not run when port is down")
+        wdog,
+        "probe_health",
+        lambda *a, **k: pytest.fail("probe_health must not run when port is down"),
     )
 
     assert wdog._fused_memory_liveness_verdict() == "port-down"
@@ -4359,7 +4688,7 @@ def test_liveness_verdict_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
 
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
-    monkeypatch.setattr(wdog, "probe_health", lambda: True)
+    monkeypatch.setattr(wdog, "probe_health", lambda *a, **k: True)
 
     assert wdog._fused_memory_liveness_verdict() == "healthy"
 
@@ -4369,7 +4698,7 @@ def test_liveness_verdict_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
 
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
-    monkeypatch.setattr(wdog, "probe_health", lambda: False)
+    monkeypatch.setattr(wdog, "probe_health", lambda *a, **k: False)
 
     assert wdog._fused_memory_liveness_verdict() == "wedged"
 
@@ -4396,8 +4725,15 @@ def test_liveness_pass_revives_on_port_down(
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "probe_port", lambda _port: False)
+    # *a/**k, not a bare `lambda:` — the verdict passes url/timeout to
+    # probe_health (task 3765), and a zero-arg stub would raise TypeError.
+    # fused_memory_liveness_pass()'s blanket try/except swallows that into a
+    # silent "no restart", so the guard below would stop guarding while still
+    # appearing to pass.
     monkeypatch.setattr(
-        wdog, "probe_health", lambda: pytest.fail("probe_health must not run when port is down")
+        wdog,
+        "probe_health",
+        lambda *a, **k: pytest.fail("probe_health must not run when port is down"),
     )
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
@@ -4417,14 +4753,30 @@ def test_liveness_pass_revives_on_port_down(
 def test_liveness_pass_no_restart_when_healthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """fused_memory_liveness_pass() must not restart when port is up and health succeeds."""
+    """fused_memory_liveness_pass() must not restart when port is up and /alive succeeds.
+
+    Also pins WHICH route the END-TO-END kill path asks for (task 3765
+    amendment). The pass-level stubs below must accept args (``lambda *a, **k``)
+    because the verdict now passes url+timeout, and a zero-arg stub's TypeError
+    is swallowed by fused_memory_liveness_pass()'s blanket try/except into a
+    silent "no restart" — but that same widening stops the stub OBSERVING the
+    url, so on its own it would let a regression repointing the verdict back at
+    FUSED_MEMORY_HEALTH_URL pass every pass-level test. Recording the request
+    here keeps the contract on the real kill path, not only on the verdict
+    helper that test_liveness_verdict_probes_alive_not_health exercises.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
+    probed_urls: list[str] = []
+
+    def fake_probe_health(url, timeout=None, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        probed_urls.append(url)
+        return True
 
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
-    monkeypatch.setattr(wdog, "probe_health", lambda: True)
+    monkeypatch.setattr(wdog, "probe_health", fake_probe_health)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     # A healthy verdict CLEARS the streak file — point it at tmp so this test
@@ -4433,7 +4785,13 @@ def test_liveness_pass_no_restart_when_healthy(
 
     wdog.fused_memory_liveness_pass()
 
-    assert restarted == [], "No restart expected when port is up and health succeeds"
+    assert restarted == [], "No restart expected when port is up and /alive succeeds"
+    assert probed_urls == [wdog.FUSED_MEMORY_ALIVE_URL], (
+        "the end-to-end kill path must fetch the zero-I/O /alive route and "
+        f"nothing else; got {probed_urls!r}. Fetching FUSED_MEMORY_HEALTH_URL "
+        "here would put the two backing-store round-trips back inside the "
+        "liveness decision (task 3765)."
+    )
 
 
 def test_liveness_pass_restarts_when_wedged(
@@ -4450,7 +4808,7 @@ def test_liveness_pass_restarts_when_wedged(
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
-    monkeypatch.setattr(wdog, "probe_health", lambda: False)
+    monkeypatch.setattr(wdog, "probe_health", lambda *a, **k: False)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
@@ -4540,6 +4898,132 @@ def test_liveness_pass_isolates_exception(monkeypatch: pytest.MonkeyPatch) -> No
 _SS_LISTEN_8002 = _SS_HEADER + "LISTEN 0      2048       127.0.0.1:8002      0.0.0.0:*\n"
 
 
+def _fake_ss_run(
+    monkeypatch: pytest.MonkeyPatch, ss_stdout: str = _SS_LISTEN_8002
+) -> list[list[str]]:
+    """Fake subprocess.run answering the `ss` port probe; returns the call log."""
+    recorded: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        recorded.append(list(cmd))
+        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return recorded
+
+
+def test_report_row_labels_alive_as_the_verdict_source(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """USER-SIGNAL: the --report row names /alive, the route the verdict came from.
+
+    Not cosmetic. This row is what an operator reads to answer "why did / did
+    not the watchdog kill fused-memory". Since task 3765 the verdict no longer
+    comes from /health, so a row still labelled /health would send an operator
+    to inspect the wrong signal.
+
+    Driven through the REAL verdict chain (faked `ss` + urlopen rather than a
+    stubbed verdict function) so the zero-mutating-calls assertion stays
+    meaningful, mirroring test_print_fused_memory_liveness_row above.
+    """
+    wdog = _load_watchdog()
+    recorded_calls = _fake_ss_run(monkeypatch)
+    _install_url_dispatching_urlopen(
+        wdog, monkeypatch, {wdog.FUSED_MEMORY_ALIVE_URL: 200}
+    )
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", lambda: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "fused-memory.service" in out, f"expected the unit name in: {out!r}"
+    assert "/alive" in out, (
+        "the row must name /alive as the verdict's source — after task 3765 a "
+        f"'/health' label asserts something false. Got: {out!r}"
+    )
+    assert "healthy" in out, f"expected the verdict token in: {out!r}"
+    # The row still carries BOTH signals plus the task-3764 streak column.
+    assert "recon-busy" in out, f"the readiness column must survive: {out!r}"
+    assert "streak" in out, f"the task-3764 streak column must survive: {out!r}"
+    _assert_zero_mutating_calls(recorded_calls)
+
+
+def test_recon_busy_verdict_still_reads_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recon gate was NOT collaterally repointed — it still reads /health.
+
+    /alive carries no recon_busy field by construction, and
+    scripts/recon_busy_check.py's parse_health() plus
+    restart-fused-memory.sh's defer-if-busy gate depend on /health's exact
+    body shape. Repointing this too would silently break the restart script's
+    cycle-awareness.
+    """
+    wdog = _load_watchdog()
+    body = json.dumps(
+        {"status": "ok", "recon_busy": [{"project_id": "dark_factory", "run_id": "r1"}]}
+    )
+    _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_HEALTH_URL: lambda _url: _FakeHealthBodyResponse(body),
+            wdog.FUSED_MEMORY_ALIVE_URL: lambda url: pytest.fail(
+                f"the recon-busy gate must NOT read {url} — it carries no recon_busy body"
+            ),
+        },
+    )
+
+    assert wdog._fused_memory_recon_busy_verdict() == "busy"
+
+
+def test_report_row_fetches_alive_and_health_exactly_once_each(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One --report row draws liveness from /alive AND readiness from /health.
+
+    With the recon-busy verdict left UNSTUBBED, a single row must fetch each
+    route exactly once: the two signals are deliberately both shown and must
+    not collapse into one. That is what lets the row legitimately read
+    "healthy" while the backing store is degraded — the entire point of the
+    aliveness/readiness split.
+    """
+    wdog = _load_watchdog()
+    _fake_ss_run(monkeypatch)
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}"))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_read_fm_liveness_streak", lambda: None)
+    monkeypatch.setattr(wdog, "_read_last_fm_liveness_restart_epoch", lambda: None)
+    asked = _install_url_dispatching_urlopen(
+        wdog,
+        monkeypatch,
+        {
+            wdog.FUSED_MEMORY_ALIVE_URL: 200,
+            wdog.FUSED_MEMORY_HEALTH_URL: lambda _url: _FakeHealthBodyResponse(
+                json.dumps({"status": "ok", "recon_busy": []})
+            ),
+        },
+    )
+
+    wdog._print_fused_memory_liveness()
+
+    assert set(asked) == {wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_HEALTH_URL}, (
+        f"the row must draw from BOTH routes; fetched {asked!r}"
+    )
+    assert asked.count(wdog.FUSED_MEMORY_ALIVE_URL) == 1, f"fetched /alive twice: {asked!r}"
+    assert asked.count(wdog.FUSED_MEMORY_HEALTH_URL) == 1, f"fetched /health twice: {asked!r}"
+
+    out = capsys.readouterr().out
+    assert "healthy" in out and "idle" in out, (
+        f"expected the aliveness verdict AND the readiness column in: {out!r}"
+    )
+
+
 def test_print_fused_memory_liveness_row(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4567,26 +5051,22 @@ def test_print_fused_memory_liveness_row(
     ]
 
     for verdict_token, ss_stdout, health_outcome in scenarios:
-        recorded_calls: list[list[str]] = []
+        # Per-scenario `ss` stdout goes through the shared _fake_ss_run helper,
+        # which also hands back this iteration's own call log. Passing it as an
+        # ARGUMENT sidesteps B023 for free: the helper's closure captures its
+        # own parameter, not this loop's rebound name.
+        recorded_calls = _fake_ss_run(monkeypatch, ss_stdout)
 
-        # The loop variables are bound explicitly as KEYWORD-ONLY defaults (so no
-        # positional caller can ever reach them). A closure defined in a loop
+        # fake_urlopen still binds its loop variable as a KEYWORD-ONLY default
+        # (so no positional caller can reach it). A closure defined in a loop
         # otherwise reads whatever the name holds when it is CALLED, not when it
         # was defined (B023) — benign only while every call stays inside the same
-        # iteration, which nothing here enforces. `_recorded` is the same list
-        # object `recorded_calls` names, so the assertion below still sees the
-        # appends.
-        def fake_run(cmd, *, _recorded=recorded_calls, _ss=ss_stdout, **kwargs):  # noqa: ANN001
-            _recorded.append(list(cmd))
-            assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-            return subprocess.CompletedProcess(cmd, 0, stdout=_ss, stderr="")
-
+        # iteration, which nothing here enforces.
         def fake_urlopen(*args, _outcome=health_outcome, **kwargs):  # noqa: ANN001, ANN002, ANN003
             if isinstance(_outcome, Exception):
                 raise _outcome
             return _FakeHealthResponse(_outcome)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
         monkeypatch.setattr(
             wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
@@ -4892,14 +5372,7 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     """
     wdog = _load_watchdog()
 
-    recorded_calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
-        recorded_calls.append(list(cmd))
-        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-        return subprocess.CompletedProcess(cmd, 0, stdout=_SS_LISTEN_8002, stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    recorded_calls = _fake_ss_run(monkeypatch)
     monkeypatch.setattr(
         wdog.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResponse(200)
     )
@@ -7487,7 +7960,10 @@ def test_liveness_pass_port_down_streaks_and_preserves_short_circuit(
     monkeypatch.setattr(
         wdog,
         "probe_health",
-        lambda: pytest.fail("probe_health must not run when the port is down"),
+        # *a/**k so this guard keeps FIRING rather than raising a TypeError
+        # that fused_memory_liveness_pass() would swallow into a silent
+        # "no restart" — the verdict passes url/timeout since task 3765.
+        lambda *a, **k: pytest.fail("probe_health must not run when the port is down"),
     )
 
     wdog.fused_memory_liveness_pass()

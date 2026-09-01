@@ -16,7 +16,6 @@ mixing those in would break the pool's purity and its existing 2-value
 from __future__ import annotations
 
 import json
-import locale
 import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -276,7 +275,7 @@ class LaneLifecycle:
         if not path.is_file():
             return None
         try:
-            return LaneRecord.from_json(path.read_text())
+            return LaneRecord.from_json(path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
@@ -306,13 +305,26 @@ class LaneLifecycle:
         ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
         :func:`tempfile.mkstemp` create, and no fsync.
 
-        ``encoding`` is passed as the process's preferred encoding because the
-        old body used a bare ``os.fdopen(fd, 'w')``, which is locale-dependent.
-        That is a latent bug — JSON written under a non-UTF-8 locale — but
-        changing it is out of scope for a consolidation (the task explicitly
-        forbids silently changing per-site encoding while consolidating), so it
-        is preserved verbatim and stated here at the call site rather than
-        hidden in the shared helper's default.
+        Task 3223 reproduced the old inlined body's behaviour verbatim: a bare
+        ``os.fdopen(fd, 'w')``, which is locale-dependent, was preserved rather
+        than silently upgraded (that consolidation explicitly forbade changing
+        per-site encoding). Task 3387 fixed the resulting latent bug: this
+        payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
+        disk to be UTF-8 — under a non-UTF-8 locale this wrote bytes that THIS
+        CLASS'S OWN READER then rejects. Name it precisely, so the next
+        investigator does not go looking in the wrong module:
+        ``_read_or_raise`` raises ``CorruptLaneRecord`` (the decode error is a
+        ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+        method's ``except`` clause), which ``read()`` logs and maps to
+        ``None``, so ``all_records()`` then silently omits the lane. (An
+        earlier version of this paragraph cited
+        ``shared.safe_io.load_json_or_warn``; that helper never reads lane
+        records — its callers are ``b3_gate``, ``chronic_flake``,
+        ``landed_outbox`` and ``merge_queue_store``.)
+
+        ``encoding`` is now pinned ``'utf-8'`` at both halves of the
+        round-trip — here on write, and on ``_read_or_raise``'s ``read_text``
+        — regardless of the ambient locale.
 
         Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
         id, not a task id — the curator resolves tickets to tasks
@@ -322,7 +334,7 @@ class LaneLifecycle:
         safe_io.atomic_write_text(
             self._record_path(lane),
             record.to_json(),
-            encoding=locale.getpreferredencoding(False),
+            encoding='utf-8',
             mode=0o600,
             mkdir=True,
         )

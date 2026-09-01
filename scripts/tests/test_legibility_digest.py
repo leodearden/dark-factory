@@ -463,9 +463,37 @@ class TestIterErrorNeighborhoods:
         assert len(neighborhoods) == 2
         for n in neighborhoods:
             assert set(n) == {
-                'index', 'attempt_tool', 'attempt_input_summary',
+                'index', 'tool_use_id', 'attempt_tool', 'attempt_input_summary',
                 'error_content', 'exit_code', 'designed_outcome',
             }
+
+    def test_neighborhood_carries_the_pairing_tool_use_id(self):
+        # The JOIN KEY (task 4751 / confusion-census-2026-08-26 R1): a
+        # caller holding this scan can relate a classified result back to
+        # the assistant attempt that produced it WITHOUT a second scan.
+        # Record index cannot serve: a retry group's `indices` are tool_use
+        # positions while a neighborhood's `index` is the tool_result one.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert [n['tool_use_id'] for n in neighborhoods] == ['tu-1', 'tu-2']
+
+    def test_tool_use_id_survives_an_unmatched_attempt(self):
+        # Read off the RESULT block, so it is populated even when the
+        # attempt was truncated off the front of the window -- the same
+        # degradation contract the None attempt fields already document.
+        records = [_tool_result('tu-orphan', 'boom', is_error=True)]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['attempt_tool'] is None
+        assert n['tool_use_id'] == 'tu-orphan'
 
     def test_ceiling_result_is_enriched_with_code_and_label(self):
         records = [
@@ -992,6 +1020,237 @@ class TestFindRetryLoops:
         assert len(loops) == 1
         assert loops[0]['tool'] == 'Bash'
         assert loops[0]['count'] == 3
+
+
+# ---------------------------------------------------------------------------
+# find_retry_loops designed-outcome ANNOTATION -- confusion-census-2026-08-26
+# §1.1 / R1 (task 4751). A healthy 4-hour escalation-watcher rotation makes
+# one date-check and one re-arm call per ~3600s cycle, so ANY rotation of
+# >= RETRY_MIN cycles necessarily crosses the threshold and renders under
+# '## Retry Loops' -- while the SAME digest's signal_counts correctly report
+# tool_error=0 and tally the ceilings under designed_outcome. Two layers of
+# one instrument told contradictory stories about one session. The fix joins
+# the retry groups against task 3610's EXISTING classification on
+# tool_use_id and ANNOTATES; it never suppresses, so a genuine retry storm
+# interleaved with ceilings stays fully visible (PRD Sec 7.2.1's
+# fail-toward-genuine principle).
+# ---------------------------------------------------------------------------
+
+_DATE_CHECK = {'command': 'date -u +"%Y-%m-%dT%H:%M:%S%z"'}
+_REARM = {
+    'command': (
+        'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
+        '--queue-dir /home/leo/src/dark-factory/data/escalations '
+        '--level 1 --timeout 3600'
+    ),
+    'timeout': 3660000,
+}
+
+
+def _watcher_rotation_records():
+    """The 631e7374 sighting shape: 3 healthy watcher cycles, each a
+    non-error `date -u` check plus a re-arm that ends in a DECLARED
+    bounded-wait CEILING. Nothing here is confusion."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _DATE_CHECK, id=f'tu-d{i}')))
+        records.append(_tool_result(f'tu-d{i}', '2026-08-26T12:00:00+0000'))
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-r{i}')))
+        records.append(_tool_result(f'tu-r{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+def _mixed_rotation_records():
+    """One 4-call re-arm group whose results split 2 designed / 2 GENUINE."""
+    records = []
+    for i in range(4):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-m{i}')))
+        content = (
+            _CEILING_DECLARATION if i < 2
+            else 'DARK_FACTORY_ROOT unset, exit code 2'
+        )
+        records.append(_tool_result(f'tu-m{i}', content, is_error=True))
+    return records
+
+
+_BARE_CEILING = 'command timed out after 60m, exit code 124'
+
+
+def _two_rule_rotation_records():
+    """One 3-call re-arm group whose designed results fire TWO different
+    classification rules -- a self-declared WATCHER_REARM_OUTCOME first,
+    then a bare bounded-wait 124 with no declaration, then the declaration
+    again. Both are designed, both carry exit 124, and they are distinct
+    ``(exit_code, label)`` pairs, so this is the only shape that exercises
+    dedup ACROSS distinct pairs and the renderer's multi-rule join."""
+    contents = [_CEILING_DECLARATION, _BARE_CEILING, _CEILING_DECLARATION]
+    records = []
+    for i, content in enumerate(contents):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-t{i}')))
+        records.append(_tool_result(f'tu-t{i}', content, is_error=True))
+    return records
+
+
+def _codeless_rotation_records():
+    """One 3-call re-arm group whose designed declarations carry NO exit
+    code -- ``FIRED`` with no ``exit=`` and no code anywhere in the blob,
+    which classify_error_content resolves to ``(None, label)``. Pins that
+    the None-code pair is REACHABLE, not a hypothetical of the type."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-n{i}')))
+        records.append(
+            _tool_result(f'tu-n{i}', 'WATCHER_REARM_OUTCOME: FIRED', is_error=True)
+        )
+    return records
+
+
+def _idless_rotation_records():
+    """>= RETRY_MIN attempts whose tool_use blocks carry NO 'id', beside a
+    DESIGNED tool_result whose 'tool_use_id' is likewise absent -- both
+    sides of the join degrade to None. Nothing here may join to anything."""
+    records = []
+    for _ in range(3):
+        block = _tool_use('Bash', _REARM)
+        del block['id']
+        records.append(_assistant(block))
+    orphan = _tool_result('unused', _CEILING_DECLARATION, is_error=True)
+    del orphan['message']['content'][0]['tool_use_id']
+    records.append(orphan)
+    return records
+
+
+def _by_signature(loops):
+    return {loop['signature']: loop for loop in loops}
+
+
+class TestRetryLoopDesignedOutcomeJoin:
+    def test_both_rotation_groups_are_still_returned_at_their_true_count(self):
+        # Annotation, never suppression: the date-check and the re-arm
+        # groups both survive at x3 exactly as before the join.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        assert len(loops) == 2
+        assert loops[mod._input_signature(_DATE_CHECK)]['count'] == 3
+        assert loops[mod._input_signature(_REARM)]['count'] == 3
+
+    def test_rearm_group_reports_its_designed_outcome_count(self):
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcome_count'] == 3
+
+    def test_rearm_group_names_the_distinct_rules_that_fired(self):
+        # DISTINCT (exit_code, label) pairs -- 3 identical ceilings collapse
+        # to one pair, so the annotation stays one line long however many
+        # cycles the rotation ran.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcomes'] == [(124, 'watcher-rearm-declared')]
+        assert rearm['designed_outcomes'] == [
+            mod.classify_error_content(_CEILING_DECLARATION)
+        ]
+
+    def test_two_distinct_rules_are_ordered_by_first_appearance(self):
+        # The non-degenerate case: 3 designed results collapsing to TWO
+        # distinct pairs, not one. Both carry exit 124, so only the LABEL
+        # separates them -- and the declaration is asserted first because
+        # ordering is transcript order (a seen-set, never a sort: exit_code
+        # is int | None, so sorted() would raise the moment a declaration
+        # carries no code).
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [
+            (124, 'watcher-rearm-declared'),
+            (124, 'bounded-wait-ceiling'),
+        ]
+
+    def test_repeat_of_an_earlier_rule_does_not_re_emit_its_pair(self):
+        # Dedup is across DISTINCT pairs, so the third call's repeat of the
+        # first call's declaration adds to the count but not to the list --
+        # the annotation stays one line long however long the rotation ran.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert len(loops[0]['designed_outcomes']) == 2
+
+    def test_declaration_without_an_exit_code_yields_a_none_coded_pair(self):
+        # classify_error_content can return (None, label): the pattern's
+        # `code` group is optional and _declared_exit_code falls through to
+        # a text scan that finds nothing. The join must carry that None
+        # through rather than dropping the pair or coercing a code.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [(None, 'watcher-rearm-declared')]
+
+    def test_idless_blocks_never_join_to_an_idless_neighborhood(self):
+        # Both sides of the join degrade to None independently, so an
+        # unrestricted {id: neighborhood} map would let a malformed id-less
+        # attempt COLLIDE with an orphan designed result and annotate a
+        # group that has no designed outcome at all. The map excludes a
+        # None key precisely to make that collision unrepresentable.
+        loops = mod.find_retry_loops(_idless_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 0
+        assert loops[0]['designed_outcomes'] == []
+
+    def test_group_with_no_error_results_annotates_nothing(self):
+        # The zero-cost default: the date-check group's results are not
+        # is_error at all, so it joins to no neighborhood.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        date_check = loops[mod._input_signature(_DATE_CHECK)]
+
+        assert date_check['designed_outcome_count'] == 0
+        assert date_check['designed_outcomes'] == []
+
+    def test_mixed_group_fails_toward_genuine(self):
+        # 2 of 4 designed: the group keeps its FULL x4 count and is not
+        # dropped. Suppressing a partly-designed group would hide a genuine
+        # retry storm interleaved with bounded-wait ceilings -- the
+        # detector lying in the opposite direction.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 4
+        assert loops[0]['designed_outcome_count'] == 2
+
+    def test_accepts_a_precomputed_scan(self):
+        # Mirrors test_partition_accepts_a_precomputed_scan: a caller
+        # holding a scan annotates from it instead of paying for a fresh
+        # one -- what keeps render_digest at two scans, not three.
+        records = _watcher_rotation_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert (
+            mod.find_retry_loops(records, neighborhoods=neighborhoods)
+            == mod.find_retry_loops(records)
+        )
+
+    def test_preexisting_group_fields_are_unchanged(self):
+        # Backward compat: the positional call still works and every field
+        # a pre-4751 caller read is byte-identical.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-3')),
+        ]
+
+        loop = mod.find_retry_loops(records)[0]
+
+        assert loop['tool'] == 'Bash'
+        assert loop['signature'] == json.dumps({'command': 'pytest'}, sort_keys=True)
+        assert loop['count'] == 3
+        assert loop['indices'] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -2741,6 +3000,188 @@ class TestDesignedOutcomesSection:
         assert body.strip() != ''
         assert '## Designed Outcomes' in body
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
+# Retry Loops designed-outcome annotation, RENDERED -- census 2026-08-26 R1
+# (task 4751). The annotation must report the designed count against the
+# group's TOTAL (never replacing it), and a group with zero designed results
+# must render byte-identically to the pre-4751 format so a genuine retry
+# storm's rendering is provably untouched.
+# ---------------------------------------------------------------------------
+
+def _retry_item(count, designed_outcome_count=0, designed_outcomes=(), tool='Bash'):
+    """One find_retry_loops group, shaped for _render_retry_loops."""
+    return {
+        'tool': tool,
+        'signature': mod._input_signature(_REARM),
+        'count': count,
+        'indices': list(range(count)),
+        'designed_outcome_count': designed_outcome_count,
+        'designed_outcomes': list(designed_outcomes),
+    }
+
+
+class TestRetryLoopAnnotationRendering:
+    def test_annotation_reports_designed_count_against_the_group_total(self):
+        # The two numbers are DIFFERENT on purpose: 6 calls, 3 of which
+        # ended in a declared ceiling. A reader must be able to see both.
+        item = _retry_item(
+            6, designed_outcome_count=3,
+            designed_outcomes=[(124, 'watcher-rearm-declared')],
+        )
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert 'x6' in line
+        assert '3 designed-outcome results' in line
+
+    def test_zero_designed_group_renders_the_preexisting_format_exactly(self):
+        # REGRESSION GUARD, asserted against the literal pre-4751 f-string:
+        # the annotation is purely additive, so a genuine retry storm's
+        # line is unchanged byte for byte.
+        item = _retry_item(4)
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert line == f"- {item['tool']} x{item['count']}: {item['signature']}"
+
+    def test_mixed_group_still_renders_its_full_call_volume(self):
+        # 2 of 4 designed -- the annotation explains the churn, it never
+        # hides how much churn there was.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert 'x4' in line
+        assert '2 designed-outcome results' in line
+
+    def test_annotation_names_the_rule_that_fired(self):
+        # Mirrors test_designed_outcome_line_names_the_rule_that_fired:
+        # ONE vocabulary across both sections, so a reader (and the nightly
+        # trickle coder) never re-derives the classification from the raw
+        # command to learn WHY these calls were designed.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        line = mod._render_retry_loops([loops[mod._input_signature(_REARM)]])[0]
+
+        assert '[exit 124]' in line
+        assert '[watcher-rearm-declared]' in line
+
+    def test_multiple_rules_render_comma_joined_in_first_appearance_order(self):
+        # The multi-rule path asserted as an EXACT substring: separator,
+        # ordering and per-pair spelling in one literal, so a future edit
+        # to any of the three has to say so out loud.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert (
+            '(3 designed-outcome results: '
+            '[exit 124] [watcher-rearm-declared], '
+            '[exit 124] [bounded-wait-ceiling])'
+        ) in line
+
+    def test_pair_without_an_exit_code_renders_the_bare_label(self):
+        # _exit_marker renders '' for a None code, so the rule shows as a
+        # bare [label] with no empty '[exit ]' stub -- the same degradation
+        # the Designed Outcomes section's lines already take.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert '(3 designed-outcome results: [watcher-rearm-declared])' in line
+        assert '[exit' not in line
+
+    def test_annotation_survives_the_per_item_byte_cap(self):
+        # _cap_item truncates from the RIGHT, so an annotation placed after
+        # the signature would be the first thing lost on exactly the
+        # long-command groups that most need explaining -- the hazard
+        # _exit_marker was introduced to solve for exit codes. 160 bytes is
+        # below the ~242 the annotated re-arm line needs, so the signature
+        # is eaten and the annotation must remain.
+        sections, _ = mod._build_sections(
+            _watcher_rotation_records(), item_max_bytes=160,
+        )
+
+        line = next(
+            ln for ln in sections['retry_loops'] if 'watcher-rearm' in ln
+        )
+
+        assert mod.ITEM_TRUNCATION_MARKER in line  # the signature WAS eaten
+        assert 'x3' in line
+        assert 'designed-outcome' in line
+        assert '[exit 124]' in line
+
+
+class TestRetryLoopAnnotationEndToEnd:
+    def _retry_block(self, records):
+        digest = mod.render_digest(records, agent_class='interactive')
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        assert '## Retry Loops' in body
+        block = body.split('## Retry Loops', 1)[1].split('\n##', 1)[0]
+        return yaml.safe_load(frontmatter_yaml), block
+
+    def test_rearm_line_is_annotated_and_the_date_line_is_not(self):
+        # The whole point of the census finding: one healthy rotation, two
+        # groups, and only the one whose results were classified designed
+        # says so. The date-check group's calls never errored at all.
+        _, block = self._retry_block(_watcher_rotation_records())
+
+        rearm_line = next(ln for ln in block.splitlines() if 'watcher-rearm' in ln)
+        date_line = next(ln for ln in block.splitlines() if 'date -u' in ln)
+
+        assert '3 designed-outcome results' in rearm_line
+        assert '[exit 124]' in rearm_line
+        assert 'designed-outcome' not in date_line
+        assert date_line.endswith(f': {mod._input_signature(_DATE_CHECK)}')
+
+    def test_rendered_instrument_version_is_wired_to_the_live_constant(self):
+        # Named for what it can actually detect. PRD Sec 7.2.2's own test,
+        # applied deliberately (census R1 asks the implementer to DECIDE
+        # rather than default), concluded that the annotation does not bump:
+        # it adds no signal_counts key and no detector hit, and leaves the
+        # gold section and the section partition alone -- textbook renderer
+        # cosmetics, which the policy says does NOT bump. Bumping would
+        # falsely tell a future census that signal semantics moved,
+        # corrupting the pre-fix / live-regression discriminator the version
+        # exists to provide. Those PREMISES are what the two tests below pin
+        # at runtime; the CONCLUSION (the constant still reads 2) is a
+        # diff-level fact, and nothing in this file freezes it -- deliberately,
+        # because a legitimate future bump must not have to edit a test named
+        # for the 4751 decision, which would point its implementer at the
+        # wrong decision record. What this test does pin is that a bump would
+        # PROPAGATE: the rendered frontmatter reports the live constant, not
+        # a literal that could go stale behind it.
+        meta, _ = self._retry_block(_watcher_rotation_records())
+
+        assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
+
+    def test_signal_counts_are_unchanged_by_the_annotation(self):
+        records = _watcher_rotation_records()
+        meta, _ = self._retry_block(records)
+
+        assert meta['signal_counts'] == mod.signal_counts(records)
+        assert meta['signal_counts']['tool_error'] == 0
+        assert meta['signal_counts']['designed_outcome'] == 3
+        assert meta['signal_counts']['self_correct'] == 0
+
+    def test_section_partition_is_unchanged_by_the_annotation(self):
+        # The same groups appear in the same section at the same counts --
+        # only their rendered line TEXT grows.
+        records = _watcher_rotation_records()
+
+        groups = {
+            (loop['tool'], loop['signature'], loop['count'])
+            for loop in mod.find_retry_loops(records)
+        }
+
+        assert groups == {
+            ('Bash', mod._input_signature(_DATE_CHECK), 3),
+            ('Bash', mod._input_signature(_REARM), 3),
+        }
+        assert mod.SECTION_PRIORITY.index('retry_loops') == 1
+        assert 'retry_loops' not in mod.SIGNAL_WEIGHTS
 
 
 # ---------------------------------------------------------------------------

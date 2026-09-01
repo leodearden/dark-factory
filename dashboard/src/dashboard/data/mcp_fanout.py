@@ -333,15 +333,32 @@ class TTLCache(Generic[V]):
     is intentional: a non-cacheable result must not be handed to every other
     waiter when a subsequent attempt might succeed.
 
-    **Unbounded key space is a caller assumption, not a guarantee.** Neither
-    ``_store`` nor ``_locks`` ever evict individual entries — only the
-    blanket ``clear()`` resets them — so a distinct key accumulates a store
-    slot and a ``Lock`` forever once created. This is safe for the current
-    callers (each keyed by a small, bounded set of project roots), but a
-    future high-cardinality key space (e.g. keyed per-request or per-user)
-    would leak locks and stale entries indefinitely; such a caller should
-    add its own eviction or key externally.
+    **Key space is bounded by disuse, not by cardinality.** A key that stops
+    being requested is reclaimed: :meth:`_evict_expired` drops store entries
+    older than ``_EVICTION_TTL_MULTIPLE`` times the TTL, along with their
+    idle locks, and ``get_or_refresh`` runs it on the cold path — the same
+    path that mints new keys, so growth and reclamation are coupled by
+    construction. An entry past its TTL is already unservable (``get_fresh``
+    enforces the TTL and is the only reader), so eviction reclaims memory
+    with NO semantic change; the multiple is margin against a callable
+    ``ttl_seconds`` that returns a larger value later.
+
+    This makes a HIGH-CARDINALITY key space safe, which it previously was
+    not. It used to be true that "neither ``_store`` nor ``_locks`` ever
+    evict individual entries", and callers were told to key externally or
+    add their own eviction. ``fetch_tasks`` then acquired a key derived from
+    a paging offset computed off a live, monotonically-growing task count —
+    minting a fresh key on every task completion, each permanently retaining
+    a 400-row task list plus a ``Lock`` (task 3857 review). A caller cannot
+    add eviction from outside (``_store`` is private), so the fix belongs
+    here. Steady-state size is now "keys requested within the eviction
+    horizon", regardless of how many distinct keys the caller has ever used.
     """
+
+    # Multiple of the TTL after which an untouched entry is evicted. Entries
+    # are unservable past 1x the TTL, so anything >= 1 is semantically free;
+    # 4 leaves margin for a callable TTL that grows between calls.
+    _EVICTION_TTL_MULTIPLE = 4
 
     def __init__(self, ttl_seconds: float | Callable[[], float]):
         self._ttl_fn: Callable[[], float] = (
@@ -357,6 +374,62 @@ class TTLCache(Generic[V]):
             return cached[1]
         return None
 
+    def _evict_expired(self) -> int:
+        """Drop store entries past the eviction horizon and their idle locks.
+
+        Returns the number of store entries dropped (for tests/observability).
+
+        Safe by construction, in two independent senses:
+
+        * SEMANTICALLY — an evicted entry is older than the TTL, and
+          :meth:`get_fresh` (the only reader of ``_store``) already refuses
+          to serve those. Eviction therefore changes no observable value,
+          only resident memory.
+        * CONCURRENTLY — this method is fully synchronous, so it runs to
+          completion without yielding to another coroutine, and a lock is
+          dropped only when it is neither held nor awaited. A coroutine that
+          has taken a lock object from ``_locks`` reaches ``lock.acquire()``
+          with no intervening await (see ``get_or_refresh``), so it cannot be
+          suspended between ``setdefault`` and entering ``acquire()``.
+
+          ``locked()`` alone would NOT be enough, which is why the predicate
+          below also checks for waiters. ``asyncio.Lock.release()`` clears
+          its ``_locked`` flag and merely SCHEDULES the first waiter's
+          future; between that release and the waiter's task actually
+          resuming, ``locked()`` reads False while a queued waiter is very
+          much still using the lock. A sweep landing in that window — reached
+          on any cold miss, and the key is absent from ``_store`` exactly
+          during an outage, since ``cache_ok`` stores nothing then — would
+          otherwise drop the lock, the next caller would ``setdefault`` a
+          fresh one, and the two would refresh concurrently.
+
+          The waiter probe reads ``asyncio.Lock``'s private ``_waiters``
+          defensively via ``getattr``: if a future CPython drops the
+          attribute, the predicate degrades to the ``locked()``-only test and
+          the cost is at most one duplicate refresh in that narrow window —
+          never corruption, and never a wrong value (the two refreshes write
+          the same key). Dropping a genuinely idle lock is safe regardless:
+          the next caller for that key simply creates a new one.
+        """
+        horizon = self._ttl_fn() * self._EVICTION_TTL_MULTIPLE
+        now = time.monotonic()
+        stale = [k for k, (stamp, _) in self._store.items() if (now - stamp) >= horizon]
+        for key in stale:
+            del self._store[key]
+        # A lock still guarding a live entry is kept, so single-flight for an
+        # actively-used key is never disturbed by a sweep.  ``_waiters`` covers
+        # the released-but-not-yet-resumed window in which ``locked()`` lies —
+        # see the docstring.
+        idle = [
+            k for k, lk in self._locks.items()
+            if k not in self._store
+            and not lk.locked()
+            and not getattr(lk, '_waiters', None)
+        ]
+        for key in idle:
+            del self._locks[key]
+        return len(stale)
+
     async def get_or_refresh(
         self,
         key: str,
@@ -370,6 +443,13 @@ class TTLCache(Generic[V]):
         a per-key lock, re-checks freshness (another waiter may have just
         filled it), and — if still cold — runs ``refresh()`` and stores the
         result iff ``cache_ok(value)``.
+
+        The cold path also sweeps expired entries (:meth:`_evict_expired`).
+        That is deliberately the ONLY sweep site: a cold miss is exactly when
+        a new key can be minted, so reclamation runs at the same rate as
+        growth and a hot warm-path hit stays lock-free and O(1). The sweep is
+        O(store size) but happens only when an ``await refresh()`` — a
+        network round trip — is about to run, which dwarfs it.
         """
         fresh = self.get_fresh(key)
         if fresh is not None:
@@ -381,6 +461,7 @@ class TTLCache(Generic[V]):
             if fresh is not None:
                 return fresh
 
+            self._evict_expired()
             value = await refresh()
             if cache_ok(value):
                 self._store[key] = (time.monotonic(), value)

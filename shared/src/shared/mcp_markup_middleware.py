@@ -122,7 +122,11 @@ from fastmcp.tools.base import ToolResult
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
     MARKUP_OVERRIDE_KEY,
-    detect,
+    # ``detect`` is deliberately NOT imported here any more (task 4696). This
+    # boundary has exactly one scan and it is parameter-aware; importing the
+    # blanket predicate too would leave a loaded gun for a future edit to
+    # re-blind the gate with, and ruff would not complain.
+    detect_for,
     markup_override_requested,
     repair,
     strip_markup_override,
@@ -173,15 +177,185 @@ _REJECT_HINT = (
 #: Surfaced when the value's boundary is a GUESS. It deliberately does NOT
 #: offer a mechanical retry — there is no repaired call to resend — so it points
 #: at the two things the caller can actually do.
-_UNREPAIRABLE_HINT = (
+#:
+#: Spelled ONCE, with the two variants below differing ONLY in the preservation
+#: clause. Composed rather than duplicated for the usual reason (INV-5): a
+#: reworded refusal must not require two edits kept in lock step.
+_UNREPAIRABLE_PREFIX = (
     'This value is UNREPAIRABLE: its own boundary cannot be determined, so no '
     'repair was attempted and nothing was written. Guessing would silently '
-    'drop whatever arguments hide in the residue. Your full payload is '
-    'preserved verbatim in the escalation named above — resend it from your '
-    'own copy once your tool-call envelope stops leaking, rather than '
-    'reconstructing it from this error. If the markup is quoted DELIBERATELY, '
-    + _OVERRIDE_SENTENCE
+    'drop whatever arguments hide in the residue. '
 )
+_UNREPAIRABLE_SUFFIX = (
+    ' If the markup is quoted DELIBERATELY, ' + _OVERRIDE_SENTENCE
+)
+
+#: WHY THE CLAIM IS CONDITIONAL. This hint is read by an agent deciding whether
+#: it still needs its own copy of the payload, so a FALSE preservation claim is
+#: worse than no hint at all: it converts a recoverable loss into an
+#: unrecoverable one by telling the caller to stop holding the data (and by
+#: explicitly discouraging the one recovery still available — reconstructing
+#: from the error). PRD C2 L187 is the contract: an unrepairable input files an
+#: escalation carrying the FULL raw payload so nothing is discarded. When that
+#: filing did NOT happen, saying it did breaks the contract twice over.
+#:
+#: Selecting between the two keeps the payload's PROSE consistent with its own
+#: ``escalation_id`` field rather than letting the two disagree.
+_UNREPAIRABLE_HINT_PRESERVED = (
+    _UNREPAIRABLE_PREFIX
+    + 'Your full payload is preserved verbatim in the escalation named above '
+    '— resend it from your own copy once your tool-call envelope stops '
+    'leaking, rather than reconstructing it from this error.'
+    + _UNREPAIRABLE_SUFFIX
+)
+_UNREPAIRABLE_HINT_UNPRESERVED = (
+    _UNREPAIRABLE_PREFIX
+    + 'NOTHING WAS PRESERVED: no record of your payload was stored anywhere, '
+    'so keep your own copy and resend it once your tool-call envelope stops '
+    'leaking. If you no longer hold one, say so — do not assume an operator '
+    'can recover this call.'
+    + _UNREPAIRABLE_SUFFIX
+)
+
+#: A decoded Python value -> the JSON-Schema type name that admits it. ``bool``
+#: is checked BEFORE ``int`` deliberately: ``bool`` is a subclass of ``int`` in
+#: Python, so the reverse order would type ``True`` as ``'integer'``.
+_JSON_TYPE_NAMES: tuple[tuple[type | None, str], ...] = (
+    (bool, 'boolean'),
+    (str, 'string'),
+    (int, 'integer'),
+    (float, 'number'),
+    (list, 'array'),
+    (dict, 'object'),
+    (None, 'null'),
+)
+
+
+def _accepted_types(declared: Any) -> frozenset[str]:
+    """The JSON-Schema type names one parameter's declaration admits.
+
+    Reads the top-level ``'type'`` — which JSON Schema permits to be a single
+    name OR a list of them — else the union of the branch types under
+    ``'anyOf'`` / ``'oneOf'``. Anything unresolvable yields the EMPTY set,
+    which :func:`_coerce_recovered` reads as "do not touch this value".
+
+    The union branch is not a nicety: ``evidence: list[dict[str, Any]] | None``
+    is the parameter this whole mechanism exists for, and pydantic emits it as
+    ``{'anyOf': [{'type': 'array', ...}, {'type': 'null'}]}`` with no
+    top-level ``'type'`` key at all.
+    """
+    if not isinstance(declared, dict):
+        return frozenset()
+
+    def _names(node: Any) -> frozenset[str]:
+        if not isinstance(node, dict):
+            return frozenset()
+        declared_type = node.get('type')
+        if isinstance(declared_type, str):
+            return frozenset({declared_type})
+        if isinstance(declared_type, list):
+            return frozenset(t for t in declared_type if isinstance(t, str))
+        return frozenset()
+
+    direct = _names(declared)
+    if direct:
+        return direct
+
+    branches: frozenset[str] = frozenset()
+    for key in ('anyOf', 'oneOf'):
+        union = declared.get(key)
+        if isinstance(union, list):
+            for branch in union:
+                branches |= _names(branch)
+    return branches
+
+
+def _json_type_name(value: Any) -> str | None:
+    """The JSON-Schema type name of a decoded Python value."""
+    for python_type, name in _JSON_TYPE_NAMES:
+        if python_type is None:
+            if value is None:
+                return name
+        elif isinstance(value, python_type):
+            return name
+    return None
+
+
+def _coerce_recovered(
+    recovered: Mapping[str, str], properties: Mapping[str, Any]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Type a recovered value against the invoked tool's declared schema.
+
+    Returns the coerced map AND the names it could NOT type — those whose
+    parameter declares a non-string type that the verbatim slice does not decode
+    into. That second element is not a diagnostic: a value in it is one pydantic
+    is CERTAIN to reject, so a caller that forwards it forwards a doomed call.
+    Separating "left alone because a string is already correct" from "left alone
+    because nothing could be believed" is what lets the caller act on the
+    difference; both look identical in the map itself.
+
+    ``Repair.recovered`` is ``dict[str, str]`` and every value in it is a
+    VERBATIM slice of the absorbed tail (``shared.toolcall_markup`` invariant
+    D5). That is correct for the parsing layer and stays true — but it means a
+    parameter the tool declares as ``list[dict]`` receives a ``str``.
+
+    THE MEASUREMENT THAT MOTIVATES THIS FUNCTION, so a later reader does not
+    "simplify" it back out: with the recovered map applied verbatim, a repaired
+    ``escalate_info`` carrying a recovered ``evidence`` logs
+    ``repaired recovered_params=['evidence', 'suggested_action']`` and then dies
+    with ``1 validation error … / evidence / Input should be a valid list
+    [type=list_type, input_type=str]``. The tool body NEVER RUNS. For a tier
+    whose entire purpose is that the call gets through (C2 / INV-6: a lost
+    ``escalate_info`` strands a task), that is worse than no guard at all —
+    ``evidence`` is optional, so an unguarded leak at least files the
+    escalation, lossily.
+
+    Parsing belongs to ``shared.toolcall_markup``; typing a recovered value
+    against the tool that is about to receive it is a BOUNDARY concern and
+    belongs here.
+
+    UNCHANGED-ON-DOUBT IS THE DELIBERATE REFUSAL (C2 L187: nothing is
+    guessed). Every branch below that declines to decode leaves the verbatim
+    slice in place, so a value this function cannot confidently type reaches
+    pydantic and produces a legible declared-type error naming the parameter —
+    never a fabricated ``[]``, ``None`` or silently retyped value. A decode
+    failure is a failure to recover, not a licence to invent.
+
+    NEVER RAISES. It runs on a path whose outcome is already decided, and an
+    exception here would convert a repair into a crash.
+    """
+    coerced: dict[str, Any] = dict(recovered)
+    untypable: list[str] = []
+    for name, value in recovered.items():
+        accepted = _accepted_types(properties.get(name))
+
+        # No resolvable declaration, or one that admits a string: leave it. A
+        # string-typed parameter's verbatim slice is ALREADY the correct value
+        # (D5), and a union admitting a string is ambiguous — decoding text
+        # that merely happens to parse would silently retype the caller's data.
+        # NOT untypable: nothing here is in doubt.
+        if not accepted or 'string' in accepted:
+            continue
+
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            untypable.append(name)
+            continue
+
+        decoded_name = _json_type_name(decoded)
+        if decoded_name is None:
+            untypable.append(name)
+            continue
+        # 'integer' is acceptable where 'number' is declared; not the reverse.
+        if decoded_name in accepted or (
+            decoded_name == 'integer' and 'number' in accepted
+        ):
+            coerced[name] = decoded
+        else:
+            untypable.append(name)
+    return coerced, tuple(untypable)
+
 
 #: The residue escalation's category, and the machine-readable owner that will
 #: exit the hold unprompted (INV-7). This is a queue-backed handoff, so the
@@ -191,6 +365,49 @@ _ESCALATION_CATEGORY = 'mcp_markup_residue'
 _ESCALATION_OWNER = 'l2-escalation-watcher'
 _ESCALATION_LEVEL = 2
 
+# --- The record vocabulary every sink dispatches on (INV-5) ----------------
+#
+# PUBLIC and exported, because these names are read at the OTHER end of the
+# injected-sink boundary: every concrete sink branches on ``error_type`` to
+# decide which record it is holding. Spelling them at each sink is how the two
+# ends drift — a rename here would leave every sink silently taking its
+# fall-through branch, which for the residue kinds means filing a
+# maximum-severity escalation carrying an empty payload. Named once here, the
+# rename is a single edit and an import error rather than a quiet mis-file.
+
+#: A call REFUSED because the leaked fragment's boundary could not be found.
+MARKUP_UNREPAIRABLE_ERROR_TYPE = 'mcp_markup_unrepairable'
+
+#: A call FORWARDED lossily: one recovered slice could not be typed against its
+#: declared schema, so it was dropped from the call and preserved instead.
+#: FORWARD_REPAIR only — see :meth:`MarkupGuardMiddleware._preserve_unrecovered`.
+MARKUP_UNRECOVERED_PARAM_ERROR_TYPE = 'mcp_markup_unrecovered_param'
+
+#: Every kind that carries a ``raw_value`` a sink must PRESERVE. A sink matches
+#: this set rather than one name, so the kind added above cannot fall through a
+#: sink written when only the refusal kind existed.
+MARKUP_RESIDUE_ERROR_TYPES = frozenset({
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+})
+
+#: A rate alarm about the window, carrying no payload of its own.
+MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
+
+#: The queue CATEGORY a boundary guard's burst alarm is filed under — one
+#: spelling for every ``MarkupGuardMiddleware`` registration site, because a
+#: burst on the escalation server and a burst on verdict-tools are the same
+#: alarm class about the same harness leak, and an operator query or dashboard
+#: filter keyed on one must not silently miss the others. The middleware itself
+#: files nothing, so this is declared here purely so a FOURTH registration site
+#: inherits the name instead of minting a fifth spelling.
+#:
+#: ``fused_memory.server.markup_tripwire``'s ``mcp_markup_write_storm`` is
+#: DELIBERATELY not this: that tripwire fires at memory-WRITE time on content
+#: that already landed, not at an MCP tool boundary, so it is a different
+#: condition an operator triages differently.
+MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
+
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
 #: otherwise have no way to learn that its arguments were altered.
 _FORWARD_HINT = (
@@ -199,6 +416,20 @@ _FORWARD_HINT = (
     'parameters it had swallowed (see recovered_params) were restored. The '
     'call went through, but your tool-call envelope is leaking into your own '
     'payloads — fix the emission rather than relying on this repair.'
+)
+
+#: Replaces _FORWARD_HINT when a recovered parameter had to be DROPPED. It says
+#: the two things the plain hint would leave a caller to assume wrongly: the
+#: call is incomplete, and the missing value still exists somewhere.
+_UNRECOVERED_HINT = (
+    'This call carried raw MCP envelope markup and was REPAIRED in place '
+    'before dispatch, but at least one parameter the leak had swallowed could '
+    'NOT be typed against its declared schema (see unrecovered_params) and was '
+    'DROPPED — forwarding it verbatim would have failed validation and lost '
+    'the whole call. The call went through WITHOUT those parameters; their raw '
+    'values are preserved in the escalation named by unrecovered_residue_id '
+    '(null if preserving them failed too). Resend them yourself if you still '
+    'hold them, and fix the envelope leak at its emission.'
 )
 
 
@@ -241,6 +472,24 @@ class MarkupGuardMiddleware(Middleware):
 
     The storm counter is held PER INSTANCE (like ``MarkupStormCounter``), so no
     burst state bleeds between servers, or between tests in one process.
+
+    WHAT THIS GUARD COVERS is NOT a fixed list of literals. As of task **4696**
+    the boundary scan is ``detect_for(value, param)``: the shared enumeration
+    PLUS the closing tag of the argument's own name, which is the dialect the
+    fixed set could never spell and which 212 of 444 measured real corruptions
+    take. One residual is accepted by construction and is documented at
+    :meth:`_first_markup_argument`: a closer naming a DIFFERENT parameter of
+    the same tool still passes, because widening to the tool's schema would
+    put an awaited round-trip on every clean call.
+
+    EXPECTED OPERATIONAL EFFECT, stated so it is not read as a regression:
+    widening the gate converts silent writes into loud
+    ``REJECT_WITH_REPAIR`` bounces carrying ``repaired_call``, so STORM
+    ESCALATIONS BECOME MORE FREQUENT — the counter is per instance at
+    threshold 3 in 3600s, and three leaks inside one agent session is an
+    observed shape. That is INV-4 behaving correctly, and it is not
+    stop-the-line: residue and storm records file under a NON-TASK anchor
+    (PRD D9), so a leaking task is never halted by its own leak.
     """
 
     def __init__(
@@ -288,9 +537,12 @@ class MarkupGuardMiddleware(Middleware):
         Ordered so the overwhelmingly common path is cheapest. The corruption
         rate measured in PRD section 2.3 is 0.26%, and this sits on EVERY tool
         call on the server, so a clean call costs ONE scan per string argument
-        and nothing else: :func:`detect` searches the whole literal set in a
-        single compiled pass (not one pass per literal), and the awaited
-        ``get_tool`` round-trip is deferred behind that gate.
+        and nothing else: ``detect_for`` searches the literal set WIDENED BY
+        THE ARGUMENT'S OWN NAME in a single compiled pass (not one pass per
+        needle), and the awaited ``get_tool`` round-trip is still deferred
+        behind that gate — which is precisely why the scan takes the parameter
+        name, already in hand, and not the schema. See
+        :meth:`_first_markup_argument`.
         """
         name = context.message.name
         arguments = context.message.arguments or {}
@@ -398,10 +650,35 @@ class MarkupGuardMiddleware(Middleware):
         swallowed the rest of the envelope. A second hit downstream of it is
         either the same leak seen twice or a value that repair() will refuse
         anyway.
+
+        PARAMETER-AWARE, and free (task **4696**). The scan asks
+        :func:`~shared.toolcall_markup.detect_for` with the argument's OWN
+        name, so a value mis-closed with its own name-echoing tag is seen — the
+        dominant real dialect, and one the fixed literal set spells no part of.
+        The name is already the loop variable from ``arguments.items()``, so
+        this adds NO awaited schema round-trip to the 99.7% clean path; it
+        costs one frozenset build and an ``lru_cache`` hit on top of the same
+        single compiled pass. Measured over
+        ``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: of 444 corrupted
+        entries, 212 were invisible to the fixed set, and 212 of 212 of those
+        are caught by the SELF-NAME closer alone.
+
+        THE SCHEMA IS DELIBERATELY NOT PASSED, and that leaves ONE ACCEPTED
+        RESIDUAL: a CROSS-FIELD misclose — a closer naming a DIFFERENT
+        parameter of the same tool — still passes here. Widening would require
+        awaiting ``get_tool`` before the gate, i.e. on every clean call, which
+        is exactly what the ordering in :meth:`on_call_tool` exists to avoid;
+        and the same measurement puts the cross-field population at ZERO. The
+        two sites that hold their schema for free — ``plan_tools``' declared
+        repairable-field table and the sweep's ``set(working.keys())`` — DO
+        pass it, so nothing is given up where it is cheap. The residual is
+        pinned by a negative-control test
+        (``TestSelfNameCloserIsSeenAtTheBoundary``) and made countable by the
+        sweep's census, rather than left to be rediscovered as a bug.
         """
         for param, value in arguments.items():
             if isinstance(value, str):
-                pattern = detect(value)
+                pattern = detect_for(value, param)
                 if pattern is not None:
                     return param, value, pattern
         return None
@@ -438,11 +715,48 @@ class MarkupGuardMiddleware(Middleware):
 
         return _text('agent_id'), _text('project_root') or _text('project_id')
 
+    @staticmethod
+    def _subject(arguments: Mapping[str, Any]) -> tuple[str | None, str | None]:
+        """The ``(task_id, agent_role)`` the CALLER declared about itself.
+
+        A SECOND, disjoint attribution axis from :meth:`_identity`, added
+        because the first one comes back empty on exactly the servers whose
+        surfaces carry the answer. Measured: a real leaked ``escalate_info``
+        sent with ``task_id='9999'`` / ``agent_role='implementer-9999'`` filed
+        a residue record naming neither, because no tool on the escalation
+        server declares ``agent_id`` / ``project_root`` / ``project_id`` —
+        so a CRITICAL, level-2 record whose own suggested_action says "recover
+        the raw_value for the caller" named a caller no operator could
+        determine. The payload was preserved and unroutable.
+
+        ``task_id`` and ``agent_role`` are read because they are what the
+        escalation surface (``escalate_info`` / ``escalate_blocker``) and the
+        orchestrator's tool surfaces actually declare, and both are REQUIRED
+        parameters there — so on the servers where this resolves at all, it
+        resolves for every call rather than for a lucky subset.
+
+        Kept SEPARATE from ``_identity`` rather than folded into it, and the
+        distinction is not cosmetic: ``_identity`` answers "which agent process
+        is leaking", which is what the storm counter keys on and what an
+        operator chasing the harness bug needs; this answers "whose data is in
+        this record", which is what an operator RETURNING the payload needs.
+        A record can legitimately have one and not the other.
+
+        Same narrow rules as ``_identity``: arguments only, non-string values
+        yield ``None``, and nothing is guessed or defaulted — an unattributed
+        record is better than a confidently misattributed one.
+        """
+        def _text(key: str) -> str | None:
+            value = arguments.get(key)
+            return value if isinstance(value, str) else None
+
+        return _text('task_id'), _text('agent_role')
+
     # -- schema resolution ------------------------------------------------
 
     @staticmethod
-    async def _schema_params(context, name: str) -> tuple[str, ...]:
-        """The invoked tool's LIVE parameter names.
+    async def _schema_properties(context, name: str) -> Mapping[str, Any]:
+        """The invoked tool's LIVE JSON-Schema ``properties`` map.
 
         Two measured substrate facts, both of which the PRD's section 6 table
         gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
@@ -453,21 +767,32 @@ class MarkupGuardMiddleware(Middleware):
         to name has to be checked against the tool as it actually is, or the
         guard would validate against a schema that has since drifted.
 
-        Any failure to resolve one yields an EMPTY set, which makes repair()
+        Any failure to resolve one yields an EMPTY map, which makes repair()
         refuse rather than recover against a phantom schema. That is the same
         fail-safe direction ``_as_name_set`` already takes: with no schema,
         every recovered name is out-of-schema, so nothing can be fabricated.
+
+        The full map rather than only its keys, because two callers need two
+        different things out of ONE walk: :meth:`_schema_params` wants the
+        names, and :func:`_coerce_recovered` wants each parameter's declared
+        type. A second copy of this ``parameters`` -> ``properties`` traversal
+        is exactly the lock-step duplication INV-5 exists to end.
         """
         try:
             tool = await context.fastmcp_context.fastmcp.get_tool(name)
         except Exception:
             logger.exception('markup guard could not resolve the schema for %r', name)
-            return ()
+            return {}
         parameters = getattr(tool, 'parameters', None) or {}
         properties = parameters.get('properties') if isinstance(parameters, dict) else None
         if not isinstance(properties, dict):
-            return ()
-        return tuple(properties)
+            return {}
+        return properties
+
+    @classmethod
+    async def _schema_params(cls, context, name: str) -> tuple[str, ...]:
+        """The invoked tool's LIVE parameter names — the keys of the above."""
+        return tuple(await cls._schema_properties(context, name))
 
     # -- policy -----------------------------------------------------------
 
@@ -478,7 +803,8 @@ class MarkupGuardMiddleware(Middleware):
         ``get_tool`` round-trip is paid only by the 0.26% of calls that
         actually carry a leak.
         """
-        fix = repair(value, param, await self._schema_params(context, name), tuple(arguments))
+        properties = await self._schema_properties(context, name)
+        fix = repair(value, param, tuple(properties), tuple(arguments))
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
         # BEFORE its outcome is delivered. Two reasons. The detection is a fact
@@ -495,7 +821,54 @@ class MarkupGuardMiddleware(Middleware):
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
             )
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
-            await self._refuse_unrepairable(name, identity, param, value, pattern, storm)
+            await self._refuse_unrepairable(
+                name, identity, self._subject(arguments),
+                param, value, pattern, storm,
+            )
+
+        # ONE application point, serving BOTH tiers. The recovered map is typed
+        # against the invoked tool's live schema here, before either policy
+        # branch sees it, so ``_forward``'s ``arguments.update`` and
+        # ``_reject``'s ``repaired_call`` cannot disagree about what a recovered
+        # value IS. Two sites that must agree byte-for-byte is exactly the
+        # lock-step duplication this PRD exists to end (INV-5).
+        #
+        # Rebinding ``fix`` rather than threading a second map downstream: every
+        # existing consumer — ``repaired_call``, and the ``sorted(fix.recovered)``
+        # in the fact and in both the meta and error payloads — picks the coerced
+        # map up automatically, and those ``sorted`` calls read the map's KEYS,
+        # so they stay type-agnostic and still emit NAMES only, never values.
+        coerced, untypable = _coerce_recovered(fix.recovered, properties)
+
+        # A value the coercion could not type is one pydantic is CERTAIN to
+        # reject, so forwarding it forwards a DOOMED call: the tool body never
+        # runs, and for a tier whose whole purpose is that the call gets through
+        # (INV-6 — a lost escalate_info strands a task) that is the strand this
+        # tier exists to prevent, arrived at by a different road. MEASURED
+        # before this branch: a truncated `evidence` tail logged
+        # `outcome=repaired` and then died with `1 validation error … evidence:
+        # Input should be a valid list [type=list_type]`, with NO residue filed
+        # — the payload destroyed and only a pydantic error to show for it.
+        #
+        # So drop the name and let the call land LOSSILY, which is exactly what
+        # an unguarded leak would have delivered, minus the envelope markup the
+        # guard still strips from `param`. Nothing is guessed: the slice is not
+        # retyped, defaulted or invented, it is REMOVED and preserved verbatim
+        # in the residue channel below, so the payload survives a refusal the
+        # caller never sees.
+        #
+        # FORWARD_REPAIR ONLY. REJECT_WITH_REPAIR writes nothing and hands the
+        # caller a `repaired_call` to resubmit; dropping a name there would
+        # silently shrink the map the caller is told to send verbatim, turning a
+        # recoverable bounce into a quiet truncation.
+        unrecovered: dict[str, str] = {}
+        if untypable and self.policy is RepairPolicy.FORWARD_REPAIR:
+            unrecovered = {name: fix.recovered[name] for name in untypable}
+            coerced = {
+                name: value for name, value in coerced.items()
+                if name not in unrecovered
+            }
+        fix = fix._replace(recovered=coerced)
 
         # Identity from the REPAIRED view. If the leak ate the caller's own
         # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
@@ -518,7 +891,16 @@ class MarkupGuardMiddleware(Middleware):
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
         )
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity[1])
-        return await self._forward(context, call_next, arguments, param, fix, storm)
+        residue_id = None
+        if unrecovered:
+            residue_id = await self._preserve_unrecovered(
+                name, identity, self._subject({**arguments, **fix.recovered}),
+                param, pattern, unrecovered,
+            )
+        return await self._forward(
+            context, call_next, arguments, param, fix, storm,
+            unrecovered=tuple(sorted(unrecovered)), residue_id=residue_id,
+        )
 
     # -- the injected channels --------------------------------------------
 
@@ -698,7 +1080,7 @@ class MarkupGuardMiddleware(Middleware):
             return
         await self._call_sink(
             self._escalation_sink,
-            {'error_type': 'mcp_markup_storm', **storm},
+            {'error_type': MARKUP_STORM_ERROR_TYPE, **storm},
             'escalation',
         )
 
@@ -715,7 +1097,7 @@ class MarkupGuardMiddleware(Middleware):
         return payload
 
     async def _refuse_unrepairable(
-        self, name, identity, param, value, pattern, storm
+        self, name, identity, subject, param, value, pattern, storm
     ) -> NoReturn:
         """ONE refusal, shared by both tiers, when the boundary is a guess.
 
@@ -742,8 +1124,9 @@ class MarkupGuardMiddleware(Middleware):
         # leaking — an operator reading one and acting on the other would
         # otherwise be chasing two different callers.
         agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
         escalation_id = await self._file_residue_escalation({
-            'error_type': 'mcp_markup_unrepairable',
+            'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
             # queue-backed handoff to a supervised consumer, so the bound is
@@ -756,6 +1139,12 @@ class MarkupGuardMiddleware(Middleware):
             'matched_pattern': pattern,
             'agent_id': agent_id,
             'project': project,
+            # WHOSE call leaked, as the caller itself declared it. Distinct
+            # from agent_id/project above, which answer "which process is
+            # leaking"; these answer "who is waiting on this data", and on the
+            # escalation surface they are the only two that resolve at all.
+            'subject_task_id': subject_task_id,
+            'subject_agent_role': subject_agent_role,
             # FULL and VERBATIM, deliberately unlike build_markup_block's
             # 200-char content_excerpt. That excerpt is a diagnostic sitting
             # beside a payload the caller still holds; this is the only
@@ -780,7 +1169,7 @@ class MarkupGuardMiddleware(Middleware):
                 'whose own boundary cannot be determined, so no repair was '
                 'attempted.'
             ),
-            'error_type': 'mcp_markup_unrepairable',
+            'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'outcome': _OUTCOME_UNREPAIRABLE,
             'tool': name,
             'field': param,
@@ -788,7 +1177,18 @@ class MarkupGuardMiddleware(Middleware):
             'escalation_id': escalation_id,
             # NO 'repaired_call'. There is no repair, and offering one would
             # invite a retry that re-sends a guess.
-            'hint': _UNREPAIRABLE_HINT,
+            #
+            # Keyed off the SAME value that populates 'escalation_id' above,
+            # never off ``self._escalation_sink is not None``: a wired sink that
+            # RAISED (a queue I/O failure on the escalation server) or returned
+            # a non-str preserved exactly nothing, and must select the
+            # unpreserved variant too. See the constants for why the claim is
+            # conditional at all.
+            'hint': (
+                _UNREPAIRABLE_HINT_PRESERVED
+                if isinstance(escalation_id, str)
+                else _UNREPAIRABLE_HINT_UNPRESERVED
+            ),
         }, storm)))
 
     async def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
@@ -824,6 +1224,65 @@ class MarkupGuardMiddleware(Middleware):
             len(record.get('raw_value') or ''),
         )
         return escalation_id
+
+    async def _preserve_unrecovered(
+        self, name, identity, subject, param, pattern,
+        unrecovered: Mapping[str, str],
+    ) -> str | None:
+        """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
+
+        The other half of the drop above. C2 L187 binds every path this guard
+        takes, not just the refusal one: "nothing is discarded even if the
+        caller never retries". A dropped slice is a recovery that did not
+        happen, so the payload it holds gets the same treatment an unrepairable
+        one gets — the SAME residue record, through the SAME sink, carrying the
+        same owner and L2 bound (INV-7), because an operator recovering data
+        should not have to know which of two internal roads lost it.
+
+        One record per dropped NAME rather than one per call: each carries a
+        different parameter's payload, and the residue channel deliberately does
+        not dedup for exactly that reason. Returns the LAST id filed, which is
+        the one the forwarded call's warning names.
+
+        Never raises — ``_file_residue_escalation`` owns that contract, and this
+        runs on a path whose outcome (forward) is already decided.
+        """
+        agent_id, project = identity
+        subject_task_id, subject_agent_role = subject
+        residue_id = None
+        for field, raw in sorted(unrecovered.items()):
+            residue_id = await self._file_residue_escalation({
+                # A DISTINCT error_type from the refusal's, because the two
+                # differ in the one way that matters to whoever reads the queue:
+                # this call SUCCEEDED, lossily, and no caller was bounced — so
+                # nobody is waiting on a retry, and nobody was told.
+                'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+                'category': _ESCALATION_CATEGORY,
+                'owner': _ESCALATION_OWNER,
+                'level': _ESCALATION_LEVEL,
+                'tool': name,
+                'field': field,
+                'matched_pattern': pattern,
+                'agent_id': agent_id,
+                'project': project,
+                # Same two axes as the refusal record carries, for the same
+                # reason: nobody was BOUNCED on this path, so the subject is
+                # the only route back to a caller that was never told.
+                'subject_task_id': subject_task_id,
+                'subject_agent_role': subject_agent_role,
+                'raw_value': raw,
+                'summary': (
+                    f'Recovered {name}.{field} could not be typed against its '
+                    f'declared schema — the call was forwarded WITHOUT it and '
+                    f'the value preserved here'
+                ),
+                'suggested_action': (
+                    f'Recover the raw_value into {name}.{field} if it is still '
+                    'needed — the caller was not told it was dropped — then '
+                    'chase the harness serialization leak that produced it.'
+                ),
+            })
+        return residue_id
 
     def _reject(self, name, arguments, param, fix, storm) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
@@ -873,7 +1332,10 @@ class MarkupGuardMiddleware(Middleware):
             'hint': _REJECT_HINT,
         }, storm)))
 
-    async def _forward(self, context, call_next, arguments, param, fix, storm):
+    async def _forward(
+        self, context, call_next, arguments, param, fix, storm,
+        *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
+    ):
         """Repair in place, let the call through, and say so.
 
         The mutation is IN PLACE on ``context.message.arguments``, which is
@@ -901,6 +1363,11 @@ class MarkupGuardMiddleware(Middleware):
         invisible must not also be the one tier that is never told.
         """
         arguments[param] = fix.clean_value
+        # Already typed against the invoked tool's live schema by
+        # :meth:`_handle_markup`, which applies :func:`_coerce_recovered` ONCE
+        # for both tiers. A verbatim str slice landing in a list-typed
+        # parameter does not coerce — pydantic raises ``list_type`` and the
+        # tool body never runs, which for this tier is worse than no guard.
         arguments.update(fix.recovered)
 
         result = await call_next(context)
@@ -917,6 +1384,13 @@ class MarkupGuardMiddleware(Middleware):
             'recovered_params': sorted(fix.recovered),
             'hint': _FORWARD_HINT,
         }, storm)
+        # Omitted when empty, the same convention `storm` follows: a key that is
+        # always present teaches a reader to skip it, and this one must be read.
+        if unrecovered:
+            # NAMES only here too. The values went to the residue channel.
+            meta['markup_repair']['unrecovered_params'] = list(unrecovered)
+            meta['markup_repair']['unrecovered_residue_id'] = residue_id
+            meta['markup_repair']['hint'] = _UNRECOVERED_HINT
         return ToolResult(
             content=result.content,
             structured_content=result.structured_content,

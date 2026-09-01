@@ -10,7 +10,7 @@
 # misclassification — see task 2446 / precedent 1852.
 
 # Verification commands
-test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=short -q"
+test_command: "uv run --directory cockpit pytest tests/ --tb=short -q"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks).
 # NOTE: `--directory cockpit` scopes only the `uv run ruff` invocation; the
 # chained `python3 fused-memory/scripts/...` call is a separate process whose
@@ -21,8 +21,8 @@ test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=s
 # long as lint_command keeps being invoked that way — same assumption
 # shared/orchestrator.yaml and dashboard/orchestrator.yaml make for their
 # identical chained check_bare_magicmock_config.py call.
-lint_command: "uv run --project cockpit --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
-type_check_command: "uv run --project cockpit --directory cockpit pyright src/ tests/"
+lint_command: "uv run --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
+type_check_command: "uv run --directory cockpit pyright src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, cockpit declared nothing
 # here and fell HARD through to the repo-root whole-fleet ceiling.

@@ -17,6 +17,20 @@ their test suites assert that structurally. Do not re-introduce a second copy
 of the label pattern anywhere: a vocabulary that exists twice drifts, and the
 drift is invisible until a destructive consumer acts on the stale half.
 
+The same rule governs the vocabulary's CAPTURE classes, which is why the digit
+captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
+rather than re-narrowed per caller. Scoped to CAPTURES on purpose, and not to
+every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad (see
+the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is ASCII-explicit
+exactly where a character reaches a consumer as DATA, and broad where it only
+decides whether to refuse. Before that,
+utils/referent_resolution._is_task_number was the only guard enforcing "a
+Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
+(task 3668) — so the DECLARED path refused what this DERIVED path happily
+minted. That guard STAYS: it covers a STRUCTURED, caller-supplied number that
+never passes through these patterns, so it is a different input channel, not a
+duplicate to delete.
+
 This module is a dependency-free leaf — it imports only stdlib and
 utils/validation (itself a leaf) — so it can be imported from both the
 services write path and any future reconciliation sweep without import
@@ -94,14 +108,45 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # _LOCAL_MENTION_PATTERN, where the same widening had a live consequence). The
 # whitespace branch keeps '\s+' VERBATIM from the ancestor pattern: narrowing it
 # would be an equally undeclared change in the opposite direction.
-_TASK_NODE_NAME_PATTERN = re.compile(r'^\s*tasks?(?:[ \t]*[#:][ \t]*|\s+)(\d+)\s*$', re.IGNORECASE)
+#
+# The digit class is '[0-9]', NOT '\d'. Measured, not stylistic: Python's re
+# matches every Unicode DECIMAL digit with '\d' on a str pattern, so
+# 'task \u0663' (ARABIC-INDIC DIGIT THREE) parsed as a task whose number was that
+# character and rendered a 'Task \u0663' node name. That is a false POSITIVE
+# against this module's precision-over-recall contract — the opposite direction
+# from the blind spots scan_content enumerates, every one of which is a recall
+# loss — and it is the DERIVED path minting exactly what the DECLARED path
+# already refuses: referent_resolution._is_task_number guards its bare-digit
+# branch with 'text.isascii() and text.isdigit()' (task 3668), saying "a Unicode
+# digit is not a task id". Narrowing it HERE means no consumer has to re-narrow
+# it per caller. An explicit class rather than re.ASCII, which would silently
+# re-scope this pattern's '\s' too.
+_TASK_NODE_NAME_PATTERN = re.compile(
+    r'^\s*tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$', re.IGNORECASE
+)
 
 # The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
 # name, '<project_id>:<task_number>'. Shares that pattern's letter-start and
 # >=3-character qualifier rules, so clock times ('12:30') and short non-project
 # tokens ('w6:2', 'py:3') never parse as a project. Case-SENSITIVE start class
 # with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
-_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)\s*$')
+#
+# The digit class is '[0-9]', NOT '\d', for the reason recorded on
+# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:\u0663' parsed to
+# Referent(project_id='reify', number='\u0663'). The qualifier class was already
+# ASCII-explicit, so the digit capture was the last Unicode-permissive CAPTURE
+# class in the vocabulary — captures only, and deliberately so. Every pattern
+# here still pads with '\s', and the mention patterns' lookbehinds still use
+# '\w', both of which stay Unicode-broad: measured on this branch,
+# 'task\u00a0132' and 'reify\u00a0:\u00a0132' (NBSP; likewise U+2003 EM SPACE and
+# U+2007 FIGURE SPACE) still parse to number '132'. That breadth is safe here:
+# padding breadth costs at most an exotic SPELLING of a number that is itself
+# ASCII and names a real node, while a lookaround only ever REFUSES a match, so
+# its breadth is precision, never recall loss. Only a CAPTURE hands
+# the character onward as data, which is why the fix is an explicit class and
+# not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
+# separately-reasoned axes for the price of one.
+_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*([0-9]+)\s*$')
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
 # the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
@@ -127,8 +172,21 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   'multitask 3', 'reify-task 12') and — decisively for the colon form — the
 #   'task: N' substring INSIDE 'subtask: N', which would otherwise suppress a
 #   real foreign ref.
+# - The digit class is '[0-9]', NOT '\d', for the reason recorded on
+#   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
+#   pattern, so 'blocked on task \u0663 for now' yielded a referent numbered with
+#   that character — a false positive against this module's
+#   precision-over-recall contract, and the derived-path twin of the
+#   isascii()-guarded refusal at referent_resolution._is_task_number (task 3668).
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
-#   captured.
+#   captured. It is deliberately left BROAD — '\d', not '[0-9]' — even though the
+#   capture class narrowed. Measured: with '(?![0-9])' a MIXED run like
+#   'task 12\u0663' still matches and captures '12', which is precisely the
+#   truncated prefix this clause exists to prevent, and it is strictly worse than
+#   the bug being narrowed away — 'Task \u0663' is obvious junk, while 'Task 12'
+#   names a REAL node a destructive consumer will act on. Left broad, a mixed run
+#   yields nothing at all. A lookaround only ever REFUSES a match, so its Unicode
+#   breadth is precision, never recall loss.
 # - The '#'/':' branch is padded with '[ \t]', NOT '\s', so a mention can never
 #   span a line break. This is measured, not stylistic: '\s' matches '\n', so
 #   '\s*[#:]\s*' read a markdown heading across a paragraph break as a mention —
@@ -146,7 +204,7 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])tasks?(?:[ \t]*[#:][ \t]*|\s+)(\d+)(?!\d)', re.IGNORECASE
+    r'(?<![\w:-])tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)', re.IGNORECASE
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
@@ -188,10 +246,20 @@ _LOCAL_MENTION_PATTERN = re.compile(
 #   any qualified referent and would equally return None if the name stopped
 #   parsing; the value of closing it is coherence, before a consumer that acts
 #   on qualified node names lands.
+# - The digit class is '[0-9]', NOT '\d', for the reason recorded on
+#   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
+#   pattern, so 'see reify:\u0663 now' scanned from another group yielded a
+#   FOREIGN referent numbered with that character.
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
-#   captured.
+#   captured, and is deliberately left BROAD for the reason recorded on
+#   _LOCAL_MENTION_PATTERN — but the stakes are higher here. Measured: with
+#   '(?![0-9])' the mixed run 'reify:12\u0663' matches and captures
+#   ('reify', '12'), which is not mangled junk but a fully well-formed foreign
+#   referent naming the WRONG task — exactly the misattribution the consumer's
+#   destructive edge surgery exists to prevent, and one it would instead
+#   perform. Left broad, a mixed run yields nothing at all.
 _QUALIFIED_REF_PATTERN = re.compile(
-    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*(\d+)(?!\d)'
+    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)(?!\d)'
 )
 
 
@@ -461,7 +529,12 @@ def scan_content(
     KNOWN BLIND SPOTS, so no reader assumes completeness: a node named with
     bare digits ('1251'), a reference made by task TITLE rather than number,
     and Greek-letter or codename aliases are all invisible here by design.
-    Recall is the consumer's problem; precision is this module's.
+    A task number written in NON-ASCII digits ('task \u0663', 'reify:\u0663') is
+    likewise invisible, and so is a MIXED run ('task 12\u0663', which yields
+    nothing rather than a truncated 'Task 12') — the deliberate, negligible
+    recall loss that is the price of the ``[0-9]`` capture classes above, which
+    exist because '\\d' matched those spellings and minted referents naming no
+    task at all. Recall is the consumer's problem; precision is this module's.
 
     One blind spot was MEASURED and accepted rather than merely designed
     around: a genuine qualified ref split across lines by HARD WRAPPING is

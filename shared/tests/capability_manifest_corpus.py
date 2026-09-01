@@ -21,7 +21,7 @@ repo. Measured from the main checkout (``/home/leo/src/dark-factory``):
 in-flight task's checkout. An rglob-based guard would validate thousands of
 unrelated working copies and go red on other tasks' in-progress edits, so
 discovery is ``git ls-files``-based instead — the same shape as
-``fused-memory/tests/test_lock_charter_guard.py``'s ``_tracked_paths()``.
+``fused-memory/tests/test_lock_charter_guard.py``'s ``_tracked_entries()``.
 """
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
     Uses ``git ls-files`` rather than ``Path.rglob`` — see module docstring
     for why. Returns ``None`` for every condition :class:`GitUnavailable`
     covers: *repo_root* not being a git checkout (``git ls-files`` exits
-    non-zero, mirroring ``test_lock_charter_guard.py``'s ``_tracked_paths()``),
+    non-zero, mirroring ``test_lock_charter_guard.py``'s ``_tracked_file_paths()``),
     a missing/unrunnable binary, or a wedge past the 30s timeout.
 
     The collapse to ``None`` is deliberate *here* specifically:

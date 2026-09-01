@@ -32,6 +32,7 @@ import os
 import pathlib
 import re
 import shlex
+import sys
 import tomllib
 
 import yaml
@@ -422,6 +423,136 @@ def test_per_module_merge_verify_raises_per_test_timeout() -> None:
             )
 
 
+#: Shell operators that end one `uv run` invocation and begin another. A
+#: pairing is only self-defeating WITHIN a single clause, so the scan resets
+#: at each of these rather than pooling flags across an `&&`-chain (every
+#: subproject's lint_command chains a `python3 .../check_*.py` sibling gate).
+_CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|"})
+
+#: The two spellings uv accepts for a value-taking long flag. The sibling
+#: parser in ``test_skills_module_config_decision.py`` (``_pytest_collected_dirs``)
+#: already handles ``--directory`` this way; mirrored here for BOTH flags so a
+#: future ``--project=X --directory=X`` cannot slip past the guard.
+_UV_VALUE_FLAGS = ("--project", "--directory")
+
+
+def _uv_same_value_flag_pairings(cmd: str, *, label: str) -> list[str]:
+    """Every value ``V`` for which one clause of *cmd* passes BOTH flags as ``V``.
+
+    Returns the offending values (usually at most one per clause). A clause
+    that sets only one of the two, or sets them to DIFFERENT values, is not
+    reported: ``--project shared --directory scripts`` means "run from
+    ``scripts/`` against ``shared``'s project", which is a genuinely different
+    and legitimate instruction, not the self-defeating same-value pairing.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError as exc:
+        raise AssertionError(
+            f"{label} is not shell-parseable ({exc.__class__.__name__}: {exc}); "
+            f"command: {cmd!r}.\nFIX: repair that config. Skipping an unparseable "
+            f"command would silently defeat this guard — an unquoted config would "
+            f"be indistinguishable from a clean one."
+        ) from exc
+
+    pairings: list[str] = []
+    seen: dict[str, str] = {}
+
+    def _end_clause() -> None:
+        project, directory = seen.get("--project"), seen.get("--directory")
+        if project is not None and project == directory:
+            pairings.append(project)
+        seen.clear()
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _CHAIN_OPERATOR_TOKENS:
+            _end_clause()
+        else:
+            for flag in _UV_VALUE_FLAGS:
+                if token == flag and index + 1 < len(tokens):
+                    seen[flag] = tokens[index + 1]
+                    index += 1
+                    break
+                if token.startswith(f"{flag}="):
+                    seen[flag] = token[len(flag) + 1 :]
+                    break
+        index += 1
+    _end_clause()
+    return pairings
+
+
+def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
+    """No module verify command may pass ``--project V`` and ``--directory V`` together.
+
+    Task 3830. The pairing is SELF-DEFEATING, not merely redundant: uv applies
+    ``--directory V`` FIRST (the process cwd becomes ``V/``) and only then
+    resolves ``--project V`` — against that NEW cwd — so it looks for ``V/V``,
+    which does not exist. uv 0.11.6 emits::
+
+        warning: Project directory `shared` does not exist. This will become an
+        error in a future release.
+
+    It is a warning today and the command still runs, which is exactly what
+    makes it worth guarding: nothing goes red until the uv release that
+    promotes it to an error, at which point EVERY module verify command breaks
+    simultaneously — and the repo root sets ``merge_verify_breadth: "full"``,
+    so that is a repo-wide merge outage rather than one subproject's problem.
+
+    The set of configs is DISCOVERED (``_discover_per_module_configs`` ->
+    the production walk), so a newly-added subproject is auto-covered at any
+    depth with no edit here. All three command slots are checked, because the
+    defect is per-command, not per-module. No exclusions frozenset: task 3830
+    fixed all 21 sites at once, leaving nothing to carve out.
+    """
+    discovered = _discover_per_module_configs()
+
+    # Same discovery floor as the timeout guard above: if a known config stops
+    # resolving, the loop below would vacuously pass on a shrunken set.
+    missing = KNOWN_PER_MODULE_CONFIG_NAMES - set(discovered)
+    assert not missing, (
+        "dynamic discovery (config._discover_module_configs, filtered to "
+        f"configs defining a test_command) failed to resolve known per-module "
+        f"config(s) {sorted(missing)} (task 3830) — discovery has regressed; "
+        f"discovered: {sorted(discovered)}"
+    )
+
+    offenders: list[str] = []
+    for prefix, module_config in sorted(discovered.items()):
+        for slot in ("test_command", "lint_command", "type_check_command"):
+            cmd = getattr(module_config, slot)
+            if cmd is None:
+                continue
+            label = f"{prefix}/orchestrator.yaml::{slot}"
+            for value in _uv_same_value_flag_pairings(cmd, label=label):
+                offenders.append(f"  {label} pairs --project {value} with --directory {value}")
+
+    assert not offenders, (
+        f"{len(offenders)} module verify command(s) pair `--project V` with "
+        "`--directory V` for the same V (task 3830):\n"
+        + "\n".join(offenders)
+        + "\n\nWHY THIS IS WRONG: uv applies `--directory V` first (cwd becomes "
+        "V/), then resolves `--project V` against that NEW cwd — looking for "
+        "V/V, which does not exist. uv 0.11.6 warns 'This will become an error "
+        "in a future release'; when it does, every one of these breaks at once, "
+        "and the repo root's merge_verify_breadth: \"full\" makes that a "
+        "repo-wide merge outage.\n\n"
+        "FIX: delete the `--project V ` token and KEEP `--directory V`. The "
+        "in-repo worked examples of an unpaired command are "
+        "scripts/orchestrator.yaml and tests/scripts/orchestrator.yaml.\n\n"
+        "Do NOT 'fix' this the other way by deleting `--directory` instead: cwd "
+        "is load-bearing. pyright resolves `[tool.pyright]` from its cwd, and "
+        "each module's own table carries a `venvPath`/`venv` interpreter pin "
+        "that is resolved RELATIVE TO THAT FILE'S DIRECTORY (plus, for "
+        "orchestrator, module-specific extraPaths). Moving cwd to the repo root "
+        "silently substitutes the ROOT pyright config for the module's own — "
+        "which type-checks green against the wrong settings, the false-GREEN "
+        "direction (its own comment records 'measured 496 phantom "
+        "reportMissingImports here, 0 with this pin')."
+    )
+
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
@@ -497,16 +628,17 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     )
 
     # Internal coherence: a cold run does strictly MORE work than a warm one —
-    # the same chain PLUS verify_cold_preprovision_command (uv sync
-    # --all-packages) — so a warm ceiling above the cold one is incoherent by
-    # construction, regardless of what either value is.
+    # the same chain PLUS verify_cold_preprovision_command (`uv sync
+    # --all-packages && npm ci …`; task 4538 added the npm clause that installs
+    # the pinned pyright the TYPE chain resolves) — so a warm ceiling above the
+    # cold one is incoherent by construction, regardless of either value.
     cold = budgets['verify_cold_command_timeout_secs']
     assert warm <= cold, (
         f'verify_command_timeout_secs={warm} exceeds '
         f'verify_cold_command_timeout_secs={cold} (task 3350). A cold verify runs '
-        'the same command chain plus the uv sync --all-packages preprovision, so '
-        'it is strictly more expensive; a warm budget above the cold one is '
-        'incoherent by construction'
+        'the same command chain plus the verify_cold_preprovision_command '
+        'preprovision (uv sync + npm ci), so it is strictly more expensive; a '
+        'warm budget above the cold one is incoherent by construction'
     )
 
 
@@ -690,7 +822,7 @@ class TestWorkspacePyrightInterpreterPinned:
     covered only the 3 directories ``type_check_command`` happened to ``cd``
     into, leaving the hole one config edit away from reopening: ``shared`` and
     ``escalation`` were type-checked only through their own
-    ``<sub>/orchestrator.yaml`` ``uv run --project X --directory X pyright``
+    ``<sub>/orchestrator.yaml`` ``uv run --directory X pyright``
     commands, where uv (not ``[tool.pyright]``) supplies the interpreter, and
     ``sampler``/``cockpit``/``dashboard`` weren't in the fleet chain at all.
     Task 3397 extended the fleet chain to all 7 workspace members, so today
@@ -887,9 +1019,10 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
         assert warm <= cold, (
             f"verify_command_timeout_secs={warm} exceeds "
             f"verify_cold_command_timeout_secs={cold} (task 3397). A cold "
-            "verify runs the same chains plus the uv sync --all-packages "
-            "preprovision, so it is strictly more expensive; a warm budget "
-            "above the cold one is incoherent by construction"
+            "verify runs the same chains plus the "
+            "verify_cold_preprovision_command preprovision (uv sync + npm ci), "
+            "so it is strictly more expensive; a warm budget above the cold one "
+            "is incoherent by construction"
         )
 
     def test_type_chain_table_matches_the_chain_it_measures(self) -> None:
@@ -1046,4 +1179,158 @@ class TestFleetLintCoversEveryWorkspaceMember:
                 f"names {target!r}, which does not exist under {REPO_ROOT} "
                 "(task 3397) — this would make the script exit non-zero on "
                 f"every fallback/merge-queue verify; targets: {targets}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Pyright scope parity: members importing a scripts/-only module (task 3931)
+# ---------------------------------------------------------------------------
+
+# Floor for the discovery below. NOT the authoritative list — the importing
+# members are DISCOVERED at runtime by scanning member sources, so a NEW
+# member that starts importing a ``scripts/``-only module is covered on day
+# one. This floor only proves the scan still resolves the member we know
+# imports one (``orchestrator/tests/test_run_vllm_eval.py`` imports
+# ``run_vllm_eval``), so a scan that silently stops matching anything fails
+# loudly instead of passing vacuously.
+KNOWN_SCRIPTS_IMPORTING_MEMBERS = frozenset({"orchestrator"})
+
+
+def _scripts_only_module_stems() -> set[str]:
+    """Top-level module names importable ONLY from repo-root ``scripts/``.
+
+    ``scripts/*.py`` stems, minus (a) non-identifier stems (``wait-for-port``
+    et al. are runnable files, never importable modules), (b) stdlib names,
+    and (c) any stem that is ALSO a top-level module/package under a workspace
+    member's ``src/`` or at the repo root — those resolve for pyright through
+    an existing ``extraPaths`` entry and say nothing about ``scripts/``.
+    """
+    stems = {p.stem for p in (REPO_ROOT / "scripts").glob("*.py") if p.stem.isidentifier()}
+    resolvable_elsewhere: set[str] = {p.stem for p in REPO_ROOT.glob("*.py")}
+    for member in _workspace_member_dirs():
+        src = REPO_ROOT / member / "src"
+        if not src.is_dir():
+            continue
+        resolvable_elsewhere |= {
+            child.stem if child.suffix == ".py" else child.name for child in src.iterdir()
+        }
+    return stems - set(sys.stdlib_module_names) - resolvable_elsewhere
+
+
+def _members_importing_scripts_only_modules() -> dict[str, set[str]]:
+    """Map each workspace member to the ``scripts/``-only modules its own files import."""
+    stems = _scripts_only_module_stems()
+    assert stems, (
+        "no repo-root scripts/ module is importable-only-from-scripts (task "
+        "3931) — this scope-parity invariant would pass vacuously"
+    )
+    pattern = re.compile(
+        r"^[ \t]*(?:import|from)[ \t]+(" + "|".join(sorted(map(re.escape, stems))) + r")\b",
+        re.MULTILINE,
+    )
+    found: dict[str, set[str]] = {}
+    for member in _workspace_member_dirs():
+        member_dir = REPO_ROOT / member
+        if not member_dir.is_dir():
+            # Presence tolerance, per TestWorkspacePyrightInterpreterPinned: a
+            # member genuinely absent from this checkout is skipped, not failed.
+            continue
+        for path in member_dir.rglob("*.py"):
+            if ".venv" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for match in pattern.finditer(text):
+                found.setdefault(member, set()).add(match.group(1))
+    return found
+
+
+def _assert_pyright_resolves_scripts(rel_dir: str, pyright: dict, why: str) -> None:
+    """Assert *rel_dir*'s ``[tool.pyright] extraPaths`` resolves repo-root ``scripts/``.
+
+    Modelled on ``_assert_pyright_pins_worktree_venv`` above (task 3367): one
+    shared assertion carrying the caller's context through ``why=``, so the
+    per-member invariant here and the module-local guard in
+    ``orchestrator/tests/test_run_vllm_eval.py`` state the same property and
+    cannot drift apart.
+
+    Asserted by RESOLUTION, never by string equality: ``../scripts`` and any
+    other spelling landing on the same directory both pass.
+    """
+    extra_paths = pyright.get("extraPaths")
+    assert extra_paths, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] declares no extraPaths (task "
+        f"3931). {why}"
+    )
+    scripts_dir = (REPO_ROOT / "scripts").resolve()
+    resolved = [(REPO_ROOT / rel_dir / entry).resolve() for entry in extra_paths]
+    assert scripts_dir in resolved, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] extraPaths {list(extra_paths)!r} "
+        f"contains no entry resolving to {scripts_dir} (task 3931, esc-3805-1 "
+        f"2026-08-09 / esc-3805-6 2026-08-12). {why} The root pyproject.toml's "
+        "extraPaths DOES list 'scripts', so ROOT-scoped pyright resolves the "
+        "import and reports real errors that PACKAGE-scoped pyright cannot see "
+        "— MEASURED at 1.1.408 with hotfix 27ac22a6a6 reverse-applied: 14 "
+        "reportArgumentType errors root-scoped, 0 package-scoped. verify's "
+        "FILE_SCOPED fallback runs pyright from the worktree ROOT while "
+        "pre-commit (hooks/project-checks) and the fleet chain run it "
+        "PACKAGE-scoped, so without this entry the two gates disagree about "
+        f"whether the same file type-checks; resolved: {[str(p) for p in resolved]}"
+    )
+
+
+class TestMembersImportingScriptsResolveScriptsOnTheirPyrightPath:
+    """A member importing a ``scripts/``-only module must resolve ``scripts/`` itself.
+
+    Task 3931 — the CHAIN-INDEPENDENT generalisation of the module-local guard
+    in ``orchestrator/tests/test_run_vllm_eval.py``, in the same spirit as
+    ``TestWorkspacePyrightInterpreterPinned`` generalising the fleet-chain
+    interpreter pin: that guard names one module in one package, this one holds
+    for every workspace member, discovered at runtime.
+
+    The property: if a member's OWN sources import a top-level module that
+    exists only under repo-root ``scripts/``, then package-scoped pyright must
+    be able to resolve it — otherwise the imported names degrade to ``Unknown``
+    and every defect involving them goes unreported in that scope, while the
+    root-scoped verify gate (whose config lists ``scripts``) still reports
+    them. That asymmetry IS esc-3805-1/esc-3805-6.
+
+    Presence-tolerant and MEMBERSHIP-only (never list equality — the rule stated at
+    tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports),
+    so an unrelated extraPaths addition does not false-red this guard.
+    """
+
+    def test_members_importing_scripts_modules_resolve_scripts(self) -> None:
+        importing = _members_importing_scripts_only_modules()
+        assert importing, (
+            "no workspace member was found importing a repo-root scripts/-only "
+            "module (task 3931) — either the scan stopped matching (an import "
+            "spelling it cannot see) or the import genuinely went away; both "
+            "need an explicit decision, not a silently vacuous guard"
+        )
+        missing = KNOWN_SCRIPTS_IMPORTING_MEMBERS - set(importing)
+        assert not missing, (
+            f"runtime discovery failed to resolve known scripts/-importing "
+            f"member(s) {sorted(missing)} (task 3931); discovered: "
+            f"{ {k: sorted(v) for k, v in importing.items()} }"
+        )
+
+        for member, modules in sorted(importing.items()):
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                continue
+            pyright = _pyproject_at(member).get("tool", {}).get("pyright")
+            if pyright is None:
+                # A member that never runs pyright has no search path to widen.
+                continue
+            _assert_pyright_resolves_scripts(
+                member,
+                pyright,
+                why=(
+                    f"{member!r} imports {sorted(modules)!r}, which exist(s) "
+                    "ONLY under repo-root scripts/, so package-scoped pyright "
+                    "can resolve the import only via an extraPaths entry "
+                    "pointing there."
+                ),
             )

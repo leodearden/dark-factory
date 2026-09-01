@@ -533,6 +533,15 @@ class TestWriteTriageLeavesAreGreenTier:
         'write_triage.t_high',
         'write_triage.t_low',
         'write_triage.calibration_report_path',
+        # Operator knobs (task 3127, PRD leaf beta), green-tier for a
+        # DIFFERENT reason than their calibrated siblings above. `enabled` is
+        # the staged-rollout kill switch: it is what an operator flips to stop
+        # an in-flight triage incident, and a restart-only kill switch is no
+        # kill switch (the mem0_update.enabled lesson, reload.py). `candidate_k`
+        # is the retrieval width, tuned against measured recall on a running
+        # server rather than by redeploying.
+        'write_triage.enabled',
+        'write_triage.candidate_k',
     )
 
     @pytest.mark.parametrize('path', PATHS)
@@ -545,6 +554,8 @@ class TestWriteTriageLeavesAreGreenTier:
             ('write_triage.t_high', 0.87),
             ('write_triage.t_low', 0.61),
             ('write_triage.calibration_report_path', 'calibration/report.json'),
+            ('write_triage.enabled', True),
+            ('write_triage.candidate_k', 37),
         ],
     )
     def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
@@ -552,7 +563,15 @@ class TestWriteTriageLeavesAreGreenTier:
         fresh = FusedMemoryConfig()
         field = path.split('.', 1)[1]
         old = getattr(live.write_triage, field)
-        assert old is None, 'the uncalibrated default is None'
+        # The precondition this needs is only that the leaf actually CHANGES —
+        # diff_config reports nothing otherwise and the lookup below raises
+        # KeyError on a test that is not about that. It used to be spelled
+        # `old is None`, which stopped being true of the whole section when the
+        # operator knobs landed with real defaults (there is no such thing as
+        # an uncalibrated kill switch). The `defaults to None` invariant for
+        # the three CALIBRATED fields is pinned where it belongs, in
+        # test_config_schema.py::TestWriteTriageConfig.
+        assert old != new_value, f'{path} must actually change for this to assert anything'
         object.__setattr__(fresh.write_triage, field, new_value)
 
         d = diff_config(live, fresh)
@@ -562,6 +581,105 @@ class TestWriteTriageLeavesAreGreenTier:
         )
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
+
+
+class TestWriteTriageJudgeLeavesAreGreenTier:
+    """The judge knobs (task 3128, PRD leaf gamma) are ALL green tier.
+
+    The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
+    rather than listed by hand, and that inversion is the whole point: a
+    SEVENTH ``judge_*`` leaf added later without a reload registration fails
+    here instead of silently degrading to restart-only. ``config/reload.py``
+    states the rule its own way — "anything absent from this frozenset
+    silently degrades to restart-only" — and a kill switch that quietly needs
+    a restart is no kill switch, because the operator believes they turned it
+    off.
+
+    Follows ``TestTopicAnchoredRecallReloadTier``'s shape: the classification
+    test is paired with the live-read test that EARNS the classification.
+    Green tier is not assertable on its own — a value captured at
+    construction cannot observe an in-place mutation, and would have to stay
+    restart-only however it were registered here.
+    """
+
+    #: Every judge leaf the schema declares, discovered rather than restated.
+    JUDGE_FIELDS = tuple(sorted(
+        name for name in FusedMemoryConfig().write_triage.__class__.model_fields
+        if name.startswith('judge_')
+    ))
+
+    def test_the_schema_actually_declares_judge_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.JUDGE_FIELDS) >= 6, self.JUDGE_FIELDS
+
+    @pytest.mark.parametrize('field', JUDGE_FIELDS)
+    def test_every_judge_leaf_is_allowlisted(self, field):
+        path = f'write_triage.{field}'
+        assert path in RELOADABLE_FIELDS, (
+            f'{path} must be allowlisted for hot-reload — an unregistered leaf '
+            'silently degrades to restart-only, and a restart-only judge kill '
+            'switch is no kill switch'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'new_value'),
+        [
+            ('judge_enabled', False),
+            ('judge_provider', 'anthropic'),
+            ('judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 3.5),
+            ('judge_candidate_count', 3),
+            ('judge_accuracy_report_path', 'calibration/judge_report.json'),
+        ],
+    )
+    def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'write_triage.{field}'
+        old = getattr(live.write_triage, field)
+        assert old != new_value, f'{path} must actually change for this to assert anything'
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    @pytest.mark.parametrize(
+        ('field', 'resolver_name', 'new_value'),
+        [
+            ('judge_enabled', 'resolve_judge_enabled', False),
+            ('judge_provider', 'resolve_judge_provider', 'anthropic'),
+            ('judge_model', 'resolve_judge_model', 'gpt-4.1-nano'),
+            ('judge_timeout_seconds', 'resolve_judge_timeout', 3.5),
+            ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
+        ],
+    )
+    def test_an_applied_reload_is_observed_by_the_live_resolver(
+        self, field, resolver_name, new_value,
+    ):
+        """The live-read property that MAKES the green-tier classification honest.
+
+        `judge_accuracy_report_path` has no resolver by design — it is a
+        traceability pointer read by the operator and the eval's own test, not
+        by the write path — so it is covered by the allowlist and
+        applied-candidate legs above and not by this one.
+        """
+        from fused_memory.server import write_triage_judge
+
+        resolver = getattr(write_triage_judge, resolver_name)
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolver(memory_service) != new_value
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert f'write_triage.{field}' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolver(memory_service) == new_value
 
 
 class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
@@ -639,3 +757,96 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         apply_reload(live, fresh)
 
         assert live.write_triage.t_high_by_category == self.SYNTHETIC
+
+
+class TestTopicAnchoredRecallReloadTier:
+    """The topic pin's kill switch is GREEN TIER (task 3111).
+
+    Green-tier classification is EARNED, not asserted: a knob captured by value
+    at construction would not observe an in-place reload and would have to stay
+    restart-only (config/reload.py's module docstring states the rule). So the
+    classification test is paired with the live-consumer test that justifies it.
+    """
+
+    def test_classified_hot_reloadable_not_restart_required(self):
+        """RED while the field is absent from RELOADABLE_FIELDS — it buckets as restart."""
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.reconciliation.topic_anchored_recall_enabled
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates['reconciliation.topic_anchored_recall_enabled'] == {
+            'old': old,
+            'new': not old,
+        }
+        assert 'reconciliation.topic_anchored_recall_enabled' not in d.restart_required
+
+    def test_flip_observed_by_live_resolver_without_reconstruction(self):
+        """The live-read property that MAKES the green-tier classification honest."""
+        from fused_memory.services.topic_anchor import resolve_topic_anchor_enabled
+
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert memory_service.config.reconciliation.topic_anchored_recall_enabled is True
+        assert resolve_topic_anchor_enabled(memory_service) is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.topic_anchored_recall_enabled' in report['applied']
+        # No service reconstruction: the SAME object now resolves differently.
+        assert resolve_topic_anchor_enabled(memory_service) is False
+
+    @pytest.mark.asyncio
+    async def test_flip_changes_the_next_searchs_behaviour(self, mock_config):
+        """End of the chain: the in-place flip changes real search behaviour.
+
+        Asserts on the observable consequence — whether the metadata lookup is
+        made at all — rather than on the resolver's return value, so this
+        cannot pass while the search path ignores the knob.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from _fm_helpers import install_identity_mocks
+
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        service.graphiti = MagicMock()
+        service.graphiti.search = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        install_identity_mocks(service.graphiti)
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': [{
+            'id': 'sibling-1',
+            'memory': 'a narrow sibling',
+            'score': 0.85,
+            'metadata': {'category': 'procedural_knowledge', 'topic': 'topic-a'},
+        }]})
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        async def _search() -> None:
+            # Spelled out rather than splatted from a dict: a heterogeneous
+            # dict literal infers `str | list[str] | int` for every value and
+            # pyright rejects the splat against search's real signature.
+            await service.search(
+                query='q',
+                project_id='dark_factory',
+                categories=['procedural_knowledge'],
+                stores=['mem0'],
+                limit=5,
+            )
+
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.reconciliation, 'topic_anchored_recall_enabled', False)
+        apply_reload(service.config, fresh)
+
+        # Same service object, no reconstruction — the next search skips the I/O.
+        await _search()
+        assert service.mem0.scroll_by_metadata.await_count == 1

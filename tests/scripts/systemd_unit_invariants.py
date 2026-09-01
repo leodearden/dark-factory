@@ -23,6 +23,54 @@ import subprocess
 import pytest
 
 # ---------------------------------------------------------------------------
+# Unit-file section parsing, and the orchestrator template glob
+#
+# Lifted here by task 3746, when the setup-host.sh installer suite and the
+# SETUP.md operator-remediation suite moved out of
+# tests/scripts/test_orchestrator_service_files.py into
+# tests/scripts/test_setup_host_unit_installation.py.  Both helpers were
+# private to that module; the split puts a consumer on BOTH sides of it — the
+# per-unit shape suite that stayed, and the installer / operator-doc suites
+# that left — which is exactly this module's admission criterion.
+#
+# Duplicating them into the new module instead is what the origin module's own
+# docstring argued against, and for parse_sections it would have produced the
+# THIRD hand-copy in this directory: tests/scripts/test_orchestrator_watchdog.py
+# still carries a private _unit_sections copy of the same six lines.
+#
+# Neither helper carries a test function here (this module holds none); their
+# guards stay in test_orchestrator_service_files.py, which still owns
+# test_orchestrator_service_glob_covers_all_known_units for the glob and
+# exercises parse_sections through the [Unit]/[Service] placement suite.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+
+def parse_sections(content: str) -> dict[str, list[str]]:
+    """Split unit-file text into {section_name: [lines]} (header line excluded)."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+# Discovered by glob rather than hand-listed, so a new orchestrator template is
+# covered by every consuming guard the day it lands.  The counterpart guard
+# test_orchestrator_service_glob_covers_all_known_units pins the glob against a
+# known-basename set, so a glob that silently matched nothing cannot make the
+# suites that iterate this list pass vacuously.
+ALL_ORCHESTRATOR_SERVICE_FILES = sorted(
+    (REPO_ROOT / "scripts").glob("orchestrator-*.service")
+)
+
+
+# ---------------------------------------------------------------------------
 # Installed-unit location
 #
 # Where setup-host.sh actually writes.  Lifted here by task 3763 from

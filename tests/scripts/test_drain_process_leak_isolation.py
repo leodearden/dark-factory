@@ -45,16 +45,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-# Reused, not re-derived. pytest's fixture marker is private and MOVED between
-# 8.x and 9.x; `_fixture_marker` already accepts both spellings and fails loudly
-# when it finds neither, which is the whole value of the helper — a second copy
-# would be a second thing to update the next time pytest moves it. Resolves
-# because `tests/scripts/conftest.py` puts this directory on sys.path (pytest's
-# --import-mode=importlib deliberately does not), the same mechanism
-# `test_skills_module_config_decision.py` uses for its sibling probe. A bare
-# import, never an importorskip: if the sibling stops importing, say so loudly.
-from test_deploy_clock_isolation import _fixture_marker  # noqa: E402
-
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     DRAIN_SCRIPT_CMDLINE_MARKER,
@@ -62,6 +52,7 @@ from df_pytest_isolation import (  # noqa: E402
     LEAK_TOKEN_ENV,
     WAIT_PROOF_GRACE_FLOOR_SECS,
     WAIT_PROOF_GRACE_MULTIPLIER,
+    fixture_marker,
     leaked_drain_process_reason,
     leaked_drain_processes,
     read_leaked_pid,
@@ -641,7 +632,7 @@ class TestGuardIsLiveInThisRun:
         AND miss a leak from a module- or session-scoped fixture, which is
         exactly where expensive subprocess setup tends to live.
         """
-        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+        marker = fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
 
         assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'

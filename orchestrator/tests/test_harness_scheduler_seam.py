@@ -255,7 +255,11 @@ class TestMidRunSweepUsesIsActivelyHeld:
 
         processed: list[str] = []
 
-        async def _fake_reconcile_one(tid, status, *, mid_run):
+        # `tally` is the per-pass RecoverySweepTally accumulator (task 3535).
+        # Named explicitly rather than swallowed by **kwargs so this stand-in
+        # keeps mirroring the real signature it replaces; this test asserts the
+        # driver's DISPATCH behaviour, not what it accumulates.
+        async def _fake_reconcile_one(tid, status, *, mid_run, tally=None):
             processed.append(tid)
             return None
 

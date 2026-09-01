@@ -1,0 +1,81 @@
+{
+  "briefing_observed_limits": {
+    "10": 4,
+    "20": 4,
+    "3": 1,
+    "5": 278617,
+    "6": 1
+  },
+  "family_share": 0.645536,
+  "harvested_at": "2026-08-15T22:49:03.292761+00:00",
+  "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+  "literal_share": 0.520202,
+  "scored_limit": 5,
+  "scored_limit_basis": "briefing.py:1376 fires the four briefing-assembler queries at limit=5. It governs nothing else. The residual tail is arbitrary other callers running at 3-50, so scoring the tail at 5 is a CHOICE made for comparability with the briefing half, not a limit observed on those queries. Per-row observed_limits carry what was actually recorded.",
+  "scored_limit_is_a_choice": true,
+  "seed": 4004,
+  "tail_count": 152994,
+  "tail_distinct": 134007,
+  "tail_observed_limits": {
+    "1": 15,
+    "10": 52697,
+    "100": 6,
+    "12": 227,
+    "15": 6391,
+    "2": 53,
+    "20": 3441,
+    "200": 1,
+    "25": 95,
+    "3": 2011,
+    "30": 286,
+    "4": 1176,
+    "40": 13,
+    "5": 54423,
+    "50": 1139,
+    "6": 9804,
+    "60": 1,
+    "7": 2,
+    "8": 21213
+  },
+  "tail_sample": 40,
+  "tail_share": 0.354464,
+  "tail_top": 40,
+  "templates": [
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74702,
+      "template": "project overview architecture goals",
+      "text": "project overview architecture goals",
+      "traffic_share": 0.173073
+    },
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74944,
+      "template": "coding conventions and project norms",
+      "text": "coding conventions and project norms",
+      "traffic_share": 0.173634
+    },
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74884,
+      "template": "recent decisions and rationale",
+      "text": "recent decisions and rationale",
+      "traffic_share": 0.173495
+    },
+    {
+      "distinct_instances": 5687,
+      "match": "parameterized",
+      "observed_count": 54097,
+      "template": "task {task_id} context and related decisions",
+      "text": "task reify_task_12 context and related decisions",
+      "traffic_share": 0.125334
+    }
+  ],
+  "total_search_ops": 431621,
+  "unlabeled": true,
+  "unlabeled_reason": "Production queries carry no ground truth: the journal records what was asked, never what should have been returned. Rows therefore carry no expects_claim_ids, and labeled metrics render as no-measurement downstream.",
+  "unparsed_search_ops": 8
+}

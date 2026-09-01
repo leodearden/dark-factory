@@ -40,7 +40,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _orch_helpers import (
+    assert_sandboxed_project_root,
+    pydantic_spec,
+    stamp_stock_routing_config,
+)
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     FakeBriefing,
@@ -663,15 +667,28 @@ class TestStaleOutcomeHygiene:
         )
 
 
-def _make_steward_config() -> MagicMock:
+def _make_steward_config(project_root: Path) -> MagicMock:
     """A MagicMock ``OrchestratorConfig`` for a REAL ``TaskSteward``.
 
-    Same stamping recipe as ``test_steward.py``'s ``mock_config`` fixture so
-    the integration test does not introduce a second config shape.  Only the
-    fields the attempt-cap path actually reads are load-bearing
-    (``steward_max_attempts``, ``steward_lifetime_budget``); the routing stamp
-    is kept because the class's other paths reach ``resolve_route``, and a
-    ``spec_set`` MagicMock must not be the reason a future assertion moves.
+    Same stamping recipe as ``conftest.py``'s ``make_steward`` fixture — the
+    recipe's owner — so the integration test does not introduce a second config
+    shape.  (It previously named ``test_steward.py``'s ``mock_config``; task 3514
+    turned that into a one-line VIEW onto ``make_steward``, so the real owner is
+    the fixture.)  Only the fields the attempt-cap path actually reads are
+    load-bearing (``steward_max_attempts``, ``steward_lifetime_budget``); the
+    routing stamp is kept because the class's other paths reach
+    ``resolve_route``, and a ``spec_set`` MagicMock must not be the reason a
+    future assertion moves.
+
+    This factory stays SEPARATE from ``make_steward``, PERMANENTLY: task 3647
+    ruled the split closed rather than deferred.  The reasons live in exactly
+    one place — ``conftest.py``'s ``make_steward`` docstring, the single owner —
+    and are deliberately not restated here, because the same rationale living in
+    three copies is the drift that task 3647 existed to end.  The ruling is
+    enforced by the census in ``test_steward_scaffolding_guards.py``, which
+    allowlists this module with that reason recorded.  It does share the
+    fixture's sandboxed ``project_root`` recipe (task 3551) — hence the required
+    parameter.
 
     Deliberately SEPARATE from the workflow's own ``OrchestratorConfig``: the
     steward-side cap and the workflow-side ``steward_completion_timeout`` are
@@ -679,7 +696,10 @@ def _make_steward_config() -> MagicMock:
     enough that fix C cannot be what satisfies it.
     """
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    cfg.project_root = Path('/tmp/fake-project')
+    # Same recipe as conftest.py's make_steward (parents=True, exist_ok=True), so
+    # the call cannot collide with a directory the enclosing test already built.
+    project_root.mkdir(parents=True, exist_ok=True)
+    cfg.project_root = project_root
     cfg.models.steward = 'opus'
     cfg.budgets.steward = 5.0
     cfg.max_turns.steward = 100
@@ -699,8 +719,25 @@ def _make_steward_config() -> MagicMock:
     return cfg
 
 
+def test_make_steward_config_project_root_is_sandboxed(tmp_path):
+    """``_make_steward_config``'s ``project_root`` is a real dir under ``tmp_path``.
+
+    The invariant and its rationale are owned by
+    ``_orch_helpers.assert_sandboxed_project_root`` (task 3647); this test's job
+    is to pin that THIS factory's produced root satisfies it, since the factory
+    reproduces ``make_steward``'s recipe rather than calling it.
+
+    Deliberately a plain SYNCHRONOUS unit test with no ``git_repo`` / ``git_ops``
+    / ``config`` fixtures — every sibling test in this module builds a real git
+    worktree, and this one only needs the factory.
+    """
+    cfg = _make_steward_config(tmp_path / 'project')
+
+    assert_sandboxed_project_root(cfg.project_root, tmp_path)
+
+
 def _make_real_steward_factory(
-    queue: EscalationQueue, esc: Escalation, task_id: str,
+    queue: EscalationQueue, esc: Escalation, task_id: str, project_root: Path,
 ):
     """A ``_steward_factory`` that builds a GENUINE ``TaskSteward``.
 
@@ -717,7 +754,7 @@ def _make_real_steward_factory(
     steward passes against a fake contract.  Task 2248 shipped the strand
     precisely because only the ``_mark_blocked`` half was ever tested.
     """
-    steward_config = _make_steward_config()
+    steward_config = _make_steward_config(project_root)
 
     class _CapFiringSteward(TaskSteward):
         async def start(self) -> None:
@@ -780,7 +817,7 @@ class TestRealStewardGiveUpUnblocksEscalatedRun:
         )
         _wire_resolve_callback(queue, workflow)
         workflow._steward_factory = _make_real_steward_factory(
-            queue, esc, task_assignment.task_id,
+            queue, esc, task_assignment.task_id, tmp_path / 'project',
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],

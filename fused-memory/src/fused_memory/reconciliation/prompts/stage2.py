@@ -1,5 +1,8 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.reconciliation.consolidation_gate import (
+    render_consolidation_gate_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -17,6 +20,7 @@ from fused_memory.reconciliation.prompts import (
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -67,11 +71,15 @@ returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
+{render_finding_provenance_section(can_file_tasks=True)}
+
 {render_execution_class_section()}
 
 {render_source_completion_section(can_file_tasks=True)}
 
 {render_predicate_contradiction_section()}
+
+{render_consolidation_gate_section(can_file_tasks=True)}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
@@ -451,12 +459,17 @@ project_root=<project_root>)` as the canonical confirmation step — unlike \
 `set_task_status`, which returns per-task \
 `{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records inline, `update_task` \
 does not reliably echo back the post-write `memory_hints` field (the Taskmaster \
-backend may filter, normalise, or coalesce hint entries). Always pass `append=True` \
-when attaching `memory_hints`. Under `append=True` the backend performs an additive \
-union merge: list-valued and dict-valued metadata keys (including `memory_hints` \
-itself and its `entities`/`queries` sub-fields) are merged with pre-existing entries \
-rather than replaced — newly-attached entries are combined with any hints already on \
-the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
+backend may filter, normalise, or coalesce hint entries). When attaching \
+`memory_hints`, always request the ADDITIVE merge — pass `append=True` ALONE, or the \
+equivalent explicit `metadata_mode='additive'`. Do NOT combine `append=True` with \
+`metadata_mode='merge'`: that pair is a contradiction ('merge' is a shallow \
+last-write-wins overwrite, `append=True` means additive) and the backend now REJECTS \
+it with a `TASKMASTER_TOOL_ERROR` rather than silently honouring 'merge' and \
+overwriting the task's whole `memory_hints` key. Under the additive merge the backend \
+unions list-valued and dict-valued metadata keys (including `memory_hints` \
+itself and its `entities`/`queries` sub-fields) with pre-existing entries \
+rather than replacing them — newly-attached entries are combined with any hints already \
+on the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
 automatically by the backend (no pre-write baseline fetch is required). Only increment \
 `tasks_hints_updated` if the returned task's `memory_hints` field is a SUPERSET of \
 the newly-attached entries — it MUST contain every newly-attached entity and query; it \
@@ -464,7 +477,7 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
-The `append=True` additive union above is ONLY for the ATTACH case (adding new hints \
+The additive union above is ONLY for the ATTACH case (adding new hints \
 to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
 `memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
 dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \
@@ -537,6 +550,22 @@ status changes). If you find evidence that you already acted on this flag in a p
 cycle, do NOT re-act — instead note in your summary that the flag was carried over from \
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
+
+Note what a persistent flag reaching you already RULES OUT. As of task 4381, Stage 1's \
+deduplicator DROPS a carried-forward flag outright when its `cited_tasks` name a live, \
+non-cancelled fix task in ANOTHER known project. So a persistent flag you can still see \
+has NOT been resolved that way — you do not need to re-derive that check, and its \
+absence is not evidence that no cross-project fix task exists (the drop is applied only \
+to flags Stage 1 hands you directly).
+
+When a flag carries a `cited_tasks` list, read those project-qualified \
+`{{project_id, task_id}}` entries as the cross-project anchor and act on them FIRST. A \
+`task_id` is a per-project integer, so a memory search keyed on `task_id` alone is \
+scoped to the RUNNING project and provably cannot reach a fix task filed in a different \
+one. Do NOT conclude "no fix task has been filed" from such a search when `cited_tasks` \
+names a task in another project — check the cited project's task instead. A CANCELLED \
+cited task does not count as filed: the work was explicitly abandoned, so a complaint \
+that no task exists still stands.
 
 ## Standing Decisions (Adjudicated Findings)
 A flagged item may carry a `standing_decision_id` field. This means the entity it \

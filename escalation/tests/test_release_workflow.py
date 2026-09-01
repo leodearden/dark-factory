@@ -319,8 +319,14 @@ async def test_no_slot_non_in_progress_status_not_parked(queue, status):
       the park would strip the intact worktree the merge worker is promised.
     - ``infra-hold``: the hold has no separate metadata flag — as the
       infra-held resume branch in ``orchestrator/harness.py`` puts it, "the
-      status IS the hold".  Parking to ``blocked`` erases it and reproduces
-      the 3465 footprint starvation.
+      status IS the hold".  Parking to ``blocked`` erases it, and with it the
+      only signal the RESUME side keys on: ``_cascade_unblock_member`` reaches
+      its infra branch via ``is_infra_held``, which tests the status alone, so
+      a parked row falls through to the ordinary blocked path and the hold is
+      silently forgotten.  (Task 3538 corrected the resume side's own
+      rationale — it re-pends rather than writing an undispatchable
+      ``in-progress`` — but that only sharpens the point here: the status must
+      survive for the resume to fire at all.)
     - ``done`` / ``cancelled``: terminal by decision; never drag them back.
     - ``None``: ``Scheduler.get_status`` returns ``None`` on ANY MCP read
       failure (its docstring says "or None on failure").  The positive

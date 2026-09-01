@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 from unittest.mock import AsyncMock, MagicMock
@@ -93,6 +94,134 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
         or scheduler_mock.lock_table.is_held(tid)
         or scheduler_mock.workflow_cancel_recent(tid)
     )
+
+
+# task 3492/4215: the pyproject-configured default per-test timeout ceiling
+# that every heavy test in this suite must clear.  MIRROR of
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
+# (currently 60).  It was a bare literal in
+# test_merge_queue_concurrent_verify.py, whose own comment admitted the
+# defect -- "it is still a literal and CAN drift if that setting changes
+# without a matching edit here; there is no automated link between the two."
+# Task 4215 moved the single definition here and made that link EXECUTABLE:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
+# pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
+# add a second copy -- import this one.
+PYPROJECT_DEFAULT_TIMEOUT = 60
+
+# task 4215: per-test ceiling for the family of guard tests that sweep the
+# WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
+# cannot be sized by the ordinary 60s default.  This comment is the SINGLE
+# home of that rationale: the ~13 modules that carry the mark point HERE
+# instead of repeating it, so switching `timeout_method`, retuning the
+# multiple, or revising the measurements is one edit rather than fourteen.
+#
+# It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
+# with `@pytest.mark.timeout(N)`", the comment on
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- applied
+# at MODULE level, which is the only form that is a sound LOWER bound on every
+# collected item (a per-test decorator leaves any test added later at the
+# default).  A tighter decorator still WINS where one is present, so the
+# module mark narrows nothing.  Coverage of the family is ENFORCED, not
+# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census from
+# source on every run and fails a scanner that lacks the mark OR pins it below
+# this ceiling.
+#
+# MECHANISM -- why a breach here is far more expensive than a red test:
+#   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
+#     answers a breach by `os._exit()`ing the whole xdist worker ("node down:
+#     Not properly terminated"), NOT by failing the offending test;
+#   * `--max-worker-restart=0` (in `[tool.pytest.ini_options].addopts`, task
+#     1907) then declines to replace that worker, degrading the run to a
+#     TRUNCATED whole-suite session whose surviving failure names some innocent
+#     guard that merely shared the dead worker.
+#   So one slow tree-scan costs a whole verify run AND misattributes the blame.
+#
+# MEASURED basis for 5x rather than a tuned literal:
+#   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
+#     (test_merge_queue_reachback_patch_guard), 6.70s
+#     (test_event_loop_antipattern_guard), 6.46s
+#     (test_serial_merge_worker_import_guard);
+#   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
+#     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
+#   * xdist worker deaths were then observed at loadavg 250-423, one further
+#     inflation step past the 60s default (esc-3980-1 on branch task/3980,
+#     esc-3787-1 on branch task/3787).
+#   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
+#   test_merge_queue_reachback_patch_guard.py and
+#   test_serial_merge_worker_import_guard.py -- which is what makes this a
+#   FAMILY defect rather than three accidents, and why the rest are marked
+#   preemptively: a marked-but-fast test costs nothing, while an
+#   unmarked-and-slow one costs a whole session.
+# 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
+# case.  DERIVED from PYPROJECT_DEFAULT_TIMEOUT because that ini default IS the
+# hazard being cleared -- deliberately NOT from HEAVY_BARRIER_TEST_TIMEOUT,
+# which happens to equal 300 but is merge-wait arithmetic
+# (`5 * MERGE_RESULT_TIMEOUT + 75`); an AST sweep performs zero merge waits, so
+# borrowing it would let a future merge-timing retune silently move this
+# ceiling.  Never-narrow.
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 5 * PYPROJECT_DEFAULT_TIMEOUT  # 300s
+
+
+# task 3540: the claimant-liveness TTL the row builder below derives its
+# symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
+# imports this same constant to pin `config.claimant_liveness_ttl_secs`, so a
+# fixture row's "fresh"/"stale" age can never drift out of step with the knob
+# `Harness._resume_repend_liveness` actually reads.  Mirrors
+# `OrchestratorConfig.claimant_liveness_ttl_secs`'s production default.
+CLAIMANT_TTL_SECS: float = 300.0
+
+# task 3540: a well-formed claimant identity in `shared.task_claimant.
+# compose_claimant_run_id` shape (`f'{run_id}/{session_id}/pid={owner_pid}'`).
+LIVE_CLAIMANT: str = 'run-abc/sess-def/pid=4242'
+
+
+def claimant_row(
+    status: str,
+    *,
+    task_id: str = 'x',
+    claimant: str | None = None,
+    heartbeat: str | None = None,
+    metadata: dict | None = None,
+    ttl_secs: float = CLAIMANT_TTL_SECS,
+) -> dict:
+    """Build a fused-memory task row for the claimant-liveness oracle (3540).
+
+    Shared by `test_cascade_unblock.py` and `test_resume_claimant_liveness.py`
+    — the two suites that drive `Harness._resume_repend_liveness` — so the
+    fresh/stale/absent branches cannot diverge between them.
+
+    Deliberately defaults to a STRANDED row (no claimant, no heartbeat), the
+    common production shape for the orphan re-pend both suites cover, so a
+    test that says nothing about liveness still exercises the flip.
+
+    `heartbeat` is a SYMBOLIC age derived from `ttl_secs` rather than a magic
+    literal, so a TTL change cannot silently invert a fixture:
+
+      - `'fresh'` -> `now` (well inside the TTL -> live, GIVEN a claimant)
+      - `'stale'` -> `now - 2 * ttl_secs` (outside the TTL -> not live)
+      - `None`    -> no `heartbeat_at` at all (unparseable -> not live)
+
+    `claimant=None` means "no claimant at all", which reads as not-live
+    regardless of the heartbeat.
+    """
+    now = datetime.now(UTC)
+    if heartbeat == 'fresh':
+        heartbeat_at: str | None = now.isoformat()
+    elif heartbeat == 'stale':
+        heartbeat_at = (now - timedelta(seconds=2 * ttl_secs)).isoformat()
+    elif heartbeat is None:
+        heartbeat_at = None
+    else:  # pragma: no cover — fixture misuse
+        raise ValueError(f'unknown heartbeat age {heartbeat!r}')
+
+    return {
+        'id': task_id,
+        'status': status,
+        'claimant_run_id': claimant,
+        'heartbeat_at': heartbeat_at,
+        'metadata': dict(metadata or {}),
+    }
 
 
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
@@ -1196,6 +1325,97 @@ def assert_update_wire_mode(
     )
     assert 'append' not in arguments, f"'append' key must not appear on the wire; got: {arguments}"
     return arguments
+
+
+def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
+    """Assert *project_root* is a created directory strictly below *tmp_path*.
+
+    THE canonical spelling of the steward-scaffolding sandbox invariant, owned
+    here so it cannot drift again.  Consolidation lineage 3461 → 3514 → 3551 →
+    3647: task 3551 propagated the recipe by COPY to a second factory, and by
+    3647 the two inline assertion blocks had already diverged — the one in
+    ``test_conftest_helpers.py`` had lost the ``.is_dir()`` clause, and NEITHER
+    carried the strictness clause.  Both now call this instead; the recurrence
+    guard in ``test_steward_scaffolding_guards.py`` keeps it that way.
+
+    ``conftest.py``'s ``make_steward`` fixture is the PRODUCER that must keep
+    satisfying it: it builds ``tmp_path / 'project'`` and ``mkdir``s it.  It is
+    deliberately not self-checked there — the value is structurally guaranteed
+    two lines from where it is constructed, and a self-check would re-verify it
+    on every one of the suite's ~250 steward builds.  This helper is for the
+    SEPARATE factories that reproduce the recipe.
+
+    Four clauses, ordered so the message a reader sees is the most specific one
+    that failed:
+
+    1. **a real** ``Path``.  A ``MagicMock`` silently satisfies every ``/``-join
+       the steward performs without ever producing a directory, so a mock root
+       is never caught downstream.  This clause runs FIRST so a non-``Path``
+       raises ``AssertionError`` rather than an ``AttributeError`` from a later
+       clause — a sandbox escape must read as a test FAILURE, not an ERROR.
+       *project_root* is therefore deliberately UNANNOTATED: annotating it
+       ``Path`` would make this clause read as unreachable.
+    2. **created**.  The retired ``Path('/tmp/fake-project')`` literal was never
+       created by anything, and a dangling root is a latent ``cwd=`` failure the
+       moment a test stops patching the invoke seam.
+    3. **not** *tmp_path* **itself**.  ``Path.is_relative_to`` returns ``True``
+       for a path against itself, so clause 4 alone does not mean "strictly
+       below".  Same spelling as ``make_steward``'s worktree guard
+       (``resolved == root or not resolved.is_relative_to(root)``), and it
+       matters for the same reason: the steward derives its artifacts root as a
+       SIBLING of the directory it is given.
+    4. **strictly below** *tmp_path*.  The retired ``/tmp/project`` and
+       ``/tmp/fake-project`` literals pointed OUTSIDE the test sandbox, so
+       anything the steward wrote relative to ``config.project_root`` escaped
+       pytest's ``tmp_path`` retention sweep.
+
+    Clauses 3 and 4 compare RESOLVED paths on both sides, which is what makes a
+    symlink escape detectable: a link created *under* ``tmp_path`` that points
+    outside it is lexically contained but physically is not, and everything the
+    steward writes through it lands outside the retention sweep.  Dropping
+    either ``.resolve()`` would leave that case silently accepted, so clause 4's
+    message reports the resolved target alongside the value as given.
+
+    ONE sanctioned exception, recorded here so a reader who greps the invariant
+    finds it instead of "fixing" the site: ``test_out_of_band_routing.py``'s
+    ``_REVIEW_PROJECT_ROOT`` must NOT be sandboxed, because
+    ``ReviewCheckpoint._run_review`` raises ``ValueError`` on any
+    ``project_root`` containing ``/tmp/pytest`` — moving it under a pytest path
+    fails 5 tests in that module (measured, task 3551).
+
+    Raises:
+        AssertionError: naming both the offending value and the sandbox root it
+            was checked against, whenever any clause fails.
+    """
+    assert isinstance(project_root, Path), (
+        f'expected project_root to be a real Path, got '
+        f'{type(project_root).__name__!r} ({project_root!r}) — a MagicMock child '
+        f'silently satisfies every "/"-join the steward performs without ever '
+        f'producing a directory'
+    )
+    root = tmp_path.resolve()
+    resolved = project_root.resolve()
+
+    assert project_root.is_dir(), (
+        f'expected project_root {project_root} to be a CREATED directory (checked '
+        f'against tmp_path={tmp_path}); the retired /tmp/fake-project literal was '
+        f'never created by anything, so a dangling project_root is a latent cwd= '
+        f'failure the moment a test stops patching the invoke seam'
+    )
+    assert resolved != root, (
+        f'project_root must be strictly below tmp_path, got {project_root} == '
+        f'tmp_path={tmp_path}; the steward derives its artifacts root as a SIBLING '
+        f'of the directory it is given, so a root AT tmp_path lands it in '
+        f"tmp_path.parent — outside the directory pytest's retention sweep reclaims"
+    )
+    assert resolved.is_relative_to(root), (
+        f'expected project_root under tmp_path={tmp_path} (resolved to {root}), got '
+        f'{project_root} which resolves to {resolved} — both sides are resolved so a '
+        f'symlink created UNDER tmp_path but pointing outside it is caught here; the '
+        f"retired '/tmp/project' and '/tmp/fake-project' literals pointed OUTSIDE "
+        f'the test sandbox, so anything the steward wrote relative to '
+        f"config.project_root escaped pytest's tmp_path retention sweep"
+    )
 
 
 # ===========================================================================

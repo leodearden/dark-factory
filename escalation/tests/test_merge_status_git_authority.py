@@ -1209,38 +1209,40 @@ class TestMergeStatusGitAuthorityIntegration:
             'merge_sha must be the merge commit on main, not the branch tip'
         )
 
-    async def test_landed_then_file_edited_on_main_returns_unknown(
+    async def test_landed_then_file_edited_on_main_returns_done(
         self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
     ) -> None:
-        """Measures the citation gate's FALSE-NEGATIVE class, end to end.
+        """Pins the task-3116 flip: a landed-then-EDITED task now reads ``done``.
 
         The task genuinely landed — merged with ``--no-ff``, cited on main,
-        never reverted — and merge_status still answers ``unknown``, because a
-        LATER unrelated commit edited a file the landing touched.
+        never reverted — and a LATER unrelated commit then EXTENDED a file the
+        landing touched.  This used to answer ``unknown``; it now answers
+        ``done`` / ``found_on_main``.
 
-        Why: the gate's third guard is ``commit_effect_present_in_main``, which
-        for a merge commit diffs the merged parent against current main HEAD
-        over every path that parent introduced (git_ops.py) and requires them
-        byte-identical.  That is strictly stronger than "was not reverted" —
-        ANY subsequent edit to a touched path reads as effect-absent.  Tier 3.5
-        fires only once the durable tiers have aged out, i.e. for OLD landings,
-        which are exactly the ones most likely to have been edited since, so
-        this class is plausibly common rather than exceptional.
+        Why it used to fail: the gate's third guard is
+        ``commit_effect_present_in_main``, which for a merge commit anchors on
+        the merged parent's fork point and, until task 3116, required the
+        touched paths to be BYTE-IDENTICAL between that parent and current
+        main.  That is strictly stronger than "was not reverted" — ANY
+        subsequent edit to a touched path read as effect-absent.  Measured
+        across the full corpus that rejected 95.4% of all landed merges, a
+        third of them within 24h, so the tier carried almost no information.
 
-        The trade-off, deliberately taken (task 3103): the tier is a
-        last-resort probe on a path where a confident WRONG ``done`` fabricates
-        provenance and closes a task that never landed, while a conservative
-        ``unknown`` costs only a deterministic manual confirmation — both
-        runbooks state in terms that ``unknown`` does NOT mean "not landed"
-        and route the reader to the canonical ancestry/citation check.
+        What task 3116 part (b) changed: byte-identity was replaced by a
+        SURVIVAL test — the lines the branch ADDED must still be present at
+        main HEAD (paired with a removed-lines-still-absent check, so a revert
+        that also adds lines cannot sneak through — the task-1175 hole).  Here
+        the later commit only APPENDS a line to ``772.py``; every line the
+        branch added survives verbatim, so the effect IS present and the tier
+        can now say ``done`` honestly.
 
-        This test exists to keep the class MEASURED: paired with
-        ``test_cited_ancestor_branch_effect_absent_returns_unknown`` (a genuine
-        revert, same answer), it pins that the tier cannot today tell the two
-        apart.  A future change that narrows the anchor selection — e.g.
-        checking only paths still attributable to the task — should flip THIS
-        test to ``done`` while leaving the revert test at ``unknown``, which is
-        precisely the signal that the tightening worked.
+        This test is the positive half of the pair that keeps the tier
+        MEASURED.  Its negative twin,
+        ``test_cited_ancestor_branch_effect_absent_returns_unknown``, is a
+        GENUINE revert and must stay at ``unknown``.  The two answering
+        DIFFERENTLY is precisely the signal that the tightening worked; if
+        this one ever regresses to ``unknown`` again, the survival predicate
+        has collapsed back into byte-identity.
         """
         tid = '772'
 
@@ -1282,9 +1284,15 @@ class TestMergeStatusGitAuthorityIntegration:
             f'precondition: main must still cite the task via the merge '
             f'commit, got citation={citation!r}'
         )
-        assert not await git_ops.commit_effect_present_in_main(
+        # Post-3116: the later commit only APPENDS, so every line the branch
+        # added survives at main HEAD and the effect reads as PRESENT.  Before
+        # task 3116 part (b) this asserted the opposite (byte-identity).
+        assert await git_ops.commit_effect_present_in_main(
             merge_result.merge_commit
-        ), 'precondition: the later edit must make the effect read as absent'
+        ), (
+            'precondition: an append-only later edit must leave the branch\'s '
+            'added lines surviving, so the effect reads as present'
+        )
 
         stub_harness = types.SimpleNamespace(
             _merge_worker=None,
@@ -1296,7 +1304,13 @@ class TestMergeStatusGitAuthorityIntegration:
 
         result = await _call_merge_status(server, task_id=tid)
 
-        assert result.get('state') == 'unknown', (
-            f'A landed-then-edited task currently reads as unknown (the '
-            f'conservative false negative this test measures), got: {result}'
+        assert result.get('state') == 'done', (
+            f'A landed-then-EXTENDED task must now read as done — the survival '
+            f'predicate (task 3116 part b) replaced byte-identity, got: {result}'
+        )
+        assert result.get('kind') == 'found_on_main', (
+            f'Expected kind=found_on_main, got: {result}'
+        )
+        assert result.get('merge_sha') == merge_result.merge_commit, (
+            f'Expected merge_sha={merge_result.merge_commit!r}, got: {result}'
         )

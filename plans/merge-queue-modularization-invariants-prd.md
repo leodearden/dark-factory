@@ -108,6 +108,38 @@ the deterministic guard validates `before_done.script` existence at
    worker's existing `_escalation_queue`; they never halt or degrade the
    pipeline themselves (observation → escalation, enforcement stays with the
    existing halt machinery).
+
+   **Amendment (task 3622, 2026-08-17) — loudly, but not before the
+   condition is real.** This decision predates task 3018, which promoted the
+   orphan-worktree reap from a startup-only sweep to the steady-state
+   `_maybe_reap_orphaned_merge_worktrees`. Once a condition has a *scheduled
+   automatic remediation*, detecting it is no longer the same thing as
+   finding an invariant violation: a leaked `_merge-*` worktree younger than
+   `PERIODIC_REAP_MIN_AGE_SECS` is something the reaper is already going to
+   destroy, so paging a human about it reports work that is about to happen
+   anyway. That is exactly what produced
+   esc-`__merge_resource_leak__`-46/-47.
+
+   The directive still holds in full — nothing is degraded, nothing is
+   silently swallowed, and **detection and logging stay loud and
+   immediate**: the WARNING fires on every violating heartbeat at the
+   unchanged detection floor, the violation still appears in
+   `snapshot()['resource_audit']`, and the string now names its own reclaim
+   disposition. What changed is only *when the L1 fires*: escalation waits
+   until the scheduled remediation has **demonstrably failed** —
+   `_resource_audit_escalation_age_secs()`, i.e. the destruction floor plus
+   `RESOURCE_AUDIT_REAP_GRACE_SWEEPS` reaper sweeps. Past that point the
+   reaper has had its chances and the tree survived them, which is a genuine
+   "nobody is going to clean this up".
+
+   This carve-out is scoped to conditions that HAVE such a remediation.
+   Speculation-accounting violations (leaked I4 permits / merge-ahead cap
+   slots) have none — nothing reclaims a leaked semaphore permit — so they
+   remain escalation-worthy from their first heartbeat and are never
+   age-suppressed. The test for applying this amendment to any future
+   invariant is therefore: *name the mechanism scheduled to fix it, and the
+   bound past which that mechanism has demonstrably failed.* Absent both,
+   escalate immediately.
 5. **Behavior preservation is the contract** for α–δ, κ, μ, ν: existing tests
    must pass with import-path churn only; `MergeOutcome.status` literals,
    reason-prefix constants, EventType emissions, snapshot() existing keys, and

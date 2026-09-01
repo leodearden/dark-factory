@@ -10,7 +10,17 @@ correctness gate.
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
-- EWA state is process-local (reset on restart — consistent with park-stop counters).
+- Task 4559: the digest GATE counts escalation-lifecycle events (submits AND
+  resolves), but the EWA NUMERATOR counts SUBMISSIONS only — a resolve is work
+  being cleared, not a new fault.  A pure-drain window therefore has numerator
+  0 and the EWA decays, so draining a backlog heals the breaker instead of
+  re-tripping it.  The gate is deliberately left on all lifecycle events: a
+  submissions-only gate would fire no digest at all during a drain, freezing a
+  tripped EWA forever.
+- EWA state is process-local EXCEPT across an ewa_trip_ pause (task 4559): the
+  tripping value is persisted on the scheduler_state row and restored on
+  startup, where the trip predicate is RE-TESTED before the halt is
+  re-asserted.  Every other pause reason is restored blind (task 3328).
 - write_digest_entry never raises; digest_dir is auto-created if missing.
 """
 
@@ -59,11 +69,21 @@ def update_ewa(
     EWA(t+1) = alpha * (escalations_in_step / max(done_in_step, 1))
                + (1 - alpha) * prev_ewa
 
-    Caller contract: escalations_in_step must be > 0.  In normal flow
-    _maybe_write_digest only calls this when escalations_in_step >= N (the
-    digest gate guarantees this invariant).  A ValueError is raised so that
-    any caller that violates the contract is loud rather than silently
-    returning a stale value — keeping the unreachable path unreachable.
+    Caller contract: escalations_in_step must be >= 0.  Zero is LEGITIMATE.
+    As of task 4559 the numerator counts escalation SUBMISSIONS only —
+    resolutions still advance the digest GATE but no longer feed the
+    numerator — so a backlog-drain window (many resolutions, zero
+    submissions) reaches here with escalations_in_step == 0.  That case is
+    not a caller error but the healthy one: the ratio is 0, so
+    EWA(t+1) = (1 - alpha) * prev_ewa, pure decay.  Draining a backlog
+    therefore HEALS the breaker instead of re-tripping it, which is the
+    defect task 4559 exists to fix.  (Before 4559 this raised, on the
+    assumption that the digest gate guaranteed esc >= N >= 1; that
+    assumption held only while gate and numerator were the same counter.)
+
+    A NEGATIVE count is still rejected loudly: counters are monotonically
+    non-decreasing and the diff is taken against an earlier snapshot, so
+    esc < 0 means a counter was reset or a snapshot went backwards.
 
     done_in_step == 0 (with esc > 0) uses denominator 1 so a step with
     escalations and zero completions (the worst-case signal) pushes EWA up
@@ -71,10 +91,11 @@ def update_ewa(
 
     No other exception handling — pure arithmetic.
     """
-    if escalations_in_step == 0:
+    if escalations_in_step < 0:
         raise ValueError(
-            'update_ewa: escalations_in_step must be > 0; '
-            'the digest gate guarantees this — passing 0 is a caller error'
+            'update_ewa: escalations_in_step must be >= 0; '
+            f'got {escalations_in_step} — counters only ever increase, so a '
+            'negative step diff means a reset or a backwards snapshot'
         )
     ratio = escalations_in_step / max(done_in_step, 1)
     return alpha * ratio + (1 - alpha) * prev_ewa
@@ -619,6 +640,13 @@ class DigestInputs:
     # stays valid.  These lanes are NEVER auto-reclaimed (WIP-preserving) — the
     # census only surfaces them for operator attention.
     stale_lane_census: list[str] = field(default_factory=list)
+    # Task 4559 — the gate/numerator split, rendered so the operator can see
+    # WHICH number drove the EWA.  submissions_in_step is the EWA NUMERATOR
+    # (new escalations only); lifecycle_events_in_step is the digest GATE
+    # (submits + resolves).  Defaulted to 0, appended last, so every existing
+    # constructor across digest.py, harness.py and the test suite stays valid.
+    submissions_in_step: int = 0
+    lifecycle_events_in_step: int = 0
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -684,6 +712,13 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append(
         f'- Value / threshold: {inputs.ewa_value:.4f} / {inputs.ewa_threshold:.4f}'
         f'{tripped_marker}'
+    )
+    # Task 4559: make the gate/numerator split legible.  Reading a trip digest
+    # without these two figures cannot distinguish a burst of new escalations
+    # from a cleanup sweep of old ones.
+    lines.append(f'- Submissions in step (EWA numerator): {inputs.submissions_in_step}')
+    lines.append(
+        f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
     )
     lines.append('')
 

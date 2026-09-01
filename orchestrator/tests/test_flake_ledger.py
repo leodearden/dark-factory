@@ -435,6 +435,215 @@ def _suppression(**overrides):
     return FlakeSuppression(**kwargs)
 
 
+class TestFlakeSuppressionFromWire:
+    """The READ half of the ``VerifyResult`` wire carrier (PRD §8 / §8.4, task ε).
+
+    ``result_to_dict`` is ``dataclasses.asdict`` and ``result_from_dict`` is a bare
+    ``VerifyResult(**d)``, so a JSON round-trip hands the nested suppression back with
+    ``verdict``/``call_site`` as plain ``str`` and ``test_ids`` as a ``list`` — NOT
+    equality-preserving, and not honest against the field's annotation.  This codec
+    coerces them back.
+
+    It NEVER raises.  ``RemoteRunner.run_merge_verify`` turns any ``TypeError`` /
+    ``ValueError`` out of ``result_from_json`` into a ``RunnerUnavailable``, which costs
+    a whole local re-verify — so letting one garbage sub-payload cost a re-verify would
+    be strictly worse than dropping one observation.
+
+    It is deliberately NOT a validator: an unrecognised vocabulary string is PRESERVED
+    so :func:`record_flake_occurrence`'s existing B12 coercion guard stays the single
+    write-time policy instead of being duplicated here.
+    """
+
+    @staticmethod
+    def _wire(s) -> dict:
+        """Exactly what ``result_to_dict`` -> ``json.dumps`` -> ``json.loads`` produces
+        for the nested field: enum members flattened to strings, tuple to list."""
+        import dataclasses
+        import json
+
+        return json.loads(json.dumps(dataclasses.asdict(s), sort_keys=True))
+
+    @staticmethod
+    def _warnings(caplog) -> list:
+        return [
+            r
+            for r in caplog.records
+            if r.name == 'orchestrator.flake_ledger' and r.levelno == logging.WARNING
+        ]
+
+    def test_round_trip_compares_equal_to_the_original(self) -> None:
+        """(a) The whole point: a wire round-trip is LOSSLESS, so the annotation on
+        ``VerifyResult.flake_suppression`` is true on the deserialized path too."""
+        from orchestrator.flake_ledger import (
+            FlakeCallSite,
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression(test_ids=('a::t1', 'b::t2'))
+        d = self._wire(s)
+        # Pin the wire shape itself, so this test still fails loudly if `asdict` ever
+        # stops flattening the enums (which would make the coercion below vacuous).
+        assert d['verdict'] == 'passes_in_isolation' and not isinstance(d['verdict'], FlakeVerdict)
+        assert d['test_ids'] == ['a::t1', 'b::t2']
+
+        rt = flake_suppression_from_wire(d)
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert isinstance(rt.verdict, FlakeVerdict) and rt.verdict is FlakeVerdict.passes_in_isolation
+        assert isinstance(rt.call_site, FlakeCallSite) and rt.call_site is FlakeCallSite.merge_gate
+        assert isinstance(rt.test_ids, tuple) and rt.test_ids == ('a::t1', 'b::t2')
+
+    def test_round_trip_of_an_unconfirmable_observation(self) -> None:
+        """(a), for the verdict that carries a reason and may name no tests."""
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(),
+            psi_cpu_some10=None,
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+        rt = flake_suppression_from_wire(self._wire(s))
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert rt.verdict is FlakeVerdict.unconfirmable
+        assert rt.test_ids == ()
+        assert rt.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
+
+    def test_none_returns_none_without_warning(self, caplog) -> None:
+        """(b) ``None`` is the ordinary "no observation" case — the B13 old-remote
+        shape — not a fault, so it must not log.
+
+        The SILENCE is the assertion, not an afterthought: on a mixed-version fleet
+        this is by far the most frequent input, so a regression that made it warn
+        would put one WARNING on every single merge.  Asserting only the ``None``
+        return would leave that regression green.
+        """
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(None) is None
+
+        assert self._warnings(caplog) == [], 'the no-observation case must be silent'
+
+    @pytest.mark.parametrize(
+        'bogus',
+        ['passes_in_isolation', ['a', 'b'], 17, 3.5, True],
+        ids=['str', 'list', 'int', 'float', 'bool'],
+    )
+    def test_a_non_dict_degrades_to_none_loudly(self, caplog, bogus) -> None:
+        """(b) Never a raise — a malformed sub-payload must cost one observation, not a
+        whole re-verify."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(bogus) is None
+
+        assert self._warnings(caplog), 'expected a loud WARNING, not a silent drop'
+
+    @pytest.mark.parametrize(
+        'missing', ['verdict', 'test_ids', 'observed_at', 'call_site', 'runner']
+    )
+    def test_a_dict_missing_a_required_key_degrades_to_none_loudly(self, caplog, missing) -> None:
+        """(c) A truncated payload is a producer bug; report it and drop the one
+        observation."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d.pop(missing)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(d) is None
+
+        assert self._warnings(caplog), 'expected a loud WARNING, not a silent drop'
+
+    def test_an_unknown_extra_key_is_dropped_and_the_rest_reconstructs(self) -> None:
+        """(d) Forward-compat with a NEWER producer: a field this version has never
+        heard of must not cost the observation it rides along with."""
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression()
+        d = self._wire(s)
+        d['some_field_from_the_future'] = {'nested': [1, 2, 3]}
+
+        rt = flake_suppression_from_wire(d)
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert rt.verdict is FlakeVerdict.passes_in_isolation
+        assert not hasattr(rt, 'some_field_from_the_future')
+
+    @pytest.mark.parametrize('field_name', ['verdict', 'call_site'])
+    def test_an_unrecognised_vocabulary_string_is_preserved_not_rejected(
+        self, caplog, field_name
+    ) -> None:
+        """(e) ONE coercion policy, and it lives at write time.  ``flaky_test`` is §5.5's
+        anti-vocabulary: preserving it here lets ``record_flake_occurrence``'s existing
+        B12 guard reject it with the log line operators already know, instead of this
+        codec silently deleting the evidence that a producer went off-vocabulary."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d[field_name] = 'flaky_test'
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            rt = flake_suppression_from_wire(d)
+
+        assert rt is not None
+        assert getattr(rt, field_name) == 'flaky_test'
+        # Every other field still reconstructs — one bad string is not a lost payload.
+        assert rt.test_ids == ('tests/test_a.py::test_one',)
+        assert rt.runner == 'local'
+
+    def test_a_bare_str_test_ids_becomes_a_one_tuple(self) -> None:
+        """``tuple('a::t')`` explodes a node-id into one entry PER CHARACTER — the same
+        hazard ``record_flake_occurrence`` guards, and now literally the same code:
+        both route through ``flake_ledger.py::_coerce_test_ids`` so the wrap-not-drop
+        rule cannot drift between the wire path and the write path."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d['test_ids'] = 'tests/test_a.py::test_one'
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None
+        assert rt.test_ids == ('tests/test_a.py::test_one',)
+
+    def test_optional_nones_are_not_coerced_to_falsy_scalars(self) -> None:
+        """(f) ``psi_cpu_some10=None`` means "PSI was unreadable", NEVER "the host was
+        idle" — a fabricated 0.0 would be a lie θ's class-3 check would read as fact."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression(psi_cpu_some10=None, unconfirmable_reason=None))
+        assert d['psi_cpu_some10'] is None
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None
+        assert rt.psi_cpu_some10 is None
+        assert rt.unconfirmable_reason is None
+
+    def test_the_reconstruction_is_frozen_like_the_original(self) -> None:
+        """A wire-built suppression is a value too — the recorder must not be able to
+        amend an observation it merely transports."""
+        import dataclasses
+
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        rt = flake_suppression_from_wire(self._wire(_suppression()))
+        assert rt is not None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            rt.runner = 'somewhere-else'  # type: ignore[misc]
+
+
 class TestRecordFlakeOccurrence:
     """The task's headline observable signal: an observation written through the API
     reads back identical, one row per examined test."""

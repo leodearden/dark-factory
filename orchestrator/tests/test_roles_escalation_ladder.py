@@ -8,12 +8,19 @@ STEWARD's route, not yours ... Filing at level 1 to jump the queue buys no
 faster resolution, only an audit trail showing you bypassed your handler." So
 the LAST thing the steward read about escalation levels reframed the very
 recourse its own body mandates four times — in STEWARD's own prompt body, at
-Rule 2 (be conservative), Rule 6 (wip_conflict/unmerged_state, the
+Rule 2 (be conservative), Rule 6 (the merge-halt categories, the
 never-auto-resolve class), and the MAX_TURNS and CLI_INPUT_REJECTED
 classification entries — as a queue-jumping bypass rather than the mandated
 recourse it actually is. (Cite these sites by name, not line number: roles.py
 churns and a hand-copied offset goes stale silently -- see
 test_roles_wait_pattern.py's module docstring for the prior incident.)
+
+Rule 6 is enumerated in `roles.MERGE_HALT_ESCALATION_CATEGORIES` and carried
+by `roles.MERGE_HALT_SAFETY_RULE`; `test_roles_merge_halt_safety.py` (task
+4130) guards it.  Earlier revisions of this file spelled that rule
+"wip_conflict/unmerged_state", naming two of its three categories -- the same
+drift task 4130 fixed at the source.  Say "the merge-halt categories" rather
+than re-spelling the membership here.
 
 The fix splits the literal at its existing blank line into
 ``ESCALATION_LADDER_CORE`` (the mechanics: what ``escalate_info`` /
@@ -45,7 +52,7 @@ from orchestrator.agents.roles import (
 
 # The one role whose own prompt body mandates `escalate_blocker(..., level=1)`
 # re-escalation -- at Rule 2 (be conservative), Rule 6
-# (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+# (the merge-halt categories), and the MAX_TURNS and CLI_INPUT_REJECTED
 # classification entries. This is the role the fix is FOR: it must keep
 # reading the ladder mechanics (ESCALATION_LADDER_CORE) but must stop reading
 # the non-steward gate telling it that its own mandated recourse is a
@@ -102,7 +109,7 @@ def test_l1_filer_roles_carry_the_ladder_core() -> None:
     assert offenders == [], (
         f'Role(s) missing ESCALATION_LADDER_CORE from system_prompt: {offenders}. '
         'These roles mandate `escalate_blocker(..., level=1)` re-escalation in '
-        'their own body (Rule 2 be-conservative, Rule 6 wip_conflict/unmerged_state, '
+        'their own body (Rule 2 be-conservative, Rule 6 merge-halt categories, '
         'MAX_TURNS, CLI_INPUT_REJECTED) and need the ladder mechanics to know what '
         'level=1 does and that only 0 and 1 are accepted.'
     )
@@ -115,7 +122,7 @@ def test_l1_filer_roles_omit_the_non_steward_gate() -> None:
     `_ESCALATION_INSTRUCTIONS` block, so the LAST thing it read about escalation
     levels was `NON_STEWARD_LEVEL_GATE` telling it that `level=1` -- the exact
     call its own body mandates at Rule 2 (be conservative), Rule 6
-    (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+    (the merge-halt categories), and the MAX_TURNS and CLI_INPUT_REJECTED
     classification entries -- is "not yours" and "buys no faster resolution,
     only an audit trail showing you bypassed your handler". This is both the
     fix and the regression guard: a future refactor that re-splices the full

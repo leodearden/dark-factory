@@ -204,16 +204,30 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     #
     # verdict_indeterminate=False DESPITE is_infra_transient=True: this row
     # fails predicate (3), on the same residual shape as ENV_TRANSIENT below.
-    # ``_classify_environmental``'s own docstring (verify_classify.py:438-453)
-    # records the task-2748/2821 "Known gap" verbatim: a deterministic
-    # SHELL-script gate assertion — their own example is a manifest-drift
-    # check, which is precisely a BRANCH-caused failure — that quotes a lock
-    # token together with a timeout token but emits no grounded verdict marker
-    # still satisfies the loose ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE``
-    # co-occurrence, with no veto marker to suppress it, and is still
-    # classified SEMAPHORE_TIMEOUT. The row flips back once that heuristic
-    # requires a positive wrapper-emitted anchor (a ``lib_slot_acquire.sh`` /
-    # ``flock -w`` marker) instead of loose co-occurrence.
+    #
+    # CORRECTED by task 4492. This comment previously justified the row by
+    # the loose ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence and
+    # promised "the row flips back once that heuristic requires a positive
+    # wrapper-emitted anchor". Both halves are now stale and the promise read
+    # as an instruction it never was: task 3679 DELETED both regexes (neither
+    # symbol exists in verify_classify.py today) and made the detector
+    # exactly the positive, line-anchored, wrapper-emitted anchor that
+    # sentence named — WITHOUT flipping this row. Task 4492 then scoped it
+    # further, so today the arm fires only on a producer-named marker at the
+    # start of a line in output carrying no passing-suite attestation.
+    #
+    # The row nonetheless keeps verdict_indeterminate=False, because
+    # predicate (3) STILL fails on a genuinely different residual: a branch
+    # can put a real, column-0 emitter line OUTSIDE run_all's framing
+    # entirely — a new test shelling out to ``lib_test_semaphore.sh`` from a
+    # ``cargo test``, or any producer emitting ``@@REIFY_SLOT_TIMEOUT@@``
+    # outside an aggregated run. Neither the anchor nor the scoping can
+    # distinguish that from a host event, so the row fails CLOSED.
+    #
+    # Do NOT flip this field on the strength of a classifier improvement:
+    # ``verdict_indeterminate`` governs whether a local failure keeps its
+    # veto over another host's PASS, i.e. merge-gate semantics far beyond
+    # this classifier.
     FailureCategory.SEMAPHORE_TIMEOUT: CategoryPolicy(
         severity_rank=3, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,

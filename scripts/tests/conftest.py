@@ -45,7 +45,8 @@ if str(_LEGIBILITY_DIR) not in sys.path:
 # imported as a namespace package at all — a direct sys.path entry is the only
 # way its flat `lms_*` modules resolve by bare name under --import-mode=importlib.
 # Mirrored in the root pyproject.toml [tool.pyright] extraPaths, which is what
-# `npx pyright scripts/` resolves against.
+# `uv run --project shared pyright scripts/` — this module's declared type gate
+# since task 4358, `npx pyright scripts/` before it — resolves against.
 _LMS_DIR = _SCRIPTS_DIR / 'local-model-serving'
 if str(_LMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LMS_DIR))
@@ -64,6 +65,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
     reject_unsafe_basetemp,

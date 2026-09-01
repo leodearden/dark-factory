@@ -535,7 +535,16 @@ class TestModuleConfigScopeGoldens:
         # flags positioned after the matched 'pytest' keyword) must be dropped
         # entirely — not merely have its `tests/` target replaced while
         # `--tb=short -q` survives.
-        assert executed[0].test_command == 'uv run pytest mymod/tests/test_thing.py', (
+        # ``--project mymod`` is PROMOTED from the source command's
+        # ``--directory mymod`` (task 3830): strip_cwd discards cwd_rel, so
+        # without the promotion this module command — already in the
+        # --directory-only shape every module orchestrator.yaml now uses —
+        # would scope to a bare `uv run` against the depless workspace root.
+        # The property under test is unchanged: the trailing
+        # ` tests/ --tb=short -q` is still dropped entirely.
+        assert executed[0].test_command == (
+            'uv run --project mymod pytest mymod/tests/test_thing.py'
+        ), (
             f'trailing flags/targets after the matched keyword must be dropped, '
             f'matching _scope_to_keyword, not preserved: {executed[0].test_command!r}'
         )
@@ -1539,7 +1548,12 @@ class TestModuleConfigOpaqueChainScoping:
         touched = 'fused-memory/tests/test_harness.py'
         (tmp_path / touched).write_text('def test_harness(): pass\n')
 
-        # Verbatim fused-memory/orchestrator.yaml:11.
+        # The pre-task-3830 PAIRED spelling of
+        # fused-memory/orchestrator.yaml::lint_command (the live config now
+        # carries `--directory fused-memory` alone). Kept paired on purpose:
+        # uv still accepts it, and the expectation below is recomputed from
+        # this same literal, so it exercises the parser rather than mirroring
+        # the config.
         lint_command = (
             'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests '

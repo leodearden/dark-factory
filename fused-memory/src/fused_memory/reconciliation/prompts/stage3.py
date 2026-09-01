@@ -204,7 +204,11 @@ stage='task_knowledge_sync')`
 it as missing.
 - `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
 ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
-`suggested_action='reconstruct'`.
+`suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
+the write paths that precede this check have already had their turn — the stage's own \
+idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
+which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
+finally).
 - `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
 not wired, or the read failed). Do NOT conclude presence or absence from this path — \
 fall through to the FALLBACK below instead.

@@ -9,7 +9,6 @@ import logging
 import os
 import time
 import traceback
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -20,12 +19,14 @@ from uuid import uuid4
 
 from shared.cli_invoke import AllAccountsCappedException, read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.storm_counter import StormCounter
 from shared.usage_gate import UsageGate
 
 from fused_memory.backends.falkor_indices import (
     expected_index_set,
     normalize_index_records,
 )
+from fused_memory.backends.mem0_client import is_missing_collection_error
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -251,10 +252,11 @@ _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD above, since a dropped placeholder
 # never enters a remediation run.  This rolling-window counter closes that
 # gap by firing ONE coarse escalation once drops recur this often for the
-# same project within the window.  Mirrors the dead_owner_shielded
-# suppression-storm counter (_record_dead_owner_suppression /
-# dead_owner_suppression_storm_threshold+window_seconds below) but as plain
-# module constants rather than ReconciliationConfig fields, since this
+# same project within the window.  The window mechanics are the shared
+# StormCounter's (see _record_placeholder_finding_drop); these knobs are
+# plain module constants rather than ReconciliationConfig fields — unlike
+# the dead_owner_shielded suppression-storm counter's
+# dead_owner_suppression_storm_threshold+window_seconds below — since this
 # predicate and its guard are private to this module.
 _PLACEHOLDER_DROP_STORM_THRESHOLD = 5
 _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
@@ -456,12 +458,27 @@ def _cycle_summary_ledger_write_missing(report: object, stage_prefix: str) -> bo
 
     *stage_prefix* is ``'stage1'`` or ``'stage2'``, selecting the
     ``<prefix>_cycle_summary_ledger_written`` /
-    ``<prefix>_cycle_summary_degraded_backstop`` stat names.
+    ``<prefix>_cycle_summary_degraded_backstop`` /
+    ``<prefix>_cycle_summary_write_recovered_backstop`` stat names.
     """
     stats = getattr(report, 'stats', None)
     if not isinstance(stats, dict):
         return False
     if stats.get(f'{stage_prefix}_cycle_summary_degraded_backstop') is True:
+        return False
+    if stats.get(f'{stage_prefix}_cycle_summary_write_recovered_backstop') is True:
+        # Task 4186: the write-recovered arm has already re-attempted AND
+        # CONFIRMED a landed row for this identity — it leaves
+        # ``<prefix>_cycle_summary_ledger_written`` at its in-stage 0 by
+        # design, so without this clause the driver's ``finally`` would
+        # re-fire the arm after the pre-Stage-3 flush (the caller that makes
+        # a pre-``finally`` marker reachable at all) already recovered it:
+        # duplicating the best-effort Mem0 mirror write and the pool-cap
+        # trim, and logging a second, misleading
+        # ``..._cycle_summary_write_recovered`` WARNING for one recovery.
+        # ``is True`` ONLY — a ``False``/absent marker means the attempt did
+        # not confirm (writer returned falsy or raised), so the ``finally``
+        # must still get its last chance.
         return False
     return stats.get(f'{stage_prefix}_cycle_summary_ledger_written') == 0
 
@@ -489,6 +506,13 @@ def _stage1_ledger_write_missing(report: object) -> bool:
     ``stats['stage1_cycle_summary_degraded_backstop'] = True``), so the two
     arms of ``_ensure_stage1_cycle_summary`` can never double-process the
     same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage1_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -528,6 +552,13 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
     the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
     the same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage2_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -621,11 +652,12 @@ class ReconciliationHarness:
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
         # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
-        # recon_stale_run suppressions.  Each entry is
-        # (timestamp, project_id, instance_id); pruned on each call to
-        # _record_dead_owner_suppression().  The count that matters is the
-        # number of distinct non-None instance_id values in the window, NOT
-        # the number of suppression events.
+        # recon_stale_run suppressions.  The count that matters is the number
+        # of distinct non-None instance_id values in the window, NOT the number
+        # of suppression events — hence count_distinct=True, with instance_id
+        # passed as the counter's `key` and project_id as its `label` (task
+        # 3259).  Those two dimensions are orthogonal by construction: the
+        # threshold follows the keys, the reported `projects` follow the labels.
         #
         # ⚠ In-process lifetime limitation: these counters are reset on every
         # harness restart.  A single restart recovers one dead_owner_shielded
@@ -645,29 +677,23 @@ class ReconciliationHarness:
         # Single-restart churn is instead observable via the per-event INFO
         # log emitted at harness.py:741.  If single-owner restart churn must
         # also alarm, count recent dead_owner_shielded _error records from
-        # the journal over the window instead of the in-memory deque.
-        self._dead_owner_suppressions: deque[tuple[datetime, str, str | None]] = deque()
-        # Timestamp of the last storm escalation — None means never fired.
-        self._last_suppression_storm_escalation_at: datetime | None = None
+        # the journal over the window instead of this in-memory counter.
+        self._dead_owner_storm = StormCounter(count_distinct=True)
 
         # Task 1970 amendment: rolling-window counter for dropped
         # referenceless actionable findings (see
         # _record_placeholder_finding_drop / _maybe_remediate).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _dead_owner_suppressions above.
-        self._placeholder_finding_drops: deque[tuple[datetime, str]] = deque()
-        self._last_placeholder_drop_storm_escalation_at: datetime | None = None
+        # in-process-lifetime caveat and rate-limited single-fire semantics as
+        # the dead-owner suppression counter above.
+        self._placeholder_drop_storm = StormCounter()
 
         # Task σ / 2717: rolling-window per-event counter of unresumable/failed
         # interrupted-run resume attempts (config-driven
-        # resume_failure_storm_threshold / _window_seconds).  Same
-        # (timestamp, project_id) shape, in-process-lifetime caveat, and
-        # rate-limited single-fire semantics as _placeholder_finding_drops above.
-        # Fed from _resume_interrupted_runs' failed+restore fallback arm so a
-        # persistent resume failure (prompt/tool drift, stale transcripts) surfaces
-        # ONE loud recon_resume_failure_storm escalation instead of silent churn.
-        self._resume_failures: deque[tuple[datetime, str]] = deque()
-        self._last_resume_failure_storm_escalation_at: datetime | None = None
+        # resume_failure_storm_threshold / _window_seconds).  Fed from
+        # _resume_interrupted_runs' failed+restore fallback arm so a persistent
+        # resume failure (prompt/tool drift, stale transcripts) surfaces ONE loud
+        # recon_resume_failure_storm escalation instead of silent churn.
+        self._resume_failure_storm = StormCounter()
 
         # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
         # inline remediation tail was deferred because the project was still in
@@ -1467,6 +1493,9 @@ class ReconciliationHarness:
             None when statuses is empty (fail-open: no supersede attempted, and
             no memory-service calls are made).  Otherwise a record dict:
               - found=False when no cached project_status_correction memory exists.
+              - found=False plus collection_missing=True when the project's Mem0
+                collection was never provisioned — an empty result, NOT an
+                error (task 2949); logged at INFO so found=False stays legible.
               - diverged=False, superseded=False when the cached memory matches
                 the live census (no-op).
               - diverged=True, superseded=True, memory_id, old, new when the
@@ -1482,10 +1511,46 @@ class ReconciliationHarness:
             return None
 
         try:
-            memories = await self.memory.get_memories_by_metadata(
-                project_id=project_id,
-                filters={'kind': 'project_status_correction'},
-            )
+            try:
+                memories = await self.memory.get_memories_by_metadata(
+                    project_id=project_id,
+                    filters={'kind': 'project_status_correction'},
+                )
+            except Exception as exc:
+                # A project whose Qdrant collection was never provisioned has no
+                # cached corrections — an EMPTY RESULT, not a failed read.  Left
+                # to the outer handler it would return an `error` record that
+                # Stage 3 re-flags as an unresolved integrity issue every cycle
+                # (task 2949).  Narrow by construction: anything else — a 500, a
+                # TimeoutError, any other exception — re-raises into the outer
+                # handler unchanged, so real failures still surface loudly.
+                #
+                # DELIBERATELY SCOPED to this call site.  The same un-provisioned
+                # collection still raises from every other Mem0 read in the cycle
+                # (targeted.py, standing_decision_writer.py, summary_pool.py,
+                # scope_freshness.py, stages/task_knowledge_sync.py all reach the
+                # same scroll_by_metadata), so a brand-new project can still see
+                # errors from those paths.  Task 2949 scopes the fix to the
+                # status_correction path and keeps scroll_by_metadata's
+                # no-silent-fail contract untouched for its other callers —
+                # including hot pool-GC loops that would pay for a proactive
+                # collection_exists round-trip.  Generalising the degradation to
+                # the whole read surface is filed as a follow-up.
+                if not is_missing_collection_error(exc):
+                    raise
+                logger.info(
+                    'reconciliation.status_correction_collection_missing',
+                    extra={'project_id': project_id},
+                )
+                return {
+                    'available': True,
+                    'found': False,
+                    'diverged': False,
+                    'superseded': False,
+                    # Distinguishes "collection absent" from "collection
+                    # genuinely empty" for an operator reading found=False.
+                    'collection_missing': True,
+                }
             if not memories:
                 return {
                     'available': True,
@@ -2152,58 +2217,110 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one dead_owner_shielded suppression and check for a storm.
 
-        Appends (effective_now, project_id, instance_id) to the rolling deque,
-        prunes entries older than the configured window, then:
-        - Returns None if the number of DISTINCT non-None instance_id values
-          (dead-owner instances) in the window is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_suppression_storm_escalation_at = effective_now
-          and returns a storm summary dict with 'count' (the distinct
-          dead-owner-instance count), 'window_seconds', and 'projects'
-          (sorted distinct project labels seen in the window).
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None while the count is below the
+        threshold and None when the alarm already fired within this window,
+        otherwise a storm summary dict with 'count' (the distinct
+        dead-owner-instance count), 'window_seconds', and 'projects' (sorted
+        distinct project labels seen in the window).
 
         Task 2039: the count is keyed on DISTINCT dead-owner instance_id
-        values, not on the number of suppression events. All orphans
-        recovered by one restart share that ONE dead owner's instance_id, so
-        a single multi-project restart contributes only 1 to the count no
-        matter how many projects it touches; only genuinely-independent
-        watchdog kills (distinct instance_id values) accumulate toward the
-        threshold. instance_id=None entries (should not occur for
-        dead_owner_shielded, which requires a matching non-None instance_id)
-        are excluded from the distinct set defensively.
+        values, not on the number of suppression events — which is why the
+        counter runs in ``count_distinct`` mode with instance_id as its ``key``
+        and project_id as its independent ``label``. All orphans recovered by
+        one restart share that ONE dead owner's instance_id, so a single
+        multi-project restart contributes only 1 to the count no matter how
+        many projects it touches; only genuinely-independent watchdog kills
+        (distinct instance_id values) accumulate toward the threshold.
+        instance_id=None entries (should not occur for dead_owner_shielded,
+        which requires a matching non-None instance_id) are excluded from the
+        distinct set defensively — StormCounter drops ``key=None`` from it.
+
+        Threshold and window are read LIVE off ``self.config`` on every call
+        rather than captured, so promoting either dead_owner_suppression_storm_*
+        leaf into ``RELOADABLE_FIELDS`` would work without further edits.
 
         The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
         time-injection convention (harness.py:1592) for deterministic unit tests.
-        Task 1755 / PRD β; distinct-instance counting added by task 2039.
+        Task 1755 / PRD β; distinct-instance counting added by task 2039;
+        migrated onto the shared counter by task 3259.
+        """
+        return self._storm_summary(
+            self._dead_owner_storm,
+            threshold=self.config.dead_owner_suppression_storm_threshold,
+            window_seconds=self.config.dead_owner_suppression_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+            key=instance_id,
+        )
+
+    # ── Shared storm-counter adapter (task 3259 / INV-5) ───────────────
+
+    @staticmethod
+    def _storm_summary(
+        counter: StormCounter,
+        *,
+        threshold: int,
+        window_seconds: float,
+        project_id: str,
+        now: datetime | None,
+        key: str | None = None,
+    ) -> dict | None:
+        """Record one event on *counter*; return this module's storm summary.
+
+        The single bridge between the harness's three storm recorders and
+        ``shared.storm_counter.StormCounter``, which owns the one
+        append-prune-count-ratelimit body in the codebase (INV-5).  It reconciles
+        the two contract differences, and nothing else:
+
+        CLOCK.  The harness injects time PER CALL (``now: datetime | None``, the
+        :meth:`_finding_recently_resolved` convention) while StormCounter's
+        ``time_provider`` binds at construction, so *now* is resolved here in
+        that idiom and forwarded as an epoch float.  The conversion is exact for
+        this use: the counter only ever subtracts and compares timestamps, and
+        ``.timestamp()`` on a tz-aware UTC datetime preserves both ordering and
+        differences.
+
+        SHAPE.  StormCounter returns ``count``/``threshold``/``window_seconds``/
+        ``labels``; this module's contract — read at the three call sites that
+        fold a summary into an escalation payload — is exactly
+        ``count``/``window_seconds``/``projects``.  Remapping here keeps that
+        shape byte-identical rather than leaking a renamed or extra key into an
+        operator-facing payload.  Same adapter shape MarkupStormCounter already
+        established: store/forward the knobs, rename ``labels`` on the way out.
+
+        *threshold* and *window_seconds* are passed PER CALL, never captured, so
+        a caller reading them live off ``self.config`` keeps observing in-place
+        reloads (``config/reload.py``'s reload-safety rule).
+
+        *key* is the distinct-count dimension, used only by
+        :meth:`_record_dead_owner_suppression` and only meaningful against a
+        counter built with ``count_distinct=True``.  This adapter deliberately
+        does NOT screen it: ``StormCounter.record`` raises ``ValueError`` on a
+        non-``None`` key handed to a default-mode counter, so a future recorder
+        wired to the wrong counter fails loudly on its first call instead of
+        silently reverting to raw-event thresholding — the pre-2039
+        (esc-recon-50da2482-1) behaviour.  Screening here would only re-hide it
+        for this one caller.  ``key=None`` stays valid in either mode, which is
+        what lets the two per-event recorders share this bridge unchanged.
         """
         effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._dead_owner_suppressions.append((effective_now, project_id, instance_id))
-        window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
-            self._dead_owner_suppressions.popleft()
-
-        count = len({iid for _, _, iid in self._dead_owner_suppressions if iid is not None})
-        if count < self.config.dead_owner_suppression_storm_threshold:
+        summary = counter.record(
+            threshold=threshold,
+            window_seconds=window_seconds,
+            label=project_id,
+            key=key,
+            now=effective_now.timestamp(),
+        )
+        if summary is None:
             return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_suppression_storm_escalation_at is not None
-            and (effective_now - self._last_suppression_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_suppression_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid, _ in self._dead_owner_suppressions})
         return {
-            'count': count,
-            'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
-            'projects': projects,
+            'count': summary['count'],
+            'window_seconds': window_seconds,
+            'projects': summary['labels'],
         }
 
     # ── Placeholder-finding drop storm counter (task 1970 amendment) ───
@@ -2213,58 +2330,32 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one dropped referenceless-finding event and check for a storm.
 
-        Same rolling-window-counter + rate-limited-single-fire shape as
-        _record_dead_owner_suppression above, applied to
-        reconciliation.remediation_dropped_placeholder_finding events instead
-        of dead_owner_shielded suppressions.  Thresholds are the plain module
-        constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
+        Applied to reconciliation.remediation_dropped_placeholder_finding events
+        instead of the dead_owner_shielded suppressions
+        :meth:`_record_dead_owner_suppression` watches.  Thresholds are the plain
+        module constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
         _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
         fields, since this counter is private to this module.
 
-        Appends (effective_now, project_id) to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window
-          (rate limit: <=1 per window).
-        - Otherwise sets _last_placeholder_drop_storm_escalation_at =
-          effective_now and returns a storm summary dict with 'count',
-          'window_seconds', and 'projects' (sorted distinct project labels
-          seen in the window).
+        The rolling-window mechanics — append, prune to the window, count,
+        compare to the threshold, rate-limit to one fire per window, and report
+        the distinct project labels seen — live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with 'count', 'window_seconds', and 'projects' (sorted distinct
+        project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as
         _record_dead_owner_suppression, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._placeholder_finding_drops.append((effective_now, project_id))
-        window = timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS)
-        cutoff_ts = effective_now - window
-        while (
-            self._placeholder_finding_drops
-            and self._placeholder_finding_drops[0][0] < cutoff_ts
-        ):
-            self._placeholder_finding_drops.popleft()
-
-        count = len(self._placeholder_finding_drops)
-        if count < _PLACEHOLDER_DROP_STORM_THRESHOLD:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_placeholder_drop_storm_escalation_at is not None
-            and (effective_now - self._last_placeholder_drop_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_placeholder_drop_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._placeholder_finding_drops})
-        return {
-            'count': count,
-            'window_seconds': _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._placeholder_drop_storm,
+            threshold=_PLACEHOLDER_DROP_STORM_THRESHOLD,
+            window_seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Resume-failure storm counter (task σ / 2717) ───────────────────
 
@@ -2273,55 +2364,32 @@ class ReconciliationHarness:
     ) -> dict | None:
         """Record one unresumable/failed interrupted-run resume and check for a storm.
 
-        Same rolling-window per-event counter + rate-limited single-fire shape as
-        :meth:`_record_placeholder_finding_drop`, applied to the failed+restore
-        fallback arm of :meth:`_resume_interrupted_runs`.  Thresholds are the
-        config fields ``resume_failure_storm_threshold`` /
+        Applied to the failed+restore fallback arm of
+        :meth:`_resume_interrupted_runs`.  Thresholds are the config fields
+        ``resume_failure_storm_threshold`` /
         ``resume_failure_storm_window_seconds`` (mirroring
         :meth:`_record_dead_owner_suppression`, which likewise reads config)
-        rather than module constants, so an operator can retune the alarm.
+        rather than module constants, so an operator can retune the alarm.  Both
+        are read LIVE on every call rather than captured, so promoting either
+        into ``RELOADABLE_FIELDS`` would work without further edits.
 
-        Appends ``(effective_now, project_id)`` to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
-        - Returns None if the alarm already fired within this window (rate limit:
-          <=1 per window).
-        - Otherwise sets ``_last_resume_failure_storm_escalation_at =
-          effective_now`` and returns a storm summary dict with ``count``,
-          ``window_seconds``, and ``projects`` (sorted distinct project labels
-          seen in the window).
+        The rolling-window mechanics live in
+        ``shared.storm_counter.StormCounter`` (INV-5); this method only supplies
+        the knobs and the event.  Returns None below the threshold and None when
+        the alarm already fired within this window, otherwise a storm summary
+        dict with ``count``, ``window_seconds``, and ``projects`` (sorted
+        distinct project labels seen in the window).
 
         The now= parameter follows the same time-injection convention as the
         sibling storm counters, for deterministic unit tests.
         """
-        effective_now = now if now is not None else datetime.now(UTC)
-
-        # Append and prune the rolling window.
-        self._resume_failures.append((effective_now, project_id))
-        window = timedelta(seconds=self.config.resume_failure_storm_window_seconds)
-        cutoff_ts = effective_now - window
-        while self._resume_failures and self._resume_failures[0][0] < cutoff_ts:
-            self._resume_failures.popleft()
-
-        count = len(self._resume_failures)
-        if count < self.config.resume_failure_storm_threshold:
-            return None
-
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_resume_failure_storm_escalation_at is not None
-            and (effective_now - self._last_resume_failure_storm_escalation_at) < window
-        ):
-            return None
-
-        # Fire: set rate-limit timestamp and build the storm summary dict.
-        self._last_resume_failure_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._resume_failures})
-        return {
-            'count': count,
-            'window_seconds': self.config.resume_failure_storm_window_seconds,
-            'projects': projects,
-        }
+        return self._storm_summary(
+            self._resume_failure_storm,
+            threshold=self.config.resume_failure_storm_threshold,
+            window_seconds=self.config.resume_failure_storm_window_seconds,
+            project_id=project_id,
+            now=now,
+        )
 
     # ── Deferred write replay ─────────────────────────────────────────
 
@@ -3138,6 +3206,15 @@ class ReconciliationHarness:
 
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+        # Task 4115: the instant every heartbeat_at in filtered_task_tree was
+        # read. Stamped HERE, immediately after the fetch returns — not later,
+        # e.g. at the _maybe_remediate call below — because the S1->S3 stage
+        # loop that follows is minutes of LLM work and the remediation
+        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
+        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
+        # gate ages a cited task's heartbeat against the actual read, not a
+        # fresh clock taken well after it.
+        filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
         statuses = await self._fetch_task_count_census(project_root)
@@ -3212,6 +3289,50 @@ class ReconciliationHarness:
 
                     current_stage_name = stage_key
                     _active.stage(current_stage_name)
+
+                    # Task 4186 — pre-Stage-3 cycle_summary flush.
+                    #
+                    # (1) WHY BEFORE STAGE 3, not in the finally: Stage 3's
+                    #     presence check is ledger-PRIMARY
+                    #     (get_cycle_summary_presence -> get_by_identity) and its
+                    #     prompt rules `ledger_available:true, present:false`
+                    #     GENUINELY ABSENT -> missing_knowledge / actionable /
+                    #     reconstruct, which _maybe_remediate below turns into a
+                    #     real Stage 1 + Stage 2 LLM pass. A CURRENT-cycle in-stage
+                    #     write failure must therefore be re-attempted before Stage
+                    #     3 is dispatched; the finally's re-attempt lands after both
+                    #     Stage 3 and remediation, too late to be seen.
+                    # (2) WHY AT THE TOP OF THE STAGE-3 ITERATION, not right after
+                    #     Stage 2 returns: `current_stage_name` is already
+                    #     'integrity_check' here, so _ensure_stage1_cycle_summary's
+                    #     arm 1 (fabricate-on-raise, gated
+                    #     `current_stage_name == memory_consolidator and no report`)
+                    #     is structurally unreachable and ONLY the write-recovered
+                    #     arms can fire. Anchoring the flush to the READER's
+                    #     dispatch also keeps it correct if the stage list is ever
+                    #     reordered, and it naturally no-ops on a resumed run whose
+                    #     Stage 3 is skipped above.
+                    # (3) WHY THIS IS SAFE: both methods are already never-raise
+                    #     (each swallows BaseException), shield their writes, and
+                    #     are idempotent on the ledger's 5-part identity
+                    #     (ON CONFLICT) — so this is a pure REORDER of arms that
+                    #     would have fired anyway, and can never manufacture a row
+                    #     the cycle would not otherwise have ended with.
+                    #
+                    # The finally-block call STAYS: it remains the terminal
+                    # backstop for paths this flush cannot reach (a stage that
+                    # raised before Stage 3, an interrupted/resumed run) and the
+                    # last chance after a flush attempt that did not CONFIRM (the
+                    # write-missing predicate excludes only a marker that is True).
+                    # _run_remediation_pass carries the identical flush; all four
+                    # sites go through _flush_cycle_summaries, so the arms and
+                    # their load-bearing Stage-1-before-Stage-2 order cannot
+                    # drift between drivers or between flush and finally.
+                    if stage_key == StageId.integrity_check.value:
+                        await self._flush_cycle_summaries(
+                            run, run_id, project_id, current_stage_name,
+                            cycle_start_time,
+                        )
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                     if isinstance(stage, MemoryConsolidator):
@@ -3302,10 +3423,13 @@ class ReconciliationHarness:
                     await self._spawn_judge(run_id, project_id)
 
                 # Remediation pass: thread scope resolved above (task 1163) and pass
-                # pre-fetched tree to avoid a redundant fetch (ref: task 478).
+                # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
+                # the instant it was read so the live-workflow gate ages heartbeats
+                # against that read, not a fresh clock (task 4115).
                 await self._maybe_remediate(project_id, run_id, run, tier,
                                             scope=scope,
-                                            filtered_task_tree=filtered_task_tree)
+                                            filtered_task_tree=filtered_task_tree,
+                                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
 
                 logger.info(
                     'reconciliation.run_completed',
@@ -3410,16 +3534,20 @@ class ReconciliationHarness:
                 )
                 raise
             finally:
-                await self._ensure_stage1_cycle_summary(
+                # TERMINAL backstop. Task 4186 hoisted a copy of this call to
+                # the top of the Stage-3 iteration above (the pre-Stage-3
+                # flush); this stays as the last resort for the paths that flush
+                # cannot reach — a stage that raised before Stage 3, an
+                # interrupted/resumed run — and as the second attempt after a
+                # flush attempt that did not CONFIRM. A flush that DID confirm
+                # makes it no-op via _cycle_summary_ledger_write_missing's
+                # write-recovered exclusion, so one recovery logs one WARNING.
+                # Stays before update_run_stage_reports so the persisted
+                # stage_reports copy captures whatever markers either arm
+                # stamped; the Stage-1-strictly-before-Stage-2 order the pair
+                # fires in is single-sourced on the helper (task 3732).
+                await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
-                )
-                # Strictly AFTER the Stage 1 arm (task 3732): that arm is
-                # pre-existing, load-bearing behaviour and a Stage 2 backstop
-                # fault must never be able to starve it. Both stay before
-                # update_run_stage_reports so the persisted stage_reports copy
-                # captures whatever markers either arm stamped.
-                await self._ensure_stage2_cycle_summary(
-                    run, run_id, project_id, cycle_start_time,
                 )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
@@ -3472,11 +3600,18 @@ class ReconciliationHarness:
         resolves the module-level ``write_stage{1,2}_cycle_summary`` global at
         call time, so tests patching that name still intercept the write.
 
-        Marker discipline (task 2734, corrected task 3732 amendment): the
-        writer serializes ``report.stats`` into the ledger row's
-        ``payload_json`` synchronously at call time (see ``write_cycle_summary``'s
-        docstring), so the ``<prefix>_cycle_summary_write_recovered_backstop``
-        marker has to already be on whatever report the writer sees. It is
+        Marker discipline (task 2734, corrected task 3732 amendment):
+        *writer* resolves to an ``async def`` (``write_stage{1,2}_cycle_summary``)
+        — calling it only creates a coroutine, so it serializes
+        ``report.stats`` into the ledger row's ``payload_json`` only once the
+        shielded task below takes its first step, never synchronously at call
+        time (see ``write_cycle_summary``'s docstring). Because that
+        serialization is deferred, the
+        ``<prefix>_cycle_summary_write_recovered_backstop`` marker has to
+        already be on whatever report object the writer was handed when it
+        was called — mutating the live *report* in place instead would not be
+        observed until that later first step, by which point this method may
+        already have "corrected" it back to ``False``. So the writer is
         handed a COPY stamped ``True`` rather than this method mutating the
         live *report* across the ``asyncio.shield`` boundary. That distinction
         is load-bearing on exactly the path the shield exists for: if the
@@ -3496,6 +3631,14 @@ class ReconciliationHarness:
         ``get_cycle_summary_presence`` reads — neither marker, and not
         ``<prefix>_cycle_summary_ledger_written``, which is left at its
         in-stage value of 0 either way.
+
+        Task 4186 gave the live report's marker a second reader: it is now
+        READ BACK by :func:`_cycle_summary_ledger_write_missing` as the
+        "already recovered, do not re-fire" gate, so the driver's ``finally``
+        no-ops after the pre-Stage-3 flush confirmed a row. That is precisely
+        why the live report must keep being stamped with only the CONFIRMED
+        outcome: an over-claiming ``True`` would suppress the ``finally``'s
+        last-chance re-attempt for a row that never landed.
         """
         marker = f'{stage_prefix}_cycle_summary_write_recovered_backstop'
         stamped = report.model_copy(
@@ -3556,45 +3699,68 @@ class ReconciliationHarness:
         raises propagates to the caller's swallow, so a ledger fault means no
         degraded row rather than a possible clobber.
 
+        The read runs INSIDE the ``asyncio.shield`` below, never ahead of it:
+        ``asyncio.shield`` only protects work once its coroutine exists as its
+        own Task, so an unshielded read ahead of the shield would raise
+        ``CancelledError`` on exactly the already-being-cancelled path the
+        shield exists for — landing no row at all, silently, since the
+        caller swallows ``BaseException``. The shield therefore covers the
+        read and the write as one uninterruptible unit; a caller passing
+        *skip_if_row_exists=False* still performs no read at all, shielded or
+        not.
+
         Finally, when the run already carries an ``_error`` record, the arm
         stamps its outcome there as a breadcrumb rather than adding a new
         top-level ``stage_reports`` key — the same place operators already look
         for a failed cycle's diagnosis.
         """
-        # The read-back is skipped when no ledger is wired: there is then no row
-        # to clobber (and the upsert itself is a no-op). Both callers that pass
+        # ledger may be None (no ReconLedgerStore wired): there is then no row
+        # to clobber, and the upsert itself is a no-op. Both callers that pass
         # skip_if_row_exists already gate on the ledger being present, so this
         # is a type-narrowing belt-and-braces, not a live path.
         ledger = getattr(self.memory, 'recon_ledger', None)
-        if skip_if_row_exists and ledger is not None:
-            existing = await ledger.get_by_identity(
-                project_id,
-                'cycle_summary',
-                task_id='',
-                flag_type=stage_id.value,
-                run_id=run_id,
-            )
-            if existing is not None:
-                logger.info(
-                    f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
-                    extra={'run_id': run_id, 'project_id': project_id},
-                )
-                return
 
-        degraded_report = StageReport(
-            stage=stage_id,
-            # Whole-cycle anchor, not the stage's real start (see docstring).
-            started_at=cycle_start_time,
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
-            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
-            llm_calls=0,
-            tokens_used=0,
-        )
-        # Shielded against a second cancellation arriving mid-write; the write
-        # keeps running to completion in its own Task.
-        ledger_written = await asyncio.shield(writer(degraded_report))
+        async def _read_then_write() -> tuple[bool, bool | None]:
+            """Returns ``(skipped, ledger_written)``. Run as ONE shielded unit
+            (see the call site below) so a second cancellation arriving while
+            the clobber-guard read is in flight cannot separate the read from
+            the write it gates — see the skip_if_row_exists docstring
+            paragraph above.
+            """
+            if skip_if_row_exists and ledger is not None:
+                existing = await ledger.get_by_identity(
+                    project_id,
+                    'cycle_summary',
+                    task_id='',
+                    flag_type=stage_id.value,
+                    run_id=run_id,
+                )
+                if existing is not None:
+                    return True, None
+
+            degraded_report = StageReport(
+                stage=stage_id,
+                # Whole-cycle anchor, not the stage's real start (see docstring).
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+                # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+                llm_calls=0,
+                tokens_used=0,
+            )
+            return False, await writer(degraded_report)
+
+        # Shielded against a second cancellation arriving mid-read or
+        # mid-write; the read-then-write keeps running to completion in its
+        # own Task even if this method's own task is cancelled again.
+        skipped, ledger_written = await asyncio.shield(_read_then_write())
+        if skipped:
+            logger.info(
+                f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
+            return
         logger.warning(
             f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
             extra={
@@ -3607,6 +3773,54 @@ class ReconciliationHarness:
         if isinstance(error_record, dict):
             error_record[f'{stage_prefix}_cycle_summary_backstop_written'] = ledger_written
 
+    async def _flush_cycle_summaries(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        current_stage_name: str | None,
+        anchor: datetime,
+    ) -> None:
+        """Fire both cycle-summary backstop arms for *run_id*, Stage 1 first.
+
+        Single-sourced call pair for the FOUR sites that need it — each of the
+        two S1→S2→S3 drivers (:meth:`run_full_cycle` and
+        :meth:`_run_remediation_pass`) calls it twice:
+
+        - as task 4186's **pre-Stage-3 flush**, at the top of the Stage-3
+          iteration, so a current-cycle in-stage write failure is re-attempted
+          BEFORE Stage 3's ledger-primary presence check can read the row as
+          genuinely absent (the full why lives at those call sites);
+        - from its ``finally``, as the **terminal backstop** for the paths the
+          flush cannot reach and as the last chance after a flush attempt that
+          did not CONFIRM.
+
+        It exists because the pair's ORDER is load-bearing and must not be able
+        to drift between those sites: Stage 1 runs STRICTLY FIRST so a Stage-2
+        backstop fault can never starve that pre-existing arm (task 3732). That
+        is the same argument that put the arm BODIES in
+        :meth:`_reattempt_cycle_summary_write` /
+        :meth:`_write_degraded_cycle_summary` — "so a fix to either arm cannot
+        be applied to one stage and forgotten on the other" — applied one level
+        up, to the sequence itself.
+
+        *anchor* is the cycle-anchor timestamp the degraded-synth paths stamp
+        when a stage's real ``started_at`` is unrecoverable: ``cycle_start_time``
+        on a full cycle, ``run.started_at`` on a remediation pass (that driver
+        has no separate local). *current_stage_name* is read only by Stage 1's
+        arm-1 gate.
+
+        Never raises: both callees swallow ``BaseException`` themselves and
+        shield their own writes, which is what makes it safe to await unshielded
+        from a ``finally``.
+        """
+        await self._ensure_stage1_cycle_summary(
+            run, run_id, project_id, current_stage_name, anchor,
+        )
+        await self._ensure_stage2_cycle_summary(
+            run, run_id, project_id, anchor,
+        )
+
     async def _ensure_stage1_cycle_summary(
         self,
         run: ReconciliationRun,
@@ -3617,10 +3831,11 @@ class ReconciliationHarness:
     ) -> None:
         """Guarantee a Stage 1 ``cycle_summary`` ledger row exists for *run_id*.
 
-        Structural backstop with two independent arms, both firing from the
-        harness's two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`) so this
-        runs on every exit path of either:
+        Structural backstop with two independent arms, both firing through
+        :meth:`_flush_cycle_summaries` — which the harness's two S1→S2→S3
+        drivers (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`)
+        call from their ``finally`` blocks, so this runs on every exit path of
+        either, and again as task 4186's pre-Stage-3 flush:
 
         - **Arm 1** (task 2440) — Stage 1's own turn raised before ``run()``
           could return a report at all (its in-stage write,
@@ -3773,8 +3988,8 @@ class ReconciliationHarness:
         Stage 2 ran but its row did not land (task 3732).
 
         Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
-        from the same two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), and
+        from the same :meth:`_flush_cycle_summaries` call pair (both S1→S2→S3
+        drivers' ``finally`` blocks, plus task 4186's pre-Stage-3 flush), and
         deliberately NARROWER than the Stage 1 method in one decisive way:
         it has no analogue of Stage 1's arm 1 (synthesize a row when the
         stage produced no report at all). Fabricating a summary for a cycle
@@ -3878,8 +4093,9 @@ class ReconciliationHarness:
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
-        :meth:`_ensure_stage1_cycle_summary` so a fault here can never starve
-        that pre-existing arm. An exception escaping would replace whatever
+        :meth:`_ensure_stage1_cycle_summary` (an order now single-sourced on
+        :meth:`_flush_cycle_summaries`) so a fault here can never starve that
+        pre-existing arm. An exception escaping would replace whatever
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
@@ -4346,6 +4562,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed.
 
@@ -4357,6 +4574,12 @@ class ReconciliationHarness:
         the project is still in backlog mode, bounded by
         config.max_backlog_remediation_deferrals.  See the comment at the gate
         for why deferring is lossless and self-terminating.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree: it is
+        the instant that tree was read (stamped by run_full_cycle right after
+        its fetch, task 4115). This method is a pure pass-through — it forwards
+        the pair verbatim to _run_remediation_pass without re-stamping or
+        defaulting either value.
         """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
@@ -4571,6 +4794,7 @@ class ReconciliationHarness:
                 project_id, parent_run_id, to_remediate, tier,
                 scope=scope,
                 filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
@@ -4589,6 +4813,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
@@ -4601,6 +4826,17 @@ class ReconciliationHarness:
         tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree and be
+        timezone-aware: it is the instant that tree was READ (task 4115),
+        consumed below to age cited tasks' heartbeats against the read rather
+        than against a fresh clock taken after this pass's S1→S2→S3 stages.
+        Ignored when filtered_task_tree is None (the self-fetch path stamps
+        its own instant); if filtered_task_tree is given without it, or with
+        a naive (tzinfo-less) datetime, falls back to datetime.now(UTC) with a
+        WARNING log — the pre-4115 behaviour existing direct callers depend on
+        for the omitted case, extended to fail loud rather than silently
+        suppressing every escalation in the pass on a malformed one.
         """
         project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
@@ -4634,12 +4870,74 @@ class ReconciliationHarness:
             },
         )
 
-        # Use caller-supplied tree if available; otherwise fetch (ref: task 455, task 478)
-        remediation_tree = (
-            filtered_task_tree
-            if filtered_task_tree is not None
-            else await self._fetch_filtered_task_tree(project_root)
-        )
+        # Task 4115: resolve the tree and the instant it was read as ONE unit
+        # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
+        # itself), so a caller's read instant can never be paired with a tree
+        # it does not describe. Caller-supplied tree: honour the caller's read
+        # instant when given AND timezone-aware; otherwise fall back to a
+        # fresh now() with a WARNING trace — loud rather than silent, since a
+        # caller that drops or malforms the instant regresses straight back to
+        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+        # norm). A naive (tzinfo-less) instant is treated the same as a
+        # missing one rather than handed to corroboration_for_task as-is:
+        # has_live_claimant compares it against timezone-aware heartbeats, and
+        # the resulting TypeError is caught and swallowed several frames down
+        # (see the `except Exception as _corr_exc` below), which would
+        # otherwise leave corroborated=None and silently suppress every
+        # stranded-work escalation in the pass — the opposite of this gate's
+        # fail-safe direction. The WARNING fallback is otherwise exactly the
+        # pre-4115 behaviour, which the ~30 existing direct
+        # _run_remediation_pass callers that pass a tree without an instant
+        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+        # (if one was even supplied) describes a different tree, or no tree at
+        # all, and must never leak onto the tree just fetched here.
+        #
+        # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
+        # below (task_by_id, and therefore every heartbeat_at it carries) was
+        # read. It is threaded into corroboration_for_task ONLY to age-check
+        # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+        # must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
+        # minutes of LLM work, and the TTL is 10 minutes — comparable to a
+        # whole pass. Using a fresh now() there would age a heartbeat that was
+        # fresh when read past the TTL purely because the pass was slow,
+        # reporting corroborated=False for a task that is in fact live and
+        # filing a spurious stranded-work escalation — task 4115 found this
+        # happening on exactly the caller-supplied-tree path, the one
+        # production always takes (run_full_cycle threads its pre-stage-loop
+        # fetch straight through): this stamp used to be an unconditional
+        # datetime.now(UTC) taken here regardless of which tree was in play,
+        # so a caller's own (earlier, more accurate) read instant was silently
+        # discarded. Pinning the clock to the read makes the verdict "was
+        # there a fresh per-task signal in the snapshot we hold" — evaluable,
+        # and biased toward suppression (the fail-safe direction) rather than
+        # toward escalating. task_by_id's own staleness is pre-existing and
+        # orthogonal.
+        _tasks_snapshot_at: datetime
+        if filtered_task_tree is not None:
+            remediation_tree = filtered_task_tree
+            if (
+                filtered_task_tree_fetched_at is not None
+                and filtered_task_tree_fetched_at.tzinfo is not None
+            ):
+                _tasks_snapshot_at = filtered_task_tree_fetched_at
+            else:
+                logger.warning(
+                    'reconciliation.remediation_tree_read_instant_missing',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'reason': (
+                            'naive_datetime'
+                            if filtered_task_tree_fetched_at is not None
+                            else 'not_supplied'
+                        ),
+                    },
+                )
+                _tasks_snapshot_at = datetime.now(UTC)
+        else:
+            remediation_tree = await self._fetch_filtered_task_tree(project_root)
+            _tasks_snapshot_at = datetime.now(UTC)
 
         # Task 2031/2067: a {str(task_id): task dict} map derived from
         # remediation_tree in a single pass, used by the live-workflow gate below
@@ -4677,21 +4975,6 @@ class ReconciliationHarness:
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
             task_by_id[str(t.get('id'))] = t
-
-        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
-        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
-        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
-        # so it must be the snapshot's clock, not the clock at the moment the gate
-        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
-        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
-        # a fresh now() there would age a heartbeat that was fresh when read past the
-        # TTL purely because the pass was slow, reporting corroborated=False for a
-        # task that is in fact live and filing a spurious stranded-work escalation.
-        # Pinning the clock to the read makes the verdict "was there a fresh
-        # per-task signal in the snapshot we hold" — evaluable, and biased toward
-        # suppression (the fail-safe direction) rather than toward escalating.
-        # task_by_id's own staleness is pre-existing and orthogonal.
-        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 
@@ -4817,6 +5100,29 @@ class ReconciliationHarness:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
+
+                # Task 4186 — pre-Stage-3 cycle_summary flush, the very same
+                # call run_full_cycle makes (see the long WHY comment there);
+                # both go through _flush_cycle_summaries so the two drivers
+                # cannot drift. Same defect on this driver: a Stage-2 in-stage write that failed transiently is
+                # only re-attempted in the finally below, i.e. AFTER this pass's
+                # own Stage 3 has already read the ledger and ruled the summary
+                # genuinely absent. The stakes differ — this driver's Stage-3
+                # findings feed the persistence-gated escalation path, so a
+                # false "summary missing" here costs an escalation rather than a
+                # second remediation pass — but the window is the same one.
+                #
+                # Anchored at run.started_at because this driver has no separate
+                # cycle_start_time local, exactly as its own finally already is.
+                # The helper's Stage 1 arm is INERT here by that arm's
+                # run_type != RunType.remediation gate (a remediation pass's
+                # Stage 1 deliberately writes no summary of its own), so it can
+                # never fabricate a Stage-1 row.
+                if current_stage_name == StageId.integrity_check.value:
+                    await self._flush_cycle_summaries(
+                        run, run_id, project_id, current_stage_name,
+                        run.started_at,
+                    )
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
@@ -5176,20 +5482,24 @@ class ReconciliationHarness:
             )
 
         finally:
-            await self._ensure_stage1_cycle_summary(
+            # TERMINAL backstop, mirroring run_full_cycle's: task 4186 hoisted a
+            # copy of this call to the top of the Stage-3 iteration above (the
+            # pre-Stage-3 flush). This stays as the last resort for the paths
+            # that flush cannot reach — a stage that raised before Stage 3 — and
+            # as the second attempt after a flush attempt that did not CONFIRM.
+            # A flush that DID confirm makes it no-op via
+            # _cycle_summary_ledger_write_missing's write-recovered exclusion.
+            #
+            # Task 3732: unlike the helper's Stage 1 arm — which deliberately
+            # no-ops on a remediation pass, since Stage 1 skips its own summary
+            # write there — the Stage 2 backstop is wired into this driver with
+            # NO remediation exclusion: Stage 2's in-stage write is unconditional
+            # by explicit design, so a lost row here is a genuine gap. Anchored
+            # at run.started_at (this driver has no separate cycle_start_time
+            # local), and placed strictly before update_run_stage_reports so the
+            # persisted copy captures whatever markers either arm stamped.
+            await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
-            )
-            # Task 3732: unlike the Stage 1 arm — which deliberately no-ops on a
-            # remediation pass, since Stage 1 skips its own summary write there —
-            # the Stage 2 backstop is wired into this driver with NO remediation
-            # exclusion: Stage 2's in-stage write is unconditional by explicit
-            # design, so a lost row here is a genuine gap. Anchored at
-            # run.started_at (this driver has no separate cycle_start_time local),
-            # exactly as the Stage 1 call above. Placed strictly after it so a
-            # Stage 2 fault can never starve that arm, and strictly before
-            # update_run_stage_reports so the persisted copy captures its markers.
-            await self._ensure_stage2_cycle_summary(
-                run, run_id, project_id, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             # Task 2744: GC this remediation run's per-run recon CLI config dir on

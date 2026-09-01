@@ -31,20 +31,34 @@ rather than merely asserted.
 
 Why this script enforces ε's rules itself
 -----------------------------------------
-Measured, not assumed: ``MemoryService.update_memory`` never calls
-``_apply_memory_metadata_validation`` — that seam runs only from
-``add_memory`` and ``add_system_record``.  So a metadata-only patch reaches
-Qdrant with **no** slug-shape check and **no** canonical-uniqueness probe.
+NOT because the seam is unreachable — that was true when this script was
+written and is no longer.  Task 3523 wired
+``_apply_memory_metadata_validation`` into ``MemoryService.update_memory``,
+so a metadata-only patch from here now DOES traverse the slug-shape check
+and the canonical-uniqueness probe.  The original claim ("update_memory
+never calls it; that seam runs only from ``add_memory`` and
+``add_system_record``") is retired, not merely softened.
 
-θ is the one caller stamping ``canonical: true`` at scale, and it is exactly
-the corpus ε's ``memory_metadata.enforce`` flag cannot yet be flipped
-against.  Leaning on a seam this script does not traverse would let it write
-a second canonical for a topic, or a non-conforming slug, with equal
-silence — re-creating the defect ε shipped warn-mode to avoid.  So the two
-probes are re-expressed here against the injected service.  That is a
-deliberate, narrow INV-5 exception: the alternative — routing θ through
-``add_memory`` — would re-embed the content and change point ids, breaking
-the whole in-place-update contract this script depends on
+The INV-5 exception survives on the reason that still holds: **posture**.
+Under the shipped ``memory_metadata.enforce = false`` the seam warn-fails
+OPEN — it censuses a violation and lets the write through, and on a probe
+error it proceeds rather than refusing.  θ is the one caller stamping
+``canonical: true`` at scale, unattended, against exactly the corpus that
+flag cannot yet be flipped against.  A bulk canonical writer that proceeds
+on an unverified uniqueness probe would write the second canonical ε exists
+to prevent, and would do it silently.  So the two probes are re-expressed
+here and FAIL CLOSED (see :func:`stamp_one`), which is a posture the seam
+deliberately does not adopt for interactive writes.
+
+Read the two as layered, not redundant: the seam is the floor every write
+path now shares; this is the stricter local ceiling for an unattended one.
+Once ``enforce`` flips (task 3626), the difference narrows to probe-error
+handling alone — at which point retiring this duplication becomes a
+reviewable question rather than the silent regression it would be today.
+
+The alternative to duplicating — routing θ through ``add_memory`` — remains
+unavailable for an unrelated reason: it would re-embed the content and mint
+new point ids, breaking the in-place-update contract this script depends on
 (``plans/mem0-in-place-update-decision.md`` §3).
 
 The *rules themselves* are still single-homed.  The slug shape and its cap
@@ -57,7 +71,7 @@ D2 says the scalar->list fold "rides θ's sweep where it touches entries
 anyway".  That is a convenience, not a mandate to manufacture a validation
 failure: two of the six live canonical records carry ``supersedes`` as an
 English *sentence*, and blindly wrapping it would produce a one-member list
-that fails ``_is_full_uuid``.  So the fold is applied only when the scalar
+that fails ``is_full_uuid``.  So the fold is applied only when the scalar
 parses as a full UUID; prose is left byte-identical and reported.
 
 Usage
@@ -76,15 +90,37 @@ import asyncio
 import functools
 import importlib.util
 import json
+import logging
 import re
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fused_memory.memory_metadata import _is_full_uuid, normalize_supersedes
+from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+from fused_memory.utils.validation import is_full_uuid
 
+# This script reports through ``print``; stdout carries its machine-read
+# markdown/JSON artifact, so the ONE diagnosis that must not land there -- the
+# fail-closed store-mutation refusal in ``run`` -- goes through this logger
+# instead. Named for the script basename, matching every other guarded script
+# (and what the tests filter ``caplog`` on).
+logger = logging.getLogger('retro_stamp_topics')
+
+# Convention: this list carries every imported helper the tests reach through the
+# module object, not only the names defined locally — ``TOPIC_SLUG_MAX_LEN``,
+# ``is_valid_topic_slug``, ``normalize_supersedes`` and ``is_full_uuid`` are all
+# foreign.  ``memory_metadata`` deliberately keeps ``is_full_uuid`` out of ITS
+# ``__all__``; the opposite treatments are both intentional.  That module is
+# importable, so re-exporting the predicate there would rebuild the re-export
+# proxy whose back-compat alias task 3942 retired.  This script is loaded by
+# path via ``importlib`` and cannot be imported from, so its ``__all__`` grants
+# the rule no second home.
 __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CANONICAL_SCROLL_LIMIT',
@@ -113,6 +149,7 @@ __all__ = [
     'compute_patch',
     'derive_topic_slug',
     'filter_plans_to_projects',
+    'is_full_uuid',
     'is_valid_topic_slug',
     'load_calibration_rows',
     'load_topic_registry',
@@ -350,13 +387,14 @@ def compute_patch(
     # would still be a resolvable id afterwards. `normalize_supersedes`
     # faithfully wraps any scalar — including the English sentences two live
     # canonical records carry — so folding unconditionally would write a
-    # one-member list that fails `_is_full_uuid`, converting a merely-legacy
+    # one-member list that fails `is_full_uuid`, converting a merely-legacy
     # shape into an outright validation failure. Both helpers are imported
-    # rather than re-expressed (INV-5).
+    # rather than re-expressed (INV-5) — the fold from `memory_metadata`, the
+    # UUID predicate from `fused_memory.utils.validation`.
     if 'supersedes' in existing_metadata:
         raw = existing_metadata['supersedes']
         members = normalize_supersedes(raw)
-        if not all(_is_full_uuid(m) for m in members):
+        if not all(is_full_uuid(m) for m in members):
             dispositions.append('supersedes_not_normalizable')
         elif isinstance(raw, list):
             # Already the target shape — no write, so run two stays empty.
@@ -432,7 +470,7 @@ def _harvest_member_ids(
 
     Every value is shaped by :func:`normalize_supersedes` (which tolerates
     both the scalar and list spellings without coercing members) and then
-    filtered by ``_is_full_uuid``.  A value that survives neither is appended
+    filtered by ``is_full_uuid``.  A value that survives neither is appended
     to *skips* rather than dropped: a member the sweep could not resolve is a
     fact about the cluster, and a report that omitted it would claim a clean
     pass over membership it never actually determined.
@@ -445,7 +483,7 @@ def _harvest_member_ids(
         if key not in metadata:
             continue
         for member in normalize_supersedes(metadata[key]):
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 skips.append({
                     'reason': 'member_not_a_uuid',
                     'memory_id': memory_id,
@@ -623,11 +661,11 @@ def plan_calibration_clusters(
             if label not in (_CANONICAL_LABEL, _MEMBER_LABEL):
                 continue
             memory_id = row.get('memory_id')
-            # The isinstance arm is redundant at runtime (`_is_full_uuid`
+            # The isinstance arm is redundant at runtime (`is_full_uuid`
             # rejects a non-str) but not to a reader or a type checker: the
             # row came off a JSONL fixture, so `memory_id` is genuinely
             # `Any | None` here and the narrowing has to be visible.
-            if not isinstance(memory_id, str) or not _is_full_uuid(memory_id):
+            if not isinstance(memory_id, str) or not is_full_uuid(memory_id):
                 skips.append({
                     'reason': 'member_not_a_uuid',
                     'cluster_id': cluster_id,
@@ -1010,9 +1048,13 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
       make the corpus depend on which planner ran first, invisibly.
 
     The result upholds ε's <=1-canonical-per-``(project_id, topic)`` rule
-    BEFORE any write — necessary because ``update_memory`` never reaches the
-    service-side uniqueness probe, so a violating plan would reach Qdrant
-    unchallenged.
+    BEFORE any write.  The service-side probe (which ``update_memory`` does
+    reach as of task 3523) cannot substitute for this one: it adjudicates a
+    single write against live state, one record at a time, so it would let
+    the FIRST member of a within-plan duplicate pair through and only refuse
+    the second — leaving the corpus dependent on iteration order and the
+    report unable to say the plan was self-contradictory.  Catching it here
+    rejects the pair as a pair, before either is written.
 
     Output is sorted by ``(project_id, topic, memory_id)`` so two dry-runs of
     an unchanged corpus produce byte-comparable reports.
@@ -1145,9 +1187,11 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
        ``canonical`` — one ``count_memories_by_metadata`` and, only on a
        non-zero count, one bounded ``get_memories_by_metadata(limit=1)`` to
        name the incumbent.  The same two-probe shape as
-       ``services.memory_service._check_canonical_uniqueness``, re-expressed
-       here for the measured reason that ``update_memory`` never reaches
-       that seam (see the module docstring's INV-5 note).
+       ``services.memory_service._check_canonical_uniqueness``, which the
+       write in step 4 now also traverses (task 3523).  Kept because the
+       seam warn-fails OPEN under the shipped ``enforce = false`` while this
+       one fails CLOSED — see the module docstring's INV-5 note, and the
+       FAIL CLOSED paragraph below for why that is the right posture here.
     4. **write**, metadata-only and merge-mode.
 
     FAIL CLOSED on a probe error, inverting the service seam's warn-mode
@@ -1488,6 +1532,36 @@ async def run(
         The report dict — rendered by :func:`render_markdown` /
         :func:`render_json` and graded by :func:`resolve_exit_code`.
     """
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # ``run`` is the choke point precisely because ``stamp_one``'s own
+    # ``--apply`` gate is PER TARGET: probing there would run once per target
+    # rather than once per run, and -- since ``StoreMutationUnavailable``
+    # subclasses ``RuntimeError`` -- would be swallowed by the per-target
+    # ``except Exception`` around the write, downgrading a run-wide
+    # environment denial into N ``outcome: 'error'`` rows inside a report that
+    # otherwise looks like a completed sweep. Emitted through the logger, not
+    # ``print``, to keep it off the stdout this script reserves for its
+    # machine-read artifact.
+    if apply:
+        try:
+            assert_store_mutation_allowed(operation='retro_stamp_topics --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'retro_stamp_topics: --apply NOT started (fail-closed) -- this '
+                "process cannot write mem0's history directory, so each stamp "
+                'would patch a record and then fail to record the change, '
+                'leaving the corpus half-stamped: some claims filed under the '
+                'new topic slug and some under the legacy one, which is worse '
+                'for an exact-match topic query than either uniform state. '
+                'Nothing was scrolled and no record was stamped. Route the '
+                'stamping through the fused-memory MCP server (the unsandboxed '
+                'owner of the store), or re-run from an unsandboxed operator '
+                'shell. To obtain the sweep report safely from anywhere, '
+                're-run without --apply.'
+            )
+            raise
+
     if calibration_rows is None:
         calibration_rows = load_calibration_rows(CALIBRATION_FIXTURE_PATH)
     if registry is None:
@@ -1863,6 +1937,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Build a live service, run the sweep, write both artifacts, exit graded."""
+    # This script is otherwise print-based, so without this the module logger
+    # added for the fail-closed store preflight would have no handler at all
+    # and its refusal would reach the operator only through
+    # ``logging.lastResort`` -- a bare line on stderr with no timestamp, level
+    # or logger name, unlike every sibling guarded script. ``stream`` is named
+    # explicitly because stdout here is reserved for the machine-read report
+    # rendered below; diagnostics must not land in it.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+
     args = _build_parser().parse_args(argv)
 
     if args.config:

@@ -117,6 +117,11 @@ def _wire_gate_harness(mock_orch_config, repo: Path, *, task_id: str) -> Harness
     # MagicMock.__iter__'s empty default.
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value=f'esc-{task_id}-1')
+    # Explicit for the same reason (task 4499): the filer's auto-dismiss guard
+    # reads a TERMINAL record on this citation, so "nothing was previously
+    # adjudicated" must be stated, not inherited from MagicMock's truthy
+    # auto-child — which would silently suppress every filing below.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 
@@ -245,7 +250,24 @@ class TestAlreadyLandedGateRealGitBoundaries:
         assert esc.task_id == task_id
         assert branch in esc.detail
         assert marker_sha in esc.detail
+        # Task 3116 part A, end-to-end.  The gate is still SAFE here, and the
+        # three assertions below pin what an operator can ACT on: the
+        # machine-readable reason code (``effect_absent``), the labelled
+        # ``diverged paths`` block — whose header is the structural evidence
+        # that the paths are rendered under their own label rather than buried
+        # in the ``probe: {...}`` dict repr — and the real deliverable path
+        # this scenario's fixture created, which the probe had to compute.
+        # Each fails if the step-4 enrichment or the step-6 rendering
+        # regresses.
+        #
+        # The operator PROSE around them is deliberately not asserted: it is
+        # not a contract, part (b) moved the semantics underneath it (the
+        # check no longer decides on byte-identity), and pinning the wording
+        # here would let the assertion outlive a real regression while
+        # blocking the corrective edit at its source.
         assert 'effect_absent' in esc.detail
+        assert 'diverged paths' in esc.detail
+        assert 'deliverable.py' in esc.detail
 
     async def test_intact_merge_marker_marks_done_no_escalation(
         self, mock_orch_config, git_repo,
@@ -298,3 +320,243 @@ class TestAlreadyLandedGateRealGitBoundaries:
         assert esc.task_id == task_id
         assert branch in esc.detail
         assert 'no_citation' in esc.detail
+
+
+async def _commit_all(repo: Path, message: str) -> str:
+    """Stage everything (including deletions) and commit, returning the sha."""
+    rc, _, err = await _run(['git', 'add', '-A'], cwd=repo)
+    assert rc == 0, f'git add -A failed: {err}'
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=repo)
+    assert rc == 0, f'commit {message!r} failed: {err}'
+    rc, sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    return sha.strip()
+
+
+def _lines(prefix: str, count: int) -> str:
+    """*count* unique, non-blank lines.
+
+    Uniqueness is load-bearing: survival is measured by line-SET membership,
+    so a duplicated or short-common line can be "present" at main by pure
+    coincidence and a fixture that tripped over it would measure the
+    coincidence instead of the deliverable.
+    """
+    return ''.join(f'{prefix}_{i:05d} = {i}\n' for i in range(count))
+
+
+async def _land_branch_marker(
+    repo: Path, task_id: str, mutate, main_edit=None,
+) -> str:
+    """Land ``task/{task_id}`` via a ``Merge task/N into main`` no-ff marker.
+
+    *mutate* is called with *repo* on the branch and may write OR delete files
+    (staging is ``git add -A``, so a deletion is a first-class deliverable —
+    that is the vacuous shape task 3116 b3 exists for).  The branch ref is
+    deleted after the merge, exactly as ``cleanup_worktree`` does before
+    ``set_task_status('done')`` lands, so only the marker can attribute the
+    landing.  Returns the marker sha.
+
+    *main_edit*, when given, is called with *repo* back on main AFTER the
+    branch commit and BEFORE the merge, and its result is committed on main.
+    ORDER IS THE WHOLE POINT: the branch must fork BEFORE that edit, so
+    ``merge-base(parent1, parent2)`` precedes it and the ``--no-ff`` merge
+    genuinely auto-integrates two independent edits.  Making the edit first
+    and forking afterwards produces a fixture where main HEAD's tree for the
+    touched paths is byte-identical to parent2's — no divergence at all — so
+    even the retired byte-identity predicate would accept it and the test
+    would discriminate nothing.
+    """
+    branch = f'task/{task_id}'
+    rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=repo)
+    assert rc == 0, f'checkout {branch} failed: {err}'
+    mutate(repo)
+    await _commit_all(repo, f'impl({task_id}): branch work')
+    rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
+    assert rc == 0, f'checkout main failed: {err}'
+    if main_edit is not None:
+        main_edit(repo)
+        await _commit_all(repo, "chore: an unrelated task's edit to a hot file")
+    rc, _, err = await _run(
+        ['git', 'merge', '--no-ff', branch, '-m', f'Merge {branch} into main'],
+        cwd=repo,
+    )
+    assert rc == 0, f'merge failed: {err}'
+    rc, marker_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse failed: {err}'
+    rc, _, err = await _run(['git', 'branch', '-D', branch], cwd=repo)
+    assert rc == 0, f'branch -D failed: {err}'
+    return marker_sha.strip()
+
+
+class TestAlreadyLandedGateSurvivalSemantics:
+    """End-to-end: the false-positive class part (b) removes (task 3116).
+
+    Every scenario here is a CLEAN LANDING that the pre-task byte-identity
+    check rejected.  The cost of each rejection was not a cheap re-check: the
+    task was left pending, DISPATCHED to an agent on the next tick for a full
+    plan/verify/review cycle, and a spurious ``task_failure`` escalation was
+    filed — and because byte-identity, once broken, is never restored, the
+    condition is ABSORBING, so it repeated every tick.  Three live tasks
+    (3653, 3640, 3717) burned days and ~5.80 USD this way.
+
+    These drive the REAL gate over REAL git state, which is the only place the
+    whole chain — marker discovery, CANDIDATE-mode validation, survival
+    measurement, escalation filing — is exercised together.
+    """
+
+    async def test_cotouched_hot_file_no_longer_reads_as_a_revert(
+        self, mock_orch_config, git_repo,
+    ) -> None:
+        """(a) THE INSTANCE-2 SHAPE: the branch touches its own deliverable
+        AND a shared hot file that main independently edited at a distant,
+        non-conflicting line before the merge.
+
+        This landing is CLEAN — the deliverable is present at main and so is
+        every line the branch added to the shared file.  Byte-identity said
+        otherwise purely because main carries an unrelated neighbour's edit to
+        a co-touched file, and that false positive is what cost a full
+        spurious dispatch.  The gate must now accept: mark_done awaited, no
+        escalation.
+
+        The fixture ORDER is what makes this shape real, and is asserted
+        below rather than assumed.  The branch forks from the seeded manifest
+        FIRST and APPENDS its entry to the file as read from disk; only then
+        does the neighbour prepend its line on main.  So the fork point
+        precedes the neighbour commit, ``git merge --no-ff`` auto-integrates
+        two genuinely independent edits, and main HEAD carries BOTH — while
+        parent2's pre-merge blob carries only the branch's.  That is exactly
+        the divergence byte-identity rejected and survival accepts: the probe
+        must still NAME ``shared.manifest`` as diverged while reporting
+        ``present``.  ``test_git_ops.py``'s
+        ``test_merge_names_only_the_co_touched_hot_file`` is the unit-level
+        template for the same shape.
+        """
+        task_id = '3640'
+        (git_repo / 'shared.manifest').write_text(_lines('shared', 40))
+        await _commit_all(git_repo, 'seed the shared hot file')
+
+        def _branch_work(repo: Path) -> None:
+            (repo / 'deliverable.py').write_text(_lines('deliv', 12))
+            manifest = repo / 'shared.manifest'
+            manifest.write_text(manifest.read_text() + _lines('branch_entry', 3))
+
+        def _neighbour_edit(repo: Path) -> None:
+            manifest = repo / 'shared.manifest'
+            manifest.write_text(_lines('neighbour', 1) + manifest.read_text())
+
+        marker_sha = await _land_branch_marker(
+            git_repo, task_id, _branch_work, main_edit=_neighbour_edit,
+        )
+
+        merged_manifest = (git_repo / 'shared.manifest').read_text()
+        assert 'neighbour_00000' in merged_manifest, (
+            "main HEAD must carry the neighbour's independent edit"
+        )
+        assert 'branch_entry_00000' in merged_manifest, (
+            "main HEAD must carry the branch's own added lines"
+        )
+
+        h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        probe = await h.git_ops.describe_commit_effect_in_main(marker_sha)
+        assert 'shared.manifest' in probe.diverged_paths, (
+            'the co-touched hot file must diverge from parent2 — that '
+            'divergence IS the false positive byte-identity rejected'
+        )
+        assert 'deliverable.py' not in probe.diverged_paths
+        assert probe.present is True, 'survival must accept what byte-identity rejected'
+
+        result = await h._already_landed_dispatch_gate(task_id)
+
+        assert result is True, 'a clean landing beside a co-touched hot file'
+        cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+    async def test_later_additive_evolution_no_longer_reads_as_a_revert(
+        self, mock_orch_config, git_repo,
+    ) -> None:
+        """(b) THE TASK-3653 SHAPE: the merge lands, then main ADDS further
+        lines to the same file without disturbing any the branch added.
+
+        Byte-identity is broken; survival is total.  This is the exact live
+        shape that re-dispatched task 3653 and left it blocked four days.
+        """
+        task_id = '3653'
+
+        def _branch_work(repo: Path) -> None:
+            (repo / 'deliverable.py').write_text(_lines('deliv', 12))
+
+        marker_sha = await _land_branch_marker(git_repo, task_id, _branch_work)
+        (git_repo / 'deliverable.py').write_text(
+            _lines('deliv', 12) + _lines('later_unrelated', 8),
+        )
+        await _commit_all(git_repo, 'feat: a later task appends to the same file')
+
+        h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        result = await h._already_landed_dispatch_gate(task_id)
+
+        assert result is True
+        cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+    async def test_deletion_deliverable_is_accepted_when_it_holds(
+        self, mock_orch_config, git_repo,
+    ) -> None:
+        """(d) A deliverable that is a FILE DELETION adds no lines at all, so
+        an added-lines-survive test is trivially true for it.
+
+        Reached through the REAL gate, not just the unit tests: the vacuous
+        arm must decide it by the mechanism that applies — is the file still
+        absent at main — and accept.
+        """
+        task_id = '3717'
+        (git_repo / 'obsolete.py').write_text(_lines('obsolete', 20))
+        await _commit_all(git_repo, 'seed the file this task will delete')
+
+        marker_sha = await _land_branch_marker(
+            git_repo, task_id, lambda repo: (repo / 'obsolete.py').unlink(),
+        )
+
+        h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        result = await h._already_landed_dispatch_gate(task_id)
+
+        assert result is True
+        cast(AsyncMock, h.scheduler.mark_done).assert_awaited_once()
+        call = cast(AsyncMock, h.scheduler.mark_done).await_args
+        assert call is not None
+        assert call.kwargs['sha'] == marker_sha
+        cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+
+    async def test_resurrected_deletion_is_still_caught_as_a_revert(
+        self, mock_orch_config, git_repo,
+    ) -> None:
+        """(d), the safety half: putting back the file the deliverable removed
+        IS a genuine revert, and a zero-added-lines branch must not be waved
+        through on the vacuous path.
+
+        This is the task-1175 clobber in deletion shape — the exact failure
+        that would make part (b) "a green light that proves nothing".
+        """
+        task_id = '3718'
+        (git_repo / 'obsolete.py').write_text(_lines('obsolete', 20))
+        await _commit_all(git_repo, 'seed the file this task will delete')
+        await _land_branch_marker(
+            git_repo, task_id, lambda repo: (repo / 'obsolete.py').unlink(),
+        )
+        (git_repo / 'obsolete.py').write_text(_lines('obsolete', 20))
+        await _commit_all(git_repo, 'resurrect the deleted file on main')
+
+        h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        result = await h._already_landed_dispatch_gate(task_id)
+
+        assert result is False
+        cast(AsyncMock, h.scheduler.mark_done).assert_not_awaited()
+        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
+        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
+        assert esc.category == 'provenance_unattributed'
+        assert 'vacuous_effect_absent' in esc.detail

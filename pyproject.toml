@@ -21,8 +21,11 @@ extraPaths = [
     # scripts/ is a flat script directory rather than a package src root, so
     # both it and scripts/legibility/ are listed explicitly. scripts/tests/
     # conftest.py performs the same two sys.path insertions at runtime, and the
-    # `scripts` module's declared type gate (`npx pyright scripts/`) runs from
-    # this directory, so it resolves against this table. Pinned by
+    # `scripts` module's declared type gate
+    # (`uv run --project shared pyright scripts/`, task 4358; `npx pyright
+    # scripts/` before that) runs from this directory — it carries no
+    # --directory, and --project selects only the environment pyright resolves
+    # from — so it resolves against this table. Pinned by
     # tests/scripts/test_scripts_module_config.py::
     # test_root_pyright_extrapaths_resolves_scripts_imports (task 3456).
     "scripts",

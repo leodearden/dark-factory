@@ -8,7 +8,198 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+#### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
+
+Replaces the hand-rolled write-then-delete choreography that made consolidation a
+**ratchet**: a canonical write plus unordered deletes with no verification nets +1
+entry per failed pass, which is how a cluster ends up containing the consolidator's
+own prior canonicals. The cure is ordering plus a closure that is CORROBORATED by a
+live re-read, never inferred from "the delete call returned ok".
+
+Ordering is the contract, and each step sits where it does because of what its
+failure would cost: (1) argument validation, pure and free to refuse; (2) fail-closed
+`metadata_patch` authorization, inherited from task 3088's resolver and run
+unconditionally — reparenting is only discovered after the canonical exists, so a late
+denial would abort mid-transaction; (3) the same tool-layer citation gate `delete_memory`
+runs, in its non-mutating `scan_only` pre-flight, so a set that cannot be cleared leaves
+the corpus byte-identical; (4) the canonical write, before anything destructive; (5)
+retained peers tagged, then per supersede read → re-home children → corroborate → delete;
+(6) deterministic re-query; (7) tombstone; (8) structured report.
+
+- **Retain-and-tag is the default arm**, ratified at gate 3200. Peers are stamped with
+  the cluster's `topic` IN PLACE — never `canonical` (exactly one per project+topic) and
+  never `parent_id` — so they keep their Qdrant point ids and every citation, parent
+  pointer and supersedes edge already aimed at them stays valid. Retained ids never
+  appear in the canonical's `metadata.supersedes`: they were not replaced.
+  A peer is first PROVEN not to be a canonical already, and one that is gets refused
+  with `RetainedPeerIsCanonical` rather than tagged. Not SETTING `canonical` is not the
+  same as ensuring it is unset: the patch is a server-side payload merge, so a peer
+  already holding the key would keep it and become a second claimant for
+  (project, topic) — invisibly, since `_apply_canonical_uniqueness` runs only on the
+  `add_memory` path. Refused rather than demoted, because a prior canonical in the
+  retain list is usually what the caller should have put in `supersedes`; an unreadable
+  peer fails closed the same way (`RetainCheckFailed`).
+- **An id repeated within one arm is refused by name, naming both slots.** Not
+  de-duplicated: silently rewriting the caller's set would make the op's own report
+  describe a request nobody made — the reason the cross-arm overlap check refuses rather
+  than picking an arm, and the reason `normalize_supersedes` never drops a member.
+  Tolerating a repeat has three durable consequences, all avoidable for free at
+  validation time: the delete arm awaits `delete_memory` TWICE for one record (a second
+  `memory_deleted` event and a second WriteJournal row for a record already gone); the
+  canonical's durable `metadata.supersedes` KEEPS the repeat, because the step (7)
+  narrowing compares SETS and so never fires on a list differing only by duplication;
+  `tombstones_written`/`tombstones_expected` BOTH count it while the recon ledger's
+  five-part identity collapses the two rows into one, so the pair the envelope advertises
+  as its audit-trail proof would overstate the ledger by one; and the single row that
+  DOES survive is gutted — `victims_by_id` is keyed by id and reassigned per pass, so the
+  repeat's pre-delete capture (running after the first pass already deleted the record)
+  misses and overwrites the good capture with `metadata=None, created_at=None`, leaving
+  the surviving tombstone stripped of exactly the victim-identity fields that make a dead
+  id answerable. The last two are why this is refused rather than tolerated — an INFERRED
+  count and a silently gutted audit row, in the op whose whole deliverable is corroborated
+  facts.
+- **`survivors` is the deliverable.** Computed only from a post-delete `get_memory_by_id`
+  per id, so an id whose delete reported success but which still resolves is reported as
+  a survivor, and an id whose delete raised but which is genuinely gone is not. Partial
+  failure is a RETURNED envelope (`status='partial'` plus `failed_deletes`,
+  `retain_failures`, `reparent_failures`), never a raise — `@mcp_tool_errors` would
+  flatten an exception and destroy exactly those per-id dispositions.
+- **Children are re-homed before their parent dies**, and a re-homing this call cannot
+  PROVE complete refuses that delete instead of orphaning. The proof fails on a refused
+  patch, on a truncated child listing (its count reads as a floor, "at least N"), or on a
+  live post-reparent re-count that is still non-zero. The delete is never forced with
+  `cascade=True`, which would destroy the children the re-homing exists to preserve.
+  A truncated listing is decided BEFORE the re-homing loop runs, not after: truncation is
+  known the instant the listing returns and refuses the delete unconditionally, so
+  re-pointing the children that ARE visible first would buy nothing and cost a real write
+  each — moving them onto the canonical while their actual parent stays alive and
+  un-deleted, splitting that subtree across two live parents, with `reparented` reporting
+  the moves exactly like ones that earned a delete. A refusal already determined costs
+  zero mutations.
+- **The delete arm stamps a task-3041 tombstone** per reaped supersede, carrying the new
+  `absorbed_by` reverse pointer and the caller-supplied `run_id` as `deleting_run_id`
+  (required whenever `supersedes` is non-empty; a delete that cannot be attributed is
+  refused before anything is written). Tombstones are stamped ONLY for CONFIRMED-GONE
+  victims — `deleted` minus `survivors` — because a tombstone over a record that still
+  resolves would mint a durable audit row asserting a record is gone while it is alive.
+  A shortfall is reported via `tombstones_written` / `tombstones_expected` and a WARNING;
+  it deliberately does NOT flip `status`, since retrying a completed merge is the very
+  ratchet this op ends.
+- **The canonical claims only what it actually replaced.** `metadata.supersedes` is
+  stamped at write time with the REQUESTED set — the write must precede every delete —
+  so on a partial run it would name records that are still live. Step (7) patches it
+  DOWN to the corroborated-gone set (the same set the tombstones are stamped for) and
+  reports the narrowing as `supersedes_correction`; `canonical_supersedes` always shows
+  what the record really carries, including when that patch itself failed. Nothing else
+  in the system repairs this field, so an uncorrected claim would persist in the corpus
+  pointing readers away from live records.
+- **`partial` is not a retry signal, and there is no resume arm.** The op takes no
+  existing canonical id, so re-running it for the same (project, topic) writes a SECOND
+  canonical — censused but ADMITTED under the shipped warn-mode default, i.e. the very
+  ratchet. The partial envelope therefore carries a `hint` with the by-hand recovery
+  (fix what the failure lists name, then `delete_memory` per still-listed id, which runs
+  the same citation gate and child guard, plus `update_memory` for any untagged peer).
+  Related bound, stated rather than widened: "a refused consolidation leaves the corpus
+  byte-identical" covers refusals from steps (1)-(4) only. The mutating citation repoint
+  runs over the whole delete set right after the canonical write, so an id later refused
+  for a non-citation reason has already had its citers rewritten onto the canonical while
+  it is still in the corpus. Under `metadata.enforce=True` one shape refuses outright: a
+  supersede that is itself the topic's incumbent canonical is still alive when the write
+  probes uniqueness, so `CanonicalUniquenessViolation` names it and nothing is deleted —
+  demote it (`metadata_patch={'canonical': False}`) and re-run, or leave it out of
+  `supersedes`. Under the shipped `enforce=False` default the write proceeds and this
+  op's own delete arm reaps the incumbent inside the same call.
+- Closure reads are deterministic Qdrant work only (`get_memory_by_id`,
+  `get_memories_by_metadata({'topic': T})`); `MemoryService.search` is never called and a
+  test pins that negative. Registered in `DISALLOW_MEMORY_WRITES` (hence Stage 3) and in
+  the orchestrator's dry-run `_DISALLOWED_TOOLS` in the same change that adds it.
+- **No unguarded await after the canonical write.** Every Qdrant call here can propagate
+  `TimeoutError` by contract, so each is guarded — otherwise one timeout would flatten the
+  whole result to `{'error', 'error_type'}` and destroy the per-id dispositions for
+  records already irreversibly gone. That covers the WRITE seams too: `update_memory`
+  returns a structured rejection only for `MemoryNotFound` and re-raises every backend
+  failure, so both the retain-arm tag and the reparent patch record a raise in the same
+  per-id shape as a returned refusal (`retain_failures` / `reparent_failures`). The
+  reparent patch matters most: it runs INTERLEAVED with the deletes, so a propagating
+  raise would abandon already-deleted supersedes with neither a disposition nor a
+  tombstone — un-attributable, i.e. indistinguishable from silent data loss.
+- **A failed READ degrades the claim, never the envelope.** Enrichment reads degrade (a
+  victim capture that fails still deletes and still tombstones, with `metadata`/
+  `created_at` null; a closure scroll that fails reports `topic_members: []` with
+  `topic_members_available: false`, so an empty listing is never misread as "this topic
+  has no members"). Proof reads FAIL CLOSED (an unreadable child listing or post-reparent
+  re-count refuses that delete with `ChildScanFailed` / `ReparentIncomplete` rather than
+  reading silence as "no children"). A corroborating read that fails is a third outcome
+  in its own `survivor_check_failed` list: the id is claimed neither alive nor gone, it
+  is NOT tombstoned, and it makes the op `partial` — unlike a tombstone shortfall, an
+  unprovable closure means the deliverable itself is missing.
+
+Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
+`recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
+`_apply_memory_metadata_validation` bypass (task 3523 — this op validates the slug at
+entry, bounding but not closing it), and `x_memory_citation_tombstones` on citing tasks
+(task 3893 — a different object in a different store).
+
 ### Changed
+
+#### `execution_class` blessed into Tier-A, and the Tier-A listing is now machine-checked (task 3780)
+
+**Two changes, and the second matters more than the first.**
+
+**`execution_class` is now a Tier-A blessed metadata key.** It had eight
+production read sites across seven modules — `execution_class_guard`,
+`operational_routing_guard` (which coerces `operational`/`decision` to
+`task_kind='deterministic'` + `always_escalates`, a real dispatch consequence),
+`routing_intent_guard`, `operational_suggestion_guard`,
+`operational_ask_registry`, the `task_interceptor` gate-marker set and the task
+curator's decision-cache key — while still emitting `code=unknown_key` on every
+read. Measured 2026-08-18: **336 of 4204 dict-metadata tasks carry it**
+(`code_tdd` 196, `operational` 126, `decision` 12, `implementation` 2), so that
+is 336 census lines removed.
+
+Blessed rather than promoted to a typed `Literal`, despite `EXECUTION_CLASSES`
+looking like a closed vocabulary. Its validity rule is conditional on
+recon-stage caller identity, which no pydantic field validator can see; and the
+vocabulary is not closed in the data — tasks 3623/3624 carry `'implementation'`,
+and both are `done` carrying `done_provenance`, so a `Literal` would raise on
+every metadata write to them and they stay unrepairable until task 3777 lands.
+That acceptance is now pinned by a test, so the constraint cannot be silently
+re-tightened into a stranding bug. `docs/task-authoring.md` §8 "Promoting a
+convention" records the generalised rule.
+
+**`docs/task-authoring.md` §8's Tier-A listing is now pinned to the frozenset**
+by `tests/scripts/test_task_authoring_blessed_keys_drift.py`, anchored on a
+`tier-a-blessed-keys-mirror` marker pair. This is the structural half. The
+listing is what a task author reads before deciding whether a key they are about
+to write will manufacture census noise, and nothing kept it in step with the
+code. The failure is measured, not hypothetical: task 4372 blessed two keys the
+day before, then mirrored them into the doc by hand in a *separate* follow-up
+commit whose own message names the hazard — "hand-maintained prose with no sync
+test, so it drifts silently if not mirrored by hand". Under-listing is the
+dangerous direction: an author sees a blessed key absent, concludes it is
+unblessed, and either `x_`-renames a machine-written key — forking the
+vocabulary against every sibling task and blinding its live reader — or files a
+redundant blessing task. The same file's frozenset header comment had meanwhile
+gone stale across two blessings, claiming 39 keys against 42; that count is now
+dropped rather than re-derived, since a hand-maintained denominator needs a hand
+re-count on every future blessing.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Re-measured after the change: **1622 tasks still carry at least one unknown
+key** (down from 1688 — the blessing removes 336 warning *lines* but clears only
+66 tasks entirely, because most carry other unknown keys too), spread across
+**975 distinct spellings**, 725 of which appear on exactly one task. The largest
+single contributor is `related_tasks` at 445 tasks — which is the *canonical*
+Tier-B spelling, not drift. Blessing one key does not move that number much, and
+the remaining tail is deliberately left warning as a drift signal.
+
+Also splits out the corpus `x_` sweep that this task originally carried, as task
+4302: 23 of its 29 target tasks carry `done_provenance` and are unwritable until
+task 3777 lands, and sweeping only the 6 writable ones would fork the vocabulary
+for a fifth of the benefit. §8's Known-gaps table is re-pointed and re-measured
+accordingly; the `execution_class` row there is now closed.
 
 #### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
 
@@ -55,6 +246,18 @@ explicit server REJECTION is deliberately excluded — the server replied and
 refused, nothing committed, and there is nothing to recover.
 
 Extends the SAFETY section added with the script itself in task 3697 (below).
+
+#### `record_mem0_deletion_tombstone(s)` gained an optional `absorbed_by` keyword (task 3133)
+
+Additive and keyword-only, defaulting to `None`. It records the surviving canonical id
+that absorbed a victim — the REVERSE pointer, which is what makes "where did its content
+go?" answerable from the DEAD id alone (the recon-gate-165 audit dead-end: the survivor
+carried a forward `consolidated_from`, but probing the victim returned `{'found': false}`
+with no tombstone at all). Written as a top-level payload field rather than through
+`victim_metadata`, whose `_VICTIM_IDENTITY_KEYS` projection is deliberately what the
+VICTIM recorded about itself. The two existing GC/trim sweeps absorb nothing, need no
+edit, and now write `absorbed_by: None` — present, not omitted, so absence reads as
+"nothing absorbed it" rather than "this row predates the field".
 
 #### `update_memory`'s default allowlists now admit `curator-` on both arms (esc-3524-1)
 

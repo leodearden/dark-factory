@@ -29,7 +29,11 @@ from fused_memory.config.schema import (
     TaskStatusConfig,
     YamlSettingsSource,
 )
-from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
+from fused_memory.server.near_duplicate_guard import (
+    _TOPIC_CLUSTER_DEFAULT_HINT,
+    build_topic_cluster_block,
+    find_matching_topic_cluster,
+)
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
 # Imported from the LEAF, not from memory_metadata: this test module asserts
@@ -1911,10 +1915,6 @@ class TestProceduralTopicGuardClustersDefault:
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert topic_id not in {c.topic_id for c in clusters}
 
-    def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
-        cluster = _seeded_cluster('pytest-xdist-serial-override')
-        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
-
     def test_every_seeded_cluster_is_well_formed(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         for cluster in clusters:
@@ -1961,6 +1961,150 @@ class TestProceduralTopicGuardClustersDefault:
                             f'occurrence would score two distinct hits and defeat '
                             f'min_phrase_hits'
                         )
+
+
+class TestPytestXdistSerialOverrideCluster:
+    """Topic-guard cluster for the pytest-xdist -n0 serial-override workaround
+    (the topic that originally motivated this guard, task 2845; canonical
+    memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51).
+
+    Unlike its four siblings, this cluster's hint used to carry a SINGLE
+    dead-end instruction -- amend the canonical memory in place -- that is
+    structurally unreachable for the audience that ever sees it:
+    ``update_memory``'s content-amend arm is authz-gated to ``recon-stage-``
+    / ``curator-`` ``agent_id`` prefixes
+    (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``), and every
+    orchestrator-dispatched task/merge agent is neither. Task 4738 (fix A)
+    replaces that hint with three ratified outcomes the blocked writer can
+    actually act on. The structural fix -- stopping a per-cluster hint from
+    shadowing the guard's escape hatches at all -- is the sibling fix-B task
+    and is deliberately not this class's concern.
+    """
+
+    TOPIC_ID = 'pytest-xdist-serial-override'
+
+    @classmethod
+    def _cluster(cls):
+        return _seeded_cluster(cls.TOPIC_ID)
+
+    def test_rendered_hint_names_all_three_outcomes(self):
+        """The rendered hint -- not the bare cluster field -- must name all three.
+
+        Asserted through ``build_topic_cluster_block`` (not ``cluster.hint``
+        alone), because ``build_topic_cluster_block`` resolves ``cluster.hint
+        or _TOPIC_CLUSTER_DEFAULT_HINT`` -- asserting on the module default here
+        would pass vacuously, since this cluster always sets its own hint.
+        The explicit ``!= _TOPIC_CLUSTER_DEFAULT_HINT`` assertion guards
+        against exactly that vacuous-pass mode, which is how the previous
+        dead-end hint survived four rounds of triage undetected.
+
+        Reviewer (test-quality, task 4738 amendment): renamed from
+        ``..._returned_to_a_non_curator_...`` -- ``build_topic_cluster_block``
+        never reads ``agent_id`` to select the hint, only echoes it into the
+        block, so this was never actually an agent-conditional test; the name
+        no longer claims a discrimination it can't make. ``matched_phrases``
+        is now derived from ``find_matching_topic_cluster`` on the realistic
+        excerpt below (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention), rather than hand-supplied, so the content string is
+        load-bearing rather than decorative.
+
+        Each outcome is pinned by the literal the writer must ACT on, not by
+        surrounding prose (the ``TestNpxPyrightEaccesAgentSandboxCluster``
+        convention): ``allow_near_duplicate`` for the override, ``skip`` +
+        ``curate-fused-memories`` for the sanctioned no-write outcome (the
+        skill name is what makes "skip" a real answer rather than an implied
+        failure -- it names who DOES own consolidation), and
+        ``escalate_blocker`` -- the actual tool name, not just the bare word
+        "escalate" -- for the unsure/contradicts outcome.
+        """
+        content = (
+            'Hit the pytest-xdist -n0 serial-override workaround again: '
+            'fused-memory/pyproject.toml hardcodes --dist loadgroup in addopts.'
+        )
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert block['topic_id'] == self.TOPIC_ID
+        assert block['error_type'] == 'ProceduralKnowledgeKnownTopicClusterWriteRejected'
+        assert hint != _TOPIC_CLUSTER_DEFAULT_HINT
+        # Outcome 1: genuinely distinct -> override, open to every agent today.
+        assert 'allow_near_duplicate' in hint
+        # Outcome 2: genuine duplicate -> skip is sanctioned, and consolidation
+        # is attributed to the interactive curation skill, not to this agent.
+        assert 'skip' in hint.lower()
+        assert 'curate-fused-memories' in hint
+        # Outcome 3: unsure / contradicts -> escalate, naming the actual tool.
+        assert 'escalate_blocker' in hint
+
+    def test_rendered_hint_does_not_route_to_a_refused_amend(self):
+        """Pins that the IMPERATIVE is gone, and that the authz reason survives.
+
+        Reviewer (test-quality, task 4738 amendment): this used to also
+        assert ``'update/consolidate canonical memory' not in hint`` -- the
+        exact wording of the phrase that had just been deleted. That pins one
+        2026-08 rephrasing, not the contract: it would stay green even if a
+        future hint reintroduced the same dead-end imperative in different
+        words ('amend the canonical entry in place'). Dropped in favour of
+        the tool-name pin below plus a positive, behavioural pin: the hint
+        must still STATE why the amend arm is refused, so a future edit that
+        quietly reroutes this audience back toward an amend -- without
+        removing that explanation -- is caught too.
+
+        ``update_memory``'s content-amend arm is authz-gated to
+        ``recon-stage-`` / ``curator-`` agent_id prefixes
+        (``Mem0UpdateConfig.content_amend_allowed_agent_prefixes``, esc-3524-1
+        ruling (b) 2026-08-11 + the 2026-08-12 all-deployments schema-default
+        ruling), so routing this audience to call it directly reproduces the
+        exact defect this task fixes.
+
+        Also renamed from ``..._a_non_curator_...``, for the same reason as
+        the sibling test above: ``agent_id`` is inert for hint rendering.
+        """
+        content = 'pytest-xdist -n0 --dist loadgroup workaround again'
+        match = find_matching_topic_cluster(content, [self._cluster()])
+        assert match is not None, f'must match its own cluster: {content!r}'
+        cluster, matched_phrases = match
+        block = build_topic_cluster_block('claude-merge-3875', content, cluster, matched_phrases)
+        hint = block['hint']
+        assert 'update_memory' not in hint
+        assert 'authz-gated' in hint
+        assert 'recon-stage-' in hint
+
+    def test_cluster_phrases_and_threshold_are_unchanged(self):
+        """Characterization: step-2's hint-only edit must not touch the matcher.
+
+        Green from the start -- exists so a hint rewrite cannot silently
+        widen or narrow what this cluster matches on.
+        """
+        cluster = self._cluster()
+        assert cluster.phrases == [
+            'pytest-xdist',
+            '-n0',
+            '--dist loadgroup',
+            'max-worker-restart',
+            '-p no:xdist',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+
+    def test_canonical_memory_id_survives_as_a_read_pointer(self):
+        """The canonical memory id stays in the hint, as a READ pointer only.
+
+        Retained (not deleted) so a blocked writer can search
+        8bb3eb15-1133-4e7b-ac1f-5bac10329b51 to decide which of the three
+        outcomes applies -- distinct, duplicate, or contradicts. It must
+        never again be re-attached to an amend instruction this audience
+        cannot execute; that regression is what
+        ``test_rendered_hint_does_not_route_to_a_refused_amend`` pins.
+        Supersedes the former
+        ``test_pytest_xdist_cluster_hint_points_at_canonical_memory`` in
+        ``TestProceduralTopicGuardClustersDefault``, folded in here so this
+        cluster's hint contract is pinned in exactly one place.
+        """
+        cluster = self._cluster()
+        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
 
 
 class TestReportTaskAlreadyDoneMainReachabilityCluster:
@@ -3032,6 +3176,111 @@ class TestWriteTriageConfig:
             WriteTriageConfig(t_high_by_category={
                 'procedural_knowledge': 0.88, 'observations_and_summaries': 9.0,
             })
+
+    # -- operator knobs (task 3127, PRD leaf beta) --------------------------
+    #
+    # DELIBERATELY NOT added to the `['t_high', 't_low',
+    # 'calibration_report_path']` parametrize lists above. Those pin "defaults
+    # to None", which encodes UNCALIBRATED — a meaningful state for a measured
+    # threshold and a meaningless one for a kill switch. `enabled` and
+    # `candidate_k` are hand-set OPERATOR knobs, not calibration outputs, so
+    # they ship with real defaults and get their own tests here.
+
+    def test_enabled_ships_off(self):
+        """The D10 staged-rollout flag ships FALSE, on every deployment.
+
+        `write_triage.enabled` is the PRD's `write_triage_enabled`: it swaps
+        the two reject guards for redirect-not-reject routing across every
+        add_memory write. Shipping it True would flip that behaviour on the
+        merge that lands the skeleton, ahead of the judge (leaf gamma) and
+        ahead of the 3169 flip gate.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        value = WriteTriageConfig().enabled
+        assert value is False, (
+            f'write_triage.enabled must default to False (D10 staged rollout: '
+            f'the flag ships off and is flipped by task 3169); got {value!r}'
+        )
+
+    def test_candidate_k_default_is_materially_wider_than_the_retired_guards_five(self):
+        """k caps what any band threshold can achieve, so it is not inherited.
+
+        Measured same-category recall on the live corpus: 26.1% @5, 43.9% @10,
+        69.4% @20, 88.5% @50. Retrieval width is a RANK property — a candidate
+        that never enters the result set cannot be scored by any t_high or
+        t_low, so k is the ceiling on the whole band mechanism. The retired
+        near-dup guard's hardcoded `limit=5` (server/tools.py, at the guard
+        call site) is therefore the one number this leaf must NOT inherit by
+        analogy: at 5 the deterministic band would miss ~three quarters of the
+        duplicates it exists to catch, and the miss would be invisible.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        value = WriteTriageConfig().candidate_k
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f'write_triage.candidate_k must be an int, got {value!r}'
+        )
+        assert value > 5, (
+            f'write_triage.candidate_k must be materially wider than the retired '
+            f'near-dup guard\'s hardcoded limit=5 (measured same-category recall: '
+            f'26.1% @5 vs 69.4% @20 — k caps what any band threshold can reach); '
+            f'got {value!r}'
+        )
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_candidate_k_rejects_a_width_that_would_disable_retrieval(self, value):
+        """Bounded ge=1 so a typo cannot silently turn triage into a no-op.
+
+        A `candidate_k: 0` loads fine as an int and produces an empty
+        candidate list on every write, which the band router reads as "no
+        comparable candidate" and routes to `stored`. That is triage disabled
+        with no error, no log line, and nothing to grep — the exact silent
+        degradation INV-4 exists to prevent. Fail at LOAD instead.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(candidate_k=value)
+
+    def test_the_root_wiring_introduces_no_operator_knob_override(self):
+        """The submodel's own defaults are what every deployment gets.
+
+        Same half-of-the-invariant guard as
+        test_root_wiring_introduces_no_default above: a
+        ``default_factory=lambda: WriteTriageConfig(enabled=True)`` would
+        leave the class defaults clean while shipping the flag ON.
+        """
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None
+        assert factory().enabled is False  # type: ignore[call-arg]
+        assert factory().candidate_k > 5  # type: ignore[call-arg]
+
+    def test_the_shipped_config_yaml_ships_the_flag_off_and_k_wide(self, monkeypatch):
+        """The pin must hold on the REAL deployment file, not just the model.
+
+        The schema default is what a deployment gets only if config.yaml stays
+        silent. config.yaml carries an explicit `write_triage:` block, so the
+        shipped values there are what the running server actually reads — and
+        they are what an operator (and the next calibration run) can edit.
+        Asserting the class default alone would pass while the deployed file
+        said `enabled: true`.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+
+        assert cfg.write_triage.enabled is False, (
+            'fused-memory/config/config.yaml must ship write_triage.enabled: '
+            'false — the D10 staged-rollout flag is flipped by task 3169, not '
+            'by the merge that lands the skeleton'
+        )
+        assert cfg.write_triage.candidate_k > 5, (
+            'fused-memory/config/config.yaml must ship a candidate_k wider than '
+            "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
+        )
+
 
 
 class TestMemoryMetadataConfig:

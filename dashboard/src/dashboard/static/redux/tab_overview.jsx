@@ -1,5 +1,5 @@
 /* Overview tab — command-center grid */
-const { Sparkline, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, HistBar, PALETTE: P } = window.DF_CHARTS;
+const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed } = window.DF_SHELL;
 const D = window.DF_DATA;
 const { useState, useEffect } = React;

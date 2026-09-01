@@ -351,9 +351,12 @@ class TestDeadL0FilingIncarnationRule:
         """The classifier may only convert an L0 when it can PROVE the filing
         incarnation is dead. It cannot here, so it pins.
 
-        This is the branch that governs TODAY: until a producer stamps
-        filing_claimant_run_id, every real record carries None — so the
-        widening cannot by itself change any disposition."""
+        Governs every record whose filing identity is unknown: legacy rows
+        written before task 3550, and producers that still do not stamp (see
+        the inventory on ``pins.classify_pins`` — most are moot above link 4,
+        but ``merge_queue._file_main_health_escalation`` reaches THIS branch
+        with a real task_id, which is exactly the residual gap the inventory
+        names)."""
         bucket = _bucket_of(
             _rec(level=0, severity='blocking', filing=filing),
             live_claimant=True,
@@ -428,10 +431,10 @@ class TestLiveClaimantIdShapeGuard:
     mismatch is not PROOF that the filer is dead, so a non-composed identity
     on EITHER side is treated as unknown.
 
-    That describes the SHAPES that resolver can emit, not production reach: its
-    plan.lock leg still reads the pre-relocation lock path and so resolves to
-    ``None`` on a real run (task 4262), and no production caller passes a live
-    identity into ``classify_pins`` yet (task 3541).
+    Its plan.lock leg reads the ``.task-meta`` root the lock's writer targets
+    (task 4028), so a composed identity from that source is reachable on a real
+    run; no production caller passes a live identity into ``classify_pins`` yet
+    (task 3541).
 
     The cases below are UNCHANGED and stay load-bearing: a bare session_id is
     still a shape this guard must reject, merely no longer one the in-repo

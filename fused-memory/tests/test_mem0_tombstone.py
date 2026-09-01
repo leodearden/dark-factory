@@ -27,6 +27,7 @@ from fused_memory.reconciliation.mem0_tombstone import (
     RECORD_KIND_MEM0_TOMBSTONE,
     is_protected_mirror_record,
     record_mem0_deletion_tombstone,
+    record_mem0_deletion_tombstones,
 )
 
 _LOGGER = 'fused_memory.reconciliation.mem0_tombstone'
@@ -423,3 +424,163 @@ class TestRecordMem0DeletionTombstone:
         assert result is True
         record = ledger.upsert.await_args.args[0]
         assert datetime.fromisoformat(record.created_at).tzinfo is not None
+
+
+class TestTheReversePointer:
+    """`absorbed_by` — the survivor id that ate this record (task 3133).
+
+    The recon-gate-165 audit dead-end that motivated this: a consolidation
+    survivor correctly carried the FORWARD pointer
+    (`consolidated_from=<victim>`), but probing the DEAD id returned
+    `{'found': false}` with no tombstone at all. From the victim id alone
+    — the only id an auditor chasing a broken reference actually holds —
+    that deletion was indistinguishable from silent data loss.
+
+    Recorded as a first-class field rather than smuggled through
+    `victim_metadata`: `_VICTIM_IDENTITY_KEYS` is deliberately an
+    identity-only projection of what the VICTIM recorded about itself, and
+    a canonical id is not that. Routing it there would make the tombstone
+    misreport its own provenance and silently widen a projection whose
+    narrowness is a stated invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_that_absorbed_the_victim_is_recorded(self):
+        memory_service, ledger = _svc_with_ledger()
+
+        await record_mem0_deletion_tombstone(
+            memory_service,
+            'dark_factory',
+            'mem-victim-uuid',
+            victim_metadata=_VICTIM_METADATA,
+            victim_created_at='2026-07-28T00:00:00+00:00',
+            deleter='consolidate_memories',
+            deleting_run_id='run-deleter',
+            absorbed_by='canonical-uuid',
+            now=_NOW,
+        )
+
+        payload = json.loads(ledger.upsert.await_args.args[0].payload_json)
+        assert payload['absorbed_by'] == 'canonical-uuid'
+        # It joins the existing fields rather than displacing any of them.
+        assert payload['deleter'] == 'consolidate_memories'
+        assert payload['deleting_run_id'] == 'run-deleter'
+        assert payload['deleted_at'] == _NOW.isoformat()
+        assert payload['created_at'] == '2026-07-28T00:00:00+00:00'
+        assert payload['kind'] == 'cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_absent_is_written_as_an_explicit_none(self):
+        """PRESENT-with-None, never omitted. The key must distinguish
+        "reaped by a GC sweep, nothing absorbed it" from a tombstone
+        written before this field existed — and only presence can carry
+        that, which is why the assertion is on the KEY, not on falsiness.
+        Matches how the identity projection already writes explicit `None`
+        for victim keys the record did not have."""
+        memory_service, ledger = _svc_with_ledger()
+
+        await record_mem0_deletion_tombstone(
+            memory_service,
+            'dark_factory',
+            'mem-victim-uuid',
+            victim_metadata=_VICTIM_METADATA,
+            victim_created_at='2026-07-28T00:00:00+00:00',
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id='run-deleter',
+            now=_NOW,
+        )
+
+        payload = json.loads(ledger.upsert.await_args.args[0].payload_json)
+        assert 'absorbed_by' in payload
+        assert payload['absorbed_by'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_batch_form_stamps_every_victim_with_the_same_absorber(self):
+        """Batch-LEVEL by construction: every victim in one consolidation is
+        absorbed by the same canonical, so this is a property of the call,
+        not of each row."""
+        memory_service, ledger = _svc_with_ledger()
+        victims = [
+            {
+                'id': f'victim-{i}',
+                'metadata': _VICTIM_METADATA,
+                'created_at': '2026-07-28T00:00:00+00:00',
+            }
+            for i in range(3)
+        ]
+
+        written = await record_mem0_deletion_tombstones(
+            memory_service,
+            'dark_factory',
+            victims,
+            deleter='consolidate_memories',
+            deleting_run_id='run-deleter',
+            absorbed_by='canonical-uuid',
+            now=_NOW,
+        )
+
+        assert written == 3
+        records = ledger.upsert_many.await_args.args[0]
+        payloads = [json.loads(r.payload_json) for r in records]
+        assert [p['absorbed_by'] for p in payloads] == ['canonical-uuid'] * 3
+        assert [r.task_id for r in records] == ['victim-0', 'victim-1', 'victim-2']
+
+    @pytest.mark.asyncio
+    async def test_the_existing_sweeps_need_no_edit(self):
+        """BACK-COMPAT, called in the exact shape `summary_pool` and
+        `stages/task_knowledge_sync` use. The two live sweeps absorb
+        nothing, so the keyword is keyword-only with a `None` default and
+        the change is purely additive."""
+        memory_service, ledger = _svc_with_ledger()
+        victims = [
+            {
+                'id': 'victim-0',
+                'metadata': _VICTIM_METADATA,
+                'created_at': '2026-07-28T00:00:00+00:00',
+            }
+        ]
+
+        written = await record_mem0_deletion_tombstones(
+            memory_service,
+            'dark_factory',
+            victims,
+            deleter='stage1_flag_marker_gc_sweep',
+            deleting_run_id='run-deleter',
+            now=_NOW,
+        )
+
+        assert written == 1
+        payload = json.loads(ledger.upsert_many.await_args.args[0][0].payload_json)
+        assert payload['absorbed_by'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_writer_stays_fail_safe_with_the_new_arg(self):
+        """No ledger wired => 0/False, no raise. This runs inside a delete
+        path; the new field must not have given it a way to blow up."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+
+        assert (
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                'dark_factory',
+                [{'id': 'victim-0', 'metadata': {}, 'created_at': None}],
+                deleter='consolidate_memories',
+                deleting_run_id='run-deleter',
+                absorbed_by='canonical-uuid',
+            )
+            == 0
+        )
+        assert (
+            await record_mem0_deletion_tombstone(
+                memory_service,
+                'dark_factory',
+                'victim-0',
+                victim_metadata=None,
+                victim_created_at=None,
+                deleter='consolidate_memories',
+                deleting_run_id='run-deleter',
+                absorbed_by='canonical-uuid',
+            )
+            is False
+        )

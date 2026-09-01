@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +17,7 @@ import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
@@ -1982,4 +1984,95 @@ class TestSandboxPathRejectsBlankPrompt:
         assert captured['stdin_data'] == b'a real prompt'
         assert 'a real prompt' not in captured['cmd'], (
             'the prompt is a stdin payload, never an argv element'
+        )
+
+
+# ── stdin-starvation race, local runner (task 3147 / esc-3118-1) ─────────────
+#
+# _run_subprocess_local is a SECOND, independent implementation of the spawn
+# path carrying the codex backend's payload, and it had the byte-for-byte
+# identical defect as shared.cli_invoke._run_subprocess: stdin=PIPE plus
+# communicate(input=...), i.e. the payload written by the EVENT LOOP after
+# execve.  Fixing only the shared runner would have left a live instance of
+# exactly the bug this task exists to close.
+
+# The stub CLI and the loop-starving exec fake are IMPORTED from
+# shared.testing_stdin (see this module's imports), not re-declared here.  They
+# were briefly duplicated from shared/tests/test_cli_invoke.py because
+# `shared.tests` is not an importable package under the orchestrator pytest
+# rootdir; the fix was to move the single definition into the shipped `shared`
+# package — which orchestrator already depends on — alongside shared.testing.
+# One copy means an edit to the stub's rejection signature cannot land in one
+# suite and silently miss the other.
+
+
+@pytest.mark.asyncio
+class TestStdinStarvationRaceLocal:
+    """_run_subprocess_local delivers stdin even when the loop stalls after spawn."""
+
+    @pytest.mark.timeout(30)
+    async def test_local_runner_delivers_stdin_when_loop_starved(self, tmp_path):
+        """A 1.0s post-spawn loop stall must not cost the codex child its payload."""
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(STDIN_STARVATION_STUB)
+
+        payload = b'Y' * 4242
+
+        with patch(
+            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+            side_effect=make_starving_exec(1.0),
+        ):
+            result = await _run_subprocess_local(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env={},
+                backend='codex',
+                model='stub',
+                max_budget_usd=1.0,
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
+        )
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        assert 'no stdin data received' not in result.stderr
+        assert 'Input must be provided' not in result.stderr
+
+    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
+        """stdin_data=None must still spawn with stdin=None (inherited).
+
+        Protects the gemini and pi branches, which pass the prompt on argv,
+        pass stdin_data=None, and rely on inherited stdin.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch(
+            'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+            side_effect=fake_exec,
+        ):
+            await _run_subprocess_local(
+                ['gemini', '-p', 'hello'],
+                tmp_path,
+                env={},
+                backend='gemini',
+                model='stub',
+                max_budget_usd=1.0,
+                stdin_data=None,
+            )
+
+        assert 'stdin' in captured_kwargs
+        assert captured_kwargs['stdin'] is None, (
+            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
         )

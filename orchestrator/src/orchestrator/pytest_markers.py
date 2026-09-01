@@ -19,11 +19,13 @@ CONTENT arrives as a string (or None), and the composed entry point takes a
 seam exactly rather than introducing a second I/O seam.
 
 FAIL-SAFE IN EXACTLY ONE DIRECTION.  Any unreadable file, TOML/AST/shlex failure,
-unsupported expression node, or merely-unknown marker resolves to "no widening" —
-i.e. precisely today's behaviour.  Widening is only ever chosen on positive
-proof.  Nothing here raises: ``verify._safe_derive_verify_plan_dict`` swallows
-exceptions and returns None, so a raise on a mid-edit ``pyproject.toml`` would
-silently destroy the ENTIRE plan record.
+unsupported expression node, merely-unknown marker, module shape the per-item
+tier cannot exhaustively enumerate (see :func:`per_item_marker_names`), or a
+module with zero collected items resolves to "no widening" — i.e. precisely
+today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
+here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
+returns None, so a raise on a mid-edit ``pyproject.toml`` would silently
+destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 
@@ -149,8 +151,8 @@ def resolve_marker_expression(
 
     *pyproject_text* is the content of the ini file at pytest's ROOTDIR, which
     the caller locates from the command's effective cwd — see
-    ``verify_plan._marker_deselecting_expression``.  This function does not and
-    cannot check that the two describe the same invocation.
+    ``verify_plan.deselecting_expression_for_command``.  This function does not
+    and cannot check that the two describe the same invocation.
 
     Never raises — every failure path returns None.
 
@@ -225,7 +227,10 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     A name ABSENT from this set is therefore UNKNOWN, not absent — which is
     precisely what makes :func:`expression_definitely_deselects`' Kleene
     treatment sound.  Excluding decorators makes the detector under-fire on some
-    genuinely-deselected files, which is the safe direction.
+    genuinely-deselected files, which is the safe direction.  Per-function and
+    per-class decorators are instead handled by the separate, enumeration-guarded
+    tier :func:`per_item_marker_names`, which this function's own contract is
+    unaffected by.
 
     Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
     call, or a list/tuple of either.  Only ``tree.body`` is walked (never
@@ -255,6 +260,185 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     return frozenset(
         name for name in (_marker_name(element) for element in elements) if name is not None
     )
+
+
+def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
+    """True iff any alias in *node* binds a name starting with ``test`` (case-insensitive).
+
+    Case-insensitive because pytest's collection is not limited to the
+    ``Test*`` class-naming convention: the default ``python_functions = test*``
+    collects any module-level callable named ``test*`` too, and an alias can
+    import EITHER shape into this module — ``from helpers import TestBase``
+    (a class) or ``from helpers import test_shared_case`` (a function) are
+    both collected here.  ``asname`` wins, matching the name that actually
+    lands in this module's namespace.
+    """
+    return any(
+        (alias.asname or alias.name.split('.')[0]).lower().startswith('test')
+        for alias in node.names
+    )
+
+
+def _assign_binds_test_prefixed_name(node: ast.Assign | ast.AnnAssign) -> bool:
+    """True iff *node* binds a ``test*``-prefixed name (case-insensitive) to a ``Name`` target.
+
+    Pytest's default ``python_functions = test*`` collects any module
+    attribute so named that resolves to a callable — including one bound by
+    a plain assignment (``test_generated = _make_case()``), not only a
+    ``def``.  This walk cannot tell statically whether the bound value is
+    actually callable, so any ``test*``-prefixed target refuses, in the safe
+    direction.
+    """
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return any(
+        isinstance(target, ast.Name) and target.id.lower().startswith('test')
+        for target in targets
+    )
+
+
+def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
+    """Same result as :func:`module_level_marker_names`, from an already-parsed *tree*.
+
+    Deliberately a SEPARATE, small duplicate of that function's body rather
+    than a shared helper the two delegate to: ``module_level_marker_names``
+    is the exact edit site of task 4561, the still-pending owner of Gap 2
+    (class-level markers), and this task leaves that function byte-identical
+    to avoid a textual merge conflict with it (see the plan's design
+    decisions).  Used only by :func:`per_item_marker_names`, which already
+    holds a parsed *tree* and would otherwise pay a second, wholly redundant
+    ``ast.parse`` of the same source purely to re-derive this set.  A later
+    reader may collapse the two into one shared tree-walker once 4561 has
+    landed and that merge-conflict risk is gone.  Sequencing: whichever of
+    this task (Gap 3) and 4561 lands second should fold its walk into the
+    tier the other already added — :func:`per_item_marker_names` or
+    :func:`module_level_marker_names` — rather than adding a third.
+    """
+    value: ast.expr | None = None
+    for statement in tree.body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is None:
+        return frozenset()
+
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
+    )
+
+
+def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | None:
+    """One guaranteed (lower-bound) marker set per top-level test item in *source*.
+
+    THE LOAD-BEARING ENUMERATION GUARANTEE: the returned tuple enumerates EVERY
+    item pytest can collect from this module, in source order — or the answer
+    is None.  This is a SECOND, additive proof tier alongside
+    :func:`module_level_marker_names` and does not weaken that function's own
+    module-wide LOWER BOUND contract: each element here is still a lower bound
+    on its item's actual marker set (``module_level_marker_names(source)``
+    unioned with that item's own ``pytest.mark.NAME`` decorators), so the
+    Kleene reading in :func:`expression_definitely_deselects` — a name outside
+    the set is UNKNOWN, never False — carries over unchanged.
+
+    Refuses (returns None) whenever the module contains a shape whose
+    collected items this walk cannot exhaustively see:
+
+    * any ``class`` anywhere in the module (``ast.walk``, not just the module
+      body) — refused regardless of its name.  This is a DELIBERATE
+      over-refusal for simplicity: only ``Test*``-prefixed classes are
+      collected under the default ``python_classes``, so a name-prefix
+      carve-out (mirroring the ``test*`` prefix already applied below to
+      functions) would fire more often, but refusing on class SHAPE rather
+      than class NAME keeps this tier's competence statable in one line —
+      "a class means there may be items this walk does not model" — without
+      a second, independently-driftable prefix rule;
+    * a ``test*``-named function found anywhere that is NOT a direct child of
+      the module body — e.g. one defined inside a top-level ``if`` — which
+      would otherwise hide an undecorated, still-SELECTED sibling from this
+      walk and let the module widen unsoundly;
+    * a star import (``from x import *``), whose bound names are statically
+      unknowable;
+    * any import (plain or ``from``) that binds a name starting with ``test``
+      case-insensitively (honouring ``asname``) — this covers BOTH an
+      imported ``Test*`` class and an imported lowercase ``test_*`` function,
+      either of which pytest collects in THIS module under the respective
+      default;
+    * a top-level assignment (``Assign``/``AnnAssign``) that binds a
+      ``test*``-prefixed name to a plain ``Name`` target — e.g.
+      ``test_generated = _make_case()`` — which the default
+      ``python_functions = test*`` collects exactly as it would a ``def``,
+      and which this walk cannot otherwise tell apart from an ordinary
+      module constant;
+    * a top-level ``pytest_*`` hook function (e.g.
+      ``pytest_collection_modifyitems``, ``pytest_generate_tests``), which can
+      add items this walk never sees.
+
+    ASSUMPTIONS THIS WALK CANNOT CHECK: the caller's pytest configuration uses
+    the DEFAULT collection prefixes (``python_functions = test*``,
+    ``python_classes = Test*``) — a repo that overrides either in its ini
+    options can collect items this walk's name-prefix reasoning does not
+    model.  It also assumes no ancestor ``conftest.py`` implements an
+    item-ADDING ``pytest_collection_modifyitems``/``pytest_generate_tests``
+    hook: this walk only refuses on such a hook defined INSIDE *source*
+    itself, because a sibling ``conftest.py``'s content is outside a single
+    module string's reach.  Both are pre-existing limits of a purely
+    per-file static analysis, recorded here rather than fixed, since fixing
+    them would need reading files this function is not given.
+
+    FAIL-SAFE IN EXACTLY ONE DIRECTION, matching the module docstring: every
+    refusal above is a None, i.e. no proof, i.e. today's FILE_SCOPED
+    behaviour.  None also covers ``source is None``, a ``SyntaxError``, and a
+    ``ValueError``.  ``()`` is a distinct, still-refused answer: "enumerated,
+    and there are zero top-level test functions" (see
+    :func:`deselecting_expression_for_targets`, which treats both alike).
+    Never raises.
+    """
+    if not source:
+        return None
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+    body_ids = {id(statement) for statement in tree.body}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            return None
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            is_top_level = id(node) in body_ids
+            if node.name.startswith('test') and not is_top_level:
+                return None
+            if node.name.startswith('pytest_') and is_top_level:
+                return None
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == '*' for alias in node.names):
+                return None
+            if _bound_names_start_with_test_ci(node):
+                return None
+        elif (
+            (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
+            or (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and id(node) in body_ids
+                and _assign_binds_test_prefixed_name(node)
+            )
+        ):
+            return None
+
+    module_markers = _module_level_marker_names_from_tree(tree)
+    items: list[frozenset[str]] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test'):
+            continue
+        decorator_markers = frozenset(
+            name
+            for name in (_marker_name(decorator) for decorator in node.decorator_list)
+            if name is not None
+        )
+        items.append(module_markers | decorator_markers)
+    return tuple(items)
 
 
 def _kleene(node: ast.expr, marker_names: frozenset[str]) -> bool | None:
@@ -335,17 +519,32 @@ def deselecting_expression_for_targets(
 
     The composed entry point: resolve the module's marker expression
     (:func:`resolve_marker_expression`), then require every target to be
-    provably fully deselected by it (:func:`module_level_marker_names` +
-    :func:`expression_definitely_deselects`).  ALL, not ANY — a single target
-    that still collects means the file-scoped run is not empty.  The EXPRESSION
-    is returned rather than a bool so the caller can name it in the
+    provably fully deselected by it under a TWO-TIER proof, tried in order per
+    target:
+
+    1. the PRIMARY tier — :func:`module_level_marker_names` +
+       :func:`expression_definitely_deselects` — a module-wide lower bound that
+       alone covers test classes, imported test classes and dynamically
+       generated items;
+    2. only if that fails to prove deselection, the FALLBACK tier —
+       :func:`per_item_marker_names` — which enumerates every collected item's
+       own (module-level union per-decorator) marker set and requires EVERY
+       one of them to be individually, definitely deselected.
+
+    The second tier is strictly ADDITIVE: it only ever turns a tier-1 refusal
+    into a proof, never the reverse, so this function can never refuse a
+    target it already accepts today.  ALL, not ANY — across both tiers and
+    across every target — a single target (or a single item within a target)
+    that still collects means the file-scoped run is not empty.  The
+    EXPRESSION is returned rather than a bool so the caller can name it in the
     operator-facing ``PlannedRun.reason``.
 
     *read_source* mirrors ``verify_plan``'s injected ``worktree_reader``
     (``Callable[[str], str | None]``) exactly, so no new I/O seam is introduced
     and its content cache is shared: a touched test file already read for
-    STRUCTURAL detection costs zero extra disk I/O.  A ``None`` answer (missing
-    or unreadable) proves nothing and refuses.
+    STRUCTURAL detection costs zero extra disk I/O.  Each target's source is
+    read EXACTLY ONCE regardless of how many tiers consult it.  A ``None``
+    answer (missing or unreadable) proves nothing and refuses.
 
     COST BOUND: with no ``-m`` expression resolved this performs ZERO target
     reads — it short-circuits BEFORE calling *read_source* at all.  The added
@@ -364,7 +563,12 @@ def deselecting_expression_for_targets(
     if expr is None:
         return None
     for target in targets:
-        guaranteed = module_level_marker_names(read_source(target))
-        if not expression_definitely_deselects(expr, guaranteed):
+        source = read_source(target)
+        if expression_definitely_deselects(expr, module_level_marker_names(source)):
+            continue
+        item_markers = per_item_marker_names(source)
+        if not item_markers:
+            return None
+        if not all(expression_definitely_deselects(expr, markers) for markers in item_markers):
             return None
     return expr

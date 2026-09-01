@@ -268,15 +268,17 @@ class TestExtractCitedTaskIdsConventions:
 
 
 class TestExtractCitedTaskIdsParenForms:
-    """Additional paren-citation forms: `(#N)`, bare `(N)`, and `(task N)`."""
+    """Additional paren-citation forms: `(#N)` and `(task N)`."""
 
     def test_hash_paren_form(self):
         """A `(#N)` citation anywhere in the message cites the id."""
         assert extract_cited_task_ids('drop stale entry (#2870)') == {'2870'}
 
-    def test_bare_paren_form(self):
-        """A bare `(N)` citation anywhere in the message cites the id."""
-        assert extract_cited_task_ids('cleanup pass (2870)') == {'2870'}
+    def test_bare_paren_form_is_not_a_citation(self):
+        """A bare `(N)` citation used to cite the id, but task 4705 retired
+        that form: it matched any parenthesized integer, not just genuine
+        citations, so it no longer counts as one."""
+        assert extract_cited_task_ids('cleanup pass (2870)') == set()
 
     def test_task_word_paren_form(self):
         """A `(task N)` citation anywhere in the message cites the id."""
@@ -287,14 +289,64 @@ class TestExtractCitedTaskIdsParenForms:
         dedupe into a single set."""
         assert extract_cited_task_ids('impl(2870): body cites (#123)') == {'2870', '123'}
 
-    def test_bare_paren_form_matches_incidental_numbers_not_just_citations(self):
-        """Documents an accepted false-positive tradeoff (see plan.json's
+    def test_bare_paren_incidental_numbers_are_not_citations(self):
+        """Recorded history of a now-reversed tradeoff (see plan.json's
         "False-positive tradeoff" section for task 2872): unlike `(#N)` and
-        `(task N)`, the bare `(N)` form matches ANY parenthesized integer —
-        a step reference, a year, a count — not just genuine task citations.
-        This is intentional, not a bug: see TestClassifyMisattributed for the
-        classify-level consequence and the rationale for accepting it."""
-        assert extract_cited_task_ids('see step (3) and year (2024)') == {'3', '2024'}
+        `(task N)`, the bare `(N)` form used to match ANY parenthesized
+        integer — a step reference, a year, a count — not just genuine task
+        citations. That was intentional, not a bug, at the time: see
+        TestClassifyMisattributed for the classify-level consequence and the
+        rationale for having accepted it.
+
+        Task 4705 reversed the tradeoff: once a downstream consumer
+        (check_found_on_main_spurious_rate.py) wrapped this audit in a
+        binary exit-code gate with no human in the loop to filter false
+        positives, a bounded false-positive rate became a hard blocker. The
+        bare `(N)` form is retired; only `(#N)` and `(task N)` still cite."""
+        assert extract_cited_task_ids('see step (3) and year (2024)') == set()
+
+
+class TestExtractCitedTaskIdsBareParenRegressions:
+    """Real bare-paren shapes (task 4705) that must NOT be read as citations.
+
+    Consolidated to one parametrized test (review remediation, task 4705
+    amendment pass): every case pins the same fact already established
+    above by test_bare_paren_form_is_not_a_citation and
+    test_bare_paren_incidental_numbers_are_not_citations — a parenthesized
+    integer in prose is not a citation — so what each case adds is its
+    real-world grounding, not new behavior. Only `task_3869_lock_row_prose`
+    is a VERBATIM quote (from commit a20fbae0286a7da2419625bd8dc92b33e1a11e53);
+    the other three are paraphrased illustrations of shapes that were
+    observed misclassifying found_on_main tasks before the bare `(N)` form
+    was retired. `task_3924_enumerated_review_findings`'s paraphrase
+    intentionally cites only `(1)` and `(8)` (omitting a third incidental
+    number) so it reproduces exactly the {'1', '8'} set the module comment
+    records as measured for that commit, rather than a different set.
+    """
+
+    @pytest.mark.parametrize('message', [
+        pytest.param(
+            'amend: guard the zero case\n\nThe count is (0) when the queue drains.',
+            id='task_4265_literal_zero',
+        ),
+        pytest.param(
+            'amend: review remediation\n\n'
+            'Addressed findings (1) and (8) from the review.',
+            id='task_3924_enumerated_review_findings',
+        ),
+        pytest.param(
+            "...a skip at 1450 in the gap between run-a's last lock row (1400) "
+            "and run-b's first (1500) must leave the truncated span at 100.0s.",
+            id='task_3869_lock_row_prose',
+        ),
+        pytest.param(
+            'impl: retune the poll loop\n\n'
+            'Budget went (20) -> (40) with a (180) second ceiling.',
+            id='task_3977_timeout_and_count_values',
+        ),
+    ])
+    def test_bare_paren_shape_is_not_a_citation(self, message):
+        assert extract_cited_task_ids(message) == set()
 
 
 class TestExtractCitedTaskIdsWordBoundary:
@@ -383,27 +435,64 @@ class TestClassifyMisattributed:
         assert reasons
         assert any('77' in r for r in reasons)
 
-    def test_bare_paren_incidental_number_is_an_accepted_false_positive(self):
-        """Documents the accepted false-positive tradeoff (plan.json's "False-
-        positive tradeoff" section for task 2872): a found_on_main task
-        correctly attributed via its recorded commit SHA, whose message
-        never cites task 50 by number but happens to contain an unrelated
-        parenthesized number (e.g. a retry-count reference), is flagged
-        misattributed by the bare `(N)` form even though the attribution is
-        actually correct. Accepted because the misattribution guard only
-        fires when the audited task_id is absent from the cited set (a real
-        self-citation still short-circuits it), `--apply` never reopens a
-        task, and the net effect is fewer missed true-positive citations
-        like test_hash_paren_citation_of_a_different_task_is_misattributed
-        above — not because this case is desired.
+    def test_bare_paren_incidental_number_is_no_longer_misattributed(self):
+        """Task 4705 reversed this: the bare `(N)` form no longer cites, so
+        this case no longer flags misattributed. Recorded history follows,
+        verbatim, for why it USED to be an accepted false positive
+        (plan.json's "False-positive tradeoff" section for task 2872): a
+        found_on_main task correctly attributed via its recorded commit
+        SHA, whose message never cites task 50 by number but happens to
+        contain an unrelated parenthesized number (e.g. a retry-count
+        reference), was flagged misattributed by the bare `(N)` form even
+        though the attribution was actually correct. Accepted because the
+        misattribution guard only fires when the audited task_id is absent
+        from the cited set (a real self-citation still short-circuits it),
+        `--apply` never reopens a task, and the net effect was fewer missed
+        true-positive citations like
+        test_hash_paren_citation_of_a_different_task_is_misattributed above
+        — not because that case was desired.
+
+        Post-4705 caveat (review remediation): "a real self-citation still
+        short-circuits it" is now only true for the three surviving forms
+        (hash-paren, task-word-paren, conventional-commit/task-branch) — a
+        self-citation written ONLY in bare-paren form no longer short-
+        circuits anything, since it is no longer part of `cited` at all.
+        See test_self_citation_only_in_bare_paren_form_now_flags_misattributed
+        below for the resulting (accepted) new edge case.
         """
         audit = _audit(
             task_id='50', is_ancestor=True,
             commit_message='Add rate limiter with default retry budget (3)',
         )
         verdict, reasons = classify(audit)
+        assert verdict != 'misattributed'
+        assert extract_cited_task_ids(audit.commit_message) == set()
+
+    def test_self_citation_only_in_bare_paren_form_now_flags_misattributed(self):
+        """New edge case from retiring the bare `(N)` form (review
+        remediation, task 4705 amendment pass): the form used to double as
+        a self-citation SUPPRESSION path, not just an other-task DETECTION
+        path. A message citing the audited task ONLY via bare-paren, while
+        citing a *different* task in one of the three surviving forms, used
+        to have its own id land in `cited` too (via the bare-paren match)
+        — enough to short-circuit the misattribution guard. Now the bare-
+        paren self-citation is invisible to `cited`, so the other task's
+        citation alone is enough to flag this task misattributed, even
+        though the message also (bare-paren) cites this task.
+
+        Accepted as rare for this corpus rather than fixed: self-citation
+        is overwhelmingly written in the conventional-commit subject form
+        (`impl(<id>): ...`), so relying SOLELY on a bare-paren self-
+        citation was already an unusual shape before this task retired
+        the form.
+        """
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='impl(77): backfill\n\nAlso closes (50).',
+        )
+        verdict, reasons = classify(audit)
         assert verdict == 'misattributed'
-        assert any('3' in r for r in reasons)
+        assert any('77' in r for r in reasons)
 
     def test_mixed_citation_does_not_flag_misattributed(self):
         """A message citing BOTH this task and another task is not misattribution."""

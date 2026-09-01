@@ -27,10 +27,22 @@ from pathlib import Path
 
 import _hold_history_fixtures as F
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.hold_history import HoldHistory
 from orchestrator.scheduler import Scheduler
+
+# test_lock_events_are_emitted_from_exactly_one_site AST-parses every *.py
+# under orchestrator/src via rglob. MEASURED at 2.90s and 3.07s per call
+# unloaded and serial (-n0) here: it is parametrized over two event names, so
+# the whole sweep runs twice. Not individually reproduced under load; marked
+# because it is structurally identical to the three members that crashed.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -278,6 +290,30 @@ def test_scheduler_predicted_remaining_uses_the_schedulers_own_wall_clock():
     )
 
     assert scheduler.predicted_remaining('1') == pytest.approx(150.0)
+
+
+def test_scheduler_predicted_remaining_survives_a_stale_phantom_beside_a_live_hold():
+    """The per-key staleness sweep reaches the production consumer.
+
+    ``_compute_provable_assembly_delay`` reads this surface; a task whose open
+    map carries one lost-release phantom alongside a genuinely live hold must
+    still yield a real remainder rather than the None that admits no backfill.
+    ``stale_open_secs`` is not a scheduler knob, so the phantom is aged past the
+    module default (86400s) directly.
+    """
+    scheduler = _make_scheduler()
+    module = 'orchestrator/src'
+    for duration in (100.0, 200.0, 300.0):
+        scheduler._hold_history.record(module, duration)
+    scheduler._hold_history.observe_acquired(
+        '1', ['ghost/src'], at=FIXED_DT.timestamp() - 90_000.0
+    )
+    scheduler._hold_history.observe_acquired(
+        '1', [module], at=FIXED_DT.timestamp() - 50.0
+    )
+
+    assert scheduler.predicted_remaining('1') == pytest.approx(150.0)
+    assert scheduler._hold_history.open_modules('1') == [module]
 
 
 @pytest.mark.asyncio

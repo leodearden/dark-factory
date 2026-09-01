@@ -7,7 +7,9 @@ const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, u
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
+const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
 // zero-suppression; colour is the caller's concern. Each reuses the hue
@@ -184,7 +186,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
-          {t.stranded && <span className="badge bad" title="stranded: in-progress with no live claimant / stale heartbeat">⚠</span>}
+          {(() => { const sb = strandBadgeState(t, { compact: true }); return sb && <span className={sb.cls} title={sb.title}>{sb.label}</span>; })()}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
             {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
@@ -533,8 +535,8 @@ function TaskDetail({ task, allTasks }) {
           {/* Strand verdict (task 3543). Computed server-side from the claim
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
-          {task.stranded && <span className="badge bad" style={{ marginLeft: 6 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}</span>
-        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
+          {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.muted ? <span style={{ color: 'var(--fg-3)' }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
@@ -554,14 +556,14 @@ function TaskDetail({ task, allTasks }) {
       {deps.length === 0
         ? <span className="chip-empty">no upstream dependencies</span>
         : <div className="chips multiline">{deps.map(d =>
-            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       <div className="section-lbl">Blocks ({dependents.length})</div>
       {dependents.length === 0
         ? <span className="chip-empty">nothing depends on this</span>
         : <div className="chips multiline">{dependents.map(d =>
-            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       {(() => {
@@ -664,11 +666,34 @@ function TasksTab({ projectFilter, search }) {
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
 
-  // Surface a single-line banner when fused-memory is unreachable for any
-  // discovered project — without it the Tasks tab renders an empty grid that
-  // looks indistinguishable from "no active work".
-  const tasksOffline = !!DF_T.TASKS_OFFLINE;
-  const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
+  // Surface a banner when task data is missing or incomplete — without it the
+  // Tasks tab renders an empty grid that looks indistinguishable from "no
+  // active work". That rationale still motivates the total-outage case, and it
+  // is exactly why the partial and degraded cases exist too: after the
+  // whole-handler budget expires, a silently-missing project would otherwise
+  // read as a project with nothing to do.
+  //
+  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
+  // it: a `k of N` judgement made in the JSX would drift from the one the
+  // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
+  // numerator is a count of task project roots, so the denominator must be
+  // one too — PROJECTS is the orchestrator-derived list, a different
+  // population that diverges whenever a root has no orchestrator (or the
+  // reverse), which made the notice understate how many projects failed.
+  const bannerNotices = tasksBannerNotices({
+    offline: !!DF_T.TASKS_OFFLINE,
+    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
+    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
+    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
+    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
+  });
+  const bannerTestIds = {
+    global: 'tasks-offline-banner',
+    partial: 'tasks-partial-banner',
+    degraded: 'tasks-degraded-banner',
+    'count-unknown': 'tasks-count-unknown-banner',
+  };
 
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
@@ -690,8 +715,9 @@ function TasksTab({ projectFilter, search }) {
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
-      {tasksOffline && (
-        <div className="col-span-12" data-testid="tasks-offline-banner"
+      {bannerNotices.map(notice => (
+        <div key={notice.kind} className="col-span-12"
+             data-testid={bannerTestIds[notice.kind]}
              style={{
                padding: '8px 12px',
                border: '1px solid var(--line)',
@@ -701,10 +727,9 @@ function TasksTab({ projectFilter, search }) {
                fontFamily: 'var(--mono)',
                fontSize: 11,
              }}>
-          fused-memory offline — task data unavailable
-          {offlineProjects.length > 0 && ` (${offlineProjects.join(', ')})`}
+          {notice.text}
         </div>
-      )}
+      ))}
       {/* Filter bar */}
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>
@@ -755,9 +780,17 @@ function TasksTab({ projectFilter, search }) {
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
               // "50+" so the user knows the displayed number is a lower bound.
+              // A MISSING DONE_COUNTS entry means the count was never
+              // measured — it does NOT mean zero. Falling through to
+              // _fallbackDone here rendered a confident "0 done", because the
+              // server skips the terminal window for exactly these projects
+              // so no done row was ever sent. Show unknown instead; the
+              // banner's 'count-unknown' notice names which projects.
               complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
                 ? DF_T.DONE_COUNTS[p.id]
-                : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
+                : ((DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || []).indexOf(p.id) !== -1
+                    ? '—'
+                    : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';

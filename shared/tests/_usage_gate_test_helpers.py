@@ -22,9 +22,29 @@ from unittest.mock import AsyncMock, patch
 
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import ScopeCap, UsageGate
+from shared.usage_gate import ProbeSpawnError, ScopeCap, UsageGate
 
 SCOPE = 'claude-fable-5'
+
+
+def spawn_fault(binary = 'claude'):
+    """A ``ProbeSpawnError`` shaped exactly like the observed incident.
+
+    Task 4512. The wrapped cause is the ``FileNotFoundError`` that
+    ``asyncio.create_subprocess_exec`` raises for an unresolvable binary --
+    reproduced verbatim rather than approximated, because the whole point of
+    ``ProbeSpawnError`` is that this specific errno used to be swallowed into
+    a ``False`` verdict indistinguishable from "still capped".
+
+    Lives here rather than in each suite: ``test_probe_loop.py`` and
+    ``test_auth_failed.py`` both exercise the same
+    ``_note_probe_spawn_failure`` / ``probe_infra_fault`` accounting surface,
+    and byte-identical copies would drift the moment the ``ProbeSpawnError``
+    constructor signature changes (task 4512 review).
+    """
+    return ProbeSpawnError(
+        binary, FileNotFoundError(2, 'No such file or directory', binary),
+    )
 
 
 def make_gate(account_names: list[str], *, cost_store=None, **cfg) -> UsageGate:

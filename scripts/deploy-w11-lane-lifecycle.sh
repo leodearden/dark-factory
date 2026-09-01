@@ -40,11 +40,16 @@ set -euo pipefail
 #                  PROJECT_ROOT, absolute values are used as-is (default:
 #                  .worktrees, matching GitConfig.worktree_dir's pydantic
 #                  default -- dark_factory does not override it).
+#   ORCH_RESTART_UNIT - PASSED THROUGH, not consumed here: the unit the
+#                  exec'd restart-orchestrator.sh targets (default:
+#                  orchestrator-dark-factory.service).
 #
-# The restart step below delegates entirely to restart-orchestrator.sh,
-# which hardcodes its own target unit (orchestrator-dark-factory.service) --
-# there is no SERVICE override here; set PATH to shim `systemctl` for tests
-# instead (see scripts/tests/test_deploy_w11_lane_lifecycle.py).
+# The restart step below delegates entirely to restart-orchestrator.sh, whose
+# target unit DEFAULTS to orchestrator-dark-factory.service and is overridable
+# via ORCH_RESTART_UNIT (task 3950). `exec` replaces the process image while
+# PRESERVING the environment, so a value set for this script reaches the
+# delegate that actually calls systemctl -- a test therefore shims PATH *and*
+# sets ORCH_RESTART_UNIT (see scripts/tests/test_deploy_w11_lane_lifecycle.py).
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -202,5 +207,7 @@ fi
 # reality -> write .lane-state records -> THEN flip). Delegate to the
 # existing restart-orchestrator.sh rather than duplicating its blocking
 # `systemctl --user restart` + fresh-ActiveEnterTimestampMonotonic verify
-# loop (DRY). It already targets orchestrator-dark-factory.service.
+# loop (DRY). It targets orchestrator-dark-factory.service by default, or
+# whatever ORCH_RESTART_UNIT names -- `exec` preserves this script's
+# environment, so no override needs re-plumbing here.
 exec "$PROJECT_ROOT/scripts/restart-orchestrator.sh"

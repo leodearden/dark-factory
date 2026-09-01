@@ -2071,3 +2071,80 @@ class TestWaitForVllmModelCheck:
         # Speed this up: patch time.sleep so the 1-second timeout trips fast.
         monkeypatch.setattr(launcher.time, "sleep", lambda _s: None)
         assert not wait_for_vllm(port, expected_model=expected, timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# Pyright scope parity (task 3931 / esc-3805-1, esc-3805-6)
+# ---------------------------------------------------------------------------
+
+
+class TestPyrightScopeParity:
+    """``orchestrator``'s pyright config must resolve repo-root ``scripts/``.
+
+    Task 3931 — the guard for the ROOT-vs-PACKAGE invocation-scope gap that
+    produced esc-3805-1 (2026-08-09) and esc-3805-6 (2026-08-12), closed by
+    break-glass hotfix 27ac22a6a6.
+
+    THIS module's ``import run_vllm_eval`` (line 57, carrying a
+    ``# type: ignore[import-not-found]``) resolves for pyright only when
+    repo-root ``scripts/`` is on pyright's search path. The root
+    ``pyproject.toml``'s ``[tool.pyright] extraPaths`` lists ``scripts``, so
+    ROOT-scoped pyright resolves it and ``EvalSummary``/``PodHandle`` become
+    real types; ``orchestrator/pyproject.toml``'s list did NOT, so
+    PACKAGE-scoped pyright saw ``Unknown`` and reported nothing.
+
+    MEASURED on this branch at pyright 1.1.408, with the hotfix
+    reverse-applied so the defect is present:
+
+      * ``npx pyright orchestrator/tests/test_run_vllm_eval.py`` from the
+        worktree ROOT               -> 14 reportArgumentType errors (first at
+                                       :1827)
+      * ``cd orchestrator && npx pyright tests/test_run_vllm_eval.py``
+                                    -> 0 errors
+
+    That 14-vs-0 divergence is the escalation: verify's FILE_SCOPED fallback
+    path runs pyright from the worktree ROOT, while pre-commit
+    (``hooks/project-checks``) and the fleet chain both run it PACKAGE-scoped,
+    so a defect one gate reports the other cannot see. This test pins the
+    entry that keeps the two scopes in agreement.
+
+    Asserted by RESOLUTION, not by string equality, so ``../scripts`` and any
+    other spelling that lands on the same directory both pass.
+    """
+
+    def test_orchestrator_pyright_extrapaths_resolves_repo_root_scripts(self) -> None:
+        import tomllib
+
+        repo_root = Path(__file__).parents[2]
+        orch_dir = repo_root / "orchestrator"
+        pyproject = tomllib.loads(
+            (orch_dir / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        pyright = pyproject.get("tool", {}).get("pyright")
+        assert pyright is not None, (
+            "orchestrator/pyproject.toml declares no [tool.pyright] table "
+            "(task 3931) — the scope-parity invariant cannot be evaluated"
+        )
+        extra_paths = pyright.get("extraPaths")
+        assert extra_paths, (
+            "orchestrator/pyproject.toml [tool.pyright] declares no extraPaths "
+            "(task 3931) — this invariant would pass vacuously"
+        )
+
+        scripts_dir = (repo_root / "scripts").resolve()
+        resolved = [(orch_dir / entry).resolve() for entry in extra_paths]
+        assert scripts_dir in resolved, (
+            "orchestrator/pyproject.toml [tool.pyright] extraPaths "
+            f"{list(extra_paths)!r} contains no entry resolving to "
+            f"{scripts_dir} (task 3931, esc-3805-1/esc-3805-6). This module's "
+            "`import run_vllm_eval` (line 57) then stays UNRESOLVED for "
+            "package-scoped pyright, so EvalSummary/PodHandle degrade to "
+            "Unknown and every argument-type defect in this 2000-line module "
+            "goes unreported — while the ROOT-scoped verify gate, whose config "
+            "DOES list scripts/, reports them. MEASURED at 1.1.408 with hotfix "
+            "27ac22a6a6 reverse-applied: 14 reportArgumentType errors "
+            "root-scoped, 0 package-scoped. Restore the entry rather than "
+            "narrowing the root config — removing `scripts` from root would "
+            "achieve parity by deleting all type checking of this module "
+            f"instead; resolved: {[str(p) for p in resolved]}"
+        )

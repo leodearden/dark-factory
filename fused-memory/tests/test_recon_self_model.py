@@ -18,6 +18,13 @@ import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
 from fused_memory.reconciliation import standing_decision_constants as sdc
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    render_consolidation_gate_section,
+    render_end_state_brief,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
 # --------------------------------------------------------------------------- #
 # Static vocabulary constants (step-1/2)
@@ -139,6 +146,70 @@ class TestMarkerLifecycle:
         )
         assert 'stage1_flag_suppression' not in gc_kinds
         assert 'cycle_summary' not in gc_kinds
+
+
+# --------------------------------------------------------------------------- #
+# MEM0_TOMBSTONE_DELETERS — single-sourced against the live deleter tags
+# --------------------------------------------------------------------------- #
+
+
+class TestMem0TombstoneDeleters:
+    """MEM0_TOMBSTONE_DELETERS names the deleter audit tags of the ONLY Mem0
+    delete paths that write a mem0_tombstone ledger row, via
+    mem0_tombstone.record_mem0_deletion_tombstones. Hand-declared in
+    recon_self_model (import-light contract — see module docstring) rather
+    than imported, and cross-checked here against the live constants so
+    drift between the two fails a test instead of silently diverging."""
+
+    def test_mem0_tombstone_deleters_shape(self):
+        """MEM0_TOMBSTONE_DELETERS is a non-empty tuple of non-empty str,
+        with no duplicate entries. Uniqueness matters because the render
+        step (render_cycle_summary_section) and the live-site ratchet below
+        both compare via set() — a duplicated tag would render the same
+        deleter twice in the prompt while passing both of those set-based
+        checks silently."""
+        assert isinstance(m.MEM0_TOMBSTONE_DELETERS, tuple)
+        assert m.MEM0_TOMBSTONE_DELETERS
+        for deleter in m.MEM0_TOMBSTONE_DELETERS:
+            assert isinstance(deleter, str) and deleter
+        assert len(set(m.MEM0_TOMBSTONE_DELETERS)) == len(m.MEM0_TOMBSTONE_DELETERS), (
+            f'MEM0_TOMBSTONE_DELETERS must not contain duplicates: '
+            f'{m.MEM0_TOMBSTONE_DELETERS}'
+        )
+
+    def test_mem0_tombstone_deleters_match_live_delete_sites(self):
+        """Drift ratchet: MEM0_TOMBSTONE_DELETERS must equal the six live
+        deleter tags used by the three production call sites of
+        mem0_tombstone.record_mem0_deletion_tombstones (summary_pool.
+        enforce_summary_pool_cap, task_knowledge_sync._sweep_stale_mem0_pool,
+        server.tools.consolidate_memories).
+
+        KNOWN LIMIT of this ratchet: it catches a RENAMED or REMOVED deleter
+        tag (the live import breaks or the set comparison fails), but a
+        brand-new call site introducing a brand-new constant is only caught
+        once someone adds it to `expected` below — it cannot discover an
+        unknown-unknown deleter on its own. That is the honest scope of this
+        guard, matching MARKER_KINDS' cross-check against recon_ledger.
+
+        Imports the stage modules lazily, inside the test body (costs ~20s
+        cold) rather than at module scope, matching this file's existing
+        `from fused_memory.reconciliation.recon_ledger import MARKER_KINDS`
+        idiom (see test_mem0_tombstone_is_in_neither_marker_kinds_constant
+        above) — recon_self_model itself must stay import-light.
+        """
+        from fused_memory.reconciliation.stages import memory_consolidator as mc
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.server import tools as srv_tools
+
+        expected = {
+            tks._STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            tks._STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            tks._FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            tks._STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            mc._STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
+            srv_tools._CONSOLIDATE_SOURCE,
+        }
+        assert set(m.MEM0_TOMBSTONE_DELETERS) == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -267,6 +338,26 @@ class TestRenderCycleSummarySection:
         text = m.render_cycle_summary_section()
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL in text
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
+
+    def test_tombstone_claim_names_its_deleters(self):
+        """The scoped claim is single-sourced from MEM0_TOMBSTONE_DELETERS.
+
+        Deliberately stronger than a per-element `deleter in text` loop:
+        that form is satisfied by ANY ordering, duplication, or scattering
+        of the tags, so it can only fail if the f-string interpolation is
+        deleted outright — it carries almost no regression signal. Asserting
+        the exact backtick-wrapped, comma-joined, in-declared-order
+        substring instead also catches a reordering, a gap opened up by an
+        unrelated edit landing mid-list, or the render switching away from
+        MEM0_TOMBSTONE_DELETERS as its source, while still failing closed if
+        the interpolation is deleted entirely.
+        """
+        text = m.render_cycle_summary_section()
+        expected_deleters_str = ', '.join(f'`{deleter}`' for deleter in m.MEM0_TOMBSTONE_DELETERS)
+        assert expected_deleters_str in text, (
+            f'Expected the exact ordered, comma-joined deleter list '
+            f'{expected_deleters_str!r} in render_cycle_summary_section()'
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -540,3 +631,141 @@ class TestRenderInvestigationOutcomeSection:
         assert 'entity_uuid' in text
         assert 'actionable' in text
         assert 'run_id' in text
+
+
+class TestRenderConsolidationGateSection:
+    """render_consolidation_gate_section() is Defect 1's prompt-side payload
+    (task 3112).
+
+    Until it landed, render_source_completion_section was the WHOLE gate-filing
+    instruction and it named no end state, so each filed gate invented its own
+    (DF gates 2969/2973/3011/3016/3036/3063/3092). This section supplies the
+    Option-C shape and points the closure predicate and the prompt at one text.
+
+    Every end-state assertion below is parameterized over BOTH
+    ``can_file_tasks`` variants: the target end state is identical for the two
+    stages, and only WHO files the gate differs.
+
+    Load-bearing-token assertions only, following TestRenderSourceCompletionSection.
+    """
+
+    @pytest.mark.parametrize('can_file', [True, False])
+    def test_returns_non_empty_str(self, can_file):
+        text = render_consolidation_gate_section(can_file_tasks=can_file)
+        assert isinstance(text, str)
+        assert text.strip()
+
+    @pytest.mark.parametrize('can_file', [True, False])
+    def test_names_the_option_c_end_state(self, can_file):
+        text = render_consolidation_gate_section(can_file_tasks=can_file)
+        assert 'metadata.topic' in text
+        assert 'metadata.canonical' in text
+
+    @pytest.mark.parametrize('can_file', [True, False])
+    def test_instructs_the_filer_to_emit_a_topic_not_a_member_list(self, can_file):
+        """A hand-written enumeration is what DF gate 3036 did, and a later
+        cycle extended it 7->8 while it still defined 'done'."""
+        text = render_consolidation_gate_section(can_file_tasks=can_file)
+        assert GATE_METADATA_KEY in text
+        assert 'build_consolidation_gate_task' in text
+
+    @pytest.mark.parametrize('can_file', [True, False])
+    def test_names_the_seam_that_enforces_closure(self, can_file):
+        """The refusal is the user-observable signal, so the filer must know
+        WHERE it fires before they file, not discover it at close time.
+
+        ``set_task_status`` is the tool identifier for the one seam step-14
+        gates.  The refusal BEHAVIOUR is covered by
+        ``test_consolidation_closure_seam.py``'s structured assertions on
+        ``result['error'] == 'consolidation_not_closed'`` — not here, by prose.
+        """
+        text = render_consolidation_gate_section(can_file_tasks=can_file)
+        assert 'set_task_status' in text
+
+    @pytest.mark.parametrize('can_file', [True, False])
+    def test_reuses_the_end_state_brief_verbatim(self, can_file):
+        """One text for the prompt, the filed gate description and the
+        predicate's target — so they cannot drift into disagreeing."""
+        assert render_end_state_brief() in render_consolidation_gate_section(
+            can_file_tasks=can_file
+        )
+
+    def test_stage1_variant_relays_instead_of_filing(self):
+        """Stage 1 does NOT hold `submit_task`, so its variant must not tell it
+        to build a submission — it must relay the gate to Stage 2.
+
+        The relay uses the SAME channel vocabulary
+        ``render_source_completion_section``'s `can_file_tasks=False` branch
+        already uses, so the two clauses in one prompt reinforce rather than
+        compete, and it must carry the payload Stage 2 needs to build the gate
+        itself: the cluster's topic slug and the rationale.
+        """
+        text = render_consolidation_gate_section(can_file_tasks=False)
+        assert 'as_submit_task_kwargs' not in text
+        assert 'submit_task' in text  # named, in its DENIAL sense
+        assert 'flag_for_stage2' in text
+        assert 'flagged_items' in text
+        assert 'topic' in text
+        assert 'rationale' in text
+
+    def test_stage2_variant_files_it_directly(self):
+        """Stage 2 holds `submit_task`, so it files the gate itself."""
+        text = render_consolidation_gate_section(can_file_tasks=True)
+        assert 'as_submit_task_kwargs' in text
+
+    def test_both_stage_prompts_embed_the_correct_variant(self):
+        """Both stages hold the memory-mutation tools, so both can REACH a
+        gate-worthy judgment call — but only Stage 2 holds `submit_task`, so
+        each prompt must carry the variant matching what that stage can do."""
+        assert (
+            render_consolidation_gate_section(can_file_tasks=False)
+            in STAGE1_SYSTEM_PROMPT
+        )
+        assert (
+            render_consolidation_gate_section(can_file_tasks=True)
+            in STAGE2_SYSTEM_PROMPT
+        )
+        # Anti-regression direction: the filing variant must never reach Stage 1.
+        assert (
+            render_consolidation_gate_section(can_file_tasks=True)
+            not in STAGE1_SYSTEM_PROMPT
+        )
+
+    def test_stage1_prompt_never_instructs_a_denied_task_write(self):
+        """Asserted against the WHOLE assembled Stage 1 prompt, not one
+        section, so a future section added elsewhere cannot reintroduce this.
+
+        ``mcp__fused-memory__submit_task`` is a member of
+        ``cli_stage_runner::DISALLOW_TASK_WRITES``, which
+        ``cli_stage_runner::STAGE1_DISALLOWED`` folds in — so a Stage 1 prompt
+        that says to submit a gate task is instructing a tool the stage does
+        not hold.  The rule, quoting ``render_source_completion_section``'s own
+        docstring: "Never instruct Stage 1 to call a tool it does not hold
+        (loud-over-silent)."
+        """
+        assert 'as_submit_task_kwargs' not in STAGE1_SYSTEM_PROMPT
+
+    def test_it_sits_alongside_the_source_completion_section(self):
+        assert m.render_source_completion_section(can_file_tasks=False) in (
+            STAGE1_SYSTEM_PROMPT
+        )
+        assert m.render_source_completion_section(can_file_tasks=True) in (
+            STAGE2_SYSTEM_PROMPT
+        )
+
+    def test_source_completion_defers_to_it_for_gate_shape(self):
+        """The two sections must not give the stages conflicting consolidation
+        instructions. render_source_completion_section's silence on shape IS
+        Defect 1's root cause, so it now names this section as the authority."""
+        for can_file in (True, False):
+            text = m.render_source_completion_section(can_file_tasks=can_file)
+            # Resolvable identifiers, not a heading phrase: both live in the
+            # shared trailing clause OUTSIDE the can_file_tasks if/else, so a
+            # rename of either symbol breaks this instead of silently
+            # orphaning the cross-reference.
+            assert 'consolidation_gate' in text, (
+                f'can_file_tasks={can_file} must point at the gate module'
+            )
+            assert 'render_consolidation_gate_section' in text, (
+                f'can_file_tasks={can_file} must point at the gate section'
+            )

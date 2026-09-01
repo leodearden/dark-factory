@@ -19,6 +19,7 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import UTC, datetime
@@ -27,7 +28,17 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+# Fully qualified rather than `from shared import ...`: the module is
+# deliberately NOT re-exported from shared/__init__, so `import shared` does
+# not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
+
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
+from orchestrator.mcp import markup_sink
 
 logger = logging.getLogger(__name__)
 
@@ -165,11 +176,147 @@ def _submit_merge_disposition(
 _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 
 
+def _emit_markup_fact(fact: dict[str, Any]) -> None:
+    """Emit the ``markup_detected`` record itself, as ONE structured line.
+
+    INV-2: every outcome emits the fact, and no consumer re-derives it by
+    log-scraping. The middleware already logs a human-readable WARNING for an
+    operator reading the stream, so duplicating that prose here would add a
+    second thing to read and still nothing to parse. This emits the RECORD —
+    greppable by its own name, then ``json.loads``-able whole.
+
+    Same emitter shape as ``escalation.server``'s, which is the only other
+    registration site that wires one; the middleware owns the record, so
+    neither builds it.
+
+    Module level rather than a ``create_server`` closure: it captures nothing.
+    """
+    logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
+
+
+#: verdict-tools' declaration of its own escalation channel (task 3690).
+#: Every field is stated here rather than defaulted inside ``markup_sink``:
+#: adding a server to the shared channel must be a decision at every axis, not
+#: an inheritance of plan-tools' answers.
+_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+    server_label='verdict-tools',
+    agent_role='verdict-tools-markup-guard',
+    residue_anchor_task_id='verdict-tools-markup-residue',
+    storm_anchor_task_id='verdict-tools-markup-storm',
+    refusal_consequence=(
+        'NO verdict was written, so the review gate this call was supposed to '
+        "close is still open and the reviewer's findings list below is the "
+        'only copy of it that exists.'
+    ),
+    storm_consequence=(
+        'further review gates strand on verdicts that never land.'
+    ),
+)
+
+
+def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
+    """Which task's verdict call leaked — the SUBJECT, not the routing key.
+
+    Deliberately NOT the escalation's ``task_id`` field: that is the non-task
+    residue anchor, because a level-2 record filed under a LIVE task id halts
+    that task, and preserving a payload must not cost the run that produced it.
+
+    The plan's own ``task_id`` when there is a plan to read (there always is by
+    the time a verdict is submitted — the verdict is about that plan's diff);
+    ``markup_sink`` falls back to the worktree name and then to an explicit
+    "unattributed" when this returns empty. An unreadable plan degrades the
+    same way rather than losing the record.
+    """
+    try:
+        plan = artifacts.read_plan()
+    except Exception:
+        logger.warning(
+            'markup guard: could not read the plan for attribution under %s; '
+            'falling back to the worktree name', artifacts.root,
+        )
+        return ''
+    task_id = plan.get('task_id') if isinstance(plan, dict) else None
+    return task_id if isinstance(task_id, str) else ''
+
+
 def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
     """Create the verdict-tools MCP server with EXACTLY ONE tool registered,
     selected by *role*.
     """
     mcp = FastMCP('verdict-tools')
+
+    # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
+    #
+    # Registered HERE, BEFORE the `if role == ...` chain below, so ONE
+    # registration covers all four branches and a fifth branch added later
+    # cannot be born unguarded. A per-branch registration would be exactly the
+    # silent gap this task exists to close.
+    #
+    # FORWARD_REPAIR, not REJECT_WITH_REPAIR, and the reason is C2's own: a lost
+    # submit_review_verdict STRANDS A REVIEW GATE (INV-6). The tier is passed
+    # EXPLICITLY as a keyword because INV-1 makes it a registration-time
+    # DECLARATION — never inferred per call from the shape of the damage or
+    # from a tool's name.
+    #
+    # This server's leaks were LOUD, unlike escalation's. submit_review_verdict
+    # declares FOUR required parameters, so an absorbed `issues` failed the call
+    # outright with `Missing required argument` rather than landing silently
+    # with an empty list; 19 corrupted calls of this shape sit in the committed
+    # corpus. That is why the repair can only work from `on_call_tool`, which
+    # runs BEFORE pydantic validation (PRD boundary row B14) — and why
+    # strict_input_validation is deliberately NOT set (row B15): with it on the
+    # SDK jsonschema-validates first, the middleware chain is never entered, and
+    # every required-parameter leak becomes silently unrepairable.
+    #
+    # exempt_tools is written out even though frozenset() is the default: an
+    # exemption is a declaration, and spelling it makes a future tool addition
+    # here a DECISION rather than an omission. No tool on this server carries
+    # envelope literals as data — the scan_memory_content case that motivates
+    # exemptions lives on fused-memory (sibling task 4458). A name added here
+    # would match BARE (`submit_review_verdict`, never the agent-facing
+    # mcp__verdict-tools__submit_review_verdict spelling the corpus records).
+    #
+    # THE ESCALATION SINK IS THE SHARED ONE, and deliberately not a second
+    # mechanism of this server's own. `orchestrator.mcp.markup_sink` is the one
+    # orchestrator-side channel every boundary guard files through — promoted
+    # out of plan_tools by this task once verdict-tools needed the identical
+    # thing. A private, weaker preservation path per server is exactly the
+    # INV-5 failure this PRD exists to rule against, and it very nearly shipped
+    # here: the first cut of this leaf wrote residue to a worktree-local
+    # `.task/markup_residue-<n>.json`, which dies with the lane at
+    # `git worktree remove --force` and which nothing ever reads. That file is
+    # now only the LAST RESORT, taken when the queue cannot be opened at all,
+    # and the sink says so in the log line it writes.
+    #
+    # Filing works from this process even though it is a standalone stdio
+    # subprocess with no in-process queue: markup_sink resolves project_root
+    # off the worktree's `--git-common-dir` and lazily opens the real
+    # EscalationQueue on the 0.27% of calls that need it, so startup latency is
+    # untouched. Residue is filed under a NON-TASK anchor -- at the level 2 the
+    # middleware declares, a pending record carrying a live task id would halt
+    # the very task whose verdict leaked.
+    #
+    # The state this preserves is worth MORE than plan-tools', not less: a lost
+    # submit_review_verdict strands a review gate (INV-6) AND destroys a
+    # reviewer's entire `issues` findings list, which is by construction text
+    # the agent cannot re-emit identically.
+    #
+    # No try/except around the delegation: the sink's own contract is that it
+    # never raises and never changes the caller's outcome, and the middleware's
+    # `_call_sink` is a second floor under it. A record that cannot be filed
+    # anywhere returns None, and the middleware's hint then tells the caller
+    # the truth rather than claiming a preservation that did not happen.
+    mcp.add_middleware(MarkupGuardMiddleware(
+        policy=RepairPolicy.FORWARD_REPAIR,
+        exempt_tools=frozenset(),
+        fact_sink=_emit_markup_fact,
+        escalation_sink=markup_sink.make_escalation_sink(
+            worktree=artifacts.worktree,
+            spec=_MARKUP_SINK_SPEC,
+            subject_task_id=lambda: _markup_subject_task_id(artifacts),
+            last_resort=artifacts.write_markup_residue,
+        ),
+    ))
 
     if role == 'judge':
         @mcp.tool()

@@ -251,6 +251,61 @@ def build_harness(
         return 'esc_1'
 
     @mcp.tool
+    def escalate_info_typed(
+        task_id: str,
+        agent_role: str,
+        category: str,
+        summary: str,
+        severity: str = 'info',
+        detail: str = '',
+        suggested_action: str = '',
+        worktree: str | None = None,
+        workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+        terminal_state_is_the_bug: bool = False,
+    ) -> str:
+        """``escalate_info`` with the REAL escalation server's signature, verbatim.
+
+        Task **3690**. Copied byte-for-byte from
+        ``escalation/src/escalation/server.py:933`` because the one thing this
+        toy has that the legacy one above does not is a **list-typed**
+        parameter: ``evidence: list[dict[str, Any]] | None``. Every recovery
+        target asserted anywhere else in this file is ``str``-typed, so the
+        measured failure this tool exists to pin had never been reachable —
+        a ``str`` recovered into a list-typed parameter does not land and is
+        not coerced, it RAISES ``list_type`` inside pydantic and the tool body
+        never runs.
+
+        ADDITIVE rather than a widening of the legacy ``escalate_info`` toy,
+        exactly as ``add_memory_strict`` was added beside ``add_memory`` for
+        B14: roughly a dozen existing call sites (B3, the INV-2 rows, the
+        storm rows) call ``escalate_info`` with only ``{'summary', 'detail'}``,
+        and its narrow shape is load-bearing for all of them. Tightening it
+        into the real eleven-parameter signature would break every one for no
+        gain.
+
+        Kept VERBATIM rather than reduced to the three parameters the tests
+        touch: ``repair()`` validates recovered names against the LIVE schema,
+        so a reduced mirror would change which recoveries are admissible and
+        make this an easier problem than the real server poses.
+        """
+        rec.record(
+            'escalate_info_typed',
+            task_id=task_id,
+            agent_role=agent_role,
+            category=category,
+            summary=summary,
+            severity=severity,
+            detail=detail,
+            suggested_action=suggested_action,
+            worktree=worktree,
+            workflow_state=workflow_state,
+            evidence=evidence,
+            terminal_state_is_the_bug=terminal_state_is_the_bug,
+        )
+        return 'esc_typed_1'
+
+    @mcp.tool
     def add_memory(
         content: str,
         category: str | None = None,
@@ -973,6 +1028,442 @@ class TestB3StrandRiskTierForwards:
         assert meta_of(result).get('fastmcp') == {'wrap_result': True}
 
 
+class TestB3ExtendedListTypedRecovery:
+    """B3, extended to the one parameter TYPE the tier had never recovered.
+
+    Task **3690**. Every recovery asserted above lands in a ``str``-typed
+    parameter, so "the recovered parameter actually LANDS" had only ever been
+    measured where the verbatim slice was already the right Python type.
+    ``Repair.recovered`` is ``dict[str, str]`` by construction (invariant D5:
+    every recovered value is a verbatim slice of the tail), and ``_forward``
+    applied it as a bare ``arguments.update(fix.recovered)``.
+
+    MEASURED, before the fix: the guard repairs, reports
+    ``recovered_params=['evidence', 'suggested_action']`` — and then pydantic
+    rejects the ``str`` with ``1 validation error for
+    call[escalate_info_typed] / evidence / Input should be a valid list
+    [type=list_type, input_type=str]``. The tool body never runs.
+
+    That is strictly WORSE than no guard for this shape. ``evidence`` is
+    OPTIONAL on the real ``escalate_info``, so today an unguarded leaked call
+    lands with ``evidence=[]``: the escalation IS filed, with silent data
+    loss (on-disk specimen esc-3184-2 is exactly this). A guard that turns a
+    filed-but-lossy escalation into a raised error makes filing STRICTLY
+    HARDER for the one call the FORWARD_REPAIR tier exists to protect
+    (C2 / INV-6: a lost ``escalate_info`` strands a task).
+
+    Driven by the committed corpus specimen that recovers BOTH a list-typed
+    and a str-typed parameter in one call, so the fix cannot be satisfied by
+    retyping everything.
+    """
+
+    SPECIMEN = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
+
+    #: The four required parameters of the real signature. The specimen's own
+    #: ``supplied`` list records exactly these plus ``detail``, so this mirrors
+    #: what the leaking caller really put on the wire.
+    REQUIRED = {
+        'task_id': '3441',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'Eight near-duplicate entries restate the same gotcha.',
+    }
+
+    async def _forward(self):
+        record = specimen(self.SPECIMEN)
+        assert record['expected_outcome'] == 'repaired'
+        assert sorted(record['expected_recovered']) == ['evidence', 'suggested_action']
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call(
+            'escalate_info_typed', {**self.REQUIRED, record['param']: record['value']}
+        )
+        return h, result
+
+    async def test_the_call_succeeds_and_the_body_runs_exactly_once(self):
+        """(a) + (b). The assertion that fails first today: it RAISES."""
+        h, _ = await self._forward()
+
+        assert len(h.recorder.calls) == 1
+
+    async def test_the_list_typed_recovery_lands_as_a_list_of_dicts(self):
+        """(c). The gamma-1 signal, and the manifest's OPEN capability.
+
+        Not a ``str``, and not an empty list either — a guard that swallowed
+        the decode failure into ``[]`` would pass a bare ``isinstance(list)``
+        while losing exactly the data this row exists to preserve.
+        """
+        h, _ = await self._forward()
+
+        evidence = h.recorder.args['evidence']
+        assert isinstance(evidence, list), (
+            f'evidence landed as {type(evidence).__name__}, not a list — the '
+            'verbatim str slice was forwarded into a list-typed parameter'
+        )
+        assert evidence, 'the recovery landed as an EMPTY list: the payload was lost'
+        assert all(isinstance(entry, dict) for entry in evidence)
+
+    async def test_the_str_typed_recovery_still_lands_as_a_str(self):
+        """(d). The same call recovers both, so a fix cannot retype blindly."""
+        h, _ = await self._forward()
+
+        suggested_action = h.recorder.args['suggested_action']
+        assert isinstance(suggested_action, str)
+        assert suggested_action, 'the str-typed recovery landed empty'
+
+    async def test_the_absorbing_field_is_clean(self):
+        h, _ = await self._forward()
+
+        assert detect(h.recorder.args['detail']) is None
+
+    async def test_meta_reports_both_recoveries(self):
+        """(e). NAMES only — the warning must not become a second copy."""
+        _, result = await self._forward()
+
+        warning = meta_of(result)['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['field'] == 'detail'
+        assert warning['recovered_params'] == ['evidence', 'suggested_action']
+
+
+class TestRejectRepairedCallValidates:
+    """The REJECT tier's ``repaired_call`` must actually be RESUBMITTABLE.
+
+    Task **3690**. ``_REJECT_HINT`` instructs a bounced caller to "Resubmit
+    repaired_call verbatim", and ``_reject`` builds it as
+    ``{**arguments, param: fix.clean_value, **fix.recovered}`` — from the RAW
+    recovered map. Coercing only the forward path would leave this tier
+    handing back a ``str`` for a list-typed parameter, so the promised
+    MECHANICAL retry dies with the same ``list_type`` error the guard just
+    prevented: the guard would be telling a bounced caller to do something
+    that cannot work.
+
+    This is what binds the fix to BOTH tiers, and why siblings 4457
+    (plan-tools) and 4458 (fused-memory) — both REJECT_WITH_REPAIR servers —
+    need it too.
+    """
+
+    SPECIMEN = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
+
+    REQUIRED = {
+        'task_id': '3441',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'Eight near-duplicate entries restate the same gotcha.',
+    }
+
+    async def _reject(self):
+        record = specimen(self.SPECIMEN)
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'escalate_info_typed',
+                {**self.REQUIRED, record['param']: record['value']},
+            )
+        return h, _reject_payload(excinfo)
+
+    async def test_the_repaired_call_carries_a_list_not_a_str(self):
+        _, payload = await self._reject()
+
+        evidence = payload['repaired_call']['evidence']
+        assert isinstance(evidence, list), (
+            f'repaired_call.evidence is a {type(evidence).__name__}; a caller '
+            'resubmitting it verbatim would be bounced again by pydantic'
+        )
+        assert all(isinstance(entry, dict) for entry in evidence)
+
+    async def test_it_names_both_recoveries(self):
+        _, payload = await self._reject()
+
+        assert payload['recovered_params'] == ['evidence', 'suggested_action']
+
+    async def test_nothing_was_written(self):
+        h, _ = await self._reject()
+
+        assert h.recorder.calls == []
+
+    async def test_the_round_trip(self):
+        """THE assertion. Resubmit ``repaired_call`` verbatim; it must work.
+
+        Everything else in this class describes the payload. This one is the
+        promise ``_REJECT_HINT`` actually makes, exercised end to end through
+        a second Client call on a fresh server.
+        """
+        _, payload = await self._reject()
+        retry = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        result = await retry.call('escalate_info_typed', payload['repaired_call'])
+
+        assert result.data == 'esc_typed_1'
+        assert len(retry.recorder.calls) == 1
+        assert isinstance(retry.recorder.args['evidence'], list)
+        assert retry.recorder.args['suggested_action']
+
+    async def test_the_retry_is_clean_so_the_guard_does_not_fire_again(self):
+        """A repaired_call that still tripped ``detect`` would loop forever."""
+        _, payload = await self._reject()
+        retry = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        await retry.call('escalate_info_typed', payload['repaired_call'])
+
+        assert retry.facts == [], 'the resubmission re-entered the guard'
+
+
+class TestCoercionNeverGuesses:
+    """The three ways a NAIVE decode of a recovered value is wrong.
+
+    Task **3690**. Typing a recovered value against the invoked tool's schema
+    is the fix for the list-typed gap above, but a decode that fires on the
+    wrong parameter is a silent RETYPING of the caller's data — a far quieter
+    defect than the loud ``list_type`` error it replaces. C2 L187 ("nothing is
+    guessed") has to hold for the coercion step too: a value the guard cannot
+    confidently type must reach pydantic UNCHANGED and produce a legible
+    declared-type error, never a fabricated one.
+    """
+
+    REQUIRED = {
+        'task_id': '3690',
+        'agent_role': 'implementer',
+        'category': 'risk_identified',
+        'summary': 'A coercion that guesses is worse than one that refuses.',
+    }
+
+    def _payload(self, absorbed: str, recovered_param: str, recovered_value: str) -> str:
+        """A ``detail`` that mis-closed and swallowed exactly one parameter."""
+        return (
+            absorbed
+            + _closer('detail')
+            + '\n'
+            + _opener(recovered_param)
+            + recovered_value
+            + _closer(recovered_param)
+            + INVOKE_CLOSER
+        )
+
+    async def _call(self, detail: str):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call(
+            'escalate_info_typed', {**self.REQUIRED, 'detail': detail}
+        )
+        return h, result
+
+    # -- (a) a union type must still coerce -------------------------------
+
+    async def test_the_union_declaration_is_what_makes_this_hard(self):
+        """Documents WHY, not merely THAT — measured off the live schema.
+
+        ``evidence: list[dict[str, Any]] | None`` carries NO top-level
+        ``'type'`` key. A coercion that reads ``properties[name]['type']``
+        therefore skips the single most important parameter in this task.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        tool = await h.mcp.get_tool('escalate_info_typed')
+        assert tool is not None
+        declared = tool.parameters['properties']['evidence']
+
+        assert 'type' not in declared, (
+            'the premise of this row changed: evidence now carries a '
+            'top-level type, so the union branch below no longer guards it'
+        )
+        assert 'anyOf' in declared
+        assert {branch.get('type') for branch in declared['anyOf']} == {'array', 'null'}
+
+    async def test_a_union_typed_recovery_still_lands_as_a_list(self):
+        h, _ = await self._call(
+            self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+        )
+
+        evidence = h.recorder.args['evidence']
+        assert evidence == [{'observation': 'measured'}]
+
+    # -- (b) a string-typed parameter is NEVER decoded ---------------------
+
+    async def test_a_str_typed_recovery_that_looks_like_json_stays_a_str(self):
+        """The regression that would silently retype every str recovery.
+
+        ``suggested_action`` is declared ``str`` and is 26 of the measured
+        recoveries on the real escalation server. Its verbatim slice is
+        ALREADY the correct value (D5); decoding it because it happens to
+        parse would hand the tool a list where it declared text.
+        """
+        looks_like_json = '[consolidate, then re-measure]'
+        h, _ = await self._call(
+            self._payload('A list-ish string.', 'suggested_action', looks_like_json)
+        )
+
+        landed = h.recorder.args['suggested_action']
+        assert landed == looks_like_json
+        assert isinstance(landed, str)
+
+    async def test_a_str_typed_recovery_that_is_a_bare_numeral_stays_a_str(self):
+        """The same defect in its most decodable form: ``json.loads('3690')``
+        succeeds and yields an ``int``."""
+        h, _ = await self._call(
+            self._payload('A numeric string.', 'suggested_action', '3690')
+        )
+
+        landed = h.recorder.args['suggested_action']
+        assert landed == '3690'
+        assert isinstance(landed, str), f'retyped to {type(landed).__name__}'
+
+    # -- (c) a non-decodable value is left verbatim, never fabricated ------
+
+    async def test_an_undecodable_value_is_never_invented(self):
+        """A decode failure is a failure to recover, not a licence to invent.
+
+        The value must never be swallowed into ``[]``, ``None`` or a retyped
+        guess — that would destroy the payload while reporting success, which is
+        precisely the silent loss this task exists to end (C2 L187). Under
+        FORWARD_REPAIR it is DROPPED instead, so the parameter arrives at the
+        tool exactly as it would have without the recovery: absent.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        assert h.recorder.args.get('evidence') in (None, [])
+        assert h.recorder.args.get('evidence') != truncated
+
+    async def test_an_undecodable_value_does_not_cost_the_whole_call(self):
+        """REVIEW SUGGESTION 5. The tier's whole purpose is that the call lands.
+
+        MEASURED before the fix: a truncated ``evidence`` tail logged
+        ``outcome=repaired`` and then died with ``1 validation error … evidence:
+        Input should be a valid list [type=list_type]``, with ``recorder.calls
+        == []`` — the tool body never ran, no residue was filed, and an
+        ``escalate_info`` was lost with only a pydantic error to show for it.
+        That is the INV-6 strand FORWARD_REPAIR exists to prevent, reached by a
+        different road than the one the tier guards.
+
+        Forwarding a value pydantic is CERTAIN to reject is not a neutral
+        "leave it alone" — it is a decision to lose the call.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        assert len(h.recorder.calls) == 1, 'the call must reach the tool'
+        # The clean value still landed — the guard is strictly better than no
+        # guard here, not merely no worse.
+        assert h.recorder.args['detail'] == 'Ill-formed.'
+
+        warning = meta_of(result)['markup_repair']
+        assert warning['outcome'] == 'repaired'
+        assert warning['unrecovered_params'] == ['evidence']
+        assert 'evidence' not in warning['recovered_params']
+        # The caller is TOLD the call is incomplete; a plain repair hint would
+        # let it assume the recovery succeeded.
+        assert 'DROPPED' in warning['hint']
+
+    async def test_a_dropped_value_is_preserved_verbatim_in_the_residue_channel(
+        self,
+    ):
+        """Dropping is not discarding (C2 L187 binds every path, not just refusal).
+
+        The same residue record, through the same sink, carrying the same owner
+        and L2 bound an unrepairable refusal files — an operator recovering data
+        should not have to know which internal road lost it. The error_type
+        differs because the difference matters to a reader: this call SUCCEEDED,
+        so nobody was bounced and nobody is waiting on a retry.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        result = await h.call(
+            'escalate_info_typed',
+            {
+                **self.REQUIRED,
+                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+            },
+        )
+
+        residues = [
+            r for r in h.escalations
+            if r['error_type'] == 'mcp_markup_unrecovered_param'
+        ]
+        assert len(residues) == 1, f'expected one residue, got {h.escalations}'
+        residue = residues[0]
+        assert residue['raw_value'] == truncated
+        assert residue['field'] == 'evidence'
+        assert residue['tool'] == 'escalate_info_typed'
+        assert residue['owner'] == 'l2-escalation-watcher'
+        assert residue['level'] == 2
+        assert residue['category'] == 'mcp_markup_residue'
+        # And the forwarded caller is pointed at it by id.
+        assert meta_of(result)['markup_repair']['unrecovered_residue_id'] is not None
+
+    async def test_reject_with_repair_keeps_the_undecodable_value_verbatim(self):
+        """The drop is FORWARD_REPAIR's alone.
+
+        REJECT_WITH_REPAIR writes nothing and hands the caller a
+        ``repaired_call`` it is told to resubmit verbatim. Shrinking that map
+        would turn a recoverable bounce into a quiet truncation — the caller
+        would resubmit a call missing a parameter it never chose to drop, and
+        nothing would say so.
+        """
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'escalate_info_typed',
+                {
+                    **self.REQUIRED,
+                    'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                },
+            )
+
+        payload = json.loads(str(excinfo.value))
+        assert payload['repaired_call']['evidence'] == truncated
+        assert h.recorder.calls == []
+
+    # -- D5 is preserved: the transform is a BOUNDARY layer ----------------
+
+    async def test_the_repair_itself_still_returns_only_strs(self):
+        """``Repair.recovered`` stays ``dict[str, str]`` — the coercion is
+        applied at the boundary, not pushed down into the parser.
+
+        Asserted against ``repair()`` DIRECTLY with the same inputs the
+        middleware hands it, so a future change that "simplified" the fix by
+        making toolcall_markup decode its own tail would fail here. That
+        module owns parsing and knows nothing of the invoked tool's schema;
+        typing a value against a tool is this layer's job.
+        """
+        from shared.toolcall_markup import repair
+
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        tool = await h.mcp.get_tool('escalate_info_typed')
+        assert tool is not None
+        detail = self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+
+        fix = repair(
+            detail,
+            'detail',
+            tuple(tool.parameters['properties']),
+            tuple({**self.REQUIRED, 'detail': detail}),
+        )
+
+        assert fix is not None
+        assert sorted(fix.recovered) == ['evidence']
+        assert all(isinstance(v, str) for v in fix.recovered.values()), (
+            'D5 broke: repair() must return every recovered value as a '
+            'verbatim str slice of the tail'
+        )
+
+
 class TestB4LastParameterNothingDropped:
     """The absorbing parameter was the LAST one, so there is nothing to recover.
 
@@ -1121,12 +1612,28 @@ class TestB5UnrepairableIsNeverGuessed:
 
     @BOTH_POLICIES
     async def test_the_escalation_locates_the_leak(self, policy):
+        """The pattern is the leak's OWN tag as of task 4696, not the one after it.
+
+        This specimen's ``how`` mis-closes on ``\\x3c/how>`` and only LATER
+        carries an ``\\x3c/invoke>``. While the boundary scan was param-blind it
+        reported the invoke closer — i.e. it blamed whatever happened to follow
+        the leak, which is verbatim the diagnosis failure PRD section 2.2 was
+        written about ("a mis-closed ``description`` could not report its own
+        tag and the write-time guard blamed whatever happened to follow it").
+        Now the earliest-by-text-position rule reaches the self-name closer, so
+        the operator record names where the leak actually STARTS.
+        """
         h, _, _ = await self._refuse(policy)
 
         record = h.escalations[0]
         assert record['tool'] == 'add_reuse_item'
         assert record['field'] == 'how'
-        assert record['matched_pattern'] == INVOKE_CLOSER
+        assert record['matched_pattern'] == _closer('how')
+        assert INVOKE_CLOSER in self._value(), (
+            'the invoke closer must still be PRESENT but LATER — otherwise this '
+            'row stops testing that the earliest tag wins'
+        )
+        assert self._value().index(_closer('how')) < self._value().index(INVOKE_CLOSER)
 
     @BOTH_POLICIES
     async def test_the_refusal_names_the_escalation_and_offers_no_repair(self, policy):
@@ -1165,6 +1672,154 @@ class TestB5UnrepairableIsNeverGuessed:
         assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
         assert h.recorder.calls == []
 
+
+class TestTheHintNeverOverclaimsPreservation:
+    """The refusal's PROSE must agree with its own ``escalation_id`` field.
+
+    ``_file_residue_escalation`` returns ``None`` on THREE distinct paths — no
+    sink wired, a sink that RAISED (``_call_sink``'s never-raises contract), and
+    a sink that returned a non-str. On every one of them the payload carries
+    ``escalation_id: null``, so a hint that unconditionally asserts "your full
+    payload is preserved verbatim in the escalation named above" is a lie told
+    at the exact moment the payload was destroyed — and it explicitly
+    discourages the ONE recovery still available ("rather than reconstructing it
+    from this error").
+
+    That converts a RECOVERABLE loss into an unrecoverable one, because the
+    hint is read by an agent deciding whether it still needs its own copy.
+
+    This is not a verdict-tools-only gap. The raising-sink path applies to the
+    ESCALATION server too, where a queue I/O failure produces the identical
+    false claim — which is why the fix lives in the middleware once rather than
+    at either registration site.
+    """
+
+    #: Reuses B5's named specimen: the refusal path is a property of the VALUE's
+    #: own boundary, so the same row drives every branch below.
+    SPECIMEN_ID = TestB5UnrepairableIsNeverGuessed.SPECIMEN_ID
+
+    #: A distinctive slice of the PRESERVED variant. Asserting on the clause
+    #: itself rather than on the whole constant keeps this row readable when the
+    #: surrounding prose is reworded.
+    PRESERVED_CLAIM = 'preserved verbatim'
+
+    @staticmethod
+    def _value() -> str:
+        return TestB5UnrepairableIsNeverGuessed._value()
+
+    async def _refuse(self, policy, **guard_kwargs):
+        h = build_harness(policy, **guard_kwargs)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the sampler', 'how': self._value(), 'where': 'shared/'},
+            )
+        return h, _reject_payload(excinfo)
+
+    # -- (a) preserved --------------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_preserved_payload_is_told_it_is_preserved(self, policy):
+        """The harness sink returns a real id, so the claim is TRUE here."""
+        _, payload = await self._refuse(policy)
+
+        assert payload['escalation_id'] == ESCALATION_ID
+        assert self.PRESERVED_CLAIM in payload['hint'], (
+            'preservation actually happened, so the caller must be told it can '
+            'stop holding its own copy'
+        )
+
+    # -- (b) no sink wired ----------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_no_sink_wired_does_not_claim_preservation(self, policy):
+        """Nothing was written anywhere, so nothing may be promised."""
+        _, payload = await self._refuse(policy, escalation_sink=None)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint'], (
+            'with no sink the payload was destroyed; telling the caller it is '
+            'safe is how a recoverable loss becomes unrecoverable'
+        )
+        assert 'nothing was preserved' in payload['hint'].lower(), (
+            'the honest variant must POSITIVELY say the data is gone, not '
+            'merely omit the claim — an agent skims for an instruction'
+        )
+
+    # -- (c) sink raised -------------------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_sink_that_raised_does_not_claim_preservation(self, policy):
+        """The escalation-server-with-a-failing-queue case."""
+        def boom(record):
+            raise RuntimeError('queue unavailable')
+
+        _, payload = await self._refuse(policy, escalation_sink=boom)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint']
+        assert 'nothing was preserved' in payload['hint'].lower()
+
+    # -- (d) sink returned a non-str -------------------------------------
+
+    @BOTH_POLICIES
+    async def test_a_sink_returning_a_non_str_does_not_claim_preservation(self, policy):
+        """The middleware normalises this to ``None`` (it is not lookup-able).
+
+        So the hint must follow the ID it actually published, not the sink's
+        intent — keying off ``self._escalation_sink is not None`` would get
+        this row exactly backwards.
+        """
+        _, payload = await self._refuse(policy, escalation_sink=lambda record: 12)
+
+        assert payload['escalation_id'] is None
+        assert self.PRESERVED_CLAIM not in payload['hint']
+        assert 'nothing was preserved' in payload['hint'].lower()
+
+    # -- (e) what must NOT change across the split -----------------------
+
+    @BOTH_POLICIES
+    async def test_every_variant_still_offers_the_override_escape(self, policy):
+        """INV-3. The pre-existing assertion pins this on the preserved branch;
+        a split that dropped it from the other branch would strand a caller
+        quoting markup DELIBERATELY."""
+        sinks: list[Any] = [
+            {},
+            {'escalation_sink': None},
+            {'escalation_sink': _raises_for_test},
+            {'escalation_sink': lambda record: 12},
+        ]
+        for kwargs in sinks:
+            _, payload = await self._refuse(policy, **kwargs)
+            assert MARKUP_OVERRIDE_KEY in payload['hint'], (
+                f'the override escape vanished for {kwargs!r}'
+            )
+
+    @BOTH_POLICIES
+    async def test_every_variant_still_says_unrepairable_and_no_repair(self, policy):
+        """The split changes ONLY the preservation clause."""
+        for kwargs in ({}, {'escalation_sink': None}):
+            _, payload = await self._refuse(policy, **kwargs)
+            hint = payload['hint']
+            assert 'UNREPAIRABLE' in hint
+            assert 'no repair was attempted' in hint
+            assert payload['outcome'] == 'unrepairable'
+            assert 'repaired_call' not in payload
+
+    async def test_the_two_variants_are_genuinely_different(self):
+        """A copy-paste that left both branches identical would otherwise pass
+        every substring check above."""
+        _, preserved = await self._refuse(RepairPolicy.FORWARD_REPAIR)
+        _, unpreserved = await self._refuse(
+            RepairPolicy.FORWARD_REPAIR, escalation_sink=None
+        )
+
+        assert preserved['hint'] != unpreserved['hint']
+
+
+def _raises_for_test(record: dict[str, Any]) -> str:
+    """A sink that fails, as a module-level name so it is reusable in a table."""
+    raise RuntimeError('queue unavailable')
 
 class TestB8RecoveredNameOutsideTheToolSchema:
     """A tail that parses CLEANLY but names a parameter the tool does not have.
@@ -1612,7 +2267,13 @@ class TestINV2StructuredFacts:
         assert h.facts[0]['pattern'] != h.facts[0]['misclose']
 
     async def test_the_unrepairable_fact_still_names_the_matched_pattern(self):
-        """A refusal that could not say WHAT it saw would be unactionable."""
+        """A refusal that could not say WHAT it saw would be unactionable.
+
+        Names ``\\x3c/how>`` rather than ``\\x3c/invoke>`` as of task 4696 — the
+        leak's own tag, not the literal that happens to follow it. See
+        :meth:`TestB5UnrepairableIsNeverGuessed.test_the_escalation_locates_the_leak`
+        for why that is the point rather than a changed expectation.
+        """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError):
@@ -1625,7 +2286,7 @@ class TestINV2StructuredFacts:
                 },
             )
 
-        assert h.facts[0]['pattern'] == INVOKE_CLOSER
+        assert h.facts[0]['pattern'] == _closer('how')
 
     # -- identity: read from the call's own arguments -----------------------
 
@@ -2588,3 +3249,222 @@ class TestB14OrderingDependsOnStrictInputValidationBeingOff:
             'empty list IS the finding, not an incidental assertion'
         )
         assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4696 — the SELF-NAME closer, the dialect the live boundary cannot see.
+# ---------------------------------------------------------------------------
+
+
+class TestSelfNameCloserIsSeenAtTheBoundary:
+    """The dominant real leak dialect, pinned at the LIVE WRITE BOUNDARY.
+
+    ``_first_markup_argument`` asked the param-free ``detect``, whose fixed
+    six-literal union echoes NONE of the invoked tool's own parameter names.
+    So a value mis-closed with its OWN name-echoing tag — and carrying no
+    invoke closer and no parameter-open token to give it away — matched
+    nothing, the guard returned ``None``, and the corrupt value was forwarded
+    to the tool and written to disk. The guard was never bypassed; it was
+    BLIND, and this class is where that blindness is visible from the outside.
+
+    Measured over ``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: 444
+    corrupted entries, 232 of them visible to the fixed literal set and **212
+    (48%) invisible to it** — of which **212 of 212 are caught by the SELF-NAME
+    closer alone**, with a cross-field residual of ZERO. That is the whole
+    basis for passing only ``param`` here and not the awaited tool schema; see
+    :meth:`TestSelfNameCloserIsSeenAtTheBoundary.
+    test_a_CROSS_FIELD_misclose_is_the_one_accepted_residual` for the residual
+    that measurement leaves behind.
+
+    The two victims below are the two largest real populations: 296
+    ``add_design_decision.rationale`` specimens and 129 ``add_reuse_item.how``
+    ones. Neither tool takes a ``task_id`` — they are called with exactly their
+    declared parameters, as the harness registers them.
+    """
+
+    #: The ONLY envelope signature in this value is the rationale closer: no
+    #: invoke closer, no ``parameter name=`` token. That is what makes it
+    #: invisible today, and it is the shape 296 real specimens have.
+    RATIONALE = 'Both mechanisms partition rather than race.' + _closer('rationale')
+    RATIONALE_CLEAN = 'Both mechanisms partition rather than race.'
+
+    #: The same shape on the second-largest victim.
+    HOW = 'Reuse the declared table directly.' + _closer('how')
+    HOW_CLEAN = 'Reuse the declared table directly.'
+
+    def test_the_specimen_carries_no_OTHER_envelope_signature(self):
+        """Otherwise this class would be re-testing a dialect already caught.
+
+        The whole point is a value whose only tell is its own closer. If a
+        future edit slipped an invoke closer or an opener into the specimen,
+        every assertion below would pass for the wrong reason.
+        """
+        for value in (self.RATIONALE, self.HOW):
+            assert INVOKE_CLOSER not in value
+            assert '\x3cparameter name=' not in value
+            assert detect(value) is None, (
+                'the blanket predicate must still be blind to this specimen — '
+                'that blindness IS the defect under test'
+            )
+
+    async def test_a_self_name_rationale_leak_is_REJECTED(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['outcome'] == 'rejected'
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['field'] == 'rationale'
+        assert payload['misclose'] == _closer('rationale')
+
+    async def test_the_tool_body_never_ran(self):
+        """"REJECT_WITH_REPAIR writes nothing" is what this empty list means."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert h.recorder.calls == []
+
+    async def test_the_repaired_call_is_the_COMPLETE_argument_map(self):
+        """So the retry is mechanical: resubmit it verbatim.
+
+        This specimen recovers NOTHING — a bare self-name closer has an empty
+        tail — so ``repaired_call`` is the caller's own map with one value
+        sliced clean. That also makes the recovered-value type coercion a
+        verified no-op here, which is why this class asserts on the trimmed
+        string alone.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['repaired_call'] == {
+            'decision': 'Widen the gate.',
+            'rationale': self.RATIONALE_CLEAN,
+        }
+        assert payload['recovered_params'] == []
+
+    async def test_the_two_pattern_channels_AGREE(self):
+        """``matched_pattern`` and the fact's ``pattern`` are fed differently.
+
+        ``matched_pattern`` comes from ``Repair.pattern``, which falls back to
+        the misclose when no literal is present — so it already reported the
+        self-name closer even while the gate was blind. The fact's ``pattern``
+        is fed DIRECTLY by the boundary scan, so it is the one that goes red
+        today. Asserting both in one place is what pins them together.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert _reject_payload(excinfo)['matched_pattern'] == _closer('rationale')
+        assert len(h.facts) == 1
+        assert h.facts[0]['pattern'] == _closer('rationale')
+
+    async def test_the_emitted_fact_locates_and_classifies_the_leak(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+        assert set(fact) == FACT_KEYS
+        assert fact['fact'] == 'markup_detected'
+        assert fact['tool'] == 'add_design_decision'
+        assert fact['param'] == 'rationale'
+        assert fact['outcome'] == 'rejected'
+        assert fact['pattern'] == _closer('rationale')
+        assert fact['misclose'] == _closer('rationale')
+
+    async def test_the_same_shape_on_add_reuse_item_how(self):
+        """The paired positive control: 129 real specimens have this shape."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.HOW, 'where': 'plan_tools'},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['field'] == 'how'
+        assert payload['misclose'] == _closer('how')
+        assert payload['repaired_call'] == {
+            'what': 'the declared table',
+            'how': self.HOW_CLEAN,
+            'where': 'plan_tools',
+        }
+        assert h.recorder.calls == []
+
+    async def test_a_CROSS_FIELD_misclose_is_the_one_accepted_residual(self):
+        """THE MEASURED RESIDUAL, pinned so it cannot be rediscovered as a bug.
+
+        ``how`` closed with ``what``'s tag — a closer naming a DIFFERENT
+        parameter of the SAME tool. The boundary deliberately passes only
+        ``param`` and does NOT await the tool's schema to widen detection, so
+        this still forwards. That is a decision with a measured basis, not an
+        oversight: 212 of 212 real invisible specimens are self-name and ZERO
+        are cross-field, while widening here would put an awaited ``get_tool``
+        round-trip on the 99.7% CLEAN path of every tool call on the server.
+
+        The two sites that hold their schema for free — plan-tools' declared
+        repairable-field table and the sweep's ``set(working.keys())`` — do
+        pass it, so nothing is given up where it is cheap. This residual is
+        made countable by the sweep's census rather than left invisible.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        cross_field = 'Reuse the declared table directly.' + _closer('what')
+
+        await h.call(
+            'add_reuse_item',
+            {'what': 'the declared table', 'how': cross_field, 'where': 'plan_tools'},
+        )
+
+        assert h.recorder.args == {
+            'tool': 'add_reuse_item',
+            'what': 'the declared table',
+            'how': cross_field,
+            'where': 'plan_tools',
+        }
+        assert h.facts == []
+        assert h.escalations == []
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
+
+    The mechanical half of the authoring-hazard note in the module docstring,
+    promoted here from ``scripts/tests/test_sweep_toolcall_markup.py`` by task
+    **4696** so every file this containment work touches carries the same
+    guard. Computed at runtime from :func:`chr` so the needle itself is not
+    spelled here either — a test that had to write the literal to check for it
+    would be the very hazard it guards.
+    """
+    needle = chr(60) + '/'
+    source = Path(__file__).read_text(encoding='utf-8')
+    assert needle not in source, (
+        'A raw envelope literal was written into this test file. Spell it with '
+        'the \\x3c escape instead — see this module\'s docstring for why.'
+    )

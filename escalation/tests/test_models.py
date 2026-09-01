@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    SEVERITY_RANK,
+    Amendment,
     Escalation,
     EvidenceEntry,
     IndexHealthState,
     TrainState,
+    max_severity,
 )
 
 
@@ -592,12 +599,26 @@ class TestEscalationResolutionClass:
         """RESOLUTION_CLASSES is a frozenset."""
         assert isinstance(RESOLUTION_CLASSES, frozenset)
 
-    def test_resolution_classes_contains_exactly_the_three_legal_values(self):
+    def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject'} — no extras. 'moot-terminal-subject' is the
-        distinct, non-benign stamp the task-2724 revalidation sweep writes."""
-        assert frozenset({'benign', 'actionable', 'moot-terminal-subject'}) == RESOLUTION_CLASSES
+        'moot-terminal-subject', 'stale-strand'} — no extras.
+
+        'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
+        revalidation sweep writes.
+
+        'stale-strand' (task 3172) is the distinguishable, NON-benign stamp the
+        startup restart dismissal (``EscalationQueue.dismiss_all_pending``)
+        writes for a level-0 escalation that had already been pending for
+        ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
+        task-2724 vocabulary rather than forking a second scheme, so a 20h
+        strand and a 90s restart artifact stop reading identically.
+        """
+        assert (
+            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            == RESOLUTION_CLASSES
+        )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES
+        assert 'stale-strand' in RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 
@@ -1253,6 +1274,86 @@ class TestFilingClaimantRunId:
         assert not hasattr(restored, 'not_a_real_field')
 
 
+class TestEscalationAmendments:
+    """`amendments` / `amendments_truncated` — the preserved-incoming-framing fields (task 3997).
+
+    `queue.add_members_to_l2` is the SOLE writer: when a fold carries framing
+    (root_cause / evidence / options / summary) that would otherwise be silently
+    discarded, it is APPENDED here instead.  Pinned by exactly the two properties
+    this repo already pins for train_state / members / granted_files: a verbatim
+    round-trip, and legacy JSON without the keys deserialising to the defaults so
+    no on-disk migration is required.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        """An L2 carrying its own original framing, plus whatever kwargs override."""
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='task_failure',
+            summary='original one-line hypothesis',
+            detail='the ORIGINAL human-facing evidence',
+            root_cause='original root cause',
+            options=['A: rollback', 'B: fix forward'],
+            level=2,
+            **kwargs,
+        )
+
+    def test_amendments_field_roundtrips_and_defaults_empty(self):
+        """Amendments survive to_json/from_json verbatim; legacy JSON defaults to empty."""
+        # --- (a) ROUND-TRIP: the amendment dict and the counter survive verbatim.
+        amendment: Amendment = {
+            'timestamp': '2026-08-11T00:00:00+00:00',
+            'agent_role': 'escalation-watcher-auto',
+            'root_cause': 'rc',
+            'summary': 's',
+            'detail': 'incoming evidence',
+            'options': ['A: x'],
+        }
+        esc = self._seeded(amendments=[amendment], amendments_truncated=2)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.amendments == [amendment], (
+            f'amendment lost or mangled through to_json/from_json: {restored.amendments!r}'
+        )
+        assert restored.amendments_truncated == 2, (
+            f'truncation counter lost: {restored.amendments_truncated!r}'
+        )
+        # The record's OWN framing is a separate thing and is untouched by the
+        # amendment — that separation is the whole point of appending.
+        assert restored.root_cause == 'original root cause'
+        assert restored.detail == 'the ORIGINAL human-facing evidence'
+
+        # --- (b) ZERO MIGRATION: legacy on-disk JSON has neither key.
+        legacy = esc.to_dict()
+        del legacy['amendments']
+        del legacy['amendments_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.amendments == [], (
+            f'legacy record without the key must default to []: {from_legacy.amendments!r}'
+        )
+        assert from_legacy.amendments_truncated == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.amendments_truncated!r}'
+        )
+
+        # --- (c) PER-INSTANCE default: field(default_factory=list), not a shared
+        # mutable default.  Without this, one L2's amendment would appear on every
+        # other default-constructed record in the process.
+        a = self._seeded()
+        b = self._seeded()
+        a.amendments.append(amendment)
+        assert b.amendments == [], (
+            'default amendments list is SHARED between instances — '
+            'a mutable default leaked one record\'s framing onto another'
+        )
+
+
 class TestTimestampIsStampedFromTheLiveClock:
     """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
 
@@ -1289,3 +1390,283 @@ class TestTimestampIsStampedFromTheLiveClock:
         assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
             first.timestamp,
         ), 'Timestamps must be non-decreasing across constructions'
+
+
+class TestSeverityRank:
+    """`escalation.models` owns a COMPLETE, public severity ordering (task 3976).
+
+    The ordering `info < blocking < critical < urgent` is not invented here: it
+    mirrors the repo's only other canonical escalation-severity ranking,
+    `cockpit/src/cockpit/priority.py:257` `_ESCALATION_SEVERITIES` and its
+    `severity_weights` (`:98-115`, urgent 6.0 > critical 5.0 > blocking 2.5 >
+    info 0.25).  Keeping the two traceably one decision is the point — two
+    independent guesses would drift.
+
+    These tests exist because `queue._SEVERITY_RANK` was `{'info': 0,
+    'blocking': 1}`: `critical`/`urgent` both fell to the rank-0 unknown
+    fail-soft, making the fold ORDER-DEPENDENT for them.
+    """
+
+    def test_rank_is_total_over_known_severities(self):
+        """(a) SEVERITY_RANK covers exactly KNOWN_SEVERITIES — no gaps, no extras.
+
+        A severity added to the vocabulary without a rank must be a loud test
+        failure, not a silent rank-0 that reads as info-level.
+        """
+        assert set(SEVERITY_RANK) == set(KNOWN_SEVERITIES), (
+            f'SEVERITY_RANK keys {sorted(SEVERITY_RANK)} != '
+            f'KNOWN_SEVERITIES {sorted(KNOWN_SEVERITIES)}'
+        )
+
+    def test_ordering_is_info_blocking_critical_urgent(self):
+        """(b) Ranks ascend info < blocking < critical < urgent."""
+        assert (
+            SEVERITY_RANK['info']
+            < SEVERITY_RANK['blocking']
+            < SEVERITY_RANK['critical']
+            < SEVERITY_RANK['urgent']
+        ), f'Unexpected ordering: {SEVERITY_RANK}'
+
+    def test_born_at_l2_severities_all_outrank_blocking(self):
+        """(b) Every born-at-L2 severity outranks 'blocking'."""
+        for sev in BORN_AT_L2_SEVERITIES:
+            assert SEVERITY_RANK[sev] > SEVERITY_RANK['blocking'], (
+                f'{sev!r} (born-at-L2) must outrank blocking; got {SEVERITY_RANK}'
+            )
+
+    @pytest.mark.parametrize(
+        ('a', 'b', 'expected'),
+        [
+            ('info', 'blocking', 'blocking'),
+            ('info', 'critical', 'critical'),
+            ('info', 'urgent', 'urgent'),
+            ('blocking', 'critical', 'critical'),
+            ('blocking', 'urgent', 'urgent'),
+            ('critical', 'urgent', 'urgent'),
+        ],
+    )
+    def test_max_severity_returns_higher_urgency(self, a: str, b: str, expected: str):
+        """(c) max_severity returns the higher-urgency of the two."""
+        assert max_severity(a, b) == expected
+        assert max_severity(b, a) == expected
+
+    @pytest.mark.parametrize('a', sorted(KNOWN_SEVERITIES))
+    @pytest.mark.parametrize('b', sorted(KNOWN_SEVERITIES))
+    def test_max_severity_is_order_independent(self, a: str, b: str):
+        """(c) max_severity(x, y) == max_severity(y, x) over every known pair."""
+        assert max_severity(a, b) == max_severity(b, a), (
+            f'Order-dependent fold: max_severity({a!r}, {b!r}) != '
+            f'max_severity({b!r}, {a!r})'
+        )
+
+    def test_info_vs_critical_regression(self):
+        """(c) Explicit regression for the live bug in queue._SEVERITY_RANK.
+
+        `queue._max_severity('info', 'critical')` returned `'info'` — both
+        arguments fell to rank 0 and the `>=` tie-break handed the win to `a`.
+        """
+        assert max_severity('info', 'critical') == 'critical'
+        assert max_severity('critical', 'info') == 'critical'
+
+    def test_unknown_severity_fails_soft_to_rank_zero(self, caplog):
+        """(d) An unknown severity is treated as rank 0 and WARNs — never raises."""
+        with caplog.at_level(logging.WARNING, logger='escalation.models'):
+            result = max_severity('warn', 'blocking')
+
+        assert result == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_unknown_vs_unknown_is_deterministic(self):
+        """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
+        assert max_severity('warn', 'wat') == 'warn'
+        assert max_severity('wat', 'warn') == 'wat'
+
+
+class TestEscalationRootCauseVariants:
+    """`root_cause_variants` / `root_cause_variants_truncated` — over-fold evidence (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold, so its failure
+    mode is OVER-folding: distinct causes silently merged under one canonical
+    key.  These fields are that failure's only observable signature — the
+    DISTINCT pre-canonical spellings an L2 has been addressed by.
+    `queue.add_members_to_l2` is the SOLE writer and sole trimmer, exactly as for
+    `amendments`, whose shape they mirror one-for-one.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='original one-line hypothesis',
+            root_cause='Watcher lease stolen.',
+            level=2,
+            **kwargs,
+        )
+
+    def test_variant_fields_default_empty_and_zero(self):
+        """(a) An L2 minted today carries no variants and no truncation."""
+        esc = self._seeded()
+
+        assert esc.root_cause_variants == [], (
+            f'expected an empty variant list, got {esc.root_cause_variants!r}'
+        )
+        assert esc.root_cause_variants_truncated == 0, (
+            f'expected 0, got {esc.root_cause_variants_truncated!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(b) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every L2 already on disk predates these fields, so a payload missing both
+        keys must hydrate to the defaults rather than raising.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['root_cause_variants']
+        del legacy['root_cause_variants_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.root_cause_variants == [], (
+            f'legacy record must default to []: {from_legacy.root_cause_variants!r}'
+        )
+        assert from_legacy.root_cause_variants_truncated == 0, (
+            f'legacy record must default to 0: {from_legacy.root_cause_variants_truncated!r}'
+        )
+
+    def test_variants_roundtrip_verbatim(self):
+        """(c) Both fields survive to_json -> from_json unchanged.
+
+        The TRUE distinct count is `len(root_cause_variants) +
+        root_cause_variants_truncated`, so the counter is as load-bearing as the
+        list — losing it would make the loss at the cap log-only (INV-8).
+        """
+        variants = ['Watcher lease stolen.', 'watcher  lease STOLEN', 'WATCHER-LEASE-STOLEN']
+        esc = self._seeded(root_cause_variants=variants, root_cause_variants_truncated=4)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.root_cause_variants == variants, (
+            f'variant spellings lost or reordered: {restored.root_cause_variants!r}'
+        )
+        assert restored.root_cause_variants_truncated == 4, (
+            f'truncation counter lost: {restored.root_cause_variants_truncated!r}'
+        )
+        assert len(restored.root_cause_variants) + restored.root_cause_variants_truncated == 7
+
+    def test_default_variant_list_is_not_shared_between_instances(self):
+        """The default_factory guard — a shared mutable default would cross-link records."""
+        a = self._seeded()
+        b = self._seeded()
+
+        a.root_cause_variants.append('a spelling')
+
+        assert b.root_cause_variants == [], (
+            'default root_cause_variants list is SHARED between instances — '
+            f'b saw {b.root_cause_variants!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded().to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.root_cause_variants == []
+
+
+class TestCitationShaAndRefileSuppressionFields:
+    """`citation_sha` / `refiles_suppressed` — the auto-dismiss triple (task 4499).
+
+    `citation_sha` is the evidence commit whose landing a
+    `provenance_unattributed` filing could not attribute.  Stamped at FILING
+    time, it survives onto the RESOLUTION, where it becomes the identity half
+    of the `(task_id, category, citation_sha)` triple that suppresses an
+    identical refile — closing the close-then-refile ping-pong an absorbing
+    reject condition otherwise drives forever.  `refiles_suppressed` is that
+    suppression's INV-4 storm counter: how many identical refiles this
+    record's resolution has absorbed, kept as a durable structured fact rather
+    than log-only (INV-2).
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-4499-1',
+            task_id='4499',
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='provenance_unattributed',
+            summary='landing evidence could not be attributed',
+            level=1,
+            **kwargs,
+        )
+
+    def test_citation_and_suppression_fields_default_to_none_and_zero(self):
+        """(a) A record minted today carries no citation and no absorbed refiles."""
+        esc = self._seeded()
+
+        assert esc.citation_sha is None, (
+            f'expected no citation identity, got {esc.citation_sha!r}'
+        )
+        assert esc.refiles_suppressed == 0, (
+            f'expected 0, got {esc.refiles_suppressed!r}'
+        )
+
+    def test_citation_and_counter_roundtrip_verbatim(self):
+        """(b) Both fields survive to_json -> from_json unchanged.
+
+        The suppression decision is made by re-reading the PERSISTED record, so
+        a field that did not round-trip would silently never suppress.
+        """
+        esc = self._seeded(citation_sha='b' * 40, refiles_suppressed=3)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.citation_sha == 'b' * 40, (
+            f'citation identity lost: {restored.citation_sha!r}'
+        )
+        assert restored.refiles_suppressed == 3, (
+            f'storm counter lost: {restored.refiles_suppressed!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(c) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every archived provenance record already on disk predates these fields,
+        so a payload missing both keys must hydrate to the defaults rather than
+        raising.  Those legacy records are exactly what the suppression lookup
+        scans, so a hydration failure here would break the reject path.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['citation_sha']
+        del legacy['refiles_suppressed']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.citation_sha is None, (
+            f'legacy record must default to None: {from_legacy.citation_sha!r}'
+        )
+        assert from_legacy.refiles_suppressed == 0, (
+            f'legacy record must default to 0: {from_legacy.refiles_suppressed!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded(citation_sha='b' * 40).to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.citation_sha == 'b' * 40

@@ -66,7 +66,7 @@ wc -l <suspect files> | sort -rn
 
 2. **Per-file fix ratio** for the top-churn files (fix-commits touching file ÷ total commits touching file) — this separates "hot because bugs" from "hot because active feature work".
 
-3. **Probe the task tracker** (source per overlay; e.g. `.taskmaster/tasks/tasks.json` structure, count, field names) so the mine:tasks prompt can state the exact shape.
+3. **Probe the task tracker** (source per overlay; e.g. a taskmaster SQLite db at `.taskmaster/tasks/tasks.db` — table/column names, row count) so the mine:tasks prompt can state the exact shape. Probe it, don't assume: the shape has changed before (dark-factory's `tasks.json` was superseded by SQLite and later deleted), so a path that appears in an older doc may be stale or absent.
 
 4. **Search memory for known bug classes**: `search(query="recurring bugs, incidents, fix batches", project_id=<overlay>)` plus your own session memory. This becomes per-cluster "known context" — *leads to verify, not gospel*.
 

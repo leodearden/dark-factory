@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import logging
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from escalation import archive
 from escalation.models import Escalation
-from escalation.queue import escalation_id_lock
+from escalation.queue import SEQ_COUNTER_SUFFIX, escalation_id_lock
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,23 @@ def _build_archive_index(archive_root: Path) -> dict[str, Path]:
             )
         index[p.stem] = p
     return index
+
+
+def _archive_stems(archive_root: Path) -> set[str]:
+    """Return the set of escalation ids that have a record anywhere under archive_root.
+
+    A stems-only sibling of :func:`_build_archive_index` for callers that need
+    mere PRESENCE rather than paths.  Two things it deliberately does not do:
+
+    * allocate a ``Path`` value per archived record, and
+    * re-emit ``_build_archive_index``'s duplicate-id WARNING — ``sweep()`` has
+      already logged it once for the operator earlier in the same startup, and a
+      second copy per multi-dated duplicate is pure noise for a caller that does
+      not care which path won.
+    """
+    if not archive_root.exists():
+        return set()
+    return {p.stem for p in archive_root.rglob('esc-*.json')}
 
 
 def _atomic_move(src: Path, dst: Path) -> None:
@@ -240,6 +258,9 @@ class StartupSweepReport:
     sweep: SweepReport
     loose_reaped: int = 0
     pruned_dirs: int = 0
+    # Sidecar locks unlinked by pass 4.  Under apply=False this is a LOWER
+    # BOUND rather than a projection; see run_startup_sweep's ``apply`` arg.
+    orphan_locks_reaped: int = 0
 
 
 def run_startup_sweep(
@@ -249,43 +270,66 @@ def run_startup_sweep(
     apply: bool = True,
     now: datetime | None = None,
 ) -> StartupSweepReport:
-    """Orchestrate sweep + loose-reap + prune at escalation server start.
+    """Orchestrate sweep + loose-reap + prune + lock-reap at escalation server start.
 
-    Runs three passes in sequence:
+    Runs four passes in sequence:
       1. sweep(queue_dir, apply=apply)       — root→archive relocation
       2. reap_loose_archive_files(…)         — archive top-level→dated subdir
       3. archive.prune_archive(…)            — drop subdirs beyond retention
+      4. reap_orphan_locks(…)                — unlink sidecar locks whose record
+                                               is in neither tier
+
+    Pass 4 runs LAST on purpose: when APPLYING, records dropped by retention in
+    pass 3 are dead ids by the time it looks, so their sidecars are reaped in the
+    SAME run rather than lingering until the next restart.  That coupling is what
+    makes ``apply=False`` under-report — see the ``apply`` arg.
 
     Logs one INFO summary line on the ``escalation.sweep`` logger.
 
     Args:
         queue_dir: Root queue directory.
         retention_days: Retention threshold forwarded to prune_archive.
-        apply: If False, dry-run all three passes (no disk mutations).
+        apply: If False, dry-run all four passes (no disk mutations).
+            CAVEAT — in dry-run ``orphan_locks_reaped`` is a LOWER BOUND, not a
+            projection.  Pass 3 is skipped entirely (``archive.prune_archive``
+            has no dry-run mode to forward ``apply`` to, and giving it one is out
+            of this pass's scope), so the archive records an applying run would
+            have evicted are still on disk when pass 4 takes its snapshot, and
+            their sidecars are counted as KEEPS.  Passes 1 and 2 do not skew the
+            count — they only move a record between two tiers pass 4 treats
+            alike.  So an applying run reaps at least what the preceding dry-run
+            promised and possibly more; it never reaps fewer.
         now: Reference datetime for prune_archive cutoff (defaults to live UTC).
 
     Returns:
-        StartupSweepReport with nested SweepReport plus loose_reaped and pruned_dirs.
+        StartupSweepReport with nested SweepReport plus loose_reaped, pruned_dirs
+        and orphan_locks_reaped.
     """
     queue_dir = Path(queue_dir)
     sweep_report = sweep(queue_dir, apply=apply)
     loose_reaped = reap_loose_archive_files(queue_dir, apply=apply)
     pruned_dirs = archive.prune_archive(queue_dir, retention_days, now=now) if apply else 0
+    # AFTER prune: a record evicted by retention just above is a dead id now, so
+    # its sidecar goes in this run.  It also means the archive index this pass
+    # builds is post-prune and cannot mistake an evicted record for a live one.
+    orphan_locks_reaped = reap_orphan_locks(queue_dir, apply=apply)
 
     report = StartupSweepReport(
         sweep=sweep_report,
         loose_reaped=loose_reaped,
         pruned_dirs=pruned_dirs,
+        orphan_locks_reaped=orphan_locks_reaped,
     )
     logger.info(
         'Startup sweep %s: archived=%d reconciled(root=%d archive=%d) '
-        'loose_reaped=%d pruned_dirs=%d pending=%d skipped=%d; root: %d → %d',
+        'loose_reaped=%d pruned_dirs=%d orphan_locks=%d pending=%d skipped=%d; root: %d → %d',
         'APPLIED' if apply else 'DRY-RUN',
         sweep_report.archived,
         sweep_report.reconciled_root_wins,
         sweep_report.reconciled_archive_wins,
         loose_reaped,
         pruned_dirs,
+        orphan_locks_reaped,
         sweep_report.untouched_pending,
         sweep_report.skipped_unparsable,
         sweep_report.root_before,
@@ -357,6 +401,142 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
             moved += 1
 
     return moved
+
+
+def reap_orphan_locks(queue_dir: Path, *, apply: bool = True) -> int:
+    """Unlink queue-root sidecar locks whose escalation record no longer exists.
+
+    ``escalation_id_lock`` creates a stable ``{escalation_id}.json.lock`` sidecar
+    on first use and never renames it (task 1609's stable-inode contract).  The
+    sidecar therefore outlives its record: once a record is pruned by archive
+    retention — or was never submitted after its id was minted — the lock file
+    is left behind forever and the queue root accumulates them.
+
+    Sidecars for ``esc-{task_id}.seq`` counters are never candidates at all; see
+    the ``SEQ_COUNTER_SUFFIX`` guard on the candidate list.
+
+    A sidecar is an ORPHAN when its record is absent from BOTH tiers — the queue
+    root AND the archive — in which case no writer can ever take that lock again
+    and unlinking it is safe.  An archived record still counts as live: it is
+    readable via ``get()``/``get_by_task`` and its resolve/dismiss paths still
+    take the sidecar lock.  Every unlink is serialized on the very lock being
+    removed, so a concurrent queue writer that already holds it is never cut in
+    on.
+
+    The archive index is a SNAPSHOT taken when this pass runs — which, inside
+    ``run_startup_sweep``, is after ``archive.prune_archive``, so records dropped
+    by retention in the same run have their sidecars reaped in that run.  The
+    residual: a resolve that archives a record between the snapshot and the
+    unlink could have its (now live) sidecar reaped.  The cost is bounded to a
+    re-created sidecar — the next ``escalation_id_lock`` O_CREATs it — and a
+    momentary exclusion gap for that one id.  Closing it would cost one archive
+    rglob per candidate (thousands of candidates x thousands of archived files
+    on the first run), which is not worth paying for a window this narrow.
+
+    Deliberately silent per KEPT sidecar: the common case is thousands of
+    legitimate keeps, and the aggregate is already on the startup INFO line.
+
+    Args:
+        queue_dir: Root queue directory (the only place sidecars are created).
+        apply: If True (default), actually unlink.  If False, only count how many
+               would be unlinked (dry-run — mutates nothing).
+
+    Returns:
+        Number of sidecars unlinked (or would-unlink when apply=False).
+    """
+    queue_dir = Path(queue_dir)
+
+    # The `esc-` prefix is an explicit ALLOW-LIST, not a convenience: it is the
+    # D6 hard invariant (pinned by TestD6GlobInvariant) applied to this pass.
+    # Only escalation record ids and `esc-{task_id}.seq` counter ids ever take
+    # escalation_id_lock, so nothing outside the esc- namespace can be a sidecar
+    # this pass owns — any other `.json.lock` in the root belongs to a different
+    # subsystem and is none of our business, record or no record.
+    #
+    # Materialize the glob before iterating so the directory scan completes
+    # before any unlink occurs — mutating a directory during os.scandir/readdir
+    # has unspecified behaviour on some filesystems and can cause subsequent
+    # sibling entries to be skipped (mirrors reap_loose_archive_files()).
+    #
+    # A make_id sequence counter has NO .json record by construction, so it
+    # would look orphaned forever; filtering it out HERE (rather than inside the
+    # loop) also keeps it out of the emptiness check below.  Deleting a counter
+    # or its sidecar forces make_id down _recover_seq_from_disk — a
+    # correctness-relevant repair path, not merely a slow one: it derives from
+    # SUBMITTED records only and so can rewind the counter below an id already
+    # minted but not yet filed.
+    candidates = [
+        path for path in queue_dir.glob('esc-*.json.lock')
+        # Sliced, not Path.stem: `.stem` strips only `.lock`, leaving `esc-1-1.json`.
+        if not path.name[: -len('.json.lock')].endswith(SEQ_COUNTER_SUFFIX)
+    ]
+    if not candidates:
+        # Steady state once the backlog is drained: nothing to judge, so skip the
+        # archive walk entirely.  It is the most expensive thing this pass does
+        # (a full rglob over the largest tree in the queue dir) and it is the
+        # SECOND such walk in a run_startup_sweep, after sweep()'s own.
+        return 0
+
+    # One pass over the archive tier for the whole run.  Presence is all this
+    # pass needs, so it uses the stems-only helper rather than
+    # _build_archive_index, which would allocate a discarded Path per archived
+    # record and re-log every duplicate-id warning sweep() already emitted.
+    archived_stems = _archive_stems(queue_dir / archive.ARCHIVE_SUBDIR)
+
+    reaped = 0
+    for path in candidates:
+        stem = path.name[: -len('.json.lock')]
+        record_path = queue_dir / f'{stem}.json'
+
+        if stem in archived_stems:
+            continue
+
+        if record_path.exists():
+            continue
+
+        if not apply:
+            # Dry-run: report the would-reap count without touching disk, the
+            # same apply=False contract sweep() and reap_loose_archive_files()
+            # honour.
+            reaped += 1
+            continue
+
+        # The OSError guard wraps the WHOLE critical section, not just the
+        # unlink: on a sidecar the reaper cannot open (root-owned, EIO, a full
+        # inode table) the raise comes out of escalation_id_lock's own
+        # os.open(O_CREAT|O_RDWR), never out of os.unlink — which needs write
+        # permission on the DIRECTORY and so would fail on every candidate or
+        # none.  Letting either escape would abort the pass for the remaining
+        # thousands AND take run_startup_sweep down before it builds its report,
+        # costing the operator the INFO summary of passes 1-3 that already
+        # succeeded (server.py wraps the call in a non-fatal try/except, so all
+        # they would see is a generic WARNING).
+        try:
+            # Unlink INSIDE the critical section so the flock is released on the
+            # already-unlinked inode and the context manager never re-creates the
+            # file on its way out.
+            with escalation_id_lock(queue_dir, stem):
+                # Re-check inside the lock to close the TOCTOU window: a
+                # concurrent writer could have created the record between our
+                # pre-check and acquiring the lock — mid-submit, holding this
+                # very sidecar first.
+                if record_path.exists():
+                    continue
+                # Another reaper or process removing it first IS the intended
+                # end state, so suppress and fall through to COUNT it rather
+                # than pretend the sidecar is still there.  Suppression is
+                # scoped to the unlink on purpose: a FileNotFoundError out of
+                # the lock acquisition instead means the queue dir itself went
+                # away — a failure to report, not a reap to count.
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+        except OSError as e:
+            # Not counted: nothing was removed.
+            logger.warning('reap_orphan_locks: could not reap %s: %s', path.name, e)
+            continue
+        reaped += 1
+
+    return reaped
 
 
 def main(argv: list[str] | None = None) -> int:

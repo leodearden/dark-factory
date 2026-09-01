@@ -209,8 +209,10 @@ def _make_req(
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The real orchestrator/orchestrator.yaml pytest test_command (uv `--directory`
-# form) — drives the scenario-1b producer<->runner scoped drive. NOT used for
+# The orchestrator/orchestrator.yaml pytest test_command in its pre-task-3830
+# PAIRED spelling (the live config now carries `--directory orchestrator`
+# alone; the pairing is kept here because uv still accepts it and this drives
+# the parser's both-flags path) (uv `--directory` form) — drives the scenario-1b producer<->runner scoped drive. NOT used for
 # the strict round-trip assertion in scenario 1a: render() normalises a
 # `--directory` flag into a leading `cd <dir> &&`, which is argv-equivalent in
 # *effect* but not shlex-list-equal to the original (one extra `&&` token) —

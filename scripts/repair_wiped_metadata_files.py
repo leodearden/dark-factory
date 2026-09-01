@@ -479,13 +479,16 @@ async def repair_one(
 
     Mode is ``metadata_mode='merge'`` — a SHALLOW merge that leaves every key
     this payload does not name untouched. Emphatically NOT ``'replace'``: that
-    is the exact primitive behind the wipe class being repaired
-    (``_execute_combine``, task_interceptor.py:1850, writes a 3-key blob in
-    replace mode; ``_merge_metadata``, sqlite_task_backend.py:3301, returns
+    was the exact primitive behind the wipe class this script repairs
+    (``_execute_combine``, task_interceptor.py, used to write a 3-key blob in
+    replace mode; ``_merge_metadata``, sqlite_task_backend.py, returns
     ``incoming`` verbatim for that mode, deleting ``files``, ``spawned_from``,
-    ``source``, ``branch_base_sha`` and the rest). A repair must not use the
-    wiper's own primitive. Merge additionally raises loudly on a corrupt stored
-    blob instead of clobbering it.
+    ``source``, ``branch_base_sha`` and the rest). Task 3446 closed that hole
+    by switching ``_execute_combine`` to ``metadata_mode='merge'``, but this
+    script's own refusal to use ``'replace'`` remains correct regardless — it
+    is the wiper's own primitive and a repair must never use it. Merge
+    additionally raises loudly on a corrupt stored blob instead of clobbering
+    it.
 
     ERRORS ARE RETURNED, NOT RAISED. ``candidate_key`` is recomputed from
     (title, files) on every metadata-touching update, so backfilling ``files``
@@ -1013,6 +1016,16 @@ CLIENT_NAME = "repair-wiped-metadata-files-3329"
 # docstring and the returns can never drift into disagreeing about what a
 # number means. Each one denotes EXACTLY ONE outcome — that is the whole
 # reason 3 and 4 exist rather than being folded into 1.
+#
+# A DELIBERATE THIRD COPY of _task_db_scan.py's Tier-3 AUDIT_EXIT_* ladder, not
+# an un-deduplicated leftover: task 3817 decided this script does NOT adopt that
+# tier's run_audit_cli. Rationale: _task_db_scan.py's module docstring. Guard:
+# tests/scripts/test_repair_wiped_metadata_files.py.
+#
+# The one part a reader of THIS file needs before touching these constants:
+# 0-3 are numerically identical to Tier 3's codes, but 1 means "a write was
+# attempted and REJECTED" here versus "the read-only sweep found findings"
+# there, and 4 is this script's own extension with no Tier-3 counterpart.
 EXIT_OK = 0                    # ran; nothing failed to write
 EXIT_WRITE_FAILED = 1          # at least one candidate FAILED to write
 EXIT_NO_ROOT = 2               # no project root resolved to a readable tasks.db

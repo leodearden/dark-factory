@@ -26,6 +26,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
+    auth_failure_reason,
     classify_invocation,
 )
 
@@ -56,6 +57,23 @@ class TestInvocationOutcomeSumType:
         outcome = AuthFailed(status=401)
         assert isinstance(outcome, InvocationOutcome)
         assert outcome.status == 401
+
+    def test_auth_failed_round_trips_body(self):
+        body = '{"type":"error","error":{"type":"authentication_error"}}'
+        outcome = AuthFailed(status=401, body=body)
+        assert outcome.status == 401
+        assert outcome.body == body
+
+    def test_auth_failed_body_defaults_to_empty(self):
+        # The field MUST default so the ~10 existing bare AuthFailed(status=...)
+        # construction sites across test_invocation_outcome.py, test_cap_retry.py
+        # and test_api_health.py keep constructing.
+        assert AuthFailed(status=401).body == ''
+
+    def test_auth_failed_body_participates_in_equality(self):
+        # Pins that the frozen-dataclass value semantics extend to the new field.
+        assert AuthFailed(status=401, body='a') != AuthFailed(status=401, body='b')
+        assert AuthFailed(status=401, body='a') == AuthFailed(status=401, body='a')
 
     def test_cli_local_error_round_trips_marker(self):
         outcome = CliLocalError(marker='is already in use')
@@ -111,6 +129,29 @@ class TestInvocationOutcomeSumType:
         assert CapHit(resets_at=None, reason='r') != NearCap(reason='r')
         assert OK() != ZeroOutputWedge()
         assert AuthFailed(status=401) != AuthFailed(status=403)
+
+
+class TestAuthFailureReason:
+    """The reason string handed to UsageGate._handle_auth_failure.
+
+    Single-sourced on purpose: production ``usage_gate.InvokeSlot.report`` and
+    the shipped mock-gate mirror ``shared.testing.make_gate_mock`` both render
+    it, and their docstrings require them to stay byte-for-byte in step.
+    """
+
+    def test_renders_status_and_body(self):
+        # Matches the pre-refactor f'HTTP {status}: {output[:120]}' shape.
+        outcome = AuthFailed(status=401, body='OAuth token has been revoked')
+        assert auth_failure_reason(outcome) == 'HTTP 401: OAuth token has been revoked'
+
+    def test_renders_bare_status_when_body_empty(self):
+        # Backward-compatibility pin: EXACTLY the string produced today, with no
+        # trailing ': '. An empty body must leave the persisted reason and the
+        # `Account X AUTH-FAILED: ...` log line byte-identical to current behaviour.
+        assert auth_failure_reason(AuthFailed(status=403)) == 'HTTP 403'
+
+    def test_is_exported(self):
+        assert 'auth_failure_reason' in invocation_outcome_module.__all__
 
 
 class TestParseResetsAt:
@@ -288,7 +329,9 @@ class TestClassifyInvocationAuthFailedPrecedence:
             api_error_status=401,
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body="You've hit your usage limit. Your plan resets in 3h."
+        )
 
     def test_429_with_cap_text_is_cap_hit_not_auth_failed(self):
         """429 is deliberately excluded from AuthFailed — it carries a real cap body."""
@@ -306,6 +349,204 @@ class TestClassifyInvocationAuthFailedPrecedence:
         outcome = classify_invocation(result, strict_confirm=True)
         assert not isinstance(outcome, AuthFailed)
         assert isinstance(outcome, Failure)
+
+    def test_401_captures_output_body(self):
+        body = (
+            '{"type":"error","error":{"type":"authentication_error",'
+            '"message":"OAuth token has been revoked"}}'
+        )
+        assert len(body) <= 120  # guards the assertion below against truncation
+        result = AgentResult(success=False, output=body, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == body
+
+    def test_403_captures_output_body(self):
+        body = (
+            '{"type":"error","error":{"type":"permission_error",'
+            '"message":"Org policy blocks this model"}}'
+        )
+        assert len(body) <= 120
+        result = AgentResult(success=False, output=body, api_error_status=403)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == body
+
+    def test_body_falls_back_to_stderr_when_output_empty(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=401,
+            stderr='Error: invalid bearer token',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: invalid bearer token'
+
+    def test_output_wins_over_stderr_when_both_present(self):
+        result = AgentResult(
+            success=False,
+            output='invalid x-api-key',
+            api_error_status=401,
+            stderr='Error: invalid bearer token',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'invalid x-api-key'
+
+    def test_body_truncated_to_120_chars(self):
+        result = AgentResult(success=False, output='x' * 500, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert len(outcome.body) == 120
+        assert outcome.body == 'x' * 120
+
+    def test_body_is_empty_when_no_text_available(self):
+        # This is what keeps the bare-equality assertions above valid.
+        result = AgentResult(success=False, output='', api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == ''
+        assert outcome == AuthFailed(status=401)
+
+    def test_body_is_stripped(self):
+        # No leading/trailing whitespace may leak into the AUTH-FAILED WARNING
+        # log line, the `paused_reason` dashboard cell, or the persisted
+        # cost-event reason.
+        result = AgentResult(success=False, output='\n  Unauthorized  \n', api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Unauthorized'
+
+    def test_body_collapses_internal_newlines_to_one_line(self):
+        # The INTERNAL case, which end-stripping alone does not cover: the
+        # stderr fallback stream is commonly multi-line, and the reason string
+        # is emitted as ONE `Account X AUTH-FAILED: {reason}` WARNING record
+        # and stored as one JSON string in the auth_failed cost event.
+        result = AgentResult(
+            success=False,
+            output='Error:\nunauthorized\nrun /login',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: unauthorized run /login'
+        assert '\n' not in outcome.body
+        assert '\n' not in auth_failure_reason(outcome)
+
+    def test_body_collapses_indentation_runs(self):
+        # Collapsing spends the 120-char budget on content, not indentation.
+        result = AgentResult(
+            success=False,
+            output='401 Unauthorized\n    at Object.<anonymous>\n\tat Module._compile',
+            api_error_status=403,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == '401 Unauthorized at Object.<anonymous> at Module._compile'
+
+    def test_multiline_stderr_fallback_is_also_collapsed(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=401,
+            stderr='Error: invalid token\n  Please run /login\n',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: invalid token Please run /login'
+
+
+class TestClassifyInvocationAuthFailedBodyIsScrubbed:
+    """A 401/403 body snippet must not park credential material on a durable surface.
+
+    The snippet is no longer log-only: `_handle_auth_failure` persists it into
+    the `auth_failed` cost-event JSON and surfaces it through
+    `gate.paused_reason` to the dashboard. If a backend CLI ever echoes key
+    material in its 401/403 stderr/output, it lands there verbatim unless it is
+    masked at the classifier — the only chokepoint every AuthFailed body flows
+    through.
+    """
+
+    def test_api_key_is_masked(self):
+        result = AgentResult(
+            success=False,
+            output='invalid x-api-key: sk-ant-api03-AbCdEf1234567890xyz',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-ant-api03' not in outcome.body
+        assert 'AbCdEf1234567890xyz' not in outcome.body
+        assert outcome.body == 'invalid x-api-key: [REDACTED]'
+
+    def test_oauth_token_is_masked_in_stderr_fallback(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=403,
+            stderr='Error: token sk-ant-oat01-ZZZ_zzz-9999999999 was revoked',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-ant-oat01' not in outcome.body
+        assert outcome.body == 'Error: token [REDACTED] was revoked'
+
+    def test_bearer_header_dump_is_masked_but_labelled(self):
+        result = AgentResult(
+            success=False,
+            output='401: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' not in outcome.body
+        # The label survives so an operator can see WHICH field was masked.
+        assert outcome.body == '401: Authorization: Bearer [REDACTED]'
+
+    def test_scrub_survives_the_reason_string(self):
+        # The end-to-end surface that actually gets persisted/logged.
+        result = AgentResult(
+            success=False,
+            output='auth failed for key sk-proj-0123456789abcdefghij',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert auth_failure_reason(outcome) == 'HTTP 401: auth failed for key [REDACTED]'
+
+    def test_scrub_runs_before_truncation(self):
+        # The key straddles the 120-char edge such that truncate-FIRST would
+        # slice it to `sk-ant-a` — below the {12,} match floor — so a scrub
+        # applied afterwards would no longer recognise it and the prefix would
+        # leak. Scrub-first masks the whole key before the cut.
+        key = 'sk-ant-api03-' + 'K' * 60
+        raw = 'x' * 110 + ' ' + key
+        assert 'sk-ant-a' in raw[:120]  # what truncate-first would have kept
+        result = AgentResult(success=False, output=raw, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-' not in outcome.body
+        # 110 + 1 + len('[REDACTED]') == 121, so the closing bracket is what
+        # falls off the 120-char edge here — harmless, unlike a key prefix.
+        assert outcome.body == ('x' * 110 + ' [REDACTED]')[:120]
+        assert len(outcome.body) == 120
+
+    def test_ordinary_diagnostic_prose_is_not_over_masked(self):
+        # The scrub is deliberately narrow: it must not eat the words that make
+        # the snippet worth capturing in the first place. `risk-assessment...`
+        # is the lookbehind's regression case; `bearer token` is the {16,}
+        # floor's.
+        for text in (
+            'Error: invalid bearer token',
+            'invalid x-api-key',
+            'org policy risk-assessment-failure blocks this model',
+            'authentication_error: OAuth token has been revoked',
+        ):
+            result = AgentResult(success=False, output=text, api_error_status=401)
+            outcome = classify_invocation(result, strict_confirm=True)
+            assert isinstance(outcome, AuthFailed)
+            assert outcome.body == text, f'over-masked: {text!r} -> {outcome.body!r}'
 
 
 class TestClassifyInvocationCliLocalError:
@@ -345,6 +586,50 @@ class TestClassifyInvocationCliLocalError:
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == CliLocalError(marker='permission denied')
 
+    def test_unresolvable_resume_session_is_cli_local_error(self):
+        """A `--resume` the CLI cannot resolve is a LOCAL error, never a cap.
+
+        The CLI resolves the session id against the on-disk transcript store and
+        exits BEFORE contacting the API, so a usage cap can never be the cause.
+        Its shape — zero cost, one turn, sub-5s — is exactly the shape
+        ``invoke_with_cap_retry``'s heuristic safety net reads as "a cap hit with
+        an unrecognised message format", so without a POSITIVE non-cap
+        attribution here a HEALTHY account gets marked CAPPED.
+
+        This is LATENT-FRAGILITY hardening with ZERO live occurrences, not an
+        active incident: real resume failures currently exceed the net's 5000 ms
+        floor. It is the same class as the reify-3604 ``CliLocalError`` escape
+        and the 2026-07-29 ``ServerError`` escape — a third instance.
+
+        The string and its STDERR placement were measured against Claude Code
+        CLI 2.1.236 on 2026-08-19, not guessed.
+        """
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='no conversation found with session id')
+
+    def test_unresolvable_resume_session_match_is_case_insensitive(self):
+        """The table is matched against ``combined.lower()``, so an upper-cased
+        variant must classify identically — the CLI's exact casing is not a
+        thing this escape may depend on."""
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'NO CONVERSATION FOUND WITH SESSION ID: '
+                '4AED993B-20C0-4B91-A8DD-60180E7DB2E0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CliLocalError)
+
     def test_marker_in_output_not_just_stderr(self):
         result = AgentResult(success=False, output='unrecognized arguments: --foo', stderr='')
         outcome = classify_invocation(result, strict_confirm=True)
@@ -374,7 +659,9 @@ class TestClassifyInvocationCliLocalError:
             stderr='Error: Session ID abc-123 is already in use.',
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body='Error: Session ID abc-123 is already in use.'
+        )
 
     def test_success_true_outranks_incidental_cli_marker_text(self):
         """A successful invocation is authoritative even when its own output

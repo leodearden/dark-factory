@@ -14,6 +14,10 @@ caught there.
 No product code (alpha/beta/gamma/delta) is modified — all four are already
 merged and green; this is a pure characterization/integration suite (every
 test passes on arrival).
+
+Exception: ``test_b6_online_per_task_read_failure_yields_none_started`` was
+added later by task 4055 and, unlike the original arrival-green suite, arrived
+RED — it drove a one-line data-side fix in ``_minutes_since``.
 """
 
 from __future__ import annotations
@@ -48,12 +52,36 @@ def _shape_task(task_id: int, title: str, status: str) -> dict:
 
 
 def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
-    """Monkeypatch fetch_tasks to return a fixed dashboard-shaped task list."""
+    """Monkeypatch fetch_tasks (and its compact map) to a fixed shaped task list.
 
-    async def _fake_fetch_tasks(client, config, project_root):
-        return list(tasks)
+    ``_shape_one_project`` narrows its fetch server-side and reads its counts
+    from ``fetch_statuses`` (task 3857), so the fake honours ``statuses`` /
+    ``page_size`` / ``offset`` — emulating the substrate's row filter and
+    ascending-id slice — and derives the compact map from the same list.
+    Ignoring the narrowing would hand the whole list to both fetch calls and
+    duplicate every row; leaving ``fetch_statuses`` unpatched would reach for
+    the network.
+    """
+
+    async def _fake_fetch_tasks(
+        client, config, project_root, *,
+        statuses=None, page_size=None, offset=0, timeout=None,
+    ):
+        rows = list(tasks)
+        if statuses is not None:
+            rows = [r for r in rows if r.get('status') in statuses]
+        rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
+        if page_size is not None:
+            rows = rows[offset:offset + page_size]
+        return rows
+
+    async def _fake_fetch_statuses(client, config, project_root):
+        return {
+            r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
+        }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
 
 
 def _producer_wire_entry(
@@ -184,3 +212,48 @@ async def test_b6_online_but_task_absent_gets_honest_zero_contrast(dummy_client,
     assert row['loops'] == 0
     assert row['attempts'] == 0
     assert row['started'] == 0
+
+
+@pytest.mark.asyncio
+async def test_b6_online_per_task_read_failure_yields_none_started(
+    dummy_client, monkeypatch, tmp_path,
+):
+    """Third leg of the three-way contract: an ONLINE snapshot whose entry for
+    the task carries a per-task read failure (loops/attempts/started/phase all
+    None + a non-empty ``error``) yields None fields with runtime_offline still
+    False -- honest error != offline project.
+
+    The full contract, all three legs now covered here: offline -> all None
+    (``test_b6_offline_snapshot_yields_none_not_zero``); online + task absent ->
+    honest 0 (``test_b6_online_but_task_absent_gets_honest_zero_contrast``);
+    online + entry-with-read-failure -> None with runtime_offline False (this
+    test). This is the leg ``shared/src/shared/task_runtime_state.py``'s
+    honest-failure projection promises -- it reports loops/attempts/phase/
+    started as None on a per-task artifact READ FAILURE, "never a fabricated
+    0" -- and it is roped through the same decoded-producer-wire path as its
+    siblings so the promise is checked against a real producer emission.
+    """
+    wire = _producer_wire_dict(tasks=[
+        _producer_wire_entry(
+            5, loops=None, attempts=None, started=None, phase=None,
+            lane_state=None, error='artifact read failed',
+        ),
+    ])
+    snapshot = _decode(wire)
+
+    _register_fetch_tasks(monkeypatch, [_shape_task(5, 'flaky task', 'in-progress')])
+    root = _project_root(tmp_path, 'flakylane')
+    config = DashboardConfig(project_root=root)
+
+    active, _, _ = await _shape_one_project(
+        dummy_client, config, root, runtime=snapshot,
+    )
+
+    assert len(active) == 1
+    row = active[0]
+    assert row['started'] is None, (
+        "a per-task read failure must not fabricate '0m running'"
+    )
+    assert row['loops'] is None
+    assert row['attempts'] is None
+    assert row['runtime_offline'] is False

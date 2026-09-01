@@ -88,6 +88,7 @@ A3B's smallest true 4-bit quant does not. See *Open Q3* below.
 cd /home/leo/src/dark-factory
 
 # 1. Install the unit template (idempotent; enables and starts nothing).
+#    Fails unless systemd will ACTUALLY apply it — see below.
 scripts/local-model-serving/install-lms-units.sh
 
 # 2. Fetch the image and weights for an arm, in transient systemd --user
@@ -134,6 +135,82 @@ to excuse.
 
 `Restart=no` in the unit template is deliberate: a dead arm stays dead rather
 than thrashing the GPU in a restart loop while you read the journal.
+
+### The install gate is the EFFECTIVE configuration, not file presence
+
+`install-lms-units.sh` no longer claims success on "the file landed". After the
+`daemon-reload` it runs [`scripts/check_lms_unit_parity.py`](../check_lms_unit_parity.py),
+which compares the installed copy against the committed template *and asks
+systemd what it would actually apply* — `systemctl --user show -p
+WorkingDirectory -p DropInPaths lms-arm@probe.service`. A non-clean answer
+fails the install with a non-zero exit and a `[lms_unit_parity]` report naming
+the finding.
+
+The installer tells those findings apart rather than describing all of them as a
+drop-in: exit 1 points you at whichever of `[override]` / `[effective]` /
+`[drift]` / `[vanished]` / `[unverifiable]` fired, exit 2 says the unit is not
+where the installer just put it, and a checker that is *missing from the
+checkout* or could not be run at all reports itself — with the command to run by
+hand — instead of blaming an override it never looked for. Each of those still
+FAILS the install: one that could not verify the effective configuration has
+established nothing, which is the state this gate exists to stop reading as
+success.
+
+File presence was never the claim an operator needed, because it is blind to
+the one thing that actually redirects a unit. `systemctl --user edit` never
+touches the unit file; it writes `lms-arm@.service.d/override.conf` beside it,
+and systemd merges that over the unit at load time. So a drop-in can pin
+`WorkingDirectory` somewhere else while the installed file stays *byte-identical*
+to the committed template — and the old installer reported success and left the
+override in place, run after run.
+
+**Every applying drop-in is named by absolute path, and none of them is
+removed.** That is deliberate (task 3750): the drop-in observed on this host was
+load-bearing while its worktree was unmerged, so deleting it blindly would have
+pointed every arm at a directory with no launcher. Removal has a correct owner
+already — `scripts/remove-lms-arm-worktree-dropin.sh` — which gates it behind
+preconditions an installer does not check.
+
+The same checker runs **warn-only** from `scripts/setup-host.sh`, so an override
+that appears *between* installs is still surfaced on the next host bring-up
+rather than waiting for someone to reinstall. It warns there instead of failing
+because bring-up must not be bricked by state we deliberately refuse to auto-fix.
+Exit 2 ("not installed on this host") is reported as benign info, not drift.
+
+### If the install reports an override
+
+1. See what systemd actually merged:
+
+   ```bash
+   systemctl --user cat lms-arm@qwen3.5-9b.service
+   systemctl --user show -p WorkingDirectory -p DropInPaths \
+       lms-arm@qwen3.5-9b.service
+   ```
+
+   `cat` shows the unit followed by every drop-in that applies to it;
+   `show` reports the *resolved* values, which is the claim being checked.
+
+2. If it is the known task-3713 worktree drop-in, remove it with its safety
+   preconditions:
+
+   ```bash
+   scripts/remove-lms-arm-worktree-dropin.sh
+   ```
+
+   It refuses unless the launcher is present at
+   `scripts/local-model-serving/lms_serve.py` in the main checkout, the template
+   is still installed, and the launcher compiles — the three things that make
+   removal safe rather than a way to break every arm at once.
+
+3. Re-run `install-lms-units.sh`. It is idempotent, and it will now say so
+   affirmatively: on the clean path it states the committed template *is* the
+   effective configuration and names the resolved `WorkingDirectory`.
+
+The failure mode this exists to prevent: a drop-in pinning `WorkingDirectory` at
+a worktree that has since landed but is still on disk. The arms keep starting,
+keep answering, and keep serving a **frozen tree** — while every operator, every
+report and every reinstall says they are running merged main. Nothing about the
+endpoint looks wrong; only the code behind it is stale.
 
 ---
 

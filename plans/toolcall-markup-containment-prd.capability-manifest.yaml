@@ -116,48 +116,122 @@ tasks:
     delivered_check:
       kind: manual
       reason: rejection quality is judged by β's boundary fixtures, not a grep
-- label: γ
+- label: γ1
   task_id: 3690
-  title: Register the middleware on all four servers; retire the in-line gates
+  title: Register the middleware on the escalation and verdict-tools servers (FORWARD_REPAIR
+    pair); absorbs task 4180
+  note: 'SPLIT 2026-08-19. The original γ declared all four servers and was never dispatched
+    once (zero runs.db events, ever) in the seven days after β landed: it required simultaneous
+    module locks on the two hottest files in the repo. γ2 (4457) carries plan-tools, γ3
+    (4458) carries fused-memory.'
   capabilities:
-  - name: middleware-registered-on-four-servers
-    binding: capability→producer (measured) — all four FastMCP( sites confirmed at
-      the PRD's cited lines on 37f761f5a4
+  - name: middleware-registered-on-forward-repair-pair
+    binding: capability→producer (measured 2026-08-19, live hasattr probe) — both sites
+      import the STANDALONE fastmcp 3.2.2, where add_middleware and get_tool are present
     verdict: PASS
     delivered_check:
       kind: grep
       pattern: add_middleware
       paths:
-      - fused-memory/src/fused_memory/server/tools.py
-      - orchestrator/src/orchestrator/mcp/plan_tools.py
-      - orchestrator/src/orchestrator/mcp/verdict_tools.py
       - escalation/src/escalation/server.py
+      - orchestrator/src/orchestrator/mcp/verdict_tools.py
+      expect: present
+  - name: list-typed-evidence-recovery-pinned
+    binding: capability→producer (UNMEASURED) — Repair.recovered is typed dict[str, str]
+      and the middleware applies it as a raw arguments.update with no type coercion;
+      escalate_info.evidence is list-typed, so the esc-3184-2 specimen exercises a case
+      B3 does not
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: evidence
+      paths:
+      - escalation/tests/test_markup_middleware_registration.py
+      expect: present
+  - name: live-escalate-info-lands-with-suggested-action
+    binding: capability→producer (producer:β, in γ1's closure γ1←β←α) — argument mutation
+      reaching the tool confirmed by PRD §6 live probe
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: observed through the filed escalation record, not by reading storage
+- label: γ2
+  task_id: 4457
+  title: Register the middleware on plan-tools, and rule on its overlap with 3692's
+    in-line repair path
+  capabilities:
+  - name: middleware-registered-on-plan-tools
+    binding: capability→producer (measured 2026-08-19) — plan_tools.py imports the STANDALONE
+      fastmcp 3.2.2; site moved to :1553, +957 from the :596 the PRD cites
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: add_middleware
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: d1-ruling-recorded-against-3692s-read-time-path
+    binding: capability→decision — task 3692 (ε, done) landed an independent read-time
+      repairer in the same file (_with_markup_repairs at :982, ~25 call sites) that
+      cannot reject, memoizes refusals per-process, and deliberately leaves _create_plan's
+      inbound arguments to this middleware. Composing vs superseding must be decided
+      and tested here, not left implicit (D1, INV-5).
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: the ruling is prose in the plan plus a test pinning the chosen interaction
+  - name: live-plan-tools-write-rejected-with-repaired-call
+    binding: capability→producer (producer:β, in γ2's closure γ2←β←α) — in-flight argument
+      access proven by PRD §6 live probe
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is a live MCP round-trip observed through the tool response,
+        not a repo grep
+- label: γ3
+  task_id: 4458
+  title: Adapt the guard to fused-memory's BUNDLED FastMCP, cover the two ungated write
+    tools, and only then retire the four in-line gates
+  capabilities:
+  - name: fused-memory-boundary-adapted
+    binding: 'capability→producer — ⚠️ THE ORIGINAL γ ROW FOR THIS SITE WAS A FALSE PASS.
+      §6 verified add_middleware against the STANDALONE fastmcp class only and then confirmed
+      the four sites by grepping the FastMCP constructor — a NAME match that does not
+      distinguish the two classes. Measured 2026-08-19: fused-memory/server/tools.py:17
+      imports mcp.server.fastmcp.FastMCP (the MCP SDK''s BUNDLED class), where hasattr
+      add_middleware is False and hasattr get_tool is False. The middleware is unattachable
+      here as written; this leaf must choose between migrating to standalone fastmcp
+      or adapting through the existing _safe_call_tool chokepoint in server/main.py.'
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: the check depends on which adaptation is chosen — an add_middleware grep
+        is only satisfiable under the migrate option, so do not re-add it blindly
+  - name: ungated-write-tools-now-covered
+    binding: capability→producer (measured 2026-08-19) — add_system_record (tools.py:3102)
+      and update_memory (tools.py:4316) have no gate of any kind; both write to Mem0
+      and both carry optional trailing parameters, which is the shape where a swallow
+      is silent rather than loud
+    verdict: OPEN
+    delivered_check:
+      kind: grep
+      pattern: add_system_record
+      paths:
+      - fused-memory/tests/test_markup_guard_fused_memory.py
       expect: present
   - name: inline-markup-gate-call-sites-retired-inv5
-    binding: capability→producer (measured) — exactly four call sites at tools.py:1828,2020,5446,5990
-      (def at :1121) to remove per D1
-    verdict: PASS
+    binding: capability→producer (measured 2026-08-19) — exactly four call sites at tools.py:2701,
+      2936, 6686, 7239 (def at :1144); the 1828/2020/5446/5990 anchors in the original
+      row are stale. MUST NOT be retired before the replacement is live and demonstrated —
+      this is the one boundary whose containment provably works (Mem0 frozen since 2026-07-30,
+      Graphiti since 2026-07-29).
+    verdict: OPEN
     delivered_check:
       kind: grep
       pattern: if block := _markup_gate\(
       paths:
       - fused-memory/src/fused_memory/
       expect: absent
-  - name: live-submit-task-rejected-with-repaired-call
-    binding: capability→producer (producer:β, in γ's transitive closure γ←β←α) — in-flight
-      argument access proven by PRD §6 live probe
-    verdict: PASS
-    delivered_check:
-      kind: manual
-      reason: the signal is a live MCP round-trip observed through the tool response,
-        not a repo grep
-  - name: live-escalate-info-lands-with-suggested-action
-    binding: capability→producer (producer:β, in γ's closure) — argument mutation
-      reaching the tool confirmed by PRD §6 live probe
-    verdict: PASS
-    delivered_check:
-      kind: manual
-      reason: observed through the filed escalation record, not by reading storage
 - label: δ
   task_id: 3691
   title: Retro-sweep of terminal state, atomic

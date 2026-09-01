@@ -13,7 +13,7 @@ see `OPERATIONS.md` once you're up and running.
 | Python 3.13 (pinned in `.python-version`) | The workspace targets `>=3.11,<4`; 3.13 is the pin every subproject is developed/tested against. |
 | [`uv`](https://astral.sh/uv/) | Manages the `uv` workspace (`cockpit`, `dashboard`, `escalation`, `fused-memory`, `orchestrator`, `sampler`, `shared`) and per-project virtualenvs. Install: `curl -LsSf https://astral.sh/uv/install.sh \| sh`. |
 | Docker + Compose v2 | Runs FalkorDB and Qdrant, the two backing stores. |
-| Node 22+ | Needed for the Playwright MCP server and for `npx pyright` (the type-check command dark-factory itself uses). |
+| Node 22+ | Needed for the Playwright MCP server and for `npx pyright` (the type-check command dark-factory itself uses). That pyright is version-pinned by the repo-root `package.json` / `package-lock.json`; run `npm ci` once at the repo root so the bare `npx pyright` resolves the pin instead of fetching whatever is current. Every cold verify worktree does that itself, via `verify_cold_preprovision_command`. |
 | [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) | `npm install -g @anthropic-ai/claude-code`, then `claude` once interactively to complete OAuth login. |
 | `bubblewrap` | Optional per-agent sandboxing primitive. Degrades gracefully if absent — see "Status & known limitations" in `README.md`. |
 

@@ -1136,13 +1136,22 @@ class TestIndeterminateExclusionsAreAdjudicated:
         # Fails part (3), on the IDENTICAL residual shape as env_transient
         # above — leaving it True after fixing env_transient on these grounds
         # would repeat the very inconsistency the review flagged.
-        # verify_classify.py:438-453 records the task-2748/2821 "Known gap"
-        # verbatim: a deterministic SHELL-script gate assertion (the docstring's
-        # own example is a manifest-drift check — precisely a BRANCH-caused
-        # failure) that quotes a lock token plus a timeout token but emits no
-        # grounded verdict marker still satisfies the loose `_LOCK_TOKEN_RE` +
-        # `_TIMEOUT_TOKEN_RE` co-occurrence and is still classified
-        # SEMAPHORE_TIMEOUT.
+        #
+        # CORRECTED by task 4492, mirroring the row's own comment in
+        # verify_categories.py. The previous wording justified this by the
+        # loose `_LOCK_TOKEN_RE` + `_TIMEOUT_TOKEN_RE` co-occurrence; task
+        # 3679 DELETED both regexes and replaced them with a positive,
+        # line-anchored, wrapper-emitted marker, and task 4492 scoped that
+        # marker to output carrying no passing-suite attestation.
+        #
+        # Predicate (3) still fails, on a different residual: a branch can
+        # put a genuine column-0 emitter line OUTSIDE run_all's framing
+        # entirely (a new test shelling out to `lib_test_semaphore.sh` from a
+        # `cargo test`, or any producer emitting `@@REIFY_SLOT_TIMEOUT@@`
+        # outside an aggregated run), which neither the anchor nor the
+        # scoping can distinguish from a host event. So the row keeps
+        # verdict_indeterminate=False and fails CLOSED — the assertions below
+        # are unchanged.
         from orchestrator.verify_categories import (
             CATEGORY_POLICY,
             INDETERMINATE_VERDICT_CATEGORIES,

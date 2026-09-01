@@ -151,10 +151,15 @@ survives any revert/reland of 3983.
   and machine-readable, and the guard change lands in the same task as
   exit-on-drain (δ), never separately**. The guard's storm-escape
   purpose is retained for exits *without* the drained marker (INV-4).
-- **D7** — Recon Landlock fix shape (η): grant the recon config root to
-  the sandbox writable set (`sandbox_recon_writable_extras` default, or
-  relocate `recon_config_base_dir` under `<explore_codebase_root>/.task/`
-  which is already granted unconditionally). This *activates* R6 and
+- **D7** — Recon Landlock fix shape (η): grant the **per-run** recon
+  config dir to the sandbox writable set as a **computed writable extra**
+  appended per invocation, with containment machine-checked at
+  `resolve_recon_sandbox_wrap`. Neither of the two shapes originally
+  floated here — a `sandbox_recon_writable_extras` schema default, or
+  relocating `recon_config_base_dir` under `<explore_codebase_root>/.task/`
+  — is taken: both leave every run's config dir writable by every other
+  run, i.e. cross-run `.credentials.json` write access (see §11 open
+  question 5, decided in this leaf). This *activates* R6 and
   recon transcripts — acceptable only because Fix A is on main (D1).
   Side benefits: the recon cap-retry veto stops force-fresh re-work
   (~110-150k tokens/day floor), `count_transcript_turns` starts
@@ -253,7 +258,7 @@ All satisfied at authoring time:
 | 3991 | 6 — false-belief + kill-switch remediation | pending | 3983 | all §9 sites corrected; kill-switches decided + documented in OPERATIONS.md; **amended at decompose to add §9 item 9** (escalation-watcher SKILL.md's inverse-differential incident note) |
 | 3992 | 8 — damage audit (scope sign-off first) | pending | 3986 | scoping proposal → human sign-off → audit of ~30 recent breaches first |
 | 3993 | (defence-in-depth) deny `Skill` to watcher-auto | pending | — | `Skill` in `_WATCHER_DISALLOWED_TOOLS` + test |
-| 3994 | (defence-in-depth) lease ownership checks | pending | — | `lease-release`/`heartbeat` require `--slug`; contention message legible |
+| 3994 | (defence-in-depth) lease ownership checks | pending | — | `lease-release`/`heartbeat` enforce holder-only mutation via `--slug`; contention message legible. *(Task 4248 later moved the slug into the CLI — `--slug` is now derived, not required; the ownership check is unchanged.)* |
 
 ### 7b. New leaves (filed by this decompose; Greek labels stamped into the sidecar)
 
@@ -372,13 +377,42 @@ call) — flag-enforced, resume-surviving per the organising principle.
 The cap-wait sanity bound is enforced where the wait actually happens
 (`usage_gate.invoke_slot` path), not only in the cap-hit branch.
 
-**C6. Recon writable set (η).** The recon per-run config dir root is a
-member of the Landlock writable set for recon stage invocations, via
-schema default or relocation under the already-granted
-`<explore_codebase_root>/.task/`. The stale claim in `landlock_exec.py`
-(~:20-23) is corrected in the same change. Credential isolation is
-preserved (the parent writes `.credentials.json` pre-spawn today;
-nothing new is shared across runs — per-run dirs stay per-run).
+**C6. Recon writable set (η).** The **per-run** recon config dir —
+`<data_dir>/recon-config/claude-config-<run_id>` — is a member of the
+sandbox writable set for that run's stage invocations, granted as a
+**computed writable extra** appended per invocation by
+`cli_stage_runner.run_stage_via_cli`. `recon_config_base_dir(data_dir)`
+itself is **never** granted, so every sibling run's config dir (and its
+`.credentials.json`) remains read-only under the ruleset. Containment is
+**machine-checked** at `sandbox_guard.resolve_recon_sandbox_wrap`, which
+fails closed (`RemediationSandboxUnavailable`) if the config dir it is
+handed is not inside the writable set that will be built — so a future
+edit that drops the grant refuses to launch instead of silently
+producing a transcript-less stage. The stale claim in `landlock_exec.py`
+(~:20-23) is corrected in the same change, along with its twin in
+`sandbox.py`'s bwrap docstring.
+
+The containment roots are `<cwd>/.task` **plus each existing extra** — and
+pointedly **not** `/tmp` (amendment, 2026-08-18). Landlock grants the host
+`/tmp` blanket but `build_bwrap_command` mounts `--tmpfs /tmp` before its
+binds, so "under `/tmp`" denotes two different things per backend: a config
+dir there that is not *also* an explicit extra would lose its pre-spawn
+`.credentials.json` and write its session JSONL into a tmpfs the parent can
+never read — the 2026-07-18 defect reproduced while the check said PASS.
+Symmetrically, the "does this root exist?" filter applies to the **extras
+only**: both backends `makedirs` `<cwd>/.task` before granting it, so
+filtering it out would fail closed on a fresh cwd and — since
+`run_stage_via_cli` treats that as fatal — error every stage. That matters
+directly to open question 5, whose considered alternative is relocating the
+config dir under `<cwd>/.task/`.
+
+Credential isolation is **enforced by the ruleset**, not merely preserved
+by naming: it is the per-run grant plus the containment assertion that
+keep it, and the earlier framing — "nothing new is shared across runs —
+per-run dirs stay per-run" — was FALSE for the schema-default-grant shape
+this section originally admitted. Granting the base would have made every
+run's `.credentials.json` writable by every other run, a capability that
+does not exist today (corrected under η's Amendment finding 1).
 
 > **CORRECTION 2026-08-11: the credential-isolation clause is true for
 > directory NAMING and FALSE for the WRITABLE SET.** Per-run dirs do
@@ -453,9 +487,20 @@ nothing new is shared across runs — per-run dirs stay per-run).
 4. **ε mechanism split** — how much of the quiet-project saving δ
    already captures; ε's description directs re-measuring after δ lands
    before adding config. Decide in ε.
-5. **η placement** — schema-default grant vs `recon_config_base_dir`
-   relocation. Relocation keeps the Landlock ruleset untouched (smaller
-   blast radius); the schema default documents the contract. Decide in η.
+5. **η placement** — **DECIDED in η (task 4003): neither.** The per-run
+   config dir is granted as a **computed writable extra** per invocation,
+   with containment machine-checked at `resolve_recon_sandbox_wrap`.
+   Both originally-offered options lose on the same axis — cross-run
+   credential write access:
+   - *schema-default grant* — the value would have to be
+     `recon_config_base_dir(data_dir)`, the root under which every run's
+     `claude-config-<run_id>/.credentials.json` lives, so every recon
+     stage would gain write access to every other run's credentials.
+   - *relocation under `<explore_codebase_root>/.task/`* — does not fix
+     that in substance: `.task` is granted as a whole subtree, so all
+     sibling run dirs would still be mutually writable, and it would
+     additionally move OAuth credentials inside the repo checkout and
+     force GC (`gc_run_config_dir`) and harness-sweep path changes.
 
    > **RESOLVED 2026-08-11 — and it was a SECURITY decision, not a
    > tactical one.** This question was framed as a placement trade-off
@@ -521,10 +566,20 @@ nothing new is shared across runs — per-run dirs stay per-run).
   INV-7 (the unbounded `invoke_slot` wait gains its governing bound).
 - ε: INV-4 repair (a cost ceiling enforced against an under-counted
   store is a silent fail-soft).
-- η/C6: INV-3 (the landlock_exec.py comment asserting an unverified
-  grant is corrected at the seam it describes).
+- η/C6: INV-1 `contracts-machine-checked` (a capability envelope — "the
+  per-task `CLAUDE_CONFIG_DIR` is writable" — lived in a prose comment
+  plus an empty-by-default config list, and the mismatch between the two
+  was discovered by failure three weeks late; the containment assertion
+  at `resolve_recon_sandbox_wrap` converts it to an enforced check) and
+  INV-4 `storm-escape-required` (the None-transcript degrade absorbed the
+  `PermissionError` with no rate, no bound and no signal;
+  `note_unreadable_transcript` is the escape — see the scope note below).
+  Correcting the `landlock_exec.py` comment does **not** satisfy INV-1 —
+  a corrected comment is still a prose contract, and the whole failure
+  is that a comment cannot notice when it stops being true.
 
-  > **CORRECTION 2026-08-11 — WRONG SLUG.** INV-3
+  > **CORRECTION 2026-08-11 — WRONG SLUG.** This row originally read
+  > `INV-3`; the slugs above are the corrected assignment. INV-3
   > `corroborate-before-acting` governs state read from a
   > snapshot/cache/metadata and then **acted on** without
   > re-corroboration. Nothing ACTS on the stale `landlock_exec.py`
@@ -556,6 +611,31 @@ nothing new is shared across runs — per-run dirs stay per-run).
   >   indistinguishable from silence. That is exactly the fail-soft
   >   INV-4 exists to forbid, and it is what turned a one-line config
   >   defect into a three-week subsystem outage.
+  >
+  >   **SCOPE of the escape as built (amendment, 2026-08-18).**
+  >   `note_unreadable_transcript` is wired into the **watchdog poll
+  >   sites only** (`shared/src/shared/cli_invoke.py`, both
+  >   `count_transcript_turns() is None` branches). The **cap-retry
+  >   force-fresh** — the other consumer of the same unreadable
+  >   transcript — is deliberately NOT routed through it: that branch
+  >   already emits its own WARNING at the point of decision (*"capped
+  >   session … has no transcript under … — retrying FRESH"*), naming
+  >   the session it is about to drop. It is a one-shot decision rather
+  >   than a poll loop, so it has no streak to latch and needs no
+  >   escape; INV-4's checkable question is answered there by that
+  >   existing WARNING. Read the claim above as covering the watchdog
+  >   path — the one that was genuinely counterless AND silent.
+  >
+  >   The escape's gate is **wall-clock, not a poll count**: it fires at
+  >   the caller's `startup_grace_secs`, the budget already defined as
+  >   "how long before we may conclude something is wrong", and latches
+  >   once per crossing in the caller. A poll-count threshold was
+  >   rejected on amendment review: it denotes two unrelated durations
+  >   in the watchdog's two regimes (5 s vs 60 s per poll) and, in the
+  >   startup regime, would fire ~15 s after spawn — inside the MCP-init
+  >   window a healthy recon stage routinely spends before its first
+  >   record lands, i.e. it would emit the WARNING once on *every*
+  >   healthy invocation, which is how a warning gets tuned out.
 - θ: INV-2 (structured per-event evidence, observation separated from
   hypothesis — required by the polarity dispute it settles).
 - No leaf introduces an unbounded hold, a new prose contract, a
@@ -608,3 +688,101 @@ nothing new is shared across runs — per-run dirs stay per-run).
   > as the wrong axis: the query is task-keyed, not time-keyed, and a
   > date window would reintroduce exactly the window-dependence γ exists
   > to remove.
+  >
+  > **CORRECTION 2026-08-20 (esc-3999-2 ruling, HEAD `ca7459b0a9`) — the
+  > threading premise above is FALSE and the resolution is WITHDRAWN.
+  > Neither half is to be built as specified.**
+  >
+  > **(i) "FastMCP 3.2.2 runs sync tool functions INLINE on the
+  > event-loop thread" — FALSE.** The cited path `fastmcp/tools/tool.py`
+  > does not exist in 3.2.2; `tool.py` was renamed to `base.py`, which
+  > `shared/pyproject.toml:41-42` already documents in-tree.
+  > `fastmcp/tools/function_tool.py:252` and `:275` both
+  > `await call_sync_fn_in_threadpool(...)` for any non-coroutine tool fn,
+  > delegating to `anyio.to_thread.run_sync` via
+  > `utilities/async_utils.py:26-34`. Proved at runtime, not only by
+  > reading: a sync `@mcp.tool()` invoked through FastMCP's own client
+  > path reports an AnyIO worker thread ident and a 5 ms asyncio
+  > heartbeat keeps ticking through a 250 ms hard block, while an `async
+  > def` control tool in the same run reports the loop's own ident — so
+  > the probe discriminates. `get_task_escalations` (sync `def`,
+  > `server.py:1548`) is therefore ALREADY off-loop, and "plus offload"
+  > is a no-op for it. Do NOT edit the `FastMCP threadpool worker`
+  > comment at `server.py:3628-3630`: it is TRUE, and six further sites
+  > depend on the same fact — including `harness.py:13533-13538`, which
+  > names the 2026-05-29 reify incident that assuming otherwise caused.
+  >
+  > **(ii) The scoping half is a CORRECTNESS REGRESSION, not a pure I/O
+  > reduction.** `make_id` takes an id-namespace KEY, not the record's
+  > stored `task_id`, and 5 production sites pass a divergent one
+  > (`curator_escalator.py:422/493/603` key `'curator'`;
+  > `ticket_janitor.py:284/491` key `'ticket-janitor'`). Measured on the
+  > live corpus: 42 records whose stem does not start with
+  > `esc-{task_id}-`. For the exact query γ's cross-check would issue,
+  > `get_task_escalations('task-curator', level=1)`, a scoped glob
+  > returns **0 of 37 records — 100% loss** — because the L1s are minted
+  > under the role key while `promote_to_l2` mints L2s under the real
+  > task_id, so the glob preserves exactly the L2s and destroys exactly
+  > the L1s. `esc-curator-35` is pending in the queue root today. The
+  > cited precedent does not transfer either: `make_id` is counter-file
+  > based as of `queue.py:1642` ("the retired directory/archive-scan
+  > derivation"), and the surviving glob in `_recover_seq_from_disk`
+  > scopes on the KEY — the thing that IS in the filename — which is
+  > exactly what its "never parsed back out of a filename" safety
+  > argument depends on. Scoping also erodes contract D11
+  > (`index_drift_detector.py:16-27`, task 3709), which adopted an opaque
+  > dedup key in the `task_id` slot precisely BECAUSE `get_by_task`
+  > filters on the stored field.
+  >
+  > **(iii) The motivation does not survive measurement — INV-8's
+  > premise here was never checked.** Nobody had ever timed the scan.
+  > Measured (medians over >=15 reps, load 60-168): archive-inclusive
+  > `get_by_task` **261-297 ms warm** (~950-1,100 ms cold), independent
+  > of hit count; root-only (`status='pending'`, 67 of 79 call sites)
+  > **~26 ms**. Rate: **~3.2 archive-inclusive MCP calls/day** over a
+  > 9.29-day transcript window, plus a bounded ~80-330 internal calls/day
+  > => **20-90 CPU-seconds/day**. The scoped-glob speedup is **15x**, not
+  > the 80-600x claimed. And "growing ~100/day with no pruning ...
+  > degrades monotonically forever" is FALSE: `archive.prune_archive`
+  > with `DEFAULT_RETENTION_DAYS = 30` runs as pass 3 of
+  > `sweep.run_startup_sweep`, the archive spans exactly 30 days, and the
+  > corpus **shrank** from the 3,039 files measured 2026-08-11 to 2,969
+  > on 2026-08-20. It is bounded at ~2,825 archived files and never
+  > reaches the ~10,700 needed for a 1 s call.
+  >
+  > **(iv) The real INV-8 exposure — the hazard is genuine, the site was
+  > wrong.** The escalation server has no loop of its own: it is a task
+  > on the ORCHESTRATOR's loop (`harness.py:11030`,
+  > `asyncio.create_task(_serve())`), so escalation-port latency IS
+  > orchestrator loop lag. What actually occupies that loop is the
+  > `async def` tools, exactly inverting the amendment: `async def
+  > get_pending_escalations` (`server.py:1450`) scans inline at `:1514`
+  > and awaits `_annotate_pins_recovery`, whose `level is not None`
+  > branch fans out one full root scan PER task_id at `server.py:544-546`
+  > — measured **2.1-4.9 s of loop occupancy per L2 drain cycle**. Plus
+  > seven in-process orchestrator sites doing archive-inclusive
+  > `get_by_task` inline inside `async def`, where FastMCP offload cannot
+  > help at all: `workflow.py:5620, 5702, 13024, 15525`,
+  > `deterministic_runner.py:2677, 2899`, `harness.py:13434`. Note the
+  > fanout POSTDATES this correction's own premise: `get_pending_escalations`
+  > became `async def` on 2026-08-17 (`b8e3bc95a3`, task 3543), six days
+  > after the 2026-08-11 analysis above — so the hazard named on
+  > 2026-08-11 was fictional, and a larger real one of the same shape has
+  > appeared since at a different site.
+  >
+  > **(v) The lever that measurement actually favours, which nobody
+  > proposed.** The queue root holds **8,901 dirents to serve 145
+  > records** — 7,531 `.json.lock` sidecars and 1,218 `.seq` counters —
+  > of which **3,334 record locks are ORPHANED** (their record was pruned
+  > by retention), the oldest dating to 2026-06-09.
+  > `run_startup_sweep`'s three passes reap records but never their
+  > locks, so this — not the record corpus — is the system's only
+  > unbounded growth vector, and it sits on the HOT path. Reaping is
+  > worth **24x** on the root glob (76.8 ms -> 1.70 ms measured) with zero
+  > semantic change, and projects to 131 ms at +6 months / 673 ms at
+  > +4.5 years if left alone.
+  >
+  > **Disposition:** γ (task 3999) is narrowed back to its decomposed
+  > SKILL.md scope; the `queue.py`/`server.py` work is withdrawn from it
+  > and re-filed against the sites above. INV-8 for γ is discharged by
+  > the fact that `get_task_escalations` is already off-loop.

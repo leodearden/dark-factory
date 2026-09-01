@@ -45,7 +45,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -141,6 +141,10 @@ _ACCEPT_PATHS = [
     'gui/src-tauri/icons/icon.ico',  # reify
     'scripts/reify-audit-snapshot-filter.jq',  # reify
     'tree-sitter-reify/.npmrc',  # reify
+    # Widened 59 -> 60 for reify #6758 (spec-conformance α): the first tracked
+    # reify file with a `tombstones` extension; filename is PRD-normative
+    # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
+    'docs/reify-language-spec.tombstones',  # reify
 ]
 
 # REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate

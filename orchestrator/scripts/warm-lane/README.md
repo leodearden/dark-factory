@@ -609,12 +609,21 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
   over the plain, `worktrees` and `.worktrees` nestings, since `_default_mount()`
   reaches a different fork in each.
 * `TestSiblingResolutionIgnoresTheCallersCwd` — asserts on **which file was
-  resolved** (a decoy-CWD marker), not on the exit code, for the reason above:
-  the exit code is a function of the caller's CWD, not of the defect. Each of
-  its absence assertions is paired with a `Usage:` **positive control**: an
-  absence assertion alone is satisfied by a script that died at line 1 for an
-  unrelated reason, so without it the case could go green having never reached
-  the resolution it names.
+  resolved**, not on the exit code, for the reason above: the exit code is a
+  function of the caller's CWD, not of the defect. The two `--help` cases
+  pair an absence assertion (a decoy-CWD marker must be absent) with a
+  **positive control**, `Usage:` — the heredoc all three scripts print on
+  `--help` — because an absence assertion alone is satisfied by a script that
+  died at line 1 for an unrelated reason, without one the case could go green
+  having never reached the resolution it names. The `--reseed` case (which
+  takes no `--help`, so it cannot use `Usage:`) instead asserts directly on
+  the RESOLVED, absolute seed-script path: `thin-warm-lane.sh` interpolates
+  `$SEED_SCRIPT` into an `info` line, emitted to stderr on the line
+  immediately before it executes it. Matching that path — not the prose
+  around it, which carries no contract and would otherwise couple the case to
+  an incidental log reword — proves both properties in one assertion: that
+  the run reached resolution (an early exit never prints it), and that
+  resolution landed beside the script rather than under the caller's CWD.
 * `TestLeafExtractionBehaviourWithoutBasename` — the **behavioural** half for
   the two converted leaf extractions, which the static gate below cannot
   reach: it catches the fork reappearing, not a conversion that changed what

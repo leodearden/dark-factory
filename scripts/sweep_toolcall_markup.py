@@ -2,27 +2,53 @@
 
 Task 3691, PRD ``plans/toolcall-markup-containment-prd.md`` contract C3.
 
-## What this sweeps — two pinned path sets, and nothing else
+## What this sweeps — three pinned path sets, and nothing else
 
 * ``data/escalations/**/*.json`` — escalation records, recursively (59 of the
   60 corrupted records measured live sit under ``archive/<date>/``). Only
   records in a TERMINAL status are rewritten; see :data:`TERMINAL_STATUSES`.
 * ``.worktrees-orphaned/*/.task/plan.json`` — the plan artifacts of reclaimed
   worktree lanes. The exact ``.task/plan.json`` tail, never ``**/*.json``.
+* ``.worktrees/.task-meta/*/plan.json`` — the DURABLE per-lane plan store the
+  two shapes above only ever pointed AT (task 4696). The W11 relocation moved
+  plan state out of the lane and into this store, so the orphaned glob reaches
+  it only through a lane that still exists to hold the link: once a lane is
+  reclaimed AND its link is gone, its plan was unreachable here while remaining
+  the durable artifact. Measured 2026-08-25: 1564 plans, 79 corrupted (5.1%).
 
-Discovery is an ALLOWLIST of those two shapes rather than a repo-wide ``.json``
-walk, because the dominant hazard here is over-reach: an orphaned worktree is a
-full checkout, so a ``**/*.json`` walk beneath one would find committed
-evidence that legitimately QUOTES leak specimens and "repair" it. See
+Discovery is an ALLOWLIST of those three shapes rather than a repo-wide
+``.json`` walk, because the dominant hazard here is over-reach: an orphaned
+worktree is a full checkout, so a ``**/*.json`` walk beneath one would find
+committed evidence that legitimately QUOTES leak specimens and "repair" it. See
 :data:`NEVER_TOUCH`.
 
 ## What it does NOT do
 
 It never repairs LIVE state. PRD D4 splits the corpus: terminal records and
-orphaned lanes are this sweep's; a live lane's plan.json belongs to task 3692's
-lazy write-back at the plan-tools boundary. That split is enforced
-mechanically, not by assumption — an orphaned plan whose symlink resolves into
-a meta-root a LIVE ``.worktrees/<id>`` still shares is skipped and reported.
+DEAD lanes are this sweep's; a live lane's plan.json belongs to plan-tools'
+lazy read-back at the MCP boundary, which repairs it atomically on the next
+read. That split is enforced mechanically, not by assumption — any plan
+resolving into a meta-root a LIVE ``.worktrees/<id>`` still shares is skipped
+and reported under :data:`REASON_LIVE_LANE_PRESENT`, whichever lane found it.
+The two mechanisms therefore PARTITION the corpus rather than racing over it,
+which matters because both write, and the read-back's write is atomic only with
+respect to other readers.
+
+## Running it as the periodic CHECK
+
+The DEFAULT dry run is also the silent-write detector: it exits
+:data:`EXIT_CLEAN` when nothing repairable remains and
+:data:`EXIT_REPAIRABLE_REMAINS` when some does, so a periodic check is one
+invocation and a non-zero exit::
+
+    uv run --project shared python scripts/sweep_toolcall_markup.py \
+        --lane meta-plans --json
+
+A separate detector script was deliberately NOT written: it would have had to
+enumerate the envelope literals a second time, which is the one thing INV-5
+forbids. The lane's ``--apply`` mode is the disposition mechanism for the same
+population, so one command answers both "is it still happening" and "clean up
+what is dead".
 
 ## Running it
 
@@ -82,6 +108,7 @@ from shared.toolcall_markup import (  # noqa: E402
     PREFILTER_NEEDLES,
     Repair,
     detect,
+    detect_for,
     repair,
 )
 
@@ -96,6 +123,7 @@ __all__ = [
     'EXIT_WRITE_FAILED',
     'INVOKE_CLOSER',
     'LANE_ESCALATIONS',
+    'LANE_META_PLANS',
     'LANE_PLANS',
     'NEVER_TOUCH',
     'PREFILTER_NEEDLES',
@@ -157,6 +185,18 @@ LANE_PLANS = 'plans'
 #: Where the escalations lane is rooted, relative to the repo root.
 _ESCALATIONS_DIR = ('data', 'escalations')
 
+#: Plan artifacts in the DURABLE per-lane store at
+#: ``.worktrees/.task-meta/*/plan.json``. Same rules as :data:`LANE_PLANS` and
+#: gated by the same live-lane check — the difference is REACH, not policy.
+#:
+#: The worktree-lane-lifecycle W11 relocation moved plan state out of the lane
+#: and into this store, which a live lane's ``.task/plan.json`` merely symlinks
+#: INTO. The orphaned glob therefore reaches it only through a lane that still
+#: exists to hold the link: once a lane is reclaimed AND its link is gone, its
+#: plan became unreachable by this sweep while remaining the durable artifact.
+#: Measured 2026-08-25 over that store: 1564 plans, 79 corrupted (5.1%).
+LANE_META_PLANS = 'meta-plans'
+
 #: Where the plans lane is rooted, relative to the repo root.
 _ORPHANED_DIR = '.worktrees-orphaned'
 
@@ -176,7 +216,8 @@ class Target(NamedTuple):
     #: Absolute path as discovered — NOT yet realpath-resolved. Resolution is
     #: :func:`resolve_write_target`'s job and happens only on the write path.
     path: Path
-    #: :data:`LANE_ESCALATIONS` or :data:`LANE_PLANS`.
+    #: :data:`LANE_ESCALATIONS`, :data:`LANE_PLANS` or
+    #: :data:`LANE_META_PLANS`.
     lane: str
 
 
@@ -235,6 +276,19 @@ def discover_targets(root: Path | str) -> list[Target]:
             # rather than silently dropped here.
             if candidate.is_file() or candidate.is_symlink():
                 targets.append(Target(path=candidate, lane=LANE_PLANS))
+
+    # The DURABLE store the two path shapes above only ever pointed AT. Both of
+    # its components are dot-prefixed, which is precisely why
+    # ``_has_dot_component`` is applied relative to a lane root and never to
+    # the absolute path — the same argument that constant already carries.
+    meta_dir = root_path.joinpath(*_META_ROOT)
+    if meta_dir.is_dir():
+        for lane_dir in meta_dir.iterdir():
+            if not lane_dir.is_dir():
+                continue
+            candidate = lane_dir / 'plan.json'
+            if candidate.is_file() or candidate.is_symlink():
+                targets.append(Target(path=candidate, lane=LANE_META_PLANS))
 
     return sorted(targets)
 
@@ -295,6 +349,13 @@ REASON_LIVE_LANE_PRESENT = 'live-lane-present'
 #: The shared meta-root a lane's plan.json is symlinked into.
 _META_ROOT = ('.worktrees', '.task-meta')
 
+#: The lanes governed by the PLAN rules: the sanctioned-location gate, the
+#: dangling-link refusal and the live-lane check. Both lanes reach the same
+#: file population from different directions, so they are gated identically —
+#: keyed off ONE tuple rather than two lane comparisons that could drift apart
+#: and leave a lane containment-ungated.
+_PLAN_LANES = (LANE_PLANS, LANE_META_PLANS)
+
 
 class ResolvedTarget(NamedTuple):
     """A target cleared for writing, with the path the swap will land on."""
@@ -305,8 +366,8 @@ class ResolvedTarget(NamedTuple):
     #: The ``os.path.realpath``-resolved file. THIS is what ``os.replace``
     #: must land on. Landing on the LINK instead would replace it with a
     #: regular file and re-fork the lane and meta-root copies — the esc-5205-9
-    #: stale-plan divergence ``plan_tools._atomic_write_plan`` documents at
-    #: line 715.
+    #: stale-plan divergence ``TaskArtifacts._write_json`` documents
+    #: (orchestrator/src/orchestrator/artifacts.py).
     write_path: Path
 
 
@@ -394,7 +455,7 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
                 reason=REASON_UNSANCTIONED_ESCALATION_LOCATION,
             )
 
-    if target.lane == LANE_PLANS:
+    if target.lane in _PLAN_LANES:
         if not _is_sanctioned_plan_location(resolved, root_real):
             return Refusal(
                 path=target.path,
@@ -499,7 +560,7 @@ def dedupe_by_realpath(targets: list[Target]) -> list[Target]:
 #: A repair was applied: the field was truncated to its clean prefix and every
 #: recovered sibling restored.
 ACTION_REPAIRED = 'repaired'
-#: The string was flagged by detect() but repair() declined. The value is left
+#: The string was flagged by the gate but repair() declined. The value is left
 #: BYTE-IDENTICAL and the reason is reported for human adjudication.
 ACTION_REFUSED = 'refused'
 
@@ -548,7 +609,13 @@ REASON_LIST_ELEMENT_NO_OBJECT = 'list-element-no-object'
 
 
 class Outcome(NamedTuple):
-    """What happened to one detect()-flagged string, and where."""
+    """What happened to one flagged string, and where.
+
+    "Flagged" is ``detect_for`` inside an object — where the field name and the
+    record's own keys are in hand — and the blanket ``detect`` for a bare list
+    element, which has neither. One enumeration, two named predicates over it
+    (INV-5).
+    """
 
     #: Dotted/indexed location within the document, e.g.
     #: ``design_decisions[1].rationale``. Built for the operator's report.
@@ -641,12 +708,22 @@ def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, 
         value = working[key]
 
         if isinstance(value, str):
-            if detect(value) is None:
-                continue
             # Recomputed per FIELD, not once per object: a hole filled by an
             # earlier repair in this same pass is no longer a hole, and two
-            # corrupted fields must never both claim it.
+            # corrupted fields must never both claim it. Hoisted above the gate
+            # because the gate now needs it too.
             schema = set(working.keys())
+            # PARAMETER-AWARE (task 4696). The blanket ``detect`` spells none of
+            # the writing tools' own parameter names, so a field mis-closed with
+            # its OWN tag was skipped here and reached NEITHER the repair nor the
+            # residue counters — silently absent from the human-adjudication
+            # queue, which is the one thing this sweep must never do with
+            # unrepaired leak. This object's own keys ARE the schema the repair
+            # below is already qualified against, so asking the wider predicate
+            # costs one set() that was being built two lines later anyway, and
+            # re-spells nothing (INV-5).
+            if detect_for(value, key, schema) is None:
+                continue
             targets = _string_holes(working) - {key}
             result = repair(value, key, schema, schema - targets - {key})
 
@@ -716,6 +793,11 @@ def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, 
     changed = False
     for index, item in enumerate(node):
         if isinstance(item, str):
+            # The BLANKET predicate here, deliberately, and NOT the
+            # parameter-aware one the object gate uses (task 4696): a bare list
+            # element has no field name and no sibling keys, so there is no
+            # parameter context to be aware of. The asymmetry is a consequence
+            # of the shape, not a missed site.
             if detect(item) is not None:
                 outcomes.append(Outcome(
                     json_path=f'{path}[{index}]',
@@ -988,9 +1070,10 @@ def round_trips(raw: str, obj: Any) -> bool:
     time rather than asserted once in a test.
 
     It also fail-safes any hand-edited or unusually-formatted file for free.
-    Reusing ``plan_tools._atomic_write_plan`` was rejected for the same reason:
-    it stamps ``_schema_version`` and re-indents, which would put changes in
-    the diff that the corrupted strings did not cause.
+    Reusing ``TaskArtifacts.write_plan`` — the single plan.json writer — was
+    rejected for the same reason: it stamps ``_schema_version`` and re-indents,
+    which would put changes in the diff that the corrupted strings did not
+    cause.
     """
     return serialize_like(raw, obj) == raw
 
@@ -1035,7 +1118,8 @@ class WriteFailure(NamedTuple):
 def _target_file_mode(path: Path) -> int | None:
     """The target's current permission bits, or ``None`` if it does not exist.
 
-    Mirrors ``plan_tools._target_file_mode``. Without this the swapped-in file
+    Mirrors ``orchestrator.artifacts._existing_mode``. Without this the
+    swapped-in file
     inherits ``mkstemp``'s 0600 and the record silently becomes unreadable to
     every other process that shares the queue directory.
     """
@@ -1055,7 +1139,7 @@ def write_repaired(
     is either its old bytes or its new bytes — never a mixture, and never
     truncated.
 
-    The ordering is load-bearing and follows ``plan_tools._atomic_write_plan``:
+    The ordering is load-bearing and follows ``TaskArtifacts._write_json``:
 
     1. ``mkstemp`` in the RESOLVED TARGET'S OWN DIRECTORY — ``os.replace`` is
        only atomic within a filesystem, so a ``/tmp`` scratch file would
@@ -1182,7 +1266,7 @@ EXIT_WRITE_FAILED = 2
 #: measured contract no longer holding for this corpus.
 EXIT_DID_NOT_CONVERGE = 3
 
-_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, 'all')
+_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, LANE_META_PLANS, 'all')
 
 
 class Summary(NamedTuple):
@@ -1344,8 +1428,11 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             'Retro-sweep leaked tool-call markup out of TERMINAL persisted '
             'state: data/escalations/**/*.json (resolved/dismissed records '
-            'only) and .worktrees-orphaned/*/.task/plan.json. Dry run by '
-            'default. Never touches '
+            'only), .worktrees-orphaned/*/.task/plan.json and '
+            '.worktrees/.task-meta/*/plan.json (dead lanes only — a plan a '
+            'live lane still shares is refused). Dry run by default, which is '
+            'also the periodic silent-write CHECK: exit 0 when nothing '
+            'remains, 1 when repairable markup does. Never touches '
             'docs/task-recovery-2026-05-13/worktree-inventory.json or '
             'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json, '
             'which are committed evidence that legitimately quotes specimens.'
@@ -1360,7 +1447,13 @@ def main(argv: list[str] | None = None) -> int:
         '--apply', action='store_true',
         help='actually rewrite files (default: report only)',
     )
-    parser.add_argument('--lane', choices=_LANE_CHOICES, default='all')
+    parser.add_argument(
+        '--lane', choices=_LANE_CHOICES, default='all',
+        help=(
+            'restrict the sweep to one lane. %(prog)s --lane meta-plans is the '
+            'periodic check over the durable per-lane plan store'
+        ),
+    )
     parser.add_argument(
         '--json', action='store_true', dest='as_json',
         help='emit the summary as JSON instead of text',

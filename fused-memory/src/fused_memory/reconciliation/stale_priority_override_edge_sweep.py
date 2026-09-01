@@ -110,9 +110,10 @@ def extract_priority_override_task_id(fact: str) -> int | None:
     Algorithm:
       1. Gate on ``_PRIORITY_OVERRIDE_GATE_RE`` against the raw fact text;
          short-circuit to None when absent.
-      2. Collect ``TASK_REF_RE`` subject ids ('task N' / 'df N' / '#N' — the
-         shared task-reference grammar 2613 and task_filter already use, so
-         this stays in sync if that grammar changes). Return the id iff
+      2. Collect ``TASK_REF_RE`` subject ids ('task N' / 'df N' / '#N' /
+         'task/N' — the shared task-reference grammar 2613 and task_filter
+         already use, so this stays in sync if that grammar changes; the
+         slash form was admitted by task 3403). Return the id iff
          exactly one distinct id is present, else None. Bare digits without a
          task/df/# prefix (dates, TTL seconds, pin orders) are never
          subjects.

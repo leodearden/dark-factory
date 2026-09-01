@@ -148,6 +148,7 @@ def mock_briefing(steward):
 def _make_result(
     cost=1.0, turns=5, session_id='sess-abc', success=True,
     duration_ms=5000, stderr='', timed_out=False, subtype='',
+    ended_awaiting_background=False,
 ):
     from shared.cli_invoke import AgentResult
     return AgentResult(
@@ -160,6 +161,7 @@ def _make_result(
         session_id=session_id,
         timed_out=timed_out,
         subtype=subtype,
+        ended_awaiting_background=ended_awaiting_background,
     )
 
 
@@ -1346,6 +1348,64 @@ class TestStewardTimeoutKillRecovery:
 
         data = _sole_invocation_end_data(steward.event_store.emit)
         assert data['timed_out'] is False
+
+    async def test_invocation_end_event_contains_ended_awaiting_background_true(
+        self, steward, mock_config,
+    ):
+        """invocation_end data must include ended_awaiting_background=True (task
+        3639).
+
+        Sibling of the workflow emitter: the flag DECIDES the success verdict
+        for a downgraded run (subtype stays 'success' while success flips
+        False), so a single runs.db query must cover both agent-invocation row
+        shapes rather than requiring a manual transcript dig.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                subtype='success',
+                timed_out=False,
+                stderr='',
+                cost=1.5,
+                turns=19,
+                session_id='sess-bg-abandoned',
+                ended_awaiting_background=True,
+            )
+            await steward._handle_escalation(esc)
+
+        data = _sole_invocation_end_data(steward.event_store.emit)
+        assert data['ended_awaiting_background'] is True
+
+    async def test_invocation_end_event_contains_ended_awaiting_background_false_by_default(
+        self, steward, mock_config,
+    ):
+        """PRESENT-and-False on an ordinary result, not absent — absence is what
+        left the class unqueryable and its denominator unknowable."""
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(success=True, cost=0.5)
+            await steward._handle_escalation(esc)
+
+        data = _sole_invocation_end_data(steward.event_store.emit)
+        assert 'ended_awaiting_background' in data, (
+            f'expected ended_awaiting_background key PRESENT; got {data!r}'
+        )
+        assert data['ended_awaiting_background'] is False
 
     async def test_invocation_end_event_timed_out_true_via_stderr_fallback(
         self, steward, mock_config,

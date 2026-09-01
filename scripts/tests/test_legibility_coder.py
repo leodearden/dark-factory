@@ -17,6 +17,9 @@ rather than ever shelling out to a real `claude` process.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 from pathlib import Path
 
 import codebook as codebook_mod
@@ -548,6 +551,141 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
 
 
 # ---------------------------------------------------------------------------
+# task 4511: code_digests announces EVERY per-digest failure as it happens.
+#
+# Not merely a nicer rendering of the aggregate nightly.py already escalates.
+# A SUB-STORM batch -- failed/total <= 0.5, e.g. 2 of 4 -- returns
+# status="ok", so run_nightly escalates nothing and those failures reach NO
+# sink at all today: not the journal, not an escalation, nowhere. Per-digest
+# lines also separate a storm of 38 identical ENOENTs from 38 distinct model
+# errors, a distinction the single joined aggregate detail flattens.
+# ---------------------------------------------------------------------------
+
+def _coder_warnings(caplog):
+    """Records at >= WARNING on coder.py's OWN logger, filtered by name so a
+    sibling module's records can never be mistaken for these."""
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "legibility.coder"
+    ]
+
+
+def _make_crashing_invoke(crash_sessions):
+    """Fake invoke that raises a BARE RuntimeError (not CoderInvocationError)
+    for the named sessions -- the exception class code_digest does NOT catch,
+    so it escapes to code_digests' own isolating `except Exception` and lands
+    as a `(None, reason)` failure."""
+    def fake_invoke(prompt, model):
+        for session_id in crash_sessions:
+            if session_id in prompt:
+                raise RuntimeError(f"unexpected explosion coding {session_id}")
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
+    """THE MOTIVATING CASE: 2 of 4 fail, which does not STRICTLY exceed the
+    0.5 storm threshold, so status stays "ok" and nightly.py escalates
+    nothing. These WARNINGs are the only sink those two failures ever
+    reach."""
+    digests = _batch_digests(4)
+    fail_sessions = {"batch-sess-0", "batch-sess-1"}
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_batch_invoke(fail_sessions),
+        )
+
+    assert result.status == "ok", (
+        "if this ever became a storm the test would be pinning the wrong "
+        "case -- the whole point is that nightly.py stays silent here"
+    )
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 2, (
+        f"expected one WARNING per failed digest; got "
+        f"{[r.getMessage() for r in warned]}"
+    )
+    messages = [r.getMessage() for r in warned]
+    for session_id in sorted(fail_sessions):
+        assert any(session_id in m for m in messages), (
+            f"{session_id!r} never reached the journal; got {messages}"
+        )
+    for session_id in ("batch-sess-2", "batch-sess-3"):
+        assert not any(session_id in m for m in messages), (
+            f"a SUCCEEDING digest was reported as a failure: {messages}"
+        )
+    for message in messages:
+        assert "could not parse a JSON object" in message, (
+            f"the REASON is the diagnosis, not just the session id; got "
+            f"{message!r}"
+        )
+
+
+def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
+    """3 of 4 -- a genuine storm. One line per failure, so an operator can
+    tell three identical ENOENTs from three distinct model errors; the
+    aggregate nightly.py escalates joins them into one string and loses
+    that."""
+    digests = _batch_digests(4)
+    fail_sessions = {"batch-sess-0", "batch-sess-1", "batch-sess-2"}
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_batch_invoke(fail_sessions),
+        )
+
+    assert result.status == "failure"
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 3, (
+        f"expected one WARNING per failed digest; got "
+        f"{[r.getMessage() for r in warned]}"
+    )
+    messages = [r.getMessage() for r in warned]
+    for session_id in sorted(fail_sessions):
+        assert any(session_id in m for m in messages), (
+            f"{session_id!r} never reached the journal; got {messages}"
+        )
+
+
+def test_code_digests_logs_the_isolated_crash_path_too(caplog):
+    """The OTHER failure path -- code_digests' own isolating `except
+    Exception`, which yields `(None, reason)` because the crash happened
+    before a session could be attributed. Both paths must reach the journal,
+    and the batch must keep going."""
+    digests = _batch_digests(3)
+
+    with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
+        result = mod.code_digests(
+            digests, _tiny_codebook(), project="dark_factory", model="haiku",
+            invoke=_make_crashing_invoke({"batch-sess-1"}),
+        )
+
+    # The batch kept going: the other two digests still coded.
+    assert result.status == "ok"
+    assert result.total == 3
+    assert result.succeeded == 2
+    assert len(result.failures) == 1
+    session, reason = result.failures[0]
+    assert session is None
+    assert "unexpected explosion coding batch-sess-1" in reason
+
+    warned = _coder_warnings(caplog)
+    assert len(warned) == 1, (
+        f"expected exactly one WARNING; got {[r.getMessage() for r in warned]}"
+    )
+    message = warned[0].getMessage()
+    assert "unexpected explosion coding batch-sess-1" in message
+    assert "None" in message, (
+        f"an unattributable crash must SAY the session is unknown rather "
+        f"than omitting it; got {message!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-15: RED — _invoke_cli() via the fake-`claude`-binary-on-PATH idiom
 # (per tests/scripts/test_spawn_claude.py's _write_fake_claude* idiom)
 # ---------------------------------------------------------------------------
@@ -746,6 +884,110 @@ def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeyp
             "prompt text", "haiku",
             claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4510: characterization pins over _invoke_cli's LEGIBILITY_CLAUDE_BIN
+# branch — the seam scripts/legibility-trickle@.service's Environment= line
+# depends on. NOT a RED: coder.py already implements this branch. These make
+# the pin undeletable from the CODE side, so dropping the env-var lookup
+# (which would silently re-open the 2026-08-18 outage even with the unit line
+# present) fails here.
+# ---------------------------------------------------------------------------
+
+def _scrub_path_of_claude(tmp_path, monkeypatch):
+    """Point PATH somewhere the REAL `claude` is NOT resolvable, and prove it.
+
+    Load-bearing test SAFETY, not tidiness. The real
+    /home/leo/.local/bin/claude is on the test runner's PATH, so if
+    _invoke_cli's resolution order (`claude_bin or
+    os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`) ever regresses, an
+    unscrubbed PATH would let the bare-name fallback spawn the GENUINE claude
+    CLI — real LLM spend, real wall-clock, and a test that passes for the
+    wrong reason, silently breaking this module's docstring promise that the
+    LLM is ALWAYS mocked here. With `claude` unresolvable, that same
+    regression instead ENOENTs into CoderInvocationError: loud and cheap.
+
+    Deliberately NOT a fully empty PATH, though that is the obvious spelling.
+    The fake binaries above are `#!/usr/bin/env bash` scripts and `env` needs
+    PATH to find `bash`, so an empty PATH makes every fake die with exit 127
+    ("env: 'bash': No such file or directory") — failing these tests for a
+    reason with nothing to do with the branch under test. PATH therefore keeps
+    a stdlib bin dir and drops ~/.local/bin, and the assertion below pins the
+    property that actually matters instead of trusting the spelling to imply
+    it.
+    """
+    empty_bin = tmp_path / "empty_bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", f"{empty_bin}{os.pathsep}/usr/bin")
+    assert shutil.which("claude") is None, (
+        "PATH scrub failed: a real `claude` is still resolvable, so a "
+        "regression in _invoke_cli's env-var branch would silently spawn the "
+        "GENUINE CLI (real spend) instead of failing loudly"
+    )
+
+
+def test_invoke_cli_honours_claude_bin_env_var(tmp_path, monkeypatch):
+    """With no explicit claude_bin=, the binary comes from
+    LEGIBILITY_CLAUDE_BIN — the exact seam the trickle systemd unit pins so
+    the coder survives a `systemd --user` manager whose PATH lacks
+    ~/.local/bin (2026-08-18: 6/6 selected digests ENOENT'd on reify, 38/38
+    on dark_factory)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_file = tmp_path / "argv.txt"
+    stdin_file = tmp_path / "stdin.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    _write_fake_claude_capturing(
+        bin_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
+    )
+
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bin_dir / "claude"))
+
+    raw = mod._invoke_cli("the prompt text UNIQUE_MARKER_ENV777", "haiku", timeout=10)
+
+    # The env-var-resolved binary actually RAN, and got the real argv/stdin.
+    argv = argv_file.read_text().splitlines()
+    assert "-p" in argv, argv
+    assert "--model" in argv, argv
+    assert "haiku" in argv, argv
+    assert "the prompt text UNIQUE_MARKER_ENV777" in stdin_file.read_text()
+    assert raw == '{"matches": [], "candidates": []}'
+
+
+def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch):
+    """Pins the precedence order _invoke_cli's docstring promises: explicit
+    argument > env var > bare name. The env var points at a FAILING fake, so
+    if precedence ever inverted this would raise CoderInvocationError."""
+    good_dir = tmp_path / "good-bin"
+    bad_dir = tmp_path / "bad-bin"
+    good_dir.mkdir()
+    bad_dir.mkdir()
+
+    argv_file = tmp_path / "argv.txt"
+    stdin_file = tmp_path / "stdin.txt"
+    stdout_path = tmp_path / "stdout.txt"
+    stdout_path.write_text('{"matches": [], "candidates": []}')
+    # Separate directories on purpose: both helpers write a file literally
+    # named "claude", so a shared bin_dir would have the loser overwrite the
+    # winner and the test would prove nothing.
+    _write_fake_claude_capturing(
+        good_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
+    )
+    _write_fake_claude_failing(bad_dir, exit_code=1, stderr_text="env var fake must not win")
+
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bad_dir / "claude"))
+
+    raw = mod._invoke_cli(
+        "the prompt text UNIQUE_MARKER_PREC555", "haiku",
+        claude_bin=str(good_dir / "claude"), timeout=10,
+    )
+
+    assert raw == '{"matches": [], "candidates": []}'
+    assert "the prompt text UNIQUE_MARKER_PREC555" in stdin_file.read_text()
 
 
 # ---------------------------------------------------------------------------

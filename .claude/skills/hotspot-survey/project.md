@@ -1,7 +1,17 @@
 # hotspot-survey overlay — dark-factory
 
 - **Memory identity**: `project_id="dark_factory"`, `agent_id="claude-interactive"` (write-tagging convention in CLAUDE.md).
-- **Task tracker**: `.taskmaster/tasks/tasks.json` — JSON with `data.master.tasks` (~1100+ tasks; fields: id, title, description, details, status, dependencies, priority, metadata). Mine the file directly with python3 — not via MCP round-trips.
+- **Task tracker**: SQLite at `.taskmaster/tasks/tasks.db` (~4,700 tasks). Mine it directly with
+  python3/sqlite3 — not via MCP round-trips. Open read-only so you never contend with the live
+  orchestrator: `sqlite3.connect('file:.taskmaster/tasks/tasks.db?mode=ro', uri=True)`.
+  `tasks` columns: `tag, id, title, description, details, test_strategy, status, priority,
+  metadata, updated_at, claimant_run_id, heartbeat_at, candidate_key` (`metadata` is a JSON
+  string). There is **no `dependencies` column** — dependencies are their own table keyed
+  `(tag, task_id, depends_on)`; dependents of N = `select task_id from dependencies where
+  depends_on=N`. ⚠️ `.taskmaster/tasks.db` at the top level is a 0-byte decoy — use the
+  `tasks/` one. The former `tasks/tasks.json` was retired at the SQLite cutover (2026-05-06),
+  sat 4 months stale (frozen at max id 1152 while the db kept growing), and was DELETED
+  2026-08-25 — if one reappears, do not mine it.
 - **Output**: `plans/bug-hotspot-survey-<date>.md` + `-full-findings.json`, committed. Use `git commit --only <paths>` — direct-to-main commits race the live merge queue (ref lock → re-add + retry); pre-commit (3× pyright) can exceed the Bash 2-min ceiling → `setsid git commit ... &` + poll.
 - **Fix-commit vocabulary**: generic set plus `--grep='amend:'` (post-merge patch-ups) and `--grep='red-main'` (broke main) — these mark the weakest code.
 - **History window**: `--since=2026-01-01` (the autonomous-factory era; most commits are agent-authored TDD).

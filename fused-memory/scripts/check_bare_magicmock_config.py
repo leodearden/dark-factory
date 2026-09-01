@@ -1,5 +1,40 @@
 #!/usr/bin/env python3
-"""Lint check: flag bare MagicMock() assigned to config-named variables in test files.
+"""Lint checks: mock-spec discipline in test files.
+
+This script carries TWO INDEPENDENT RULES.  They share only the AST predicates
+(``_is_magicmock_call`` / ``_is_specced``), the exemption-comment contract and the
+output format; they have separate detection pipelines, separate message vocabularies
+and separate ``# noqa`` codes.  Every statement in the "Rule A" section below is
+scoped to Rule A and says nothing about Rule B.
+
+  Rule A — ``bare-magicmock`` (tasks 1339/1372)
+      Config-NAMED bindings only, ``ast.Assign``/``ast.AnnAssign`` positions only.
+      Remedies are pydantic-specific (``mock_orch_config``, ``pydantic_spec``).
+
+  Rule B — ``bare-dataclass-double`` (task 4016)
+      Registry-driven and POSITION-BLIND: any ``ast.Call`` anywhere — including
+      ``return MagicMock(...)``, an argument, a comprehension body — whose literal
+      kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
+      ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
+      dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
+      Carries a shrink-only per-file debt BUDGET (``_DATACLASS_DOUBLE_DEBT``): a
+      grandfathered file is silent while it carries at most its recorded number of
+      sites and reports the overrun as soon as it carries more.
+
+WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
+script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
+lint_commands, ``dark-factory-orchestrator.yaml``, ``hooks/project-checks``), a second
+``python3`` process per lint run and a second fleet-lint-coverage entry — all to run the
+same ``ast.parse`` over the same files.  Widening cost zero wiring edits.  Rule A's
+stated non-goals below guard against inflating the CONFIG-NAME set, which would blur one
+rule's boundary; adding a second rule with its own name, vocabulary and noqa code is the
+opposite of that scope creep.  The FILENAME is therefore a deliberately retained legacy
+name — it no longer describes the whole file, and renaming it would touch those same nine
+call sites and break every in-flight branch, for a cosmetic gain.
+
+---------------------------------------------------------------------------
+Rule A — ``bare-magicmock``
+---------------------------------------------------------------------------
 
 Rule: Any assignment of the form ``<config_name> = MagicMock()`` where the call has
 no ``spec``, no ``spec_set`` keyword argument, and no positional argument (MagicMock's
@@ -48,9 +83,46 @@ Preferred alternatives named in the rejection message:
 Origin: Task 1339 (migrate existing bare configs), task 1313/1064 (spec discipline).
 This guard is implemented in task 1372 to prevent regressions after the migration.
 
+---------------------------------------------------------------------------
+Rule B — ``bare-dataclass-double``
+---------------------------------------------------------------------------
+
+Rule: any ``MagicMock(...)`` call, IN ANY POSITION, with no spec/spec_set and no
+positional argument, whose literal keyword names match a shape registered in
+``_DATACLASS_SHAPES`` — unless the preceding non-blank line carries
+``# noqa: bare-dataclass-double — <reason>``, or the file is on the debt baseline
+and still within its recorded site budget.
+
+Matching is ANCHOR + OVERLAP, deliberately NOT "kwargs are a subset of the fields":
+every anchor must be present AND at least ``min_field_matches`` fields must match.
+A kwarg that is not a field is *drift evidence* named in the message, never an
+exemption — a bare MagicMock accepts any keyword silently, so an unrecognised one is
+the strongest signal the double has drifted from the type it impersonates.  A subset
+rule would have missed all ten sites behind task 3980, every one of which passed
+``verify_skipped=`` (a MergeOutcome field:
+orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped).
+
+Why this rule exists: Rule A provably cannot see the shape, for three independent
+reasons, any one of them fatal — it inspects only ``ast.Assign``/``ast.AnnAssign``
+while all ten task-3980 sites were ``return MagicMock(...)``; ``_is_config_name``
+matches only config/cfg/*_config/*_cfg targets; and its remedies read pydantic
+``model_fields`` while ``VerifyResult`` is a stdlib dataclass.
+
+Preferred alternatives named in the rejection message:
+  • ``_fake_verify_result(...)``
+    (orchestrator/tests/test_merge_queue_concurrent_verify.py::_fake_verify_result)
+  • ``MagicMock(spec=VerifyResult)`` seeded from ``dataclasses.fields(VerifyResult)``
+
+Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
+file-local guard), task 4016 (this shared, repo-wide guard).
+
+---------------------------------------------------------------------------
+
 This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys, typing) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
-Adding a third-party dependency here would break that fast path.
+Adding a third-party dependency here would break that fast path.  This is why
+``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
+describes: ``import orchestrator.verify`` would need pydantic and break every caller.
 """
 
 from __future__ import annotations
@@ -59,7 +131,7 @@ import argparse
 import ast
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 
@@ -76,6 +148,69 @@ class Violation(NamedTuple):
 # Exact matches plus suffix rules — generic names are excluded by design.
 _CONFIG_EXACT: frozenset[str] = frozenset({'config', 'cfg'})
 _CONFIG_SUFFIXES: tuple[str, ...] = ('_config', '_cfg')
+
+
+class _DataclassShape(NamedTuple):
+    """A dataclass whose *shape* Rule B recognises in unspecced MagicMock kwargs.
+
+    Matching is ANCHOR + OVERLAP, never "kwargs are a subset of fields":
+      - every name in ``anchors`` must appear among the call's literal kwarg names, AND
+      - at least ``min_field_matches`` of ``fields`` must be matched.
+
+    A kwarg that is NOT a field does not exempt the call — it is *additional drift
+    evidence* and gets named in the violation message.  This is load-bearing: all ten
+    sites behind task 3980 passed ``verify_skipped=``, a MergeOutcome field
+    (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped) that
+    VerifyResult does not have, so a subset rule would have missed precisely the
+    defect this rule exists to catch.
+    """
+
+    name: str
+    module: str
+    fields: frozenset[str]
+    anchors: frozenset[str]
+    min_field_matches: int
+    factory: str
+
+
+# Registered shapes.  The field lists are LITERALS, not imports: this script is
+# stdlib-only by hard contract (see module docstring) so hooks/project-checks and
+# all seven package lint_commands can run it under bare ``python3`` with no venv
+# resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
+#
+# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py::VerifyResult.
+# Drift is absorbed structurally rather than by keeping this list exhaustive:
+# matching keys on the ``passed`` anchor plus a 2-field overlap floor, so adding,
+# renaming or removing a peripheral field cannot silently disable detection.  Only
+# removing ``passed`` itself could, and that is a VerifyResult refactor that would
+# break the orchestrator far more loudly first.
+_DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
+    _DataclassShape(
+        name='VerifyResult',
+        module='orchestrator.verify',
+        fields=frozenset({
+            'passed',
+            'test_output',
+            'lint_output',
+            'type_output',
+            'summary',
+            'timed_out',
+            'cause_hint',
+            'category',
+            'worktree_log_paths',
+            'archive_log_paths',
+            'contention',
+            'plan',
+            'failing_test_ids',
+            'failing_leg_categories',
+            'trivial',
+            'duration_secs',
+        }),
+        anchors=frozenset({'passed'}),
+        min_field_matches=2,
+        factory='_fake_verify_result',
+    ),
+)
 
 
 def _is_config_name(name: str) -> bool:
@@ -131,11 +266,28 @@ def _is_specced(call: ast.Call) -> bool:
     return False
 
 
-# Exemption comment regex.
-# Matches: ``# noqa: bare-magicmock — <non-empty-reason>``
+# Exemption comment regexes, one per rule code.
+# Matches: ``# noqa: <code> — <non-empty-reason>``
 # Accepts em-dash (—) or ASCII hyphen (-) as separator.
 # Requires at least one non-space character after the separator.
-_EXEMPT_RE = re.compile(r'#\s*noqa:\s*bare-magicmock\s*[—\-]+\s*\S.*')
+#
+# Each rule gets its OWN code so a suppression written for one can never silently
+# exempt the other: the remedies are unrelated (mock_orch_config/pydantic_spec vs
+# _fake_verify_result/spec=VerifyResult), so a pragma for one is not informed
+# consent for the other.  Both are built from the same template, so the
+# em-dash/ASCII-hyphen and mandatory-reason contract is identical across rules.
+_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
+
+_RULE_A_CODE = 'bare-magicmock'
+_RULE_B_CODE = 'bare-dataclass-double'
+
+# Kept at its historical value so Rule A's behaviour is bit-identical.
+_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
+
+_EXEMPT_RES: dict[str, re.Pattern[str]] = {
+    _RULE_A_CODE: _EXEMPT_RE,
+    _RULE_B_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_B_CODE))),
+}
 
 _VIOLATION_MSG = (
     'bare MagicMock() assigned to a config variable with no spec/spec_set.'
@@ -145,19 +297,239 @@ _VIOLATION_MSG = (
 )
 
 
-def _is_exempted(lines: list[str], lineno: int) -> bool:
-    """Return True if the assignment at *lineno* (1-based) is preceded by a valid exemption comment.
+def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
+    """Build Rule B's rejection message for *shape* matched by *kwargs*.
+
+    Deliberately shares NO vocabulary with ``_VIOLATION_MSG``: Rule A's remedies
+    (``mock_orch_config`` / ``pydantic_spec``) read ``model_fields`` and require a
+    pydantic BaseModel, so they are unusable for a stdlib dataclass.  Offering them
+    here would send the reader down a dead end.
+
+    Any kwarg that is not a field of *shape* is reported as drift evidence: a bare
+    MagicMock accepts any keyword without objection, so an unrecognised one is the
+    single strongest signal that the double has drifted from the type it impersonates.
+    """
+    drift = sorted(kwargs - shape.fields)
+    drift_clause = ''
+    if drift:
+        names = ', '.join(drift)
+        drift_clause = (
+            f' It also passes {names} — not {"a field" if len(drift) == 1 else "fields"}'
+            f' of {shape.name}, which a bare MagicMock accepts silently.'
+        )
+    return (
+        f'unspecced MagicMock shaped like {shape.module}.{shape.name}'
+        f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
+        ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
+        f' of raising AttributeError.{drift_clause}'
+        f' Use the {shape.factory}(...) helper, or MagicMock(spec={shape.name}) seeded'
+        f' from dataclasses.fields({shape.name}), so unknown-attribute reads raise'
+        ' (tasks 3477/3980 built the factory; task 4016 added this guard).'
+        ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding'
+        ' non-blank line.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rule B debt baseline — SHRINK-ONLY, and CHECKED.
+#
+# path → the number of pre-existing dataclass-double sites that file carried when
+# Rule B landed (AST census over all seven scanned tests/ directories, task 4016;
+# 95 sites across 11 files).  Shipping the rule hot with no transition would have
+# turned orchestrator/tests' lint_command red on day one and stalled the merge lane
+# repo-wide, so these are grandfathered — Rule B ONLY; Rule A still applies in full
+# to every file here.
+#
+# The count is a BUDGET, not a comment.  A debt file is silent while it carries at
+# most its recorded number of sites and reports the overrun the moment it carries
+# more, so "shrink-only" is enforced on the same hot path the rule itself runs on
+# rather than trusted.  This matters most for
+# orchestrator/tests/test_merge_queue.py: 63 sites in an actively-developed hub,
+# where a wholesale grandfather would have made a brand-new bare double added
+# tomorrow invisible to the gate.
+#
+# DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files
+# are migrated onto _fake_verify_result / MagicMock(spec=VerifyResult); that
+# migration is filed as a follow-up task.  A NEW file with a bare dataclass double
+# must fail the gate — that is the entire reason the baseline is opt-OUT rather
+# than opt-in.
+#
+# orchestrator/tests/test_merge_speculation.py is deliberately NOT here: task
+# 3980 just cleaned that module, and even a budgeted entry would let a new double
+# land there silently. Its one deliberate double carries a per-site pragma instead.
+_DATACLASS_DOUBLE_DEBT: dict[str, int] = {
+    'orchestrator/tests/test_merge_queue.py': 63,
+    'orchestrator/tests/test_concurrent_verify_boundary.py': 9,
+    'orchestrator/tests/test_merge_queue_permit_conservation.py': 7,
+    'orchestrator/tests/test_merge_queue_resolve_release.py': 7,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 3,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 1,
+    'orchestrator/tests/test_merge_item_union.py': 1,
+    'orchestrator/tests/test_merge_queue_equivalence.py': 1,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 1,
+    'orchestrator/tests/test_merge_queue_metrics.py': 1,
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 1,
+}
+
+
+def _debt_budget(filename: str) -> int | None:
+    """Return *filename*'s Rule B debt budget, or None if it is not a debt file.
+
+    Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
+    entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
+    Component-awareness is what stops ``orchestrator/tests/not_test_merge_queue.py``
+    — which merely contains a debt filename as a substring — from being grandfathered.
+
+    Trailing-component matching (rather than an exact string compare) is required
+    because the nine call sites pass repo-relative paths while pytest passes
+    absolutes; both must reach the same verdict.
+
+    Returns None (not 0) for a non-debt file so callers can distinguish "no budget
+    recorded — report every site" from "budget of zero".
+    """
+    parts = PurePosixPath(filename.replace('\\', '/')).parts
+    for entry, allowed in _DATACLASS_DOUBLE_DEBT.items():
+        entry_parts = PurePosixPath(entry).parts
+        if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
+            return allowed
+    return None
+
+
+def _debt_overrun_msg(budget: int, found: int) -> str:
+    """Build the message for a debt file that has grown past its recorded budget."""
+    return (
+        'this file is on the SHRINK-ONLY bare-dataclass-double debt baseline with a'
+        f' recorded budget of {budget} site(s), but {found} were found —'
+        f' {found - budget} over budget. The baseline may only shrink.'
+        ' The reported sites are simply the LAST in source order: the anchor is'
+        ' positional and is NOT a claim that these exact sites are the new ones.'
+        ' Fix by migrating a site in this file onto _fake_verify_result(...) or'
+        ' MagicMock(spec=VerifyResult) seeded from dataclasses.fields, or by adding'
+        ' # noqa: bare-dataclass-double — <reason> above a deliberate one.'
+        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+    )
+
+
+def _apply_debt_budget(doubles: list[Violation], budget: int | None) -> list[Violation]:
+    """Filter Rule B violations for a debt file down to just its budget overrun.
+
+    - Not a debt file (*budget* is None) → every violation is reported unchanged.
+    - At or under budget → silence: this is the grandfathering the baseline exists for.
+    - Over budget → report exactly ``found - budget`` violations, so the noise is
+      proportional to the overrun rather than dumping all 63 sites of
+      test_merge_queue.py on someone who added one.
+
+    The reported sites are the last in source order.  That choice is deterministic
+    rather than diagnostic — the checker cannot know which site is new — and the
+    message says so explicitly.
+    """
+    if budget is None:
+        return doubles
+    if len(doubles) <= budget:
+        return []
+    ordered = sorted(doubles, key=lambda v: (v.lineno, v.col_offset))
+    message = _debt_overrun_msg(budget, len(ordered))
+    return [v._replace(message=message) for v in ordered[budget:]]
+
+
+def _literal_kwarg_names(call: ast.Call) -> set[str]:
+    """Return *call*'s literal keyword-argument names.
+
+    The ``kw.arg is not None`` guard is what makes a ``**spread`` a non-match: CPython
+    represents ``MagicMock(**kw)`` as a keyword whose ``arg`` is None.  A spread exposes
+    no literal name, so it can never satisfy an anchor gate.
+    """
+    return {kw.arg for kw in call.keywords if kw.arg is not None}
+
+
+def _matching_shape(call: ast.Call) -> tuple[_DataclassShape, set[str]] | None:
+    """Return the first registered shape *call* matches (with its kwarg names), else None.
+
+    ANCHOR + OVERLAP, both required:
+      1. every name in ``shape.anchors`` appears among the literal kwarg names, AND
+      2. at least ``shape.min_field_matches`` of ``shape.fields`` are matched.
+
+    Gate 1 alone would flag a stray ``MagicMock(passed=True)`` on an unrelated object;
+    gate 2 alone would flag ``MagicMock(summary=..., timed_out=...)`` with no anchor.
+    Neither is sufficient by itself.
+
+    Kwargs that are NOT fields neither block nor weaken the match — they are drift
+    evidence surfaced in the message.  A subset rule (``kwargs <= fields``) would have
+    missed all ten task-3980 sites, every one of which carried ``verify_skipped=``.
+
+    Only the FIRST matching shape is returned: a call must never produce one violation
+    per registered shape.
+    """
+    kwargs = _literal_kwarg_names(call)
+    for shape in _DATACLASS_SHAPES:
+        if not shape.anchors <= kwargs:
+            continue
+        if len(kwargs & shape.fields) < shape.min_field_matches:
+            continue
+        return shape, kwargs
+    return None
+
+
+def _dataclass_double_violation(
+    call: ast.Call, lines: list[str], filename: str
+) -> Violation | None:
+    """Rule B, evaluated for ONE ``ast.Call``: return a Violation, or None if clean.
+
+    Deliberately POSITION-BLIND — the caller hands this every ``ast.Call`` in the tree
+    rather than only Rule A's ``ast.Assign``/``ast.AnnAssign`` values.  All ten sites
+    behind task 3980 were ``return MagicMock(...)``, which Rule A cannot see; the
+    binding name is not consulted either, so Rule A's config-name gate does not apply.
+
+    Reuses ``_is_magicmock_call`` and ``_is_specced`` unchanged, so the two rules can
+    never disagree about what "a MagicMock" or "specced" means.
+
+    Violations carry ``call.col_offset`` (the ``MagicMock(`` token), so a node that
+    trips both rules yields two deterministically-ordered entries rather than a collision.
+
+    Per-NODE rather than per-tree so ``find_violations`` can evaluate both rules in a
+    SINGLE ``ast.walk``.  A second full walk cost ~43% of total checker runtime
+    (measured over the seven scanned tests/ dirs: 20.8s → 30.7s), paid on every
+    merge-queue verify across all nine call sites; folded into Rule A's existing walk
+    it is nearly free.
+    """
+    if not _is_magicmock_call(call):
+        return None
+    if _is_specced(call):
+        return None
+    match = _matching_shape(call)
+    if match is None:
+        return None
+    shape, kwargs = match
+    # Computed lazily — only after a shape match — so the upward line walk keeps
+    # the cost profile it has under Rule A rather than running on every call node.
+    if _is_exempted(lines, call.lineno, _RULE_B_CODE):
+        return None
+    return Violation(
+        filename=filename,
+        lineno=call.lineno,
+        col_offset=call.col_offset,
+        message=_dataclass_violation_msg(shape, kwargs),
+    )
+
+
+def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
+    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
 
     Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
-    If that line matches _EXEMPT_RE the assignment is exempt.
+    If that line matches ``code``'s exemption regex the node is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
 
+    The *code* parameter keeps the two rules' suppressions strictly separate: a
+    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double``
+    violation, or vice versa.  Only the regex differs — the walk, the blank-line
+    tolerance and the mandatory-non-empty-reason contract are shared verbatim.
+
     Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
-    is inspected.  A ``# noqa: bare-magicmock`` comment on the same line as the
-    assignment (inline trailing) is intentionally ignored.  This is by design — see
-    module-level docstring for rationale.
+    is inspected.  A ``# noqa: ...`` comment on the same line as the node (inline
+    trailing) is intentionally ignored.  This is by design — see module-level docstring.
     """
-    # lineno is 1-based; convert to 0-based index of the line ABOVE the assignment.
+    exempt_re = _EXEMPT_RES[code]
+    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
     idx = lineno - 2  # the line immediately above
     while idx >= 0:
         line = lines[idx]
@@ -166,7 +538,7 @@ def _is_exempted(lines: list[str], lineno: int) -> bool:
             idx -= 1
             continue
         # Nearest non-blank line found — must match the exemption regex.
-        return bool(_EXEMPT_RE.match(stripped))
+        return bool(exempt_re.match(stripped))
     return False
 
 
@@ -194,7 +566,29 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     lines = source.splitlines()
     violations: list[Violation] = []
 
+    # Rule B violations are collected separately so a debt file's budget can be
+    # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up once
+    # per file, not per node.
+    dataclass_doubles: list[Violation] = []
+    debt_budget = _debt_budget(filename)
+
+    # ONE walk, BOTH rules.  Rule B was originally a second full ast.walk over the same
+    # tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
+    # scanned tests/ dirs) — a cost paid on every merge-queue verify across all nine
+    # call sites.  Rule A's walk already visits every node and simply skips non-Assign
+    # ones, so folding Rule B's per-Call handling in here makes it nearly free.  Output
+    # is unchanged: the final sort by (lineno, col_offset) still normalises ordering.
     for node in ast.walk(tree):
+        # ---- Rule B: bare-dataclass-double, position-blind over every ast.Call ----
+        # An ast.Call is never an ast.Assign/ast.AnnAssign, so this branch and Rule A's
+        # below are mutually exclusive and the `continue` cannot skip Rule A work.
+        if isinstance(node, ast.Call):
+            double = _dataclass_double_violation(node, lines, filename)
+            if double is not None:
+                dataclass_doubles.append(double)
+            continue
+
+        # ---- Rule A: bare-magicmock, ast.Assign/ast.AnnAssign only ----
         # Normalise both ast.Assign (possibly multi-target) and ast.AnnAssign
         # (single annotated target) into a uniform (targets, value, lineno) triple
         # so the evaluation pipeline below can be written once.
@@ -233,7 +627,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             if not _is_config_name(target.id):
                 continue
             if exempted is None:
-                exempted = _is_exempted(lines, assignment_lineno)
+                exempted = _is_exempted(lines, assignment_lineno, _RULE_A_CODE)
             if exempted:
                 # All targets of this node share the same lineno and therefore
                 # the same exemption status — no need to check further targets.
@@ -246,6 +640,11 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     message=_VIOLATION_MSG,
                 )
             )
+
+    # Rule B's per-file debt budget is applied to the collected COUNT, not to
+    # individual sites: a grandfathered file stays silent while it does not grow,
+    # and reports exactly its overrun once it does.
+    violations.extend(_apply_debt_budget(dataclass_doubles, debt_budget))
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 

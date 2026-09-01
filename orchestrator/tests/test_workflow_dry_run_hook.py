@@ -204,8 +204,14 @@ class TestMarkBlockedSkipsDryRunWhenMergePhase:
         # hook was NOT called
         assert len(dry_run_calls) == 0
 
-        # blocked status was NOT written (merge_phase suppresses it)
-        assert 'blocked' not in scheduler.statuses.get('43', [])
+        # The 'blocked' status IS written.  Task 3537 (spec §8-E2, INV-6)
+        # narrowed merge_phase's suppression to the ENTRY transition only:
+        # this call takes _mark_blocked's final fall-through BLOCKED return,
+        # which is a SLOT EXIT, so the row must be parked truthfully rather
+        # than left 'in-progress' with no live claimant.  merge_phase still
+        # suppresses the write on the REQUEUED retry-in-place arm, which is
+        # the carve-out's only real dependent (commit 22918d5c24).
+        assert 'blocked' in scheduler.statuses.get('43', [])
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +328,9 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
 
         This is the post-merge red-main class: main is already advanced when
         _mark_blocked runs, so the SHA capture inside run_dry_run_unblock
-        naturally reflects post-merge reality.  The status write is still
-        suppressed (merge_phase=True contract intact).
+        naturally reflects post-merge reality.  The status write now HAPPENS
+        here (task 3537): merge_phase suppresses only the entry transition,
+        and this escalate_to_human short-circuit is a slot exit.
         """
         wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='47', enabled=True)
 
@@ -367,8 +374,12 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         assert 'worktree' in kwargs
         assert kwargs['worktree'] == str(wf.worktree)
 
-        # merge_phase=True suppresses the 'blocked' status write — still
-        assert 'blocked' not in scheduler.statuses.get('47', [])
+        # The 'blocked' status IS written.  This is the escalate_to_human
+        # short-circuit, a SLOT EXIT: the merge landed, main advanced, and an
+        # L1 goes to a human, so the workflow returns BLOCKED and frees the
+        # slot.  Task 3537 (spec §8-E2, INV-6) made merge-phase BLOCKED exits
+        # park the row instead of leaving it 'in-progress' unclaimed.
+        assert 'blocked' in scheduler.statuses.get('47', [])
 
 
 # ---------------------------------------------------------------------------

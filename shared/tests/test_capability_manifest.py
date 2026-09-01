@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -251,6 +252,13 @@ class TestManifestCapability:
         cap = ManifestCapability(name='foo', binding='b', verdict='FAIL')
         assert cap.verdict == 'FAIL'
 
+    def test_verdict_open_accepted(self):
+        # OPEN means the binding is deliberately deferred INTO the leaf that
+        # owns it — it is neither a green G3 binding (PASS) nor a
+        # queue-blocking FAIL.
+        cap = ManifestCapability(name='foo', binding='b', verdict='OPEN')
+        assert cap.verdict == 'OPEN'
+
     def test_verdict_outside_vocab_rejected(self):
         with pytest.raises(ValidationError):
             ManifestCapability(name='foo', binding='b', verdict='MAYBE')  # type: ignore[arg-type]
@@ -285,6 +293,18 @@ class TestManifestTask:
     def test_title_omitted_ok(self):
         task = ManifestTask(label='α', capabilities=[])
         assert task.title is None
+
+    def test_note_accepted(self):
+        note = (
+            'SPLIT 2026-08-19. The original gamma row was one task across four '
+            'servers; this leaf carries fused-memory.'
+        )
+        task = ManifestTask(label='α', capabilities=[], note=note)
+        assert task.note == note
+
+    def test_note_omitted_defaults_none(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.note is None
 
     def test_task_id_non_int_string_rejected(self):
         with pytest.raises(ValidationError):
@@ -402,6 +422,23 @@ tasks:
     capabilities: []
 """
 
+    #: A task block carrying task-level ``note:`` provenance — the shape the
+    #: real sidecars use, so this pins the YAML path and not just kwargs
+    #: construction.
+    _VALID_YAML_WITH_NOTE = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "γ1"
+    task_id: 1
+    title: "Example task"
+    note: "SPLIT 2026-08-19. The original γ row was one task across four servers; this leaf carries fused-memory."
+    capabilities:
+      - name: "cap-one"
+        binding: "capability→producer (wired)"
+        verdict: OPEN
+"""
+
     def test_parse_capability_manifest_from_dict(self):
         data = {
             'prd': 'plans/example-prd.md',
@@ -428,6 +465,25 @@ tasks:
         assert isinstance(cap.delivered_check, DeliveredCheck)
         assert cap.delivered_check.kind == 'grep'
         assert cap.delivered_check.pattern == 'foo'
+
+    def test_load_sidecar_with_task_level_note(self, tmp_path):
+        # A LOAD test, deliberately not named "round_trips": it proves the
+        # YAML path decodes `note:` into the model, nothing more. The claim
+        # ManifestTask's docstring actually rests on — that a declared field
+        # survives manifest_stamping's yaml.safe_dump write-back where a
+        # comment would not — can only be asserted on the stamping side, in
+        # fused-memory/tests/test_manifest_stamping.py, which is outside this
+        # task's lock scope. Filed as tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD
+        # (follow-up from task 4471); the round-trip name is reserved for it.
+        sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML_WITH_NOTE)
+        doc = load_capability_manifest(sidecar)
+        task = doc.tasks[0]
+        assert task.label == 'γ1'
+        assert task.note is not None
+        assert task.note.startswith('SPLIT 2026-08-19.')
+        assert 'this leaf carries fused-memory' in task.note
+        assert task.capabilities[0].verdict == 'OPEN'
 
     def test_load_capability_manifest_accepts_str_path(self, tmp_path):
         sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
@@ -1012,6 +1068,75 @@ _SCRIPT_CHECK_IDS = [
 _SCRIPT_KIND_RE = re.compile(r'\bkind:\s*[\'"]?script\b')
 
 
+class OpenVerdictRef(NamedTuple):
+    """One ``verdict: OPEN`` capability row located in a checked-in sidecar."""
+
+    manifest: Path
+    label: str
+    capability: ManifestCapability
+
+
+def _discover_open_verdict_rows() -> list[OpenVerdictRef]:
+    """Every ``verdict: OPEN`` capability row in the checked-in corpus.
+
+    Derived from _MANIFEST_PATHS, NOT a second corpus walk — so it inherits
+    discover_manifests' anti-rglob, worktree-excluding, non-raising
+    ``git ls-files`` behaviour verbatim. The load is wrapped because this
+    runs at module import time and anything escaping here takes down
+    collection of the whole module; an unloadable or schema-invalid sidecar
+    is TestCheckedInManifestCorpus's failure to report (with a
+    file-attributed message), not this sweep's. The three caught types are
+    exactly the ones load_capability_manifest documents as propagating.
+    What the swallow drops is caught by
+    test_open_row_sweep_covers_every_declared_row.
+    """
+    rows: list[OpenVerdictRef] = []
+    for path in _MANIFEST_PATHS:
+        try:
+            doc = load_capability_manifest(path)
+        except (OSError, yaml.YAMLError, ValidationError):
+            continue
+        for task in doc.tasks:
+            rows.extend(
+                OpenVerdictRef(manifest=path, label=task.label, capability=cap)
+                for cap in task.capabilities
+                if cap.verdict == 'OPEN'
+            )
+    return rows
+
+
+_OPEN_ROWS = _discover_open_verdict_rows()
+_OPEN_ROW_IDS = [
+    f'{ref.manifest.relative_to(REPO_ROOT)}::{ref.label}::{ref.capability.name}'
+    for ref in _OPEN_ROWS
+]
+
+#: Independent, loader-free way to count the `verdict: OPEN` rows a sidecar
+#: DECLARES — same regex-over-raw-text discipline as _SCRIPT_KIND_RE above,
+#: so it still counts a row inside a sidecar the loader could not parse.
+#: Matches block style (`verdict: OPEN`) and the flow style the corpus also
+#: uses (`{verdict: OPEN, ...}`), quoted or bare.
+_OPEN_VERDICT_RE = re.compile(r'\bverdict:\s*[\'"]?OPEN\b')
+
+
+def _open_row_evidence_gap(ref: OpenVerdictRef) -> str | None:
+    """Why an OPEN row carries no evidence obligation, or ``None`` if it does.
+
+    An OPEN row asserts that the binding decision is the leaf's own work
+    product. That is only an honest record if the leaf owes something
+    checkable for it: a mechanical `delivered_check` the δ gate can run, or
+    a `kind: manual` check whose `reason` says what a human must confirm.
+    A bare OPEN row with neither is indistinguishable from an unmeasured
+    one — see TestCheckedInOpenVerdictEvidence.
+    """
+    check = ref.capability.delivered_check
+    if check is None:
+        return 'no delivered_check at all'
+    if check.kind == 'manual' and not (check.reason or '').strip():
+        return 'kind: manual with no reason'
+    return None
+
+
 def _missing_from_worktree_message(manifest_path: Path) -> str:
     """Message for a sidecar ``git ls-files`` tracks but the working tree lacks.
 
@@ -1122,6 +1247,85 @@ class TestCheckedInManifestCorpus:
         expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
         assert doc.prd == expected_prd
         assert (REPO_ROOT / doc.prd).is_file()
+
+
+class TestCheckedInOpenVerdictEvidence:
+    """Every checked-in `verdict: OPEN` row carries an evidence obligation.
+
+    `verdict` has NO programmatic consumer — grep the tree: nothing reads
+    `ManifestCapability.verdict` outside its own Literal. So "PASS required
+    to queue", "FAIL blocks queueing" and "OPEN must never be read as a
+    green G3 binding" are prose-only invariants, and widening the vocabulary
+    to three values (task 4471) enlarged the surface on which a non-green
+    row can queue silently. This class is the one mechanical backstop under
+    OPEN: it cannot check that the deferral was JUSTIFIED, but it can check
+    that the leaf owes something checkable for it, so an OPEN row is never a
+    bare assertion with nothing behind it (code-review amendment, task 4471).
+
+    Green on arrival — inherent to a preventative guard, and not a reason to
+    trust it unverified. The RED signal was proven by mutation instead, in
+    the same discipline TestCheckedInManifestCorpus records:
+
+        1. Deleted the `delivered_check:` block from the γ1
+           `list-typed-evidence-recovery-pinned` row of
+           plans/toolcall-markup-containment-prd.capability-manifest.yaml,
+           and separately blanked the `reason:` on the γ2 `kind: manual`
+           row. Each mutation turned exactly its own parametrized case red
+           ("no delivered_check at all" / "kind: manual with no reason"),
+           naming the manifest, label and capability, with every other case
+           and every other class staying green.
+        2. Reverted with `git checkout --` and confirmed the sidecar was
+           byte-identical again and the module fully green.
+
+    Deliberately asserts NO non-vacuity floor, unlike
+    test_corpus_discovery_is_not_vacuous and
+    test_script_check_corpus_is_not_vacuous. An OPEN row exists precisely
+    because its owning task is in flight, so the corpus legitimately reaches
+    ZERO OPEN rows the day the last one lands — a floor here would be a
+    landmine that goes red on someone else's success. The count cross-check
+    below is the anti-shrinkage guard instead, and it holds at zero.
+    """
+
+    def test_open_row_sweep_covers_every_declared_row(self):
+        # _discover_open_verdict_rows swallows sidecars the loader cannot
+        # parse (it must — it runs at import time). Without this cross-check
+        # a schema-invalid sidecar would drop ALL of its OPEN rows out of the
+        # sweep below and every remaining case would stay green, which is the
+        # precise fail-soft this class exists to remove. Re-derives the
+        # expected count by regex over raw TEXT, bypassing the loader, and
+        # asserts EQUALITY rather than a hand-bumped floor so nothing has to
+        # be remembered later. Mirrors
+        # test_sweep_covers_every_declared_script_check.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        declared = 0
+        for path in _MANIFEST_PATHS:
+            try:
+                text = path.read_text(encoding='utf-8')
+            except OSError:
+                pytest.fail(_missing_from_worktree_message(path))
+            declared += len(_OPEN_VERDICT_RE.findall(text))
+        assert len(_OPEN_ROWS) == declared, (
+            f'{declared} `verdict: OPEN` rows are declared across the checked-in '
+            f'sidecars but only {len(_OPEN_ROWS)} reached the sweep — '
+            '_discover_open_verdict_rows dropped a sidecar (unloadable or '
+            'schema-invalid; see TestCheckedInManifestCorpus for the attributed '
+            'error), so its OPEN rows are silently unguarded'
+        )
+
+    @pytest.mark.parametrize('ref', _OPEN_ROWS, ids=_OPEN_ROW_IDS)
+    def test_open_row_carries_an_evidence_obligation(self, ref):
+        gap = _open_row_evidence_gap(ref)
+        assert gap is None, (
+            f'{ref.manifest.relative_to(REPO_ROOT)}: capability '
+            f'{ref.capability.name!r} under label {ref.label!r} is '
+            f'verdict: OPEN but has {gap}. OPEN records that the binding '
+            'decision is THIS leaf\'s own work product, so the leaf must owe '
+            'something checkable for it — a mechanical delivered_check the '
+            'gate can run, or a kind: manual check whose reason states what a '
+            'human must confirm. Without either, OPEN is indistinguishable '
+            'from an unmeasured binding and queues with nothing behind it.'
+        )
 
 
 class TestCheckedInScriptCheckTargets:

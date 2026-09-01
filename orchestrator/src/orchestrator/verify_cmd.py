@@ -83,6 +83,12 @@ class VerifyCmd:
     entry (set by ``govern_cpu``) is treated as a resolved cpu-governed-exec
     path and wraps the *entire* rendered command as an outermost
     ``/bin/bash -c`` payload.
+
+    ``tool_version`` carries the ``@<version>`` suffix of an npx PACKAGE SPEC
+    (``npx pyright@1.1.408`` -> ``'1.1.408'``), so ``render`` can reproduce a
+    pinned spelling that ``_TOOL_HEAD`` alone cannot. It defaults to ``None``
+    — the unpinned spelling — which keeps dataclass equality and ``replace()``
+    semantics identical to before task 3931 for every command in the tree.
     """
 
     tool: ToolKind
@@ -93,6 +99,7 @@ class VerifyCmd:
     env: Mapping[str, str] = field(default_factory=dict)
     wrappers: tuple[str, ...] = ()
     raw: str | None = None
+    tool_version: str | None = None
 
 
 # Shell chain-delimiter tokens. shlex.split has no concept of shell operators —
@@ -496,7 +503,67 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
         head_positions.add(idx + 2)
 
     kw_tokens = keyword.split()
-    return any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions)
+    if any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions):
+        return True
+    # Task 3931 / esc-3805-1: a VERSIONED npx package spec still invokes the
+    # tool. `npx pyright@1.1.408` puts `pyright@1.1.408` at the head position,
+    # which exact token equality above reads as "does not invoke pyright" — so
+    # split_chain_tail's later-segment scan stops seeing a pinned clause and
+    # can flip the chain's accept/reject verdict purely because a version was
+    # pinned. Matched only at an npx head position and only for a single-token
+    # keyword, so a `@` in any other position is still no match.
+    if tokens[0:1] == ['npx'] and len(kw_tokens) == 1 and len(tokens) > 1:
+        return tokens[1].startswith(f'{kw_tokens[0]}@')
+    return False
+
+
+def keyword_truncation_end(head: str, end: int) -> int:
+    """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
+
+    Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
+    ``verify_plan._scope_prefix_to_keyword`` — truncate their matched segment
+    to everything up to and including the first occurrence of the keyword,
+    historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
+    That slice cuts mid-token at the ``@`` of a pinned npx package spec, so
+    ``npx pyright@1.1.408`` was truncated to ``npx pyright`` BEFORE being
+    re-parsed: the pin was destroyed by the truncation, independently of
+    whether the parser could carry it. A gate spelled as pinned therefore ran
+    whatever npx last cached — MEASURED byte-identical output for the pinned
+    and unpinned fleet chains.
+
+    Both callers route through this one helper for the same reason they route
+    through ``split_chain_tail``: their lockstep is STRUCTURAL, not a
+    convention kept by hand.
+
+    THE BOUNDARY RULE, and why it is this narrow. The extension applies ONLY
+    when the very next character is ``@`` — the npm package-spec version
+    separator — and then runs to the end of that token (stopping at whitespace
+    or any shell metacharacter, so a chain operator can never be swallowed).
+    Every other mid-token keyword occurrence keeps its pre-3931 truncation
+    byte-for-byte.
+
+    The rejected alternative was "retain whatever token the keyword ends
+    inside". That would also absorb an unrelated LONGER token: ``npx
+    pyright-foo`` is a DIFFERENT tool whose name merely starts with the
+    keyword, and retaining ``pyright-foo`` whole would reclassify the command
+    as ``ToolKind.NPX``, where ``scope_to`` treats the tool name as a target
+    and REPLACES it with the touched file. Anchoring on ``@`` keeps the
+    widening to exactly the shape that needs it. Pinned by
+    ``test_verify.py::TestVersionPinSurvivesScoping`` and
+    ``test_verify_plan.py::TestVersionPinSurvivesPrefixScoping``.
+    """
+    if head[end : end + 1] != '@':
+        return end
+    stop = end + 1
+    while stop < len(head) and not head[stop].isspace() and head[stop] not in _SHELL_METACHARS:
+        stop += 1
+    return stop
+
+
+# Characters that can never be part of an npx package-spec token — every one
+# of them would start (or be part of) shell control flow, so
+# `keyword_truncation_end`'s scan must stop before it swallows one.
+_SHELL_METACHARS = frozenset('&|;()<>`$"\'')
 
 
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
@@ -1016,9 +1083,14 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         idx += 3
 
     # Peel a `uv run [--project X] [--directory X]` wrapper — both flags may
-    # appear together (in either order; real per-subproject commands carry
-    # both: `uv run --project orchestrator --directory orchestrator pyright
-    # ...`), so this loops rather than peeling at most one. uv_project is
+    # appear together (in either order), so this loops rather than peeling at
+    # most one. The live per-subproject commands no longer pair them: task
+    # 3830 retired `--project X --directory X` (uv resolves `--project X`
+    # against the cwd `--directory X` just established, looking for X/X) and
+    # they now carry `--directory X` alone. The loop still handles the pairing
+    # because uv still ACCEPTS it, other projects' configs may still use it,
+    # and a differing pair (`--project shared --directory scripts`) remains
+    # legitimate. uv_project is
     # tri-state: None = no uv wrapper at all; '' = bare `uv run <tool>`
     # (uv-wrapped, no explicit project — see reproject()); non-empty = an
     # explicit --project was given.
@@ -1051,6 +1123,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
 
     head = rest[0]
     wrappers: tuple[str, ...] = ()
+    tool_version: str | None = None
     if head == 'pytest':
         tool = ToolKind.PYTEST
         rest = rest[1:]
@@ -1067,9 +1140,23 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         tool = ToolKind.CARGO_CLIPPY
         rest = rest[2:]
     elif head == 'npx':
-        if rest[1:2] == ['pyright']:
+        # Task 3931 / esc-3805-1: accept a VERSIONED npx package spec
+        # (`npx pyright@1.1.408`) as a pyright invocation, not just the bare
+        # token. This branch previously compared by exact token equality, so
+        # any pinned spelling fell through to ToolKind.NPX below — the command
+        # stopped being recognised as pyright at all, and `scope_to` then
+        # treated `pyright@1.1.408` as a TARGET and REPLACED it with the
+        # touched file (measured: `npx pyright@1.1.408` scoped to `a/b.py`
+        # rendered as `npx a/b.py`). Pinning the YAML alone was therefore a
+        # silent no-op on precisely the FILE_SCOPED path that generated
+        # esc-3805-1. Split on the FIRST `@` only: npm scoped names
+        # (`@scope/pkg@ver`) keep their leading `@` in the package part.
+        pkg = rest[1] if len(rest) > 1 else ''
+        pkg_name, _, pkg_version = pkg.partition('@') if not pkg.startswith('@') else (pkg, '', '')
+        if pkg_name == 'pyright':
             tool = ToolKind.PYRIGHT
             wrappers = ('npx',)
+            tool_version = pkg_version or None
             rest = rest[2:]
         else:
             tool = ToolKind.NPX
@@ -1106,6 +1193,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         targets=targets,
         wrappers=wrappers,
         raw=None,
+        tool_version=tool_version,
     )
 
 
@@ -1192,9 +1280,21 @@ def _render_structured(cmd: VerifyCmd) -> str:
             segments.append(f'uv run --project {shlex.quote(cmd.uv_project)}')
         else:
             segments.append('uv run')
-    if 'npx' in cmd.wrappers:
+    npx_wrapped = 'npx' in cmd.wrappers
+    if npx_wrapped:
         segments.append('npx')
-    segments.append(_TOOL_HEAD[cmd.tool])
+    head = _TOOL_HEAD[cmd.tool]
+    if npx_wrapped and cmd.tool_version is not None:
+        # Task 3931 / esc-3805-1: emit the VERSIONED npx package spec
+        # (`pyright@1.1.408`) rather than the bare `_TOOL_HEAD` value.
+        # Rebuilding the head from that constant unconditionally is what made
+        # a pin unrecoverable — a pinned YAML clause rendered back out
+        # UNPINNED, so the gate advertised a fixed pyright while running
+        # whatever npx last cached. Gated on the npx wrapper deliberately:
+        # `_TOOL_HEAD` is shared with the non-npx `pyright` spelling, which
+        # names a resolved executable and takes no package version.
+        head = f'{head}@{cmd.tool_version}'
+    segments.append(head)
     segments.extend(shlex.quote(flag) for flag in cmd.base_flags)
     segments.extend(shlex.quote(target) for target in cmd.targets)
     return ' '.join(segments)
@@ -1233,6 +1333,49 @@ def strip_cwd(cmd: VerifyCmd) -> VerifyCmd:
     if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
         return cmd
     return replace(cmd, cwd_rel=None)
+
+
+def promote_cwd_to_project(cmd: VerifyCmd) -> VerifyCmd:
+    """Return *cmd* with ``cwd_rel`` copied into an EMPTY ``uv_project`` (task 3830).
+
+    ``--directory X`` and ``--project X`` select the same uv project, but
+    ``strip_cwd`` discards only the former — it clears ``cwd_rel`` and
+    deliberately keeps ``uv_project`` ("it selects the venv, independent of
+    cwd"). A command that expresses its project SOLELY via ``--directory X``
+    therefore loses that selection the moment it is scoped, rendering a bare
+    ``uv run <tool> <root-relative files>`` against the workspace root — which
+    is depless by design ("not a package, just coordinates subprojects"), so
+    on a cold merge-verify worktree the tool is not installed at all. That is
+    the 'Failed to spawn: pytest' / exit-127 shape of regression ef68777a17 /
+    task 2036, independently recorded as a standing review invariant in
+    ``review/briefing.yaml``.
+
+    Applying this BEFORE ``strip_cwd`` keeps a scoped ``--directory``-only
+    command byte-identical to the ``--project X --directory X`` form it
+    replaces, which is what lets the module ``orchestrator.yaml`` files retire
+    the self-defeating pairing (uv resolves ``--project X`` against the cwd
+    ``--directory X`` just established, looking for ``X/X``) without
+    degrading any scoped render.
+
+    Promotion ONLY: ``cwd_rel`` is left set, so this composes with — rather
+    than duplicates — ``strip_cwd``, which remains the single place a cwd
+    shift is cleared.
+
+    No-op when: an explicit ``--project`` is already set (``uv_project``
+    non-empty — the same "don't second-guess an explicit uv context" rule
+    ``reproject`` follows, so a deliberately DIFFERING pair like
+    ``--project shared --directory scripts`` keeps its own project); there is
+    no cwd to promote (``cwd_rel is None`` — that is ``reproject``'s case);
+    the command is not uv-wrapped at all (``uv_project is None``, e.g. a
+    ``cd X && npx pyright`` clause — see the tri-state note on
+    ``VerifyCmd.uv_project``); OPAQUE (P1); or a raw-retained chain.
+    Idempotent: ``uv_project`` is non-empty after the first application.
+    """
+    if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
+        return cmd
+    if cmd.uv_project != '' or cmd.cwd_rel is None:
+        return cmd
+    return replace(cmd, uv_project=cmd.cwd_rel)
 
 
 def reproject(cmd: VerifyCmd, project: str) -> VerifyCmd:

@@ -28,6 +28,7 @@ from _verify_config_corpus import (
     load_config_scalar,
 )
 
+from orchestrator import verify
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
     ChainSegment,
@@ -35,6 +36,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     _has_unspliceable_pytest_invocation,
     _is_serial_forced,
+    _segment_invokes_tool,
     _split_at_unbalanced_close,
     _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
@@ -43,6 +45,7 @@ from orchestrator.verify_cmd import (
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     reproject,
     scope_to,
@@ -238,11 +241,14 @@ class TestParseConfigCommandUvWrapper:
     def test_uv_run_with_project_and_directory_sets_both(self):
         """--project and --directory can both appear on one `uv run` wrapper.
 
-        Real per-subproject commands (orchestrator.yaml) carry both flags
-        together, e.g. `uv run --project orchestrator --directory
-        orchestrator pyright src/ tests/` — --project selects the venv,
-        --directory shifts cwd. Both must be captured, not just the first
-        one peeled.
+        BACK-COMPAT/ROBUSTNESS coverage, not a mirror of the live configs:
+        task 3830 retired the `--project X --directory X` pairing from every
+        module orchestrator.yaml, which now carries `--directory X` alone.
+        The parser must still capture both, because uv still ACCEPTS the
+        pairing, other projects' configs may still carry it, and a DIFFERING
+        pair (`--project shared --directory scripts`) stays legitimate —
+        --project selects the venv, --directory shifts cwd. Both must be
+        captured, not just the first one peeled.
         """
         cmd = parse_config_command(
             'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
@@ -505,6 +511,113 @@ class TestReproject:
         raw = 'cargo test --workspace && cargo test --workspace'
         cmd = parse_config_command(raw)
         assert reproject(cmd, 'shared') == cmd
+
+
+class TestPromoteCwdToProject:
+    """promote_cwd_to_project(cmd) copies cwd_rel into an EMPTY uv_project.
+
+    ``--directory X`` and ``--project X`` select the same uv project, but
+    ``strip_cwd`` discards only the former — it clears ``cwd_rel`` and
+    deliberately keeps ``uv_project`` ("it selects the venv, independent of
+    cwd"). So a command that expresses its project SOLELY via ``--directory X``
+    loses that selection at scope time and renders as a bare ``uv run <tool>``
+    against the depless workspace root: the 'Failed to spawn: pytest' / exit-127
+    shape of regression ef68777a17 / task 2036. Promoting BEFORE ``strip_cwd``
+    keeps the selection alive (task 3830).
+    """
+
+    def test_promotes_cwd_rel_into_empty_uv_project(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/ tests/')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel == 'sampler'
+        promoted = promote_cwd_to_project(cmd)
+        assert promoted.uv_project == 'sampler'
+        # Promotion ONLY: clearing cwd_rel remains strip_cwd's job, so this
+        # mutator stays composable with (and independent of) it.
+        assert promoted.cwd_rel == 'sampler'
+
+    def test_noop_when_project_already_set(self):
+        """An explicit --project is never second-guessed — reproject's own rule."""
+        cmd = parse_config_command('uv run --project sampler --directory sampler ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_project_already_set_and_differs_from_directory(self):
+        """A deliberately DIFFERING --project/--directory pair keeps its --project.
+
+        Distinct semantics (run from ``scripts/`` against ``shared``'s
+        project), not the self-defeating same-value pairing task 3830 retires.
+        """
+        cmd = parse_config_command('uv run --project shared --directory scripts ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_not_uv_wrapped(self):
+        """``cd X && npx pyright`` carries a cwd_rel but no uv context at all.
+
+        ``uv_project is None`` (not uv-wrapped) is distinct from ``''``
+        (uv-wrapped, no explicit --project) — see the tri-state note on
+        ``VerifyCmd.uv_project``. Promoting here would invent a --project for
+        a command that never had a uv wrapper to put it on.
+        """
+        cmd = parse_config_command('cd fused-memory && npx pyright')
+        assert cmd.uv_project is None
+        assert cmd.cwd_rel == 'fused-memory'
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_no_cwd_set(self):
+        """A bare ``uv run`` has no cwd to promote — that is reproject's case."""
+        cmd = parse_config_command('uv run ruff check x')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel is None
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_idempotent(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/')
+        once = promote_cwd_to_project(cmd)
+        twice = promote_cwd_to_project(once)
+        assert twice == once
+
+
+class TestScopedRenderKeepsDirectoryOnlyProject:
+    """A ``--directory``-only module command must not scope to a BARE ``uv run``.
+
+    The integration hazard task 3830 closes: retiring the self-defeating
+    ``--project X --directory X`` pairing from every module orchestrator.yaml
+    leaves the project expressed solely as ``--directory X``, which
+    ``strip_cwd`` discards. Without the promotion these render project-less at
+    the depless workspace root, where ruff/pyright/pytest are not installed.
+    """
+
+    _FILES = ['sampler/src/a.py']
+    _EXPECTED = 'uv run --project sampler pyright sampler/src/a.py'
+
+    def test_directory_only_command_keeps_its_project(self):
+        scoped = verify._scope_to_keyword(
+            'uv run --directory sampler pyright src/ tests/', 'pyright', self._FILES
+        )
+        assert scoped == self._EXPECTED
+
+    def test_paired_command_scopes_to_the_same_string(self):
+        """Scoped-render EQUIVALENCE: dropping ``--project X`` costs nothing.
+
+        The old paired shape and the new ``--directory``-only shape must scope
+        to the identical string, which is what makes the orchestrator.yaml
+        change render-preserving rather than merely non-fatal.
+        """
+        scoped = verify._scope_to_keyword(
+            'uv run --project sampler --directory sampler pyright src/ tests/',
+            'pyright',
+            self._FILES,
+        )
+        assert scoped == self._EXPECTED
 
 
 class TestCargoScopeStructured:
@@ -1700,16 +1813,19 @@ class TestSplitChainTail:
         assert prefix + tail == raw
 
     def test_accepts_fused_memory_lint_chain_and_preserves_both_checkers(self):
-        """The task's headline case: fused-memory/orchestrator.yaml:11.
+        """The task's headline case: fused-memory/orchestrator.yaml::lint_command.
 
         The ruff clause is segment 0 (the caller will scope it); both
         `python3 .../check_*.py` sibling clauses live in the preserved tail,
         byte-identical to their slice of the config string.
+
+        Labelled by yaml KEY, not line number — the old `:11` label is the
+        rot `_verify_config_corpus.py`'s own provenance convention exists to
+        avoid, and FM_LINT_COMMAND is pinned against the live yaml by
+        `test_verify_config_corpus.py` anyway.
         """
         prefix, tail = split_chain_tail(FM_LINT_COMMAND, 'ruff check')
-        assert prefix == (
-            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
-        )
+        assert prefix == ('uv run --directory fused-memory ruff check src/ tests/ ')
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
@@ -2869,3 +2985,151 @@ class TestSplitAndChainSegmentsLiveConfigDrift:
             "the live chain no longer carries a 'tests/scripts/' clause the "
             'segmenter can run independently (esc-3062-2)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Versioned npx package spec (task 3931 / esc-3805-1)
+# ---------------------------------------------------------------------------
+
+# The pinned spelling this task introduces into dark-factory-orchestrator.yaml's
+# type_check_command. Kept as a LOCAL literal rather than derived from the
+# corpus so these guards state the parse/render contract independently of
+# whichever version the fleet chain happens to pin today.
+_PINNED = 'npx pyright@1.1.408'
+
+
+class TestVersionedNpxPyrightSpec:
+    """``npx pyright@<version>`` must parse, render and classify as pyright.
+
+    Task 3931 / esc-3805-1. Pinning the npx package version in the YAML is
+    load-bearing only if the pin SURVIVES this module's parse/render pipeline.
+    It does not today, and the failure is silent.
+
+    MEASURED on this branch, before the step-4 change:
+
+        parse_config_command('npx pyright@1.1.408')
+            -> tool=ToolKind.NPX, wrappers=(), targets=('pyright@1.1.408',)
+
+    Two consequences, both wrong:
+
+      * the command is no longer recognised as a pyright invocation at all, so
+        every pyright-keyed code path (``_segment_invokes_tool`` and through it
+        ``split_chain_tail``) stops matching it;
+      * ``scope_to`` treats the version token as a TARGET and REPLACES it —
+        ``render(scope_to(parse_config_command(_PINNED), ['a/b.py']))``
+        measured as ``'npx a/b.py'``, i.e. the pyright invocation is deleted
+        outright and the gate silently runs bare ``npx`` against a file.
+
+    ``render`` round-tripping the pinned string is therefore NOT on its own
+    evidence of correctness — it round-trips today only because ToolKind.NPX
+    carries the whole spec through ``targets`` verbatim. The guard is the
+    CONJUNCTION of the round-trip with the tool classification, which is how
+    each test below is written.
+
+    The change these pin is strictly ADDITIVE: the bare ``npx pyright``
+    spelling must keep parsing, rendering and scoping exactly as today (the
+    last test), so the ~65 existing bare-spelling assertions in this repo stay
+    green.
+    """
+
+    def test_versioned_spec_parses_as_pyright_behind_npx(self):
+        cmd = parse_config_command(_PINNED)
+        assert cmd.tool is ToolKind.PYRIGHT, (
+            f'{_PINNED!r} parsed as {cmd.tool!r}, not ToolKind.PYRIGHT (task '
+            '3931) — _parse_single_segment matches the npx package token by '
+            "EXACT equality (rest[1:2] == ['pyright']), so any @version "
+            'suffix falls through to the ToolKind.NPX branch and the command '
+            'stops being recognised as pyright'
+        )
+        assert cmd.wrappers == ('npx',)
+        assert cmd.tool_version == '1.1.408', (
+            f'{_PINNED!r} parsed without carrying its package version (task '
+            '3931) — the version must be recoverable on the VerifyCmd or '
+            'render() cannot reproduce it from _TOOL_HEAD'
+        )
+        assert cmd.targets == ()
+        assert cmd.raw is None
+
+    def test_versioned_spec_round_trips_as_a_pyright_command(self):
+        """Byte-identical render, FROM a pyright-classified VerifyCmd."""
+        for raw in (_PINNED, f'{_PINNED} some/file.py'):
+            cmd = parse_config_command(raw)
+            assert cmd.tool is ToolKind.PYRIGHT, (
+                f'{raw!r} must classify as pyright for this round-trip to mean '
+                'anything — ToolKind.NPX round-trips it vacuously by carrying '
+                'the whole spec in targets (task 3931)'
+            )
+            assert render(cmd) == raw, (
+                f'render(parse_config_command({raw!r})) == {render(cmd)!r} '
+                '(task 3931) — render rebuilds the head from '
+                "_TOOL_HEAD[ToolKind.PYRIGHT] = 'pyright', so the @version is "
+                'unrecoverable unless render consults the parsed version'
+            )
+
+    def test_scope_to_keeps_the_version_and_replaces_only_targets(self):
+        cmd = parse_config_command(_PINNED)
+        scoped = render(scope_to(cmd, ['a/b.py']))
+        assert scoped == f'{_PINNED} a/b.py', (
+            f'scope_to on the pinned spec rendered {scoped!r} (task 3931). '
+            "MEASURED before the fix: 'npx a/b.py' — classified as "
+            'ToolKind.NPX, the version token sits in targets and scope_to '
+            'REPLACES it, deleting the pyright invocation entirely and '
+            'running bare npx against the touched file'
+        )
+
+    def test_pinned_and_unpinned_chains_get_the_same_tail_verdict(self):
+        """The pin must not flip ``split_chain_tail``'s accept/reject decision.
+
+        The fleet TYPE chain is a cwd-sequenced same-tool fan-out, which the
+        gate REJECTS (``_verify_config_corpus``'s
+        ``test_real_config_corpus_keeps_its_exact_disposition``, root-type-check
+        -> preserves=False). Pinning the version must not turn that into an
+        ACCEPT: a rejected chain falls through to the caller's
+        truncate-at-keyword path, an accepted one preserves a tail, and
+        silently swapping between them would change what the gate actually
+        runs.
+        """
+        pinned_chain = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', _PINNED)
+        assert pinned_chain != ROOT_TYPE_CHECK_COMMAND, (
+            'the pinned-chain fixture rewrote nothing (task 3931) — this '
+            'parity guard would compare a string against itself'
+        )
+
+        assert _segment_invokes_tool(_PINNED, 'pyright') is True, (
+            f'_segment_invokes_tool({_PINNED!r}, "pyright") is False (task '
+            '3931) — the npx-head check compares the package token by exact '
+            'equality, so a pinned clause reads as "does not invoke pyright" '
+            "and split_chain_tail's later-segment scan stops seeing it"
+        )
+        assert _segment_invokes_tool(f'{_PINNED} src/', 'pyright') is True
+
+        unpinned_prefix, unpinned_tail = split_chain_tail(ROOT_TYPE_CHECK_COMMAND, 'pyright')
+        pinned_prefix, pinned_tail = split_chain_tail(pinned_chain, 'pyright')
+        assert bool(pinned_tail) is bool(unpinned_tail) is False
+        assert pinned_prefix == pinned_chain
+        assert unpinned_prefix == ROOT_TYPE_CHECK_COMMAND
+
+    def test_bare_spelling_is_unchanged(self):
+        """Regression floor: the unpinned spelling parses/renders exactly as today.
+
+        Deliberately asserts ONLY properties that already hold before step-4,
+        so it is GREEN today and can only go red if that change stopped being
+        additive.
+        """
+        cmd = parse_config_command('npx pyright')
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert cmd.wrappers == ('npx',)
+        assert render(cmd) == 'npx pyright'
+        assert render(scope_to(cmd, ['a/b.py'])) == 'npx pyright a/b.py'
+        assert _segment_invokes_tool('npx pyright', 'pyright') is True
+
+    def test_bare_spelling_carries_no_version(self):
+        """The new field defaults to None, so VerifyCmd equality/replace() is preserved.
+
+        Separated from the regression floor above precisely because it is NOT
+        a property that holds today: ``tool_version`` does not exist yet, so
+        this is RED for the missing-field reason while the floor stays green.
+        """
+        assert parse_config_command('npx pyright').tool_version is None
+        assert parse_config_command('pyright src/').tool_version is None
+        assert VerifyCmd(tool=ToolKind.PYRIGHT).tool_version is None

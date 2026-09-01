@@ -52,6 +52,10 @@ from fused_memory.reconciliation.task_filter import (  # noqa: F401
     COUNT_SNAPSHOT_RE,
     is_count_snapshot,
 )
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 logger = logging.getLogger('cleanup_count_snapshots')
 
@@ -591,6 +595,37 @@ async def run(
             file=sys.stderr,
         )
         return abort_payload
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # Deliberately placed AFTER the unknown---project-id abort above (a bad
+    # project id still fails with its own clearer message and never probes)
+    # and BEFORE the first store read below. It is NOT at the ``if args.apply:``
+    # gate further down, which is downstream of the entire two-pass
+    # enumeration, and NOT inside ``apply_cleanup``, whose three mutation loops
+    # each carry a best-effort ``except Exception``: since
+    # ``StoreMutationUnavailable`` subclasses ``RuntimeError``, a probe there
+    # would be absorbed into failed_invalidations/failed_refreshes rows while
+    # the writes proceeded -- and ``update_edge`` invalidates an edge BEFORE
+    # its audit memory is written, so each such row would be an
+    # already-invalidated edge with no rollback record.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='cleanup_count_snapshots --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'cleanup_count_snapshots: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so each "
+                'invalidation would supersede its edge and then fail to write '
+                'the audit memory that records the rollback, leaving edges '
+                'invalidated with no way to reconstruct what they said. No '
+                'entity was enumerated, no edge was scanned and nothing was '
+                'mutated. Route the cleanup through the fused-memory MCP '
+                'server (the unsandboxed owner of the store), or re-run from '
+                'an unsandboxed operator shell. To obtain the audit report '
+                'safely from anywhere, re-run without --apply.'
+            )
+            raise
 
     # First pass: fetch entity counts for the safety cap check.
     # We do this BEFORE calling get_all_valid_edges / scanning so that an

@@ -16,12 +16,25 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+# Resolved via scripts/tests/conftest.py's sys.path insertion (scripts/ AND
+# scripts/legibility/ are both on sys.path; no package __init__ needed) --
+# same idiom as test_legibility_coder.py's `import coder as mod`.
+import coder
+
 SCRIPT = Path(__file__).parent.parent / "legibility" / "install-trickle-timer.sh"
 TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
+
+# The unit names the PRODUCTION checkout absolutely -- systemd resolves
+# Environment= absolutely and the installed unit is a byte copy of the
+# committed one -- so this must NOT be derived from a REPO_ROOT, which is a
+# .worktrees/<id> path when the suite runs in a lane. Precedent + rationale:
+# scripts/tests/test_install_reify_closure_staleness_sweep_timer.py:27-32.
+PRODUCTION_CLAUDE_BIN = "/home/leo/.local/bin/claude"
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +228,79 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", "legibility-trickle@proj_a.timer"] in calls, f"calls={calls!r}"
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
+
+
+def _service_environment(service_text):
+    """Parse the [Service] section's `Environment=` assignments into a dict.
+
+    Scans from the `[Service]` header to the next section header, and
+    shlex.split()s each directive's right-hand side before splitting every
+    token on its FIRST `=`. The shlex step handles BOTH the
+    one-assignment-per-line form this template uses and systemd's legal
+    space-separated multi-assignment form, so a future reflow of the unit
+    onto a single Environment= line does not silently stop being checked.
+    """
+    env = {}
+    in_service = False
+    for raw_line in service_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            in_service = line == "[Service]"
+            continue
+        if not in_service or not line.startswith("Environment="):
+            continue
+        for token in shlex.split(line[len("Environment="):]):
+            name, sep, value = token.partition("=")
+            if sep:
+                env[name] = value
+    return env
+
+
+def test_service_template_pins_claude_bin():
+    """Template-content invariant (NOT install behavior): the committed
+    @.service must pin LEGIBILITY_CLAUDE_BIN to an ABSOLUTE `claude` path.
+
+    Root cause this guards (2026-08-18): coder.py resolves the CLI as
+    `claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`, so
+    without this pin the bare name is execvp-resolved against whatever PATH
+    the `systemd --user` manager happens to hold. That manager started at
+    boot with NO ~/.local/bin on PATH -- the graphical login that imports
+    ~/.profile came 84 minutes later -- and the timer's Persistent=true
+    catch-up run fired into exactly that window, ENOENT'ing 6/6 selected
+    digests on reify and 38/38 on dark_factory in about one second. The pin
+    is load-bearing, not redundant belt-and-braces; do not "clean it up".
+    """
+    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
+    env = _service_environment(service_text)
+
+    # Read the env-var NAME from coder rather than hardcoding the literal:
+    # the pin is only useful because coder.py reads that exact variable, so
+    # a rename there must fail HERE instead of leaving a live unit setting a
+    # var nothing reads.
+    assert coder._CLAUDE_BIN_ENV_VAR in env, (
+        f"The trickle @.service must pin {coder._CLAUDE_BIN_ENV_VAR}= so the "
+        f"coder survives a systemd --user manager whose PATH lacks "
+        f"~/.local/bin; parsed [Service] Environment={env!r}"
+    )
+    value = env[coder._CLAUDE_BIN_ENV_VAR]
+    assert value == PRODUCTION_CLAUDE_BIN, (
+        f"Expected {coder._CLAUDE_BIN_ENV_VAR}={PRODUCTION_CLAUDE_BIN!r}, "
+        f"got {value!r}"
+    )
+    # Asserted independently of the literal above: the entire point of the
+    # fix is surviving a PATH gap, so an edit back to a bare `claude` must
+    # fail even if someone also changes PRODUCTION_CLAUDE_BIN.
+    assert os.path.isabs(value), (
+        f"{coder._CLAUDE_BIN_ENV_VAR} must be an ABSOLUTE path (a bare name "
+        f"would be PATH-resolved, which is the failure being fixed); "
+        f"got {value!r}"
+    )
+
+    # Adding a second Environment= line must not displace the first.
+    assert "PYTHONPATH" in env, (
+        f"The pre-existing PYTHONPATH assignment must survive alongside the "
+        f"claude-bin pin; parsed [Service] Environment={env!r}"
+    )
 
 
 def test_install_is_idempotent(tmp_path):

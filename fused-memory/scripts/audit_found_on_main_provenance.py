@@ -64,10 +64,19 @@ from shared.task_metadata import parse_metadata
 
 logger = logging.getLogger('audit_found_on_main_provenance')
 
-# Mirrors orchestrator.git_ops.DEFAULT_COMMIT_CITATION_PATTERN (git_ops.py:219)
-# conventions (task 2870 widens that pattern with the same three forms below;
-# this is a deliberately independent, self-contained copy — see the NOT
-# imported note just below — so it does not depend on 2870's landing state).
+# Derived from — and, as of task 4705, deliberately NARROWER than —
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN (task 2870 widened
+# that pattern with the same three additional forms below; this is a
+# deliberately independent, self-contained copy — see the NOT imported note
+# just below — so it does not depend on 2870's landing state). The two are
+# allowed to diverge: orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN
+# and orchestrator/merge_gates.py::ALREADY_LANDED_CITATION_PATTERN both still
+# accept an optional-`#` bare-paren form (`\(#?{tid}\)` / `\(#?{tid}\)!?:`)
+# that task 4705 did not touch — lower-risk there, since both test one
+# ALREADY-KNOWN task id (`{tid}`-interpolated: "does this one candidate cite
+# MY task", never "extract every id") applied to the commit SUBJECT only
+# (git_ops.py) or immediately after the conventional-commit type word
+# (merge_gates.py), never to the whole commit MESSAGE this script scans.
 # NOT imported from there — orchestrator.git_ops pulls in the whole GitOps
 # stack, and a fused-memory -> orchestrator runtime import is architecturally
 # backwards (see task 2645 design decisions). This local pattern is
@@ -76,27 +85,71 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # interpolation as the orchestrator version does:
 #   - conventional-commit subject: `impl(50): ...` / `fix(50): ...`
 #   - `task/{id}` branch mention: `Merge task/50 into main`, `... task/50 ...`
-#   - hash-paren / bare-paren: `(#50)` / `(50)` anywhere in the message
+#   - hash-paren: `(#50)` anywhere in the message
 #   - task-word paren: `(task 50)` anywhere in the message
 # `\d+` is greedy, so a captured id is always the FULL digit run — `task/339`
 # never yields a citation match for id '3399', nor vice versa. The paren/hash
 # forms need no `\b` guard: the literal parens (and optional `#`) are
 # self-delimiting, so `(#2870)` can never yield a truncated '287'.
-# Accepted false-positive tradeoff: unlike `(#N)`/`(task N)`, bare `(N)`
-# matches ANY parenthesized integer (a step ref, a year, a count), not just
-# genuine citations — so an incidental one can flip a correctly-attributed
-# found_on_main task to `misattributed` (see
-# TestClassifyMisattributed.test_bare_paren_incidental_number_is_an_accepted_false_positive
-# in the test module). Accepted because the misattribution check only fires
-# when the audited task_id is absent from the cited set, `--apply` never
-# reopens a task, and the net effect is fewer missed true-positive citations
-# — this offline audit trades a bounded false-positive rate (surfaced for
-# human review, not auto-corrected) for fewer missed misattributions.
+# Bare-paren tradeoff, reversed by task 4705: bare `(N)` used to match ANY
+# parenthesized integer (a step ref, a year, a count) and feed it to
+# extract_cited_task_ids as a citation, which could flip a correctly-
+# attributed found_on_main task to `misattributed` (see
+# TestClassifyMisattributed.test_bare_paren_incidental_number_is_no_longer_misattributed
+# in the test module). That was an acceptable tradeoff while this was an
+# offline audit whose false positives were surfaced for a human to filter
+# (`--apply` never reopens a task). It stopped being acceptable once
+# check_found_on_main_spurious_rate.py wrapped this audit in a binary exit
+# code gating a milestone — a gate has no human in the loop to filter a
+# false positive, so a bounded false-positive rate became a hard blocker.
+# Measured evidence (main HEAD 72286f53b9): bare `(N)` misread task 3869's
+# lock-row prose as citing {'1400', '1500'}, task 3924's enumerated review-
+# remediation body as citing {'1', '8'}, task 4265's zero-count prose as
+# citing {'0'}, and task 3977's timeout/count prose as citing {'180', '20',
+# ...} — three of those four were content-verified HONEST during the
+# esc-2683-1 triage. `(#N)` and `(task N)` still cite, so the true-positive
+# case that motivated widening to paren forms in the first place is
+# unaffected.
+#
+# That evidence covers only the SHRINKING direction (fewer/no ids
+# extracted) and was not re-measured live against the production task
+# corpus (review remediation, task 4705 amendment pass) — this task holds
+# no lock on that corpus to run a before/after `verdict_counts` diff, so
+# one is filed as a follow-up instead. Two reverse-direction effects were
+# traced through `_classify_core` below rather than measured live:
+#   (1) self-citation SUPPRESSION narrows too, not just other-task
+#       DETECTION — a message citing the audited task ONLY via bare-paren
+#       while citing a *different* task in one of the three surviving
+#       forms (e.g. subject `impl(77): backfill` + body `Also closes
+#       (50).`, audited for task 50) now flags `misattributed`, where the
+#       bare-paren self-citation used to short-circuit that guard. Covered
+#       by
+#       TestClassifyMisattributed.test_self_citation_only_in_bare_paren_form_now_flags_misattributed
+#       below; accepted as rare for this corpus, since self-citation here
+#       is overwhelmingly written in the conventional-commit subject form.
+#   (2) a found_on_main task with no declared files whose only self-
+#       citation was bare-paren reclassifies `ok` -> `unverifiable`.
+#       Relabeling only, not a new gating false positive: `unverifiable`
+#       is not a member of `_FLAGGED_VERDICTS` below, so it never trips
+#       `_has_flagged_findings` / `--fail-on-findings`.
+#
+# Residual, un-addressed false-positive source (out of this task's scope):
+# the `task/{id}` branch-mention alternative above matches ANYWHERE in the
+# message, not just a merge subject — body prose like "rebased on top of
+# task/3869" or "supersedes task/4012" makes `cited` non-empty with a
+# foreign id, which can flag a correctly-attributed found_on_main task
+# `misattributed` the same way bare parens used to, and this repo's commit
+# bodies cite other tasks in prose considerably more often than they
+# happen to contain an incidental bare-paren integer. Anchoring
+# `task/{id}` to the subject line would close it;
+# plans/found-on-main-provenance-integrity-prd.md label δ already tracks
+# an analogous subject-anchoring fix for git_ops.py's own citation regex,
+# but not for this script's independent copy.
 CITATION_PATTERN = re.compile(
     r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
     r'|\btask/(?P<branch_tid>\d+)\b'
-    r'|\(#?(?P<paren_tid>\d+)\)'
+    r'|\(#(?P<paren_tid>\d+)\)'
     r'|\(task (?P<task_word_tid>\d+)\)',
     re.MULTILINE,
 )
@@ -197,8 +250,8 @@ def extract_cited_task_ids(message: str) -> set[str]:
     Mirrors the citation conventions in ``CITATION_PATTERN`` above:
     conventional-commit ``type(id):`` subjects, ``task/{id}`` mentions
     (which subsumes the ``Merge task/{id} into <main>`` merge-commit
-    subject), hash-paren/bare-paren ``(#id)``/``(id)``, and the task-word
-    paren form ``(task id)``. Returns an empty set for a message with no
+    subject), hash-paren ``(#id)``, and the task-word paren form
+    ``(task id)``. Returns an empty set for a message with no
     citations — never raises.
     """
     ids: set[str] = set()

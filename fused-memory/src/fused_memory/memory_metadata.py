@@ -80,13 +80,6 @@ from fused_memory.topic_slug import (
 # "is this a canonical full UUID" from ONE definition (INV-5).
 from fused_memory.utils.validation import is_full_uuid
 
-#: Back-compat alias for the pre-move private spelling; import
-#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
-# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
-# tests/test_retro_stamp_topics.py import the predicate directly (both are
-# outside this task's locked file scope).
-_is_full_uuid = is_full_uuid
-
 __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
@@ -168,9 +161,21 @@ def normalize_supersedes(value: Any) -> list[Any]:
 #:
 #: Generated mechanically from the census artifact, NOT read at import
 #: time: a registry that mutates when an artifact is regenerated is not
-#: a registry.  ``tests/test_memory_metadata.py::TestKindRegistry`` loads
-#: the artifact and asserts this literal against it, so a regeneration
-#: that adds a kind fails the suite loudly instead of drifting silently.
+#: a registry.  ``tests/test_memory_metadata.py::TestKindRegistry`` asserts
+#: this literal against the census it was DERIVED from — a frozen
+#: projection at ``tests/fixtures/census-grandfather-oracle.json``, not the
+#: live ``plans/`` artifact, which task 4006 turned into a nightly
+#: regenerated trend input (see that constant's docstring for the full
+#: rationale, and for why re-deriving needs leaf β review rather than a
+#: fixture refresh).
+#:
+#: KNOWN STALE against the live corpus as of 2026-08-16: 4006's first live
+#: census measured 385 distinct ``kind`` values vs the 329 below (+70 new,
+#: −14 disappeared).  Harmless under the shipped defaults —
+#: ``enforce_kind_registry`` is False and deliberately stays off (see the
+#: WARNING below) — so nothing is rejected; re-derivation is queued as
+#: reviewed leaf-β work, including a policy for values that LEAVE the
+#: corpus, which this registry does not currently have.
 KIND_REGISTRY: frozenset[str] = frozenset({
     # ---------------------------------------------------------------
     # BLOCK 1 — CENSUS-MEASURED (329 values)

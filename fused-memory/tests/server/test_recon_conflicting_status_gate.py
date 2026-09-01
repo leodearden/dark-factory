@@ -17,6 +17,18 @@ _TERMINAL_ONLY_CONTENT = 'Task 4802 has landed as merge commit eb7f5d6437.'
 _NON_TERMINAL_ONLY_CONTENT = 'Task 4802 is still pending.'
 _PROJECT_ID = 'dark_factory'
 
+# (task 3403) The same conflicting framing, but with a dotted technical token —
+# a config filename — between the ref and its status marker. Byte-identical to
+# the unit fixture in test_task_filter.py, keeping the unit and gate layers in
+# lockstep. Before the clause-splitter widening every dot ended a clause, so
+# this shattered into '...Task 4802 (tracked in dark-factory-orchestrator' +
+# 'yaml) is still pending', divorcing the ref from 'still pending': the
+# detector returned set() and the write sailed through the gate.
+_CONFLICTING_DOTTED_CONTENT = (
+    'Task 4802 (tracked in dark-factory-orchestrator.yaml) is still pending. '
+    'Task 4802 landed as merge commit eb7f5d6437.'
+)
+
 
 class TestAddEpisodeConflictingStatusGate:
     """Write-gate: recon-stage- agents must not write content via add_episode that
@@ -54,6 +66,40 @@ class TestAddEpisodeConflictingStatusGate:
         )
         assert result.get('content_excerpt') == _CONFLICTING_CONTENT[:200], (
             f'Expected content_excerpt=content[:200], got: {result!r}'
+        )
+        assert result.get('conflicting_task_ids') == [4802], (
+            f'Expected conflicting_task_ids=[4802], got: {result!r}'
+        )
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_conflicting_status_with_dotted_token_between_ref_and_status(self):
+        """(task 3403) A dotted filename between the ref and its status marker
+        must not let a conflicting-status write past the gate.
+
+        This is the shipped consequence of the clause-splitter widening, not
+        just the pure function: the gate is what actually protects Graphiti from
+        the before/after narration that extraction atomizes into two
+        self-contradictory edges. MEASURED before the widening: the detector
+        returned set(), so this write was NOT blocked and add_episode ran.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _CONFLICTING_DOTTED_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'conflicting_task_status_framing_write_blocked', (
+            f"Expected error='conflicting_task_status_framing_write_blocked' for "
+            f'content whose ref and status marker are separated by a dotted '
+            f'filename, got: {result!r}'
         )
         assert result.get('conflicting_task_ids') == [4802], (
             f'Expected conflicting_task_ids=[4802], got: {result!r}'
@@ -146,6 +192,36 @@ class TestAddMemoryConflictingStatusGate:
         )
         assert result.get('error_type') == 'ReconConflictingTaskStatusWriteRejected', (
             f"Expected error_type='ReconConflictingTaskStatusWriteRejected', got: {result!r}"
+        )
+        assert result.get('conflicting_task_ids') == [4802], (
+            f'Expected conflicting_task_ids=[4802], got: {result!r}'
+        )
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_conflicting_status_with_dotted_token_between_ref_and_status(self):
+        """(task 3403) The add_memory/temporal_facts arm of the same gate must
+        also block when a dotted filename sits between the ref and its status
+        marker. MEASURED before the widening: not blocked, add_memory ran.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONFLICTING_DOTTED_CONTENT,
+                'category': 'temporal_facts',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'conflicting_task_status_framing_write_blocked', (
+            f"Expected error='conflicting_task_status_framing_write_blocked' for "
+            f'content whose ref and status marker are separated by a dotted '
+            f'filename, got: {result!r}'
         )
         assert result.get('conflicting_task_ids') == [4802], (
             f'Expected conflicting_task_ids=[4802], got: {result!r}'

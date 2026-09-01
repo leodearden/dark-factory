@@ -30,8 +30,10 @@ and are NOT already covered by other tests:
    ``overrides_db_path`` so ``OverrideStore.from_config(config)`` can call
    ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
 
-6. **``make_steward`` owns its worktree** — the shared steward factory (as of
-   task 3514, the suite's *only* one) must root every worktree it builds
+6. **``make_steward`` owns its worktree** — the shared steward factory (the
+   suite's steward factory; the sites outside it, and the ruling that the split
+   is PERMANENT, are recorded in its ``conftest.py`` docstring and enforced by
+   ``test_steward_scaffolding_guards.py``) must root every worktree it builds
    strictly *below* the test's ``tmp_path``, whether the caller supplies one or
    not, so pytest's retention policy reclaims both the worktree and the
    ``.task-meta`` sibling the steward derives from it, and two default builds in
@@ -235,21 +237,25 @@ class TestInitHarnessStateForTest:
     Guards two invariants:
 
     1. **Digest counters initialised** — after ``Harness.__new__(Harness)``
-       followed by ``_init_harness_state_for_test(h)``, the four task-1327
-       AFK-hardening digest counters exist at their ``Harness.__init__``
-       defaults.  Without the helper the attributes are absent and
+       followed by ``_init_harness_state_for_test(h)``, the six digest
+       counters (four from task-1327 AFK hardening plus the two task-4559
+       submissions counters) exist at their ``Harness.__init__`` defaults.
+       Without the helper the attributes are absent and
        ``_maybe_write_digest`` raises ``AttributeError`` (now surfaced by the
        narrowed catch-all added in step-4; previously silently swallowed).
 
     2. **Safe on already-initialised harness** — calling the helper a second
-       time on a harness that already has the four counters set does NOT raise.
+       time on a harness that already has the six counters set does NOT raise.
        Idempotence on *pre-existing values* is NOT required (the helper
        unconditionally overwrites with defaults), but it must not crash so that
        stacked helpers remain safe in future fixtures.
     """
 
     def test_digest_counters_set_to_init_defaults(self, tmp_path) -> None:
-        """Four task-1327 digest counters are present at their __init__ defaults.
+        """Six digest counters are present at their __init__ defaults.
+
+        Four from task 1327 (AFK hardening) plus the two task-4559 submissions
+        counters, which split the EWA NUMERATOR away from the digest GATE.
 
         This test FAILS before step-2 because ``_init_harness_state_for_test``
         does not yet exist in ``_orch_helpers``.
@@ -272,6 +278,13 @@ class TestInitHarnessStateForTest:
         )
         assert h._last_digest_window_end_iso == '', (
             f'_last_digest_window_end_iso expected \'\', got {h._last_digest_window_end_iso!r}'
+        )
+        # Task 4559: submissions-only EWA numerator, snapshotted like the events pair.
+        assert h._escalation_submit_count == 0, (
+            f'_escalation_submit_count expected 0, got {h._escalation_submit_count!r}'
+        )
+        assert h._last_digest_submit_count == 0, (
+            f'_last_digest_submit_count expected 0, got {h._last_digest_submit_count!r}'
         )
 
     def test_helper_does_not_crash_on_already_initialised_harness(self, tmp_path) -> None:
@@ -317,12 +330,13 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
 class TestMakeStewardFixture:
     """Contract tests for the ``make_steward`` conftest fixture-factory.
 
-    ``make_steward`` is the suite's ONLY steward factory.  Task 3461 merged the
-    two near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
-    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
-    that remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
-    five-fixture graph, whose fixture names survive there as views onto a single
-    build).  See the fixture docstring in ``conftest.py``.
+    ``make_steward`` is the suite's steward factory.  The sites that sit outside
+    it, and the reason each does, are owned by the fixture's own docstring in
+    ``conftest.py`` — deliberately not restated here, since the same rationale
+    living in three copies is the drift task 3647 existed to end.  That task
+    ruled the split PERMANENT rather than deferred, and enforced the ruling with
+    a census in ``test_steward_scaffolding_guards.py``.  Read the fixture
+    docstring, then that census, before attempting another consolidation.
 
     Because it closes over ``tmp_path`` it can *own* the worktree directory
     rather than merely documenting a convention, which is what these tests pin:
@@ -380,26 +394,26 @@ class TestMakeStewardFixture:
         )
 
     def test_project_root_is_a_real_path_inside_the_sandbox(self, make_steward, tmp_path):
-        """``config.project_root`` is a real ``Path`` under ``tmp_path``, not a bare mock.
+        """``make_steward``'s PRODUCED ``config.project_root`` satisfies the sandbox invariant.
 
-        The sandbox invariant this refactor fixed: the retired triage factory
-        set the ``/tmp/project`` literal, which pointed outside the test's tmp
-        dir, so anything the steward wrote relative to it escaped pytest's
-        retention sweep.  A ``MagicMock`` here would also silently satisfy every
-        ``/``-join in the steward without producing a real directory.
+        The invariant itself — a real ``Path``, a created directory, strictly
+        below ``tmp_path`` — is owned by
+        ``_orch_helpers.assert_sandboxed_project_root``, along with the full
+        rationale for each of its four clauses.  This test's job is only to pin
+        that the fixture's produced root satisfies it; ``make_steward`` is the
+        PRODUCER of that value and is deliberately not self-checked.
+
+        Folding onto the helper STRENGTHENED this test (task 3647): the copy
+        that lived here carried neither the ``.is_dir()`` clause nor the
+        strictly-below clause.
 
         The scalar config defaults (``steward_max_attempts``, ``models.*``,
         ``escalation.port``, …) are deliberately NOT asserted — they would
         restate ``conftest.py``'s literals without detecting a regression.
         """
-        project_root = make_steward().config.project_root
-        assert isinstance(project_root, Path), (
-            f'expected project_root to be a real Path, got {type(project_root).__name__!r}'
-        )
-        assert project_root.resolve().is_relative_to(tmp_path.resolve()), (
-            f'expected project_root under tmp_path={tmp_path}, got {project_root} — '
-            f'the old /tmp/project literal pointed outside the test sandbox'
-        )
+        from _orch_helpers import assert_sandboxed_project_root
+
+        assert_sandboxed_project_root(make_steward().config.project_root, tmp_path)
 
     def test_config_overrides_applied_after_defaults(self, make_steward):
         """``config_overrides`` wins over the defaults, and does not leak between builds.

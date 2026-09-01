@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
@@ -3117,3 +3118,317 @@ class TestReconReportComponentsWiring:
         assert state._ttl_seconds == 300  # type: ignore[attr-defined]
         assert mcp.name == 'Recon Report'
         assert uv_cfg.port == 8003
+
+
+# ---------------------------------------------------------------------------
+# task 2979: apply_citation_verification — the verification write-back
+# ---------------------------------------------------------------------------
+
+
+class _WBFakeMemoryService:
+    """Minimal memory service for the write-back tests — every id 'exists' at
+    cite time, so a phantom has to be created the way production creates one:
+    cited successfully, then verified later and found gone."""
+
+    async def get_memory(self, memory_id: str, project_id: str, store: str) -> dict:
+        return {'category': 'observations_and_summaries', 'agent_id': 'x', 'created_at': 'now'}
+
+
+class TestApplyCitationVerification:
+    """``verify_cited_memories`` must reach the AUTHORITATIVE recon_report
+    record, not just the throwaway projection (task 2979, Gap B).
+
+    ``get_assembled_report`` builds a FRESH dict per finding with
+    ``'cited_memories': list(f.cited_memories)`` — a NEW list object. So the
+    verification pass in ``BaseStage.run()`` mutates that projection while the
+    authoritative ``_Finding``, and the durable SQLite row written inside the
+    CLI subprocess at add_finding/cite_memory/complete time (strictly BEFORE
+    verification runs), keep the phantom forever. Two stores then permanently
+    disagree about the same finding's citations, and which one a consumer reads
+    decides whether it sees the phantom. ``apply_citation_verification`` closes
+    that divergence.
+    """
+
+    _GOOD = 'd4e5f6a7-b8c9-0123-d456-e78f9a0b1c2d'
+    _PHANTOM = 'b47ded9b-1111-4222-8333-444444444444'
+
+    def _state_with_two_citations(self, tmp_path=None):
+        """A completed report whose single finding cites _GOOD and _PHANTOM."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        store = None
+        if tmp_path is not None:
+            from fused_memory.server.recon_report_store import ReconReportStore
+
+            store = ReconReportStore(tmp_path / 'recon_report_state.db')
+            store.open()
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_WBFakeMemoryService(),
+            store=store,
+        )
+        run_id = 'run-wb-1'
+        state.start_report(run_id=run_id, stage='memory_consolidator', project_id='dark_factory')
+        finding_id = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='memory_stale',
+            description='a finding citing a phantom',
+            suggested_action='a',
+            actionable=True,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+        )['finding_id']
+        return state, store, run_id, finding_id
+
+    async def _cite_both(self, state, run_id, finding_id):
+        await state.cite_memory(run_id, finding_id, self._GOOD, 'mem0')
+        await state.cite_memory(run_id, finding_id, self._PHANTOM, 'mem0')
+
+    def _verification_result(self, finding_id):
+        """What BaseStage.run()'s verification pass concluded: keep _GOOD, drop
+        _PHANTOM (get_memory_by_id returned None for it)."""
+        return [
+            {
+                'finding_id': finding_id,
+                'cited_memories': [{'memory_id': self._GOOD, 'store': 'mem0'}],
+                'citation_failures': [
+                    {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+                ],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_phantom_stripped_from_authoritative_findings(self):
+        """After apply_citation_verification, neither get_findings_for_run nor
+        get_assembled_report lists the phantom id."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        # Pre-condition: both ids are on the authoritative record.
+        pre = state.get_findings_for_run(run_id)[0]
+        assert [c['memory_id'] for c in pre['cited_memories']] == [self._GOOD, self._PHANTOM]
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        post = state.get_findings_for_run(run_id)[0]
+        assert [c['memory_id'] for c in post['cited_memories']] == [self._GOOD]
+
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        assembled_finding = assembled['flagged_items'][0]
+        assert [c['memory_id'] for c in assembled_finding['cited_memories']] == [self._GOOD]
+
+    @pytest.mark.asyncio
+    async def test_citation_failure_marker_is_recorded_and_projected(self):
+        """The dropped phantom is recorded on the finding and visible to BOTH
+        readers — the marker is what makes the phantom claim surfaced rather
+        than silently vanished."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        expected = [{'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'}]
+        assert state.get_findings_for_run(run_id)[0]['citation_failures'] == expected
+        assembled = state.get_assembled_report(run_id, 'memory_consolidator')
+        assert assembled is not None
+        assert assembled['flagged_items'][0]['citation_failures'] == expected
+
+    @pytest.mark.asyncio
+    async def test_correction_is_durable_across_a_fresh_hydrate(self, tmp_path):
+        """The correction reaches the SQLite row, not just memory.
+
+        This is the assertion that actually closes the divergence: a brand-new
+        ReconReportState hydrating from the same db file must see the corrected
+        citations. Without the _persist_run write-back, the row still carries
+        the pre-verification phantom.
+        """
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        state, store, run_id, finding_id = self._state_with_two_citations(tmp_path)
+        assert store is not None  # tmp_path was passed, so a store was built.
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        # Re-open the same db in a fresh state object and hydrate.
+        store.close()
+        reopened = ReconReportStore(tmp_path / 'recon_report_state.db')
+        reopened.open()
+        rehydrated = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WBFakeMemoryService(),
+            store=reopened,
+        )
+        rehydrated.hydrate_from_store()
+
+        durable = rehydrated.get_findings_for_run(run_id)
+        assert durable, 'the run must survive hydrate_from_store'
+        assert [c['memory_id'] for c in durable[0]['cited_memories']] == [self._GOOD], (
+            'the persisted row still carries the phantom — the verification '
+            'result never reached the durable store'
+        )
+        assert durable[0]['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_accepted_after_complete_unlike_delete_finding(self):
+        """The _ERR_ALREADY_COMPLETED guard must NOT apply here.
+
+        This write-back is a harness-side integrity correction that by
+        construction runs after the CLI subprocess called complete(), so
+        applying delete_finding's guard would reject every legitimate call. The
+        asymmetry is deliberate: unlike a retraction it only edits citation
+        lists, never adds or removes a finding, so complete()'s cached
+        flagged_count is unaffected.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        completed = state.complete(run_id, summary='s')
+        flagged_count_before = completed['flagged_count']
+
+        result = state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        assert 'error' not in result, (
+            f'post-complete write-back must be accepted, got {result!r}'
+        )
+        # Contrast: delete_finding on the same completed entry IS rejected.
+        assert state.delete_finding(run_id, finding_id).get('error') == 'report_already_completed'
+        # flagged_count is untouched — only citation lists changed.
+        assert len(state.get_findings_for_run(run_id)) == flagged_count_before
+
+    @pytest.mark.asyncio
+    async def test_repeat_pass_does_not_duplicate_citation_failure_markers(self):
+        """A second pass over the same (run_id, stage) is IDEMPOTENT.
+
+        The caller sends the FULL citation_failures list off the assembled
+        projection, not the delta it appended — and get_assembled_report
+        projects the already-persisted markers straight back out. A plain
+        extend therefore re-appended every prior marker on every repeat. A
+        repeat is architecturally reachable: start_report is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke stage.run() under the same run_id.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+        # Second pass sends exactly what get_assembled_report now projects: the
+        # surviving citation AND the marker the first pass persisted.
+        state.apply_citation_verification(run_id, self._verification_result(finding_id))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert durable['citation_failures'] == [
+            {'memory_id': self._PHANTOM, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ], 'a repeat pass must not duplicate the marker it already persisted'
+        assert [c['memory_id'] for c in durable['cited_memories']] == [self._GOOD]
+
+    @pytest.mark.asyncio
+    async def test_repeat_verification_error_dedupes_across_error_types(self):
+        """The dedupe key is (memory_id, store, reason) — error_type excluded.
+
+        Two verification errors for the same citation record the same fact
+        ("this id could not be resolved") whichever exception class surfaced
+        it. Keying on error_type would let a flapping backend grow the list
+        without bound across repeat passes.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        def _err_result(error_type):
+            return [
+                {
+                    'finding_id': finding_id,
+                    'cited_memories': [
+                        {'memory_id': self._GOOD, 'store': 'mem0'},
+                        {'memory_id': self._PHANTOM, 'store': 'mem0'},
+                    ],
+                    'citation_failures': [
+                        {
+                            'memory_id': self._PHANTOM,
+                            'store': 'mem0',
+                            'reason': 'verification_error',
+                            'error_type': error_type,
+                        },
+                    ],
+                },
+            ]
+
+        state.apply_citation_verification(run_id, _err_result('TimeoutError'))
+        state.apply_citation_verification(run_id, _err_result('ConnectionError'))
+
+        durable = state.get_findings_for_run(run_id)[0]
+        assert len(durable['citation_failures']) == 1, (
+            f'error_type must not split the dedupe key, got '
+            f'{durable["citation_failures"]!r}'
+        )
+        assert durable['citation_failures'][0]['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_no_op_result_does_not_repersist_the_run(self):
+        """A result that changes nothing must not drive a _persist_run.
+
+        _persist_run re-serialises and upserts EVERY entry of the run, and the
+        overwhelmingly common case is a clean verification pass where every
+        citation resolved. Recording "nothing moved" at the cost of a full-run
+        rewrite, once per stage per cycle, is pure waste.
+        """
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        # Echo back exactly what the projection carries — which is what
+        # BaseStage.run() sends after a pass that dropped nothing. Built from
+        # the projection rather than hand-written so the no-op stays a no-op if
+        # cite_memory's entry shape ever gains a field.
+        projected = state.get_findings_for_run(run_id)[0]
+        no_op = [
+            {
+                'finding_id': finding_id,
+                'cited_memories': projected['cited_memories'],
+                'citation_failures': projected['citation_failures'],
+            },
+        ]
+        with patch.object(state, '_persist_run') as persist:
+            result = state.apply_citation_verification(run_id, no_op)
+
+        assert result['findings_updated'] == 1, 'the finding still RESOLVED'
+        assert result['findings_changed'] == 0, 'but nothing about it moved'
+        assert persist.call_count == 0, 'a no-op write-back must not re-persist the run'
+
+    @pytest.mark.asyncio
+    async def test_unknown_finding_id_is_skipped_not_raised(self):
+        """A post-hoc hygiene pass must never fail a stage: an unresolvable
+        finding_id is logged and skipped, and the resolvable ones still apply."""
+        state, _store, run_id, finding_id = self._state_with_two_citations()
+        await self._cite_both(state, run_id, finding_id)
+        state.complete(run_id, summary='s')
+
+        results = [
+            {'finding_id': 'no-such-finding', 'cited_memories': [], 'citation_failures': []},
+            *self._verification_result(finding_id),
+        ]
+        state.apply_citation_verification(run_id, results)  # must not raise
+
+        assert [
+            c['memory_id'] for c in state.get_findings_for_run(run_id)[0]['cited_memories']
+        ] == [self._GOOD]
+
+    def test_unknown_run_id_is_skipped_not_raised(self):
+        """Same posture for a run_id that no longer exists (TTL-reaped)."""
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+        state.apply_citation_verification('no-such-run', [])  # must not raise

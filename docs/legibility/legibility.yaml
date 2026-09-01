@@ -6,7 +6,18 @@
 # CLI (--config defaults to this path).
 project_id: dark_factory
 project_root: /home/leo/src/dark-factory
-escalation_port: 8103
+# 8102 is dark_factory's ORCHESTRATOR escalation queue, and it is the only
+# correct value here. Do not point this at 8103 (fused-memory's RECONCILIATION
+# queue): that queue has no promotion ladder — `promote_to_l2` exists in
+# orchestrator/ and escalation/ and appears NOWHERE in fused-memory/src — so an
+# L0 filed there stays L0 forever, behind a hand-launched consumer. Measured on
+# the 2026-08-18 twin failure: reify's identical trickle L0 went L0->L1->L2 and
+# reached a human in ~10 minutes on its orchestrator port, while dark_factory's
+# (esc-legibility-trickle-dark_factory-1, "38/38 digests failed") sat unpromoted
+# for 2d3h and was then closed only INCIDENTALLY, as a side effect of a human
+# ruling reify's twin. Ruled by Leo 2026-08-25 (esc-4526-1): this was always a
+# misconfiguration, never a routing choice.
+escalation_port: 8102
 # reify adds warm-lane + worktree roots; the inventory pre-filters
 # ~/.claude/projects encoded dir names by these prefixes (57 encodings for
 # dark-factory today: main checkout + .worktrees/.claude-worktrees children).

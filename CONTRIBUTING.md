@@ -110,6 +110,68 @@ Other top-level dirs:
 - **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
   install via `hooks/setup.sh`.
 
+<!-- line-pin-policy:begin
+     The repo's decision on bare `file.py:NNN` citations (esc-3815-7).
+     Mirrored in CLAUDE.md and pinned by
+     tests/scripts/test_line_pin_policy.py — that guard asserts these
+     markers still delimit non-empty prose and that nothing enforces the
+     convention mechanically. It deliberately asserts nothing about the
+     WORDING below, so this paragraph can be rewritten freely. -->
+
+**Cite code by symbol, not by line number.** The blessed form for a
+cross-file reference in a source comment or docstring is
+`path/to/module.py::symbol`. It is greppable and it survives edits above
+the site; a bare `module.py:1234` does neither.
+
+**The existing bare pins are tolerated drift, not debt.** Measured for
+esc-3815-7 (2026-08-24): **428 bare `file.py:NNN` pins** across the four
+`src` trees, 1842 repo-wide in `.py`. A 49-pin hand-adjudicated sample put
+**~80% of them wrong** (Wilson 95% CI 66–89%) with a median time-to-rot of
+about **six days**, and two of eight blame-traced pins were wrong at the
+commit that authored them. A task proposing to sweep them — repo-wide or
+over some subset — is correctly closable as won't-fix, and so is an
+escalation re-reporting the population.
+
+A repo-wide sweep was considered and declined for four reasons.
+**No realised harm has ever been found**: a search of 9,579 agent
+transcripts, 5,629 escalation records and full `git log --all` bodies
+returns zero cases of a wrong pin misleading a reader, against a
+same-method control that returns 25 for `git stash`. Wrong pins are
+useless rather than deceptive — 0% cite past end-of-file, ~32% land on a
+blank line, import or comment, and nearly all sit beside a symbol name the
+reader greps in seconds. **The repair is mostly not mechanical**: only 78
+of the 428 can be rewritten by script, and 143 name no symbol at all —
+they describe a behaviour, so a sweep would either drop information or
+invent it. **The diff conflicts with most in-flight work**: 476 files
+carry a pin, and 58% of the branches active in a given three-day window
+touch one — the objection §3 records for `ruff format`, with a worse
+ratio. And **a one-off sweep buys about a week** before the six-day rot
+half-life catches up.
+
+**The rule, scoped deliberately to the change in front of you:** cite by
+symbol in prose *this change introduces or edits*. Don't de-number a file
+you are merely passing through. An unscoped sweep is the expensive gate
+that gets routed around rather than applied — the same reasoning
+`skills/prd/references/author-mode.md` gives for session-scoping the
+identical rule over PRD prose, which
+`skills/prd/references/decompose-mode.md` states for `delivered_check`s.
+This paragraph extends both to source comments and docstrings.
+
+**Nothing enforces this mechanically, by choice.** A write-time guard was
+designed and costed (diff-scoped, zero violations on today's corpus) and
+declined: with zero measured harm it does not earn its ~700 lines, and the
+one prior attempt at a class-level citation guard (task 4240) burned
+$35.97 over 18 `recovery_vetoed` events without landing. Where a line
+number *is* load-bearing — a gate key, or guard prose an assertion pins —
+it gets fixed structurally instead; see task 1910's re-key of
+`shared/tests/silent_fallthrough_allowlist.py` to
+`(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
+entirely".
+
+Reversing this decision means updating this section, `CLAUDE.md` and
+`tests/scripts/test_line_pin_policy.py` together.
+<!-- line-pin-policy:end -->
+
 ---
 
 ## 3. Environment
@@ -145,7 +207,22 @@ Other top-level dirs:
   more leg the merge gate also runs —
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
   `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
-  the full chain.
+  the full chain. Despite its legacy filename that script now carries **two
+  independent mock-spec-discipline rules**, each with its own suppression
+  code (both take the form
+  `# noqa: <code> — <reason>` on the **preceding** non-blank line; the reason
+  is mandatory and an inline trailing comment is deliberately not honored):
+  - `bare-magicmock` — a config-named variable (`config`, `cfg`, `*_config`,
+    `*_cfg`) assigned an unspecced `MagicMock()`. Remedy: the
+    `mock_orch_config` fixture or `MagicMock(spec_set=pydantic_spec(...))`.
+  - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
+    registered stdlib dataclass (`VerifyResult` today), flagged in **any**
+    syntactic position including `return MagicMock(...)`. Remedy:
+    `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
+    Eleven files carry pre-existing debt, grandfathered in the script's
+    `_DATACLASS_DOUBLE_DEBT` baseline. That list is **shrink-only** — entries
+    come off as files are migrated and must never be added. A new offending
+    file is covered by default and will fail the gate.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
@@ -173,9 +250,13 @@ Other top-level dirs:
   ```bash
   cd fused-memory && uv run pyright   # also: orchestrator, dashboard
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same
-  three packages via `npx pyright` (needs Node 22+) — either invocation
-  works.
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs all seven
+  workspace members via `npx pyright` (needs Node 22+) — either invocation
+  works, and both resolve the SAME pyright version: `uv run pyright` resolves
+  the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
+  `package.json` pin that `npm ci` installs into `node_modules/`. Run `npm ci`
+  once locally, or a bare `npx pyright` fetches whatever is current instead.
+  `tests/scripts/test_pyright_version_pin.py` holds the two lanes together.
 
 Treat `dark-factory-orchestrator.yaml`'s `test_command` / `lint_command` /
 `type_check_command` as the source of truth if these drift.
@@ -204,9 +285,15 @@ it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
 **pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
 across all three if the change touches a shared dependency like `shared` or
-`escalation`). This can comfortably exceed two minutes — give commit
-commands a timeout of at least `300000`ms (or run detached via `setsid` and
-poll) rather than letting a default 2-minute timeout kill it mid-hook.
+`escalation`). That stage is path-filtered since task 2551: a commit
+staging no `.py` files skips pyright entirely and finishes in seconds
+(`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
+outside every one of those prefixes (e.g. `scripts/`, a root-level
+`conftest.py`) skips it too — silently, with no such line printed. A
+commit that does stage Python under a configured package can comfortably
+exceed two minutes — give those a timeout of at least `300000`ms (or run
+detached via `setsid` and poll) rather than letting a default 2-minute
+timeout kill it mid-hook; the two skip cases above need no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
@@ -336,6 +423,13 @@ chore: <housekeeping>
   promotion process.
 - **Don't `--no-verify` the pre-commit hook** to skip ruff/pyright — if it's
   genuinely too slow, raise the timeout instead (§4).
+- **Don't file a cleanup task — or an escalation — for a stale
+  `file.py:NNN` citation** in a comment or docstring. It is tolerated drift
+  (§2): ~80% of the 428 existing pins are already wrong and none has ever
+  been shown to mislead a reader. Fix a pin in prose you are already
+  editing; leave the rest. Twenty tasks, $141.77 and 31 escalations (14 of
+  them human-facing) have gone into this class one file at a time, against
+  a population that grows about 20x faster than the lane clears it.
 - **Don't use a bare task number as a branch slug**, or reuse a
   blocked/in-flight task's id for unrelated work — either can corrupt that
   task's merge bookkeeping (non-numeric `task/<slug>` branches are the

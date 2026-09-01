@@ -106,6 +106,15 @@ class ReindexManager:
                 fixed-dimension indices must be rebuilt.  Defaults to False for
                 backward compatibility.
 
+                HISTORICAL, and operator-facing: this was a measured NO-OP until
+                task 3769 (``GraphitiBackend.drop_vector_indices``' docstring
+                records what was broken).  The consequence for anyone reading old
+                logs is that ``Dropped 0 VECTOR index(es)`` was emitted regardless
+                of what the graph actually held, so it is NOT evidence of an
+                index-free graph.  From 3769 on the count is truthful, and a
+                failed drop propagates — with the partial list logged at ERROR —
+                rather than being reported as a clean run.
+
         Returns:
             Dict with reindex_result (ReindexResult), replay_count (int), and
             indices_dropped (list of {label, field} dicts).
