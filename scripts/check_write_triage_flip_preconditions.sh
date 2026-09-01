@@ -87,6 +87,17 @@ PROBE="$REPO/scripts/check_write_triage_attach_target.py"
 # scripts/tests/test_check_write_triage_flip_preconditions.py so the two
 # cannot drift apart silently.
 PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candidate'
+
+# The probe's marker for a pass that rests partly on a PARAMETER NAME rather
+# than on behaviour alone (it accepts a target-named parameter that echoes its
+# argument, because a real option (b) naming the target in a header is
+# structurally identical to free text that merely interpolates it). Such a pass
+# is real but unconfirmed, and a WARN buried in the probe's report is not a
+# mitigation: on a PASS this gate exits 0, DeterministicRunner files no
+# escalation, and this stdout is forwarded nowhere. So it gets its own machine
+# -detectable channel, reported on item 1's own line AND in the report's tail.
+# Pinned from both ends by the hermetic tests, like PROBE_PASS_MARKER.
+PROBE_PENDING_MARKER='PASS-NEEDS-CONFIRMATION'
 if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
   PROBE_PY="$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
 elif [ -x "$REPO/.venv/bin/python3" ]; then
@@ -106,6 +117,12 @@ fi
 
 fail=0
 report=''
+
+#: Set when item 1 passed only with the probe's name-assisted forgiveness. Not
+#: a failure -- refusing it would re-block task 3169 against a valid
+#: header-marking fix, the false-FAIL class this gate was rewritten to remove
+#: -- but not a silent pass either.
+item1_pending=0
 
 #: The NUMBERS of the items that failed, space-separated, in check order. Read
 #: only by the compact summary line at the very end of the report — see the
@@ -187,7 +204,14 @@ else
     # never again depends on the probe alone getting that right: a report that
     # does not CLAIM a pass is not one.
     if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -qF "$PROBE_PASS_MARKER"; then
-      note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
+      if printf '%s' "$probe_out" | grep -qF "$PROBE_PENDING_MARKER"; then
+        item1_pending=1
+        note "PASS  item 1  (NEEDS CONFIRMATION) the judge path binds a verdict to a"
+        note "              determinate candidate -- but the probe accepted it partly on a"
+        note "              PARAMETER NAME, not on behaviour alone. See its WARN below."
+      else
+        note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
+      fi
     elif [ "$probe_rc" -eq 0 ]; then
       note "FAIL  item 1  UNVERIFIABLE: the probe exited 0 without reporting a PASS."
       note "              Its report claims no verdict, so nothing was asserted about"
@@ -302,6 +326,16 @@ if [ -n "$failed_items" ]; then
   note "FAILING ITEMS: ${failed_items% }"
 else
   note "FAILING ITEMS: none"
+fi
+# Same reasoning as the summary above, for the one PASS that is not a clean
+# one. It sits AFTER the failing-items line because on the run where it matters
+# there are no failing items, and this is then the last thing the report says.
+if [ "$item1_pending" -ne 0 ]; then
+  note "ITEM 1 NEEDS CONFIRMATION: it passed on a target-NAMED parameter that ECHOES"
+  note "        its argument into the prompt rather than matching it against the"
+  note "        candidates. That is what a real header-marking fix looks like too, so"
+  note "        it is accepted -- but confirm BY EYE that the judge prompt tells the"
+  note "        model which candidate the attach will touch before flipping the flag."
 fi
 
 printf '%s' "$report"

@@ -125,6 +125,19 @@ _NONCE_IDS = ('probe-nonce-alpha-9f13', 'probe-nonce-beta-4c07')
 #: matters ONLY for header-style renderings that interpolate the id verbatim.
 _TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 
+#: Emitted INSTEAD of a bare WARN when a pass rests on a parameter's NAME.
+#: A warning alone mitigates nothing here and the comment above says why: on
+#: a PASS the gate exits 0, DeterministicRunner files no escalation, and the
+#: gate's stdout is forwarded nowhere, so no operator reads it. This is a
+#: distinct channel a machine can act on -- the gate greps for it (as
+#: PROBE_PENDING_MARKER) and reports item 1 as satisfied-pending-eyeball, in
+#: the report's TAIL where truncation cannot reach it. Pinned from both ends
+#: by scripts/tests/test_check_write_triage_flip_preconditions.py.
+#:
+#: It deliberately still starts a line that the PASS-marker grep does NOT
+#: match, so the two verdicts stay independent.
+_PENDING_MARKER = 'PASS-NEEDS-CONFIRMATION'
+
 
 class _Unverifiable(Exception):
     """The invariant could not be evaluated. Fails closed, never passes."""
@@ -1201,15 +1214,22 @@ def _echo_forgiven_note(param: Any) -> list[str]:
     (b) that names the target in a header looks exactly like this. Surfacing it
     keeps the operator from reading a name-assisted pass as a purely behavioural
     one.
+
+    LED BY ``_PENDING_MARKER``, not by ``WARN``. Prose reaches nobody on this
+    path: the gate exits 0 on a PASS, so no escalation is filed and its stdout
+    is forwarded nowhere. The marker is the channel the gate greps for.
     """
     return [
-        f'WARN  ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER: {param.name!r} put an',
-        '      off-slate id into the prompt verbatim rather than matching it against',
-        '      the candidates, so the swap test alone cannot separate it from free',
-        '      text that merely echoes its argument. It is accepted because its NAME',
-        '      designates the attach target (a real option (b) naming the target in a',
-        '      header renders exactly this way). Confirm by eye that the judge prompt',
-        '      genuinely tells the model which candidate the attach will touch.',
+        f'{_PENDING_MARKER}  ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER: '
+        f'{param.name!r}',
+        '      WARN this pass rests partly on a parameter NAME, not on behaviour',
+        '      alone. It put an off-slate id into the prompt verbatim rather than',
+        '      matching it against the candidates, so the swap test alone cannot',
+        '      separate it from free text that merely echoes its argument. It is',
+        '      accepted because its NAME designates the attach target (a real option',
+        '      (b) naming the target in a header renders exactly this way). Confirm by',
+        '      eye that the judge prompt genuinely tells the model which candidate the',
+        '      attach will touch.',
     ]
 
 

@@ -52,6 +52,13 @@ _SWAP_HELD = 'rendering depends on which candidate is the attach target'
 _OPTION_A_HELD = 'the verdict itself names its candidate'
 _ECHOED = 'ECHOED into the prompt'
 _ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
+#: The machine-detectable channel for a name-assisted pass. A WARN alone is
+#: no mitigation: on a PASS the gate exits 0, DeterministicRunner files no
+#: escalation and the gate's stdout is forwarded nowhere, so no operator ever
+#: reads it — verbatim the argument _TARGET_NAME_RE's own comment uses to
+#: reject the `canonical` false PASS.
+_PENDING = 'PASS-NEEDS-CONFIRMATION'
+_GATE_PENDING = 'ITEM 1 NEEDS CONFIRMATION'
 _BARE_STR = 'returns a bare str'
 _OUTSIDE_SRC_ROOT = 'outside --src-root'
 
@@ -929,6 +936,16 @@ class TestEchoedArgumentIsNotATarget:
         assert proc.returncode == 0, f'probe failed a header-marking fix:\n{proc.stdout}\n{proc.stderr}'
         assert _SWAP_HELD in proc.stdout, proc.stdout
         assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+        # ... on a channel a machine can read. Prose alone reaches nobody: the
+        # gate exits 0 on a PASS and its stdout is forwarded nowhere.
+        assert _PENDING in proc.stdout, proc.stdout
+
+    def test_a_behavioural_pass_is_not_flagged_pending(self, tmp_path):
+        """The control. A marker on every PASS would be no signal at all."""
+        src_root = _write_fake_judge(tmp_path / 'src', variant='by_id')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PENDING not in proc.stdout, proc.stdout
 
 
 class TestPayloadCarryingBinderIsNotAnEcho:
@@ -1108,6 +1125,29 @@ class TestProbeCannotPassByExiting:
         assert marker in proc.stdout, (
             f'the gate greps for {marker!r}, which the probe no longer '
             f'emits on a PASS:\n{proc.stdout}'
+        )
+
+    def test_the_gates_pending_marker_matches_the_probes_own_wording(self, tmp_path):
+        """The same drift guard for the name-assisted pass channel.
+
+        If the probe reworded it, every name-assisted pass would be reported
+        as an ordinary one and the eyeball confirmation it exists to demand
+        would be silently dropped — the failure is INVISIBLE, since the gate
+        still exits 0 either way.
+        """
+        marker = None
+        for line in _GATE_SCRIPT.read_text().splitlines():
+            if line.startswith('PROBE_PENDING_MARKER='):
+                marker = line.split('=', 1)[1].strip().strip("'\"")
+                break
+        assert marker, 'the gate no longer defines PROBE_PENDING_MARKER'
+
+        src_root = _write_fake_judge(tmp_path / 'src', variant='target_named_header')
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, proc.stdout
+        assert marker in proc.stdout, (
+            f'the gate greps for {marker!r}, which the probe no longer emits on a '
+            f'name-assisted pass:\n{proc.stdout}'
         )
 
 
@@ -1597,6 +1637,37 @@ class TestFlipPreconditionsScript:
         )
         assert 'FAIL  item 1' in proc.stdout, proc.stdout
         assert _UNVERIFIABLE in proc.stdout, proc.stdout
+
+    def test_name_assisted_pass_is_reported_as_needing_confirmation(self, tmp_path):
+        """The WARN has to reach the GATE's report, not just the probe's.
+
+        Reviewer-reported hole (cycle 5): a judge whose only extra parameter
+        merely interpolates its argument passes as long as the parameter is
+        target-NAMED, and on a PASS the gate exits 0, DeterministicRunner files
+        no escalation, and the gate's stdout is forwarded nowhere. The
+        `_echo_forgiven_note` WARN therefore mitigated nothing — which is
+        verbatim the argument `_TARGET_NAME_RE`'s comment uses to reject the
+        `canonical` false PASS. Give it a machine-detectable channel instead.
+        """
+        repo = _make_gate_repo(tmp_path, judge='target_named_header', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert 'NEEDS CONFIRMATION' in proc.stdout, proc.stdout
+        # The probe's own WARN survives into the gate's report ...
+        assert _ECHO_FORGIVEN in proc.stdout, proc.stdout
+        # ... and the demand for an eyeball sits in the TAIL, which is the part
+        # that survives the escalation detail's 2000-char truncation.
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert _GATE_PENDING in tail, tail
+
+    def test_a_behavioural_pass_is_not_reported_as_needing_confirmation(self, tmp_path):
+        """The control: an ordinary PASS must stay an ordinary PASS."""
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert 'NEEDS CONFIRMATION' not in proc.stdout, proc.stdout
 
     def test_items_2_and_4_still_fail_on_their_patterns(self, tmp_path):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
