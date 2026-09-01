@@ -1626,9 +1626,13 @@ class TargetedReconciler:
             queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
             index = {}
             for esc in await asyncio.to_thread(queue.get_pending):
+                # str() both sides of what get_by_task compared with ==, so an
+                # int-typed task_id still pins its dependent rather than
+                # silently missing the lookup.
                 pinned = str(getattr(esc, 'task_id', '') or '')
+                esc_id = str(getattr(esc, 'id', '') or '')
                 if pinned:
-                    index.setdefault(pinned, []).append(getattr(esc, 'id', None))
+                    index.setdefault(pinned, []).append(esc_id)
         except Exception:
             logger.warning(
                 'sweep: could not read the escalation store for the '
