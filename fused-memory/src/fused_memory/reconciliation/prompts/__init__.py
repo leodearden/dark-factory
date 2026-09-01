@@ -411,7 +411,7 @@ _RECON_REPORT_PLACEHOLDERS = {
 # tests/test_recon_report_guidance_drift.py::TestCuratedGuidanceTablesStayInSync,
 # and a slip degrades to a generic bullet rather than raising (see
 # _render_recon_report_tool_guidance's is_annotated()).
-_GUIDANCE_TOOL_ORDER = (
+_GUIDANCE_TOOL_ORDER: tuple[str, ...] = (
     'add_finding',
     'delete_finding',
     'cite_entity',
@@ -430,7 +430,7 @@ _GUIDANCE_TOOL_ORDER = (
 # inserting delete_finding between filing and citing does not strand a
 # colon-terminated 'Then attach typed citations:' in front of unrelated prose
 # — and so the lead-in disappears entirely if no citation tool is present.
-_GUIDANCE_CITATION_GROUP = (
+_GUIDANCE_CITATION_GROUP: tuple[str, ...] = (
     'cite_entity',
     'cite_edge',
     'cite_task',
@@ -444,7 +444,7 @@ _GUIDANCE_CITATIONS_LEAD_IN = 'Then attach typed citations:\n'
 # a group, at the position of whichever of them comes first in
 # _GUIDANCE_TOOL_ORDER, with whichever are present joined by ' or ' — splitting
 # them into two independent sentences would change the shipped wording.
-_GUIDANCE_STATS_GROUP = ('set_stat', 'inc_stat')
+_GUIDANCE_STATS_GROUP: tuple[str, ...] = ('set_stat', 'inc_stat')
 
 # Opening prose. Unconditional, and deliberately NOT derived from *signatures*:
 # start_report's mention here is the sentence that tells the agent the harness
