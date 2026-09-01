@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -54,7 +55,7 @@ from typing import Protocol
 
 import lms_fetch_weights
 import lms_vram
-from lms_ctl import DEFAULT_READY_TIMEOUT_S
+from lms_ctl import DEFAULT_READY_TIMEOUT_S, EXIT_MANIFEST_ERROR
 from lms_healthcheck import HealthReport
 from lms_manifest import load_arms
 from lms_serve import REPO_ROOT
@@ -178,8 +179,13 @@ def part_path(parts_dir: str | Path, arm_id: str) -> Path:
     return Path(parts_dir) / f'{arm_id}.json'
 
 
-def part_is_complete(path: str | Path, arm_id: str) -> bool:
-    """True only when *path* is a usable part for *arm_id*.
+def part_is_complete(
+    path: str | Path,
+    arm_id: str,
+    *,
+    served_model_name: str | None = None,
+) -> bool:
+    """True only when *path* is a usable part for *arm_id* -- a PASSING one.
 
     Validated through the PRODUCER'S OWN pydantic model rather than an ad-hoc
     key check, so a part and `lms_healthcheck` can never disagree about what a
@@ -192,6 +198,24 @@ def part_is_complete(path: str | Path, arm_id: str) -> bool:
     merged artifact, not a part; resuming off one would skip an arm whose row
     came from somewhere else entirely.
 
+    A FAIL ROW IS NOT A RESUME POINT.  `lms_healthcheck` writes its report
+    BEFORE returning the verdict's exit code, so an arm whose probe failed
+    still leaves a fully valid part on disk.  Accepting it would mean an
+    operator who FIXED that arm and re-ran the driver gets a byte-identical
+    artifact carrying the stale FAIL row, with nothing but a `SKIPPED` line to
+    say why -- and the only escape would be `--force`, which re-measures all
+    seven arms and so costs exactly the ~30 minutes resuming exists to save.
+    Re-measuring the arms that FAILED is the cheap direction of that trade: a
+    red arm costs one model load to re-check, a red slate costs the sweep.
+
+    *served_model_name*, when given, is checked against the row for the same
+    reason: an `arms.yaml` edit that changes what an arm serves invalidates its
+    part, which would otherwise be reused and leave the artifact describing a
+    model the manifest no longer commissions under that id.  It cannot catch
+    EVERY manifest edit -- a `model_ref` or `quant` change that keeps the
+    served name is invisible from a report row -- so `--force` remains the
+    answer after a manifest edit that does not move the served name.
+
     Any failure returns False (re-run) and never propagates.  The common case
     is the ordinary first run, where the file simply does not exist; the
     interesting one is a half-written part from a killed sweep, which is what
@@ -201,11 +225,20 @@ def part_is_complete(path: str | Path, arm_id: str) -> bool:
         report = HealthReport.model_validate_json(Path(path).read_text())
     except (OSError, ValueError):
         return False
-    return len(report.arms) == 1 and report.arms[0].arm_id == arm_id
+    if len(report.arms) != 1:
+        return False
+    row = report.arms[0]
+    if served_model_name is not None and row.served_model_name != served_model_name:
+        return False
+    return row.arm_id == arm_id and row.verdict == 'PASS'
 
 
-def ctl_argv(verb: str, arm_id: str, *extra: str) -> list[str]:
+def ctl_argv(verb: str, arm_id: str | None = None, *extra: str) -> list[str]:
     """One `lms_ctl.py` invocation.
+
+    *arm_id* is optional because `stop-all` takes none -- `lms_ctl` declares it
+    `nargs='?'` and errors out on the verbs that need one, so passing an empty
+    string rather than omitting it would be an arm id of `''`.
 
     Note what is NOT here: `--no-exclusive`.  `lms_ctl start` is exclusive by
     default and REFUSES (exit 4) when another arm holds the card rather than
@@ -214,12 +247,20 @@ def ctl_argv(verb: str, arm_id: str, *extra: str) -> list[str]:
     sweep never needs the flag because it stops each arm before starting the
     next.
     """
-    return [sys.executable, str(CTL_PATH), verb, arm_id, *extra]
+    subject = [] if arm_id is None else [arm_id]
+    return [sys.executable, str(CTL_PATH), verb, *subject, *extra]
 
 
 def healthcheck_argv(*args: str) -> list[str]:
     """One `lms_healthcheck.py` invocation."""
     return [sys.executable, str(HEALTHCHECK_PATH), *args]
+
+
+#: The subject the pre-sweep release reports a failure under.  Deliberately
+#: not an arm id and deliberately not parseable as one: `stop-all` acts on
+#: every arm, and attributing its failure to one of them would send an operator
+#: to debug an arm that is fine.
+RELEASE_SUBJECT = '(all arms)'
 
 
 def sweep_arms(
@@ -240,9 +281,19 @@ def sweep_arms(
     list, so an eighth arm added to `arms.yaml` is swept without touching this
     file.
 
-    RESUMABLE: an arm that already has a valid part on disk is skipped
+    RESUMABLE: an arm that already has a valid PASSING part on disk is skipped
     entirely, so a sweep killed at arm six re-measures one arm and not seven.
     *force* re-measures every arm regardless.
+
+    THE CARD IS RELEASED BEFORE THE FIRST ARM.  `lms_ctl start` is exclusive
+    and REFUSES (exit 4) while any `lms-arm@` unit is active; it never evicts.
+    So a single arm left running by an earlier hand-driven session -- the very
+    workflow this script replaces -- would turn the whole sweep into seven
+    refusals, no parts, and a merge that refuses on coverage.  The `finally`
+    below defends only against arms THIS sweep started, so the leading
+    `stop-all` is what makes the sweep survive a card it did not leave clean.
+    It touches `lms-arm@` units only, so whisper-writer and anything else on
+    the card is unaffected.
 
     *runner* is the seam that keeps the tests offline: it defaults to
     `subprocess.run` and is injected as a recorder in `test_lms_slate_run.py`,
@@ -252,9 +303,20 @@ def sweep_arms(
     parts.mkdir(parents=True, exist_ok=True)
     failures: list[tuple[str, str, int]] = []
 
+    released = runner(ctl_argv('stop-all')).returncode
+    if released:
+        # Recorded rather than swallowed, and NOT fatal: if nothing was
+        # actually held the sweep runs perfectly well from here, and if
+        # something was, the per-arm refusals below name it.  Reporting it
+        # under a subject that is plainly not an arm id keeps the failure line
+        # honest about what failed.
+        failures.append((RELEASE_SUBJECT, 'stop-all', released))
+
     for arm in load_arms().arms:
         existing = part_path(parts, arm.arm_id)
-        if not force and part_is_complete(existing, arm.arm_id):
+        if not force and part_is_complete(
+            existing, arm.arm_id, served_model_name=arm.served_model_name,
+        ):
             # Named, not silent: a resumed sweep that quietly does less looks
             # identical to one that measured everything.
             print(f'\n=== {arm.arm_id} === SKIPPED, reusing {existing}', flush=True)
@@ -319,6 +381,41 @@ def existing_parts(parts_dir: str | Path) -> list[str]:
     ]
 
 
+def placeholder_arm_ids() -> list[str]:
+    """The manifest arms that still carry TBD placeholders, if any."""
+    return [arm.arm_id for arm in load_arms().arms if arm.is_placeholder]
+
+
+#: Why a placeholder arm makes the WHOLE slate unassemblable, measured on this
+#: branch rather than assumed.  Each leg was checked:
+#:
+#:   * `lms_ctl start` refuses a placeholder BEFORE touching the card
+#:     (`lms_ctl.preflight`'s first check) -- exit 4, nothing started.
+#:   * `lms_healthcheck --arm <placeholder>` cannot stand in for it either.
+#:     `run_healthcheck` reads the VRAM baseline for every arm it is given
+#:     BEFORE probing, and the only writer of a baseline is `lms_ctl start`.
+#:     With no start there is no baseline, so it raises `StaleBaselineError`
+#:     -> exit 8 and writes NO file -- confirmed by direct call.  So the
+#:     PLACEHOLDER_ARM refusal row `_placeholder_refusal` would produce never
+#:     reaches disk, and no part exists for the arm.
+#:   * `merge_reports` requires a row for every id in `load_arms().arm_ids()`,
+#:     placeholders included, and refuses without one.
+#:
+#: A hand-run `lms_healthcheck --all` hits the same baseline wall, so this is
+#: not a limitation the driver introduces -- it is one the driver can only
+#: report EARLY instead of after ~30 minutes of sweeping the other arms for an
+#: artifact that could never have been written.
+PLACEHOLDER_REFUSAL = (
+    'lms_slate_run: refusing to sweep: arms {arms} still carry TBD '
+    'placeholders, and no slate artifact can be assembled while they do. '
+    '`lms_ctl start` refuses a placeholder arm (exit 4), and '
+    '`lms_healthcheck --arm` cannot cover it either: with no start there is no '
+    'VRAM baseline, so it exits 8 having written nothing -- while the merge '
+    'requires a row for EVERY manifest arm. Resolve the PRD open question '
+    'that owns them, or drop them from arms.yaml, before running the slate.'
+)
+
+
 def run_slate(
     parts_dir: str | Path,
     output: str | Path,
@@ -346,7 +443,18 @@ def run_slate(
 
     The merge is issued even when NO part exists.  Skipping it on a totally
     failed sweep would end the run with no refusal recorded anywhere.
+
+    The ONE thing that returns before the merge is a manifest still carrying
+    TBD placeholders -- see `PLACEHOLDER_REFUSAL` for why such a slate cannot
+    be assembled by this driver OR by hand.  Sweeping anyway would spend the
+    full ~30 minutes to arrive at a coverage refusal that was decidable from
+    the manifest alone, before the card was touched.
     """
+    unresolved = placeholder_arm_ids()
+    if unresolved:
+        print(PLACEHOLDER_REFUSAL.format(arms=unresolved), file=sys.stderr)
+        return EXIT_MANIFEST_ERROR
+
     failures = sweep_arms(
         parts_dir, ready_timeout=ready_timeout, force=force, runner=runner,
     )

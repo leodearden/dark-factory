@@ -263,13 +263,25 @@ def _stage_key(argv):
 
 
 class _FakeArm:
-    def __init__(self, arm_id):
+    """Only the manifest fields the driver reads.
+
+    `served_model_name` mirrors `_one_row_report`, which writes the arm id into
+    that field, so a part built there matches the arm it is named for and the
+    staleness check below is exercised by an EDIT rather than by the fixture
+    simply disagreeing with itself.
+    """
+
+    def __init__(self, arm_id, *, is_placeholder=False, served_model_name=None):
         self.arm_id = arm_id
+        self.is_placeholder = is_placeholder
+        self.served_model_name = (
+            arm_id if served_model_name is None else served_model_name
+        )
 
 
 class _FakeManifest:
-    def __init__(self, *arm_ids):
-        self.arms = [_FakeArm(a) for a in arm_ids]
+    def __init__(self, *arms):
+        self.arms = [a if isinstance(a, _FakeArm) else _FakeArm(a) for a in arms]
 
     def arm_ids(self):
         return [a.arm_id for a in self.arms]
@@ -287,7 +299,8 @@ def test_each_arm_runs_start_wait_healthcheck_stop_in_that_order(tmp_path, two_a
 
     lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
 
-    assert runner.stages()[:8] == [
+    assert runner.stages()[:9] == [
+        ('ctl', 'stop-all', None),
         ('ctl', 'start', 'arm-one'),
         ('ctl', 'wait-ready', 'arm-one'),
         ('healthcheck', 'arm-one'),
@@ -464,6 +477,62 @@ def test_a_refused_start_is_not_waited_on_or_probed_but_is_still_stopped(
     assert ('ctl', 'stop', 'arm-one') in stages
 
 
+def test_the_card_is_released_before_the_first_arm_starts(tmp_path, two_arms):
+    """ONE arm left running by an earlier hand-driven session -- the workflow
+    this script replaces -- would turn the whole sweep into seven `start`
+    refusals (exit 4: `lms_ctl start` refuses rather than evicting), no parts,
+    and a merge that refuses on coverage.  The per-arm `finally` cannot help:
+    it only releases arms THIS sweep started."""
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    stages = runner.stages()
+    assert stages[0] == ('ctl', 'stop-all', None)
+    assert stages.count(('ctl', 'stop-all', None)) == 1
+
+
+def test_the_pre_sweep_release_names_no_arm(tmp_path, two_arms):
+    """`lms_ctl stop-all` takes no arm id (`nargs='?'`), so passing an empty
+    string would make it an arm id of `''` rather than an omitted one."""
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    argv = runner.calls[0]
+    assert argv == [sys.executable, str(lms_slate_run.CTL_PATH), 'stop-all']
+
+
+def test_a_failing_pre_sweep_release_is_reported_but_not_fatal(tmp_path, two_arms):
+    """Not swallowed: a non-zero `stop-all` is the difference between a clean
+    card and one this sweep could not clear.  Not fatal either: if nothing was
+    actually held the sweep runs fine, and if something was, the per-arm
+    refusals name it."""
+    runner = _FakeRunner(codes={('ctl', 'stop-all', None): 1})
+
+    failures = lms_slate_run.sweep_arms(tmp_path / 'parts', runner=runner)
+
+    assert (lms_slate_run.RELEASE_SUBJECT, 'stop-all', 1) in failures
+    assert ('ctl', 'start', 'arm-one') in runner.stages()
+
+
+def test_the_release_subject_is_not_mistakable_for_an_arm(two_arms):
+    """The failure line reads `<subject>: stop-all failed`; a subject that
+    looked like an arm id would send an operator to debug an arm that is
+    fine."""
+    assert lms_slate_run.RELEASE_SUBJECT not in two_arms.arm_ids()
+
+
+def test_a_failing_release_makes_the_run_non_zero(tmp_path, two_arms):
+    runner = _FakeRunner(codes={('ctl', 'stop-all', None): 1})
+
+    code = lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', runner=runner,
+    )
+
+    assert code != 0
+
+
 def test_per_arm_failures_are_collected_and_reported_by_arm_id(tmp_path, two_arms):
     """A sweep that failed somewhere must say WHERE.  A bare non-zero exit
     sends an operator back through 30 minutes of journal to find out which arm
@@ -613,6 +682,72 @@ def test_a_multi_row_report_is_not_a_part(tmp_path):
     path.write_text(merged.model_dump_json())
 
     assert not lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def _failed_part(arm_id):
+    """A part exactly as `lms_healthcheck --arm X --output p` leaves one when
+    the probe FAILS: the report is written BEFORE the non-zero exit code is
+    returned, so a failed arm leaves a fully valid file on disk."""
+    import lms_healthcheck
+
+    report = _one_row_report(arm_id)
+    failed_row = report.arms[0].model_copy(update={
+        'verdict': 'FAIL',
+        'reason': lms_healthcheck.Reason.MALFORMED_RESPONSE,
+        'detail': 'the probe returned junk',
+    })
+    return report.model_copy(update={'arms': [failed_row], 'overall': 'FAIL'})
+
+
+def test_a_part_whose_row_failed_is_re_measured_not_reused(tmp_path, two_arms):
+    """`lms_healthcheck` writes the report BEFORE returning the verdict's exit
+    code, so a FAILED arm leaves a perfectly valid part behind.  Reusing it
+    would hand an operator who FIXED that arm a byte-identical artifact still
+    carrying the stale FAIL row -- with only a SKIPPED line to say why, and
+    `--force` (all seven arms, ~30 minutes) as the only escape."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one', text=_failed_part('arm-one').model_dump_json())
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
+
+
+def test_part_is_complete_rejects_a_failed_row(tmp_path):
+    path = tmp_path / 'arm-one.json'
+    path.write_text(_failed_part('arm-one').model_dump_json())
+
+    assert not lms_slate_run.part_is_complete(path, 'arm-one')
+
+
+def test_a_part_for_a_different_served_model_is_stale_and_re_measured(tmp_path):
+    """An `arms.yaml` edit that changes what an arm SERVES invalidates its
+    part: reusing it would leave the artifact describing a model the manifest
+    no longer commissions under that id."""
+    path = _write_part(tmp_path / 'parts', 'arm-one')
+
+    assert lms_slate_run.part_is_complete(
+        path, 'arm-one', served_model_name='arm-one',
+    )
+    assert not lms_slate_run.part_is_complete(
+        path, 'arm-one', served_model_name='some/other-model',
+    )
+
+
+def test_the_sweep_checks_the_part_against_the_manifests_served_model(
+    tmp_path, monkeypatch,
+):
+    """The staleness check is wired to the MANIFEST, not merely available."""
+    manifest = _FakeManifest(_FakeArm('arm-one', served_model_name='new/model'))
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')  # served_model_name == 'arm-one'
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    assert ('healthcheck', 'arm-one') in runner.stages()
 
 
 def test_force_re_runs_an_arm_that_already_has_a_valid_part(tmp_path, two_arms):
@@ -778,6 +913,96 @@ def test_a_failed_arm_makes_the_run_non_zero_even_when_the_merge_succeeds(
     code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
 
     assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# a manifest carrying TBD placeholders is refused UP FRONT
+#
+# Measured on this branch, not assumed.  `lms_ctl start` refuses a placeholder
+# before touching the card (exit 4), and `lms_healthcheck --arm <placeholder>`
+# cannot cover it either: `run_healthcheck` reads the VRAM baseline for every
+# arm BEFORE probing, the only writer of a baseline is `lms_ctl start`, so with
+# no start it raises StaleBaselineError -> exit 8 and writes NO file.  The
+# PLACEHOLDER_ARM refusal row therefore never reaches disk, and `merge_reports`
+# refuses without a row for every manifest arm.  So the slate is unassemblable
+# either way -- and the only thing the driver can improve is WHEN it says so.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def one_placeholder(monkeypatch):
+    manifest = _FakeManifest('arm-one', _FakeArm('tbd-arm', is_placeholder=True))
+    monkeypatch.setattr(lms_slate_run, 'load_arms', lambda: manifest)
+    return manifest
+
+
+def test_a_placeholder_manifest_is_refused_before_the_card_is_touched(
+    tmp_path, one_placeholder,
+):
+    """Not after ~30 minutes of sweeping the other arms for an artifact that
+    could never have been written: this is decidable from the manifest alone,
+    before anything starts."""
+    runner = _FakeRunner()
+
+    code = lms_slate_run.run_slate(
+        tmp_path / 'parts', tmp_path / 'out.json', runner=runner,
+    )
+
+    assert code != 0
+    assert runner.calls == []
+
+
+def test_the_placeholder_refusal_names_the_arms_and_the_reason(
+    tmp_path, one_placeholder, capsys,
+):
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json',
+                            runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert 'tbd-arm' in err
+    assert 'arms.yaml' in err
+
+
+def test_the_placeholder_refusal_writes_no_artifact(tmp_path, one_placeholder):
+    """It returns BEFORE the merge -- the one thing that does.  A merge here
+    could only refuse on coverage, and refusing twice explains once."""
+    output = tmp_path / 'out.json'
+
+    lms_slate_run.run_slate(tmp_path / 'parts', output, runner=_FakeRunner())
+
+    assert not output.exists()
+
+
+def test_the_refusal_exit_code_is_the_one_lms_ctl_uses_for_a_bad_manifest():
+    """Pinned to the sibling CLI's vocabulary rather than a fresh literal: a
+    placeholder slate is a manifest problem, and the tools an operator runs
+    side by side should not spell that two different ways."""
+    import lms_ctl
+
+    assert lms_slate_run.EXIT_MANIFEST_ERROR == lms_ctl.EXIT_MANIFEST_ERROR
+
+
+def test_a_manifest_without_placeholders_sweeps_normally(tmp_path, two_arms):
+    """The guard must not fire on the ordinary case -- all seven arms in
+    `arms.yaml` are non-placeholder today."""
+    runner = _FakeRunner()
+
+    lms_slate_run.run_slate(tmp_path / 'parts', tmp_path / 'out.json', runner=runner)
+
+    assert ('ctl', 'start', 'arm-one') in runner.stages()
+
+
+def test_placeholder_arm_ids_reads_the_manifest(one_placeholder):
+    assert lms_slate_run.placeholder_arm_ids() == ['tbd-arm']
+
+
+def test_the_committed_manifest_carries_no_placeholder_today():
+    """Not a duplicate of the guard: it records the premise the guard is
+    latent under, so the day an arm goes TBD this file says which behaviour
+    the operator has just moved into."""
+    from lms_manifest import load_arms
+
+    assert [a.arm_id for a in load_arms().arms if a.is_placeholder] == []
 
 
 # ---------------------------------------------------------------------------
