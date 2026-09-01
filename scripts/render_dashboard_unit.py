@@ -235,6 +235,25 @@ class UnitRenderSpec:
     log_tag: str
     host_local_environment: tuple[str, ...]
 
+    # The committed template this unit is rendered FROM, REPO-RELATIVE. It is
+    # what makes the registry self-describing rather than a bare tag/preserve-set
+    # pair, and it is what the staleness guard reads to pair a preserve set with
+    # the template that must actually declare it
+    # (tests/scripts/test_render_dashboard_unit.py::
+    # test_every_preserved_name_is_declared_exactly_once_in_its_units_template).
+    # A preserve set checked against the WRONG unit's template would pass while
+    # preserving nothing on the host, since the two templates declare overlapping
+    # but not identical Environment= sets.
+    #
+    # --template STAYS A REQUIRED CLI FLAG and is deliberately NOT defaulted from
+    # this field. Do not "tidy" that into a default: setup-host.sh passes an
+    # absolute path built from $REPO_ROOT, so defaulting would introduce a SECOND
+    # path-resolution rule (script-relative vs caller-supplied) for no caller that
+    # wants one — and it would silently resolve against the checkout this file
+    # happens to live in rather than the one being installed, which is the exact
+    # class of wrong-checkout bug the preserve set excludes PROJECT_ROOT to avoid.
+    template: str
+
 
 # The registry --unit selects from. Keys are the operator-facing unit NAMES as
 # setup-host.sh spells them on the command line.
@@ -255,10 +274,12 @@ UNITS: "dict[str, UnitRenderSpec]" = {
     "dashboard": UnitRenderSpec(
         log_tag=LOG_TAG,
         host_local_environment=HOST_LOCAL_ENVIRONMENT,
+        template="scripts/dashboard.service.template",
     ),
     "fused-memory": UnitRenderSpec(
         log_tag="fused_memory_unit_render",
         host_local_environment=FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT,
+        template="scripts/fused-memory.service.template",
     ),
 }
 
