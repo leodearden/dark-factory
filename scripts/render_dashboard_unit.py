@@ -276,6 +276,13 @@ UNITS: "dict[str, UnitRenderSpec]" = {
         host_local_environment=HOST_LOCAL_ENVIRONMENT,
         template="scripts/dashboard.service.template",
     ),
+    # RECIPROCAL POINTER: this unit's preserve set and
+    # check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES must stay
+    # DISJOINT by variable name. That checker's --fix appends a missing required
+    # line after the last [Service] line, where systemd's last-wins would beat
+    # anything preserved here — see the WARNING above
+    # FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT, and the matching warning at the point
+    # of the edit in check_fused_memory_unit_parity.py.
     "fused-memory": UnitRenderSpec(
         log_tag="fused_memory_unit_render",
         host_local_environment=FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT,

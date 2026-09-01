@@ -23,13 +23,24 @@ duplication one level up.
 
 ``environment_map`` is the THIRD lift, and its second consumer is NOT a fourth
 checker: it is ``scripts/render_dashboard_unit.py``, the renderer setup-host.sh
-now uses in place of a truncating ``sed`` redirect to install
-dark-factory-dashboard.service. That renderer must PRESERVE this host's
-host-local ``Environment=DASHBOARD_KNOWN_PROJECT_ROOTS`` value across a
-re-render, which means reading the installed unit's ``Environment=`` map — and
-it must read it through the SAME code ``check_dashboard_unit_parity.py``
-compares those variables with, or a value the checker can see stops being a
-value the installer can preserve.
+now uses in place of a truncating ``sed`` redirect to install BOTH
+dark-factory-dashboard.service (task 4793) and fused-memory.service (task 4796
+— one renderer, selected by ``--unit`` off its ``UNITS`` registry). That
+renderer must PRESERVE this host's host-local
+``Environment=DASHBOARD_KNOWN_PROJECT_ROOTS`` value across a re-render, which
+means reading the installed unit's ``Environment=`` map — and it must read it
+through the SAME code ``check_dashboard_unit_parity.py`` compares those
+variables with, or a value the checker can see stops being a value the installer
+can preserve.
+
+The fused-memory unit is where that reader earns its keep rather than merely
+being consistent: ``_join_continuations`` is what makes that template's
+FOUR-PHYSICAL-LINE ``ExecStart=`` parse as one directive, and
+``environment_map``'s ``shlex.split`` is what correctly reads its quoted
+``Environment="FUSED_MEMORY_PREDONE_HOOK_REIFY=... --task {id} ..."`` line,
+which a naive split would mangle. Its documented last-wins semantics also handle
+the operator who registered extra roots by APPENDING a second
+``DASHBOARD_KNOWN_PROJECT_ROOTS`` line rather than editing the first.
 
 It could not get that by importing the checker, and the obstacle is measured
 rather than stylistic: ``tests/scripts/test_check_dashboard_unit_parity.py``'s
