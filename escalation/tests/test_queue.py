@@ -2744,6 +2744,166 @@ class TestAttachDedupeChild:
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
 
+class TestAttachDedupeChildGrowthBound:
+    """dedupe_children is BOUNDED, and the bound is loud.
+
+    Why a bound is needed: ``DedupeConfig.for_gate_backlog()`` sets
+    ``infra_dedupe_window_secs=float('inf')`` by design (a 300h-old gate MUST
+    still fold), so nothing ever ages a gate-backlog parent out — it gains one
+    child id per Stage-1 cycle for as long as a human has not decided, and that
+    whole record is read and parsed by ``get_pending()`` on every subsequent
+    dedupe scan.
+
+    Retention is HEAD-PRESERVING (first ``_MAX_DEDUPE_CHILDREN_HEAD`` + most
+    recent), not the pure oldest-shed used for ``amendments``: this list has no
+    external anchor for the fold's ORIGIN, so shedding purely oldest-first would
+    erase where the parent came from and leave only-recent ids — the least useful
+    provenance possible on a record whose whole problem is that it is old.
+
+    Every expected value below is DERIVED from the module constants, never
+    transcribed as a literal: a hand-copied literal encodes the constant's VALUE
+    instead of its NAME and silently drifts when the cap is retuned (test_server's
+    ``_COMPACT_KEYS`` comment records that this drift already happened once here).
+    """
+
+    #: How far past the cap these tests push.  Small on purpose — the shed is
+    #: per-attach in steady state, so K attaches past the cap shed exactly K.
+    K = 5
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1', severity: str = 'blocking') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity=severity,
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def _attach_n(self, queue: EscalationQueue, parent_id: str, n: int) -> list[str]:
+        """Attach *n* children with predictable ids; returns the attach ORDER."""
+        order = [f'esc-child-{i}' for i in range(n)]
+        for child_id in order:
+            queue.attach_dedupe_child(parent_id, child_id)
+        return order
+
+    def test_below_the_cap_nothing_is_shed(self, tmp_path: Path):
+        """(a) Exactly at the cap: every id is still present, in order, nothing counted."""
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert len(from_disk.dedupe_children) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children == order, 'At the cap nothing may be shed or reordered'
+        assert from_disk.dedupe_children_truncated == 0
+
+    def test_past_the_cap_sheds_the_oldest_non_head_ids_and_counts_them(self, tmp_path: Path):
+        """(b) Past the cap: the list is bounded, the HEAD and the TAIL both survive,
+        and exactly the oldest NON-head ids are shed and counted."""
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN + self.K)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        assert len(kept) == _MAX_DEDUPE_CHILDREN, (
+            f'dedupe_children must be BOUNDED at _MAX_DEDUPE_CHILDREN='
+            f'{_MAX_DEDUPE_CHILDREN}, got {len(kept)}'
+        )
+        assert from_disk.dedupe_children_truncated == self.K
+
+        # Head retention — the ids that ESTABLISHED the fold survive.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == order[:_MAX_DEDUPE_CHILDREN_HEAD], (
+            'The first _MAX_DEDUPE_CHILDREN_HEAD ids must be retained: on a '
+            "weeks-old parent they are the only record of the fold's origin"
+        )
+        # Tail retention — current activity survives.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == order[-tail_len:], (
+            'The most recent ids must be retained'
+        )
+
+        # Exactly the oldest NON-head ids were shed.
+        shed = order[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + self.K]
+        assert set(shed).isdisjoint(kept), f'Expected {shed} to have been shed, found some kept'
+
+        # The true-provenance-total identity: the loss is assertable FROM THE
+        # RECORD, never log-only (INV-8).
+        assert len(kept) + from_disk.dedupe_children_truncated == _MAX_DEDUPE_CHILDREN + self.K
+
+    def test_the_cap_never_touches_dedupe_count_or_severity(self, tmp_path: Path):
+        """(c) The cap bounds PROVENANCE only.
+
+        dedupe_count is the load-bearing recurrence signal (task 3522) — a
+        recon-watcher drain sorts the longest-rotting gates by it and
+        sweep._pick_richer ranks on it — so it must keep climbing past the cap.
+        Severity promotion is likewise unaffected, and is never demoted.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', severity='info'))
+
+        total = _MAX_DEDUPE_CHILDREN + self.K
+        self._attach_n(queue, 'esc-1-1', total)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == total, (
+            f'dedupe_count is the recurrence SIGNAL and is never capped: expected '
+            f'{total}, got {from_disk.dedupe_count}'
+        )
+        assert from_disk.severity == 'info', 'info children must not promote an info parent'
+
+        # A promotion AFTER the cap is crossed still takes effect.
+        promoted = queue.attach_dedupe_child('esc-1-1', 'esc-late-1', child_severity='blocking')
+        assert promoted is not None
+        assert promoted.severity == 'blocking', (
+            'max_severity promotion must still work once the list is at the cap'
+        )
+        assert promoted.dedupe_count == total + 1
+
+    def test_shedding_logs_a_warning_naming_the_running_total(self, tmp_path: Path, caplog):
+        """(d) The loss is LOUD: a WARNING names the parent and the running total.
+
+        no-silent-fail-soft — a bound that drops ids quietly is exactly the
+        silent degradation this repo forbids.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        # Fill to the cap OUTSIDE the caplog window, so only shed warnings land.
+        self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.attach_dedupe_child('esc-1-1', 'esc-over-1')
+
+        shed_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.WARNING
+            and 'esc-1-1' in r.getMessage()
+            and 'truncated=1' in r.getMessage()
+        ]
+        assert shed_records, (
+            'Expected a WARNING from escalation.queue naming the parent id and the '
+            f'running dedupe_children_truncated total, got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
 class TestFindPendingL2ByRootCause:
     """EscalationQueue.find_pending_l2_by_root_cause() locates a pending L2 by root_cause string."""
 
