@@ -1,5 +1,6 @@
 """Tests for targeted reconciliation."""
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -1126,6 +1127,50 @@ class TestProposedResolutionPromotionGate:
             f'Expected a planned_episodes_withheld action for a proposed-resolution '
             f'episode, got actions={result.get("actions")!r}'
         )
+
+
+# ── task-4903: shared helpers for the dependent-unblock sweep ──────────────
+
+
+def _dep_tasks(*dependents: dict) -> dict:
+    """Build a ``get_tasks`` payload: the just-done task '1' plus *dependents*.
+
+    Matches the convention already pinned by
+    ``test_on_task_done_checks_dependents`` (:288-292) and
+    ``test_on_task_done_search_failure_does_not_abort_later_capture_steps``
+    (:2990-2995): the just-done task is always present as the first row,
+    reflecting that the interceptor persists the status write BEFORE
+    scheduling the fire-and-forget ``reconcile_task`` (see
+    ``_fetch_done_provenance``'s docstring in targeted.py) -- so the sweep's
+    own re-read of the live task list always observes its own transition.
+    """
+    return {'tasks': [{'id': '1', 'status': 'done', 'dependencies': []}, *dependents]}
+
+
+@pytest.fixture
+def wired_reconciler(reconciler):
+    """The ``reconciler`` fixture with a mocked ``TaskInterceptor`` attached.
+
+    ``set_task_status`` returns a realistic happy-path ``SetTaskStatusResult``
+    -- note the deliberate absence of a ``success`` key (task_interceptor.py
+    :1453-1455); ``interceptor_write_succeeded`` defaults a missing
+    ``success`` to True. ``update_task`` returns a plain success dict.
+    Mirrors the inline idiom at
+    ``test_blocked_routes_update_through_task_interceptor_when_wired``
+    below (:1150-1152).
+
+    Does NOT touch the ``reconciler`` fixture itself, which deliberately
+    leaves ``task_interceptor = None`` -- the unwired-safety case depends
+    on that default.
+    """
+    interceptor = AsyncMock()
+    interceptor.set_task_status = AsyncMock(return_value={
+        'message': 'status updated',
+        'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
+    })
+    interceptor.update_task = AsyncMock(return_value={'success': True})
+    reconciler.task_interceptor = interceptor
+    return reconciler
 
 
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
@@ -4643,3 +4688,1175 @@ class TestVerificationFailureAudit:
         )
         # Containment preserved: the exception does not propagate.
         assert 'task_id' in result
+
+
+# ── task-4903: TargetedReconciler dependent-unblock sweep ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_unblocks_blocked_dependent_when_last_dep_completes(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """Reify 5662/5759 repro: a `blocked` dependent whose sole dep just went
+    `done` must be durably flipped to `pending` through the interceptor, not
+    merely observed.
+
+    Before this fix, targeted.py's step-3 branch gated on
+    ``t.get('status') == 'pending'`` -- exactly the tasks that need no
+    unblocking -- and even on a match only appended an observation dict; no
+    code path anywhere wrote the dependent's status. This is the regression
+    test reproducing that defect verbatim.
+
+    Uses a real tmp_path-derived project_root rather than a shared literal
+    path: the escalation-pin veto (added later in this task) constructs an
+    ``EscalationQueue(Path(project_root)/'data/escalations')``, whose
+    ``__init__`` does ``mkdir(parents=True, exist_ok=True)`` -- this test
+    must not create directories under a path shared with other tests.
+    """
+    project_root = str(tmp_path)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    # (a) the write happened, exactly once, for the right task/status/root.
+    wired_reconciler.task_interceptor.set_task_status.assert_awaited_once()
+    call = wired_reconciler.task_interceptor.set_task_status.await_args
+    assert call.kwargs.get('task_id') == '2', (
+        f'Expected set_task_status to bind task_id="2" by keyword (matching '
+        f"_sweep_cancel_orphan/_sweep_block_orphan's convention in this file); "
+        f'got kwargs={call.kwargs!r}, args={call.args!r}'
+    )
+    assert call.kwargs.get('status') == 'pending', (
+        f'Expected status="pending", got kwargs={call.kwargs!r}'
+    )
+    assert call.kwargs.get('project_root') == project_root, (
+        f'Expected project_root={project_root!r}, got kwargs={call.kwargs!r}'
+    )
+
+    # (b) exactly one dependent_unblock_applied action, naming the dependency
+    #     whose completion satisfied it.
+    applied = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblock_applied']
+    assert len(applied) == 1, (
+        f'Expected exactly one dependent_unblock_applied action, got: {result.get("actions")}'
+    )
+    assert applied[0]['task_id'] == '2'
+    assert applied[0]['satisfied_by'] == '1'
+
+    # (c) the legacy dependent_unblocked observation stays reserved for the
+    #     already-pending case -- it must NOT fire for a blocked dependent.
+    unblocked = [a for a in result.get('actions', []) if a['type'] == 'dependent_unblocked']
+    assert unblocked == [], (
+        f'dependent_unblocked must stay reserved for already-pending dependents, '
+        f'got: {result.get("actions")}'
+    )
+
+
+# The full vocabulary this sweep emits, keyed off the dependent's own
+# task_id -- used by the guard table below to isolate "our" actions from
+# the rest of a done-transition's unrelated actions (fast-path echo, search,
+# verification, ...).
+_DEP_ACTION_TYPES = {
+    'dependent_unblocked',
+    'dependent_unblock_applied',
+    'dependent_unblock_failed',
+    'dependent_unblock_vetoed',
+    'dependent_unblock_skipped',
+}
+
+
+def _dep_actions_for(result: dict, task_id: str) -> list[dict]:
+    """The subset of ``result['actions']`` naming *task_id* from the
+    dependent-unblock sweep's own vocabulary (see ``_DEP_ACTION_TYPES``)."""
+    return [
+        a for a in result.get('actions', [])
+        if a.get('type') in _DEP_ACTION_TYPES and a.get('task_id') == task_id
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'dependent_overrides, extra_tasks, wired, expected_type, expected_reason',
+    [
+        pytest.param(
+            {'status': 'pending'}, [], True, 'dependent_unblocked', None,
+            id='pending_all_deps_done_observed_only',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [{'id': '9', 'status': 'pending', 'dependencies': []}],
+            True, None, None,
+            id='blocked_sibling_dep_still_pending',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [{'id': '9', 'status': 'cancelled', 'dependencies': []}],
+            True, None, None,
+            id='blocked_sibling_dep_cancelled_fails_closed',
+        ),
+        pytest.param(
+            {'status': 'blocked', 'dependencies': ['1', '9']},
+            [],
+            True, None, None,
+            id='blocked_sibling_dep_absent_from_snapshot',
+        ),
+        pytest.param(
+            {
+                'status': 'blocked',
+                'metadata': {'parent_cancelled': '7', 'needs_recheck_against_main': True},
+            },
+            [], True, 'dependent_unblock_vetoed', 'parent_cancelled',
+            id='blocked_vetoed_parent_cancelled',
+        ),
+        pytest.param(
+            {
+                'status': 'blocked',
+                'metadata': {'external_deps': {'other_project:12': 'pending'}},
+            },
+            [], True, 'dependent_unblock_vetoed', 'external_deps',
+            id='blocked_vetoed_external_deps',
+        ),
+        # The shape _unblock_veto_reason's isinstance(metadata, str) ->
+        # json.loads branch exists for: every other case here hands it a
+        # dict, so dropping that branch would leave the table green while
+        # silently un-parking a parent_cancelled task.
+        pytest.param(
+            {'status': 'blocked', 'metadata': json.dumps({'parent_cancelled': '7'})},
+            [], True, 'dependent_unblock_vetoed', 'parent_cancelled',
+            id='blocked_vetoed_parent_cancelled_json_string_metadata',
+        ),
+        # ... and its unparseable fallback: treated as empty metadata (no
+        # veto), never as an error that fails the whole dependent.
+        pytest.param(
+            {'status': 'blocked', 'metadata': '{not json'},
+            [], True, 'dependent_unblock_applied', None,
+            id='blocked_unparseable_metadata_treated_as_empty',
+        ),
+        # Negative boundary of the external_deps veto: the key must be
+        # NON-EMPTY to veto. Pins `and external_deps` against a regression
+        # to a bare `'external_deps' in metadata` membership test.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'external_deps': {}}},
+            [], True, 'dependent_unblock_applied', None,
+            id='blocked_empty_external_deps_does_not_veto',
+        ),
+        # Park-protection parity with the orchestrator's sibling sweep
+        # (scheduler.py::Scheduler._phase_redispatch_stranded_blocked): an
+        # infra-hold park is never stranded-blocked
+        # (shared/task_claimant.py::is_stranded_blocked returns False for it
+        # unconditionally), so this sweep must not un-park it either.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'infra_hold': True}},
+            [], True, 'dependent_unblock_vetoed', 'infra_hold',
+            id='blocked_vetoed_infra_hold',
+        ),
+        # Same parity for that sweep's DESIGN-GAP carve-out: a blocked
+        # deterministic task is owned exclusively by the deterministic gate
+        # flow / deterministic-recon sweep.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'task_kind': 'deterministic'}},
+            [], True, 'dependent_unblock_vetoed', 'deterministic_owned',
+            id='blocked_vetoed_deterministic_owned',
+        ),
+        pytest.param({'status': 'in-progress'}, [], True, None, None, id='in_progress_untouched'),
+        pytest.param({'status': 'deferred'}, [], True, None, None, id='deferred_untouched'),
+        pytest.param({'status': 'review'}, [], True, None, None, id='review_untouched'),
+        pytest.param(
+            {'status': 'merge-deferred'}, [], True, None, None, id='merge_deferred_untouched',
+        ),
+        pytest.param(
+            {'status': 'blocked'}, [], False, 'dependent_unblock_skipped', 'interceptor_unwired',
+            id='blocked_interceptor_unwired',
+        ),
+        pytest.param(
+            {'status': 'blocked'}, [], True, 'dependent_unblock_applied', None,
+            id='blocked_positive_control',
+        ),
+    ],
+)
+async def test_unblock_dependent_guards(
+    reconciler, mock_taskmaster, tmp_path,
+    dependent_overrides, extra_tasks, wired, expected_type, expected_reason,
+):
+    """Every shape that must NOT be flipped, plus the positive control.
+
+    ``wired`` is applied by attaching a mocked TaskInterceptor directly to
+    the plain (unwired-by-default) ``reconciler`` fixture -- deliberately
+    NOT via the ``wired_reconciler`` fixture, since that fixture mutates
+    and returns the very ``reconciler`` instance this test also requests
+    directly; requesting both in one test would make the "unwired" case
+    (``wired=False``) silently observe the wired instance instead.
+
+    The ``blocked_sibling_dep_cancelled_fails_closed`` case is a deliberate
+    divergence from ``Scheduler._deps_satisfied`` (scheduler.py:4444-4460),
+    which counts ``cancelled`` deps as satisfied: this sweep fires
+    immediately on a ``done`` transition with none of that sweep's
+    claimant-liveness/cooldown guards, so its only defense against
+    over-unblocking is a conservative, ``done``-only predicate. Under-
+    unblocking here is self-healing (the orchestrator's own stranded-blocked
+    sweep still covers it); over-unblocking is the exact defect this task
+    exists to close, so the predicate must fail closed.
+    """
+    if wired:
+        interceptor = AsyncMock()
+        interceptor.set_task_status = AsyncMock(return_value={
+            'message': 'status updated',
+            'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
+        })
+        interceptor.update_task = AsyncMock(return_value={'success': True})
+        reconciler.task_interceptor = interceptor
+
+    dependent = {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']}
+    dependent.update(dependent_overrides)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(dependent, *extra_tasks))
+
+    result = await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    actions = _dep_actions_for(result, '2')
+    if expected_type is None:
+        assert actions == [], (
+            f'Expected no dependent-unblock action for task 2, got: {actions}'
+        )
+    else:
+        assert len(actions) == 1, (
+            f'Expected exactly one dependent-unblock action for task 2, got: {actions}'
+        )
+        assert actions[0]['type'] == expected_type, (
+            f'Expected type={expected_type!r}, got: {actions[0]!r}'
+        )
+        if expected_reason is not None:
+            assert actions[0].get('reason') == expected_reason, (
+                f'Expected reason={expected_reason!r}, got: {actions[0]!r}'
+            )
+
+    if wired:
+        if expected_type == 'dependent_unblock_applied':
+            reconciler.task_interceptor.set_task_status.assert_awaited_once()
+        else:
+            reconciler.task_interceptor.set_task_status.assert_not_awaited()
+    else:
+        mock_taskmaster.set_task_status.assert_not_awaited()
+
+
+# ── task-4903: durability of the write + per-dependent isolation ───────────
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_not_persisted_is_not_reported_as_applied(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A post-write read-back failure must be reported as failed, never applied.
+
+    Real ``StatusWriteNotPersistedResult`` shape (backends/task_backend_types.py
+    :38-51): returned instead of a fabricated success when the status column
+    did not actually take the requested value.
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '2',
+        'requested_status': 'pending',
+        'actual_status': 'blocked',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_failed', (
+        f'A not-persisted write must not be reported as applied, got: {actions[0]!r}'
+    )
+    assert actions[0]['error'] == 'status_write_not_persisted', (
+        f'Expected the stable error code, got: {actions[0]!r}'
+    )
+    assert actions[0]['actual_status'] == 'blocked', (
+        f'Expected the live actual_status surfaced, got: {actions[0]!r}'
+    )
+    assert not any(a['type'] == 'dependent_unblock_applied' for a in result.get('actions', [])), (
+        f'No dependent_unblock_applied action must exist anywhere, got: {result.get("actions")}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_gate_rejection_is_not_reported_as_applied(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A gate rejection (no `success` key at all, e.g. BacklogVerdict) is a
+    failure, and the stable `error_type` code is preferred over the rendered
+    `error` message -- the same precedence already used at the
+    hints_attached/hints_skipped audit pair (targeted.py:~1037-1039).
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'error': 'ReconciliationBacklogExceeded: backlog too deep',
+        'error_type': 'ReconciliationBacklogExceeded',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_failed', (
+        f'A gate rejection must not be reported as applied, got: {actions[0]!r}'
+    )
+    assert actions[0]['error'] == 'ReconciliationBacklogExceeded', (
+        f'error_type must be preferred over the rendered error message, got: {actions[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_no_op_is_reported_distinctly(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A same-status race (something already re-pended the task) must not
+    claim a flip that didn't happen, while still recording that the desired
+    end state was reached. Real shape from the interceptor's same-status
+    early return (task_interceptor.py:1159).
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'success': True, 'no_op': True, 'task_id': '2',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'The desired end state (pending) was reached; expected _applied, got: {actions[0]!r}'
+    )
+    assert actions[0].get('no_op') is True, (
+        f'Expected a truthy no_op field distinguishing a race from a real flip, '
+        f'got: {actions[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_failure_does_not_strand_siblings(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """One dependent's write failure must not abandon the rest of the sweep.
+
+    Mirrors the isolation contract scheduler.py:6562-6577 documents for its
+    sibling sweep: two blocked dependents of the same just-done task, one
+    write raises, the other must still land.
+    """
+    async def _set_task_status(*, task_id, **kwargs):
+        if task_id == '2':
+            raise RuntimeError('db locked')
+        return {'message': 'ok', 'tasks': [{'taskId': task_id, 'newStatus': 'pending'}]}
+
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(side_effect=_set_task_status)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+    actions_2 = _dep_actions_for(result, '2')
+    actions_3 = _dep_actions_for(result, '3')
+    assert len(actions_2) == 1, f'Expected exactly one action for task 2, got: {actions_2}'
+    assert actions_2[0]['type'] == 'dependent_unblock_failed', (
+        f'Expected task 2 to fail in isolation, got: {actions_2[0]!r}'
+    )
+    assert 'db locked' in actions_2[0].get('error', ''), (
+        f'Expected the truncated exception string in detail, got: {actions_2[0]!r}'
+    )
+    assert len(actions_3) == 1, (
+        f"Task 3's unblock must not be stranded by task 2's failure, got: {actions_3}"
+    )
+    assert actions_3[0]['type'] == 'dependent_unblock_applied', (
+        f'Expected task 3 to still be applied, got: {actions_3[0]!r}'
+    )
+    assert wired_reconciler.task_interceptor.set_task_status.await_count == 2, (
+        f'Expected both dependents to be attempted, got '
+        f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
+    )
+
+
+# ── task-4903: escalation-pin veto ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_by_open_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """An open (status='pending') escalation pinning the dependent must veto
+    the unblock.
+
+    This is what stops the sweep from fighting the orchestrator:
+    ``Harness._block_and_escalate_external_dep`` (harness.py:7281) and
+    ``_block_and_escalate_delivered_check`` (harness.py:7364) both BLOCK
+    *and* file an escalation, and a human ``/unblock`` park does too --
+    unblocking a task pinned by an open escalation would be immediately
+    undone.
+
+    Writes a real on-disk escalation via ``EscalationQueue.submit`` (reusing
+    the exact construction ``_sweep_escalate_l1`` performs at
+    targeted.py:1441-1454), so the on-disk shape is production-real rather
+    than a hand-rolled JSON blob.
+    """
+    from escalation.models import Escalation
+    from escalation.queue import EscalationQueue
+
+    project_root = str(tmp_path)
+    queue = EscalationQueue(Path(project_root) / 'data/escalations')
+    esc = Escalation(
+        id=queue.make_id('2'),
+        task_id='2',
+        agent_role='harness',
+        severity='blocking',
+        category='dependency_discovered',
+        summary='Task 2 blocked pending external dependency',
+        detail='blocked pending review',
+        suggested_action='wait',
+        level=1,
+    )
+    esc_id = queue.submit(esc)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=project_root,
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'An open escalation must veto the unblock, got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_pinned', (
+        f'Expected reason=escalation_pinned, got: {actions[0]!r}'
+    )
+    assert actions[0].get('escalation_ids') == [esc_id], (
+        f'Expected escalation_ids to name the pinning escalation, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_when_escalation_store_unreadable(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """An unreadable escalation store cannot prove "no open escalation", so
+    it must veto rather than flip -- fail-safe direction is deliberate, not
+    assumed. Same rule stated verbatim for the orchestrator's sibling sweep
+    at scheduler.py:6499-6524 (the esc-3163 lesson): a false "no open
+    escalation" would redispatch (here: unblock) a deliberately parked task.
+    """
+    from fused_memory.reconciliation import targeted
+
+    def _raise(*_args, **_kwargs):
+        raise OSError('escalation store unavailable')
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _raise)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'An unreadable escalation store must veto (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_store_unavailable', (
+        f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_proceeds_when_no_open_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """The escalation-pin veto must not become an unconditional block: with
+    no open escalation, the unblock still applies.
+
+    Also pins the lazy per-sweep memo (step-8): the queue must be
+    constructed AT MOST ONCE for a sweep containing two blocked dependents,
+    not once per dependent -- ``EscalationQueue.__init__`` does
+    ``mkdir(parents=True, exist_ok=True)``, so eager per-dependent
+    construction would be wasted I/O on every ``done`` transition.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation import targeted
+
+    construct_calls: list[tuple] = []
+
+    class _SpyQueue(EscalationQueue):
+        def __init__(self, *args, **kwargs):
+            construct_calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _SpyQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    for tid in ('2', '3'):
+        actions = _dep_actions_for(result, tid)
+        assert len(actions) == 1, f'Expected exactly one action for task {tid}, got: {actions}'
+        assert actions[0]['type'] == 'dependent_unblock_applied', (
+            f'No open escalation must not become an unconditional block, got: {actions[0]!r}'
+        )
+
+    assert len(construct_calls) == 1, (
+        f'Expected the escalation queue constructed at most once per sweep '
+        f'(lazy per-sweep memo), got {len(construct_calls)} constructions: {construct_calls}'
+    )
+    assert wired_reconciler.task_interceptor.set_task_status.await_count == 2, (
+        f'Expected both dependents to be attempted, got '
+        f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_when_pending_scan_raises(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """A constructible queue whose SCAN raises is still an unreadable store.
+
+    Distinct from ``test_unblock_dependent_vetoed_when_escalation_store_unreadable``
+    (which fails at construction): once the veto reads the store through a
+    single memoized ``get_pending`` scan, a raise inside that scan is the
+    other way the index can come back unusable, and it must veto rather than
+    flip for the same esc-3163 reason.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation import targeted
+
+    class _ExplodingQueue(EscalationQueue):
+        def get_pending(self):
+            raise OSError('escalation store read failed')
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _ExplodingQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'A failed escalation scan must veto (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_store_unavailable', (
+        f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """The escalation SCAN, not just the queue object, is memoized per sweep.
+
+    The per-dependent ``get_by_task(dep_id, status='pending')`` this replaced
+    re-globbed ``queue_dir/esc-*.json`` and re-parsed every pending record for
+    each blocked dependent -- a D x E filesystem scan (D dependents, E open
+    escalations) charged to the shared event loop on every ``done``
+    transition. One ``get_pending`` scan plus a dict lookup is equivalent
+    (same glob, same ``status == 'pending'`` filter) at 1 x E.
+
+    Also pins the live-status re-read's own per-sweep memo: two blocked
+    dependents must cost exactly two ``get_tasks`` calls (the caller's
+    snapshot + one shared re-read), not one re-read per dependent.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation import targeted
+
+    scans: list[int] = []
+
+    class _CountingQueue(EscalationQueue):
+        def get_pending(self):
+            scans.append(1)
+            return super().get_pending()
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _CountingQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '4', 'title': 'Downstream Four', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    for tid in ('2', '3', '4'):
+        actions = _dep_actions_for(result, tid)
+        assert len(actions) == 1 and actions[0]['type'] == 'dependent_unblock_applied', (
+            f'Expected task {tid} unblocked, got: {actions}'
+        )
+
+    assert len(scans) == 1, (
+        f'Expected the pending-escalation store scanned exactly once per sweep '
+        f'(memoized index), got {len(scans)} scans for 3 blocked dependents'
+    )
+    assert mock_taskmaster.get_tasks.await_count == 2, (
+        f'Expected 2 get_tasks calls (caller snapshot + one memoized live '
+        f're-read), got {mock_taskmaster.get_tasks.await_count}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_skipped_when_live_status_left_blocked(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """TOCTOU guard: a dependent that left 'blocked' after the snapshot is
+    never flipped back to 'pending'.
+
+    ``reconcile_task`` is fire-and-forget background work and this sweep does
+    escalation I/O before writing, so the snapshot can be arbitrarily stale.
+    ``blocked -> in-progress`` is a legal edge (a harness resume-at-verify),
+    and because the write carries no recon ``agent_id`` the
+    ``ActorClass.RECONCILIATION`` restriction that forbids ``(in-progress,
+    *)`` never runs against it -- this live re-read is the only guard.
+    """
+    snapshot = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    )
+    live = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'in-progress', 'dependencies': ['1']},
+    )
+    mock_taskmaster.get_tasks = AsyncMock(side_effect=[snapshot, live])
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_skipped', (
+        f'A dependent that is no longer blocked must be skipped, got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'status_changed', (
+        f'Expected reason=status_changed, got: {actions[0]!r}'
+    )
+    assert actions[0].get('live_status') == 'in-progress', (
+        f'The action must name the status actually observed, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_skipped_when_live_reread_unavailable(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A failed live re-read cannot prove the dependent is still blocked, so
+    it skips rather than flips -- same fail-safe direction as the escalation
+    arm. Under-unblocking is self-healing (the orchestrator's own
+    stranded-blocked sweep still covers it); over-unblocking is the
+    oscillation this sweep exists to end.
+    """
+    snapshot = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    )
+    mock_taskmaster.get_tasks = AsyncMock(
+        side_effect=[snapshot, RuntimeError('taskmaster unavailable')],
+    )
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_skipped', (
+        f'An unreadable live status must skip (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'live_status_unavailable', (
+        f'Expected reason=live_status_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+# ── task-4903: durable audit trail ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_writes_journal_rows(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """A successful unblock must leave a durable 'write' journal row.
+
+    Without this the flip is auditably silent: set_task_status only stamps
+    reopen_reason/reopen_from/reopen_at onto the task row when old_status is
+    terminal (done/cancelled) -- task_interceptor.py:1215-1238 -- and
+    'blocked' is not terminal. Mirrors the symmetric write/skip journal-row
+    convention established by the hints_attached/hints_skipped pair
+    (targeted.py:~1009-1046).
+    """
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    actions = await journal.get_run_actions(runs[0].id)
+    write_rows = [
+        a for a in actions
+        if a['action_type'] == 'write' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert len(write_rows) == 1, f'Expected exactly one write row, got: {write_rows}'
+    detail = write_rows[0]['detail']
+    assert detail.get('task_id') == '2', f'Expected task_id="2" in detail, got: {detail!r}'
+    assert detail.get('satisfied_by') == '1', (
+        f'Expected satisfied_by="1" in detail, got: {detail!r}'
+    )
+    assert detail.get('new_status') == 'pending', (
+        f'Expected new_status="pending" in detail, got: {detail!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_failure_writes_skip_journal_row(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """A rejected write must leave the symmetric 'skip' journal row, carrying
+    the error code, so operators can compute rejection cardinality with
+    ``WHERE action_type='skip'`` without parsing detail JSON.
+    """
+    wired_reconciler.task_interceptor.set_task_status = AsyncMock(return_value={
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '2',
+        'requested_status': 'pending',
+        'actual_status': 'blocked',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    actions = await journal.get_run_actions(runs[0].id)
+    skip_rows = [
+        a for a in actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert len(skip_rows) == 1, f'Expected exactly one skip row, got: {skip_rows}'
+    assert skip_rows[0]['detail'].get('error') == 'status_write_not_persisted', (
+        f'Expected the stable error code in the skip row, got: {skip_rows[0]["detail"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_stamps_task_metadata(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A successful unblock must stamp unblocked_by/unblocked_at onto the
+    dependent's own metadata via ``metadata_mode='merge'`` (last-write-wins),
+    NOT ``append=True``.
+
+    ``append=True`` resolves to additive merge semantics where a scalar
+    collision keeps the OLD value (sqlite_task_backend.py:3294-3295,
+    :3325-3326, :3350-3351) -- a second unblock of the same task would then
+    keep the first timestamp forever, silently freezing the audit at the
+    first occurrence.
+    """
+    import json
+    from datetime import datetime
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    wired_reconciler.task_interceptor.update_task.assert_awaited_once()
+    call = wired_reconciler.task_interceptor.update_task.await_args
+    assert call.kwargs.get('task_id') == '2', (
+        f'Expected update_task for task_id="2", got kwargs={call.kwargs!r}'
+    )
+    assert call.kwargs.get('metadata_mode') == 'merge', (
+        f'Expected metadata_mode="merge" (last-write-wins), NOT append=True '
+        f'(additive keeps the OLD scalar on collision), got kwargs={call.kwargs!r}'
+    )
+    assert 'append' not in call.kwargs, (
+        f'append and metadata_mode must not both be passed (append=False raises '
+        f'TaskmasterError per the task-2180 guard), got kwargs={call.kwargs!r}'
+    )
+    metadata = json.loads(call.kwargs.get('metadata'))
+    assert metadata.get('unblocked_by') == '1', (
+        f'Expected unblocked_by="1", got metadata={metadata!r}'
+    )
+    unblocked_at = metadata.get('unblocked_at')
+    assert isinstance(unblocked_at, str) and unblocked_at, (
+        f'Expected an ISO-8601 unblocked_at timestamp, got metadata={metadata!r}'
+    )
+    # Round-trips through fromisoformat -- confirms it's actually ISO-8601,
+    # not just any truthy string.
+    datetime.fromisoformat(unblocked_at)
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_failure_does_not_downgrade_applied(
+    wired_reconciler, mock_taskmaster, tmp_path, caplog,
+):
+    """A metadata-stamp failure must not downgrade a landed status flip.
+
+    The status write already succeeded; reporting the action as failed would
+    make the audit lie in the opposite direction from step-5/6's contract.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(
+        side_effect=RuntimeError('db locked'),
+    )
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A metadata-stamp failure must not downgrade a landed status flip, '
+        f'got: {actions[0]!r}'
+    )
+    warns = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.targeted' and r.levelno >= logging.WARNING
+    ]
+    assert warns, 'Expected a warning logged for the metadata-stamp failure'
+
+
+# ── task-4903: the metadata stamp must be CLASSIFIED, not just try/except'd ──
+#
+# ``TaskInterceptor.update_task``'s gates do NOT raise: the _backlog_gate
+# BacklogVerdict, the lock-charter rejection and the write-authority floor all
+# return early with a rejection dict. A bare ``try/except Exception`` around
+# the stamp therefore sees nothing under a deep reconciliation backlog --
+# exactly the condition under which this sweep is most likely to run -- and
+# the action still claims ``dependent_unblock_applied`` with no warning and no
+# journal row. ``interceptor_write_succeeded`` is the module's single
+# sanctioned classifier (task_interceptor.py::interceptor_write_succeeded).
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_gate_rejection_is_not_reported_as_stamped(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, caplog,
+):
+    """A gate rejection of the metadata stamp must be classified, not swallowed.
+
+    ``BacklogVerdict.to_error_dict()`` (recon_write_policy.py::BacklogVerdict)
+    returns ``{'error': <rendered msg>, 'error_type': 'ReconciliationBacklog
+    Exceeded', ...}`` -- note there is **no** ``success`` key, and it does not
+    raise, so the helper's ``try/except`` catches nothing.
+
+    The status flip itself genuinely landed, so the action must stay
+    ``dependent_unblock_applied`` (the contract pinned by
+    ``test_unblock_metadata_failure_does_not_downgrade_applied``) -- but it
+    must additionally carry ``metadata_stamp='rejected'`` so the audit does
+    not overstate what landed.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(return_value={
+        'error': 'ReconciliationBacklogExceeded: backlog depth 512 exceeds limit',
+        'error_type': 'ReconciliationBacklogExceeded',
+    })
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A rejected metadata stamp must not downgrade a landed status flip, '
+        f'got: {actions[0]!r}'
+    )
+    assert actions[0].get('metadata_stamp') == 'rejected', (
+        f'Expected metadata_stamp="rejected" so the audit does not claim the '
+        f'stamp landed, got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    detail = stamp_skips[0]['detail']
+    assert detail.get('task_id') == '2', f'Expected task_id="2", got: {detail!r}'
+    assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+        f'Expected the stable error_type code (preferred over the rendered '
+        f'error message), got: {detail!r}'
+    )
+
+    warns = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.targeted' and r.levelno >= logging.WARNING
+    ]
+    assert warns, 'Expected a warning logged for the rejected metadata stamp'
+
+    # The status write is entirely unaffected by the stamp rejection.
+    status_writes = [
+        a for a in journal_actions
+        if a['action_type'] == 'write' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert len(status_writes) == 1, (
+        f'Expected exactly one write/set_task_status row, got: {status_writes}'
+    )
+    status_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'set_task_status'
+    ]
+    assert not status_skips, (
+        f'A metadata-stamp rejection must not emit a set_task_status skip row, '
+        f'got: {status_skips}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_success_writes_journal_row(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """The symmetric positive row: a landed stamp gets its own 'write' row.
+
+    ``metadata_stamp`` is a pure exception-signal -- absent when the stamp
+    landed, mirroring ``hints_attached``, which carries no status field
+    (targeted.py, task 1136/1184).
+    """
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'Expected dependent_unblock_applied, got: {actions[0]!r}'
+    )
+    assert 'metadata_stamp' not in actions[0], (
+        f'metadata_stamp must be absent when the stamp landed, got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_writes = [
+        a for a in journal_actions
+        if a['action_type'] == 'write' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_writes) == 1, (
+        f'Expected exactly one write/update_task row, got: {stamp_writes}'
+    )
+    detail = stamp_writes[0]['detail']
+    assert detail.get('task_id') == '2', f'Expected task_id="2", got: {detail!r}'
+    assert detail.get('satisfied_by') == '1', (
+        f'Expected satisfied_by="1", got: {detail!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_exception_marks_action(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, caplog,
+):
+    """A *raising* stamp is marked 'failed' -- deliberately distinct from the
+    'rejected' marker a gate rejection produces, so an operator can tell an
+    infrastructure fault apart from a policy refusal.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(
+        side_effect=RuntimeError('db locked'),
+    )
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await wired_reconciler.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root=str(tmp_path),
+            task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+        )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A raising metadata stamp must not downgrade a landed status flip, '
+        f'got: {actions[0]!r}'
+    )
+    assert actions[0].get('metadata_stamp') == 'failed', (
+        f'Expected metadata_stamp="failed" (distinct from "rejected"), '
+        f'got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    assert 'db locked' in str(stamp_skips[0]['detail'].get('error')), (
+        f'Expected the exception text in the skip row, '
+        f'got: {stamp_skips[0]["detail"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """A non-dict response is always a failure.
+
+    ``interceptor_write_succeeded(None)`` is False -- the contract is
+    centralised at task_interceptor.py::interceptor_write_succeeded, and a
+    hand-rolled truthiness check would misclassify it.
+    """
+    wired_reconciler.task_interceptor.update_task = AsyncMock(return_value=None)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0].get('metadata_stamp') == 'rejected', (
+        f'A non-dict update_task response must classify as rejected, '
+        f'got: {actions[0]!r}'
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    journal_actions = await journal.get_run_actions(runs[0].id)
+    stamp_skips = [
+        a for a in journal_actions
+        if a['action_type'] == 'skip' and a['target'] == 'taskmaster'
+        and a['operation'] == 'update_task'
+    ]
+    assert len(stamp_skips) == 1, (
+        f'Expected exactly one skip/update_task row, got: {stamp_skips}'
+    )
+    assert stamp_skips[0]['detail'].get('error') == 'unknown', (
+        f"Expected the 'unknown' fallback for a non-dict response, "
+        f'got: {stamp_skips[0]["detail"]!r}'
+    )
