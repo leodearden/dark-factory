@@ -494,13 +494,23 @@ def _git_argv_path(tmp_path):
 
 
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
-                     default_prefix=False, record_git=False):
+                     default_prefix=False, record_git=False,
+                     pad_commit_output=0):
     """Point both wrapper seams at fake recorders. Returns (env, state_path).
 
     With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
     the wrapper's own `uv run --frozen --project <FM> python` prefix is the
     thing under test, with a fake `uv` recorder on PATH. Every other wrapper
     test overrides both seams and therefore never exercises that prefix at all.
+
+    `pad_commit_output` (bytes, default 0/off) is an opt-in knob on the
+    `record_git=True` shim: when set, the shim's handling of a `commit`
+    invocation captures the REAL git's combined output, replays it VERBATIM
+    first, then appends this many padding bytes, and exits with git's REAL
+    status. git's own behaviour never changes -- only the volume the wrapper
+    must read past does. This is what turns the wrapper's SIGPIPE-under-
+    pipefail misread (see the retry-predicate tests below) from a ~0.6% race
+    at git's natural output size into a deterministic reproduction.
     """
     bin_dir = tmp_path / 'wbin'
     bin_dir.mkdir(exist_ok=True)
@@ -535,14 +545,41 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         git_log = _git_argv_path(tmp_path)
         git_log.write_text('')
         shim = bin_dir / 'git'
-        shim.write_text(
-            '#!/usr/bin/env bash\n'
+        record_snippet = (
             f'{sys.executable} -c '
             '\'import json,sys; open(sys.argv[1],"a").write('
             'json.dumps(sys.argv[2:])+"\\n")\' '
             f'{git_log} "$@"\n'
-            f'exec {real_git} "$@"\n'
         )
+        if pad_commit_output:
+            # Only `commit` invocations are padded. Skip any leading `-C
+            # <dir>` pair(s) before checking the subcommand, mirroring
+            # _forbidden_reason's own argv walk below, so this cannot be
+            # fooled by option placement either. Non-commit calls (rev-parse,
+            # status, the scoped add --) fall through to the plain `exec`
+            # branch, untouched.
+            shim.write_text(
+                '#!/usr/bin/env bash\n'
+                + record_snippet +
+                'rest=("$@")\n'
+                'while [ "${rest[0]:-}" = "-C" ] && [ "${#rest[@]}" -ge 2 ]; do\n'
+                '    rest=("${rest[@]:2}")\n'
+                'done\n'
+                'if [ "${rest[0]:-}" = "commit" ]; then\n'
+                f'    out="$({real_git} "$@" 2>&1)"\n'
+                '    rc=$?\n'
+                '    printf \'%s\' "$out"\n'
+                f'    head -c {pad_commit_output} /dev/zero | tr \'\\0\' x\n'
+                '    exit "$rc"\n'
+                'fi\n'
+                f'exec {real_git} "$@"\n'
+            )
+        else:
+            shim.write_text(
+                '#!/usr/bin/env bash\n'
+                + record_snippet +
+                f'exec {real_git} "$@"\n'
+            )
         shim.chmod(0o755)
 
     repo = tmp_path / 'fake-repo'
@@ -844,6 +881,86 @@ def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
     )
     assert proc.returncode != 0
     assert 'did not match any file' in (proc.stdout + proc.stderr).lower()
+
+
+# Trailing bytes appended AFTER git's real (verbatim) commit output, to force
+# the retry predicate's SIGPIPE misread deterministically rather than at its
+# natural ~0.6%-under-load rate.
+#
+# Mirrors tests/scripts/test_setup_host_probe_pipelines.py::BULK_BYTES
+# (task 4204): that file's 30-trials-per-size measurement records 65536 as
+# FLAKY at 26/30 while 262144 and above are 30/30. Do NOT lower this -- a
+# too-small pad does not make the test flaky, it silently weakens its power to
+# catch a reintroduced `printf | grep -q` pipeline, which is worse because it
+# is invisible. (This task separately measured 200/200 at ~200KB on this box;
+# 262144 is the repo's already-established, better-sampled floor.)
+_PAD_COMMIT_OUTPUT_BYTES = 262144
+
+
+def test_the_untracked_retry_is_decided_by_gits_message_not_its_volume(
+        tmp_path):
+    """The untracked-run retry decision must be read from git's MESSAGE, not
+    manufactured by how much git printed.
+
+    ROOT CAUSE. The retry predicate (wrapper lines ~199-201) is
+
+        printf '%s' "$commit_out" | grep -qi 'did not match any file'
+
+    under `set -uo pipefail` (wrapper line 68). `grep -q` exits the instant
+    it matches, and the match is on line 1 of git's own error message; the
+    `printf` writer can then die of SIGPIPE once `commit_out` exceeds the pipe
+    buffer, `pipefail` promotes the pipeline's status to 141, and a TRUE
+    predicate reads FALSE -- so the scoped `git add --` retry is skipped and
+    the first-ever-run commit silently does not happen, even though the
+    string the grep looks for was genuinely present in `commit_out`.
+
+    MEASURED (this worktree, 2026-09-01, git 2.43.0, bash 5.2.21, fleet load
+    avg ~127/32 cores): 25/4000 (0.6%) misses at git's natural ~270-byte
+    message -- an intermittent flake, not a deterministic failure -- and
+    200/200 once the payload passes the pipe buffer. This test buys the
+    deterministic RED the second way: `pad_commit_output=
+    _PAD_COMMIT_OUTPUT_BYTES` inflates ONLY the volume `commit_out` carries
+    (git's real message is replayed verbatim first, and git's real exit
+    status is preserved) -- never git's message or status -- so a 0.6% race
+    becomes a certainty.
+
+    Already-fixed siblings of this exact defect class, adopted here rather
+    than rediscovered: scripts/setup-host.sh::_parity_verdict and
+    scripts/legibility/install-trickle-timer.sh (task 3527, commit
+    5653ccd4f5) -- both replaced `printf | grep -q` with bash's own `[[ ]]`
+    for the identical SIGPIPE-under-pipefail reason.
+
+    Asserts on the BRANCH THE WRAPPER TOOK -- the recorded argv, the
+    narration, the resulting commit -- never on "did the internal pipeline
+    return 141". Measured: that pipeline returns 141 at every payload size
+    tried, including 4096 bytes; it is only the VERDICT drawn from it that
+    races, so a bare exit-141 check would be green on a healthy wrapper too.
+    """
+    repo = _git_repo_harness(tmp_path, tracked=False)
+    result, _ = _run_wrapper_in_git_repo(
+        tmp_path, repo, record_git=True,
+        pad_commit_output=_PAD_COMMIT_OUTPUT_BYTES,
+    )
+    recorded = [
+        json.loads(line)
+        for line in _git_argv_path(tmp_path).read_text().splitlines() if line
+    ]
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+    # The scoped retry actually fired for THIS run -- the branch under test,
+    # not merely "the script survived". Same substring idiom as the pooled
+    # guard below (' add -- ' padded on both sides so a bare `add` verb never
+    # matches), scoped to this one run's own recorded argv.
+    flat = [' '.join(a) for a in recorded]
+    assert any(' add -- ' in f'{c} ' for c in flat), (
+        f'the scoped `git add --` retry never fired for this run: {flat!r}; '
+        f'stderr={result.stderr[-2000:]!r}')
+    assert 'committed the regenerated artifacts' in result.stdout, result.stdout
+    assert 'commit=0' in result.stdout, result.stdout
+    # All three landed in the one retried commit -- the retry stayed scoped.
+    files = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout.split()
+    assert sorted(files) == sorted(_ARTIFACTS), files
 
 
 def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
