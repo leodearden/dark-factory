@@ -641,6 +641,82 @@ class TestGetWithDuplicateArchiveCandidates:
         )
 
 
+class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
+    """get_by_task must find a record whose FILENAME does not encode its task_id.
+
+    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
+    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
+    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
+    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
+    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
+    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
+    carries three stem families in the live corpus (``esc-curator-*`` 31,
+    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
+
+    The false identity "for every record file, ``stem.startswith(
+    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
+    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
+    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
+    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
+    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
+    STORED ``task_id`` FIELD.
+
+    THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
+    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
+    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
+    over a corpus the 30-day pruner already bounds, weighed against a
+    silent-record-loss failure mode and the erosion of contract D11
+    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
+    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+
+    This test is GREEN on arrival — it characterises existing correct behaviour —
+    so its honest RED is a MUTATION check: swap both globs to the scoped form and
+    it must go red.  That check was run and recorded in this commit.
+    """
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
+        """Both live stem families for one task_id come back from get_by_task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        # The SAME task_id under the other live stem family, for contrast.
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+
+        results = queue.get_by_task('task-curator')
+
+        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+            'get_by_task filters on the STORED task_id field, not on the '
+            f'filename: got {sorted(e.id for e in results)}'
+        )
+
+    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+        """The archive tier must not lose the divergent record either."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        queue.resolve('esc-curator-1', 'handled')
+
+        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
+        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+
+        results = queue.get_by_task('task-curator')
+
+        assert 'esc-curator-1' in {e.id for e in results}, (
+            'an ARCHIVED divergent-stem record must still be found by its stored '
+            f'task_id: got {sorted(e.id for e in results)}'
+        )
+
+
 class TestGetByTaskAcrossArchive:
     """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
 
