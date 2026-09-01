@@ -795,7 +795,13 @@ def build_report(
     ``refused_target`` is that same channel for the fail-closed target verify:
     true when ``repo`` could not be verified as the root of the repository git
     resolves for it, so the sweep AND the final prune were declined and every
-    scanned parking landed in ``skipped``. It is reported SEPARATELY because
+    ELIGIBLE parking landed in ``skipped``. ELIGIBLE, not scanned: the age floor
+    is applied UPSTREAM of the sweep (:func:`select_reclaimable`), so a parking
+    younger than ``--min-age-hours`` is counted in ``kept`` and never reaches
+    ``skipped`` even under a refusal. A watchdog's refusal predicate is
+    therefore ``refused_target`` itself — ``skipped == scanned`` holds only when
+    no young parking is present, which on a real nightly is the uncommon case.
+    It is reported SEPARATELY because
     ``skipped`` alone cannot distinguish "detached branch" from "refused
     target", and the always-0 exit code carries no signal at all. A refused
     sweep is a MISSED nightly the next run retries — never a wedged timer, and

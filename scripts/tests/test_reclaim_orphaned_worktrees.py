@@ -1095,19 +1095,27 @@ def test_park_commit_still_commits_through_a_symlinked_parking(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _cli_repo_with_live_and_prunable_parkings(tmp_path):
-    """A repo with one LIVE old parking and one whose directory was deleted, so
-    ``git worktree list --porcelain`` reports a ``prunable`` admin entry.
+    """A repo with one LIVE old parking, one whose directory was deleted (so
+    ``git worktree list --porcelain`` reports a ``prunable`` admin entry), and
+    one YOUNG parking held back by the age floor.
 
     The prunable entry is the observable for the FINAL ``git worktree prune``:
     it is the only phase whose effect survives after the sweep, so "did the
     prune run against this repo?" is answerable from the porcelain alone.
+
+    The YOUNG parking is what makes ``scanned`` exceed ``kept + skipped``'s
+    degenerate case: the age floor is applied UPSTREAM of the sweep, so a young
+    parking is counted in ``kept`` and never reaches ``skipped`` even under a
+    refusal. Without one, ``skipped == scanned`` holds by accident and a test
+    asserting it would pin a coincidence rather than the real invariant.
     """
     repo = _init_repo(tmp_path)
     live = _add_parking(repo, f"2920-{TS_OLD}")
     stale = _add_parking(repo, f"_lane-0-{TS_LANE}")
     shutil.rmtree(stale)
+    young = _add_parking(repo, f"3050-{TS_YOUNG}")
     assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
-    return repo, live, stale
+    return repo, live, stale, young
 
 
 def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
@@ -1116,7 +1124,7 @@ def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
     never wedged. The refusal is carried by the JSON report's ``refused_target``
     key, because the always-0 exit code cannot carry it and ``skipped`` alone
     cannot distinguish 'detached branch' from 'refused target' (INV-4)."""
-    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
     subdir = repo / "subdir"
     subdir.mkdir()
 
@@ -1136,7 +1144,13 @@ def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
     assert report["reclaimed"] == 0
     assert report["park_committed"] == 0
     assert report["scanned"] > 0
-    assert report["skipped"] == report["scanned"]
+    # A refusal skips every ELIGIBLE parking — NOT every scanned one. The age
+    # floor runs upstream of the sweep, so the young parking is counted in
+    # `kept` and never reaches `skipped`. The fixture carries one precisely so
+    # this asserts the invariant rather than the `kept == 0` coincidence.
+    assert report["kept"] > 0
+    assert report["skipped"] == report["scanned"] - report["kept"]
+    assert young.exists()  # the age floor still protects it under a refusal
     assert LOG_PREFIX in result.stderr
     assert "REFUSING" in result.stderr
 
@@ -1158,7 +1172,7 @@ def test_prune_gate_reuses_the_sweep_verdict_instead_of_re_probing(tmp_path, cap
     Driven in-process (not via ``_run_cli``) because monkeypatching cannot cross
     the subprocess boundary.
     """
-    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
     truthful = row.is_git_toplevel
     repo_probes: list[Path] = []
 
@@ -1180,6 +1194,7 @@ def test_prune_gate_reuses_the_sweep_verdict_instead_of_re_probing(tmp_path, cap
     # ...and the prune AGREES with that report: the stale entry survives.
     assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
     assert live.exists()
+    assert young.exists()
     # One decision, one probe — the second source of truth is gone.
     assert len(repo_probes) == 1
 
@@ -1187,7 +1202,7 @@ def test_prune_gate_reuses_the_sweep_verdict_instead_of_re_probing(tmp_path, cap
 def test_cli_verified_run_reports_not_refused_and_still_prunes(tmp_path):
     """NON-REGRESSION: an ordinary run reports ``refused_target`` false, still
     reclaims, and still clears the stale admin entry."""
-    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
 
     result = _run_cli(
         "--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48"
@@ -1198,6 +1213,7 @@ def test_cli_verified_run_reports_not_refused_and_still_prunes(tmp_path):
     assert report["refused_target"] is False
     assert report["reclaimed"] == 1
     assert not live.exists()
+    assert young.exists()  # held back by the age floor, not by the guard
     assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout
 
 
@@ -1206,7 +1222,7 @@ def test_cli_symlinked_repo_behaves_exactly_like_the_direct_path_run(tmp_path):
     legitimate target — reclaims, prunes, ``refused_target`` false. A guard that
     compared literal paths would turn every symlinked deployment into a silently
     skipped nightly."""
-    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    repo, live, _stale, young = _cli_repo_with_live_and_prunable_parkings(tmp_path)
     link = tmp_path / "repo-link"
     link.symlink_to(repo)
 
@@ -1219,4 +1235,5 @@ def test_cli_symlinked_repo_behaves_exactly_like_the_direct_path_run(tmp_path):
     assert report["refused_target"] is False
     assert report["reclaimed"] == 1
     assert not live.exists()
+    assert young.exists()  # held back by the age floor, not by the guard
     assert "prunable" not in _git(repo, "worktree", "list", "--porcelain").stdout
