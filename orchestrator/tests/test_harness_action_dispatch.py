@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEffect
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -43,9 +44,20 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     # Replace scheduler with async mocks (same as test_cascade_unblock.py)
     h.scheduler = MagicMock()
+    # Task 3540: is_actively_held auto-mocks TRUTHY on a bare MagicMock,
+    # so every row would read as having a live claimant and every
+    # resume flip would be silently skipped. Wire the real accessors.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
+    # Task 3540: the row must carry 'status' too, and it must AGREE with
+    # get_status above. _cascade_unblock_member re-reads the row immediately
+    # before the write and re-applies the status/liveness gate to THAT
+    # snapshot (INV-3), so a row that omits 'status' describes a task that
+    # cannot exist and reads as "left the re-pendable statuses" -> no write.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': 'task', 'status': 'blocked', 'metadata': {}}
+    )
     h.scheduler.update_task = AsyncMock(return_value=True)
 
     # _merge_worker stays None — unhalt branch skipped in all tests here
@@ -221,8 +233,18 @@ class TestDispatchLegacyPaths:
             'Wake event must be set synchronously even when flip is suppressed'
         )
 
-    async def test_legacy_resolve_level0_no_flip(self, harness: Harness):
-        """Legacy resolve at level 0 → no flip (level gate preserved)."""
+    async def test_legacy_resolve_level0_orphan_flips(self, harness: Harness):
+        """Legacy resolve at level 0, ORPHANED → flips.
+
+        Re-anchored by task 3540 (PRD D8, spec E9). This previously codified
+        the `level >= 1` floor ("no flip at level 0"), whose premise was that
+        every L0 has a live workflow waiting on the synchronous `event.set()`.
+        That is false for a workflow that died between filing its escalation
+        and exiting: its `_escalation_events` entry is already popped, so the
+        wake set nothing and the floor then dropped the re-pend in silence.
+        Liveness, not level, is the discriminator — the live-workflow half is
+        `test_legacy_resolve_level0_active_workflow_no_flip` below.
+        """
         task_id = 'task-6'
         esc = _make_esc(
             task_id=task_id,
@@ -232,21 +254,58 @@ class TestDispatchLegacyPaths:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
+
+    async def test_legacy_resolve_level0_active_workflow_no_flip(
+        self, harness: Harness
+    ):
+        """The preserved half of the old level-0 floor.
+
+        A LIVE L0 workflow still owns its own re-pend and must not be raced —
+        and it is still woken synchronously. This is the twin of
+        `test_legacy_resolve_active_workflow_no_flip` above at level 0, which
+        is what makes the level gate's removal safe rather than merely wider.
+        """
+        task_id = 'task-6-live'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,
+            status='resolved',
+            resolved_by='steward',
+            level=0,
+        )
+        harness._escalation_events[task_id] = asyncio.Event()
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert harness._escalation_events[task_id].is_set(), (
+            'Wake event must be set synchronously even when the flip is suppressed'
+        )
 
 
 # ---------------------------------------------------------------------------
-# Pair B — resume level>=1 generalization (D7)
-# Step-3: RED until the resume gate is changed from level==1 to level>=1
+# Pair B — the resume gate.  D7 widened it from level==1 to level>=1; task
+# 3540 (PRD plans/task-escalation-state-graph-prd.md D8, spec E9) removed the
+# level floor entirely and replaced it with claimant liveness.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestResumeLevelGate:
-    """B7 — D7: resume gate must be level>=1, not level==1."""
+    """B7: the resume gate keys on LIVENESS, at every escalation level.
+
+    Retains its original name because it is still the cell that owns the
+    gate's contract — what changed is the discriminator, not the subject.
+    """
 
     async def test_born_at_l2_resume_flips_blocked(self, harness: Harness):
         """(a) Born-at-L2 (level=2, resolution_action='resume', direct resolve,
@@ -274,10 +333,16 @@ class TestResumeLevelGate:
             task_id, 'pending',
         )
 
-    async def test_level0_resume_no_flip(self, harness: Harness):
-        """(b) level=0 direct resume still does NOT flip — level floor preserved.
+    async def test_level0_resume_orphan_flips(self, harness: Harness):
+        """(b) level=0 direct resume, ORPHANED → flips.
 
-        After step-4 changes gate to level>=1, level==0 is still excluded.
+        Re-anchored by task 3540 (PRD D8, spec E9): the level floor this cell
+        used to preserve is gone, replaced by claimant liveness. The same
+        re-anchor applied to the legacy-mapping twin in
+        `TestDispatchLegacyPaths.test_legacy_resolve_level0_orphan_flips`; here
+        the action is EXPLICIT (`resolution_action='resume'`) rather than
+        derived, so the two together show the widening is a property of the
+        resume EFFECT, not of how the action string was arrived at.
         """
         task_id = 'task-l0'
         esc = _make_esc(
@@ -288,11 +353,14 @@ class TestResumeLevelGate:
             level=0,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness._escalation_events.pop(task_id, None)  # orphan: no live workflow
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, 'pending',
+        )
 
     async def test_cascade_member_parent_resume_action_flips(self, harness: Harness):
         """(c) Cascade member (level=1, resolved_by='l2-cascade:<id>') whose
@@ -777,8 +845,84 @@ class TestTeardownKillSequence:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        # hard_cancel must be called because the slot never cleared
-        harness.hard_cancel_workflow.assert_called_once_with(task_id)  # type: ignore[attr-defined]
+        # hard_cancel must be called because the slot never cleared.
+        # task 3172: the call now also attributes itself (see
+        # TestTeardownHardCancelIsAttributed below), so match on the task_id
+        # positionally and let the reason kwarg ride along.
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        assert harness.hard_cancel_workflow.call_args.args[0] == task_id  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestTeardownHardCancelIsAttributed:
+    """Escalation-action teardown names ITSELF when it hard-cancels (task 3172).
+
+    Without this, a teardown-cancelled slot's synthetic TaskReport falls into
+    the ``cancelled_unattributed`` residue bucket and is indistinguishable in
+    runs.db from a shutdown drain — the same flattening this task removes on
+    the escalation-sweep side.  The reason carries the ACTION so restart, park
+    and abandon stay separable.
+    """
+
+    def _make_wedged_harness(self, harness: Harness) -> None:
+        """Slot never clears → the poll budget exhausts → hard cancel fires."""
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.set_task_status = AsyncMock()
+        harness.cancel_workflow = MagicMock(return_value=True)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+        harness.is_workflow_active = MagicMock(return_value=True)
+        harness.config.terminal_status_hard_cancel_polls = 2
+
+    async def test_restart_teardown_attributes_the_action(self, harness: Harness):
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-restart'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='restart',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:restart', (
+            f'restart teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
+
+    async def test_park_teardown_attributes_the_action(self, harness: Harness):
+        """Park is the case an INFERRED cause would get wrong.
+
+        Park writes target_status='blocked', so ``_should_stamp`` is False and
+        it leaves NO ``_action_teardown_tasks`` marker behind (harness.py's
+        ``_should_stamp = target_status != 'blocked'``).  A reason reverse-
+        inferred from that marker would silently mislabel every park; a stamped
+        reason is correct by construction.
+        """
+        self._make_wedged_harness(harness)
+        task_id = 'task-attributed-park'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='park',
+            status='pending',
+            resolved_by='interactive',
+            level=2,
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Precondition: park really does leave no teardown marker.
+        assert task_id not in harness._action_teardown_tasks
+
+        harness.hard_cancel_workflow.assert_called_once()  # type: ignore[attr-defined]
+        kwargs = harness.hard_cancel_workflow.call_args.kwargs  # type: ignore[attr-defined]
+        assert kwargs.get('reason') == 'action_teardown:park', (
+            f'park teardown must attribute itself; got {kwargs.get("reason")!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1085,8 +1229,14 @@ class TestActionEffectsTableCoupling:
             level=1,
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        # 'status' must be present and AGREE with get_status above — task
+        # 3540's corroborating read (INV-3) re-applies the status/liveness gate
+        # to this snapshot immediately before the write, so a row omitting
+        # 'status' reads as "left the re-pendable statuses" and no flip lands.
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': task_id, 'metadata': {}},  # no infra_hold
+            return_value={  # no infra_hold
+                'id': task_id, 'status': 'blocked', 'metadata': {},
+            },
         )
         harness._escalation_events.pop(task_id, None)  # ensure orphan (no active workflow)
 

@@ -12,7 +12,17 @@ description = "Agent orchestration system — decomposes PRDs into concurrent TD
 requires-python = ">=3.11,<4"
 dependencies = [
     "click>=8.0",
-    "fastmcp>=2.0",
+    # >=3.2, raised from >=2.0 by task 3690: orchestrator/mcp/verdict_tools.py
+    # now registers shared.mcp_markup_middleware.MarkupGuardMiddleware, and
+    # that module imports `fastmcp.tools.base` (a path that exists only after
+    # tool.py was renamed to base.py) and `fastmcp.server.middleware.Middleware`
+    # (absent before 2.9). Under the old >=2.0 floor a fresh resolve could hand
+    # this package a 2.x where `import shared.mcp_markup_middleware` fails
+    # OUTRIGHT rather than degrading. 3.2.2 is the version every substrate fact
+    # in that module was measured against and what uv.lock already resolves.
+    # Mirrors shared/pyproject.toml, which carries the same floor for the same
+    # reason.
+    "fastmcp>=3.2",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.0",
@@ -32,7 +42,25 @@ orchestrator = "orchestrator.cli:main"
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
+#
+# "../scripts" — task 3931 / esc-3805-1 (2026-08-09), esc-3805-6 (2026-08-12),
+# break-glass hotfix 27ac22a6a6. The root pyproject.toml's own extraPaths lists
+# `scripts`, so ROOT-scoped pyright resolves tests/test_run_vllm_eval.py's
+# `import run_vllm_eval` and EvalSummary/PodHandle become real types; without
+# this entry PACKAGE-scoped pyright leaves that import unresolved, everything
+# degrades to Unknown, and the defects go unreported HERE while the root-scoped
+# verify gate reports them. MEASURED at pyright 1.1.408 with the hotfix
+# reverse-applied: `npx pyright orchestrator/tests/test_run_vllm_eval.py` from
+# the worktree ROOT -> 14 reportArgumentType errors (first at :1827);
+# `cd orchestrator && npx pyright tests/test_run_vllm_eval.py` -> 0 errors.
+# verify's FILE_SCOPED fallback runs pyright root-scoped while pre-commit
+# (hooks/project-checks) and the fleet chain run it package-scoped, so this
+# entry is what keeps the two gates in agreement. DO NOT REMOVE — pinned by
+# tests/test_run_vllm_eval.py::TestPyrightScopeParity and by
+# tests/scripts/test_fallback_verify_config.py's chain-independent
+# generalisation. It only widens IMPORT RESOLUTION: scripts/ is still absent
+# from `include` above, so scripts/ files are not themselves type-checked here.
+extraPaths = ["src", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own

@@ -7,15 +7,39 @@ import logging
 import os
 import re
 import shutil
+import stat
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+from shared import safe_io
 
 from orchestrator.config import TASK_META_DIRNAME
 
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+
+
+class ArtifactWriteError(OSError):
+    """An atomic artifact write was REFUSED; the target was left UNTOUCHED.
+
+    Names both the requested and the resolved path in its message so the
+    failure is actionable without log-scraping.
+
+    Reserved for the ONE refusal that has no natural ``OSError`` of its own:
+    declining to write through a DANGLING symlink is a decision this module
+    makes, not an error the kernel reported.  Ordinary write failures
+    (EACCES, ENOSPC, …) keep propagating as their own types — ``_write_json``
+    has ~13 callers whose observable contract is "whatever OSError the
+    filesystem raised", and blanket-wrapping them would change that for every
+    artifact writer in the orchestrator as a side effect of an atomicity fix.
+
+    Subclasses ``OSError`` so existing ``except OSError`` handlers keep
+    working, and is a DISTINCT type so ``_write_json``'s vanished-root
+    ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
+    """
+
 
 # Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
 # trailing whitespace) at the START of a step description.  Used by
@@ -25,6 +49,30 @@ PLAN_SCHEMA_VERSION = 1
 # than stacking provenance.  The ``+`` also cleans up any tags that a prior
 # (pre-strip) implementation may have already stacked.
 _COMMITTED_TAG_RE = re.compile(r'^(?:\[COMMITTED [0-9a-fA-F]+\]\s*)+')
+
+
+def _existing_mode(target: Path) -> int | None:
+    """The permission bits *target* must carry AFTER an atomic replace.
+
+    An existing target's own mode is preserved verbatim, matching what
+    ``Path.write_text`` (which truncates rather than recreates) did before
+    every artifact write became a tmp+rename.  Without this, the first write
+    after that migration would silently re-mode every `.task-meta` artifact.
+
+    ``None`` for a target that does not exist yet lets ``atomic_write_text``
+    create the temp 0o666 and have the KERNEL apply the process umask —
+    exactly what ``write_text`` produces for a new file, and free of the
+    non-thread-safe ``os.umask(os.umask(0))`` read-back that plan-tools'
+    superseded (now deleted) mode helper needed to compute the same answer.
+
+    Swallows ONLY FileNotFoundError.  EACCES/ELOOP/ENAMETOOLONG on the stat
+    are genuine failures and must surface, not be papered over as "new file".
+    """
+    try:
+        return stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        return None
+
 
 # Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
 # session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
@@ -186,6 +234,13 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
 
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+#: How many consecutive residue filenames ``write_markup_residue`` will probe
+#: before giving up LOUDLY. Every probe past the first means another writer
+#: claimed that index in the same instant, so this is a bound on simultaneous
+#: writers against one artifacts root — a reviewer panel is a handful, and the
+#: orchestrator runs one guarded MCP server per subprocess.
+_MARKUP_RESIDUE_MAX_PROBES = 64
 
 
 def _validate_verdict_role(role: str) -> None:
@@ -1270,6 +1325,138 @@ class TaskArtifacts:
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
+    def write_markup_residue(self, record: dict) -> str | None:
+        """Preserve the residue of a tool call refused for unrepairable markup.
+
+        This is the ONLY surviving copy of a payload the calling agent could not
+        re-emit: the leak is, by construction, a serialization defect that
+        mangled text the agent produced once. Preserving it is what makes
+        refusing a corrupted call NON-DESTRUCTIVE (PRD C2 L187 / INV-7) rather
+        than a silent data loss dressed up as a clean error.
+
+        IT IS THE LAST RESORT, NOT THE CHANNEL. The primary channel for both
+        orchestrator-side boundary guards is the real escalation queue, via
+        ``orchestrator.mcp.markup_sink.make_escalation_sink`` — a queued record
+        names an owner, carries the standing L2 age bound, and is actually READ.
+        This writer is what a guard falls back to when that queue cannot be
+        opened at all (an unresolvable project root, a missing ``escalation``
+        package). Its root lives inside the task's own worktree/meta root, which
+        the orchestrator destroys at teardown with ``git worktree remove
+        --force`` and which a pooled lane clears on acquisition — so a payload
+        parked here survives only until the lane is reaped and nothing
+        proactively surfaces it. Strictly better than losing the payload the
+        instant the queue is down; strictly worse than a queued escalation.
+        Callers must wire it as ``last_resort=``, never as the sink itself.
+        ``.task/`` is gitignored, so a residue file can never contaminate a
+        task's diff or its verify.
+
+        Returns the bare FILENAME (e.g. ``markup_residue-3.json``), not an
+        absolute path: the id stays stable across the worktree/``.task-meta``
+        split and is short enough to sit legibly in a refusal payload, which
+        quotes it so a bounced agent can point an operator at its own data.
+        Returns ``None`` when the root has vanished and nothing was written —
+        never a name for a file that does not exist, because the middleware's
+        hint is conditional on exactly this value, and a caller pointed at a
+        missing file is told its data is safe when it is gone.
+
+        The next index is derived by SCANNING the directory rather than from
+        in-process state: a fresh subprocess's counter would restart at 1 and
+        clobber the previous invocation's evidence. The scan only picks where to
+        START, though — the name itself is CLAIMED with ``O_CREAT | O_EXCL``,
+        the same primitive ``lock_plan`` uses below and for the same reason.
+        Scanning then writing would leave a window a re-check cannot close: a
+        reviewer panel runs several verdict-tools subprocesses against ONE
+        artifacts root (only ``verdicts/<role>.json`` is per-role), a
+        serialization leak is bursty and correlated across panel members, and
+        two writers that both scan before either writes would both choose the
+        same index — the second write silently destroying the first payload.
+
+        There is deliberately no ``read_markup_residue``/``clear_markup_residue``
+        pair. The ``write_*``/``read_*``/``clear_*`` triads in this class exist
+        for records the orchestrator CONSUMES to make a routing decision;
+        residue is durable evidence for an operator, and inventing a consumer
+        API with no consumer would imply a sweep that does not exist. Wiring
+        proactive surfacing is follow-up work, filed against this task.
+        """
+        # The same root-gone guard write_review/write_verdict carry, and for the
+        # same reason. MEASURED: _write_json's FileNotFoundError tolerance does
+        # NOT cover this on its own, because its mkdir(parents=True) RE-CREATES
+        # a root that was deleted out-of-band — resurrecting a worktree
+        # directory as a side effect of a best-effort write. Both siblings guard
+        # explicitly ahead of the call for exactly that reason; this is that one
+        # policy, not a second one.
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_markup_residue for %s.%s — '
+                'root %s no longer exists; %d chars of residue are NOT preserved',
+                record.get('tool'), record.get('field'), self.root,
+                len(record.get('raw_value') or ''),
+            )
+            return None
+
+        existing = sorted(self.root.glob('markup_residue-*.json'))
+        highest = 0
+        for path in existing:
+            suffix = path.stem.removeprefix('markup_residue-')
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+
+        name = None
+        # Bounded, and the bound is stated rather than assumed: this many
+        # writers would have to hold consecutive names at once to exhaust it,
+        # and a real reviewer panel is a handful. Exhaustion is LOUD below
+        # rather than silently rolling over to a second naming scheme.
+        for index in range(highest + 1, highest + 1 + _MARKUP_RESIDUE_MAX_PROBES):
+            candidate = self.root / f'markup_residue-{index}.json'
+            try:
+                # The claim IS the atomicity: O_EXCL fails rather than truncates
+                # if the name was taken between the scan and here, so a loser
+                # moves to the next index instead of overwriting a winner. It
+                # also skips a non-numeric or out-of-band file for free — such a
+                # name must never cost an operator the record.
+                os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            except FileExistsError:
+                continue
+            except OSError:
+                # A vanished root between the guard above and here, or any other
+                # storage failure. _call_sink's never-raises contract makes this
+                # a heads-up, not a crash on the caller's refusal path.
+                logger.info(
+                    'TaskArtifacts: could not claim a residue name under %s for '
+                    '%s.%s; %d chars of residue are NOT preserved',
+                    self.root, record.get('tool'), record.get('field'),
+                    len(record.get('raw_value') or ''),
+                )
+                return None
+            name = candidate.name
+            break
+
+        if name is None:
+            logger.error(
+                'TaskArtifacts: %d consecutive residue names from %d are taken '
+                'under %s; %d chars of residue are NOT preserved for %s.%s',
+                _MARKUP_RESIDUE_MAX_PROBES, highest + 1, self.root,
+                len(record.get('raw_value') or ''),
+                record.get('tool'), record.get('field'),
+            )
+            return None
+
+        # Via _write_json, NOT a hand-rolled write_text: it already carries the
+        # mkdir, the indent+newline convention and the vanished-root tolerance
+        # every other writer in this class relies on. One write policy. It
+        # overwrites the empty claim, which is what the claim is for.
+        self._write_json(self.root / name, record)
+        # A claim with nothing in it is worse than no claim: it holds an index
+        # AND reads as a preserved record that is in fact empty. Only a file
+        # with content earns the name this returns.
+        try:
+            if (self.root / name).stat().st_size == 0:
+                (self.root / name).unlink()
+                return None
+        except OSError:
+            return None
+        return name
+
     def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
 
@@ -1382,13 +1569,122 @@ class TaskArtifacts:
         return False
 
     def _write_json(self, path: Path, data: dict) -> None:
+        """Write *data* to *path* as JSON, ATOMICALLY and DURABLY.
+
+        The single write seam behind every whole-file `.task-meta` artifact
+        (metadata, plan, review_state, reviews, verdicts, agent_session,
+        reconcile_state, the architect's report artifacts), and therefore the
+        single owner of their byte format and their durability guarantees.
+
+        What a concurrent reader may rely on: it observes either the complete
+        OLD contents or the complete NEW contents — never a truncated file,
+        and never a missing one.  ``os.replace`` on a temp written in the
+        destination's own directory is what buys that, by itself and for
+        almost nothing.  (The superseded ``path.write_text`` was
+        truncate-then-write, and a reader racing it could and did observe a
+        half-written file — see ``TestWriteJsonIsAtomic``.)
+
+        ``fsync=True`` is a SEPARATE guarantee, deliberately bought, not a
+        free extension of that one — and it is the dominant cost of this
+        method.  MEASURED on this repo's own filesystem (ext4 on NVMe, a
+        5.5 KB plan.json, 200-write loops): ``write_text`` 0.18 ms/write,
+        atomic WITHOUT fsync 0.27 ms, atomic WITH fsync 5.26 ms.  Atomicity
+        costs ~0.1 ms; durability costs ~5 ms on top — ~20x more — and every
+        caller of this seam pays it.  ``shared.safe_io`` defaults the flag to
+        False for precisely that reason, so overriding its default here is a
+        decision, and it rests on three things:
+
+        * Passing ``fsync=False`` would be a REGRESSION rather than a neutral
+          default.  The plan-tools plan.json writer this method absorbed
+          fsynced its temp before every replace, so a non-fsyncing
+          ``_write_json`` would silently weaken plan.json's existing
+          guarantee on the very change that consolidated it.
+          ``atomic_write_text``'s flag is both-or-neither (temp file AND
+          parent directory), so the real choice was "keep it for every
+          artifact" or "lose it for plan.json".
+        * These artifacts ARE the crash-recovery inputs.  A resumed
+          orchestrator reads plan.json / metadata.json / review_state.json /
+          agent_session.json back to learn what a task already did; an
+          artifact that is atomically written but not durable is exactly what
+          a host crash turns into a silently rewound task.  The
+          parent-directory half earns its keep for the same reason — without
+          it a crash can leave fully synced bytes unreachable under a name
+          that was never persisted.
+        * The cost is bounded because nothing behind this seam is a hot loop.
+          These are lifecycle writes — at most tens per task across all ~13
+          artifacts — so ~5 ms apiece totals well under a second per task,
+          once, against a task lifetime measured in minutes.
+
+        A per-call-site durability flag was rejected: it would make an
+        artifact's crash-safety depend on which method happened to write it,
+        and no current site has a defensible reason to opt out.  Should a
+        future caller genuinely write in a loop, give THAT caller the flag
+        rather than flipping the default underneath the recovery artifacts.
+        The kwargs this contract turns on are pinned by
+        ``TestWriteJsonDelegatesToSharedSafeIo``.
+
+        An EXISTING target keeps its own permission bits across the swap (see
+        :func:`_existing_mode`), which the superseded ``write_text`` got for
+        free by truncating rather than recreating; a new one lands with the
+        umask-derived mode ``write_text`` would have given it.
+
+        A SYMLINKED target is written THROUGH, as ``write_text`` wrote through
+        it: *path* is resolved first and the real file is what gets replaced.
+        This is load-bearing, not hygiene — ``ensure_lane_plan_symlink`` makes
+        ``<worktree>/.task/plan.json`` a symlink onto the meta-root plan, and
+        a bare replace onto the link path would swap it for a regular file,
+        silently re-forking the lane and meta-root copies (the esc-5205-9
+        stale-plan divergence).  Resolving also guarantees the temp shares a
+        filesystem with the real file, so the replace is an intra-filesystem
+        rename rather than EXDEV.  A DANGLING link is REFUSED with
+        :class:`ArtifactWriteError` rather than materialising a stray regular
+        file at the link path — that stray file would BE the divergence.
+
+        The tmp+rename itself is DELEGATED to ``shared.safe_io`` rather than
+        re-implemented here: that helper is the repo's single blessed home for
+        the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
+        still-open fd, and BaseException-safe cleanup are all things a local
+        copy would have to re-earn), and the consolidation is machine-enforced
+        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+
+        ``append_iteration_log`` is deliberately NOT routed through here: it
+        is genuinely append-only, and tmp+rename would turn an O(1) append
+        into an O(n) rewrite while destroying the partial-read tolerance that
+        makes a truncated log still usable line-by-line.
+        """
         # Tolerate a vanished worktree.  Callers that care about durability
         # (init, plan, base_commit, etc.) check ``self.root`` themselves; the
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2) + '\n')
+            # Resolve FIRST — write through a symlink, never onto it.  Order
+            # inside this block is deliberate: the refusal must precede any
+            # filesystem mutation, so dangling check → mode lookup → write.
+            target = Path(os.path.realpath(path))
+            if path.is_symlink() and not target.parent.is_dir():
+                raise ArtifactWriteError(
+                    f'atomic artifact write to {path} refused: its resolved '
+                    f'target {target} has no existing parent directory (a '
+                    'dangling symlink?) — refusing to materialise a stray '
+                    'file at the link path'
+                )
+            # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
+            # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
+            # same path as any other write failure.  It swallows
+            # FileNotFoundError ITSELF and reports the target as new, so a
+            # vanished target does NOT short-circuit here — it reaches
+            # ``atomic_write_text``, which re-creates the parent chain under
+            # ``mkdir=True``, exactly as the superseded
+            # ``path.parent.mkdir(parents=True)`` did.  The tolerated no-op
+            # branch below is therefore reached from the WRITE, never from
+            # the mode lookup.
+            safe_io.atomic_write_text(
+                target,
+                json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
+                mode=_existing_mode(target),
+                fsync=True,
+                mkdir=True,
+            )
         except FileNotFoundError:
             if not self.root.is_dir():
                 logger.info(

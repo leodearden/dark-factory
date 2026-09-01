@@ -26,12 +26,13 @@ other suite-wide isolation defence, so the two read as one family.
 
 from __future__ import annotations
 
+import importlib
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from types import ModuleType
 
 import pytest
 
@@ -49,6 +50,7 @@ from df_pytest_isolation import (  # noqa: E402
     deploy_clock_guard_roots,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    fixture_marker,
 )
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -57,37 +59,6 @@ from df_pytest_isolation import (  # noqa: E402
 # import and pass even with the conftest wiring removed, i.e. exactly the dead
 # defence it exists to detect. Reach it through the module instead.
 _GUARD_NAME = '_df_deploy_clocks_unwritten'
-
-# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
-# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
-# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
-# are accepted, and neither-found is an explicit failure rather than a skipped
-# assertion — a private-API pin that silently stops finding its target is worse
-# than no pin, because it still reads as coverage.
-_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
-
-
-def _fixture_marker(fixture: object) -> Any:
-    """Return pytest's fixture marker, whatever this pytest version calls it.
-
-    `Any`, not `object`, is the honest annotation and is load-bearing for the
-    type gate: the two `_MARKER_ATTRS` spellings above hang DIFFERENT private
-    classes off the fixture, neither of which pytest exports, so there is no
-    real static type that covers both — and `object` makes every `.scope` /
-    `.autouse` read below a `reportAttributeAccessIssue`. Do not "tighten" this
-    back to `object`; pin the attributes with assertions instead, as the caller
-    does.
-    """
-    for attr in _MARKER_ATTRS:
-        marker = getattr(fixture, attr, None)
-        if marker is not None:
-            return marker
-    pytest.fail(
-        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
-        f'{_MARKER_ATTRS}. pytest moved its private fixture API again — find the '
-        'new spelling and add it, do NOT delete this assertion.',
-        pytrace=False,
-    )
 
 _FLEET_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 _FM_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
@@ -453,7 +424,7 @@ class TestGuardIsLiveInThisRun:
         subprocess setup tends to live), and without ``autouse`` nothing would
         ever request it.
         """
-        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+        marker = fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
 
         assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
@@ -589,3 +560,96 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'falsified a REAL deploy clock' not in result.stdout
+
+
+# The sibling that used to reach into THIS module for the marker helper. Named
+# and located as constants so the guard below fails with a legible message
+# rather than a bare ModuleNotFoundError if the file is ever renamed.
+_SIBLING_MODULE_NAME = 'test_drain_process_leak_isolation'
+_SIBLING_PATH = Path(__file__).with_name(_SIBLING_MODULE_NAME + '.py')
+
+
+def _sibling_drain_module() -> ModuleType:
+    """The live ``test_drain_process_leak_isolation`` module object.
+
+    Preferred from ``sys.modules``, matched by ``__file__`` rather than by name:
+    pytest's ``--import-mode=importlib`` (set in the root ``addopts``) registers
+    a collected test module under a rootdir-derived dotted key, not under its
+    bare filename, so a name lookup would miss the module the session actually
+    loaded. Only when this file runs alone — the sibling never collected — is it
+    imported by name, which ``tests/scripts/conftest.py`` makes resolvable by
+    putting this directory on ``sys.path``.
+
+    A bare import, never an ``importorskip``: if the sibling stops importing,
+    this guard must say so loudly rather than skip.
+    """
+    for module in list(sys.modules.values()):
+        origin = getattr(module, '__file__', None)
+        if origin and Path(origin).resolve() == _SIBLING_PATH.resolve():
+            return module
+    return importlib.import_module(_SIBLING_MODULE_NAME)
+
+
+def test_fixture_marker_is_the_shared_one_not_a_local_copy() -> None:
+    """The fixture-marker helper must have exactly ONE definition (task 3960).
+
+    WHY A SECOND COPY IS THE DEFECT AND NOT A STYLE NIT. pytest's fixture marker
+    is PRIVATE and has already MOVED once: ``<=8.x`` hangs it off the decorated
+    function as ``_pytestfixturefunction``, while ``9.x`` wraps the function in a
+    ``FixtureFunctionDefinition`` carrying ``_fixture_function_marker``. Every
+    copy of the lookup is one more thing to update the next time it moves — and
+    a private-API pin that silently stops finding its target is worse than no
+    pin, because it still reads as coverage. The shared helper
+    ``df_pytest_isolation.fixture_marker`` is deliberately built to fail loudly
+    instead (``pytest.fail(..., pytrace=False)`` when it finds neither
+    spelling), so there is exactly one place to fix.
+
+    It also removes a test-module-imports-test-module coupling: the sibling
+    ``test_drain_process_leak_isolation`` reached into THIS module for the
+    helper, which only resolved because ``tests/scripts/conftest.py`` puts this
+    directory on ``sys.path`` — something pytest's ``--import-mode=importlib``
+    deliberately does not do.
+
+    MEASURED RED at base main ``23ce883356``: this module defined its own
+    ``_fixture_marker`` (with ``_MARKER_ATTRS`` beside it) and bound no
+    ``fixture_marker`` at all, and the sibling bound ``_fixture_marker`` via
+    ``from test_deploy_clock_isolation import _fixture_marker`` — so all three
+    assertions below failed.
+
+    ``tests/scripts/test_fleet_dir_isolation.py`` is the working reference for
+    the intended shape: it already imports ``fixture_marker`` from
+    ``df_pytest_isolation`` through the same preamble both these modules carry.
+    """
+    this_module = sys.modules[__name__]
+
+    # (a) This module resolves the SHARED symbol, by identity — not a same-named
+    # re-implementation, which would satisfy any weaker "is it callable" test.
+    resolved = getattr(this_module, 'fixture_marker', None)
+    assert resolved is df_pytest_isolation.fixture_marker, (
+        f'{__name__}.fixture_marker is {resolved!r}, not '
+        f'df_pytest_isolation.fixture_marker (task 3960) — import the shared '
+        f'helper into the existing `from df_pytest_isolation import (...)` '
+        f'block rather than re-implementing the private-API lookup here'
+    )
+
+    # (b) The two names the private copy occupied are GONE, so it cannot grow
+    # back beside the shared one and quietly become the one that gets called.
+    for name in ('_fixture_marker', '_MARKER_ATTRS'):
+        assert not hasattr(this_module, name), (
+            f'{__name__} still defines {name!r} (task 3960) — that is the '
+            f'private copy of the fixture-marker lookup; delete it and use '
+            f'df_pytest_isolation.fixture_marker / _FIXTURE_MARKER_ATTRS'
+        )
+
+    # (c) The sibling does not bind the private copy either — the cross-test-
+    # module import must not return. Reached through the live module object
+    # rather than by re-importing the name, so this tests what the session
+    # actually loaded.
+    sibling = _sibling_drain_module()
+    assert not hasattr(sibling, '_fixture_marker'), (
+        f'{_SIBLING_MODULE_NAME} binds _fixture_marker (task 3960) — that is '
+        f'either a second private copy or a `from {__name__} import '
+        f'_fixture_marker`, a test-module-imports-test-module coupling that '
+        f'only resolves because tests/scripts/conftest.py puts this directory '
+        f'on sys.path. Import df_pytest_isolation.fixture_marker there instead.'
+    )

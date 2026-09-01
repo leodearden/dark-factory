@@ -19,6 +19,8 @@ import re
 import sys
 import types
 import uuid
+import warnings
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -781,6 +783,49 @@ def unique_graph_name(slug: str) -> str:
     return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
 
 
+def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.Session) -> str:
+    """Return this worker's id ('gw0', 'gw1', …) or 'master' — without the xdist PLUGIN.
+
+    Backs the session-scoped ``worker_id`` fixture in ``tests/conftest.py``,
+    which exists because ``worker_id`` was otherwise supplied *solely* by
+    pytest-xdist (``xdist/plugin.py``).  The offline-deep lane's serial confirm
+    re-run appends ``-p no:xdist -o addopts=`` (see
+    ``orchestrator/src/orchestrator/verify_cmd.py``), and ``-p no:xdist``
+    unregisters the plugin along with its FIXTURES — not just its ``-n`` /
+    ``--dist`` CLI options.  Every test requesting ``worker_id`` therefore
+    ERRORED at setup with ``fixture 'worker_id' not found`` in that re-run, and
+    a developer typing ``pytest -p no:xdist`` locally hit the same wall.
+
+    It DELEGATES to xdist's own ``get_xdist_worker_id`` rather than
+    reimplementing its three lines of ``workerinput`` logic.  A conftest
+    fixture SHADOWS a same-named plugin fixture, so the shim takes over
+    ``worker_id`` for every fused-memory test — including healthy
+    ``-n auto --dist loadgroup`` runs, where per-worker isolation is the whole
+    point.  Any semantic drift from xdist would silently collapse worker
+    namespaces and cause the cross-worker collisions those suffixes exist to
+    prevent; delegating makes such drift structurally impossible, which is what
+    makes the shadowing provably safe.
+
+    The import is function-local and deliberate: ``-p no:xdist`` unregisters the
+    PLUGIN but leaves the MODULE importable, so delegation works in exactly the
+    case that is otherwise broken.
+
+    There is deliberately no ``except ImportError: return 'master'`` fallback.
+    pytest-xdist is a declared dev dependency here and this project's addopts
+    hardcode ``-n auto``, so a venv genuinely missing the module is broken
+    rather than a supported configuration — and quietly collapsing every worker
+    onto one shared 'master' namespace there would reintroduce precisely the
+    collisions above, as flaky live-service tests instead of a clear error.
+
+    Args:
+        request_or_session: a pytest ``request`` or ``session`` object — the
+            same parameter xdist's own function takes.
+    """
+    from xdist.plugin import get_xdist_worker_id
+
+    return get_xdist_worker_id(request_or_session)
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
@@ -971,6 +1016,160 @@ async def poll_until_stable(
                 message or f'poll_until_stable: condition not met within {timeout}s'
             )
         await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Shared retry_until_observed() observation barrier (task 4972)
+# ---------------------------------------------------------------------------
+#
+# The THIRD member of the barrier family above, placed beside its two siblings
+# for the same reason poll_until_stable was placed beside poll_until: picking
+# the wrong one is the defect this exists to prevent -- see the docstring's
+# decision rule. Public (no leading underscore) for the reason this module
+# already documents for poll_until / poll_until_stable: it is imported
+# cross-module.
+# ---------------------------------------------------------------------------
+
+async def retry_until_observed(
+    observe: Callable[[], Any],
+    *,
+    reopen: Callable[[], Any] | None = None,
+    attempts: int = 4,
+    delay: float = 0.0,
+    message: str | None = None,
+) -> Any:
+    """Observe a RACY TRANSIENT, RE-OPENING it between attempts, and return what was seen.
+
+    Choosing between this and its two siblings — the whole point of having
+    three:
+
+    * :func:`poll_until` is a **liveness** barrier. Correct when the assertion
+      that follows is "X happened".
+    * :func:`poll_until_stable` is a **settle** barrier. Required when the
+      assertion that follows is an exact count or an "exactly once" claim.
+    * ``retry_until_observed`` is an **observation** barrier. **Required** when
+      the condition is a racy TRANSIENT that may close before any client read
+      can see it — the case both siblings structurally cannot handle, because
+      each only ever looks at ONE opening of the window.
+
+    The discriminator, stated plainly: reach for this only when a miss means
+    the window never opened *for this attempt*, so no interval and no deadline
+    on a single attempt can help — there is nothing left to observe. The only
+    lever that acts on an absent window is to open a new one, which is what
+    *reopen* does.
+
+    The motivating call site is
+    ``tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow``,
+    which observes the rebuild window FalkorDB opens when ``DROP VECTOR INDEX``
+    leaves a merged index's other fields behind. Measured under the offline
+    lane's own scheduling (``nice -n 19 ionice -c3``, serial): the window was
+    observable on 28 of 30 first attempts. On a miss it was not merely hard to
+    catch — the first post-DROP read, taken 6.8 ms after ``DROP`` returned,
+    already showed ONE Entity row, already ``OPERATIONAL``, and it stayed that
+    way for the whole deadline. FalkorDB had completed the rebuild inside the
+    ``DROP`` round-trip; the window never opened at all.
+
+    *observe* and *reopen* may each be a plain sync callable or an
+    async/coroutine function — either way called with no arguments and, if the
+    result is awaitable (``inspect.isawaitable``), awaited before use, matching
+    ``poll_until``'s contract exactly so all three primitives accept the same
+    callable shapes. A falsy *observe* result means "the window was not
+    observed on this attempt". Only a FALSY result counts as a miss —
+    an exception from either callable propagates untouched, so a caller
+    reading a live system can still tell "the shape changed" apart from
+    "the window closed too fast" (the motivating call site's second durable
+    job depends on exactly that).
+
+    WHAT MAKES AN ATTEMPT AN ATTEMPT. Nothing here re-observes faster than
+    the caller lets it, so each attempt must be able to see a window that
+    was not open at the instant the previous one gave up. Satisfy that in
+    one of two ways: make *observe* itself a TIME-BOUNDED awaiting attempt
+    (typically a bounded :func:`poll_until`, which is what the motivating
+    call site does), or pass a non-zero *delay*. A synchronous *observe*
+    with ``reopen=None`` and ``delay=0.0`` would otherwise spend its whole
+    budget inside a single event-loop tick — a barrier that gated nothing
+    while wearing a plausible exhaustion message. The miss path always
+    awaits ``asyncio.sleep(delay)`` even at the 0.0 default, so the loop at
+    minimum YIELDS between attempts rather than starving the event loop.
+
+    Args:
+        observe: Zero-arg sync or async callable making ONE bounded attempt to
+            observe the transient. Returns a truthy observation, or falsy for a
+            miss. Typically itself a bounded ``poll_until``.
+        reopen: Zero-arg sync or async callable that re-opens the transient,
+            called only BETWEEN attempts — never before the first (the caller
+            has already opened the window) and never after the last (nobody
+            would read it). ``None`` means the transient re-arms itself, and
+            is a supported no-op: the attempt budget and the exhaustion raise
+            are unchanged.
+        attempts: Maximum number of observation attempts. Must be >= 1;
+            ``attempts=1`` degenerates to a single un-retried observation.
+        delay: Seconds slept BETWEEN attempts — after *reopen*, before the
+            next observation, so the wait is spent on a window that exists
+            rather than one not yet opened. The sibling primitives spell
+            their cadence knob ``interval``; this one is deliberately named
+            differently because it is not a poll cadence but the gap between
+            two INDEPENDENT openings. Awaited even at the 0.0 default (see
+            above) and, like *reopen*, never after the final miss.
+        message: Caller diagnostic appended to the exhaustion AssertionError.
+
+    Returns:
+        The observation, returned verbatim (not coerced to ``True``), matching
+        ``poll_until`` / ``poll_until_stable``.
+
+    Raises:
+        AssertionError: The transient was not observed in any of *attempts*
+            independent openings — the message names the attempt count and
+            carries the caller's *message*. This helper RAISES rather than
+            returning ``None`` because exhausting the budget is the one signal
+            it must never swallow: it is the evidence that the transient is
+            genuinely GONE rather than merely hard to catch. At the motivating
+            call site that distinction IS the test's primary durable job — a
+            FalkorDB that stopped rebuilding the merged index in place would
+            make every post-drop barrier task 4748 added dead weight, and a
+            silent ``None`` would let that pass as an ordinary miss.
+        ValueError: *attempts* was less than 1 — raised before *observe* is
+            called even once, so a mis-configured budget can never masquerade
+            as the exhaustion AssertionError above.
+    """
+    # Fail CLOSED on a mis-configured budget, before observing anything: with a
+    # bare loop, attempts=0 would make zero observations and then raise the
+    # ordinary exhaustion AssertionError below -- a barrier that gated nothing
+    # while wearing a plausible-looking failure message. Same argument
+    # await_index_operational makes for treating an empty result_set as NOT
+    # ready. ValueError (not AssertionError) so a caller catching a genuine
+    # missed observation cannot swallow a mis-configuration with it.
+    if attempts < 1:
+        raise ValueError(f'retry_until_observed: attempts must be >= 1, got {attempts!r}')
+    for attempt in range(1, attempts + 1):
+        result = observe()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            return result
+        # Re-open, then wait, ONLY between attempts:
+        #   * not before attempt 1 -- the caller has already opened the window
+        #     once, and re-opening first would silently discard that opening
+        #     and double the cost of the common (observed-first-try) case;
+        #   * not after the final miss -- re-arming a window nobody will look
+        #     at is pure waste, and would leave the caller's subject in a
+        #     different state than it expects on the failure path; sleeping
+        #     there is pure latency on the failure path for the same reason.
+        if attempt < attempts:
+            if reopen is not None:
+                reopened = reopen()
+                if inspect.isawaitable(reopened):
+                    await reopened
+            # Unconditional, even at delay=0.0: asyncio.sleep(0) costs one
+            # event-loop tick and hands control back, which is the minimum
+            # that makes a reopen=None caller (a transient re-armed by an
+            # external producer) able to make progress at all. Placed AFTER
+            # reopen so the wait is spent on an already-open window.
+            await asyncio.sleep(delay)
+    detail = f' {message}' if message else ''
+    raise AssertionError(
+        f'retry_until_observed: condition not observed in {attempts} attempt(s).{detail}'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1279,6 +1478,235 @@ async def reap_leaked_ticket_workers() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Leaked async httpx client reaping (task 4412)
+#
+# Sibling of reap_leaked_ticket_workers above, and of
+# orchestrator/tests/_orch_helpers.py::reap_leaked_aiosqlite_connections
+# (task 2413): a per-test teardown drain for a resource whose owner never
+# closes it, written here rather than at the ~40 call sites across 7 test
+# modules that leak one.
+# ---------------------------------------------------------------------------
+
+#: Every httpx.AsyncClient constructed since track_async_httpx_clients() ran.
+#: A WeakSet so tracking never keeps a client alive past its natural lifetime —
+#: the reaper only ever sees clients something else is still holding.
+_TRACKED_ASYNC_HTTPX_CLIENTS: weakref.WeakSet = weakref.WeakSet()
+
+#: Per-client bound on the drain's aclose(). The reaper runs in EVERY test's
+#: teardown, so an aclose() that never returns must cost that test a bounded
+#: pause rather than hang it until pytest-timeout kills the whole xdist worker
+#: (see the timeout notes in fused-memory/pyproject.toml). A module-level knob
+#: rather than a literal so the bound itself is testable in ~50ms — see
+#: test_async_httpx_leak_isolation.test_reap_is_bounded_when_aclose_hangs.
+ASYNC_HTTPX_ACLOSE_TIMEOUT = 10.0
+
+
+#: Stamped on the installed wrapper so a second install is a no-op. Named on
+#: the FUNCTION rather than kept in a module global because the thing being
+#: guarded is the state of ``httpx.AsyncClient.__init__`` itself: a test that
+#: restores a pristine ``__init__`` (see
+#: test_async_httpx_leak_isolation.test_track_async_httpx_clients_is_idempotent)
+#: must be able to re-install, which a module-level "already ran" flag would
+#: wrongly refuse.
+_TRACK_SENTINEL = '_df_tracks_async_httpx_clients'
+
+
+def track_async_httpx_clients() -> bool:
+    """Record every ``httpx.AsyncClient`` built from now on, for later reaping.
+
+    Wraps ``httpx.AsyncClient.__init__`` — ONE patch point that catches every
+    library shipping the leaky wrapper, present and future. Measured in this
+    worktree: ``openai._base_client.AsyncHttpxClientWrapper`` and
+    ``anthropic._base_client.AsyncHttpxClientWrapper`` both have MRO
+    ``(Wrapper -> _DefaultAsyncHttpxClient -> httpx.AsyncClient)`` and chain to
+    ``httpx.AsyncClient.__init__``, so patching only the base tracked all of
+    ``AsyncOpenAI``, ``AsyncAnthropic``, a ``graphiti_core`` ``OpenAIClient``
+    and a bare ``httpx.AsyncClient``. That needs no per-library import list to
+    keep in sync and cannot break on import order.
+
+    Instances are recorded AFTER the original ``__init__`` returns, so a
+    constructor that raises leaves nothing half-built in the WeakSet.
+
+    Idempotent, and that is load-bearing rather than hygiene: ``conftest``'s
+    ``pytest_configure`` installs the hook at session start and each test in
+    ``test_async_httpx_leak_isolation.py`` calls it again, so an unguarded
+    re-wrap would nest one extra frame around the saved original per call for
+    the rest of the session.
+
+    Returns:
+        True if this call installed the hook, False if it was already present.
+    """
+    original = httpx.AsyncClient.__init__
+    if getattr(original, _TRACK_SENTINEL, False):
+        return False
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _TRACKED_ASYNC_HTTPX_CLIENTS.add(self)
+
+    # functools.wraps copies __dict__ from the wrapped function, so stamp the
+    # sentinel AFTER it — otherwise re-installing over an already-stamped
+    # original would carry the flag straight onto the new wrapper anyway.
+    setattr(__init__, _TRACK_SENTINEL, True)
+    httpx.AsyncClient.__init__ = __init__
+    return True
+
+
+def _leaked_async_httpx_clients() -> list:
+    """Return the tracked clients that are unclosed AND resurrect-capable.
+
+    "Resurrect-capable" means ``type(c)`` defines ``__del__`` — the finaliser
+    that reschedules ``aclose()`` onto a running loop and so produces the
+    flake. Measured: True for both libraries' ``AsyncHttpxClientWrapper``,
+    False for a bare ``httpx.AsyncClient`` (``'__del__' not in
+    httpx.AsyncClient.__dict__``). Deriving the predicate from the MECHANISM
+    rather than allow-listing ``openai``/``anthropic`` by name means any
+    future dependency shipping the same finaliser is covered without a code
+    change, and — just as important — that a bare async httpx client owned by
+    an unrelated fixture is left strictly alone. Closing everything tracked
+    would give the reaper a much larger blast radius than a flake fix earns.
+
+    Also the cheap predicate ``conftest``'s SYNC autouse fixture checks before
+    deciding whether to spin up an event loop at all, so the ~14100-of-14147
+    tests that leak nothing pay only a WeakSet scan.
+
+    NO NOTION OF OWNERSHIP OR AGE, deliberately: every tracked, open,
+    resurrect-capable client is selected, whoever built it and whenever. A
+    client built by a fixture scoped WIDER than ``function`` would therefore
+    be closed at the first test's teardown, out from under its owner. See the
+    CONSTRAINT block above the two autouse arms in ``conftest.py`` for why
+    scoping the reap to the current test was considered and rejected (it opens
+    the inverse hole), and for the warning that makes the trap discoverable if
+    anyone ever walks into it.
+    """
+    return [
+        client
+        for client in list(_TRACKED_ASYNC_HTTPX_CLIENTS)
+        if not client.is_closed and hasattr(type(client), '__del__')
+    ]
+
+
+async def reap_leaked_async_httpx_clients() -> int:
+    """Close any tracked ``httpx.AsyncClient`` that its owner never closed.
+
+    Task 4412 — fix for the fused-memory caplog flake CLASS where an unclosed
+    ``openai``/``anthropic`` client emits an ERROR record onto the root
+    ``asyncio`` logger from inside an unrelated later test's caplog window.
+
+    ROOT CAUSE: ``openai._base_client.AsyncHttpxClientWrapper`` and its
+    ``anthropic`` twin define::
+
+        def __del__(self) -> None:
+            if self.is_closed:
+                return
+            try:
+                asyncio.get_running_loop().create_task(self.aclose())
+            except Exception:
+                pass
+
+    An ``AsyncOpenAI``/``AsyncAnthropic`` that is never closed is GC-finalised
+    at a nondeterministic point; if a loop happens to be running, ``__del__``
+    RESURRECTS the object as ``create_task(self.aclose())``. That Task's
+    coroutine is httpx's inherited ``AsyncClient.aclose`` — the
+    ``coro=<AsyncClient.aclose() ...>`` in the symptom. Its ``aclose()`` then
+    hits a connection pool bound to an already-closed loop and raises
+    ``RuntimeError('Event loop is closed')``; nobody retrieves it, so
+    ``Task.__del__`` logs ``Task exception was never retrieved`` at ERROR and
+    it is blamed on whichever test's caplog is open at the time.
+
+    MEASURED (this worktree, full default-lane suite, 14147 passed): 40
+    wrapper instances constructed, ALL 40 GC-finalised, ZERO closed — i.e. 40
+    chances per suite run for ``__del__`` to resurrect. They come from
+    ``graphiti_core``'s ``OpenAIClient`` / ``OpenAIGenericClient`` /
+    ``OpenAIEmbedder`` / ``OpenAIRerankerClient``, each of which mints its own
+    ``AsyncOpenAI`` in ``__init__`` and exposes no ``close()`` — so the tests
+    that trigger them have no call-site fix available.
+
+    FIX: close every tracked client at each test's teardown boundary.
+    ``__del__``'s own ``if self.is_closed: return`` then short-circuits, so the
+    resurrect path is unreachable and the ERROR record can never be emitted.
+
+    Best-effort and bounded, and a cheap no-op for the (vast majority of)
+    tests that leak nothing. Only ``asyncio.TimeoutError`` and ``RuntimeError``
+    are suppressed: a client whose pool belongs to an already-closed loop
+    raises ``RuntimeError`` on ``aclose()`` and must not fail an innocent test.
+    A genuine bug inside the reaper itself — or a ``CancelledError`` targeting
+    the reaper's own task — is deliberately left to propagate rather than
+    masked by a blanket ``except Exception``
+    (loud-over-silent-degradation). Both halves of that robustness contract
+    are pinned behaviourally rather than left as prose:
+    ``test_reap_survives_a_client_whose_aclose_raises`` (the suppressed
+    ``RuntimeError``, and that a client which failed to close is NOT counted)
+    and ``test_reap_is_bounded_when_aclose_hangs`` (the
+    ``ASYNC_HTTPX_ACLOSE_TIMEOUT`` bound, exercised at 50ms).
+
+    MAINTENANCE NOTE: this relies on third-party internals that are not part
+    of any public API — the ``AsyncHttpxClientWrapper.__del__`` finaliser in
+    ``openai``/``anthropic``, and those wrappers chaining to
+    ``httpx.AsyncClient.__init__`` so a single base-class hook sees them.
+    Verified against httpx 0.28.1 / openai 2.31.0 / anthropic 0.92.0. If a
+    future release drops the finaliser or stops chaining, this helper degrades
+    to a no-op (returns 0) rather than raising — the reaping is then lost. That
+    loss is NOT silent: ``test_async_httpx_leak_isolation.py``'s
+    ``test_a_reaped_client_del_schedules_no_aclose_task`` asserts an UNCLOSED
+    client's ``__del__`` schedules exactly 1 ``AsyncClient.aclose()`` task, so
+    a dropped finaliser fails that test loudly (mirrors
+    ``reap_leaked_aiosqlite_connections``'s MAINTENANCE NOTE and its
+    ``PytestUnhandledThreadExceptionWarning`` backstop, task 4075). Re-verify
+    this helper against both libraries' ``_base_client.py`` whenever the
+    pinned versions change.
+
+    Returns:
+        The number of clients this call actually closed (``is_closed``
+        confirmed post-drain) — a client that fails to close within the
+        bounded timeout is not counted.
+    """
+    reaped = 0
+    for client in _leaked_async_httpx_clients():
+        with contextlib.suppress(asyncio.TimeoutError, RuntimeError):
+            await asyncio.wait_for(
+                client.aclose(), timeout=ASYNC_HTTPX_ACLOSE_TIMEOUT,
+            )
+        if client.is_closed:
+            reaped += 1
+    return reaped
+
+
+def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None:
+    """Warn if the drain closed a client that pre-dated the current test.
+
+    *preexisting* is the snapshot ``conftest``'s SYNC autouse arm takes at
+    SETUP: the clients that were already tracked, open and resurrect-capable
+    before the test started.
+    Any of them found closed at teardown was closed by this test or by the
+    drain — either way, something owns a client that outlives a single test,
+    which the drain cannot support (see the CONSTRAINT block above the two
+    autouse arms in ``conftest.py``, and ``_leaked_async_httpx_clients``
+    above for why the selection predicate has no notion of ownership).
+
+    A warning rather than a failure: the drain closing a foreign client is a
+    design violation by the FIXTURE, not by the test that happens to be
+    finishing, and failing that test would reproduce the very
+    blame-the-innocent-test pattern being removed. The warning is greppable in
+    CI output and names the fix.
+    """
+    closed = [client for client in preexisting if client.is_closed]
+    if not closed:
+        return
+    warnings.warn(
+        f'async-httpx drain closed {len(closed)} openai/anthropic client(s) '
+        f'that existed BEFORE this test started. The drain has no notion of '
+        f'ownership: it closes every tracked, open, resurrect-capable client '
+        f'at every test teardown. If a fixture scoped wider than `function` '
+        f'(or a module-level cache) owns one, it has just been closed out from '
+        f'under its owner and will fail later with "Cannot send a request, as '
+        f'the client has been closed". Move it to function scope (task 4412).',
+        stacklevel=2,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
 # test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
 # independent copies of the same loader).
@@ -1346,3 +1774,114 @@ def load_script_module(
         _LOADED_SCRIPT_MODULE_NAMES.discard(name)
         raise
     return module
+
+
+# ---------------------------------------------------------------------------
+# Cross-run citation repair fixtures (task 3065)
+#
+# Shared by BOTH tests/reconciliation/test_citation_repair.py and
+# tests/server/test_recon_report_citation_repair.py — one definition here rather
+# than a copy in each module, so the journal shape the repair path reads and the
+# lookup verdicts it branches on cannot drift between the two suites.
+# ---------------------------------------------------------------------------
+
+
+async def build_journal_with_closed_run(
+    tmp_path: Any,
+    *,
+    run_id: str,
+    project_id: str = 'reify',
+    status: str = 'completed',
+    stage: str = 'memory_consolidator',
+    findings: list[dict[str, Any]],
+    extra_stage_reports: dict[str, Any] | None = None,
+):
+    """Open a real ``ReconciliationJournal`` holding one run with ``findings``.
+
+    A REAL journal on a tmp_path SQLite file, not a fake: the repair path's whole
+    reason to exist is that a closed run's findings live only in the journal's
+    ``runs.stage_reports`` blob, so a test that stubbed the round-trip would stop
+    exercising the one thing under test (``StageReport`` parse on read,
+    ``model_dump(mode='json')`` re-serialize on write).
+
+    ``findings`` becomes ``stage_reports[stage].items_flagged``.
+    ``extra_stage_reports`` is merged in verbatim AFTER that entry, so a caller
+    can seed a second real stage or a raw non-``StageReport`` entry
+    (``{'_error': {...}}``) to prove the stage scan tolerates it.
+
+    Returns the OPEN journal — the caller closes it (``await journal.close()``).
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+    from fused_memory.reconciliation.journal import ReconciliationJournal
+
+    journal = ReconciliationJournal(pathlib.Path(tmp_path))
+    await journal.initialize()
+    now = datetime.now(UTC)
+    # ``status``/``stage`` stay plain ``str`` in the signature so a caller writes
+    # the same literal the journal row holds; coerced here because the model
+    # fields are StrEnums (pydantic would coerce anyway — this just makes the
+    # conversion visible to the type checker rather than implicit).
+    await journal.start_run(
+        ReconciliationRun(
+            id=run_id,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=now,
+            completed_at=None if status == 'running' else now,
+            status=RunStatus(status),
+        )
+    )
+    reports: dict[str, Any] = {
+        stage: StageReport(
+            stage=StageId(stage),
+            started_at=now,
+            completed_at=now,
+            items_flagged=findings,
+        )
+    }
+    reports.update(extra_stage_reports or {})
+    await journal.update_run_stage_reports(run_id, reports)
+    return journal
+
+
+class FakeMemoryLookup:
+    """Async ``get_memory_by_id`` stub with an explicit per-id verdict.
+
+    The map's value decides the branch, so a test states which of the THREE
+    outcomes it means without any implicit default:
+
+    - ``dict``      -> the memory resolves (live);
+    - ``None``      -> genuinely absent (the only verdict that licenses a repair);
+    - ``Exception`` -> the backend RAISED (unknown, never "absent").
+
+    An id missing from the map resolves to ``None``, matching the real service's
+    not-found return. ``calls`` records every ``(project_id, memory_id)`` in
+    order, so a test can assert a gate fired BEFORE any lookup was attempted.
+
+    Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
+    replacement's fingerprint off the raw Qdrant payload this returns, not
+    through ``MemoryService.get_memory`` (whose mem0 fingerprint is
+    structurally ``{category: None, agent_id: None, ...}`` — see
+    ``citation_repair._fingerprint_from_record``). A test that needs to pin
+    that non-call subclasses this and adds a recording ``get_memory``.
+    """
+
+    def __init__(self, memories: dict[str, Any] | None = None):
+        self.memories: dict[str, Any] = dict(memories or {})
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_memory_by_id(self, project_id: str, memory_id: str) -> Any:
+        self.calls.append((project_id, memory_id))
+        verdict = self.memories.get(memory_id)
+        if isinstance(verdict, BaseException):
+            raise verdict
+        return verdict

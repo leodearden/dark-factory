@@ -23,6 +23,7 @@ from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
+    _materialize_stdin,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
@@ -1143,26 +1144,43 @@ async def _run_subprocess_local(
 ) -> _SubprocessResult:
     """Run a subprocess, log output, enforce budget timeout.
 
-    *stdin_data*, when set, is piped to the process's stdin (mirrors
+    *stdin_data*, when set, is delivered on the process's stdin (mirrors
     shared.cli_invoke._run_subprocess's stdin_data param, used by the
     codex backend to deliver instructions without a worktree file — see
     _invoke_codex). When None (gemini/pi callers), behavior is
     byte-identical to before this param existed.
+
+    Like the shared runner, the payload is pre-materialized into an unlinked
+    temp file BEFORE spawn rather than written to a pipe afterwards, so an
+    event-loop stall cannot make the child miss its stdin deadline (task 3147
+    — see shared.cli_invoke._materialize_stdin for the confirmed failure mode).
+    The helper is imported, never re-implemented, so the two runners cannot
+    drift apart.
     """
     logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
 
     start_ms = int(time.monotonic() * 1000)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Pre-materialize the payload BEFORE the child exists (task 3147); see the
+    # docstring above.  stdin_data is None must still yield stdin=None.
+    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's handle once the child has its own dup — this is
+        # what delivers EOF to the child.  In a `finally` so a raising
+        # create_subprocess_exec cannot leak the fd.
+        if stdin_file is not None:
+            stdin_file.close()
     # Capture pgid at spawn; start_new_session guarantees pgid == pid.
     pgid = proc.pid
 
@@ -1176,7 +1194,9 @@ async def _run_subprocess_local(
     try:
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_data),
+                # No `input=`: stdin was pre-materialized as a real fd before
+                # spawn (task 3147), so communicate() performs reads only.
+                proc.communicate(),
                 timeout=timeout_seconds,
             )
         except TimeoutError:

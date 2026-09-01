@@ -15,12 +15,26 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+
+# Fully qualified rather than `from shared import ...`: the module is
+# deliberately NOT re-exported from shared/__init__, so `import shared` does
+# not pull fastmcp into every consumer of the base layer.
+from shared.mcp_markup_middleware import (
+    FACT_MARKUP_DETECTED,
+    MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_STORM_ERROR_TYPE,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MARKUP_UNREPAIRABLE_ERROR_TYPE,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
+from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
@@ -391,18 +405,30 @@ CATEGORIES = [
 #
 # NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
 # to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
-# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
-# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
-# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
-# basis for including them.  Bounding them here was considered and REJECTED in
-# both available forms: truncating ``root_cause`` in the projection would
-# silently break the exact-match rebuild that is C1's entire point, and capping
-# it at mint would either fail a legitimate promote outright or collapse two
-# distinct keys into one L2 — over-folding, the very failure the amendment
+# validates only that ``root_cause`` is non-empty and canonicalises to something,
+# so an arbitrarily long key rides every compact row, and ``member_ids`` grows
+# with cluster size.  Both are short in PRACTICE (a one-line dedup key; ~20-char
+# ids), which is the actual basis for including them.  Bounding them here was
+# considered and REJECTED in both available forms: truncating ``root_cause`` in
+# the projection would silently break the C1 rebuild that is its entire point
+# (the key would no longer canonicalise to what the server matches on), and
+# capping it at mint would either fail a legitimate promote outright or collapse
+# two distinct keys into one L2 — over-folding, the very failure the amendment
 # storm report exists to surface.  The cost is real and named rather than
 # denied: every compact reader pays it, including the dashboard's
 # ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
 # ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+#
+# NO CANONICAL-FORM FIELD IS PROJECTED (task 3998), deliberately: matching moved
+# to the canonical form, but adding a second key would roughly double
+# root_cause's share of every compact row for no gain.  A client-side rebuild
+# should import ``escalation.canonical.canonical_root_cause`` — it is exported
+# publicly for exactly that — rather than reimplementing the transform; and
+# because the server now folds near-duplicates itself, a rebuild sees ONE row
+# where it used to see two.  A rebuild that keeps comparing raw strings is
+# strictly MORE conservative than the server (it re-promotes a near-duplicate,
+# the server folds it and answers ``status:'updated'``), so it stays correct.
+#
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
 # get_escalation round-trip.
@@ -477,6 +503,160 @@ _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
 # attribution belongs.  The ids also form one greppable
 # ``esc-l2-amendment-truncation-N`` series.
 _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
+
+
+# --- Leaked-envelope-markup residue anchors (task 3690, PRD section 4 C2) ---
+#
+# Two SYNTHETIC anchors, same reasoning as ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``
+# above and as ``markup_tripwire._ANCHOR_TASK_ID``: both conditions are properties
+# of the HARNESS serialization leak, not of whichever task's call happened to
+# carry the damage.  The middleware's residue record has no ``task_id`` at all —
+# it resolves ``agent_id``/``project`` and deliberately does not guess a task —
+# so there is no caller task to file against even if one were wanted.
+#
+# They are DISTINCT anchors because the two records have opposite dedup needs.
+# A residue record is the ONLY surviving copy of one specific caller's payload,
+# so every one must land on its own; a storm record is a rate alarm about a
+# condition, so a second one while the first is still open is noise.  One shared
+# anchor would force a single answer to both.
+_MARKUP_RESIDUE_ANCHOR_TASK_ID = 'mcp-markup-residue'
+_MARKUP_STORM_ANCHOR_TASK_ID = 'mcp-markup-storm'
+
+# The burst alarm's own category. Named once because it is written on the way
+# IN (the record this sink files) and read on the way OUT (the dedup predicate
+# asking whether this guard's own alarm is already open) — and a dedup that
+# matches on a second spelling of the category it writes silently stops
+# deduping, which is the failure mode that is hardest to notice from the queue.
+_MARKUP_STORM_CATEGORY = 'mcp_markup_storm'
+
+# The sentinel role these records are filed under.  A born-at-L2 record must
+# carry a role in ``_HARNESS_SENTINEL_ROLE_PREFIXES`` — the same contract
+# ``submit.py`` enforces at its argument boundary for the file-backed CLI, and
+# the reason the agent-role downgrade gate below exists.  The residue sink
+# writes ``level=2`` directly via ``queue.submit`` and so bypasses that gate;
+# honouring the contract here is what keeps the on-disk record legal rather than
+# merely unchecked.
+_MARKUP_GUARD_AGENT_ROLE = 'harness-markup-guard'
+
+# Born-at-L2 severity for the residue record.  ``level=2`` and a severity in
+# ``BORN_AT_L2_SEVERITIES`` are one decision, not two: ``models`` states that an
+# escalation is born at L2 *when* its severity is in that set, so a level=2
+# record carrying 'info' would be internally incoherent to every reader of the
+# consumer-per-level contract.
+#
+# THE SIBLING GUARDS FILE THE SAME RECORD CLASS AT 'blocking'
+# (``orchestrator.mcp.markup_sink.file_residue``), and that is ONE rule
+# resolving two ways, not two sites disagreeing.  The rule is the sentinel-role
+# gate directly below — ``_is_harness_sentinel_role`` — which this repo applies
+# wherever a born-at-L2 severity is minted: ``_chokepoint_or_submit`` downgrades
+# critical/urgent to 'blocking' for any non-sentinel role, and ``submit.py``
+# rejects a non-sentinel ``--agent-role`` outright.  This guard runs INSIDE the
+# escalation server and files as ``harness-markup-guard``, a sentinel; the
+# orchestrator-side guards file as ``plan-tools-markup-guard`` /
+# ``verdict-tools-markup-guard``, which are not, so 'blocking' is the only
+# severity those records may legally carry.  Both sites reach the queue through
+# a direct ``queue.submit`` that bypasses the gate, so each honours the rule by
+# construction rather than by being checked — which is exactly why the answer is
+# written down at both, and why neither may be "made to match" the other by
+# changing the severity alone.
+#
+# The severity is NOT the flood control, and must not be mistaken for it: an
+# actively running leak files one undeduped level=2 record per refused call, and
+# ``escalation.watcher`` emits one notification per pending L2 (it exits after
+# the first match and re-arms), so N refusals page N times regardless of which
+# born-at-L2 severity is written.  Batching that channel is the L2 watcher's own
+# concern — see the digest rule in ``skills/escalation-watcher/SKILL.md`` and the
+# rolling-window ceiling ``scripts/dashboard-watchdog.py`` already keeps — and
+# filed as follow-up work rather than fixed here, because the alternative inside
+# this sink is to dedup residue records, which destroys the one payload each of
+# them exists to preserve.
+_MARKUP_RESIDUE_SEVERITY = 'critical'
+
+
+def _markup_residue_prose(record: dict[str, Any]) -> str:
+    """What actually happened to the call, in the reader's own terms.
+
+    DISPATCHED ON ``error_type``, never assumed, because this sink receives two
+    residue kinds whose triage is OPPOSITE and this server is the only site that
+    produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
+    REFUSED — nothing was written, and the caller was told, so a human may
+    reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
+    means the call was FORWARDED and LANDED without the parameter, and nobody
+    was told: no retry is coming, and the stored record is already wrong.  One
+    hardcoded "the call was refused" sentence renders the second kind a record
+    that contradicts its own summary three lines above, and the false half is
+    the half that changes what an operator does.
+
+    ``shared.mcp_markup_middleware`` names the kinds precisely so a sink written
+    when only the refusal existed cannot silently mis-file the newer one; this
+    is that sink, matching the set rather than a single name.
+
+    An UNRECOGNISED kind is filed anyway, with a visibly-hedged body that
+    renders the middleware's own ``summary`` and ``suggested_action`` — the same
+    posture ``orchestrator.mcp.markup_sink`` takes.  Dropping a record kind is
+    the silent fail-soft this PRD exists to end, and an unfamiliar record in the
+    queue is a question an operator can answer.
+    """
+    error_type = record.get('error_type')
+    if error_type == MARKUP_UNREPAIRABLE_ERROR_TYPE:
+        return (
+            'THE CALL WAS REFUSED. The leaked fragment\'s own boundary could '
+            'not be determined, so no repair was attempted and nothing was '
+            'guessed. Nothing this call carried reached the escalation store, '
+            'and the caller WAS told: it holds its own copy and can resend, so '
+            'the payload below is a recovery aid rather than the only route '
+            'back to the data.'
+        )
+    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
+        return (
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
+            'value below was recovered from the leak but could not be typed '
+            'against the parameter\'s declared schema, so it was dropped from '
+            'the call rather than passed through untyped. The caller was NOT '
+            'told — nobody is waiting on a retry, and the record that call '
+            'filed is already stored missing this field. The payload below is '
+            'the only surviving copy of it.'
+        )
+    logger.warning(
+        'markup guard: filing an unrecognised residue kind %r — the middleware '
+        'emits something this sink does not know about (known: %s)',
+        error_type, sorted(MARKUP_RESIDUE_ERROR_TYPES),
+    )
+    return '\n'.join([
+        f'UNRECOGNISED RESIDUE KIND {error_type!r}. This sink does not know '
+        'what this call\'s outcome was, so it states neither — the middleware '
+        'grew a record kind that escalation/src/escalation/server.py has not '
+        'been taught. Its own words for what happened follow; treat them, not '
+        'this paragraph, as the account of the call.',
+        '',
+        f'summary: {record.get("summary")!r}',
+        f'suggested_action: {record.get("suggested_action")!r}',
+    ])
+
+
+# INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
+# the pending-L2 lookup folds more promotes BY DESIGN, so its failure mode is
+# over-folding: distinct causes silently merged under one canonical key.  The
+# signature is a single L2 addressed by many mutually-DISTINCT pre-canonical
+# spellings, counted durably in `Escalation.root_cause_variants` (+ _truncated),
+# which stays the primary structured fact (INV-8); this is the notification.
+#
+# THRESHOLD CALIBRATED AGAINST MEASUREMENT, NOT TASTE: over the live queue
+# (data/escalations root + archive, 398 distinct non-empty root_cause keys,
+# measured 2026-08-19) there are ZERO canonical classes holding more than one
+# spelling.  Five distinct spellings of ONE canonical key is therefore far
+# outside the observed baseline.  It also sits well below
+# `queue._MAX_ROOT_CAUSE_VARIANTS` = 20, so the cap never decides whether the
+# alarm fires.
+_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5
+
+# Synthetic anchor, for the same reason as _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID:
+# the condition is system-scoped (is the MATCHING rule too loose?) and a burst
+# spans tasks, so attributing it to whichever promote crossed the threshold
+# would surface an unrelated infra record on that task and could land PENDING on
+# an already-terminal one (this helper bypasses the terminal-task chokepoint).
+# The affected L2 id is named in the summary and detail instead.
+_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID = 'l2-root-cause-overfold'
 
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
@@ -601,6 +781,7 @@ def create_server(
     harness: Any = None,
     dedupe_config: DedupeConfig | None = None,
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
+    task_claimant_lookup: Callable[[str], Awaitable[str | None]] | None = None,
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
@@ -625,6 +806,19 @@ def create_server(
     (the default), the auto-resolve chokepoint is disabled and all escalations
     are submitted normally.
 
+    *task_claimant_lookup* is the deliberate MIRROR of *task_status_lookup*
+    (task 3550): an optional async callable ``(task_id) -> str|None`` returning
+    the task's current ``claimant_run_id``.  When provided, ``escalate_blocker``
+    and ``escalate_info`` stamp that value onto the filed record's
+    ``filing_claimant_run_id``, which is what lets ``escalation.pins`` Link 4
+    tell a LIVE agent handoff from one filed by a dead incarnation.  The DB row
+    is the right source because it holds the identity ``TaskWorkflow``'s
+    dispatch stamp wrote via ``shared.task_claimant.compose_claimant_run_id``,
+    so an agent-filed escalation carries the identity of the incarnation that
+    dispatched that agent.  When omitted (the default — the standalone
+    escalation server, and every caller that predates 3550) the field stays
+    ``None``, which ``pins`` reads as UNKNOWN and fails safe to pinning.
+
     *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
     for testing.  When *merge_queue* is not None and no registry is supplied, a
     fresh registry is created lazily inside this function so it is shared across
@@ -647,6 +841,235 @@ def create_server(
     deterministic and wall-clock-independent.
     """
     mcp = FastMCP('escalation')
+
+    # --- Leaked tool-call envelope markup (task 3690, PRD section 4 C2) ---
+    #
+    # Registered HERE, immediately after the server exists and before any
+    # @mcp.tool() below, so every tool on this server is covered by one
+    # registration and a tool added later cannot miss it.
+    #
+    # FORWARD_REPAIR, not REJECT_WITH_REPAIR, and the reason is C2's own: a
+    # lost escalate_info STRANDS A TASK (INV-6). Where bouncing a caller costs
+    # more than proceeding, the guard repairs in place and warns rather than
+    # refusing. The tier is passed EXPLICITLY as a keyword because INV-1 makes
+    # it a registration-time DECLARATION — never inferred per call from the
+    # shape of the damage or from a tool's name.
+    #
+    # exempt_tools is likewise written out even though frozenset() is the
+    # default: an exemption is a declaration, and spelling it makes a future
+    # tool addition on this server a DECISION rather than an omission. No tool
+    # here legitimately carries envelope literals as data — the
+    # scan_memory_content case that motivates exemptions lives on fused-memory
+    # (sibling task 4458). A name added here would match BARE (`escalate_info`,
+    # never the agent-facing mcp__escalation__escalate_info spelling the
+    # specimen corpus records), because context.message.name is the in-server
+    # name and a declaration that fails open is worse than none.
+    #
+    # strict_input_validation is deliberately NOT set (PRD boundary row B15):
+    # with it on the SDK jsonschema-validates before FastMCP's handler, the
+    # middleware chain is never entered, and every required-parameter leak
+    # becomes silently unrepairable.
+    def _emit_markup_fact(fact: dict[str, Any]) -> None:
+        """Emit the ``markup_detected`` record itself, as ONE structured line.
+
+        INV-2: every outcome emits the fact, and no consumer re-derives it by
+        log-scraping.  The middleware already logs a human-readable WARNING for
+        an operator reading the stream, so duplicating that prose here would add
+        a second thing to read and still nothing to parse.  This emits the
+        RECORD — greppable by its own name, then ``json.loads``-able whole.
+
+        Never raises by construction (``json.dumps`` over a flat record of
+        strings and ``None``s), and the middleware invokes every sink
+        defensively anyway: a sink that raised would be logged and would not
+        change the caller's outcome.
+        """
+        logger.info('%s %s', FACT_MARKUP_DETECTED, json.dumps(fact, sort_keys=True))
+
+    def _file_markup_residue(record: dict[str, Any]) -> str | None:
+        """Persist an unrepairable call's payload, or report a storm burst.
+
+        The escalation channel the guard writes to (C2 L187 / INV-7).  Returns
+        the queued id as a ``str`` — the middleware propagates it into the
+        refusal payload so a bounced caller can point an operator at its own
+        preserved data, and treats a non-``str`` as reporting no id.
+
+        THE QUEUE IS WRITTEN DIRECTLY, and both halves of that are deliberate:
+
+        * NOT through ``escalate_info``/``escalate_blocker``.  Those re-enter
+          this same middleware, and a residue payload is BY CONSTRUCTION full of
+          envelope markup — it would be detected, refused, and recursed on.
+        * NOT through ``_submit_or_dedupe``.  Folding a residue record into a
+          pending parent destroys the raw payload the record exists to preserve.
+          (Its born-at-L2 branch would in fact bypass dedupe for this severity;
+          calling ``queue.submit`` directly is that branch's own mechanism, used
+          without depending on a severity check to keep choosing it.)
+
+        Blocking file I/O inside an async caller, matching every other write on
+        this server: ``escalate_info`` reaches ``queue.submit`` the same way.
+        """
+        error_type = record.get('error_type')
+        if error_type == MARKUP_STORM_ERROR_TYPE:
+            return _file_markup_storm(record)
+
+        # `level` and `category` are read from the RECORD rather than restated,
+        # so the middleware stays the single source of the contract (INV-5).
+        # The fallbacks matter only if that contract is ever violated, and they
+        # fail toward L2 rather than toward a silently-L0 record nobody reads.
+        level = int(record.get('level') or 2)
+        subject_task_id = record.get('subject_task_id')
+        detail = '\n'.join([
+            # WHOSE call leaked. Rendered FIRST and unconditionally because on
+            # this server it is the only attribution that ever resolves: the
+            # middleware's `_identity` reads `agent_id` / `project_root` /
+            # `project_id` off the call's own arguments, and no escalation tool
+            # declares any of the three, so the two fields below it are
+            # structurally None here. The record's own `task_id` is the
+            # synthetic anchor, not the caller's, so without these two lines a
+            # critical L2 record names nobody at all.
+            f'subject_task_id={subject_task_id!r}',
+            f'subject_agent_role={record.get("subject_agent_role")!r}',
+            # The OWNER that will exit this hold unprompted (INV-7), read off
+            # the record rather than restated: the middleware names it, and a
+            # second spelling here could name a consumer that no longer exists.
+            f'owner={record.get("owner")!r}',
+            f'tool={record.get("tool")!r}',
+            f'field={record.get("field")!r}',
+            f'matched_pattern={record.get("matched_pattern")!r}',
+            f'agent_id={record.get("agent_id")!r}',
+            f'project={record.get("project")!r}',
+            f'raw_value_chars={len(record.get("raw_value") or "")}',
+            '',
+            _markup_residue_prose(record),
+            '',
+            'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
+            'Recover it for the caller if it is still needed, then chase the '
+            'harness serialization leak that produced it '
+            '(plans/toolcall-markup-containment-prd.md).',
+            '',
+            str(record.get('raw_value') or ''),
+        ])
+        # Task 3550 deliberately does NOT stamp filing_claimant_run_id here:
+        # filed under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
+        # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
+        # and there is no honest identity to record.
+        esc = Escalation(
+            id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
+            task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # Derived from `level`, never asserted beside it: the two are one
+            # decision (see _MARKUP_RESIDUE_SEVERITY), so if the middleware ever
+            # lowers the level this record follows it down instead of writing a
+            # born-at-L2 severity onto an L0/L1 record.
+            severity=_MARKUP_RESIDUE_SEVERITY if level >= 2 else 'blocking',
+            category=str(record.get('category') or 'mcp_markup_residue'),
+            # The subject is PREFIXED rather than left to the detail: the
+            # record's own task_id is the synthetic anchor, so a reader
+            # scanning summaries alone — which is what the L2 watcher's
+            # notification shows — would otherwise have no way to tell whose
+            # call leaked. Same shape the sibling sink uses.
+            summary=(
+                f'[{subject_task_id}] ' if subject_task_id else ''
+            ) + str(record.get('summary') or ''),
+            detail=detail,
+            suggested_action=str(record.get('suggested_action') or ''),
+            level=level,
+        )
+        return queue.submit(esc)
+
+    def _file_markup_storm(record: dict[str, Any]) -> str | None:
+        """One open record per burst, not one per window (INV-4).
+
+        The middleware's own ``StormCounter`` already rate-limits to one fire
+        per window and states that dedup is the SINK's knowledge, not its own.
+        A leak running for hours would otherwise file one record per hour; this
+        collapses them into the single open record until an operator resolves
+        it, exactly as ``markup_tripwire.emit_markup_storm_escalation`` does.
+
+        A read failure falls THROUGH to filing rather than bailing: losing
+        duplicate suppression is strictly better than losing the alarm for an
+        actively running leak.
+
+        The open-record test is "is MY alarm already open", never "is anything
+        pending on this anchor", and the difference is measured rather than
+        theoretical. The anchor is a SYNTHETIC id, so nothing reserves it and
+        any producer of SYSTEM-scoped records may land one there;
+        ``markup_tripwire``'s own docstring records what a category-blind test
+        then costs — it "filed nothing 2026-08-16..2026-08-19 while 41
+        rejections occurred" because another producer held its shared anchor
+        open, and that silence read as calm. Both halves of the identity are
+        checked because both can differ independently: another PRODUCER's
+        record (any category), and a sibling guard's record (this category,
+        another server). ``getattr`` rather than attribute access so a record
+        shape that predates either field cannot raise on this path.
+        """
+        try:
+            existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
+        except Exception:
+            logger.exception(
+                'markup guard: could not check for an open storm record; '
+                'filing a new one rather than dropping the alarm',
+            )
+            existing = []
+        mine = [
+            esc for esc in existing
+            if getattr(esc, 'category', None) == _MARKUP_STORM_CATEGORY
+            and getattr(esc, 'agent_role', None) == _MARKUP_GUARD_AGENT_ROLE
+        ]
+        if mine:
+            # Sorted by id, not `mine[0]`: get_by_task's order comes from a
+            # directory glob, so folding into "whichever came back first" would
+            # make the id this returns — the one a caller is told to look up —
+            # depend on filesystem enumeration order. The ids carry a
+            # monotonic sequence, so the lowest is the record that opened the
+            # alarm.
+            open_alarm = min(mine, key=lambda esc: esc.id)
+            logger.info(
+                'markup guard: %s already open (storm %r now); not duplicating',
+                open_alarm.id, record,
+            )
+            return open_alarm.id
+
+        outcome = record.get('outcome')
+        # Task 3550: unstamped by design — synthetic _MARKUP_STORM_ANCHOR_TASK_ID,
+        # level=1 (pins Link 3 -> QUEUE_HANDOFF regardless of filing identity),
+        # and not filed by any task-workflow incarnation.
+        return queue.submit(Escalation(
+            id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
+            task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+            agent_role=_MARKUP_GUARD_AGENT_ROLE,
+            # 'blocking', not a born-at-L2 severity: this is a rate alarm about
+            # a condition, and markup_tripwire's storm record is filed the same
+            # way. The residue records it accompanies carry the L2 routing.
+            severity='blocking',
+            category=_MARKUP_STORM_CATEGORY,
+            summary=(
+                f'{record.get("count")} {outcome} MCP call(s) in '
+                f'{record.get("window_seconds")}s for project='
+                f'{record.get("project")!r} — the serialization leak is ACTIVE'
+            ),
+            detail='\n'.join(
+                f'{key}={record[key]!r}' for key in sorted(record)
+            ),
+            suggested_action=(
+                'identify the leaking caller from the markup_detected facts and '
+                'report it against plans/toolcall-markup-containment-prd.md'
+            ),
+            level=1,
+        ))
+
+    mcp.add_middleware(MarkupGuardMiddleware(
+        policy=RepairPolicy.FORWARD_REPAIR,
+        exempt_tools=frozenset(),
+        # C2 L187 / INV-7. Without this the guard logs "no escalation_sink is
+        # wired, so the residue of %r will not be preserved anywhere" and the
+        # refusal DESTROYS the caller's payload — which for a leak that is by
+        # construction an agent emitting text it cannot re-emit identically is
+        # not something a retry recovers. The queue is in-process here, so this
+        # server is the one place the residue can actually be preserved.
+        escalation_sink=_file_markup_residue,
+        fact_sink=_emit_markup_fact,
+    ))
+
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
     # --- Startup sweep (pre-serving single-writer window) ---
@@ -768,6 +1191,9 @@ def create_server(
             if storm is None:
                 return
             labels = ', '.join(storm['labels']) or l2_id
+            # Task 3550: unstamped by design — synthetic anchor task id and
+            # severity='info' (pins Link 1 -> NON_PINNING), so the filing
+            # identity is never read, and no incarnation filed it anyway.
             _submit_or_dedupe(Escalation(
                 # Filed under the synthetic anchor, NOT the triggering promote's
                 # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
@@ -808,6 +1234,92 @@ def create_server(
                 l2_id, e,
             )
 
+    def _report_root_cause_overfold(l2_id: str, variants: int) -> None:
+        """File ONE info escalation when *l2_id* reaches the distinct-spelling threshold.
+
+        ``queue.add_members_to_l2`` already accumulates every DISTINCT
+        pre-canonical root_cause spelling on the record itself
+        (``root_cause_variants`` / ``root_cause_variants_truncated``).  Those
+        counters stay the PRIMARY structured fact — assertable from the record,
+        never by log-scrape (INV-8) — and this is the thresholded NOTIFICATION
+        layered on top, which is what INV-4 asks for: a hearer, at a threshold.
+
+        WHY A PER-RECORD CROSSING, NOT A ``StormCounter`` RATE (the one place
+        this deliberately diverges from ``_report_amendment_truncation_storm``,
+        which it otherwise copies line for line): the two conditions have
+        different shapes.  Truncation is an EVENT that bursts across many L2s, so
+        a rate-in-a-window counter fits it.  Over-folding is an ACCUMULATION on
+        ONE record — "this single cluster has now been addressed by five mutually
+        distinct spellings of one canonical key" — which a rate window would
+        either miss (slow accumulation) or spam (fast one).  Because the count is
+        monotone and increments by one, the caller's
+        ``variant_added and variants == THRESHOLD`` test fires exactly once per
+        L2 by construction, with no extra suppression state to keep.
+
+        WHY THE TRUNCATION REPORT DOES NOT ALREADY COVER THIS: it only fires once
+        an L2 has blown the 20-entry amendment cap, so it is deaf to an over-fold
+        at five or six distinct causes — exactly the range this one hears.
+
+        Fleet-wide burst control is still present and free: ``severity='info'`` /
+        ``category='infra_issue'`` routes through ``_submit_or_dedupe``, so a
+        hundred simultaneous crossings fold under ``summary_dedupe_key``'s
+        first-three-token key.  That is why the summary's LEADING tokens are kept
+        stable and the L2 id placed later in the string.
+
+        PURELY ADDITIVE, NEVER FATAL, like its neighbour: a dropped report costs
+        a notification; a raised one would cost the fold.
+        """
+        try:
+            _submit_or_dedupe(Escalation(
+                # Synthetic anchor, NOT the triggering promote's task_id — see
+                # _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID.
+                id=queue.make_id(_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID),
+                task_id=_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about matching precision is a notification, not a
+                # page: 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                # Leading tokens FIXED so a fleet-wide burst folds under one
+                # dedupe parent; the varying parts come after.
+                summary=(
+                    f'L2 root-cause over-fold suspected: {variants} distinct '
+                    f'root_cause spellings folded into one L2 ({l2_id})'
+                ),
+                detail=(
+                    f'OBSERVED: L2 escalation {l2_id} has now been addressed by '
+                    f'{variants} mutually DISTINCT pre-canonical root_cause '
+                    f'spellings that all canonicalise to the same key (threshold '
+                    f'{_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD}).\n'
+                    f'The spellings themselves are on the record in '
+                    f'`root_cause_variants`; the TRUE distinct total is '
+                    f'len(root_cause_variants) + root_cause_variants_truncated, '
+                    f'and the L2\'s own root_cause/detail/options/summary are '
+                    f'never touched by a fold.\n'
+                    f'MEASURED BASELINE: across the live queue (398 distinct '
+                    f'non-empty root_cause keys, 2026-08-19) ZERO canonical '
+                    f'classes hold more than one spelling, so this is far '
+                    f'outside the observed norm.\n'
+                    f'Hypothesis: root-cause canonicalisation is OVER-folding — '
+                    f'merging genuinely distinct causes under one canonical key '
+                    f'— rather than the same cause simply being re-spelled by '
+                    f'successive watcher rotations.'
+                ),
+                suggested_action=(
+                    f'Read {l2_id} and compare its `root_cause_variants` entries '
+                    'against each other: if they name genuinely different causes, '
+                    'the canonicalisation policy in escalation/canonical.py is '
+                    'too aggressive and the wrongly-merged members need splitting '
+                    'into separate L2s; if they are re-spellings of one cause, '
+                    'this is working as intended and the report can be dismissed.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'root-cause over-fold report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
+
     # --- Terminal-task chokepoint helper ---
 
     async def _chokepoint_or_submit(
@@ -827,6 +1339,38 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        #
+        # Placement is the whole design: this runs before the C4/D3 downgrade,
+        # before the born-at-L2 `esc.level = 2` assignment, and before all four
+        # gates, so EVERY exit path carries the identity — the two bypass
+        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
+        # except branch below, and the terminal-task submit_resolved
+        # auto-resolve.  No gate can lose it, so those cases need no
+        # special-casing.
+        #
+        # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
+        # one filed by a dead incarnation.  None means UNKNOWN, which pins
+        # fails safe to pinning — so every degraded path here leaves it None
+        # rather than inventing a value.
+        if task_claimant_lookup is not None and not esc.filing_claimant_run_id:
+            # Never overwrite a caller-supplied value.
+            try:
+                _claimant = await task_claimant_lookup(esc.task_id)
+            except Exception as exc:
+                # Same fail-open discipline as gate 4's status lookup: a
+                # filing must NEVER be dropped because an identity lookup
+                # broke.  Loud, not silent — the record is named at WARNING.
+                logger.warning(
+                    'task_claimant_lookup raised for task %s, leaving filing '
+                    'identity unknown: %s',
+                    esc.task_id, exc,
+                )
+            else:
+                # Normalise blank/whitespace-only to None so an empty string
+                # never reaches pins._norm_id as a pseudo-value.
+                esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
         # both naturally observe 'blocking' and route the downgraded record through
@@ -1484,7 +2028,12 @@ def create_server(
         {root_cause of the pending L2s} u {their member_ids} across the returned
         rows, with NO session memory — previously that set could only be carried
         forward in-session, so a rotation re-promoted clusters it had already
-        promoted.
+        promoted.  Since task 3998 the SERVER matches root causes on their
+        CANONICAL form, so a client-side rebuild should compare
+        ``escalation.canonical.canonical_root_cause(row['root_cause'])`` rather
+        than raw strings; comparing raw is still safe, just more conservative
+        (it re-promotes a near-duplicate and the server folds it, answering
+        ``status:'updated'`` without creating anything).
 
         Use this from a long-running watcher to keep context small as the
         pending pile grows; fetch the full record for a specific id via
@@ -1752,7 +2301,17 @@ def create_server(
 
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
-        than filing a duplicate.  The response ``status`` distinguishes the two
+        than filing a duplicate.  "Same" means the same CANONICAL FORM, not the
+        same bytes (task 3998): two promotes describing one cause but spelled
+        differently — differing only in case, in whitespace runs or in
+        punctuation — now fold into the first instead of minting two decision
+        points for one incident.  Canonicalisation happens once, in
+        ``escalation.canonical.canonical_root_cause``, and only at COMPARE time:
+        the surviving record's own ``root_cause`` is never rewritten to the
+        canonical form.  Punctuation is treated as a SEPARATOR rather than
+        deleted, so keys whose identity lives in delimited segments
+        (``risk:3184`` vs ``risk:318:4``) stay distinct.  The response ``status``
+        distinguishes the two
         outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
         append RAISES the existing L2's severity when the incoming members (or
         an explicit *severity*) justify it, and never lowers it — an L2's
@@ -1793,8 +2352,16 @@ def create_server(
             Non-empty list of L1 escalation ids forming this cluster.
             Passing an empty list returns ``{'error': ...}``.
         root_cause:
-            Non-empty exact-string dedup key.  Whitespace-only input returns
-            ``{'error': ...}`` (mirrors ``find_pending_l2_by_root_cause``).
+            Non-empty dedup key, matched on its CANONICAL FORM (task 3998):
+            ``escalation.canonical.canonical_root_cause`` is the single
+            canonicalisation site, and near-duplicates differing only in case,
+            whitespace or punctuation therefore FOLD into the existing L2 rather
+            than minting a second decision point for one incident.  Input that
+            is whitespace-only — or whose canonical form is empty, i.e. a key of
+            pure punctuation like ``'::'`` — returns ``{'error': ...}`` (mirrors
+            ``find_pending_l2_by_root_cause``'s falsy-key guard, which is now on
+            the canonical form).  The record's own ``root_cause`` is stored and
+            displayed VERBATIM; the canonical form is never persisted.
         evidence:
             Supporting context — stored in the escalation's ``detail`` field.
         options:
@@ -1898,6 +2465,26 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
+        # Stricter than `.strip()` since task 3998: matching is on the CANONICAL
+        # form, so a key made only of punctuation/symbols ('::', '--') is not a
+        # usable dedup key — it canonicalises to nothing and the dedup scan could
+        # never find the L2 again, so every subsequent promote would mint another
+        # one.  That is a silent, self-perpetuating duplicate source, which is the
+        # exact defect class this task exists to reduce; refusing at the boundary
+        # where the caller can still fix it is the loud-over-silent norm.
+        # Measured safe: 0 of the 398 distinct live root_cause keys canonicalise
+        # to empty, and `\w` is Unicode-aware so CJK and other non-Latin keys are
+        # unaffected.
+        if not canonical_root_cause(root_cause):
+            return {
+                'error': (
+                    f'root_cause {root_cause!r} canonicalises to the empty string '
+                    '(it carries no word characters, only punctuation/symbols), so '
+                    'no L2 filed under it could ever be found again by the '
+                    'root-cause dedup scan — every promote would mint another '
+                    'duplicate. Supply a key with at least one word character.'
+                ),
+            }
         if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -1951,7 +2538,10 @@ def create_server(
             # and was a real TOCTOU: the queue is built for cross-process
             # mutators, so a concurrent fold between the pre-read and the call
             # made the flag wrong in either direction.
-            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
+            outcome: AmendmentOutcome = {
+                'recorded': False, 'dropped': 0,
+                'variant_added': False, 'variants': 0,
+            }
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
@@ -1974,6 +2564,15 @@ def create_server(
                 # report can never fail this fold.
                 if outcome['dropped']:
                     _report_amendment_truncation_storm(existing_id)
+                # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
+                # Exactly-once per L2 by construction — `variants` is monotone
+                # and increments by one, so the equality can only hold on the
+                # single fold that crosses.  Never fatal, same as above.
+                if (
+                    outcome['variant_added']
+                    and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
+                ):
+                    _report_root_cause_overfold(existing_id, outcome['variants'])
                 return {
                     'id': existing_id,
                     'status': 'updated',
@@ -1998,6 +2597,9 @@ def create_server(
         # Create path: build a fresh L2 and submit it.
         # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
         # do not create duplicate entries in the on-disk record.
+        # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
+        # regardless of filing identity) and filed by a human/watcher promotion,
+        # not by a task-workflow incarnation.
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,

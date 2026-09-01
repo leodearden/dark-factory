@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -43,8 +43,9 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     Every field is given a concrete, distinguishable value so a round-trip
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about. Includes the C1 schema
-    extensions (parent_session_id/spawn_mode/display/question) alongside the
-    original rail fields.
+    extensions (parent_session_id/spawn_mode/display/question) and the
+    task-4193 hook-owner binding (claude_session_id, claude_owner_pid)
+    alongside the original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -72,6 +73,8 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
             kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
+        'claude_session_id': 'uuid-claude-abc123',
+        'claude_owner_pid': 424242,
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -209,6 +212,9 @@ def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
     assert record.spawn_mode == sr.SpawnMode.CHILD
     assert record.display is None
     assert record.question is None
+    # Task 4193's additive hook-owner binding: absent on disk -> None, no
+    # migration required.
+    assert record.claude_session_id is None
 
 
 def test_schema_minor_is_int_bumped() -> None:
@@ -217,6 +223,102 @@ def test_schema_minor_is_int_bumped() -> None:
     # The PERSISTED major must stay migration-free: bumping it would make
     # rail-vintage and C1 records version-distinguishable on disk.
     assert sr.SCHEMA_VERSION == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4193: SessionRecord.claude_session_id (hook-owner binding)
+# ---------------------------------------------------------------------------
+
+
+def test_session_record_round_trip_includes_claude_session_id() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+    # The wire key is pinned by name: session_hooks reads it back off disk.
+    assert r.to_dict()['claude_session_id'] == 'uuid-claude-abc123'
+
+    # The unbound shape a spawn-claude.sh `launching` write produces (no hook
+    # has claimed the slug yet) must round-trip just as losslessly.
+    r_unbound = _make_record(claude_session_id=None)
+    assert sr.SessionRecord.from_dict(r_unbound.to_dict()) == r_unbound
+    assert sr.SessionRecord.from_json(r_unbound.to_json()) == r_unbound
+    assert r_unbound.to_dict()['claude_session_id'] is None
+
+
+def test_session_record_defaults_claude_session_id_to_none() -> None:
+    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+    assert record.claude_session_id is None
+
+
+def test_session_record_round_trip_includes_claude_owner_pid() -> None:
+    # esc-4193-11 suggestion 3: to_dict/from_dict must actually carry
+    # claude_owner_pid -- without a non-None value in _make_record's fields,
+    # the round-trip pin above is vacuous (both sides default to None even
+    # if to_dict silently dropped the key).
+    r = _make_record()
+    assert r.claude_owner_pid == 424242
+    assert r.to_dict()['claude_owner_pid'] == 424242
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),  # bool is an int subclass; must be rejected before the int check
+        ('x', None),
+        (3.0, None),
+        (0, None),
+        (-1, None),
+        (None, None),
+        (4242, 4242),
+    ],
+)
+def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
+    assert sr._coerce_owner_pid(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        (True, None),
+        (123, None),
+        (3.0, None),
+        (None, None),
+        ('', None),
+        ('   ', None),
+        ('uuid-claude-abc123', 'uuid-claude-abc123'),
+        ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
+    ],
+)
+def test_coerce_session_id(raw: object, expected: str | None) -> None:
+    assert sr._coerce_session_id(raw) == expected
+
+
+def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
+    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
+    # carrying a non-string claude_session_id must not survive into the
+    # SessionRecord -- session_hooks does `(record.claude_session_id or
+    # '').strip()` outside a try/except, so a raw int here would raise
+    # AttributeError and lose the whole hook event.
+    data = _make_record().to_dict()
+    data['claude_session_id'] = 123
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_session_id is None
+
+
+def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
+    # Sibling to the claude_session_id regression test above (task 4660
+    # review follow-up): pins the from_dict call site for claude_owner_pid
+    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
+    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
+    # otherwise survive as a real-looking pid, which could silently compare
+    # equal to a real pid in session_hooks._env_slug_ownership
+    # (session_hooks.py:329).
+    data = _make_record().to_dict()
+    data['claude_owner_pid'] = True
+    record = sr.SessionRecord.from_dict(data)
+    assert record.claude_owner_pid is None
 
 
 def test_spawn_mode_enum_values() -> None:
@@ -3693,8 +3795,12 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     # reads as "someone else has it"). `none` is the third token in the
     # vocabulary, and it is pinned here because nothing else exercises it.
     assert lines[0] == 'decision=acquired'
-    assert lines[-1] == 'holder_liveness=none'
-    assert len(lines) == 3
+    assert lines[2] == 'holder_liveness=none'
+    # Task 4248 appended a `slug=` line after it (pinned in that task's own
+    # section); anchored by INDEX here so this keeps asserting the position of
+    # `holder_liveness`, which is what this test is about, rather than silently
+    # re-aiming at whatever line happens to be last.
+    assert len(lines) == 4
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -3819,7 +3925,9 @@ def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
     lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
 
     assert lines[0] == 'decision=stand-down'
-    assert lines[-1] == 'holder_liveness=orphaned'
+    # Anchored by INDEX, not [-1]: task 4248 appended a `slug=` line after this
+    # one, and [-1] would have silently re-aimed at it instead of failing.
+    assert lines[2] == 'holder_liveness=orphaned'
 
 
 def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
@@ -3836,7 +3944,8 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
 
     assert rc == 0
     # 'unknown' must never be promoted to an orphan finding: fail toward held.
-    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+    # Index, not [-1] -- task 4248's `slug=` line now follows it.
+    assert capsys.readouterr().out.splitlines()[2] == 'holder_liveness=held'
 
 
 class TestLeaseSlugIsNotASessionRecordKey:
@@ -3856,10 +3965,9 @@ class TestLeaseSlugIsNotASessionRecordKey:
     record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
 
     The namespaces differ in all three segments:
-    - the LEASE slug is claimant-chosen, prescribed by the skills as
-      ``<lease-role>-<project>-<session pid>``
-      (skills/escalation-watcher/SKILL.md:50) — there is no production
-      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
+    - the LEASE slug is ``<lease name>-<session pid>``, built by
+      ``default_lease_slug`` (task 4248 moved it out of shell in the SKILLs and
+      into the CLI, for the reason 3994 moved the pid there);
     - the RECORD slug comes from ``build_session_slug(role, project, task,
       <uniqueness token>)``, where the token is a session UUID for a
       hand-launched session (``session_hooks.hook_session_slug``) and the
@@ -3881,8 +3989,16 @@ class TestLeaseSlugIsNotASessionRecordKey:
     SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
 
     def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
-        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
-        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+        """The lease slug exactly as production builds it (task 4248).
+
+        Routed through ``default_lease_slug`` rather than hand-building the
+        f-string: the disjointness this class pins is only interesting if the
+        left-hand side is the REAL lease slug, so the helper must break when
+        production's builder changes shape.
+        """
+        slug = sr.default_lease_slug(f'watcher-{project}', {sr.SESSION_PID_ENV: str(pid)})
+        assert slug is not None  # pid > 0, so the builder always derives here
+        return slug
 
     def _record_slug(self, project: str = 'dark_factory') -> str:
         """The record slug exactly as session_hooks.hook_session_slug builds it."""
@@ -3962,6 +4078,115 @@ def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPa
     assert sr.resolve_session_pid() == 424242
 
 
+# --- default_lease_slug (task 4248) ----------------------------------------
+#
+# 3994 moved the lease PID into code because it depended on every skill doc
+# getting one shell token right. The SLUG stayed in shell -- and 3994 then made
+# it load-bearing, since a mismatch on `lease-heartbeat`/`lease-release` is
+# REFUSED. These tests pin the builder that moves it into code too.
+
+
+def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
+    """The defaulted slug is BYTE-IDENTICAL to what the WATCHER skills built.
+
+    ``watcher-df-1894895`` is the slug measured in the live fleet root on
+    2026-08-15 and recorded in ``TestLeaseSlugAndRecordSlugAreDisjoint``. This
+    equality is the back-compat oracle FOR THE TWO WATCHER LEASES ONLY --
+    ``watcher-<project>`` and ``recon-watcher-<project>``, whose pre-4248 skill
+    prescription was already ``<name>-${CLAUDE_PID:-$PPID}``. For those, an
+    IN-FLIGHT session that stops passing ``--slug`` keeps its lease with no
+    restart, because the CLI re-derives exactly the token it claimed with.
+
+    It does NOT generalise to ``/unblock`` -- see
+    ``test_the_unblock_lease_slug_shape_changed_at_4248``, which records that
+    asymmetry rather than leaving this docstring to imply it away.
+    """
+    assert sr.default_lease_slug('watcher-df', {sr.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
+    assert (
+        sr.default_lease_slug('recon-watcher-df', {sr.SESSION_PID_ENV: '1894895'})
+        == 'recon-watcher-df-1894895'
+    )
+
+
+def test_the_unblock_lease_slug_shape_changed_at_4248() -> None:
+    """The `/unblock` lease slug is NOT back-compatible, and that is recorded here.
+
+    The two watcher skills built ``<lease name>-<pid>``, so deriving from the
+    name reproduces their token exactly. ``/unblock`` did not: its lease NAME
+    is ``unblock-<project>#<TASK_ID>`` (``build_lease_name``'s ``#``) while its
+    skill built the slug with a ``-`` separator and no ``#`` at all. Deriving
+    from the name therefore yields a DIFFERENT token.
+
+    ROLLOUT CONSEQUENCE, stated so nobody rediscovers it from a lingering
+    lease: an `/unblock` session that CLAIMED under the pre-4248 prescription
+    and then releases slug-less gets ``result=refused`` -- non-destructive, but
+    its lease lingers and falsely reports a holder to the next `/unblock` on
+    that task until the 2h ``LEASE_HEARTBEAT_TTL`` ages it out. Such a session
+    must either keep passing its ORIGINAL ``--slug`` on release or accept the
+    TTL wait; ``skills/unblock/SKILL.md`` says so at the release step. Sessions
+    that claim after 4248 are unaffected -- both ends derive the same token.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    derived = sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '1894895'})
+
+    assert derived == 'unblock-df#2085-1894895'
+    # The exact string the pre-4248 SKILL.md prescribed, for contrast.
+    assert derived != 'unblock-df-2085-1894895'
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_default_lease_slug_refuses_to_derive_when_the_session_pid_is_unresolvable(
+    env: dict[str, str],
+) -> None:
+    """An underivable slug is None -- and specifically NOT ``f'{name}-0'``.
+
+    Same parametrize set as ``resolve_session_pid``'s degradation sweep, on
+    purpose: these are exactly the envs where that function degrades to pid 0.
+
+    THE assertion is the second one. ``resolve_session_pid`` may degrade to 0
+    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
+    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0``
+    is not unique: two concurrently-degraded sessions contending the same lease
+    name would compute an IDENTICAL slug, so each would pass the other's
+    ``_is_lease_owner`` check and could heartbeat or release the other's lease
+    -- 3994 defect 1 ("any caller may evict/refresh any lease") reopened on the
+    degraded path. Refusing to synthesize a token it cannot make unique is the
+    only answer that keeps the ownership guard honest; the CLI then exits 2 and
+    names ``--slug`` as the escape hatch.
+    """
+    assert sr.default_lease_slug('watcher-df', env) is None
+    assert sr.default_lease_slug('watcher-df', env) != 'watcher-df-0'
+
+
+def test_default_lease_slug_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.default_lease_slug('watcher-df') == 'watcher-df-424242'
+
+
+def test_default_lease_slug_passes_a_task_scoped_name_through_verbatim() -> None:
+    """``build_lease_name``'s ``#`` separator survives into the slug untouched.
+
+    A lease slug is never a filesystem path: ``lease_path_for_name`` sanitizes
+    only the NAME, and ``sanitize_slug`` applies only to session-RECORD slugs.
+    A lease slug lives inside the lease's JSON body and is compared for
+    equality alone, so the task-scoped ``unblock-df#2085`` needs no escaping.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    assert name == 'unblock-df#2085'
+    assert sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
+
+
 def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4025,6 +4250,205 @@ def test_main_lease_claim_explicit_pid_still_overrides_the_env(
     assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
 
 
+def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--slug` is now optional on lease-claim and defaults like `--pid` does.
+
+    Same shape as the `--pid` pair above, on purpose: the two CLI-owned tokens
+    should read as ONE pattern rather than two conventions.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid, so an env-blind implementation
+    # (e.g. one reaching for os.getpid()) cannot pass by coincidence.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert (
+        sr.LeaseHolder.from_json(lease_path.read_text()).session_slug
+        == f'watcher-df-{_DEAD_PID}'
+    )
+
+
+def test_main_lease_claim_derives_the_body_pid_and_the_slug_pid_from_one_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A no-flag claim's IDENTITY pid and its LIVENESS pid come from ONE resolution.
+
+    The slug embeds a pid and the lease body records one. If each were resolved
+    independently they would agree only because both happen to call the same
+    function today: any later change making `resolve_session_pid`
+    non-deterministic (a cache, a fallback probe, a re-read of a mutated env)
+    would silently desynchronise the identity token from the pid
+    `holder_liveness` probes — a lease whose slug names a different session than
+    its own liveness check. So `main()` resolves once and feeds both, and this
+    pins the resulting equality rather than the implementation.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.pid == int(holder.session_slug.rsplit('-', 1)[1])
+    assert holder.pid == _DEAD_PID
+
+
+def test_an_explicit_pid_does_not_satisfy_an_underivable_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--pid` is the body's LIVENESS pid, not this session's IDENTITY.
+
+    The two CLI-owned tokens read as one pattern in the skills ("the CLI owns
+    both"), so an operator on the degraded path may reach for the documented
+    `--pid` and expect it to unblock a slug-less claim. It deliberately does
+    not, and this pins that: `lease-heartbeat`/`lease-release` have no `--pid`
+    at all, so a slug derived from one would be derivable by the CLAIM alone —
+    an identity the session's own later release could not reproduce, which is
+    the exact drift task 4248 removes. `--slug` is the escape hatch precisely
+    because all three verbs honour it. The refusal must SAY so, or the operator
+    just retries with a bigger `--pid`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main(['lease-claim', '--name', 'watcher-df', '--pid', str(_DEAD_PID)])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert '--pid' in err
+    assert '--slug' in err
+    assert not sr.lease_path_for_name('watcher-df', root=tmp_path).exists()
+
+
+def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # An explicit --slug remains a deliberate operator override, never shadowed.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
+
+
+# --- lease-claim's `slug=` diagnostic line (task 4248) ---------------------
+#
+# ADDITIVE and LAST, under 3994's discipline: `decision=` stays line 1 and the
+# human message line 2, so a not-yet-reloaded skill parser reading only the
+# first two lines is unaffected. What the line is FOR, now that the skills no
+# longer pass `--slug`: it makes the CLI-derived identity LEGIBLE, so an agent
+# can cross-check it against `lease-show`'s holder_slug when a heartbeat comes
+# back `result=refused`. It is a diagnostic, NOT a value to thread into the
+# next call -- a shell variable cannot survive to the next Claude Code Bash
+# tool call, which is exactly why the derivation had to move into the CLI.
+
+
+def test_main_lease_claim_prints_the_derived_slug_last_on_the_acquired_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=acquired'
+    assert lines[2] == 'holder_liveness=none'
+    assert lines[3] == f'slug=watcher-df-{_DEAD_PID}'
+    assert len(lines) == 4
+
+
+def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """On a stand-down the `slug=` line is about US; `holder_liveness=` is about THEM.
+
+    Confusing the two would make the line actively misleading in the one
+    situation it exists for — reconciling a refusal against `lease-show`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(slug='watcher-df-OTHER', pid=_DEAD_PID)
+    capsys.readouterr()
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    # DETERMINISTIC, not "either value": the holder above was seeded with
+    # `_DEAD_PID`, which `test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid`
+    # already pins as `orphaned`. Accepting `held` too would buy nothing and
+    # would read as if the outcome were nondeterministic.
+    assert lines[2] == 'holder_liveness=orphaned'
+    assert lines[3] == f'slug=watcher-df-{os.getpid()}'
+    assert 'watcher-df-OTHER' not in lines[3]
+
+
+def test_main_lease_claim_prints_the_slug_line_even_when_it_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fail-open path keeps its 3994 silence about the HOLDER, but not about US.
+
+    `holder_liveness=` stays ABSENT on a substrate fault, deliberately: we know
+    nothing about a holder and must not assert one either way. The slug is a
+    different fact — it is this caller's own derived identity, which the fault
+    did not make unknown — so it is still emitted, and is in fact most useful
+    here, where the claim's outcome is least certain.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        raise OSError('lease substrate on fire')
+
+    monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=proceed'
+    assert lines[2] == f'slug=watcher-df-{_DEAD_PID}'
+    assert not any(line.startswith('holder_liveness=') for line in lines)
+
+
+def test_main_lease_claim_echoes_an_explicit_slug_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # The line reports the slug ACTUALLY claimed with, not the one that would
+    # have been derived — otherwise it would misreport the override path.
+    assert capsys.readouterr().out.splitlines()[-1] == 'slug=watcher-df-OPERATOR'
+
+
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
 
 
@@ -4042,19 +4466,173 @@ def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None
     )
 
 
-@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
-def test_main_lease_mutating_verbs_require_slug(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
+@pytest.mark.parametrize('verb', ['lease-claim', 'lease-heartbeat', 'lease-release'])
+def test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
 ) -> None:
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    _claim_via_cli()
+    """An underivable slug FAILS LOUDLY — it never drifts to a colliding token.
 
-    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
-    # evicting/refreshing a lease it may not hold. argparse exits 2.
+    This is the half of task 4248 that is not "move it into the CLI": having
+    moved it, the CLI must refuse rather than synthesize. `{name}-0` would be
+    IDENTICAL for two concurrently-degraded sessions, so each would pass the
+    other's `_is_lease_owner` check — 3994 defect 1 reopened. Exit 2 is not a
+    regression: pre-4248 a slug-less lease verb ALSO exited 2, so the
+    underivable case keeps its exit code and only the derivable case changed.
+
+    The stderr assertions matter as much as the code: an operator who is
+    refused must also be told the escape hatch, not merely told no.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
     with pytest.raises(SystemExit) as excinfo:
         sr.main([verb, '--name', 'watcher-df'])
 
     assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert 'CLAUDE_PID' in err
+    assert '--slug' in err
+    # Nothing was mutated on the way out.
+    assert lease_path.read_text() == original_body
+
+
+def test_the_read_only_lease_verbs_stay_usable_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DIAGNOSIS must survive the degraded path the exit-2 refusal creates.
+
+    `lease-show` and `lease-reap` are exactly what a refused or degraded
+    operator is sent to next — `_run_lease_mutation`'s `result=refused` message
+    ends "inspect with `lease-show --name <name>`", and both watcher SKILLs say
+    the same — so the guard must cover only the three SLUG-BEARING verbs.
+    Nothing else pins that:
+    the guard is scoped by a hardcoded verb tuple, and widening it (or hoisting
+    it above the verb check) would leave every new test green while removing
+    the operator's only way to see WHY they were refused.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    # Read-only inspection: still prints its normal key=value report.
+    assert sr.main(['lease-show', '--name', 'watcher-df']) == 0
+    shown = dict(line.split('=', 1) for line in capsys.readouterr().out.splitlines())
+    assert shown['name'] == 'watcher-df'
+    assert shown['holder_slug'] == 'watcher-df-100'
+
+    # The sweep: also unguarded, and a live holder is still not reaped.
+    assert sr.main(['lease-reap']) == 0
+    assert lease_path.is_file()
+
+
+def test_an_explicit_slug_is_still_the_escape_hatch_under_an_unresolvable_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is escapable, and does not break the degraded-pid path.
+
+    `test_a_degraded_pid_lease_still_ages_out_and_is_reaped` depends on being
+    able to CLAIM a lease with an unresolvable `CLAUDE_PID` (recording pid 0, so
+    a crashed holder still ages out). Refusing to DERIVE a slug must not refuse
+    to ACCEPT one — the operator supplies a stable token and the pid degrades
+    exactly as 3994 designed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.session_slug == 'watcher-df-degraded'
+    assert holder.pid == 0
+
+
+# `test_main_lease_mutating_verbs_require_slug` lived here until task 4248.
+# It asserted that OMITTING `--slug` exits 2 — true only while the token had
+# to be spelled in shell. It is superseded, not dropped: its surviving half
+# (an UNDERIVABLE slug exits 2 rather than defaulting to a colliding token) is
+# now pinned across all THREE lease verbs by
+# `test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived`, and
+# the ownership guarantee it was really protecting is pinned directly by
+# `..._still_refuse_a_stranger_with_a_derived_slug` below. It was also quietly
+# env-dependent: it never unset `CLAUDE_PID`, so post-4248 it would pass or
+# fail on ambient environment rather than on behaviour.
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_derive_the_owners_slug_when_it_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE POINT of task 4248: the CLI re-derives the same slug across invocations.
+
+    Claim and mutate are separate Claude Code Bash tool calls in production —
+    separate `/bin/bash -c` processes — so nothing can be carried between them.
+    Both derive from `$CLAUDE_PID`, so the owner matches itself without ever
+    spelling the token in shell.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_still_refuse_a_stranger_with_a_derived_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE GUARD TEST: defaulting `--slug` is a CALLER-DERIVED default, not a fallback.
+
+    3994's `required=True` comment reads "a silent no-slug fallback would
+    preserve the 'any caller may evict/refresh any lease' defect indefinitely".
+    This pins that the defect stays fixed. The defect 3994 closed was that both
+    verbs mutated UNCONDITIONALLY — no ownership check ran at all. The check
+    still runs; it now compares against a slug derived from THIS caller's own
+    `$CLAUDE_PID`, so a DIFFERENT session derives a DIFFERENT slug and is
+    refused, with the lease body untouched. What 4248 retires is only the
+    requirement that the token be spelled in shell — which is what let it drift.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    # A different session: same lease name, its own (different) session pid.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID - 1))
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line names the REAL holder — the first session's derived slug.
+    assert f'watcher-df-{_DEAD_PID}' in lines[1]
+    assert lease_path.read_text() == original_body
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
@@ -4299,13 +4877,186 @@ def test_main_write_decision_files_open_record(
     assert len(listed) == 1
     rec = listed[0]
     assert rec.id == 'dec-park-1'
-    assert rec.project == 'df'
+    # Stored CANONICAL, not verbatim: --project is normalized at the CLI
+    # boundary (task 3807, see test_main_write_decision_canonicalizes_project).
+    assert rec.project == 'dark_factory'
     assert rec.text == 'Approve risky merge?'
     assert rec.task_id == '2085'
     assert rec.escalation_id == 'esc-1'
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+@pytest.mark.parametrize(
+    'raw_project',
+    ['df', 'DF', 'dark-factory', 'Dark-Factory', '  DARK_FACTORY '],
+)
+def test_main_write_decision_canonicalizes_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw_project: str,
+) -> None:
+    """--project is stored NORMALIZED, not verbatim (task 3807).
+
+    Mirrors how --escalations-dir is already stamped normalized one line
+    below in _run_write_decision. Storing the raw argv string is what let one
+    project's decisions accumulate in three separate partitions, each
+    invisible to a reap scoped to either of the others.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'd-alias',
+            '--project',
+            raw_project,
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'dark_factory'
+
+
+def test_main_write_decision_canonicalizes_an_unaliased_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The fold applies to EVERY project, not just the one aliased token: a
+    genuinely new project must be able to file without a code change, so the
+    verb normalizes rather than rejecting an unrecognized spelling.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'd-av',
+            '--project',
+            'autopilot-video',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].project == 'autopilot_video'
+
+
+def test_main_write_decision_project_normalization_never_touches_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``df-`` prefix belongs to --id, which YOU type; write-decision
+    never derives it from, or rewrites it because of, --project.
+
+    Conflating the two is how the three-way split arose in the first place --
+    a human reading ``df-esc-3524-1`` inferred that ``--project df`` was the
+    right spelling. The id (and therefore the record's filename) must survive
+    project canonicalization byte-for-byte, or every cockpit cross-link to a
+    filed decision would break.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'df-esc-3524-1',
+            '--project',
+            'df',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / 'decisions' / 'df-esc-3524-1.json').is_file()
+    assert 'df-esc-3524-1' in capsys.readouterr().out
+    listed = sr.list_decisions(root=tmp_path)
+    assert [(d.id, d.project) for d in listed] == [('df-esc-3524-1', 'dark_factory')]
+
+
+def test_main_write_decision_logs_a_project_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rewrite is LOUD, not silent (project norm: loud-over-silent
+    degradation) -- so an operator can see that what they typed is not what
+    was stored, and fix the spelling at the source.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        assert (
+            sr.main(
+                [
+                    'write-decision',
+                    '--id',
+                    'd-w',
+                    '--project',
+                    'df',
+                    '--text',
+                    'q?',
+                    '--escalations-dir',
+                    str(tmp_path / 'escalations'),
+                ]
+            )
+            == 0
+        )
+
+    assert any(
+        r.levelno >= logging.WARNING and 'df' in r.getMessage() and 'dark_factory' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_main_write_decision_already_canonical_project_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning fires only on an actual REWRITE. A watcher already passing
+    the canonical token -- which is what both SKILL.md files now tell it to
+    do -- must not emit a warning on every park, or the signal is noise.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-ok',
+                '--project',
+                'dark_factory',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'dark_factory'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_main_write_decision_stamps_severity(
@@ -5019,6 +5770,157 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
     assert merged == dataclasses.replace(existing, severity='urgent')
 
 
+# ---------------------------------------------------------------------------
+# Project-token canonicalization (task 3807)
+# ---------------------------------------------------------------------------
+
+_PROJECT_TOKEN_CASES: list[tuple[str, str]] = [
+    # Separator/case folding: one project, five spellings, one token.
+    ('dark_factory', 'dark_factory'),
+    ('dark-factory', 'dark_factory'),
+    ('Dark-Factory', 'dark_factory'),
+    ('DARK_FACTORY', 'dark_factory'),
+    ('  dark-factory  ', 'dark_factory'),
+    # Alias: the one seeded PROJECT_TOKEN_ALIASES entry, itself folded first.
+    ('df', 'dark_factory'),
+    ('DF', 'dark_factory'),
+    (' df ', 'dark_factory'),
+    ('-df-', 'dark_factory'),
+    # Unset sentinel -- '' is never a token (mirrors normalize_escalations_dir).
+    ('', ''),
+    ('   ', ''),
+    ('\t\n', ''),
+    # Pass-through: an already-canonical token of another project is untouched.
+    ('reify', 'reify'),
+    # A split whose spellings differ ONLY by separator folds with no alias
+    # entry -- and autopilot_video is also what that project's config
+    # declares, so folding fully resolves it.
+    ('autopilot-video', 'autopilot_video'),
+    ('autopilot_video', 'autopilot_video'),
+    # solar-challenge's two spellings fold into ONE bucket, but that bucket
+    # is NOT its declared memory.project_id. See the residual-gap test below
+    # -- this row deliberately does not claim folding resolved it.
+    ('solar-challenge', 'solar_challenge'),
+    ('solar_challenge', 'solar_challenge'),
+]
+
+
+@pytest.mark.parametrize(('raw', 'expected'), _PROJECT_TOKEN_CASES)
+def test_normalize_project_token_table(raw: str, expected: str) -> None:
+    """One project must have ONE token, whatever spelling it was filed under.
+
+    The live population that motivated this (2026-08-06): 41 OPEN
+    dark-factory decisions split 22/17/2 across ``dark_factory``/``df``/
+    ``dark-factory``, each partition invisible to a reap scoped to either of
+    the others.
+    """
+    assert sr.normalize_project_token(raw) == expected
+
+
+def test_normalize_project_token_does_not_merge_solar_challenge_platform() -> None:
+    """COLLAPSE GUARD: folding must never merge two DIFFERENT projects.
+
+    ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge`` and
+    ``/home/leo/src/solar-challenge-platform`` declares
+    ``solar_challenge_platform`` -- separate project roots, separate
+    orchestrator configs, separate escalation queues, whose tokens merely
+    share a prefix. Merging them would let one project's reaper close the
+    other's decisions, which is strictly worse than the bug being fixed. Only
+    case and separator differences may ever fold.
+    """
+    assert sr.normalize_project_token('solar_challenge_platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar-challenge-platform') == 'solar_challenge_platform'
+    assert sr.normalize_project_token('solar_challenge_platform') != sr.normalize_project_token(
+        'solar-challenge'
+    )
+
+
+@pytest.mark.parametrize('raw', [case[0] for case in _PROJECT_TOKEN_CASES])
+def test_normalize_project_token_is_idempotent(raw: str) -> None:
+    """f(f(x)) == f(x) for every token in the table.
+
+    Load-bearing twice over: the migration decides a record is already
+    canonical by comparing ``normalize_project_token(p) == p``, so a
+    non-idempotent fold would rewrite the same record on every run; and the
+    reaper normalizes an already-normalized stored token on every compare.
+    """
+    once = sr.normalize_project_token(raw)
+    assert sr.normalize_project_token(once) == once
+
+
+@pytest.mark.parametrize('raw', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_normalize_project_token_fail_soft_on_non_str(raw: object) -> None:
+    """Fail-soft, matching normalize_escalations_dir's contract for helpers a
+    C8 watch loop calls directly: a non-str value never raises into the
+    caller.
+    """
+    assert isinstance(sr.normalize_project_token(raw), str)
+
+
+def test_normalize_project_token_coerces_non_str_to_a_matchless_token() -> None:
+    """Pins the VALUE a coercion produces, not just that it is a str.
+
+    ``isinstance(..., str)`` alone is a tautology under a ``return str(...)``
+    body -- it cannot fail, so it cannot defend the docstring's actual claim
+    that a coerced token "matches no real project". These assert the claim.
+    """
+    assert sr.normalize_project_token(42) == '42'
+    assert sr.normalize_project_token(3.5) == '3.5'
+
+
+def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
+    """``None`` means UNSET, so it must land on ``''``, not on ``'none'``.
+
+    ``str(None)`` folds to ``'none'`` -- an ordinary-looking token, not a
+    sentinel. That matters because ``DecisionRecord.from_dict`` reads
+    ``data['project']`` with no coercion, so a hand-edited record carrying
+    ``"project": null`` round-trips a real ``None``; without this case the
+    migration would rewrite it onto a literal ``'none'`` bucket that a
+    reaper scoped to a project spelled that way could then match. ``''``
+    only ever matches ``''``, keeping the fail-OPEN direction.
+    """
+    assert sr.normalize_project_token(None) == ''
+    assert sr.normalize_project_token(None) != 'none'
+
+
+def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
+    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+
+    Folding DOES merge solar-challenge's two filed spellings into one bucket
+    -- an improvement, since a reap scoped to either previously missed the
+    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
+    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
+    ``my_solar_challenge``, and no alias bridges them. So a reaper passing
+    the config-declared token matches ZERO of those 5 rows.
+
+    This test exists so nobody reads the folding rows above as "solved" and
+    so the day an alias IS added (its own filed decision task, 3813) this
+    test fails loudly and must be updated deliberately -- rather than the
+    gap silently changing shape. The skills' ``--project`` guidance carries
+    the same caveat for the humans and watchers that read it.
+    """
+    assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
+    assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
+        'solar_challenge'
+    )
+    assert sr.normalize_project_token('my_solar_challenge') != sr.normalize_project_token(
+        'solar-challenge'
+    )
+    assert 'solar_challenge' not in sr.PROJECT_TOKEN_ALIASES
+
+
+def test_project_token_aliases_maps_folded_to_folded() -> None:
+    """Every PROJECT_TOKEN_ALIASES key AND value must already be canonical
+    under the fold, or a lookup would miss (key) or emit a non-canonical
+    token (value) -- the alias map is applied AFTER folding, never before.
+    """
+    assert sr.PROJECT_TOKEN_ALIASES['df'] == 'dark_factory'
+    for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
+        assert sr.normalize_project_token(alias) == canonical
+        assert sr.normalize_project_token(canonical) == canonical
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
@@ -5247,6 +6149,102 @@ def test_main_reap_decisions_scopes_to_project(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_closes_every_spelling_of_one_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3807): ONE run closes EVERY spelling of ONE project.
+
+    Measured live 2026-08-06: 41 OPEN dark-factory decisions split 22/17/2
+    across ``dark_factory``/``df``/``dark-factory``. The reaper compared
+    ``decision.project`` to ``--project`` as raw strings, so each partition
+    was invisible to a reap scoped to either of the others and an L2 session
+    had to run the verb once per token to close them all.
+
+    All four decisions share ONE queue and each pins its own resolved
+    escalation, so the axis-2 queue guard is satisfied and cannot short-
+    circuit this into a vacuous pass -- ``escalations_dir=`` is therefore
+    passed explicitly at each call site, per _make_decision's documented rule.
+
+    One test, both directions: the three dark-factory spellings must ALL
+    close, and the unrelated ``reify`` decision must stay OPEN -- so widening
+    the axis-1 match to spellings of the SAME project provably does not widen
+    it ACROSS projects.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    for esc_id in ('esc-a', 'esc-b', 'esc-c', 'esc-other'):
+        (archive_dir / f'{esc_id}.json').write_text(json.dumps({'status': 'resolved'}))
+    seeded = {
+        'dec-df': ('df', 'esc-a'),
+        'dec-hyphen': ('dark-factory', 'esc-b'),
+        'dec-canonical': ('dark_factory', 'esc-c'),
+        'dec-reify': ('reify', 'esc-other'),
+    }
+    for decision_id, (project, escalation_id) in seeded.items():
+        sr.write_decision(
+            _make_decision(
+                id=decision_id,
+                project=project,
+                escalation_id=escalation_id,
+                state=sr.DecisionState.OPEN,
+                escalations_dir=str(escalations_dir),
+            ),
+            root=tmp_path,
+        )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', 'dark_factory', '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-df'] == sr.DecisionState.ANSWERED
+    assert listed['dec-hyphen'] == sr.DecisionState.ANSWERED
+    assert listed['dec-canonical'] == sr.DecisionState.ANSWERED
+    assert listed['dec-reify'] == sr.DecisionState.OPEN
+
+
+@pytest.mark.parametrize('reaper_project', ['DF', 'df', 'dark-factory', ' Dark_Factory '])
+def test_main_reap_decisions_normalizes_the_reapers_own_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reaper_project: str,
+) -> None:
+    """BOTH sides of the join normalize, mirroring the axis-2 queue guard.
+
+    A watcher invoking with a stale ``--project`` spelling must still close a
+    decision stored under the canonical token -- otherwise the fix would be
+    half-applied and the caller's own spelling would become a new way to
+    silently miss rows.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-08-06'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-r.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-canon',
+            project='dark_factory',
+            escalation_id='esc-r',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=str(escalations_dir),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(
+        ['reap-decisions', '--project', reaper_project, '--escalations-dir', str(escalations_dir)]
+    )
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canon'] == sr.DecisionState.ANSWERED
 
 
 def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
@@ -6096,7 +7094,11 @@ def test_main_write_decision_same_id_different_project_is_refused(
     assert [d.id for d in listed] == ['esc-42-1']
     survivor = listed[0]
     # Untouched in EVERY field -- not merged, not overwritten, not enriched.
-    assert survivor.project == 'df'
+    # 'dark_factory', not the 'df' filed above: write-decision canonicalizes
+    # --project at the CLI boundary (task 3807), so that IS this record's
+    # untouched stored value. The incumbent still has to survive the colliding
+    # filing unchanged, which is what this test pins.
+    assert survivor.project == 'dark_factory'
     assert survivor.text == 'Adopt the reify plan?'
     assert survivor.severity == 'info'  # NOT maxed up by the other project
     assert survivor.task_id is None  # no empty field filled from reify
@@ -6109,7 +7111,8 @@ def test_main_write_decision_same_id_different_project_is_refused(
     ]
     assert refusals, 'the refusal must be logged, not silent'
     assert 'reify' in refusals[0].getMessage()  # names the refused project
-    assert 'df' in refusals[0].getMessage()  # ...and the incumbent
+    # ...and the incumbent, under its canonical stored spelling (task 3807).
+    assert 'dark_factory' in refusals[0].getMessage()
 
 
 def test_main_write_decision_non_open_record_is_still_overwritten(
@@ -7344,3 +8347,521 @@ class TestStdlibOnlySelfContainment:
             'guard.\n'
             f'{detail}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Decision project-token migration (task 3807)
+# ---------------------------------------------------------------------------
+
+
+def _seed_mixed_spellings(tmp_path: Path) -> dict[str, dict[str, Any]]:
+    """Seed the observed mixed-spelling population, one record per case.
+
+    Mirrors the live 2026-08-06 census in miniature: three dark-factory
+    spellings needing repair (one per DecisionState, so preservation is
+    checked against a row that must NOT be reopened), one already-canonical
+    dark-factory row, and one unrelated project. Returns each seeded record's
+    ``to_dict()`` keyed by id, so a test can diff the whole dict before/after
+    and catch a field a future change lets escape.
+    """
+    seeds = {
+        'd-df': ('df', sr.DecisionState.OPEN),
+        'd-hyphen': ('dark-factory', sr.DecisionState.ANSWERED),
+        'd-mixed': ('Dark_Factory', sr.DecisionState.DROPPED),
+        'd-canon': ('dark_factory', sr.DecisionState.OPEN),
+        'd-reify': ('reify', sr.DecisionState.OPEN),
+    }
+    before: dict[str, dict[str, Any]] = {}
+    for decision_id, (project, state) in seeds.items():
+        record = _make_decision(id=decision_id, project=project, state=state)
+        sr.write_decision(record, root=tmp_path)
+        before[decision_id] = record.to_dict()
+    return before
+
+
+def test_migrate_decision_project_tokens_reports_only_changed_records(tmp_path: Path) -> None:
+    """Returns one MigratedDecision per CHANGED record and nothing else.
+
+    An already-canonical row and an unrelated project's row are not
+    "migrated" -- reporting them would make the operator's `| wc -l` lie
+    about how much of the legacy population actually needed repair.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in migrated} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+
+
+def test_migrate_decision_project_tokens_canonicalizes_on_disk(tmp_path: Path) -> None:
+    """The point of the sweep: after it, every dark-factory row -- whatever
+    it was filed under -- reads back as the ONE canonical token, and an
+    unrelated project is untouched.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    on_disk = {d.id: d.project for d in sr.list_decisions(root=tmp_path)}
+    assert on_disk == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_migrate_decision_project_tokens_changes_only_the_project_field(tmp_path: Path) -> None:
+    """PRESERVATION: exactly one key may differ, on every record.
+
+    Asserted as a whole-dict diff rather than a field checklist so a future
+    field added to DecisionRecord cannot silently escape the check. This is
+    the invariant that makes the sweep safe to run against the live
+    population: an ANSWERED/DROPPED row must never be reopened, and filed_at
+    (the cockpit's age/ordering signal) must not be restamped.
+    """
+    before = _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    after = {d.id: d.to_dict() for d in sr.list_decisions(root=tmp_path)}
+    assert set(after) == set(before)
+    for decision_id, before_dict in before.items():
+        differing = {
+            key
+            for key in set(before_dict) | set(after[decision_id])
+            if before_dict.get(key) != after[decision_id].get(key)
+        }
+        assert differing <= {'project'}, decision_id
+    # Spelled out for the states that must survive, so the intent survives a
+    # future refactor of the diff above.
+    states = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert states['d-df'] == sr.DecisionState.OPEN
+    assert states['d-hyphen'] == sr.DecisionState.ANSWERED
+    assert states['d-mixed'] == sr.DecisionState.DROPPED
+
+
+def test_migrate_decision_project_tokens_is_idempotent(tmp_path: Path) -> None:
+    """A second sweep is a no-op: nothing reported, no file rewritten.
+
+    Follows from normalize_project_token's idempotence, and is what makes the
+    verb safe to keep as a permanent repair tool rather than a one-shot
+    script that must be deleted after use.
+    """
+    _seed_mixed_spellings(tmp_path)
+    sr.migrate_decision_project_tokens(root=tmp_path)
+    settled = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    assert sr.migrate_decision_project_tokens(root=tmp_path) == []
+    assert {path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))} == (
+        settled
+    )
+
+
+def test_migrated_decision_is_a_frozen_result_record() -> None:
+    """Mirrors the sibling ReapedDecision contract: a frozen dataclass, so a
+    caller cannot mutate the audit trail of what the sweep actually did.
+    """
+    migrated = sr.MigratedDecision(id='d-1', old_project='df', new_project='dark_factory')
+
+    assert (migrated.id, migrated.old_project, migrated.new_project) == (
+        'd-1',
+        'df',
+        'dark_factory',
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        migrated.new_project = 'other'  # type: ignore[misc]
+
+
+def test_migrate_decision_project_tokens_dry_run_reports_without_writing(
+    tmp_path: Path,
+) -> None:
+    """dry_run=True previews the exact same work but touches nothing.
+
+    An operator must be able to see the full rewrite of the live population
+    -- 391 records at filing -- before committing to it. Compared as RAW FILE
+    TEXT before/after, so even a byte-identical re-serialization would fail:
+    "side-effect-free" means the files are not written at all, not that they
+    happen to round-trip.
+    """
+    _seed_mixed_spellings(tmp_path)
+    before_text = {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    }
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert {(m.id, m.old_project, m.new_project) for m in previewed} == {
+        ('d-df', 'df', 'dark_factory'),
+        ('d-hyphen', 'dark-factory', 'dark_factory'),
+        ('d-mixed', 'Dark_Factory', 'dark_factory'),
+    }
+    assert {
+        path: path.read_text() for path in sorted((tmp_path / 'decisions').glob('*.json'))
+    } == before_text
+
+
+def test_migrate_decision_project_tokens_dry_run_does_not_consume_the_work(
+    tmp_path: Path,
+) -> None:
+    """A preview must not be mistaken for the migration: the real run
+    afterwards still reports and performs the identical set of rewrites.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    previewed = sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+    performed = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {(m.id, m.old_project, m.new_project) for m in performed} == {
+        (m.id, m.old_project, m.new_project) for m in previewed
+    }
+    assert {d.id for d in sr.list_decisions(root=tmp_path) if d.project == 'dark_factory'} == {
+        'd-df',
+        'd-hyphen',
+        'd-mixed',
+        'd-canon',
+    }
+
+
+def test_migrate_decision_project_tokens_dry_run_creates_no_lock_sidecar(
+    tmp_path: Path,
+) -> None:
+    """dry_run takes no lock, so it leaves no ``<id>.json.lock`` sidecar.
+
+    decision_id_lock documents that merely TAKING a lock materializes a
+    sidecar (its ORPHAN SIDECARS note). A preview that littered one per
+    record across the whole fleet would not be the side-effect-free
+    operation its name promises.
+    """
+    _seed_mixed_spellings(tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path, dry_run=True)
+
+    assert list((tmp_path / 'decisions').glob('*.lock')) == []
+
+
+def test_migrate_decision_project_tokens_takes_the_per_id_lock(tmp_path: Path) -> None:
+    """POSITIVE counterpart to the dry-run sidecar test: a real run DOES lock.
+
+    decision_id_lock materializes ``<id>.json.lock`` on entry (its ORPHAN
+    SIDECARS note), so the sidecar's presence is the observable proof the
+    read-modify-write actually ran under the same lock every other mutator
+    takes -- invariant (a). Without this, a regression that dropped the lock
+    would leave every other migration test green.
+    """
+    sr.write_decision(_make_decision(id='d-df', project='df'), root=tmp_path)
+
+    sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert (tmp_path / 'decisions' / 'd-df.json.lock').exists()
+
+
+def test_migrate_decision_project_tokens_does_not_roll_back_a_racing_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INVARIANT (b): a state transition landing between the scan and the
+    write survives the sweep.
+
+    This is the entire safety argument for running the sweep against the live
+    population, and it is what a regression reusing the ``list_decisions``
+    snapshot record (instead of re-reading under the lock) would break --
+    silently resurrecting an ANSWERED decision back to OPEN while every other
+    test stayed green.
+
+    The race is injected deterministically by wrapping decision_id_lock: the
+    concurrent transition is applied to the file just after the lock is held
+    and just before the migration's re-read, which is exactly the window the
+    invariant claims to cover. It writes the file directly rather than via
+    update_decision_state, which would re-enter the patched lock.
+    """
+    sr.write_decision(
+        _make_decision(id='d-race', project='df', state=sr.DecisionState.OPEN), root=tmp_path
+    )
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-race.json'
+
+    @contextlib.contextmanager
+    def _racing_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            # A human answers the decision in the scan->write window.
+            raced = json.loads(path.read_text())
+            raced['state'] = sr.DecisionState.ANSWERED.value
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _racing_lock)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    settled = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert settled['d-race'].project == 'dark_factory'
+    assert settled['d-race'].state == sr.DecisionState.ANSWERED
+    assert {m.id for m in migrated} == {'d-race'}
+
+
+def test_migrate_decision_project_tokens_reports_the_token_it_actually_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INVARIANT (b), audit half: ``old_project`` names what was ON DISK at
+    write time, not what the pre-lock scan happened to see.
+
+    Here a concurrent writer re-spells the token inside the scan->write
+    window. Deriving the new token from the stale snapshot would clobber that
+    writer's value, and reporting the snapshot's ``old_project`` would put a
+    token in the audit trail that was never the one replaced.
+    """
+    sr.write_decision(_make_decision(id='d-respell', project='df'), root=tmp_path)
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-respell.json'
+
+    @contextlib.contextmanager
+    def _respelling_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            raced = json.loads(path.read_text())
+            raced['project'] = 'Dark-Factory'
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _respelling_lock)
+
+    migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert [(m.id, m.old_project, m.new_project) for m in migrated] == [
+        ('d-respell', 'Dark-Factory', 'dark_factory')
+    ]
+
+
+def test_migrate_decision_project_tokens_skips_a_record_canonicalized_in_the_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record another writer already canonicalized in the scan->write window
+    is skipped, not re-reported.
+
+    The pre-filter runs off the snapshot, so such a record still reaches the
+    lock; the re-read is what turns it into a no-op. Reporting it would make
+    the operator's audit trail claim a rewrite that this sweep never made.
+    """
+    sr.write_decision(_make_decision(id='d-beaten', project='df'), root=tmp_path)
+    real_lock = sr.decision_id_lock
+    path = tmp_path / 'decisions' / 'd-beaten.json'
+
+    @contextlib.contextmanager
+    def _beating_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+        with real_lock(decision_id, root=root):
+            raced = json.loads(path.read_text())
+            raced['project'] = 'dark_factory'
+            path.write_text(json.dumps(raced))
+            yield
+
+    monkeypatch.setattr(sr, 'decision_id_lock', _beating_lock)
+
+    assert sr.migrate_decision_project_tokens(root=tmp_path) == []
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-beaten': 'dark_factory'
+    }
+
+
+def test_migrate_decision_project_tokens_skips_a_corrupt_neighbour(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One unparseable file must not abort the sweep of the rest.
+
+    list_decisions already skips it on the read side; this pins that the
+    whole call still migrates every good record and leaves the bad file
+    byte-for-byte alone rather than "repairing" something it cannot parse.
+    """
+    for decision_id in ('d-good-1', 'd-good-2'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    broken = tmp_path / 'decisions' / 'broken.json'
+    broken.write_text('{not json at all')
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-good-1', 'd-good-2'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-good-1': 'dark_factory',
+        'd-good-2': 'dark_factory',
+    }
+    assert broken.read_text() == '{not json at all'
+
+
+def test_migrate_decision_project_tokens_skips_an_unwritable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A record whose write fails is absent from the result and does not stop
+    the sweep -- mirrors reap_answered_decisions' "only record it when the
+    update actually succeeded" contract. Reporting a rewrite that never
+    landed would make the operator's audit trail lie.
+    """
+    for decision_id in ('d-ok', 'd-bad'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _flaky_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-bad':
+            return False
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _flaky_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-ok': 'dark_factory',
+        'd-bad': 'df',
+    }
+
+
+def test_migrate_decision_project_tokens_survives_a_raising_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A per-record fault mid-loop is logged and skipped, never propagated.
+
+    Matches the module-wide fail-soft convention (write_decision,
+    update_decision_state and list_decisions all self-guard): one record
+    faulting must not deny the operator the repair of the other 390.
+    """
+    for decision_id in ('d-ok', 'd-boom'):
+        sr.write_decision(_make_decision(id=decision_id, project='df'), root=tmp_path)
+    real_write = sr.write_decision
+
+    def _exploding_write(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        if record.id == 'd-boom':
+            raise OSError('disk on fire')
+        return real_write(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', _exploding_write)
+
+    with caplog.at_level(logging.ERROR):
+        migrated = sr.migrate_decision_project_tokens(root=tmp_path)
+
+    assert {m.id for m in migrated} == {'d-ok'}
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI migrate-decision-projects verb (task 3807: one-shot project backfill)
+# ---------------------------------------------------------------------------
+
+
+def test_main_migrate_decision_projects_prints_one_line_per_migrated_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One ``<id> <old> -> <new>`` line per migrated record, mirroring
+    reap-decisions' one-line-per-closed-decision convention -- so the verb is
+    grep-able and diffable the same way and an operator's ``| wc -l`` habits
+    transfer unchanged. Asserted as a SET: ordering is list_decisions' sorted
+    glob, not a promise this verb makes.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'dark_factory',
+        'd-hyphen': 'dark_factory',
+        'd-mixed': 'dark_factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_dry_run_prints_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--dry-run prints the same preview lines and leaves every record's
+    project unchanged, so an operator can read the plan before running it
+    against the live fleet root.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+
+    rc = sr.main(['migrate-decision-projects', '--dry-run'])
+
+    assert rc == 0
+    printed = {line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert printed == {
+        'd-df df -> dark_factory',
+        'd-hyphen dark-factory -> dark_factory',
+        'd-mixed Dark_Factory -> dark_factory',
+    }
+    assert {d.id: d.project for d in sr.list_decisions(root=tmp_path)} == {
+        'd-df': 'df',
+        'd-hyphen': 'dark-factory',
+        'd-mixed': 'Dark_Factory',
+        'd-canon': 'dark_factory',
+        'd-reify': 'reify',
+    }
+
+
+def test_main_migrate_decision_projects_is_a_no_op_when_already_clean(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Re-running after the fleet is clean prints NOTHING.
+
+    That silence is what makes the verb safe to keep permanently: it doubles
+    as the repair tool for a hand-edited record without an operator having to
+    reason about whether it already ran.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _seed_mixed_spellings(tmp_path)
+    assert sr.main(['migrate-decision-projects']) == 0
+    capsys.readouterr()
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+
+
+def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_write_decision_fail_soft_when_fleet_root_under_a_file:
+    an unusable fleet root must return 0 and raise nothing, preserving the
+    module's documented boundary that a registry fault can never change a
+    bash caller's exit code.
+    """
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
+
+    rc = sr.main(['migrate-decision-projects'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert not (blocker / 'fleet').exists()

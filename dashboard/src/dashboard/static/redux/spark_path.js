@@ -64,6 +64,12 @@
 // The difference from the sparkline builders is only the BOX: a sparkline
 // scales into a bare 0..height viewport, whereas a chart scales into a box
 // offset by its axis gutter, so x gains an `x0` and y a `y0`.
+//
+// charts.jsx's HBarChart (task 3681) closed out the same defect class with NO
+// new export here: its input is rows of OBJECTS, so it projects to a values
+// array at the CALL SITE and reuses this module's builders unchanged. Why it
+// needed nothing of its own — and what its hole decision drives — is documented
+// where that code lives, in charts.jsx.
 
 // ── Is this value a real, plottable measurement? ───────────────────────────
 // Finite numbers only. `null`/`undefined` (a missing sample), `NaN`/`±Infinity`
@@ -374,11 +380,19 @@ function axisPaths(values, geom) {
   return { line: lines.join(' '), area: areas.join(' '), stepX };
 }
 
-// ── Bar heights as a fraction of the axis max (`BarChart`, `HistBar`) ──────
+// ── Bar sizes as a fraction of the axis max (`BarChart`, `HistBar`, ───────
+//    `HBarChart`)
 // Returns { fractions }, the SAME length as `values`, holding `null` at every
 // hole and `values[i] / max` everywhere else. The caller multiplies by
 // whatever its bar space is — chartH pixels for BarChart, 100 percent for
-// HistBar — so one helper serves both.
+// HistBar's heights and for HBarChart's widths — so one helper serves all
+// three. (HBarChart projects its rows to a values array first, and calls this
+// a second time per row for that row's segments, scaled against the same max.)
+//
+// A caller may branch on the null for more than its bar — HBarChart also drives
+// its value cell off it, and says there why that is exact rather than
+// approximate. Nothing here needs to know that; the contract below is the same
+// either way.
 //
 // WHY A NULL ENTRY AND NOT A ZERO. There is no NUMBER a bar renderer can draw
 // that means "no measurement here". charts.jsx proved this twice: a `null`

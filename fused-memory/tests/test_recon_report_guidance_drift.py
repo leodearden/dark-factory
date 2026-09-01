@@ -313,24 +313,41 @@ class TestReportToolClassificationPartitionsTheLiveToolSet:
         """Cross-check the classification against the list that actually gates the stages.
 
         This is the one assertion here that compares two genuinely INDEPENDENT
-        sources of truth. DISALLOW_RECON_REPORT_LEDGER_WRITES is what the stage
+        sources of truth. The DISALLOW_RECON_REPORT_* lists are what the stage
         runner actually passes to ``--disallowed-tools``; without this check
         STAGE_GATED_REPORT_TOOLS would just be a third hand-maintained list,
         vulnerable to exactly the drift this task exists to fix. Pinning them
         together means gating a tool without classifying it (or classifying it
         without gating it) fails loudly here.
-        """
-        from fused_memory.reconciliation.cli_stage_runner import (
-            DISALLOW_RECON_REPORT_LEDGER_WRITES,
-        )
 
+        BOTH disallow lists are unioned, not just the LEDGER one: task 3065
+        added DISALLOW_RECON_REPORT_JOURNAL_WRITES as a sibling gate (Stage 3
+        is denied repair_memory_citation because it writes the durable
+        ReconciliationJournal). Reading only one list would let a tool gated
+        via the other be classified shared-guidance and rendered into a stage
+        that cannot call it — the precise failure this cross-check exists to
+        prevent. Any FUTURE sibling list must be unioned in here too.
+        """
+        from fused_memory.reconciliation import cli_stage_runner
+
+        disallow_lists = {
+            name: getattr(cli_stage_runner, name)
+            for name in dir(cli_stage_runner)
+            if name.startswith('DISALLOW_RECON_REPORT_')
+        }
+        assert disallow_lists, (
+            'No DISALLOW_RECON_REPORT_* lists found in cli_stage_runner — either they '
+            'were renamed (update this test) or the stage gating was removed.'
+        )
         gated = {
             name.removeprefix('mcp__recon-report__')
-            for name in DISALLOW_RECON_REPORT_LEDGER_WRITES
+            for names in disallow_lists.values()
+            for name in names
         }
         assert set(STAGE_GATED_REPORT_TOOLS) == gated, (
-            'STAGE_GATED_REPORT_TOOLS (server/recon_report.py) and '
-            'DISALLOW_RECON_REPORT_LEDGER_WRITES (reconciliation/cli_stage_runner.py) '
+            'STAGE_GATED_REPORT_TOOLS (server/recon_report.py) and the '
+            f'DISALLOW_RECON_REPORT_* lists {sorted(disallow_lists)} '
+            '(reconciliation/cli_stage_runner.py) '
             f'disagree: classified={set(STAGE_GATED_REPORT_TOOLS)}, actually gated={gated}. '
             'A recon-report tool that is denied in some stages must be classified '
             'stage-gated so it stays out of the stage-agnostic guidance block, and a tool '
@@ -878,9 +895,10 @@ class TestFallbackIsDerivedFromTheSameRenderer:
         The snapshot is compared against the DERIVED shared-guidance set
         (task 3878). The previous version of this test subtracted a
         hand-written ``not_agent_guidance_tools`` allowlist that named
-        start_report, delete_finding and write_entity_standing_decision — so
-        the two tools this task found already drifted were precisely the ones
-        that allowlist was muting. With the set derived from the live tool
+        start_report, delete_finding, write_entity_standing_decision and (once
+        task 3065 landed) repair_memory_citation — so the tools this task found
+        already drifted were precisely the ones that allowlist was muting, and
+        every new tool had to be hand-added to it. With the set derived from the live tool
         names minus the classification constants, the old "undeclared" check
         is empty by construction and has been replaced by the assertion that
         still has teeth: the snapshot must cover exactly the shared-guidance

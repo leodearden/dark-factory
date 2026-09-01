@@ -1602,6 +1602,92 @@ def test_fleet_dir_default_matches_across_tiers() -> None:
     )
 
 
+def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
+    """restart-orchestrator.sh's target-unit default must not diverge.
+
+    Three mirrors of one unit name that cannot import each other: the
+    watchdog's WATCHED table (Python, and the deployed watchdog's own idea of
+    which unit is the dark-factory orchestrator — already port-pinned against
+    the real escalation configs by test_watched_ports_match_escalation_configs
+    above), restart-orchestrator.sh's SERVICE default (bash, stdlib-free) and
+    restart-all-orchestrators.sh's SELF_UNIT default (bash — the same unit, for
+    the same fleet, never previously pinned against the table).
+
+    WHY THIS EXISTS, and why it is not optional: task 3950 made the restart
+    script's target env-overridable (`ORCH_RESTART_UNIT`) so its two
+    fake-systemctl harnesses could stop putting a REAL unit name in front of
+    whatever `systemctl` resolves to. That retired the only two assertions in
+    the repo that pinned the production default —
+    scripts/tests/test_restart_orchestrator.py::UNIT and
+    scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT — which now hold
+    synthetic names the fixtures themselves supply. Without this pin the
+    default would be wholly UNPINNED: a future edit could retarget the script
+    at any unit and every test would stay green.
+
+    THE DECISION THIS ENCODES, not merely the mismatch: restart-orchestrator.sh
+    is invoked by operators and by `task_kind='deterministic'` before_done
+    scripts to restart THE dark-factory orchestrator. A drifted default does not
+    fail loudly — it silently restarts the WRONG unit, or none at all, while
+    reporting success against whatever it did restart.
+
+    A CHARACTERIZATION PIN, not a RED test: the production values are already
+    correct and must not change. Isolate a test by SETTING ORCH_RESTART_UNIT to
+    a synthetic `orchestrator-fake*` unit (df_pytest_isolation.synthetic_unit),
+    never by changing this default.
+    """
+    wdog = _load_watchdog()
+
+    # The canonical in-repo source: what the deployed watchdog actually
+    # restarts for the dark-factory escalation port.
+    port_to_unit = {port: unit for port, unit in wdog.WATCHED}
+    assert 8102 in port_to_unit, (
+        "No WATCHED entry for the dark-factory escalation port 8102 -- did the "
+        "table's port change? This pin derives the expected unit name from it."
+    )
+    expected = port_to_unit[8102]
+
+    drift_note = (
+        "\nrestart-orchestrator.sh is invoked by operators and by "
+        "task_kind='deterministic' before_done scripts to restart THE "
+        "dark-factory orchestrator, so a drifted default silently restarts the "
+        "WRONG unit (or none) while reporting success. This pin is the ONLY "
+        "remaining coverage of that default: task 3950 made it overridable and "
+        "thereby retired the two harness literals "
+        "(scripts/tests/test_restart_orchestrator.py::UNIT, "
+        "scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT) that were "
+        "previously its only pins. Isolate a test by SETTING ORCH_RESTART_UNIT "
+        "to a synthetic orchestrator-fake* unit instead of changing this value."
+    )
+
+    # --- bash mirror 1: restart-orchestrator.sh SERVICE default (task 3950) ---
+    restart_src = (REPO_ROOT / "scripts" / "restart-orchestrator.sh").read_text()
+    match = re.search(r'SERVICE="\$\{ORCH_RESTART_UNIT:-([^}]+)\}"', restart_src)
+    assert match is not None, (
+        "restart-orchestrator.sh SERVICE default pattern not found -- did its "
+        "literal shape change? Update this regex to match. (A pin that silently "
+        "stops finding its target is worse than no pin.)"
+    )
+    assert match.group(1) == expected, (
+        f"restart-orchestrator.sh SERVICE default {match.group(1)!r} has drifted "
+        f"from the watchdog WATCHED table's unit for port 8102 ({expected!r})."
+        + drift_note
+    )
+
+    # --- bash mirror 2: restart-all-orchestrators.sh SELF_UNIT default ---
+    fleet_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    self_match = re.search(r'SELF_UNIT="\$\{SELF_UNIT:-([^}]+)\}"', fleet_src)
+    assert self_match is not None, (
+        "restart-all-orchestrators.sh SELF_UNIT default pattern not found -- did "
+        "its literal shape change? Update this regex to match."
+    )
+    assert self_match.group(1) == expected, (
+        f"restart-all-orchestrators.sh SELF_UNIT default {self_match.group(1)!r} "
+        f"has drifted from the watchdog WATCHED table's unit for port 8102 "
+        f"({expected!r}); it names the same unit for the same fleet -- the unit "
+        "the fleet script restarts LAST, as its own." + drift_note
+    )
+
+
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

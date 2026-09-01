@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import random
 import re
 import time
 from collections import deque
@@ -521,6 +522,81 @@ def is_transient_api_requeue(
     if m is None:
         return False
     return is_server_error_status(int(m.group(1)))
+
+
+# Hard ceiling on the exponent used by `transient_requeue_cooldown` (task 3317
+# amend).  `base * 2**(exp - 1)` is a Python int shift with an UNBOUNDED
+# exponent, and `float * huge_int` raises `OverflowError: int too large to
+# convert to float` past ~1024 bits.  `n` is the task's transient requeue
+# count, bounded in practice by `transient_requeue_cap` — but that field is
+# validated only `ge=1`, so an operator who raises it into the thousands would
+# turn every transient arming into an exception raised out of
+# `Scheduler.release`.  Clamping is SEMANTICS-PRESERVING: the envelope is
+# already `min(cap_secs, ...)`, and reaching this ceiling would need
+# `cap_secs > base_secs * 2**63` (~9.2e18x — a cooldown of ~292 billion years
+# at base 1s), which no reachable config can express.
+_MAX_BACKOFF_EXPONENT = 64
+
+
+def transient_requeue_cooldown(
+    n: int,
+    *,
+    base_secs: float,
+    cap_secs: float,
+    rng: Callable[[float, float], float] | None = None,
+) -> tuple[float, float]:
+    """Return ``(armed_secs, envelope_secs)`` for the *n*-th transient requeue.
+
+    PRD ``plans/server-side-api-error-handling-prd.md`` contract C3 (task
+    3317, resolved decision 7)::
+
+        envelope(n) = min(cap_secs, base_secs * 2**(n - 1))
+        armed       = U(envelope / 2, envelope)          # equal jitter
+
+    With the shipped defaults (base 30.0 / cap 900.0) the envelope walks
+    30 → 60 → 120 → 240 → 480 → 900 and then stays pinned at the cap.  This
+    replaces the flat ``requeue_cooldown_secs`` for requeues classified
+    transient by :func:`is_transient_api_requeue` ONLY; a genuine requeue
+    keeps the flat cooldown.  Origin incident: the 2026-07-29 provider
+    outage, where a flat 30s retry produced 67 starts in one half-hour
+    bucket.
+
+    The jitter is EQUAL jitter — the draw floor is ``envelope / 2``, never
+    zero — so the arming schedule is monotone-nondecreasing in *n*
+    regardless of how the draws land, while still decorrelating a fleet of
+    tasks that all began retrying against the same provider at the same
+    moment.  *n* is clamped to ``>= 1``, so a degenerate count can only
+    degrade toward a full base cooldown, never toward a hot loop.
+
+    Sibling implementation of the same idiom:
+    :func:`orchestrator.fm_retry.fm_retry_backoffs`.  The two are
+    deliberately NOT merged — this one is single-step and returns its
+    envelope for observability (the scheduler stamps it into the state
+    snapshot), that one builds a whole budget-spanning schedule and clamps
+    its final sleep to the remaining window.
+
+    Args:
+        n: The task's transient requeue count at arming (post-increment,
+            so the first transient requeue is ``n=1``).
+        base_secs: First-step cooldown / exponential base.
+        cap_secs: Per-step ceiling; also the answer when ``base > cap``.
+        rng: Injectable ``(lo, hi) -> float`` draw, defaulting to
+            ``random.uniform``.  Tests inject a boundary function
+            (``lambda lo, hi: hi``) for exact assertions — the same seam
+            ``fm_retry_backoffs`` exposes.
+
+    Returns:
+        ``(armed_secs, envelope_secs)`` — the jittered cooldown to arm, and
+        the un-jittered envelope it was drawn from.
+    """
+    uniform = rng or random.uniform
+    # Clamped at BOTH ends: `>= 1` so a degenerate count can only degrade
+    # toward a full base cooldown, `<= _MAX_BACKOFF_EXPONENT` so an oversized
+    # `transient_requeue_cap` cannot make the shift overflow float (see the
+    # constant's comment).  Both bounds are semantics-preserving.
+    exp = min(max(1, int(n)), _MAX_BACKOFF_EXPONENT)
+    envelope = min(cap_secs, base_secs * (2 ** (exp - 1)))
+    return uniform(envelope / 2, envelope), envelope
 
 
 @dataclass(frozen=True)
@@ -1728,6 +1804,68 @@ def _task_external_deps(task: dict) -> list[str]:
     return metadata.external_deps
 
 
+def _reject_contradictory_metadata_mode(
+    metadata_mode: str | None, append: bool
+) -> None:
+    """Raise if a metadata write asks for both 'merge' and additive semantics.
+
+    THE single definition of the contradictory-pair rejection (task 3890),
+    shared by ``Scheduler.update_task`` and by the ``FakeMetadataBackend`` test
+    double in ``orchestrator/tests/_workflow_helpers.py``.  It lives at module
+    scope, and the fake calls THIS function rather than restating the
+    condition, so the double cannot drift back into being more permissive than
+    production: a later narrowing or widening of the rule lands in both callers
+    at once, by construction.  (Test-infrastructure-lies-about-production drift
+    is the exact failure class this guard was added to close, so re-opening it
+    by hand-copying the condition would be self-defeating.)
+
+    The check has to live client-side, not be delegated downwards: because
+    ``append`` is deliberately never forwarded on the wire by
+    ``Scheduler.update_task`` (``append=False`` would resolve to a destructive
+    REPLACE on the backend), the pair can never reach the backend's
+    ``sqlite_task_backend.py::_resolve_metadata_mode``, so without this every
+    orchestrator caller would be permanently exempt from any backend-side
+    rejection of it.  Task 3581 is the sibling backend fix for the same
+    contradiction one layer down, and it HAS landed — but that does not make
+    this one redundant belt-and-braces: because ``append`` never reaches the
+    wire, 3581's guard is structurally unreachable from any orchestrator
+    caller.  Exactly one guard fires per path — this one for orchestrator
+    callers, 3581's for direct-MCP callers (interactive / curator / recon) —
+    so removing either would leave its path unguarded.
+
+    Deliberately exactly one cell wide: ``('replace', True)`` (the sanctioned
+    destructive co-signal) and ``('additive', True)`` (both signals agree) stay
+    honored, and ``('merge', append=False/omitted)`` — the default-safe #4271
+    path — is untouched.  The *append* test is truthiness, NOT ``is True``,
+    deliberately: the mode resolver it guards reads ``'additive' if append``,
+    so an identity check would let a truthy non-bool (``append=1`` from a
+    dict-splat or a JSON-derived flag) slip past the guard while still reading
+    as additive intent to the resolver — resolving to 'merge' and forwarding
+    the very clobber this rejects.  Truthiness preserves the same one-cell
+    narrowness, since ``append=False``/omitted is falsy either way.
+
+    Raises
+    ------
+    ValueError
+        If ``metadata_mode='merge'`` is passed alongside a truthy ``append``.
+    """
+    if metadata_mode == 'merge' and append:
+        raise ValueError(
+            "Refusing a contradictory metadata_mode='merge' + append=True "
+            'update_task call: append=True asks for the ADDITIVE recursive '
+            "union merge while metadata_mode='merge' asks for a SHALLOW "
+            'last-write-wins overwrite, and there is no coherent way to do '
+            "both.  Resolving it silently to 'merge' overwrote nested keys "
+            "wholesale — a task's whole memory_hints blob (authored "
+            'entities/queries and all) replaced by the incoming stub '
+            'instead of unioned with it.  State intent explicitly: pass '
+            "metadata_mode='additive' (or append=True alone) to UNION "
+            'nested list/dict fields into the existing blob, or drop '
+            "append=True and keep metadata_mode='merge' to CONFIRM a "
+            'shallow top-level last-write-wins overwrite.'
+        )
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -1781,6 +1919,7 @@ class Scheduler:
         park_eviction_store: ParkEvictionRequestStore | None = None,
         wall_time_source: Callable[[], datetime] | None = None,
         state_snapshot_path: Path | None = None,
+        jitter_source: Callable[[float, float], float] | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -1794,6 +1933,15 @@ class Scheduler:
         # compare correctly after a process restart. Injectable so tests can
         # drive deterministic dated/delayed milestone scenarios.
         self._wall_now: Callable[[], datetime] = _resolve_wall_time_source(wall_time_source)
+        # Jitter draw for the transient-requeue backoff (task 3317 / PRD C3).
+        # NOT a clock: a ``(lo, hi) -> float`` uniform draw, the same seam
+        # ``fm_retry_backoffs``'s ``rng`` parameter exposes, so deterministic
+        # tests can inject a boundary function (``lambda lo, hi: hi``) and
+        # assert exact armed cooldowns instead of sampling a random band.
+        # Production leaves it None and gets ``random.uniform``.
+        self._jitter_source: Callable[[float, float], float] = (
+            jitter_source if jitter_source is not None else random.uniform
+        )
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
         # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
@@ -1924,6 +2072,22 @@ class Scheduler:
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
+        # ADDITIVE sibling of _requeue_until (task 3317 / PRD contract C3):
+        # per-task cooldown facts for the state snapshot's `requeue_cooldowns`
+        # key.  _requeue_until itself keeps its plain dict[str, float] shape —
+        # the two eligibility readers, the per-tick GC sweep and several tests
+        # all depend on that — so the operator-facing detail lives here rather
+        # than widening the deadline map's value type.
+        #
+        # Holds ONLY values FIXED AT ARMING.  Nothing may be derived from
+        # "now": _build_snapshot_payload content-dedups the snapshot to
+        # throttle disk writes, so a field recomputed per tick (a naive
+        # `remaining_secs`) would make every payload byte-different and defeat
+        # the throttle.  Written by `_arm_requeue_cooldown` (from `release`);
+        # popped in lockstep by `_gc_expired_cooldowns` so an entry can never
+        # outlive its deadline, and EARLIER by `clear_requeue_count` when the
+        # task reaches a terminal outcome and is no longer waiting to retry.
+        self._requeue_cooldown_meta: dict[str, dict] = {}
         # Per-task dispatch timestamps (monotonic) for the dispatch-cooldown
         # gate.  Set immediately after a successful dispatch; cleared when the
         # task transitions to a terminal status.  Process-local — an
@@ -1937,6 +2101,29 @@ class Scheduler:
         self._requeue_counts: dict[str, int] = {}
         self._transient_requeue_counts: dict[str, int] = {}
         self._requeue_history: dict[str, list[RequeueRecord]] = {}
+        # task_id -> the POST-INCREMENT transient requeue count of a requeue
+        # whose cooldown has not been armed yet (task 3317 / PRD contract C3,
+        # open question 1).  Written by ``record_requeue``'s transient route
+        # (route 2) and CONSUMED — popped unconditionally — by ``release``,
+        # which is its sole reader.
+        #
+        # WHY THE CUMULATIVE COUNTER ALONE IS INSUFFICIENT.
+        # ``record_requeue`` runs strictly before ``release`` for the same
+        # outcome (``Harness._run_slot``'s finally block calls
+        # ``_apply_retry_cap`` and then ``scheduler.release``), so
+        # ``_transient_requeue_counts[task_id]`` is already post-increment at
+        # arming time — but it is CUMULATIVE and cannot say whether THIS
+        # requeue was transient.  A task carrying 2 prior transient requeues
+        # that then requeues GENUINELY would read 2 and wrongly arm a 60s
+        # backoff, violating boundary row 4's "genuine requeue stays flat
+        # 30s".  The stamp supplies both halves at once: the ``n`` for the
+        # envelope AND the transient-vs-genuine discrimination.
+        #
+        # It is consume-once precisely so a stamp can never leak into a later
+        # flat arming: ``release`` pops it even when ``requeued=False`` (the
+        # cap-exhaust shape), and ``clear_requeue_count`` drops it alongside
+        # the counters.
+        self._pending_transient_cooldown: dict[str, int] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
         # Per-tier cap bookkeeping: remember the effective priority of every
@@ -4247,7 +4434,9 @@ class Scheduler:
             preserved, supplied keys overwrite wholesale.  This is the #4271
             fix: no-append callers (prd-tagger, module-tagger, auto-eval
             back-link) now preserve sibling keys like _causation_id and
-            memory_hints instead of silently clobbering them.
+            memory_hints instead of silently clobbering them.  Passing
+            ``'merge'`` together with ``append=True`` is a contradiction and
+            raises :class:`ValueError` — see the ``append`` parameter below.
             ``'additive'``: recursive list-union, dict-recursive, scalar
             OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
             ``'replace'``: whole-blob overwrite, delete-by-omission.  Also
@@ -4258,9 +4447,33 @@ class Scheduler:
             ``metadata_mode='replace'`` call to repair.
         append:
             Legacy shorthand kept for back-compat.  Resolved to
-            ``'additive'`` when ``True``.  Ignored when ``metadata_mode``
-            is set explicitly.  Precedence: metadata_mode > append > merge.
+            ``'additive'`` when ``True``.  Precedence: ``metadata_mode`` >
+            ``append`` > merge, with ONE carve-out: ``metadata_mode='merge'``
+            alongside ``append=True`` is **rejected** as a contradiction
+            rather than silently letting 'merge' win (see Raises).  The other
+            explicit/append combinations are honored unchanged —
+            ``('replace', True)`` stays 'replace' (the sanctioned destructive
+            co-signal) and ``('additive', True)`` stays 'additive' (both
+            signals agree).
+
+        Raises
+        ------
+        ValueError
+            If ``metadata_mode='merge'`` is passed alongside a truthy
+            ``append`` — see ``_reject_contradictory_metadata_mode``.
         """
+        # The contradictory-pair guard has to live HERE, client-side, and not be
+        # delegated downwards: because 'append' is deliberately never forwarded
+        # on the wire (see below), the pair can never reach the backend's
+        # _resolve_metadata_mode, so without this check every orchestrator
+        # caller would be permanently exempt from any backend-side rejection of
+        # it.  The condition and its message live in the module-level
+        # ``_reject_contradictory_metadata_mode`` (which carries the full
+        # rationale, the one-cell-narrowness carve-outs, and why the *append*
+        # test is truthiness rather than ``is True``) so the FakeMetadataBackend
+        # test double can call the SAME function instead of restating it and
+        # drifting.
+        _reject_contradictory_metadata_mode(metadata_mode, append)
         # Resolve mode: explicit metadata_mode wins; append=True → additive;
         # default → merge (the #4271 fix — NOT replace).
         # NEVER forward 'append' on the wire: append=False resolves to REPLACE
@@ -4616,6 +4829,11 @@ class Scheduler:
         for tid, deadline in list(self._requeue_until.items()):
             if deadline <= now:
                 del self._requeue_until[tid]
+                # Keep the snapshot meta in lockstep (task 3317) so a
+                # `requeue_cooldowns` entry can never outlive its deadline.
+                # `.pop(..., None)` because a deadline can be injected
+                # directly (tests) with no meta entry behind it.
+                self._requeue_cooldown_meta.pop(tid, None)
 
     def _deferred_watch_gated(self, task: dict) -> bool:
         """Return True when *task* must be withheld from dispatch as a
@@ -7214,6 +7432,13 @@ class Scheduler:
             )
             return None
 
+        # Tick clock starts HERE, not at the phase loop: the get_tasks preamble
+        # below is a real per-tick cost (an ~11.6MB MCP payload on this repo)
+        # and both early returns under it are ticks that happened.  Deliberately
+        # after the paused / warm-base-hard-down returns above, which are not
+        # dispatch attempts and would otherwise emit every idle_poll_secs for as
+        # long as the pause lasts.
+        tick_started = time.perf_counter()
         tasks = await self.get_tasks(
             statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True,
         )
@@ -7226,6 +7451,7 @@ class Scheduler:
             # during exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
+            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
             return None
         self._reset_fm_read_failure_streak()
         if not tasks:
@@ -7237,6 +7463,7 @@ class Scheduler:
             # eviction for a stranded park sits in the table indefinitely until
             # some active task happens to appear and trigger a normal tick.
             self._drain_park_eviction_requests({}, {})
+            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
             return None
 
         # Status + id indices, built once per tick.
@@ -7276,26 +7503,83 @@ class Scheduler:
         # each `_phase_<label>` method's own docstring rather than inline
         # here, since a generic loop has no single call site to hang
         # per-phase commentary off of.
-        for label in self._TICK_PHASE_ORDER:
-            r = await getattr(self, f'_phase_{label}')(ctx)
-            # Explicit check (not a bare `assert`) so the contract is still
-            # enforced under `python -O` (asserts stripped) — without it, a
-            # phase that forgets to return would fall through to
-            # `return r.assignment` on `None` and raise an opaque
-            # AttributeError instead of this descriptive error.
-            if not (r is _CONTINUE or isinstance(r, TickOutcome)):
-                raise RuntimeError(
-                    f'_phase_{label} returned {r!r} — every _phase_* method must '
-                    f'return _CONTINUE or a TickOutcome (did it forget a return?)'
-                )
-            if r is not _CONTINUE:
-                return r.assignment
-        return None
+        # Tick telemetry (see EventType.scheduler_tick): the loop below is the
+        # orchestrator's throughput constraint and was previously untimed, so a
+        # regression to ~14min/tick went unnoticed for months.  try/finally
+        # because the common exit is the short-circuit `return` mid-loop, not
+        # the fall-through.  `tick_started` was stamped before get_tasks above,
+        # so duration_ms covers the whole tick and not just the phases.
+        phase_ms: dict[str, int] = {}
+        terminal_phase: str | None = None
+        assignment: TaskAssignment | None = None
+        try:
+            for label in self._TICK_PHASE_ORDER:
+                phase_started = time.perf_counter()
+                try:
+                    r = await getattr(self, f'_phase_{label}')(ctx)
+                finally:
+                    phase_ms[label] = round(
+                        (time.perf_counter() - phase_started) * 1000
+                    )
+                # Explicit check (not a bare `assert`) so the contract is still
+                # enforced under `python -O` (asserts stripped) — without it, a
+                # phase that forgets to return would fall through to
+                # `return r.assignment` on `None` and raise an opaque
+                # AttributeError instead of this descriptive error.
+                if not (r is _CONTINUE or isinstance(r, TickOutcome)):
+                    raise RuntimeError(
+                        f'_phase_{label} returned {r!r} — every _phase_* method must '
+                        f'return _CONTINUE or a TickOutcome (did it forget a return?)'
+                    )
+                if r is not _CONTINUE:
+                    terminal_phase = label
+                    assignment = r.assignment
+                    return assignment
+            return None
+        finally:
+            self._emit_tick_telemetry(
+                ctx, tick_started, phase_ms, terminal_phase, assignment,
+            )
+
+    def _emit_tick_telemetry(
+        self,
+        ctx: TickContext | None,
+        tick_started: float,
+        phase_ms: dict[str, int],
+        terminal_phase: str | None,
+        assignment: TaskAssignment | None,
+    ) -> None:
+        """Emit one ``scheduler_tick`` event summarising the tick just finished.
+
+        Called from ``acquire_next``'s ``finally``, so it also runs for a tick
+        that raised, and from the two task-fetch early returns above the phase
+        loop — where *ctx* does not exist yet and ``terminal_phase`` carries the
+        pseudo-label (``'get_tasks_failed'`` / ``'no_active_tasks'``) naming why
+        the tick ended early.  Total-silent on any failure: telemetry must never
+        be able to break dispatch, which is the same PROPERTY-1 fail-open rule
+        the consult gates follow.
+        """
+        if self.event_store is None:
+            return
+        try:
+            candidates = ctx.candidates if ctx is not None else None
+            self.event_store.emit(
+                EventType.scheduler_tick,
+                task_id=assignment.task_id if assignment is not None else None,
+                data={
+                    'duration_ms': round((time.perf_counter() - tick_started) * 1000),
+                    'phases': phase_ms,
+                    'terminal_phase': terminal_phase,
+                    'candidates': len(candidates) if candidates is not None else None,
+                },
+            )
+        except Exception:
+            logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains eleven top-level keys:
+        Contains twelve top-level keys:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}}
         - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
@@ -7310,6 +7594,34 @@ class Scheduler:
           same way before matching against current_holders.
         - is_paused: bool — True when the scheduler is park-stop paused
         - pause_reason: str | None — human-readable reason, or None when not paused
+        - requeue_cooldowns: {task_id: {armed_secs, envelope_secs, transient,
+          transient_count, armed_at, expires_at}} — the per-task requeue
+          cooldown currently gating re-dispatch, as armed (task 3317 / PRD
+          contract C3).  ``armed_secs``
+          GROWS across successive transient (5xx) requeues — 30/60/120/240/480,
+          capped at 900 — and stays FLAT at ``requeue_cooldown_secs`` for a
+          genuine one; ``envelope_secs`` is the un-jittered ceiling the armed
+          value was drawn from (``armed`` always lies in
+          ``[envelope/2, envelope]``).  Entries appear at arming and are
+          dropped either by ``clear_requeue_count`` (the task reached a
+          terminal outcome — DONE, or blocked by cap exhaust) or by
+          ``_gc_expired_cooldowns`` once the deadline passes.  The key
+          therefore answers "which tasks are cooling, and for how long",
+          with ONE bounded imprecision: the GC runs once per tick from
+          ``acquire_next``, so an expired entry can linger until the next
+          tick.  Compare ``expires_at`` against now rather than treating
+          mere presence as proof a task is still cooling.
+          ``armed_at``/``expires_at`` are ISO-8601 WALL-clock strings —
+          restart-comparable and operator-readable, answering "when does this
+          task come back" — while the internal ``_requeue_until`` deadline
+          they describe stays MONOTONIC (no epoch relation, resets across a
+          process restart).  That is the same split ``_resolve_wall_time_source``
+          documents; a monotonic float alone is meaningless to a cross-process
+          reader.
+          NO wall-clock-relative "remaining" field is emitted, deliberately:
+          every value here is fixed at arming, because
+          ``_build_snapshot_payload`` content-dedups this snapshot to throttle
+          disk writes and a per-tick-recomputed field would defeat it.
         - snapshot_at: ISO8601 timestamp
         """
         # skip_counts — plain int values, safe to copy.
@@ -7374,6 +7686,11 @@ class Scheduler:
             'lock_depth': self.config.lock_depth,
             'is_paused': self.is_paused,
             'pause_reason': self.pause_reason,
+            # Per-entry copy — honours this method's deep-copy contract, so a
+            # caller mutating the returned dict cannot corrupt scheduler state.
+            'requeue_cooldowns': {
+                tid: dict(meta) for tid, meta in self._requeue_cooldown_meta.items()
+            },
             'snapshot_at': datetime.now(UTC).isoformat(),
         }
 
@@ -7809,14 +8126,136 @@ class Scheduler:
         self.release(task_id, requeued=True)
         return False
 
+    def _arm_requeue_cooldown(self, task_id: str, armed_n: int | None) -> None:
+        """Write *task_id*'s re-dispatch cooldown deadline and snapshot meta.
+
+        Extracted from :meth:`release` (task 3317 amend) for ONE reason: this
+        is the only fallible work in that method, and it runs BEFORE
+        ``lock_table.release``.  The pre-3317 arming was a single float add
+        that could not raise; it is now an exponential shift, an injectable
+        rng call, a wall-clock read and a ``timedelta`` construction.  An
+        exception escaping any of those would skip the lock-table release,
+        the reservation cleanup, ``_hold_history.forget`` and
+        ``_settle_backfill_grant`` — stranding the task's module locks with
+        no owner left to free them.  That is exactly the stuck-lock hazard
+        contract C5 / task 3818 exists to prevent
+        (``test_lock_release_single_writer_guard.py``), so this method is
+        TOTAL: it always arms something and never propagates.
+
+        *armed_n* is the consumed ``_pending_transient_cooldown`` stamp —
+        ``None`` for a genuine / unstamped requeue (flat cooldown), else the
+        post-increment transient count driving the jittered exponential.
+
+        On an unexpected failure it logs at ERROR with the full traceback and
+        the inputs, then falls back to the pre-3317 flat
+        ``requeue_cooldown_secs``.  That is a fail-soft, but a LOUD one, and
+        the alternative it replaces is a wedged module lock: a
+        too-short cooldown is recoverable on the next tick, a lock nobody
+        holds is not.  The fallback touches only a float add and an attribute
+        read — the same two operations the rest of the scheduler already
+        depends on — so it cannot itself raise where the caller could not.
+        """
+        try:
+            if armed_n is None:
+                cooldown = envelope = self.config.requeue_cooldown_secs
+            else:
+                cooldown, envelope = transient_requeue_cooldown(
+                    armed_n,
+                    base_secs=self.config.transient_requeue_backoff_base_secs,
+                    cap_secs=self.config.transient_requeue_backoff_cap_secs,
+                    rng=self._jitter_source,
+                )
+            # Operator-facing record of what was just armed.  JSON-native
+            # primitives ONLY (float/bool/int/str) and nothing derived from
+            # "now" — see the _requeue_cooldown_meta declaration for why.
+            #
+            # armed_at/expires_at are ISO-8601 STRINGS, never datetime
+            # objects: the production writer serialises with
+            # `json.dumps(state, default=str)`, which would silently
+            # stringify a datetime into a shape `read_scheduler_state`
+            # cannot round-trip — a loud TypeError is what the strings buy.
+            # The wall clock is read ONCE and expires_at derived from that
+            # same value, so `expires_at - armed_at` is exactly armed_secs;
+            # two _wall_now() calls would let the pair drift apart.
+            armed_at = self._wall_now()
+            meta = {
+                'armed_secs': round(cooldown, 3),
+                'envelope_secs': round(envelope, 3),
+                'transient': armed_n is not None,
+                'transient_count': armed_n or 0,
+                'armed_at': armed_at.isoformat(),
+                'expires_at': (armed_at + timedelta(seconds=cooldown)).isoformat(),
+            }
+        except Exception:
+            logger.exception(
+                'Task %s: transient requeue cooldown arming failed '
+                '(n=%r, base=%r, cap=%r) — falling back to the flat %.1fs '
+                'cooldown so the module locks below still release. '
+                'Check transient_requeue_backoff_{base,cap}_secs and '
+                'transient_requeue_cap.',
+                task_id,
+                armed_n,
+                self.config.transient_requeue_backoff_base_secs,
+                self.config.transient_requeue_backoff_cap_secs,
+                self.config.requeue_cooldown_secs,
+            )
+            cooldown = self.config.requeue_cooldown_secs
+            meta = None
+        self._requeue_until[task_id] = self._time_source() + cooldown
+        if meta is None:
+            # Drop rather than publish a half-built entry: `requeue_cooldowns`
+            # promises a fixed six-field JSON-native shape, and a partial one
+            # would be worse to read than an absent one.  The deadline above
+            # still gates re-dispatch, and `_gc_expired_cooldowns` tolerates a
+            # deadline with no meta behind it.
+            self._requeue_cooldown_meta.pop(task_id, None)
+        else:
+            self._requeue_cooldown_meta[task_id] = meta
+
     def release(self, task_id: str, *, requeued: bool = False) -> None:
-        """Release all module locks for a task and clear dispatch guard."""
+        """Release all module locks for a task and clear dispatch guard.
+
+        When *requeued*, this also arms the anti-hot-loop cooldown that gates
+        re-dispatch — and as of task 3317 (PRD contract C3) it arms ONE OF TWO
+        cooldowns, discriminated by the ``_pending_transient_cooldown`` stamp
+        ``record_requeue``'s transient route left behind:
+
+        - NO stamp — a GENUINE requeue, or an arming with no preceding
+          ``record_requeue`` at all (the blast-radius requeue above, and
+          ``arm_requeue_cooldown``).  Arms the FLAT
+          ``config.requeue_cooldown_secs``, exactly as before.
+        - A stamp — a TRANSIENT (server-side 5xx) requeue.  Arms
+          ``transient_requeue_cooldown(n)``: a jittered exponential drawn from
+          ``[envelope/2, envelope]`` where
+          ``envelope = min(config.transient_requeue_backoff_base_secs *
+          2**(n-1), config.transient_requeue_backoff_cap_secs)`` and ``n`` is
+          the stamped post-increment transient count.  A sustained provider
+          outage therefore backs a task off 30 → 60 → 120 → 240 → 480 → 900s
+          instead of retrying flat every 30s.
+
+        Both knobs are read from ``self.config`` HERE, at arm time, which is
+        what makes them green-tier hot-reloadable with no reload hook (see
+        ``RELOADABLE_FIELDS``); an already-armed deadline keeps its old window.
+
+        ``_requeue_until``'s value type is unchanged — a monotonic deadline
+        float — because the eligibility readers, the per-tick GC sweep and
+        several tests all depend on that shape.
+
+        The arming itself is delegated to :meth:`_arm_requeue_cooldown`, which
+        is TOTAL by construction: it is the only fallible work in this method
+        and it runs ahead of the lock-table release, so an exception escaping
+        it would strand this task's module locks.
+        """
         self._dispatched.discard(task_id)
         self._dispatched_priority.pop(task_id, None)
+        # Consume this task's pending transient-cooldown stamp (task 3317 /
+        # PRD contract C3).  UNCONDITIONAL and ahead of the `requeued` branch:
+        # the cap-exhaust path records a transient requeue and then releases
+        # with requeued=False, so a conditional pop would leave residue that
+        # leaked into whatever armed next.
+        armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
-            self._requeue_until[task_id] = (
-                self._time_source() + self.config.requeue_cooldown_secs
-            )
+            self._arm_requeue_cooldown(task_id, armed_n)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
@@ -8545,7 +8984,11 @@ class Scheduler:
         2. Transient API requeue (a server-side HTTP 5xx), classified by
            ``is_transient_api_requeue`` — routed to
            ``_transient_requeue_counts`` (feeds ``config.transient_requeue_cap``);
-           does NOT increment the genuine ``_requeue_counts``.  As of task
+           does NOT increment the genuine ``_requeue_counts``.  This route is
+           ALSO the sole writer of ``_pending_transient_cooldown[task_id]``
+           (task 3317 / PRD contract C3), the consume-once stamp carrying this
+           requeue's post-increment transient count to its arming; ``release``
+           is its sole reader and pops it unconditionally.  As of task
            3315 (PRD contract C2 / INV-1) this classification is FIELD-FIRST
            on the structured *api_error_status* threaded here from
            ``TerminalReport -> TaskReport``; the ``agent API error: HTTP <n>``
@@ -8572,6 +9015,10 @@ class Scheduler:
         elif is_transient_api_requeue(reason, api_error_status=api_error_status):
             t_count = self._transient_requeue_counts.get(task_id, 0) + 1
             self._transient_requeue_counts[task_id] = t_count
+            # Stamp the pending cooldown for THIS requeue (task 3317 / PRD C3).
+            # Route 2 only — routes 1 and 3 deliberately leave no stamp, so
+            # their arming stays flat.  Consumed by ``release``.
+            self._pending_transient_cooldown[task_id] = t_count
         else:
             g_count = self._requeue_counts.get(task_id, 0) + 1
             self._requeue_counts[task_id] = g_count
@@ -8609,6 +9056,29 @@ class Scheduler:
         self._requeue_counts.pop(task_id, None)
         self._transient_requeue_counts.pop(task_id, None)
         self._requeue_history.pop(task_id, None)
+        # Drop any un-armed cooldown stamp too (task 3317): it is keyed off a
+        # count that no longer exists, so leaving it would arm a backoff sized
+        # from a cleared history.
+        self._pending_transient_cooldown.pop(task_id, None)
+        # ...and the operator-facing snapshot entry for an ALREADY-armed
+        # cooldown (task 3317 amend).  Both callers are TERMINAL for the
+        # retry lane — DONE (task recovered) and cap-exhaust (task blocked,
+        # awaiting a human) — so the task is by definition no longer waiting
+        # to retry.  Pre-3317 the residue was invisible bookkeeping swept
+        # within 30s; with the backoff the stale window stretches to 900s, and
+        # `requeue_cooldowns` is now an operator-facing key whose entries read
+        # as "this task is waiting to retry" (with a future `expires_at`).
+        #
+        # `_requeue_until` is deliberately NOT popped here.  It gates
+        # DISPATCH, and dropping it would change behaviour: a task that
+        # transiently requeued, completed DONE and is later REOPENED would
+        # skip the remainder of its cooldown.  Leaving it is inert — the
+        # status gate in `_eligible_for_dispatch` already refuses a
+        # non-pending task, and `_gc_expired_cooldowns` sweeps it at the
+        # deadline.  Popping only the meta keeps the documented lockstep
+        # invariant (meta never OUTLIVES its deadline) strictly tighter, and
+        # the GC's `.pop(..., None)` already tolerates the gap.
+        self._requeue_cooldown_meta.pop(task_id, None)
 
     async def trigger_retry_cap_exhausted(
         self,

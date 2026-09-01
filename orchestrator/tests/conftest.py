@@ -56,6 +56,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
+    CLAIMANT_TTL_SECS,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -65,12 +66,16 @@ from _orch_helpers import (  # noqa: E402
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
+    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
 from orchestrator import merge_queue  # noqa: E402
+from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
     FusedMemoryConfig,
@@ -240,6 +245,27 @@ def repo_root() -> Path | None:
         if (parent / '.git').exists():
             return parent
     return None
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
+
+    Shared by ``test_roles_wait_pattern.py`` and
+    ``test_roles_background_warning.py`` (task 3747 — the two files were
+    forked from a common ancestor and carried byte-identical copies of this
+    fixture until they were consolidated here).
+    """
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
 
 
 @pytest.fixture(autouse=True)
@@ -1073,6 +1099,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Task 3540: harness._resume_repend_liveness feeds this straight into
+    # timedelta(seconds=...); a spec_set MagicMock attribute raises
+    # TypeError there. THIS is the single owner of the value for the suite —
+    # no test should re-pin it locally. Sourced from _orch_helpers so the
+    # knob and the fixture rows built by `claimant_row` (whose fresh/stale
+    # ages are 0.5x/2x this) can never drift apart.
+    config.claimant_liveness_ttl_secs = CLAIMANT_TTL_SECS
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

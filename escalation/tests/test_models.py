@@ -599,12 +599,26 @@ class TestEscalationResolutionClass:
         """RESOLUTION_CLASSES is a frozenset."""
         assert isinstance(RESOLUTION_CLASSES, frozenset)
 
-    def test_resolution_classes_contains_exactly_the_three_legal_values(self):
+    def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject'} — no extras. 'moot-terminal-subject' is the
-        distinct, non-benign stamp the task-2724 revalidation sweep writes."""
-        assert frozenset({'benign', 'actionable', 'moot-terminal-subject'}) == RESOLUTION_CLASSES
+        'moot-terminal-subject', 'stale-strand'} — no extras.
+
+        'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
+        revalidation sweep writes.
+
+        'stale-strand' (task 3172) is the distinguishable, NON-benign stamp the
+        startup restart dismissal (``EscalationQueue.dismiss_all_pending``)
+        writes for a level-0 escalation that had already been pending for
+        ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
+        task-2724 vocabulary rather than forking a second scheme, so a 20h
+        strand and a 90s restart artifact stop reading identically.
+        """
+        assert (
+            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            == RESOLUTION_CLASSES
+        )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES
+        assert 'stale-strand' in RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 
@@ -1473,3 +1487,186 @@ class TestSeverityRank:
         """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
         assert max_severity('warn', 'wat') == 'warn'
         assert max_severity('wat', 'warn') == 'wat'
+
+
+class TestEscalationRootCauseVariants:
+    """`root_cause_variants` / `root_cause_variants_truncated` — over-fold evidence (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold, so its failure
+    mode is OVER-folding: distinct causes silently merged under one canonical
+    key.  These fields are that failure's only observable signature — the
+    DISTINCT pre-canonical spellings an L2 has been addressed by.
+    `queue.add_members_to_l2` is the SOLE writer and sole trimmer, exactly as for
+    `amendments`, whose shape they mirror one-for-one.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='original one-line hypothesis',
+            root_cause='Watcher lease stolen.',
+            level=2,
+            **kwargs,
+        )
+
+    def test_variant_fields_default_empty_and_zero(self):
+        """(a) An L2 minted today carries no variants and no truncation."""
+        esc = self._seeded()
+
+        assert esc.root_cause_variants == [], (
+            f'expected an empty variant list, got {esc.root_cause_variants!r}'
+        )
+        assert esc.root_cause_variants_truncated == 0, (
+            f'expected 0, got {esc.root_cause_variants_truncated!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(b) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every L2 already on disk predates these fields, so a payload missing both
+        keys must hydrate to the defaults rather than raising.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['root_cause_variants']
+        del legacy['root_cause_variants_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.root_cause_variants == [], (
+            f'legacy record must default to []: {from_legacy.root_cause_variants!r}'
+        )
+        assert from_legacy.root_cause_variants_truncated == 0, (
+            f'legacy record must default to 0: {from_legacy.root_cause_variants_truncated!r}'
+        )
+
+    def test_variants_roundtrip_verbatim(self):
+        """(c) Both fields survive to_json -> from_json unchanged.
+
+        The TRUE distinct count is `len(root_cause_variants) +
+        root_cause_variants_truncated`, so the counter is as load-bearing as the
+        list — losing it would make the loss at the cap log-only (INV-8).
+        """
+        variants = ['Watcher lease stolen.', 'watcher  lease STOLEN', 'WATCHER-LEASE-STOLEN']
+        esc = self._seeded(root_cause_variants=variants, root_cause_variants_truncated=4)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.root_cause_variants == variants, (
+            f'variant spellings lost or reordered: {restored.root_cause_variants!r}'
+        )
+        assert restored.root_cause_variants_truncated == 4, (
+            f'truncation counter lost: {restored.root_cause_variants_truncated!r}'
+        )
+        assert len(restored.root_cause_variants) + restored.root_cause_variants_truncated == 7
+
+    def test_default_variant_list_is_not_shared_between_instances(self):
+        """The default_factory guard — a shared mutable default would cross-link records."""
+        a = self._seeded()
+        b = self._seeded()
+
+        a.root_cause_variants.append('a spelling')
+
+        assert b.root_cause_variants == [], (
+            'default root_cause_variants list is SHARED between instances — '
+            f'b saw {b.root_cause_variants!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded().to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.root_cause_variants == []
+
+
+class TestCitationShaAndRefileSuppressionFields:
+    """`citation_sha` / `refiles_suppressed` — the auto-dismiss triple (task 4499).
+
+    `citation_sha` is the evidence commit whose landing a
+    `provenance_unattributed` filing could not attribute.  Stamped at FILING
+    time, it survives onto the RESOLUTION, where it becomes the identity half
+    of the `(task_id, category, citation_sha)` triple that suppresses an
+    identical refile — closing the close-then-refile ping-pong an absorbing
+    reject condition otherwise drives forever.  `refiles_suppressed` is that
+    suppression's INV-4 storm counter: how many identical refiles this
+    record's resolution has absorbed, kept as a durable structured fact rather
+    than log-only (INV-2).
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-4499-1',
+            task_id='4499',
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='provenance_unattributed',
+            summary='landing evidence could not be attributed',
+            level=1,
+            **kwargs,
+        )
+
+    def test_citation_and_suppression_fields_default_to_none_and_zero(self):
+        """(a) A record minted today carries no citation and no absorbed refiles."""
+        esc = self._seeded()
+
+        assert esc.citation_sha is None, (
+            f'expected no citation identity, got {esc.citation_sha!r}'
+        )
+        assert esc.refiles_suppressed == 0, (
+            f'expected 0, got {esc.refiles_suppressed!r}'
+        )
+
+    def test_citation_and_counter_roundtrip_verbatim(self):
+        """(b) Both fields survive to_json -> from_json unchanged.
+
+        The suppression decision is made by re-reading the PERSISTED record, so
+        a field that did not round-trip would silently never suppress.
+        """
+        esc = self._seeded(citation_sha='b' * 40, refiles_suppressed=3)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.citation_sha == 'b' * 40, (
+            f'citation identity lost: {restored.citation_sha!r}'
+        )
+        assert restored.refiles_suppressed == 3, (
+            f'storm counter lost: {restored.refiles_suppressed!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(c) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every archived provenance record already on disk predates these fields,
+        so a payload missing both keys must hydrate to the defaults rather than
+        raising.  Those legacy records are exactly what the suppression lookup
+        scans, so a hydration failure here would break the reject path.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['citation_sha']
+        del legacy['refiles_suppressed']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.citation_sha is None, (
+            f'legacy record must default to None: {from_legacy.citation_sha!r}'
+        )
+        assert from_legacy.refiles_suppressed == 0, (
+            f'legacy record must default to 0: {from_legacy.refiles_suppressed!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded(citation_sha='b' * 40).to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.citation_sha == 'b' * 40

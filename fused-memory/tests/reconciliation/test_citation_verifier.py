@@ -16,7 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
+from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
+    STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
     build_citation_tombstone,
     find_citation_occurrences,
@@ -238,6 +240,242 @@ async def test_multiple_findings_processed_independently():
     assert stats['stage1_citations_verified'] == 1
     assert stats['stage1_phantom_citations_dropped'] == 1
     assert stats['stage1_citation_verification_errors'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# stat_prefix — the same pass serves all three stages (task 2979)
+# --------------------------------------------------------------------------- #
+#
+# Task 2979 hoists this pass out of ``MemoryConsolidator.run()`` and into the
+# shared ``BaseStage.run()`` assembly path, so Stage 2 (task_knowledge_sync) and
+# Stage 3 (integrity_check) get the same phantom-citation protection instead of
+# silently inheriting none. Each stage merges the returned stats into its own
+# flat ``report.stats``, so the three counters need a per-stage prefix.
+#
+# The parameter is DEFAULTED to 'stage1' on purpose: every existing Stage-1 key
+# name stays byte-identical, which is what keeps the ~18 pre-existing
+# ``stage1_``-key assertions (here, in test_stage1.py and in test_stages.py)
+# and the downstream stats consumers working untouched. Case (c) pins that
+# default so a future rename cannot silently break them.
+
+
+def _phantom_finding() -> dict[str, Any]:
+    """A finding citing one resolving mem0 id ('A') and one phantom ('B')."""
+    return {
+        'description': 'a finding',
+        'cited_memories': [
+            {'memory_id': 'A', 'store': 'mem0'},
+            {'memory_id': 'B', 'store': 'mem0'},
+        ],
+    }
+
+
+def _phantom_memory_service() -> AsyncMock:
+    """A memory service where 'A' resolves and everything else is a phantom."""
+
+    async def _get(project_id, memory_id):
+        if memory_id == 'A':
+            return {'id': 'A', 'content': 'x', 'metadata': {}}
+        return None
+
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(side_effect=_get)
+    return memory_service
+
+
+@pytest.mark.parametrize('prefix', ['stage2', 'stage3'])
+@pytest.mark.asyncio
+async def test_stat_prefix_renames_every_counter(prefix):
+    """``stat_prefix='stage2'``/``'stage3'`` emits exactly that stage's triple
+    and NO ``stage1_*`` key, with the keep/drop/mark behaviour unchanged."""
+    finding = _phantom_finding()
+    memory_service = _phantom_memory_service()
+
+    stats = await verify_cited_memories(
+        [finding], memory_service, 'test_project', stat_prefix=prefix,
+    )
+
+    # Exactly the three counters, all under the requested prefix.
+    assert stats == {
+        f'{prefix}_phantom_citations_dropped': 1,
+        f'{prefix}_citations_verified': 1,
+        f'{prefix}_citation_verification_errors': 0,
+    }
+    # No leakage of the default prefix into a non-default call.
+    assert not any(key.startswith('stage1_') for key in stats)
+
+    # Keep/drop/mark behaviour is identical to the default-prefix call.
+    assert [c['memory_id'] for c in finding['cited_memories']] == ['A']
+    assert finding['citation_failures'] == [
+        {'memory_id': 'B', 'store': 'mem0', 'reason': 'memory_not_found'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_default_stat_prefix_is_stage1():
+    """Omitting ``stat_prefix`` still returns EXACTLY the three ``stage1_*``
+    keys — the regression guard for every pre-existing Stage-1 assertion and
+    for ``report.stats``' downstream consumers."""
+    finding = _phantom_finding()
+    memory_service = _phantom_memory_service()
+
+    stats = await verify_cited_memories([finding], memory_service, 'test_project')
+
+    assert stats == {
+        'stage1_phantom_citations_dropped': 1,
+        'stage1_citations_verified': 1,
+        'stage1_citation_verification_errors': 0,
+    }
+
+    assert [c['memory_id'] for c in finding['cited_memories']] == ['A']
+    assert finding['citation_failures'] == [
+        {'memory_id': 'B', 'store': 'mem0', 'reason': 'memory_not_found'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stat_prefix_is_keyword_only():
+    """``stat_prefix`` is keyword-only, so a 4th positional argument cannot be
+    mistaken for it (the 3 positional params keep their existing meaning)."""
+    with pytest.raises(TypeError):
+        # Deliberately wrong arity: the 4th positional is what this test forbids.
+        await verify_cited_memories([], AsyncMock(), 'test_project', 'stage2')  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+async def test_stat_prefix_zero_stats_shape_on_the_no_citations_path():
+    """A citation-less finding still yields the full prefixed triple at zero —
+    the explicit-zero stats convention, preserved under a custom prefix."""
+    finding = {'description': 'a finding with no citations'}
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock()
+
+    stats = await verify_cited_memories(
+        [finding], memory_service, 'test_project', stat_prefix='stage3',
+    )
+
+    assert stats == {
+        'stage3_phantom_citations_dropped': 0,
+        'stage3_citations_verified': 0,
+        'stage3_citation_verification_errors': 0,
+    }
+    # Untouched-when-no-cited_memories still holds.
+    assert finding == {'description': 'a finding with no citations'}
+    memory_service.get_memory_by_id.assert_not_awaited()
+
+
+def test_stage_stat_prefix_covers_every_stage_id():
+    """``STAGE_STAT_PREFIX`` maps every ``StageId`` member to its stage number,
+    so ``BaseStage.run()``'s lookup can never miss a stage."""
+    expected = {
+        StageId.memory_consolidator: 'stage1',
+        StageId.task_knowledge_sync: 'stage2',
+        StageId.integrity_check: 'stage3',
+    }
+    assert expected == STAGE_STAT_PREFIX
+    assert set(STAGE_STAT_PREFIX) == set(StageId)
+
+
+# --------------------------------------------------------------------------- #
+# per-call lookup memoisation (task 2979 amendment)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_repeated_memory_id_is_resolved_once_per_call():
+    """A memory_id cited by N findings costs ONE get_memory_by_id, not N.
+
+    get_memory_by_id is a Qdrant point read on the stage's critical path, and
+    task 2979 put this pass on all three stages — so the repeat-citation case
+    got three times as common. The counters must stay per-CITATION though: they
+    count what the report claims, not how many round trips it took to check.
+    """
+    findings = [
+        {'description': f'finding {i}', 'cited_memories': [{'memory_id': 'm1', 'store': 'mem0'}]}
+        for i in range(3)
+    ]
+    # A fourth citation of the same id, this time alongside a distinct one.
+    findings.append(
+        {
+            'description': 'finding 3',
+            'cited_memories': [
+                {'memory_id': 'm1', 'store': 'mem0'},
+                {'memory_id': 'm2', 'store': 'mem0'},
+            ],
+        },
+    )
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(
+        side_effect=lambda _pid, mid: {'id': mid, 'content': 'x', 'metadata': {}},
+    )
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    resolved = [c.args[1] for c in memory_service.get_memory_by_id.await_args_list]
+    assert sorted(resolved) == ['m1', 'm2'], (
+        f'each distinct id must be resolved exactly once, got {resolved!r}'
+    )
+    # Counters follow the CITATIONS (4x m1 + 1x m2), not the 2 lookups.
+    assert stats['stage1_citations_verified'] == 5
+    assert stats['stage1_phantom_citations_dropped'] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_phantom_is_marked_on_every_finding_from_one_lookup():
+    """The memo must not swallow the MARKERS: a phantom cited by two findings
+    is looked up once and marked on both, so neither silently keeps it."""
+    findings = [
+        {
+            'description': 'first',
+            'cited_memories': [{'memory_id': 'gone', 'store': 'mem0'}],
+        },
+        {
+            'description': 'second',
+            'cited_memories': [{'memory_id': 'gone', 'store': 'mem0'}],
+        },
+    ]
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(return_value=None)
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    assert memory_service.get_memory_by_id.await_count == 1
+    for finding in findings:
+        assert finding['cited_memories'] == []
+        assert finding['citation_failures'] == [
+            {'memory_id': 'gone', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+    assert stats['stage1_phantom_citations_dropped'] == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_erroring_id_is_not_re_raised_per_citation():
+    """A backend error is memoised too — one failed lookup, the same marker on
+    every citation of that id, and the entries all KEPT (an error is 'unknown',
+    not 'absent'). Re-raising per citation only hammers a store that just
+    failed while producing the identical marker."""
+    findings = [
+        {'description': 'first', 'cited_memories': [{'memory_id': 'sick', 'store': 'mem0'}]},
+        {'description': 'second', 'cited_memories': [{'memory_id': 'sick', 'store': 'mem0'}]},
+    ]
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timeout'))
+
+    stats = await verify_cited_memories(findings, memory_service, 'test_project')
+
+    assert memory_service.get_memory_by_id.await_count == 1
+    for finding in findings:
+        assert finding['cited_memories'] == [{'memory_id': 'sick', 'store': 'mem0'}]
+        assert finding['citation_failures'] == [
+            {
+                'memory_id': 'sick',
+                'store': 'mem0',
+                'reason': 'verification_error',
+                'error_type': 'TimeoutError',
+            },
+        ]
+    assert stats['stage1_citation_verification_errors'] == 2
+    assert stats['stage1_phantom_citations_dropped'] == 0
 
 
 # --------------------------------------------------------------------------- #

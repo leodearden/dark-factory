@@ -1,0 +1,332 @@
+verify.sh: DF_VERIFY_ROLE=merge — forcing --scope all (integrity gate never narrows, contract C2)
+verify.sh: + ./scripts/check-infra-classification-manifest.sh
+verify.sh: + ./scripts/check-harness-baseline-registration.sh --from-git
+HARNESS_BASELINE_REG PASS 
+HARNESS_BASELINE_REG SUMMARY added=1 violations=0
+verify.sh: + ./scripts/check-manifold-deps.sh
+verify.sh: + ./scripts/tree-sitter-generate.sh
+tree-sitter: up to date (grammar.js unchanged)
+
+--- Running: test_lane_x_flock.sh ---
+=== test_lane_x_flock.sh: lib_lane_x_flock.sh mechanism tests ===
+
+--- Test 1: lib file exists ---
+  PASS: lib file exists at scripts/lib_lane_x_flock.sh
+
+--- Test 2: lib is executable ---
+  PASS: lib is executable
+
+--- Test 3: lib has correct shebang ---
+  PASS: first line is #!/usr/bin/env bash
+
+--- Test 4: lib is sourceable without side effects and defines acquire+release ---
+  PASS: sourceable: defines lane_x_flock_acquire, lane_x_flock_release
+
+--- Test 6: lib is sourceable and defines lane_x_flock_run ---
+  PASS: sourceable: defines lane_x_flock_run
+
+--- Test 7: lib contains 'set -euo pipefail' (inside the main-guard) ---
+  PASS: lib contains 'set -euo pipefail'
+
+--- Test 8: direct-exec wrapper runs the command and exits 0 ---
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.u8nQYGlN5X) after 0s
+  PASS: Test 8: direct-exec wrapper exits 0 (got 0)
+  PASS: Test 8: direct-exec wrapper runs the command (stdout contains 'ran')
+
+--- Test 9: exit-code propagated through the wrapper ---
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.dSBa83KRvd) after 0s
+  PASS: Test 9: exit code 42 propagated through wrapper (got 42)
+
+--- Test 10: lock released after wrapper exits (slot-1 re-lockable) ---
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.AzMeJ8mGnP) after 0s
+  PASS: Test 10: wrapper exits 0 (got 0)
+  PASS: Test 10: slot-1 lock released after wrapper exit (re-lockable)
+
+--- Test 11: wrapper closes fd 9 on child; surviving daemons do not leak the slot lock ---
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.BCE0lFVZHg) after 0s
+  PASS: Test 11: detached daemon is still alive after wrapper exits (pid=544739)
+  PASS: Test 11: slot-1 lock released after wrapper exit despite surviving daemon (fd 9 not inherited)
+  PASS: Test 11: wrapper exited 0 on successful spawn (got 0)
+
+--- Test 12: WAIT=0 with slot held exits 75 fast, does not run the command, and diagnoses on stderr ---
+  PASS: Test 12a: WAIT=0 with slot held exits 75 well within the timeout (got 75)
+  PASS: Test 12b: WAIT=0 did NOT run the command (stdout lacks SHOULD_NOT_RUN)
+  PASS: Test 12c: stderr contains an 'acquire' diagnostic (case-insensitive)
+  PASS: Test 12d: stderr contains a 'Lane-X' diagnostic (case-insensitive)
+
+--- Test 13: default (WAIT unset) is also fail-fast (does not block) ---
+lib_lane_x_flock.sh: failed to acquire Lane-X lock within 0s (LOCK=/tmp/tmp.gt3JgYzyGW)
+  PASS: Test 13: default WAIT is fail-fast, exits 75 under timeout 5 (got 75)
+
+--- Test 14: WAIT=unlimited serializes two concurrent invocations, both exit 0 ---
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.Vm3txiLpOg) after 0s
+lib_lane_x_flock.sh: acquired Lane-X lock (LOCK=/tmp/tmp.Vm3txiLpOg) after 1s
+  PASS: Test 14a: two WAIT=unlimited 1.0s invocations run serially (elapsed >= 1800ms, got 2564ms)
+  PASS: Test 14b: first invocation exits 0 (got 0)
+  PASS: Test 14c: second (queued) invocation exits 0 (got 0)
+
+--- Test 15: finite WAIT=1 with slot held exits 75 after the finite budget ---
+lib_lane_x_flock.sh: failed to acquire Lane-X lock within 1s (LOCK=/tmp/tmp.lgYIoAIqOb)
+  PASS: Test 15: finite WAIT=1 with held slot exits 75 (EX_TEMPFAIL; got 75)
+
+--- Test 16: REIFY_LANE_X_FLOCK_WAIT=abc exits 64 with a validation diagnostic (non-integer) ---
+  PASS: Test 16a: WAIT=abc exits 64 (got 64)
+  PASS: Test 16b: WAIT=abc emits a validation diagnostic on stderr
+
+--- Test 17: REIFY_LANE_X_FLOCK_DISABLE=1 bypasses lock acquisition (marker on stderr) ---
+  PASS: Test 17a: DISABLE=1 exits 0 (got 0)
+  PASS: Test 17b: DISABLE=1 still runs the command (stdout contains 'ran')
+  PASS: Test 17c: DISABLE=1 emits the disabled(REIFY_LANE_X_FLOCK_DISABLE=1) marker on stderr
+
+--- Test 18: DISABLE=1 does not acquire a slot — two concurrent invocations do not serialize ---
+lib_lane_x_flock.sh: disabled (REIFY_LANE_X_FLOCK_DISABLE=1) — no lock acquired
+lib_lane_x_flock.sh: disabled (REIFY_LANE_X_FLOCK_DISABLE=1) — no lock acquired
+  PASS: Test 18a: two DISABLE=1 1.0s invocations run concurrently, not serially (elapsed < 1500ms, got 1156ms)
+  PASS: Test 18b: first invocation exits 0 (got 0)
+  PASS: Test 18c: second invocation exits 0 (got 0)
+
+--- Test 19: lock-parent directory does not exist exits 1 with a diagnostic ---
+  PASS: Test 19a: nonexistent lock-parent dir exits 1 (got 1)
+  PASS: Test 19b: stderr mentions the parent directory diagnostic
+
+--- Test 20: lock-parent directory not writable exits 1 with a diagnostic ---
+  PASS: Test 20a: non-writable lock-parent dir exits 1 (got 1)
+  PASS: Test 20b: stderr mentions the parent directory diagnostic
+
+Results: 35 passed, 0 failed
+  RESULT: PASS (test_lane_x_flock.sh)
+
+--- Running: test_reify_audit_ptodo.sh ---
+--- attempt 1 (serial) ---
+=== PTODO detector infra gate ===
+  PASS: ratchet regression diagnostic names the offending fingerprints (4636 actionability)
+  PASS: ratchet check is silent + rc0 when live set is empty
+
+--- (a) Ratchet: live fingerprints subset of committed baseline ---
+  FAIL: live fingerprints are a subset of committed baseline (no ratchet regression)
+  ---- assert: captured output (tail -50) ----
+  | RATCHET REGRESSION — 1 live fingerprint(s) NOT in committed baseline:
+  |   + crates/reify-eval/src/geometry_ops.rs :: phantom-tracking :: // `start_angle`/`end_angle` are angles (PRD 3's scope, tracked separately)
+  ---- assert: end captured output ----
+
+--- (b) Scenario 13: hermetic fixture detects fresh untracked marker ---
+  PASS: fixture live output contains an ':: untracked ::' line for src/fresh.rs
+  PASS: fixture live fingerprints are NOT in empty baseline (gate fires red)
+
+--- (c) Exit-code hard gate: untracked → High → non-zero exit ---
+  PASS: (c-dirty) precondition: $FIX set and src/fresh.rs git-tracked
+  PASS: (c-dirty) untracked marker → reify-audit exits 1 (exactly 1 High finding)
+  PASS: (c-clean) no markers → reify-audit exits 0
+@@HARDGATE_C_PASSED@@
+
+--- (d) Orphaned-cite hard gate: done-task cite → orphaned → High → non-zero exit ---
+  PASS: (d-orphan) orphaned cite (#4444) → done-task → reify-audit exits 1 (exactly 1 High)
+  PASS: (d-control) pending-task cite → live cite → reify-audit exits 0
+@@HARDGATE_D_PASSED@@
+
+--- (e) G-allow orphaned hard gate: done-task owner-cite → High → non-zero exit ---
+  PASS: (e-orphan) G-allow owner-cite (#5555) → done-task → g-allow-orphaned High → reify-audit exits 1
+  PASS: (e-control) pending-task G-allow owner-cite → live cite → reify-audit exits 0
+@@HARDGATE_E_PASSED@@
+
+Results: 11 passed, 1 failed
+--- attempt 2 (serial retry) ---
+=== PTODO detector infra gate ===
+  PASS: ratchet regression diagnostic names the offending fingerprints (4636 actionability)
+  PASS: ratchet check is silent + rc0 when live set is empty
+
+--- (a) Ratchet: live fingerprints subset of committed baseline ---
+  FAIL: live fingerprints are a subset of committed baseline (no ratchet regression)
+  ---- assert: captured output (tail -50) ----
+  | RATCHET REGRESSION — 1 live fingerprint(s) NOT in committed baseline:
+  |   + crates/reify-eval/src/geometry_ops.rs :: phantom-tracking :: // `start_angle`/`end_angle` are angles (PRD 3's scope, tracked separately)
+  ---- assert: end captured output ----
+
+--- (b) Scenario 13: hermetic fixture detects fresh untracked marker ---
+  PASS: fixture live output contains an ':: untracked ::' line for src/fresh.rs
+  PASS: fixture live fingerprints are NOT in empty baseline (gate fires red)
+
+--- (c) Exit-code hard gate: untracked → High → non-zero exit ---
+  PASS: (c-dirty) precondition: $FIX set and src/fresh.rs git-tracked
+  PASS: (c-dirty) untracked marker → reify-audit exits 1 (exactly 1 High finding)
+  PASS: (c-clean) no markers → reify-audit exits 0
+@@HARDGATE_C_PASSED@@
+
+--- (d) Orphaned-cite hard gate: done-task cite → orphaned → High → non-zero exit ---
+  PASS: (d-orphan) orphaned cite (#4444) → done-task → reify-audit exits 1 (exactly 1 High)
+  PASS: (d-control) pending-task cite → live cite → reify-audit exits 0
+@@HARDGATE_D_PASSED@@
+
+--- (e) G-allow orphaned hard gate: done-task owner-cite → High → non-zero exit ---
+  PASS: (e-orphan) G-allow owner-cite (#5555) → done-task → g-allow-orphaned High → reify-audit exits 1
+  PASS: (e-control) pending-task G-allow owner-cite → live cite → reify-audit exits 0
+@@HARDGATE_E_PASSED@@
+
+Results: 11 passed, 1 failed
+  RESULT: FAIL (test_reify_audit_ptodo.sh)
+
+--- Running: test_test_run_semaphore.sh ---
+=== test_test_run_semaphore.sh: lib_test_semaphore.sh mechanism tests ===
+
+--- Test 1: lib file exists ---
+  PASS: lib file exists at scripts/lib_test_semaphore.sh
+
+--- Test 2: lib is executable ---
+  PASS: lib is executable
+
+--- Test 3: lib has correct shebang ---
+  PASS: first line is #!/usr/bin/env bash
+
+--- Test 4: lib contains set -euo pipefail ---
+  PASS: lib contains 'set -euo pipefail'
+
+--- Test 5: lib is sourceable without side effects and defines all three functions ---
+  PASS: sourceable: defines test_semaphore_acquire, test_semaphore_release, test_semaphore_run
+
+--- Test 6: two concurrent role=task N=1 runs serialize (elapsed >= 700ms) ---
+  PASS: two 0.4s sleep invocations run serially (elapsed >= 700ms, got 1024ms)
+
+--- Test 7: exit-code propagated through the wrapper ---
+lib_test_semaphore.sh: acquired test slot (slot 1/1) after 1s (LOCK=/tmp/tmp.M6Kn1buuH6)
+  PASS: exit code 42 propagated through wrapper (got 42)
+
+--- Test 9: role=merge bypass noted in stderr ---
+  PASS: Test 9: merge bypass is noted in stderr (grep merge|exempt|bypass)
+  PASS: Test 9: role=merge exits 0 (bypass, no command failure; got 0)
+
+--- Test 10: role=task WAIT=1 with slot held → exit 75 within budget ---
+  PASS: Test 10: exits 75 (EX_TEMPFAIL) when WAIT budget exhausted (got 75)
+
+--- Test 11: exit-75 stderr mentions 'acquire' and wait duration (1s) ---
+  PASS: Test 11: stderr mentions 'acquire' and lock-wait duration (1s)
+  PASS: Test 11: exits 75 (EX_TEMPFAIL; got 75)
+
+--- Test 12: REIFY_TEST_SEMAPHORE_DISABLE=1 bypasses slot acquisition (marker on stderr) ---
+  PASS: Test 12: DISABLE=1 exits 0 (got 0)
+  PASS: Test 12: DISABLE=1 still runs the command (stdout contains 'ran')
+  PASS: Test 12: DISABLE=1 emits the disabled(REIFY_TEST_SEMAPHORE_DISABLE=1) marker on stderr
+
+--- Test 13: wrapper closes fd 9 on child; surviving daemons do not leak the slot lock ---
+lib_test_semaphore.sh: acquired test slot (slot 1/1) after 0s (LOCK=/tmp/tmp.ulT3g5lukR)
+  PASS: Test 13: detached daemon is still alive after wrapper exits (pid=613523)
+  PASS: Test 13: slot-1 lock released after wrapper exit despite surviving daemon (fd 9 not inherited)
+  PASS: Test 13: wrapper exited 0 on successful spawn (got 0)
+
+--- Test 14: REIFY_TEST_SEMAPHORE_CONCURRENCY=abc exits 64 (non-integer) ---
+lib_test_semaphore.sh: REIFY_TEST_SEMAPHORE_CONCURRENCY must be a positive integer (got 'abc')
+  PASS: Test 14: CONCURRENCY=abc exits 64 (got 64)
+
+--- Test 15: REIFY_TEST_SEMAPHORE_CONCURRENCY=0 exits 64 (less than 1) ---
+lib_test_semaphore.sh: REIFY_TEST_SEMAPHORE_CONCURRENCY must be >= 1 (got '0')
+  PASS: Test 15: CONCURRENCY=0 exits 64 (got 64)
+
+--- Test 16: REIFY_TEST_SEMAPHORE_WAIT=x exits 64 (non-integer) ---
+lib_test_semaphore.sh: REIFY_TEST_SEMAPHORE_WAIT must be a non-negative integer or 'unlimited' (got 'x')
+  PASS: Test 16: WAIT=x exits 64 (got 64)
+
+--- Test 17: non-existent LOCK parent dir exits 1 with a stderr diagnostic ---
+  PASS: Test 17: non-existent LOCK parent exits 1 (got 1)
+  PASS: Test 17: non-existent LOCK parent emits a 'lock parent' diagnostic on stderr
+
+--- Test T18: WAIT=unlimited with free slot exits 0 (not 64/75) ---
+  PASS: Test T18: WAIT=unlimited with free slot exits 0 (not 64 non-integer; got 0)
+
+--- Test T19: WAIT=unlimited queues behind 2s holder, exits 0, emits STOP/HEARTBEAT/START ---
+  PASS: Test T19a: WAIT=unlimited exits 0 (queued-then-ran, not 75; got 0)
+  PASS: Test T19b: elapsed >= 1500ms (was blocked by 2s holder; got 2186ms)
+  PASS: Test T19c: stderr contains @@REIFY_QUOTED_CLOCK_STOP@@ reason=test_slot_starvation
+  PASS: Test T19d: stderr contains @@REIFY_QUOTED_CLOCK_START@@
+  PASS: Test T19e: stderr contains @@REIFY_QUOTED_CLOCK_HEARTBEAT@@ (HEARTBEAT_SECS=1 + 2s hold)
+
+--- Test T20: finite WAIT=1 with held slot exits 75 AND emits @@REIFY_QUOTED_CLOCK_STOP@@ ---
+  PASS: Test T20a: finite WAIT=1 exits 75 (EX_TEMPFAIL; got 75)
+  PASS: Test T20b: stderr contains @@REIFY_QUOTED_CLOCK_STOP@@ (entered the wait before deadline)
+
+--- Test T21: balance — uncontended acquire (free slot) emits NO @@REIFY_QUOTED_CLOCK_STOP@@ ---
+  PASS: Test T21a: uncontended WAIT=unlimited exits 0 (got 0)
+  PASS: Test T21b: uncontended acquire emits NO @@REIFY_QUOTED_CLOCK_STOP@@ (fast path is silent)
+
+--- Test CS-1: lib_clock_stop.sh exists, is sourceable, and defines all emitter functions ---
+  PASS: Test CS-1a: lib_clock_stop.sh exists at scripts/lib_clock_stop.sh
+  PASS: Test CS-1b: lib_clock_stop.sh is sourceable and defines clock_emit_stop, clock_emit_heartbeat, clock_emit_start
+
+--- Test CS-2: clock_emit_stop emits exact grammar @@REIFY_QUOTED_CLOCK_STOP@@ reason=... pid=... to stderr ---
+  PASS: Test CS-2a: clock_emit_stop stderr contains @@REIFY_QUOTED_CLOCK_STOP@@
+  PASS: Test CS-2b: clock_emit_stop stderr contains reason=test_slot_starvation
+  PASS: Test CS-2c: clock_emit_stop stderr contains pid=<digits>
+  PASS: Test CS-2d: clock_emit_stop full line matches exact grammar: @@REIFY_QUOTED_CLOCK_STOP@@ reason=test_slot_starvation pid=<digits>
+
+--- Test CS-3: clock_emit_heartbeat emits exact grammar @@REIFY_QUOTED_CLOCK_HEARTBEAT@@ reason=... waited=... to stderr ---
+  PASS: Test CS-3a: clock_emit_heartbeat stderr contains @@REIFY_QUOTED_CLOCK_HEARTBEAT@@
+  PASS: Test CS-3b: clock_emit_heartbeat stderr contains reason=test_slot_starvation
+  PASS: Test CS-3c: clock_emit_heartbeat stderr contains waited=42
+  PASS: Test CS-3d: clock_emit_heartbeat full line matches exact grammar: @@REIFY_QUOTED_CLOCK_HEARTBEAT@@ reason=test_slot_starvation waited=42
+
+--- Test CS-4: clock_emit_start emits exact grammar @@REIFY_QUOTED_CLOCK_START@@ reason=... waited=... to stderr ---
+  PASS: Test CS-4a: clock_emit_start stderr contains @@REIFY_QUOTED_CLOCK_START@@
+  PASS: Test CS-4b: clock_emit_start stderr contains reason=test_slot_starvation
+  PASS: Test CS-4c: clock_emit_start stderr contains waited=7
+  PASS: Test CS-4d: clock_emit_start full line matches exact grammar: @@REIFY_QUOTED_CLOCK_START@@ reason=test_slot_starvation waited=7
+
+--- Test CS-5: reason= arg is passed through to each emitter (psi_pressure variant) ---
+  PASS: Test CS-5a: clock_emit_stop(psi_pressure) full line matches grammar
+  PASS: Test CS-5b: clock_emit_heartbeat(psi_pressure) full line matches grammar
+  PASS: Test CS-5c: clock_emit_start(psi_pressure) full line matches grammar
+
+--- Test CD-1: clock_maybe_heartbeat — existence, EMIT path, THROTTLE no-op, EMPTY-reason no-op ---
+  PASS: Test CD-1a: clock_maybe_heartbeat is defined in lib_clock_stop.sh
+  PASS: Test CD-1b: clock_maybe_heartbeat EMIT — stderr matches @@REIFY_QUOTED_CLOCK_HEARTBEAT@@ reason=test_reason waited=[0-9]+
+  PASS: Test CD-1c: clock_maybe_heartbeat EMIT — LAST_HB_VAR updated to non-zero epoch
+  PASS: Test CD-1d: clock_maybe_heartbeat THROTTLE no-op — no heartbeat when last_hb is recent
+  PASS: Test CD-1e: clock_maybe_heartbeat EMPTY reason — no @@REIFY_QUOTED_CLOCK_*@@ output
+
+--- Test CD-2: clock_enter_wait — existence, first-entry STOP+vars, already-waiting silent, empty-reason silent ---
+  PASS: Test CD-2a: clock_enter_wait is defined in lib_clock_stop.sh
+  PASS: Test CD-2b: clock_enter_wait first-entry — emits @@REIFY_QUOTED_CLOCK_STOP@@ reason=test_reason pid=[0-9]+
+  PASS: Test CD-2c: clock_enter_wait first-entry — WAITED_VAR set to 1 (got '1')
+  PASS: Test CD-2d: clock_enter_wait first-entry — LAST_HB_VAR updated to non-zero epoch
+  PASS: Test CD-2e-stop: clock_enter_wait already-waiting (WAITED=1) — NO STOP emitted
+  PASS: Test CD-2e-var: clock_enter_wait already-waiting — WAITED_VAR stays 1
+  PASS: Test CD-2f-stop: clock_enter_wait empty reason — NO STOP emitted
+  PASS: Test CD-2f-var: clock_enter_wait empty reason — WAITED_VAR still set to 1
+
+--- Test CD-3: clock_exit_wait — existence, waited=1 emits START, waited=0 silent, empty-reason silent ---
+  PASS: Test CD-3a: clock_exit_wait is defined in lib_clock_stop.sh
+  PASS: Test CD-3b: clock_exit_wait waited=1 — emits @@REIFY_QUOTED_CLOCK_START@@ reason=test_reason waited=42
+  PASS: Test CD-3c: clock_exit_wait waited=0 — NO START emitted
+  PASS: Test CD-3d: clock_exit_wait empty reason — NO START emitted
+
+--- Test CD-4: integration — slot_acquire emits balanced STOP→START via helper wiring ---
+  PASS: Test CD-4a: contended slot_acquire exits 0 (helper wiring intact; got 0)
+  PASS: Test CD-4b: stderr contains @@REIFY_QUOTED_CLOCK_STOP@@ (clock_enter_wait wired in slot_acquire)
+  PASS: Test CD-4c: stderr contains @@REIFY_QUOTED_CLOCK_START@@ (clock_exit_wait wired — STOP/START balanced)
+
+--- Test CE-1: clock_now_epoch — existence + assigns a plausible current epoch ---
+  PASS: Test CE-1a: clock_now_epoch is defined in lib_clock_stop.sh
+  PASS: Test CE-1b: clock_now_epoch assigns an all-digits value (got '1786279467')
+  PASS: Test CE-1c: clock_now_epoch value is a plausible current epoch (>= 1700000000; got '1786279467')
+
+--- Test CE-2: slot_acquire N=1 contended poll loop forks ZERO date/shuf calls ---
+  PASS: Test CE-2a: finite WAIT=2 contended acquire exits 75 (got 75)
+  PASS: Test CE-2b: poll loop forks ZERO date calls (got 0)
+  PASS: Test CE-2c: poll loop forks ZERO shuf calls at N=1 (got 0)
+
+--- Test HG-1: host-global default lock is TMPDIR-independent ---
+  PASS: Test HG-1a: _test_semaphore_default_lock is defined
+  PASS: Test HG-1b: with a private non-/tmp TMPDIR exported, _test_semaphore_default_lock prints '/tmp/reify-test-semaphore-1000.lock' (got '/tmp/reify-test-semaphore-1000.lock')
+
+--- Test HG-2: test_semaphore_acquire's default-LOCK wiring is TMPDIR-independent (not just the resolver in isolation) ---
+  PASS: Test HG-2: test_semaphore_acquire's own LOCK= diagnostic resolves to the fixed default (/tmp/reify-test-semaphore-1000.lock), not the private TMPDIR (stderr: @@REIFY_QUOTED_CLOCK_STOP@@ reason=test_slot_starvation pid=627861
+lib_test_semaphore.sh: failed to acquire test slot within 0s (LOCK=/tmp/reify-test-semaphore-1000.lock, N=1))
+
+Results: 79 passed, 0 failed
+  RESULT: PASS (test_test_run_semaphore.sh)
+  RESULT: PASS (test_warm_lane_sizing_lifecycle.sh)
+
+=== Summary: 145 discovered, 1 failed ===
+=== FAILED: test_reify_audit_ptodo.sh ===
+FAILED test_reify_audit_ptodo.sh
+--- FAILED-DETAIL: test_reify_audit_ptodo.sh ---
+  FAIL: live fingerprints are a subset of committed baseline (no ratchet regression)
+--- END FAILED-DETAIL: test_reify_audit_ptodo.sh ---
+verify.sh: FAILED (exit 1): if test -f tests/infra/run_all.sh; then REIFY_AUDIT_NO_COLD_BUILD=1 REIFY_RUN_ALL_EXCLUDE_HOST_INFRA=1 REIFY_RUN_ALL_CONTENT_SKIP=1 timeout --kill-after=60 30m bash tests/infra/run_all.sh 2>&1; fi

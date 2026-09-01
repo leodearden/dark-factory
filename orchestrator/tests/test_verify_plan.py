@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from _verify_config_corpus import (
@@ -30,6 +31,7 @@ from _verify_config_corpus import (
 )
 
 from orchestrator import verify
+from orchestrator import verify_plan as verify_plan_module
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import (
     ToolKind,
@@ -49,6 +51,7 @@ from orchestrator.verify_plan import (
     _scope_prefix_to_keyword,
     classify_file,
     derive_verify_plan,
+    effective_merge_module_configs,
     reverse_dependent_test_targets,
 )
 
@@ -2480,3 +2483,256 @@ class TestPlanRecordScopedTargets:
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
+
+
+class TestEffectiveMergeModuleConfigs:
+    """``effective_merge_module_configs(config, module_configs)`` — the ONE
+    resolution of "which modules does a MERGE-role verify actually cover?"
+
+    Flake-ledger PRD §8.2 / task 3787 (γ). Before this helper the answer was
+    reimplemented inline at two sites inside ``run_scoped_verification``, each
+    rebinding a LOCAL that never propagated out — so the merge-flake
+    suppression gate (and the wire spec the remote reconstructs from) still saw
+    the TASK's own modules while the run itself executed the full registry.
+    This class pins the helper's contract so both consumers can be pointed at
+    it (steps 3-8) instead of at a second copy of the expression (INV-5).
+    """
+
+    @staticmethod
+    def _mc(prefix: str) -> ModuleConfig:
+        return ModuleConfig(
+            prefix=prefix,
+            test_command=f'uv run --directory {prefix} pytest tests/',
+            lint_command=f'uv run --directory {prefix} ruff check src/',
+            type_check_command=f'uv run --directory {prefix} pyright src/',
+        )
+
+    @classmethod
+    def _registry_config(
+        cls,
+        breadth: Literal['scoped', 'full'],
+        registry: dict[str, ModuleConfig] | None,
+    ) -> OrchestratorConfig:
+        """A REAL OrchestratorConfig (never a bare MagicMock — the
+        ``check_bare_magicmock_config`` lint gate) with ``_module_configs`` set
+        via the same private attr ``load_config`` populates.
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), merge_verify_breadth=breadth)
+        if registry is not None:
+            config._module_configs = registry
+        return config
+
+    # -- (a) breadth='full' + non-empty registry: the WHOLE registry ----------
+
+    def test_full_breadth_returns_entire_registry_not_the_passed_subset(self):
+        """(a) The passed set is the TASK's modules; at breadth='full' the merge
+        verify covers every REGISTERED module, so that is what comes back —
+        in registry iteration order, and as the very ModuleConfig objects the
+        registry holds (never copies or re-derivations).
+        """
+        mc_a, mc_b, mc_g = self._mc('alpha'), self._mc('beta'), self._mc('gamma')
+        config = self._registry_config('full', {'alpha': mc_a, 'beta': mc_b, 'gamma': mc_g})
+
+        result = effective_merge_module_configs(config, [mc_a])
+
+        assert [m.prefix for m in result] == ['alpha', 'beta', 'gamma']
+        # Identity, not just equality: the helper hands back the registry's own
+        # objects, so a consumer comparing by `is` (or mutating a field) sees
+        # the same config the rest of the run does.
+        assert result[0] is mc_a
+        assert result[1] is mc_b
+        assert result[2] is mc_g
+
+    # -- (b) breadth='full' + EMPTY registry: safe degrade, never [] ----------
+
+    @pytest.mark.parametrize('registry', [None, {}], ids=['none-sentinel', 'empty-dict'])
+    def test_full_breadth_empty_registry_falls_back_to_passed_set(self, registry):
+        """(b) An empty registry must degrade to the PASSED set, not to ``[]``.
+
+        Returning ``[]`` here would silently verify NOTHING at the very breadth
+        that exists to verify everything — the loudest possible fail-soft. Both
+        empty shapes are covered: the ``None`` sentinel (``_module_configs``
+        left at its default, which is how every directly-constructed config and
+        most of this suite looks) and an explicit ``{}``.
+        """
+        mc_a = self._mc('alpha')
+        config = self._registry_config('full', registry)
+
+        result = effective_merge_module_configs(config, [mc_a])
+
+        assert [m.prefix for m in result] == ['alpha']
+        assert result[0] is mc_a
+
+    # -- (c) breadth='scoped' (the shipped default): identity ----------------
+
+    def test_scoped_breadth_returns_passed_set_unchanged(self):
+        """(c) At the shipped default the helper is the IDENTITY on the passed
+        set even with a populated registry — this is the R4 rollback path, and
+        it is what keeps every non-'full' caller byte-identical to today.
+        """
+        mc_a, mc_b = self._mc('alpha'), self._mc('beta')
+        config = self._registry_config('scoped', {'alpha': mc_a, 'beta': mc_b})
+
+        result = effective_merge_module_configs(config, [mc_a])
+
+        assert [m.prefix for m in result] == ['alpha']
+        assert result[0] is mc_a
+
+    # -- (d) config=None: never raises ---------------------------------------
+
+    def test_none_config_returns_passed_set_and_never_raises(self):
+        """(d) ``None`` config — every role='task' caller and most tests — is
+        treated as the shipped default by ``_merge_breadth_is_full``, so the
+        helper returns the passed set rather than dereferencing None.
+        """
+        mc_a = self._mc('alpha')
+
+        result = effective_merge_module_configs(None, [mc_a])
+
+        assert [m.prefix for m in result] == ['alpha']
+        assert result[0] is mc_a
+        # And an empty passed set with no config is still not an error.
+        assert effective_merge_module_configs(None, []) == []
+
+    # -- (e) IDEMPOTENCE across the full (breadth x registry) grid -----------
+
+    @pytest.mark.parametrize('breadth', ['scoped', 'full'])
+    @pytest.mark.parametrize('registry_populated', [True, False], ids=['registry', 'empty'])
+    def test_is_idempotent(self, breadth, registry_populated):
+        """(e) ``f(cfg, f(cfg, xs)) == f(cfg, xs)`` for every combination.
+
+        THIS is the property that makes step-4's refactor safe: once the merge
+        boundary has resolved the effective set once (step-6), the surviving
+        call inside ``run_scoped_verification`` re-applies the helper to an
+        ALREADY-resolved set and must not change it. Without idempotence that
+        second application would be a second, order-dependent expansion.
+        """
+        mc_a, mc_b = self._mc('alpha'), self._mc('beta')
+        registry = {'alpha': mc_a, 'beta': mc_b} if registry_populated else {}
+        config = self._registry_config(breadth, registry)
+
+        once = effective_merge_module_configs(config, [mc_a])
+        twice = effective_merge_module_configs(config, once)
+
+        assert twice == once
+        assert [m.prefix for m in twice] == [m.prefix for m in once]
+
+    # -- (f) VALUE-PRESERVATION vs the expression being replaced -------------
+
+    @pytest.mark.parametrize(
+        ('registry_populated', 'expected_prefixes'),
+        [(True, ['alpha', 'beta']), (False, ['alpha'])],
+        ids=['registry', 'empty'],
+    )
+    def test_full_breadth_matches_the_inline_expression_it_replaces(
+        self, registry_populated, expected_prefixes,
+    ):
+        """(f) Under breadth='full' the helper returns what the inline
+        expression at verify.py's two rebinding sites returned — the whole
+        registry when there is one, else the passed set.
+
+        Step-4 replaced those sites with a call to this helper; this test IS
+        the "value-preserving by inspection" claim, made executable so a later
+        edit cannot quietly change what a merge covers.
+
+        The expected sets are WRITTEN OUT rather than re-derived by evaluating
+        ``list(config.module_configs_or_empty.values()) or passed`` here
+        (reviewer amendment): an oracle that re-runs the implementation cannot
+        fail when the implementation and the oracle are changed together, or
+        when both share a misreading of the registry accessor. Hard-coding
+        them is what makes this an independent check rather than a tautology.
+        """
+        mc_a, mc_b = self._mc('alpha'), self._mc('beta')
+        registry = {'alpha': mc_a, 'beta': mc_b} if registry_populated else {}
+        config = self._registry_config('full', registry)
+        passed = [mc_a]
+
+        result = effective_merge_module_configs(config, passed)
+
+        assert [m.prefix for m in result] == expected_prefixes
+
+    def test_delegates_the_breadth_predicate_rather_than_rereading_the_knob(
+        self, monkeypatch,
+    ):
+        """One breadth predicate in the tree: the helper asks
+        ``_merge_breadth_is_full`` rather than re-reading
+        ``config.merge_verify_breadth`` itself.
+
+        Pinned by forcing the predicate False on a config that IS 'full' — a
+        helper that re-read the knob would still expand.
+        """
+        mc_a, mc_b = self._mc('alpha'), self._mc('beta')
+        config = self._registry_config('full', {'alpha': mc_a, 'beta': mc_b})
+        monkeypatch.setattr(verify_plan_module, '_merge_breadth_is_full', lambda _cfg: False)
+
+        assert effective_merge_module_configs(config, [mc_a]) == [mc_a]
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through the VerifyCmd-layer scoper (task 3931)
+# ---------------------------------------------------------------------------
+
+# The committed fleet chain is deliberately BARE — task 4538 pins the pyright
+# version out-of-band, in the repo-root package.json that
+# verify_cold_preprovision_command's `npm ci` materialises — so the pinned
+# fixture is DERIVED from it here. The non-vacuity assert in
+# ``test_unpinned_chain_scopes_exactly_as_today`` below is what keeps the two
+# fixtures from collapsing into one string if that ever changes.
+_PINNED_TYPE_CHAIN_3931 = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesPrefixScoping:
+    """``_scope_prefix_to_keyword`` must keep a pinned npx package version.
+
+    Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
+    ``test_verify.py::TestVersionPinSurvivesScoping``.
+
+    This function is the ``VerifyCmd``-layer twin of
+    ``verify._scope_to_keyword`` and carries the IDENTICAL byte-offset
+    truncation (``retained = head[: idx + len(keyword)]``); its own docstring
+    states that *raw* "is ALWAYS truncated to everything up to and including
+    the first occurrence of *keyword* before being (re-)parsed". So it strips a
+    version pin exactly the same way, and the two layers must be fixed in the
+    SAME commit or they silently diverge — the trap task 3830 fell into, where
+    a plan named only verify.py while verify_plan.py needed the identical
+    change.
+
+    MEASURED on this branch before the step-6 change (and after step-4, so this
+    is verify_plan.py's own stripping, not the parser's):
+
+        _scope_prefix_to_keyword(PINNED, 'pyright', [file])
+            -> ToolKind.PYRIGHT, renders 'npx pyright <file>'   <-- pin GONE
+    """
+
+    def test_pinned_chain_keeps_its_version(self):
+        cmd = _scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_prefix_to_keyword dropped the version pin, rendering '
+            f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
+            'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
+            'fixed in lockstep with it — the pair routes through one shared '
+            'split_chain_tail gate and its STRUCTURAL lockstep is a documented '
+            'property'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling is unchanged."""
+        assert _PINNED_TYPE_CHAIN_3931 != ROOT_TYPE_CHECK_COMMAND, (
+            'the committed fleet chain already carries an inline `@<version>` '
+            '(task 3931 / 4538) — the pinned fixture above would then be the '
+            'same string as this one and neither guard would mean anything'
+        )
+        cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+    def test_a_longer_unrelated_token_is_not_absorbed(self):
+        """Same boundary rule as verify.py's: widen across `@<version>` ONLY.
+
+        Passes today; it is the floor that makes the step-6 widening provably
+        narrow rather than a general "keep the whole token" change.
+        """
+        cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'

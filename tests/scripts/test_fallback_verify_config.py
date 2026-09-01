@@ -32,6 +32,7 @@ import os
 import pathlib
 import re
 import shlex
+import sys
 import tomllib
 
 import yaml
@@ -627,16 +628,17 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     )
 
     # Internal coherence: a cold run does strictly MORE work than a warm one —
-    # the same chain PLUS verify_cold_preprovision_command (uv sync
-    # --all-packages) — so a warm ceiling above the cold one is incoherent by
-    # construction, regardless of what either value is.
+    # the same chain PLUS verify_cold_preprovision_command (`uv sync
+    # --all-packages && npm ci …`; task 4538 added the npm clause that installs
+    # the pinned pyright the TYPE chain resolves) — so a warm ceiling above the
+    # cold one is incoherent by construction, regardless of either value.
     cold = budgets['verify_cold_command_timeout_secs']
     assert warm <= cold, (
         f'verify_command_timeout_secs={warm} exceeds '
         f'verify_cold_command_timeout_secs={cold} (task 3350). A cold verify runs '
-        'the same command chain plus the uv sync --all-packages preprovision, so '
-        'it is strictly more expensive; a warm budget above the cold one is '
-        'incoherent by construction'
+        'the same command chain plus the verify_cold_preprovision_command '
+        'preprovision (uv sync + npm ci), so it is strictly more expensive; a '
+        'warm budget above the cold one is incoherent by construction'
     )
 
 
@@ -1017,9 +1019,10 @@ class TestFleetTypeCheckCoversEveryWorkspaceMember:
         assert warm <= cold, (
             f"verify_command_timeout_secs={warm} exceeds "
             f"verify_cold_command_timeout_secs={cold} (task 3397). A cold "
-            "verify runs the same chains plus the uv sync --all-packages "
-            "preprovision, so it is strictly more expensive; a warm budget "
-            "above the cold one is incoherent by construction"
+            "verify runs the same chains plus the "
+            "verify_cold_preprovision_command preprovision (uv sync + npm ci), "
+            "so it is strictly more expensive; a warm budget above the cold one "
+            "is incoherent by construction"
         )
 
     def test_type_chain_table_matches_the_chain_it_measures(self) -> None:
@@ -1176,4 +1179,158 @@ class TestFleetLintCoversEveryWorkspaceMember:
                 f"names {target!r}, which does not exist under {REPO_ROOT} "
                 "(task 3397) — this would make the script exit non-zero on "
                 f"every fallback/merge-queue verify; targets: {targets}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Pyright scope parity: members importing a scripts/-only module (task 3931)
+# ---------------------------------------------------------------------------
+
+# Floor for the discovery below. NOT the authoritative list — the importing
+# members are DISCOVERED at runtime by scanning member sources, so a NEW
+# member that starts importing a ``scripts/``-only module is covered on day
+# one. This floor only proves the scan still resolves the member we know
+# imports one (``orchestrator/tests/test_run_vllm_eval.py`` imports
+# ``run_vllm_eval``), so a scan that silently stops matching anything fails
+# loudly instead of passing vacuously.
+KNOWN_SCRIPTS_IMPORTING_MEMBERS = frozenset({"orchestrator"})
+
+
+def _scripts_only_module_stems() -> set[str]:
+    """Top-level module names importable ONLY from repo-root ``scripts/``.
+
+    ``scripts/*.py`` stems, minus (a) non-identifier stems (``wait-for-port``
+    et al. are runnable files, never importable modules), (b) stdlib names,
+    and (c) any stem that is ALSO a top-level module/package under a workspace
+    member's ``src/`` or at the repo root — those resolve for pyright through
+    an existing ``extraPaths`` entry and say nothing about ``scripts/``.
+    """
+    stems = {p.stem for p in (REPO_ROOT / "scripts").glob("*.py") if p.stem.isidentifier()}
+    resolvable_elsewhere: set[str] = {p.stem for p in REPO_ROOT.glob("*.py")}
+    for member in _workspace_member_dirs():
+        src = REPO_ROOT / member / "src"
+        if not src.is_dir():
+            continue
+        resolvable_elsewhere |= {
+            child.stem if child.suffix == ".py" else child.name for child in src.iterdir()
+        }
+    return stems - set(sys.stdlib_module_names) - resolvable_elsewhere
+
+
+def _members_importing_scripts_only_modules() -> dict[str, set[str]]:
+    """Map each workspace member to the ``scripts/``-only modules its own files import."""
+    stems = _scripts_only_module_stems()
+    assert stems, (
+        "no repo-root scripts/ module is importable-only-from-scripts (task "
+        "3931) — this scope-parity invariant would pass vacuously"
+    )
+    pattern = re.compile(
+        r"^[ \t]*(?:import|from)[ \t]+(" + "|".join(sorted(map(re.escape, stems))) + r")\b",
+        re.MULTILINE,
+    )
+    found: dict[str, set[str]] = {}
+    for member in _workspace_member_dirs():
+        member_dir = REPO_ROOT / member
+        if not member_dir.is_dir():
+            # Presence tolerance, per TestWorkspacePyrightInterpreterPinned: a
+            # member genuinely absent from this checkout is skipped, not failed.
+            continue
+        for path in member_dir.rglob("*.py"):
+            if ".venv" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for match in pattern.finditer(text):
+                found.setdefault(member, set()).add(match.group(1))
+    return found
+
+
+def _assert_pyright_resolves_scripts(rel_dir: str, pyright: dict, why: str) -> None:
+    """Assert *rel_dir*'s ``[tool.pyright] extraPaths`` resolves repo-root ``scripts/``.
+
+    Modelled on ``_assert_pyright_pins_worktree_venv`` above (task 3367): one
+    shared assertion carrying the caller's context through ``why=``, so the
+    per-member invariant here and the module-local guard in
+    ``orchestrator/tests/test_run_vllm_eval.py`` state the same property and
+    cannot drift apart.
+
+    Asserted by RESOLUTION, never by string equality: ``../scripts`` and any
+    other spelling landing on the same directory both pass.
+    """
+    extra_paths = pyright.get("extraPaths")
+    assert extra_paths, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] declares no extraPaths (task "
+        f"3931). {why}"
+    )
+    scripts_dir = (REPO_ROOT / "scripts").resolve()
+    resolved = [(REPO_ROOT / rel_dir / entry).resolve() for entry in extra_paths]
+    assert scripts_dir in resolved, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] extraPaths {list(extra_paths)!r} "
+        f"contains no entry resolving to {scripts_dir} (task 3931, esc-3805-1 "
+        f"2026-08-09 / esc-3805-6 2026-08-12). {why} The root pyproject.toml's "
+        "extraPaths DOES list 'scripts', so ROOT-scoped pyright resolves the "
+        "import and reports real errors that PACKAGE-scoped pyright cannot see "
+        "— MEASURED at 1.1.408 with hotfix 27ac22a6a6 reverse-applied: 14 "
+        "reportArgumentType errors root-scoped, 0 package-scoped. verify's "
+        "FILE_SCOPED fallback runs pyright from the worktree ROOT while "
+        "pre-commit (hooks/project-checks) and the fleet chain run it "
+        "PACKAGE-scoped, so without this entry the two gates disagree about "
+        f"whether the same file type-checks; resolved: {[str(p) for p in resolved]}"
+    )
+
+
+class TestMembersImportingScriptsResolveScriptsOnTheirPyrightPath:
+    """A member importing a ``scripts/``-only module must resolve ``scripts/`` itself.
+
+    Task 3931 — the CHAIN-INDEPENDENT generalisation of the module-local guard
+    in ``orchestrator/tests/test_run_vllm_eval.py``, in the same spirit as
+    ``TestWorkspacePyrightInterpreterPinned`` generalising the fleet-chain
+    interpreter pin: that guard names one module in one package, this one holds
+    for every workspace member, discovered at runtime.
+
+    The property: if a member's OWN sources import a top-level module that
+    exists only under repo-root ``scripts/``, then package-scoped pyright must
+    be able to resolve it — otherwise the imported names degrade to ``Unknown``
+    and every defect involving them goes unreported in that scope, while the
+    root-scoped verify gate (whose config lists ``scripts``) still reports
+    them. That asymmetry IS esc-3805-1/esc-3805-6.
+
+    Presence-tolerant and MEMBERSHIP-only (never list equality — the rule stated at
+    tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports),
+    so an unrelated extraPaths addition does not false-red this guard.
+    """
+
+    def test_members_importing_scripts_modules_resolve_scripts(self) -> None:
+        importing = _members_importing_scripts_only_modules()
+        assert importing, (
+            "no workspace member was found importing a repo-root scripts/-only "
+            "module (task 3931) — either the scan stopped matching (an import "
+            "spelling it cannot see) or the import genuinely went away; both "
+            "need an explicit decision, not a silently vacuous guard"
+        )
+        missing = KNOWN_SCRIPTS_IMPORTING_MEMBERS - set(importing)
+        assert not missing, (
+            f"runtime discovery failed to resolve known scripts/-importing "
+            f"member(s) {sorted(missing)} (task 3931); discovered: "
+            f"{ {k: sorted(v) for k, v in importing.items()} }"
+        )
+
+        for member, modules in sorted(importing.items()):
+            if not (REPO_ROOT / member / "pyproject.toml").is_file():
+                continue
+            pyright = _pyproject_at(member).get("tool", {}).get("pyright")
+            if pyright is None:
+                # A member that never runs pyright has no search path to widen.
+                continue
+            _assert_pyright_resolves_scripts(
+                member,
+                pyright,
+                why=(
+                    f"{member!r} imports {sorted(modules)!r}, which exist(s) "
+                    "ONLY under repo-root scripts/, so package-scoped pyright "
+                    "can resolve the import only via an extraPaths entry "
+                    "pointing there."
+                ),
             )

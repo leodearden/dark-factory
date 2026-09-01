@@ -12,6 +12,85 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
+# Classify what a parity checker just told us. Defined HERE, once, immediately
+# below the log shims and above every parity call site — the five sites share
+# one shell scope, and every sliced block is executed by the test harness under
+# a preamble that provides this helper (tests/scripts/setup_host_sections.py
+# slices it live out of this file, so there is no second copy to drift).
+#
+#   _parity_verdict <captured_output> <exit_status> <bracketed_tag>
+#
+# echoes exactly one of:
+#   unreported — the tag is ABSENT, so the checker did not report. Its status
+#                says NOTHING about this host: exit 2 in particular is also what
+#                python3 returns for a script it cannot open and what argparse
+#                returns for a rejected flag. Checked FIRST and outranking the
+#                status entirely, which is the whole point of the guard.
+#   parity     — it reported, and found what it was looking for (0).
+#   absent     — it reported that the thing is not installed here (2).
+#   finding    — it reported something actionable (1, or any other status: 127
+#                and friends are not benign just because they are undocumented).
+#
+# CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
+# effects, because those legitimately differ — `absent` is `info` at the
+# orchestrator, dashboard pre-install and lms sites but `warn` at the
+# fused-memory and dashboard post-install ones; the orchestrator gate may
+# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
+# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# A helper that also emitted messages would have to collapse those distinctions
+# or take five message parameters — either way re-creating the coupling the
+# extraction removes.
+#
+# The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
+# exits the instant it matches and the tag is on line 1, so once the report
+# exceeds the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes
+# the pipeline return 141, and that becomes "it did not run" on a report that
+# plainly carries the tag — a verdict manufactured by the mechanism rather than
+# read from the checker, which is the exact class of failure this guard exists
+# to remove. `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe
+# form flips at ~82KB of tagged output; this does not.)
+_parity_verdict() {
+  local _out="$1" _status="$2" _tag="$3"
+  if [[ "$_out" != *"$_tag"* ]]; then
+    printf '%s\n' unreported
+  elif [ "$_status" -eq 0 ]; then
+    printf '%s\n' parity
+  elif [ "$_status" -eq 2 ]; then
+    printf '%s\n' absent
+  else
+    printf '%s\n' finding
+  fi
+}
+
+# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
+# section-12 health check ask exactly the same question, and a copy at each site
+# is how the two drift apart.
+#
+# The verdict is read from the captured REPLY, not from a pipeline's exit
+# status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
+# a different question and gets this wrong two ways. `grep -q` exits on its
+# first match and closes the read end, so a producer still writing dies of
+# SIGPIPE and `pipefail` hands the caller that 141; and the same conflation
+# misreads any producer that emits PONG and then exits non-zero for reasons of
+# its own (an exec whose status covers the whole run, not the one line asked
+# about). Either way a live FalkorDB is reported as down. (Measured: with 256KiB
+# of trailing output the pipe form reports no PONG 30/30; this form reports it.)
+#
+# `|| true` is load-bearing: without it the assignment is a simple command and
+# `set -e` kills the bootstrap the moment docker is unavailable, where the old
+# pipeline merely took the else branch. It also must not be `|| out=""` — that
+# throws away a reply the producer did write, preserving the bug. A producer
+# that wrote nothing still yields no match, which is the not-answering verdict
+# both callers already gave.
+#
+# `local` confines the reply to the call, so neither caller can ever read a
+# verdict the other left behind in the shared shell scope.
+falkordb_pings() {
+  local out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  [[ "$out" == *PONG* ]]
+}
+
 # ---------------------------------------------------------------------------
 # 1. Prerequisites
 # ---------------------------------------------------------------------------
@@ -79,7 +158,9 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report a live server as never healthy.
+  if falkordb_pings; then
     ok "FalkorDB healthy"
     break
   fi
@@ -140,10 +221,6 @@ fi
 # nine. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
-#
-# HARNESS CONSTRAINT: do NOT name the parity checker's file in the prose below
-# — call it "the parity gate" up here. It bites silently, and the whole rule is
-# stated at the `_orch_parity_script=` assignment that anchors it.
 #
 # Installs and enables (kept in step with scripts/orchestrator-*.service by
 # test_setup_host_installs_every_orchestrator_unit — every template must be
@@ -240,15 +317,22 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 #
 # HARNESS CONSTRAINT, stated once, HERE, because this next line is what anchors
 # it. tests/scripts/test_check_orchestrator_unit_parity.py slices this file
-# from the FIRST mention of the parity checker's file name through the install
-# construct's closing `fi`, and EXECUTES that slice under bash. Two consequences,
-# both silent:
-#   - naming that file ABOVE this line moves the slice's start upward, so the
-#     suite runs this section's `install -m 0755 ... "$HOME/bin/..."` against
-#     the developer's REAL home directory;
-#   - anything the sliced code needs (the unit array, the skip-reason helper)
-#     must be declared BELOW this line, or it is unbound at run time and kills
-#     the run under `set -u`.
+# from the `_orch_parity_script=` ASSIGNMENT below through the install
+# construct's closing `fi`, and EXECUTES that slice under bash.
+#
+# The anchor is CODE and unique to this site — the same line the structural
+# sweep in test_check_dashboard_unit_parity.py discovers, and the shared slicer
+# (tests/scripts/setup_host_sections.py) skips comment lines, so prose that
+# merely QUOTES the anchor cannot move the slice. That retires the rule this
+# comment used to state: naming the checker's file up in the section header no
+# longer drags the slice's start upward over the `install -m 0755 ...
+# "$HOME/bin/..."` above, and two tests now hold that shut rather than a
+# request to remember it.
+#
+# The other consequence still holds and is NOT enforced by a test: anything the
+# sliced code needs (the unit array, the skip-reason helper) must be declared
+# BELOW this line, or it is unbound at run time and kills the run under
+# `set -u`.
 _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
 
 # The units this section installs, declared ONCE. Both loops below iterate this
@@ -304,33 +388,39 @@ else
        --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
-  # The tag is matched in BASH, not through `printf ... | grep -q`. grep exits
-  # the instant it matches and the tag is on line 1, so once the report exceeds
-  # the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes the
-  # pipeline return 141, and `!` turns that into "it did not run" with the tag
-  # plainly present — a verdict manufactured by the mechanism rather than read
-  # from the checker, which is the exact class of failure this guard removes.
-  # `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe form
-  # flips at ~82KB of tagged output; the pattern below does not.)
-  if [[ "$_orch_parity_out" != *'[orchestrator_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file — see its comment
+  # for why the tag outranks the status and why it is matched with `[[ ]]`.
+  _orch_parity_verdict="$(_parity_verdict "$_orch_parity_out" \
+       "$_orch_parity_exit" '[orchestrator_unit_parity]')"
+  case "$_orch_parity_verdict" in
+  unreported)
     fail "Orchestrator parity gate produced no [orchestrator_unit_parity] report"
     fail "  (status $_orch_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     _orch_install_blocked=1
-  elif [ "$_orch_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Orchestrator units: parity with committed copies"
-  elif [ "$_orch_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "Orchestrator units: not yet installed in $UNIT_DIR (installing below)"
-  else
-    # Status 1 is "drift OR unverifiable" — it also covers a vanished committed
-    # unit, an unreadable unit file and a drop-in override, which the checker
-    # words apart so the operator is not sent hunting for a directive diff that
-    # does not exist.
+    ;;
+  finding | *)
+    # `*` folded in with `finding` deliberately: the helper is total over four
+    # tokens today, and a fifth added later must land on the LOUD arm rather
+    # than fall through a `case` that silently matches nothing — the same
+    # "benign because undocumented" reading the helper itself refuses.
+    #
+    # A finding is "drift OR unverifiable" — it also covers a vanished
+    # committed unit, an unreadable unit file and a drop-in override, which the
+    # checker words apart so the operator is not sent hunting for a directive
+    # diff that does not exist.
     warn "Orchestrator units: drift or unverifiable state — see the"
     warn "  [orchestrator_unit_parity] report above. Note a drop-in override"
     warn "  needs manual removal."
     _orch_install_blocked=1
-  fi
+    ;;
+  esac
 fi
 
 # A unit that did not clear is SKIPPED rather than warned about, because a
@@ -596,7 +686,13 @@ fi
 
 # Add jcodemunch MCP to user-level Claude config (idempotent)
 if command -v claude &>/dev/null; then
-  if claude mcp list --scope user 2>/dev/null | grep -q jcodemunch; then
+  # Matched in BASH, not through `| grep -q` — see falkordb_pings above for why
+  # that pipeline can report an installed server as absent.
+  # Here the cost is re-running `claude mcp add` on a server already registered.
+  # The capture stays INSIDE the `command -v claude` guard: hoisting it would
+  # run `claude mcp list` on hosts with no claude installed.
+  _jcodemunch_mcp_out="$(claude mcp list --scope user 2>/dev/null)" || true
+  if [[ "$_jcodemunch_mcp_out" == *jcodemunch* ]]; then
     ok "jcodemunch MCP already in user config"
   else
     claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
@@ -764,27 +860,33 @@ else
        --repo-root     "$REPO_ROOT" 2>&1)" && _dash_parity_exit=0 || _dash_parity_exit=$?
   printf '%s\n' "$_dash_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate
-  # above for why a `printf | grep -q` here can report "it did not run" on a
-  # report that carries the tag.
-  if [[ "$_dash_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file.
+  _dash_parity_verdict="$(_parity_verdict "$_dash_parity_out" \
+       "$_dash_parity_exit" '[dashboard_unit_parity]')"
+  case "$_dash_parity_verdict" in
+  unreported)
     fail "Dashboard parity gate produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     fail "  The install below still runs; it simply gathered no evidence first."
-  elif [ "$_dash_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Dashboard units: already at parity with the committed copies"
-  elif [ "$_dash_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "Dashboard units: not yet installed in $UNIT_DIR (installing below)"
-  else
-    # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
-    # unit and a drop-in override, which the checker deliberately words apart
-    # so the operator is not sent hunting for a directive diff that does not
-    # exist. Naming only DRIFT here would collapse that distinction back.
+    ;;
+  finding | *)
+    # A finding is "drift OR unverifiable" — it also covers a vanished
+    # committed unit and a drop-in override, which the checker deliberately
+    # words apart so the operator is not sent hunting for a directive diff that
+    # does not exist. Naming only DRIFT here would collapse that distinction
+    # back. (`*` is folded in for the reason given at the orchestrator gate.)
     warn "Dashboard units: pre-existing drift or unverifiable state — see the"
     warn "  [dashboard_unit_parity] report above. The install below propagates"
     warn "  the committed units; a drop-in override needs manual removal."
-  fi
+    ;;
+  esac
 fi
 
 sed \
@@ -895,7 +997,10 @@ echo ""
 info "Health checks"
 
 # FalkorDB
-if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+# The same probe the section-2 wait loop runs, so it is the same function and
+# not a second copy of it — see falkordb_pings for why the verdict is read from
+# the reply rather than from `| grep -q`.
+if falkordb_pings; then
   ok "FalkorDB: PONG"
 else
   fail "FalkorDB: not responding"
@@ -936,13 +1041,13 @@ fi
 # silent-drift failure the checker exists to catch, reproduced one level up in
 # its own wiring.
 #
-# The orchestrator gate above greps the checker's [orchestrator_unit_parity]
-# tag. This checker has no LOG_TAG (and is read-only for this task), so its own
-# bracketed markers stand in for one. That vocabulary is an implicit contract of
-# a file this block does not own, so it is pinned directly by
-# test_gate_markers_appear_on_every_real_exit_path_and_neither_collision in
-# tests/scripts/test_check_fused_memory_unit_parity.py: markers present on all
-# three real exit paths, absent on both collision sources.
+# So no status is believed unless the checker's own [fused_memory_unit_parity]
+# tag appears in the output it produced. That tag is on EVERY line it emits,
+# which test_main_every_emitted_line_carries_the_log_tag pins, so its absence is
+# conclusive rather than a heuristic. The other half — that all three real exit
+# paths emit it and NEITHER collision source does — is pinned by
+# test_gate_tag_appears_on_every_real_exit_path_and_neither_collision, both in
+# tests/scripts/test_check_fused_memory_unit_parity.py.
 _fm_parity_script="$REPO_ROOT/scripts/check_fused_memory_unit_parity.py"
 
 if [ ! -f "$_fm_parity_script" ]; then
@@ -957,28 +1062,26 @@ else
        && _fm_parity_exit=0 || _fm_parity_exit=$?
   printf '%s\n' "$_fm_parity_out"
 
-  # The marker is line-ANCHORED (the equivalent of `grep -E '^\[(ok|...)\]'`),
-  # so an argparse usage line's `[--fix]` and python3's mid-line `[Errno 2]`
-  # cannot pass for a report. Prefixing a newline makes the first line match
-  # the same way as any other. Done in bash rather than through a pipe to grep
-  # for the SIGPIPE reason spelled out at the orchestrator gate above.
-  _fm_parity_reported=0
-  case $'\n'"$_fm_parity_out" in
-    *$'\n'"[ok]"*|*$'\n'"[skip]"*|*$'\n'"[drift]"*|*$'\n'"[fixed]"*)
-      _fm_parity_reported=1 ;;
-  esac
-
-  if [ "$_fm_parity_reported" -eq 0 ]; then
+  # Classified by the shared helper at the top of this file.
+  _fm_parity_verdict="$(_parity_verdict "$_fm_parity_out" \
+       "$_fm_parity_exit" '[fused_memory_unit_parity]')"
+  case "$_fm_parity_verdict" in
+  unreported)
     fail "Fused-memory parity check produced no recognizable report"
     fail "  (status $_fm_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
-  elif [ "$_fm_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Fused-memory unit: parity with template (all safety directives present)"
-  elif [ "$_fm_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     warn "Fused-memory unit: not installed at $UNIT_DIR/fused-memory.service (skipping parity check)"
-  else
+    ;;
+  finding | *)
+    # `*` folded in for the reason given at the orchestrator gate.
     warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
-  fi
+    ;;
+  esac
 fi
 
 # Dashboard unit parity — POST-INSTALL SANITY CHECK ONLY.
@@ -1019,24 +1122,32 @@ else
        && _dash_post_parity_exit=0 || _dash_post_parity_exit=$?
   printf '%s\n' "$_dash_post_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate for
-  # why a `printf | grep -q` here can report "it did not run" on a report that
-  # carries the tag.
-  if [[ "$_dash_post_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file. Distinct verdict
+  # variable from section 8's for the same reason the _out/_exit pair above is
+  # distinct: both blocks share one shell scope.
+  _dash_post_parity_verdict="$(_parity_verdict "$_dash_post_parity_out" \
+       "$_dash_post_parity_exit" '[dashboard_unit_parity]')"
+  case "$_dash_post_parity_verdict" in
+  unreported)
     fail "Dashboard post-install check produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_post_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
     fail "  The install above is therefore UNVERIFIED, not verified."
-  elif [ "$_dash_post_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "Dashboard units: install verified (installed copies match the committed ones)"
-  elif [ "$_dash_post_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     warn "Dashboard units: not installed in $UNIT_DIR (section 8 did not run?)"
-  else
+    ;;
+  finding | *)
+    # `*` folded in for the reason given at the orchestrator gate.
     warn "Dashboard units: still not at parity AFTER installing — the install"
     warn "  did not take. See the [dashboard_unit_parity] report above; a"
     warn "  [override] drop-in survives reinstallation and must be removed by"
     warn "  hand (systemctl --user cat <unit> shows the merged result)."
-  fi
+    ;;
+  esac
 fi
 
 # lms-arm@ unit: REPORT ONLY. setup-host.sh does not install the arms and must
@@ -1079,29 +1190,39 @@ else
        --repo-root     "$REPO_ROOT" 2>&1)" && _lms_parity_exit=0 || _lms_parity_exit=$?
   printf '%s\n' "$_lms_parity_out"
 
-  # Matched in bash, not through a pipe to grep — see the orchestrator gate
-  # above for why a `printf | grep -q` here can report "it did not run" on a
-  # report that carries the tag.
-  if [[ "$_lms_parity_out" != *'[lms_unit_parity]'* ]]; then
+  # Classified by the shared helper at the top of this file. Note this gate
+  # answers `unreported` with warn(), not fail(): it is warn-only by charter
+  # (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only), which
+  # is exactly the per-site severity difference the helper does not collapse.
+  _lms_parity_verdict="$(_parity_verdict "$_lms_parity_out" \
+       "$_lms_parity_exit" '[lms_unit_parity]')"
+  case "$_lms_parity_verdict" in
+  unreported)
     warn "lms-arm@ unit: parity gate produced no [lms_unit_parity] report"
     warn "  (status $_lms_parity_exit) — it did not run, so its status says"
     warn "  nothing about this host. Check the script path and its flags."
-  elif [ "$_lms_parity_exit" -eq 0 ]; then
+    ;;
+  parity)
     ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
-  elif [ "$_lms_parity_exit" -eq 2 ]; then
+    ;;
+  absent)
     info "lms-arm@ unit: not installed on this host (install with scripts/local-model-serving/install-lms-units.sh)"
-  else
-    # Exit 1 is "drift OR unverifiable" — it also covers a drop-in override and
-    # an effective configuration that disagrees, which the checker deliberately
-    # words apart so the operator is not sent hunting for a directive diff that
-    # does not exist. Naming only DRIFT here would collapse that distinction.
+    ;;
+  finding | *)
+    # A finding is "drift OR unverifiable" — it also covers a drop-in override
+    # and an effective configuration that disagrees, which the checker
+    # deliberately words apart so the operator is not sent hunting for a
+    # directive diff that does not exist. Naming only DRIFT here would collapse
+    # that distinction. (`*` is folded in for the reason given at the
+    # orchestrator gate.)
     warn "lms-arm@ unit: drift, a drop-in override, or an unverifiable effective"
     warn "  configuration — see the [lms_unit_parity] report above."
     warn "  A drop-in SURVIVES reinstallation and is NOT removed automatically."
     warn "  Inspect:  systemctl --user cat lms-arm@<arm>.service"
     warn "  Remove:   scripts/remove-lms-arm-worktree-dropin.sh (checks its"
     warn "            safety preconditions first)"
-  fi
+    ;;
+  esac
 fi
 
 # jCodeMunch watcher

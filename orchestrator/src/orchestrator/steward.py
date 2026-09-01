@@ -628,6 +628,12 @@ class TaskSteward:
                     'retry_count': retry_count,
                     'account_name': result.account_name,
                     'timed_out': is_timeout,
+                    # Sibling of the workflow._invoke emitter (task 3639): keep
+                    # the two agent-invocation row shapes symmetric so one
+                    # runs.db query covers both roles.  Emitted unconditionally,
+                    # False included, so the false-positive rate has a
+                    # denominator.
+                    'ended_awaiting_background': result.ended_awaiting_background,
                 },
             )
 

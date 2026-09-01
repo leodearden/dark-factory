@@ -423,6 +423,25 @@ NON_CAP_CLI_ERROR_MARKERS = [
     'invalid value',
     'no such file or directory',
     'permission denied',
+    # An unresolvable `--resume` (task 3578). Like the --session-id collision
+    # above, the CLI resolves the session id against the on-disk transcript
+    # store and exits BEFORE contacting the API, so a usage cap can never be the
+    # cause. Without this positive non-cap attribution the zero-cost/instant
+    # heuristic in invoke_with_cap_retry reports a SYNTHETIC cap hit and churns
+    # a HEALTHY account through compounding cooldowns for a local error the API
+    # never saw.
+    #
+    # LATENT-FRAGILITY hardening, zero live occurrences: real resume failures
+    # currently exceed the net's 5000 ms floor, so nothing is being fixed here —
+    # the fragility is that the floor is the only thing standing in the way.
+    # Third instance of this class, after reify-3604 (--session-id collision)
+    # and the 2026-07-29 ServerError escape.
+    #
+    # Text and its STDERR placement MEASURED against Claude Code CLI 2.1.236 on
+    # 2026-08-19, not guessed: the CLI prints
+    # `No conversation found with session ID: <uuid>` on stderr and exits 1.
+    # classify scans `combined = f'{stderr}\n{output}'`, so stderr is seen.
+    'no conversation found with session id',
 ] + CLI_INPUT_REQUIRED_MARKERS
 
 # Substrings (case-insensitive) indicating the requested model does not

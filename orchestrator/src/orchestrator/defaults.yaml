@@ -77,6 +77,15 @@ requeue_cap: 3
 # exempt from requeue_cap.  Guards against unbounded retry on a persistent
 # provider outage.  Process-local; orchestrator restart resets it.
 transient_requeue_cap: 10
+# Jittered exponential backoff for the transient lane (PRD contract C3).  The
+# n-th transient requeue arms min(base * 2**(n-1), cap) seconds, drawn with
+# equal jitter U(cooldown/2, cooldown); n is the task's transient requeue
+# count at arming.  30/900 walks 30/60/120/240/480 and pins at 900s from n=6,
+# so a provider outage settles into a 7.5-15 min cadence instead of a flat-30s
+# retry storm (2026-07-29: 67 starts in one half-hour bucket).  GENUINE
+# (non-5xx) requeues are unaffected — they stay flat at requeue_cooldown_secs.
+transient_requeue_backoff_base_secs: 30.0
+transient_requeue_backoff_cap_secs: 900.0
 
 # Verification timeouts
 verify_command_timeout_secs: 1800
@@ -471,15 +480,24 @@ fairness:
 # a whole namespace.  TRAP: `<name>.*` does NOT match the bare parent key
 # `<name>`, so a top-level dict key must be listed EXACTLY.
 #
-# Excused keys stay listed by check-config (at exit 0) and in reload_config's
+# Excused keys stay listed by check-config and in reload_config's
 # `ignored_config_keys`, so an over-broad glob remains auditable.
+#
+# PREFER the reasoned mapping form.  An entry is an ASSERTION that some
+# non-orchestrator consumer reads the key; a bare string makes that assertion
+# unfalsifiable and nothing ever re-checks it.  A bare string still works but
+# check-config reports it as un-reasoned DEBT (advisory, exit 0).  If the
+# consumer has NOT landed yet, the reason MUST cite its tracking task as
+# `#NNNN` — an uncited "pending" claim has no expiry (hard finding, exit 2).
 # See OPERATIONS.md §6a.
 config_key_census:
   ignore: []
   # ignore:
-  #   - 'cpu_governance.*'       # whole namespace
-  #   - 'fairness.scheduler_v2'  # exact path
-  #   - 'warm_lane_pool'         # top-level dict key — must be exact
+  #   - path: 'cpu_governance.*'          # whole namespace
+  #     reason: read verbatim by scripts/cpu-governed-exec.sh
+  #   - path: 'warm_lane_pool'            # top-level dict key — must be exact
+  #     reason: temporary — pending #5908, which deletes this entry
+  #   - 'fairness.scheduler_v2'           # bare form: accepted, reports as debt
 
 # Starvation watchdog (task 1880).
 #
@@ -658,6 +676,14 @@ recovery_emission:
   # The narrower kill switch: the only part of the mechanism that WRITES to the
   # escalation queue.  Turn this off to keep the telemetry and silence the L1.
   streak_escalation_enabled: true
+  # Task 4647 -- the landing-detector storm escape.  git_error is the one
+  # landing reason whose REPETITION means the detector is broken rather than
+  # the task being unlanded, and a broken detector is silent by construction:
+  # every verdict it produces rejects.  STRICT exceedance of this trailing-hour
+  # rate files ONE blocking L1 against a synthetic sentinel.  Same narrow
+  # kill-switch discipline as streak_escalation_enabled above.
+  landing_git_error_rate_per_hour: 10
+  landing_git_error_escalation_enabled: true
 
 # Autonomous dry-run unblock hook
 unblock_auto:

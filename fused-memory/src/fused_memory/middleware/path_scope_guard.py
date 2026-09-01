@@ -23,7 +23,24 @@ signal (task 3106).
 
 That yields THREE outcomes at the interceptor's ``submit_task`` seam
 (``TaskInterceptor._path_guard_or_skip``), in evaluation order — recorded
-here so a future reader need not re-derive the taxonomy from the call site:
+here so a future reader need not re-derive the taxonomy from the call site,
+plus one bypass that PRECEDES all three:
+
+0. AUDITED BYPASS (:func:`is_routing_override`, task 3123) — the caller
+   supplied a non-blank ``routing_override_reason``.  Checked FIRST, before
+   any of the three below can be reached, so that "no enforcement side-effect
+   fires on the override path" is a STRUCTURAL property rather than one each
+   future branch must re-establish.  The verdicts ARE still computed inside
+   this branch, for REPORTING ONLY: the interceptor files a
+   ``scope_violation`` override escalation naming the reason and the paths
+   that WOULD have been flagged, then returns without enforcing anything.
+
+   The escalation is what makes this an AUDITED bypass rather than a silent
+   one.  Its predecessor — a lone ``logger.warning`` — was never a sufficient
+   audit trail, and not only because a log is easy to miss: ``journalctl -p
+   warning`` does NOT match Python ``logger.warning`` records (they carry the
+   syslog priority the handler assigns, not the Python level), so the obvious
+   way an operator would go looking for these found nothing.
 
 1. FILES-CERTAIN REJECT (:func:`check_files_for_scope`, task 2206) — a
    DECLARED file is owned by another project.  Hard reject, no LLM
@@ -585,6 +602,17 @@ def is_routing_override(routing_override_reason: str | None) -> bool:
     it is a non-empty string after stripping leading/trailing whitespace.
     Empty strings, None, and whitespace-only strings all return False —
     preserving the default no-override semantics.
+
+    That strip-only rule is the whole of the validation, and it is the PINNED
+    contract — but note what a ``True`` here actually gates: it disables ALL
+    THREE outcomes of the module taxonomy above, the FILES-certain HARD REJECT
+    included, not merely the prose advisory.  There is no allowlist, no format
+    constraint, and no cross-check of the stated reason against the paths the
+    submission actually claims.
+
+    Callers are REQUIRED to emit the audit escalation on the ``True`` branch
+    (see outcome (0) in the module docstring); a bypass that leaves no
+    operator-visible record is indistinguishable from no bypass at all.
 
     Use only when sure the task belongs to the submitting project.
     If unsure, escalate rather than risking a mis-filed task.
