@@ -835,8 +835,12 @@ class TestAnUnencodableRecordIsStillWritten:
         So the floor catches it, exactly as it catches an over-budget record.
         """
         sink = build_sink(tmp_path)
+        # Annotated ``dict[Any, Any]`` because the SPECIMEN IS THE WRONG SHAPE:
+        # the int key is the whole point, and the sink's parameter is
+        # ``dict[str, Any]``, so the literal cannot be passed inline.
+        record: dict[Any, Any] = make_fact(**{'ok': object()}) | {7: 'int key'}
 
-        assert await sink(make_fact(**{'ok': object()}) | {7: 'int key'}) is not None
+        assert await sink(record) is not None
 
         (line,) = journal_lines(tmp_path)
         assert line[markup_journal.MARKUP_JOURNAL_OVERFLOW_KEY] is True
@@ -921,7 +925,8 @@ class TestTheAttributionLadderIsShared:
     ``markup_sink``'s own header rules against.
     """
 
-    def test_the_journal_uses_markup_sinks_ladder(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_the_journal_uses_markup_sinks_ladder(self, tmp_path, monkeypatch):
         seen: list[str] = []
         monkeypatch.setattr(
             markup_sink,
@@ -930,7 +935,7 @@ class TestTheAttributionLadderIsShared:
         )
         sink = build_sink(tmp_path)
 
-        asyncio.run(sink(make_fact()))
+        await sink(make_fact())
 
         (line,) = journal_lines(tmp_path)
         assert line['subject_task_id'] == 'stubbed', (
