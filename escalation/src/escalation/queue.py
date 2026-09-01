@@ -2104,8 +2104,11 @@ class EscalationQueue:
         """
         self._atomic_write_path(path, str(value), durable=True)
 
-    def _recover_seq_from_disk(self, task_id: str) -> int:
-        """Highest sequence observed on disk for *task_id*, or 0 if none.
+    def _recover_seq_from_disk(self, key: str) -> int:
+        """Highest sequence observed on disk under *key*, or 0 if none.
+
+        *key* is an id-NAMESPACE key, not a task_id — see ``make_id``, which is
+        the sole caller and whose docstring carries the full contract.
 
         Consulted ONLY when the counter file is ABSENT or UNPARSEABLE, never
         while it is present and parseable, so PRD C9's contract — the
@@ -2113,32 +2116,39 @@ class EscalationQueue:
         sequence — holds in steady state, and task 1879's retired per-mint
         archive glob + ``_archive_max_seq_cache`` stays retired.  ``make_id``
         immediately makes the result durable via ``_write_seq_counter``, so
-        this runs at most once per task_id per counter lifetime and never
+        this runs at most once per key per counter lifetime and never
         gates a steady-state mint.
 
         Not *purely* a repair path, despite the framing above: the FIRST
-        mint for every brand-new task_id also lands on the absent-counter
+        mint for every brand-new key also lands on the absent-counter
         branch and pays one scan.  See "Cost" below.
 
-        Scans both halves of the id namespace, because a task_id whose
+        Scans both halves of the id namespace, because a key whose
         escalations were all resolved has evidence ONLY in the archive — and
         that is precisely the case ``get()``'s archive fallback would
         otherwise resolve a re-minted id to (task 3238):
 
-        - queue root: ``esc-{task_id}-*.json``
-        - archive subtree: ``_iter_archive_paths('esc-{task_id}-*.json')``
+        - queue root: ``esc-{key}-*.json``
+        - archive subtree: ``_iter_archive_paths('esc-{key}-*.json')``
 
         The ``.json`` suffix in the pattern is load-bearing: it excludes the
-        ``esc-{task_id}.seq`` counter itself, the ``{id}.json.lock``
+        ``esc-{key}.seq`` counter itself, the ``{id}.json.lock``
         sidecars, and submit's ``{id}.tmp`` staging files.
 
         Sequence extraction is PREFIX-ANCHORED: the literal
-        ``esc-{task_id}-`` is stripped from the stem and the remainder must
-        parse as an int.  The task_id is known, never parsed back out of a
-        filename, so this is hyphen-safe by construction — recovering task
-        ``'1-2'`` correctly ignores ``esc-1-2-3-9.json`` (task ``'1-2-3'``),
+        ``esc-{key}-`` is stripped from the stem and the remainder must
+        parse as an int.  The key is known, never parsed back out of a
+        filename, so this is hyphen-safe by construction — recovering key
+        ``'1-2'`` correctly ignores ``esc-1-2-3-9.json`` (key ``'1-2-3'``),
         which the glob over-matches.  Reintroducing the retired
         parse-after-last-hyphen derivation here would resurrect that bug.
+
+        THE SCOPED GLOB HERE IS CORRECT BECAUSE IT SCOPES ON THE KEY — the
+        thing that IS in the filename.  It would NOT be correct if it scoped
+        on a stored ``task_id``, which the filename does not encode; do not
+        read this argument as transferring to ``get_by_task`` (see
+        ``make_id``).  That is exactly the trap this paragraph is worded to
+        close.
         The comparison is NUMERIC (``max`` over parsed ints, not over stem
         suffixes as strings): lexicographically ``'9' > '10'``, which would
         under-report the max and mint a colliding id.
@@ -2146,15 +2156,15 @@ class EscalationQueue:
         Cost, and why the archive half is a FRESH targeted rglob rather than
         the memoised ``_get_archive_listing()``: that memo is built once per
         instance and can predate another ``EscalationQueue`` instance's
-        archival of records for this task_id.  ``_locate_path`` tolerates
+        archival of records under this key.  ``_locate_path`` tolerates
         that staleness because it is an EXISTENCE lookup — it verifies a
         memo hit with ``.exists()`` and re-probes on a memo miss — but a
         MAXIMUM derived from a merely-incomplete memo is wrong in the
         collision-producing direction: it under-reports and mints an id an
         archived record already holds, the exact defect this scan exists to
         prevent.  The freshness is therefore deliberate, and the price is
-        one archive rglob per task_id per counter lifetime (so, in a
-        long-lived instance, once per new task_id) rather than one per
+        one archive rglob per key per counter lifetime (so, in a
+        long-lived instance, once per new key) rather than one per
         instance — paid off the steady-state mint path, under the per-counter
         lock, and bounded by ``prune_archive`` retention.
 
@@ -2166,7 +2176,7 @@ class EscalationQueue:
         branch is NOT routed here: there the counter still exists and
         remains authoritative over disk.
         """
-        prefix = f'esc-{task_id}-'
+        prefix = f'esc-{key}-'
         pattern = f'{prefix}*.json'
         highest = 0
         for path in itertools.chain(
@@ -2178,16 +2188,46 @@ class EscalationQueue:
             try:
                 seq = int(stem[len(prefix):])
             except ValueError:
-                # A sibling task_id the glob over-matched (e.g. esc-1-2-3-9
+                # A sibling key the glob over-matched (e.g. esc-1-2-3-9
                 # while recovering '1-2'), or a non-numeric suffix.
                 continue
             highest = max(highest, seq)
         return highest
 
-    def make_id(self, task_id: str) -> str:
-        """Generate a unique escalation ID from a durable per-task_id counter.
+    def make_id(self, key: str) -> str:
+        """Generate a unique escalation ID from a durable per-KEY counter.
 
-        The counter file ``queue_dir/esc-{task_id}.seq`` holds the
+        *key* IS AN ID-NAMESPACE KEY, NOT A TASK_ID.  It names two things and
+        nothing more: the durable counter ``esc-{key}.seq`` and the id stem
+        ``esc-{key}-{n}``.  It NEED NOT equal the record's stored ``task_id``,
+        and five production sites diverge deliberately:
+
+        - ``fused-memory/src/fused_memory/middleware/curator_escalator.py`` —
+          three sites, ``make_id('curator')`` with ``task_id='task-curator'``
+        - ``fused-memory/src/fused_memory/middleware/ticket_janitor.py`` —
+          two sites, ``make_id('ticket-janitor')`` with ``task_id='task-curator'``
+
+        THEREFORE NOTHING MAY DERIVE A TASK_ID FROM A FILENAME OR FROM AN
+        ESCALATION ID.  State the false identity plainly so a future reader
+        recognises it on sight: ``stem.startswith(f'esc-{record.task_id}-')`` is
+        FALSE — 42 of 2,972 corpus records violate it, and ``'task-curator'``
+        alone carries three stem families (``esc-curator-*``,
+        ``esc-ticket-janitor-*``, ``esc-task-curator-*``).  Believing it cost TWO
+        design cycles: task 3999's 2026-08-11 amendment and
+        ``plans/resume-charter-loss-remediation-prd.md``, both withdrawn
+        2026-08-20 under ruling esc-3999-2.
+
+        The practical consequence: ``get_by_task`` globs the UNSCOPED
+        ``esc-*.json`` and filters on the STORED ``task_id`` FIELD, and must not
+        be "optimised" to a scoped ``f'esc-{task_id}-*.json'`` glob.  That was
+        rejected on its own merits in esc-3999-2, and contract D11
+        (``index_drift_detector.py``, task 3709) put an opaque dedup key in the
+        task_id slot precisely BECAUSE get_by_task filters on the stored field.
+        Pinned by
+        ``tests/test_queue.py::TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId``,
+        which fails under exactly that swap.
+
+        The counter file ``queue_dir/esc-{key}.seq`` holds the
         last-issued sequence number as plain integer text. In steady state
         this file is the SOLE source of the next sequence: unlike the
         retired directory/archive-scan derivation, make_id() never globs the
@@ -2204,12 +2244,12 @@ class EscalationQueue:
           loss an operator must see — but it is now self-healing rather than
           collision-producing.
         - An absent file: reconciled the same way.  0 recovered is the
-          common, legitimate case (a brand-new task_id) and stays SILENT;
+          common, legitimate case (a brand-new key) and stays SILENT;
           a non-zero recovery means the counter was LOST (aggressive
           cleanup, fresh checkout, disk restore, accidental rm of the
-          non-.json sidecar) while escalations for this task_id already
+          non-.json sidecar) while escalations under this key already
           exist, and is logged as an ERROR.  Note this branch is not only a
-          repair path — every brand-new task_id's FIRST mint takes it and
+          repair path — every brand-new key's FIRST mint takes it and
           pays one reconciliation scan (see ``_recover_seq_from_disk``
           "Cost"); every mint after that is counter-derived and scan-free.
         - An ``OSError`` while reading an EXISTING file (transient I/O error,
@@ -2222,22 +2262,22 @@ class EscalationQueue:
 
         Reconciliation returns ``max(observed sequence on disk) + 1``, so a
         recovered id is strictly greater than every root and archived record
-        for this task_id — it can never be one that ``get()``'s archive
+        under this key — it can never be one that ``get()``'s archive
         fallback resolves to a pre-existing, already-resolved record (task
         3238).  The reconciled value is written durably BEFORE the id is
-        returned, which is what bounds the repair scan to once per task_id
+        returned, which is what bounds the repair scan to once per key
         per counter lifetime.  The residual hole: recovery observes
         SUBMITTED records only, so an id minted but not yet submitted when
         the counter was lost is invisible to it and can still be re-minted.
 
         The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
         see ``_write_seq_counter``) all happen inside
-        ``escalation_id_lock(queue_dir, f'esc-{task_id}.seq')`` so concurrent
-        OS processes minting ids for the SAME task_id serialize on the
-        stable ``esc-{task_id}.seq.json.lock`` sidecar inode and never
+        ``escalation_id_lock(queue_dir, f'esc-{key}.seq')`` so concurrent
+        OS processes minting ids under the SAME key serialize on the
+        stable ``esc-{key}.seq.json.lock`` sidecar inode and never
         observe the same counter value.
         """
-        counter_id = f'esc-{task_id}{SEQ_COUNTER_SUFFIX}'
+        counter_id = f'esc-{key}{SEQ_COUNTER_SUFFIX}'
         counter_path = self.queue_dir / counter_id
         with escalation_id_lock(self.queue_dir, counter_id):
             current = 0
@@ -2245,22 +2285,22 @@ class EscalationQueue:
                 try:
                     current = int(counter_path.read_text().strip())
                 except ValueError as e:
-                    current = self._recover_seq_from_disk(task_id)
+                    current = self._recover_seq_from_disk(key)
                     logger.error(
                         f'make_id: could not parse counter file {counter_path}: {e}; '
                         f'reconciled it from a one-shot bounded root+archive scan for '
-                        f'task_id {task_id!r} (highest observed sequence {current}) and '
-                        f'resuming at {current + 1}, so no already-recorded id is '
+                        f'id-namespace key {key!r} (highest observed sequence {current}) '
+                        f'and resuming at {current + 1}, so no already-recorded id is '
                         'reused (an id minted but never submitted is not observable '
                         'on disk and is not covered)'
                     )
             else:
-                current = self._recover_seq_from_disk(task_id)
+                current = self._recover_seq_from_disk(key)
                 if current > 0:
                     logger.error(
                         f'make_id: counter file {counter_path} is absent but '
-                        f'escalations for task_id {task_id!r} already exist on disk '
-                        f'(highest observed sequence {current}); reconciled the '
+                        f'escalations under id-namespace key {key!r} already exist on '
+                        f'disk (highest observed sequence {current}); reconciled the '
                         f'counter from a one-shot bounded root+archive scan and '
                         f'resuming at {current + 1} rather than re-minting from 1, '
                         'so no already-recorded id is reused (an id minted but '
@@ -2269,7 +2309,7 @@ class EscalationQueue:
                     )
             nxt = current + 1
             self._write_seq_counter(counter_path, nxt)
-            return f'esc-{task_id}-{nxt}'
+            return f'esc-{key}-{nxt}'
 
 
 def observed_submit_response(
