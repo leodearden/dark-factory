@@ -889,20 +889,101 @@ else
   esac
 fi
 
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/dashboard.service.template" \
-  > "$UNIT_DIR/dark-factory-dashboard.service"
+# THE RENDER. No longer `sed ... > "$UNIT_DIR/<unit>"`, and the difference is
+# not stylistic (task 4793).
+#
+# scripts/dashboard.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, which renders to a
+# SINGLE root. Further aggregation roots are host-LOCAL settings, added to the
+# installed unit and deliberately not committed — the committed unit's own
+# comment says so, and nine of them were measured on this host on 2026-08-01. A
+# truncating redirect destroyed eight of those nine on every re-run, and did it
+# INVISIBLY: that variable is on the parity checker's DIVERGENCE_ALLOWLIST
+# (compared by NAME, value blessed), so the post-install check in section 12
+# reported parity afterwards — and the gate above tells the operator to run this
+# script, so following the advice was what caused the loss.
+#
+# THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
+# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# defect one level up: bash truncates the destination before python ever opens
+# it, so the installed value would be gone before it could be read and the tool
+# would preserve nothing while reporting success. --output is read FIRST as the
+# installed copy, then replaced atomically.
+#
+# AND THERE IS DELIBERATELY NO sed FALLBACK. Rendering "the old way" when the
+# renderer is missing would reinstate the exact clobber it replaced, on the one
+# path where nobody is left watching for it — the post-install gate cannot see
+# this variable's value. A missing renderer therefore leaves the unit ALONE and
+# says so, which is the recoverable direction: stale but intact.
+_dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+
+# Set to 1 only by the branch that actually rendered. The section's closing line
+# and the enable below are worded off it rather than printed unconditionally:
+# `fail` here is a printf, not an exit, so without this every degraded path
+# still reached a green "Dashboard units installed" — a line asserting exactly
+# what the FAIL lines above it had just denied.
+_dash_rendered=0
+
+if [ ! -f "$_dash_render_script" ]; then
+  fail "Dashboard unit renderer missing: $_dash_render_script"
+  fail "  NOT rendering it the old way — a plain template render would strip"
+  fail "  this host's local DASHBOARD_KNOWN_PROJECT_ROOTS entries, and the"
+  fail "  post-install parity check cannot see that variable's value."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service is left AS-IS. The watchdog"
+  fail "  units below still install."
+elif python3 "$_dash_render_script" \
+       --template  "$REPO_ROOT/scripts/dashboard.service.template" \
+       --repo-root "$REPO_ROOT" \
+       --uv-path   "$UV_PATH" \
+       --output    "$UNIT_DIR/dark-factory-dashboard.service"; then
+  _dash_rendered=1
+  ok "Dashboard service unit rendered (host-local Environment= values preserved — see the [dashboard_unit_render] lines above)"
+else
+  # The renderer RAN and refused. Without this branch the `elif` chain simply
+  # falls through with status 0 and says nothing about the unit that did not get
+  # written — the same reports-green-because-it-never-ran failure the parity
+  # gate above exists to remove, one construct over. Leaving `_dash_rendered` at
+  # 0 is the other half: it is what keeps the section's closing line from
+  # claiming the install happened.
+  fail "Dashboard service unit render FAILED — see the [dashboard_unit_render]"
+  fail "  report above for which step refused and why."
+  fail "  $UNIT_DIR/dark-factory-dashboard.service was left UNTOUCHED: this"
+  fail "  host's local Environment= values (DASHBOARD_KNOWN_PROJECT_ROOTS)"
+  fail "  survived, and the unit is at worst STALE — which the pre-install"
+  fail "  parity gate reports on the next run. Re-run this script once the"
+  fail "  cause is fixed. The watchdog units below still install: one"
+  fail "  un-renderable service unit must not take its supervision with it."
+fi
 
 # Watchdog service + timer (no templating needed — no repo-specific paths)
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.service" "$UNIT_DIR/"
 cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.timer" "$UNIT_DIR/"
 
 systemctl --user daemon-reload
-systemctl --user enable dark-factory-dashboard
+# GUARDED on the unit existing, not on `_dash_rendered`: a failed render on a
+# host that already HAS the unit must still leave it enabled (stale but
+# supervised is the recoverable direction this whole construct chooses). The
+# combination the guard exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist is a non-zero exit,
+# and under this file's `set -e` that aborts the entire installer before the
+# watchdog TIMER is enabled and before every later section. The two branches
+# above promise "the watchdog units below still install"; this is what makes
+# that promise true rather than true-only-when-a-unit-was-already-there.
+if [ -f "$UNIT_DIR/dark-factory-dashboard.service" ]; then
+  systemctl --user enable dark-factory-dashboard
+else
+  fail "dark-factory-dashboard NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The watchdog timer below still is."
+fi
 systemctl --user enable dark-factory-dashboard-watchdog.timer
-ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+if [ "$_dash_rendered" = "1" ]; then
+  ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+else
+  warn "Dashboard watchdog units installed; the dashboard SERVICE unit was NOT"
+  warn "  rendered — see the FAIL lines above. Whatever copy this host already"
+  warn "  had is untouched and still enabled; a bare host has none."
+fi
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code skill symlinks
