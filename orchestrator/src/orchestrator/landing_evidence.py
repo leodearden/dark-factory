@@ -166,10 +166,27 @@ the ``Harness._branch_is_degenerate`` delegation), ``escalation/server.py``
 Also shared here (INV-5): :func:`format_unattributed_landing_detail` renders
 a rejected verdict into a human-facing ``(summary, detail)`` pair, and
 :func:`file_unattributed_landing_escalation` is the dedup-guarded L1 filing
-boilerplate (queue-None guard, ``has_open_l1`` dedup, ``Escalation``
-construction) that both ``Harness._file_unattributed_landing_escalation``
-and ``SpeculativeMergeWorker._file_unattributed_landing_escalation``
-delegate to — the two differ only in the ``agent_role`` they pass.
+boilerplate (queue-None guard, ``has_open_l1`` dedup, the terminal-record
+auto-dismiss, ``Escalation`` construction) that both
+``Harness._file_unattributed_landing_escalation`` and
+``SpeculativeMergeWorker._file_unattributed_landing_escalation`` delegate
+to — the two differ only in the ``agent_role`` they pass.
+
+That filer carries TWO complementary dedup guards, and the pair is what
+closes the close-then-refile ping-pong for an ABSORBING reject condition —
+the same failure shape task 2870 hit with ``lineage_mismatch`` and
+documented above (task 4499). ``has_open_l1`` asks *is a duplicate still
+OPEN?* and reads PENDING records only, so it necessarily goes False the
+moment the auto-watcher resolves the L1 — and the next tick refiles the
+identical finding, forever. ``EscalationQueue.find_terminal_by_citation``
+asks the complementary question, *was this exact evidence already
+ADJUDICATED?*, against RESOLVED and DISMISSED records carrying the same
+``citation_sha`` this filing would stamp. The asymmetry is deliberate: a
+filing is suppressed ONLY against a terminal record with an identical
+citation sha, so genuine new evidence — a different sha, no sha at all, a
+different task, a different category — always gets through. Suppression is
+the only outcome that LOSES an escalation, so every uncertain path resolves
+toward filing.
 """
 
 from __future__ import annotations
@@ -2184,6 +2201,86 @@ def file_unattributed_landing_escalation(
     open L1 per category rather than one overall — in exchange for not hiding
     provenance defects behind unrelated escalations. Do not widen it back.
 
+    **The filed record carries its evidence identity** (task 4499). The
+    rejected verdict's ``probe['citation']`` — the commit whose landing could
+    not be attributed — is stamped onto the record as ``citation_sha``, so
+    that after the auto-watcher resolves it the ARCHIVED resolution still
+    answers "which evidence was this?". That read-after-resolve is what makes
+    an identical refile recognisable. ``.get`` rather than ``[...]``: this is
+    a best-effort helper and a caller passing a hand-built probe without the
+    key must degrade to ``None`` (no identity, never suppressed) rather than
+    raise. ``probe['citation']`` is populated in BOTH validation modes
+    (CANDIDATE = the candidate sha; DISCOVERY = the discovered citation) and
+    stays ``None`` for a ``no_citation`` reject, which returns before the
+    citation is ever assigned — so that arm carries no identity by
+    construction.
+
+    **The CITATION is the identity, deliberately NOT the effect-check anchor**
+    (task 4499, amendment pass — recorded here so the next reader does not have
+    to re-derive it). The two are the same sha in CANDIDATE mode, but they
+    diverge in DISCOVERY mode: when the citation is an in-branch work commit
+    ``validate_landing_evidence`` anchors the survival check on
+    ``branch_tip_sha`` instead, and it is that ``probe['effect_check_sha']``,
+    not the citation, whose survival was actually measured. Stamping the anchor
+    would look like the more precise identity and is the WRONG choice here,
+    because the two shas have opposite stability: the citation is the newest
+    main commit whose SUBJECT cites the task and moves only when the task lands
+    again, while the branch tip moves on every commit added to the branch.
+    Keying suppression on a moving anchor would re-open the ping-pong on each
+    tip advance — the exact storm this guard exists to close — so the frozen
+    design decision is that the sha, not the probe diagnostics, is the identity.
+
+    The accepted residue: a second incarnation under the same task id that
+    re-lands from a re-created branch is measured against a different anchor,
+    yet suppressed against the earlier adjudication if it still resolves to the
+    same citation commit. That is bounded rather than open-ended —
+    ``find_task_citation_commit`` returns the MOST RECENT subject-citing commit
+    on main, so any re-landing that itself cites the task shifts the citation
+    and lifts the suppression automatically. The window is a re-landing that
+    adds no new subject-citing commit, and the trade is taken knowingly: the
+    alternative fails toward a permanent storm rather than a narrow one.
+    ``test_same_citation_under_a_different_effect_anchor_is_still_suppressed``
+    pins this as intended behaviour, not an oversight.
+
+    **An identical refile is auto-dismissed** (task 4499). ``has_open_l1``
+    above cannot close the close-then-refile ping-pong, and never could: it
+    reads PENDING records, so it goes False by design the moment the
+    auto-watcher resolves the L1 — and because this reject condition is
+    ABSORBING (main only moves forward, so evidence that stopped surviving
+    stays gone) the next tick re-observes the identical finding and refiles
+    it, forever. The second guard therefore consults
+    ``find_terminal_by_citation`` for a RESOLVED or DISMISSED record on this
+    task carrying the same ``citation_sha``, and returns without filing when
+    one exists. The two guards are complementary — *is a duplicate still
+    OPEN?* versus *was this exact evidence already ADJUDICATED?* — and the
+    category scoping on the first one is task 3116's, load-bearing, and not
+    re-derived here.
+
+    The asymmetry is deliberate and is the safety property: suppression
+    applies ONLY against a terminal record with an IDENTICAL citation sha, so
+    genuine new evidence always gets through — a different sha, no sha at all
+    (a ``no_citation`` reject can never suppress, by the falsy-key
+    short-circuit), a different task, or a different category. Suppression is
+    the only outcome that LOSES an escalation, so it is the narrowest of the
+    two guards by construction.
+
+    For the same reason the suppression lookup **fails open**: it is wrapped in
+    its own ``try/except`` (and its attribute ``getattr``-guarded, so an older
+    or duck-typed queue stand-in files as before) rather than being allowed to
+    reach the outer blanket ``except`` below, which would drop the filing
+    entirely. Its failure direction has to be "file, possibly a duplicate", not
+    "lose this escalation now" — the policy ``find_dedupe_parent``'s falsy-key
+    short-circuit and ``gate_backlog_fingerprint_key``'s documented
+    fail-toward-duplicates rule already encode. The counter bump is wrapped
+    separately for the mirror-image reason: it is observability, not the
+    decision, so its failure must not re-open the storm.
+
+    Note the resulting, deliberate CONTRAST with ``has_open_l1``: a raising
+    ``has_open_l1`` still DOES drop the filing (it reaches the outer blanket
+    except, as ``test_raising_queue_is_contained`` pins), because ITS failure
+    direction is "file a duplicate on the next tick" — recoverable. A raising
+    ``find_terminal_by_citation`` is not, so it is handled differently.
+
     Args:
         escalation_queue: The caller's ``EscalationQueue``, or ``None``.
         task_id: The task (or coalesce member) id the escalation is filed for.
@@ -2200,6 +2297,68 @@ def file_unattributed_landing_escalation(
             task_id, category='provenance_unattributed',
         ):
             return
+        citation_sha = verdict.probe.get('citation')
+        # AUTO-DISMISS an identical refile (task 4499).  Sits AFTER the pending
+        # guard above — the two are complementary, not redundant: that one asks
+        # "is a duplicate still OPEN?" (pending-only), this one asks "was this
+        # exact evidence already ADJUDICATED?" (terminal-only).  It must run
+        # BEFORE make_id below, so a suppressed refile burns no sequence number.
+        #
+        # It FAILS OPEN, in its own try/except rather than the function's outer
+        # blanket one below.  Suppression is the ONLY outcome here that LOSES an
+        # escalation, so the two failure directions are not symmetric: a guard
+        # that errs toward FILING costs a duplicate record someone closes, while
+        # one that errs toward SUPPRESSING costs a provenance defect nobody ever
+        # sees.  Letting this call reach the outer except would take the second
+        # direction — it would drop the filing on the floor.  Same policy as
+        # ``find_dedupe_parent``'s falsy-key short-circuit and
+        # ``gate_backlog_fingerprint_key``'s fail-toward-duplicates rule.
+        #
+        # ``getattr`` for the attribute itself so a duck-typed or older queue
+        # stand-in that lacks the method files as before rather than raising.
+        prior = None
+        finder = getattr(escalation_queue, 'find_terminal_by_citation', None)
+        if finder is not None:
+            try:
+                prior = finder(task_id, 'provenance_unattributed', citation_sha)
+            except Exception:
+                logger.warning(
+                    'Suppression lookup failed for task %s (citation %s) — '
+                    'filing anyway rather than risk losing the escalation',
+                    task_id, citation_sha, exc_info=True,
+                )
+        if prior is not None:
+            # INV-4 storm counter: record the suppression ON the resolution
+            # that absorbed it, so the storm is a durable structured fact and
+            # not merely the WARNING below (INV-2).  Deliberately
+            # UNTHRESHOLDED — escalating at a count would file the very
+            # escalation this guard exists to suppress, recreating the
+            # close-then-refile storm one level up.
+            #
+            # Its OWN try/except: a bookkeeping-counter failure must never
+            # turn into a re-opened escalation, and must never propagate out
+            # of this best-effort helper.  ``getattr`` for the same
+            # duck-typed-stand-in reason as the lookup itself.
+            absorbed = None
+            noter = getattr(escalation_queue, 'note_suppressed_refile', None)
+            if noter is not None:
+                try:
+                    counted = noter(prior.id)
+                    absorbed = getattr(counted, 'refiles_suppressed', None)
+                except Exception:
+                    logger.warning(
+                        'Failed to count a suppressed provenance_unattributed '
+                        'refile against %s — suppressing anyway',
+                        prior.id, exc_info=True,
+                    )
+            logger.warning(
+                'Suppressing provenance_unattributed refile for task %s '
+                '(branch %s, citation %s): already adjudicated by %s '
+                '(%s by %s); refiles absorbed so far: %s',
+                task_id, branch, citation_sha, prior.id, prior.status,
+                prior.resolved_by, absorbed if absorbed is not None else 'uncounted',
+            )
+            return
         from escalation.models import Escalation  # noqa: PLC0415
 
         summary, detail = format_unattributed_landing_detail(task_id, branch, verdict)
@@ -2213,6 +2372,15 @@ def file_unattributed_landing_escalation(
             detail=detail,
             suggested_action='investigate_unattributed_landing_evidence',
             level=1,
+            # The evidence identity this filing could not attribute — the
+            # identity half of the ``(task_id, category, citation_sha)``
+            # triple read back AFTER this record is resolved to suppress an
+            # identical refile.  Without the stamp there is nothing to match
+            # on and the close-then-refile ping-pong cannot be closed.
+            # ``.get``, not ``[...]``: a caller passing a hand-built probe
+            # without the key must degrade to None (= never suppress) rather
+            # than raise inside this best-effort helper.
+            citation_sha=citation_sha,
         )
         escalation_queue.submit(esc)
         logger.warning(

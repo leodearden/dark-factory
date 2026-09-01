@@ -417,6 +417,42 @@ class Escalation:
     # filter as every field above.
     root_cause_variants: list[str] = field(default_factory=list)
     root_cause_variants_truncated: int = 0
+    # The evidence commit whose landing this filing could NOT attribute — the
+    # `verdict.probe['citation']` of the rejected landing-evidence verdict
+    # (task 4499).  Written at FILING time by
+    # `orchestrator.landing_evidence::file_unattributed_landing_escalation`,
+    # and read back AFTER the record has been resolved as the identity half of
+    # the `(task_id, category, citation_sha)` triple that suppresses an
+    # identical refile.  That read-after-resolve is the whole point: the reject
+    # condition is ABSORBING (main only moves forward, so lines that stopped
+    # surviving stay gone), so once the auto-watcher closes the L1 the
+    # pending-only `has_open_l1` guard goes False and the very next tick refiles
+    # the same finding — a close-then-refile ping-pong. Matching on the citation
+    # makes "this exact evidence was already adjudicated" answerable from the
+    # archived resolution.
+    #
+    # `None` means NO EVIDENCE IDENTITY — a `no_citation` reject, or any
+    # non-provenance escalation — and NEVER suppresses anything: the lookup
+    # short-circuits on a falsy key, so an absent identity always files.
+    #
+    # `refiles_suppressed` is that suppression's INV-4 storm counter: how many
+    # identical refiles this record's resolution has absorbed.  It keeps the
+    # suppression a durable STRUCTURED fact rather than log-only (INV-2), the
+    # same role `dedupe_count` plays for the fold path.  Deliberately
+    # UNTHRESHOLDED — escalating on repeated suppression would recreate the
+    # storm the suppression exists to stop.
+    #
+    # Zero migration, same pattern as members / evidence / train_state / the
+    # triage quad / granted_files / filing_claimant_run_id / amendments /
+    # root_cause_variants above: legacy JSON without these keys deserialises to
+    # the defaults via the from_dict __dataclass_fields__ filter below,
+    # to_dict's asdict() serialises them automatically, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    # Deliberately NOT added to `_COMPACT_ESCALATION_FIELDS` (server.py) —
+    # machine-internal filing bookkeeping, not triage-facing.
+    citation_sha: str | None = None
+    refiles_suppressed: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

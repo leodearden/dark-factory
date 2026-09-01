@@ -740,6 +740,86 @@ class EscalationQueue:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
         return bool(open_l1s)
 
+    def find_terminal_by_citation(
+        self, task_id: str, category: str, citation_sha: str | None,
+    ) -> Escalation | None:
+        """Newest TERMINAL record matching ``(task_id, category, citation_sha)``, or None.
+
+        A PURE READ with no side effects.  It answers one question: *was this
+        exact evidence already adjudicated?*  ``has_open_l1`` above answers the
+        complementary one — *is a duplicate still OPEN?* — and reads PENDING
+        records only.  The two are deliberately disjoint: a PENDING match is
+        NOT reported here, because that case is already ``has_open_l1``'s
+        contract and reporting it in both places would blur which guard fired.
+
+        Why a terminal-record read exists at all (task 4499): the
+        ``provenance_unattributed`` reject condition is ABSORBING — main only
+        moves forward, so evidence that stopped surviving stays gone.  Once the
+        auto-watcher resolves the L1, the pending-only guard goes False and the
+        next tick refiles the identical finding, forever: a close-then-refile
+        ping-pong.  Matching the citation sha carried on the RESOLUTION makes
+        "already adjudicated" answerable from the archive, so the refile can be
+        suppressed while genuine NEW evidence (a different sha, or none at all)
+        still gets through.
+
+        A falsy *citation_sha* short-circuits to None — the
+        ``find_dedupe_parent`` falsy-key convention.  An absent identity is not
+        an identity, and suppressing on one would collapse unrelated findings.
+
+        Cost — why the TARGETED per-task glob (``esc-{task_id}-*.json`` over
+        the queue root plus ``_iter_archive_paths``, the shape
+        ``_recover_seq_from_disk`` already uses) rather than
+        ``get_by_task``'s full-archive ``esc-*.json`` rglob: this runs on the
+        REJECT path, which is exactly the path that recurs every tick in the
+        storm case being fixed, over an archive shared across 7+ projects.  An
+        O(whole-archive) parse per tick would be the wrong bound.
+
+        The ``.json`` suffix is load-bearing for the same three reasons
+        ``_recover_seq_from_disk`` lists: it excludes the
+        ``esc-{task_id}{SEQ_COUNTER_SUFFIX}`` counter, the ``{id}.json.lock``
+        sidecars, and submit's ``{id}.tmp`` staging files.  The glob
+        OVER-matches sibling hyphenated task ids (``esc-1-2-3-9.json`` when
+        scanning task ``'1-2'``), so the record's own ``task_id`` field — never
+        a filename parse — is the authoritative filter.
+        """
+        if not citation_sha:
+            return None
+
+        pattern = f'esc-{task_id}-*.json'
+        newest: Escalation | None = None
+        newest_ts = datetime.min.replace(tzinfo=UTC)
+        for path in itertools.chain(
+            self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
+        ):
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse {path}: {e}')
+                continue
+            # task_id is authoritative — the glob over-matches hyphenated siblings.
+            if esc.task_id != task_id:
+                continue
+            if esc.category != category:
+                continue
+            if esc.citation_sha != citation_sha:
+                continue
+            if esc.status not in ('resolved', 'dismissed'):
+                continue
+            # Malformed stamps sort OLDEST (never dropped, never displacing a
+            # well-formed newer match) and are logged loudly, not swallowed.
+            ts, _ = parse_timestamp_or_warn(
+                esc.resolved_at,
+                fallback=datetime.min.replace(tzinfo=UTC),
+                context='queue.find_terminal_by_citation',
+            )
+            # Strictly-newer displaces, so a TIE keeps the incumbent — and the
+            # queue root is scanned first, matching get_by_task's "queue_dir
+            # copy takes precedence" rule for a root/archive duplicate pair.
+            if newest is None or ts > newest_ts:
+                newest, newest_ts = esc, ts
+
+        return newest
+
     def get_pending(self) -> list[Escalation]:
         """Get all pending escalations."""
         results = []
@@ -1606,6 +1686,82 @@ class EscalationQueue:
 
         # Atomically rewrite AT THE SAME PATH (tmp file in path.parent, not queue root).
         self._atomic_write_path(path, esc.to_json())
+        return esc
+
+    def note_suppressed_refile(self, escalation_id: str) -> Escalation | None:
+        """Record that this record's resolution absorbed one identical refile.
+
+        The INV-4 storm counter for the auto-dismiss path (task 4499).  When
+        ``find_terminal_by_citation`` matches, the refile is dropped without a
+        record being filed — so without this bump the suppression would be
+        LOG-ONLY, and "this adjudication has silently absorbed 900 refiles"
+        would be unobservable from the record itself (INV-2
+        ``structured-facts-at-failure``).  ``refiles_suppressed`` plays the
+        same role for suppression that ``dedupe_count`` plays for the fold
+        path: a durable, bounded recurrence signal on the surviving record.
+
+        Deliberately UNTHRESHOLDED — it never escalates at a count.  Escalating
+        on repeated suppression would file the very escalation the suppression
+        exists to stop, recreating the close-then-refile storm one level up.
+        INV-4's applicable house pattern here is the storm COUNTER, not a
+        threshold escalation.
+
+        WHO HEARS ABOUT IT — INV-4's other half, answered by name rather than
+        left for the next reader to hunt for (amendment pass, task 4499).  The
+        counter is readable from the ``get_escalation(escalation_id)`` MCP tool,
+        which returns ``Escalation.to_dict()`` — a bare ``asdict``, so both
+        ``refiles_suppressed`` and ``citation_sha`` are on that response with no
+        whitelist to widen (verified end-to-end, not assumed).  It is
+        deliberately NOT on the compact LIST rows: ``_COMPACT_ESCALATION_FIELDS``
+        is an exact-key-tested whitelist for triage drains, and a field that is
+        non-zero only on already-adjudicated records has no business inflating
+        every pending row.
+
+        The residual gap is DISCOVERY, not access: the counter accrues only on
+        RESOLVED/DISMISSED records, which no triage surface lists, so reading it
+        means knowing the id to ask about.  The suppression WARNING in
+        ``file_unattributed_landing_escalation`` names that id on every
+        suppression, which is the intended entry point; a listing surface or a
+        named operator query for "resolutions absorbing refiles" is genuine
+        follow-up work and is filed as such rather than being silently assumed.
+
+        Locking: unlike ``patch_resolution_metadata`` above (a last-write-wins
+        field SET) this is a genuine INCREMENT, so the whole read-modify-write
+        runs under ``escalation_id_lock`` — a concurrent same-id bump from
+        another harness/worker process must not be lost.  The lock sidecar
+        lives in ``queue_dir`` and is stable regardless of whether the record
+        currently sits in the root or the archive.
+
+        Patches the record IN PLACE wherever it lives, via ``_locate_path`` +
+        ``_atomic_write_path`` — NOT ``_rewrite``/``_atomic_write``, which
+        always target the queue root and would resurrect an archived record
+        out of the archive.
+
+        Returns None (writing nothing) when the record is missing, unparseable,
+        or still pending — a pending record has absorbed nothing, since it is
+        its own open-L1 veto that suppresses the refile.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
+
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+
+            if esc.status not in ('resolved', 'dismissed'):
+                return None
+
+            esc.refiles_suppressed += 1
+            self._atomic_write_path(path, esc.to_json())
+
+        logger.info(
+            f'Escalation {escalation_id} has now absorbed '
+            f'{esc.refiles_suppressed} identical refile(s)'
+        )
         return esc
 
     def _rewrite(self, escalation_id: str, escalation: Escalation) -> None:
