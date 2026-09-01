@@ -50,16 +50,21 @@ def _clear_escape_latch():
     but pinning that independence here means a future test reusing a path can
     never silently observe another test's suppression.
 
-    BOTH structures are cleared. ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` suppresses just
+    ALL THREE structures are cleared. ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` suppresses just
     as effectively as ``_RUFF_ESCAPE_REPORTED`` once it reaches the cap, so an
     un-cleared attempt counter would leak silence across tests — and it would do
     so invisibly, since a suppressed probe emits nothing to assert against.
+    ``_RUFF_ESCAPE_IN_FLIGHT`` is released in a ``finally`` and so should always
+    be empty between tests; it is cleared anyway so that a test which crashes
+    the event loop mid-probe cannot mute the NEXT test's probe.
     """
     verify._RUFF_ESCAPE_REPORTED.clear()
     verify._RUFF_ESCAPE_PROBE_ATTEMPTS.clear()
+    verify._RUFF_ESCAPE_IN_FLIGHT.clear()
     yield
     verify._RUFF_ESCAPE_REPORTED.clear()
     verify._RUFF_ESCAPE_PROBE_ATTEMPTS.clear()
+    verify._RUFF_ESCAPE_IN_FLIGHT.clear()
 
 
 
@@ -727,6 +732,117 @@ class TestUnmeasuredProbeDoesNotLatchSilence:
         )
         # Nothing was ever measured, so nothing is ever claimed.
         assert _escape_records(caplog) == []
+
+
+class TestLatchDedupesUnderCONCURRENTLintLegs:
+    """The latch must dedupe under the concurrency it was BUILT for.
+
+    Every other latch test in this module awaits its verifications
+    SEQUENTIALLY, so each one observes the previous one's completed write.  That
+    shape cannot distinguish a correct latch from a check-then-set spanning the
+    ``await``, and production never has that shape: ``verify_all_modules`` fans
+    the per-module ``run_verification`` calls out with
+    ``asyncio.gather(*(run_verification(...) for mc in module_configs.values()))``
+    and the merge lane does the same in ``merge_queue.py::_run_one``.  So every
+    concurrent lint leg on one worktree reaches the latch check before ANY of
+    them finishes its probe.
+
+    Two distinct things break without a synchronous reservation, and they are
+    pinned separately below because they fail differently:
+
+    * the RECORD stops being at-most-once — N legs each emit the full multi-line
+      WARNING, the exact noise the latch exists to prevent;
+    * the attempt CAP stops bounding spawns — N concurrent probes all read the
+      same attempt count and write ``count + 1``, so the counter advances once
+      per ROUND rather than once per attempt, admitting roughly
+      ``N * _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS`` doomed 20s-timeout subprocesses.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_modules_on_one_worktree_probe_once(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            # The production shape verbatim: gather, not sequential awaits.
+            await asyncio.gather(*(
+                _verify_with_stubbed_spawn(
+                    worktree, tmp_path, lint_rc=0, prefix=f'mod{i}',
+                )
+                for i in range(4)
+            ))
+
+        assert len(probe_spy) == 1, (
+            f'concurrent lint legs each spawned a probe: {probe_spy}'
+        )
+        assert len(_escape_records(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_unmeasurable_probes_still_plateau_at_the_cap(
+        self, geometry, tmp_path, caplog,
+    ):
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+        cap = verify._RUFF_ESCAPE_MAX_PROBE_ATTEMPTS
+        fanout = 4
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            _probe_unmeasurable(None) as calls,
+        ):
+            # Rounds of CONCURRENT legs.  Enough rounds that a per-round counter
+            # would also plateau, so the two implementations are separated by
+            # the total spawn COUNT rather than by the number of rounds run.
+            for _ in range(cap + 3):
+                await asyncio.gather(*(
+                    verify._report_ruff_config_escape(worktree)
+                    for _ in range(fanout)
+                ))
+
+        assert len(calls) == cap, (
+            f'concurrent probes overran the cap ({cap}): {len(calls)} spawns; '
+            f'a per-round counter would admit up to {cap * fanout}'
+        )
+        assert _escape_records(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_losing_leg_does_not_permanently_lose_its_turn(
+        self, geometry, tmp_path, caplog,
+    ):
+        """Reserving must not become a THIRD way to latch silence.
+
+        ``_RUFF_ESCAPE_IN_FLIGHT`` suppresses a concurrent duplicate, so it has
+        the same power to mute a key as the other two structures.  It is
+        released in a ``finally`` precisely so that power lasts only as long as
+        the probe does: once an unmeasurable round finishes, the NEXT round must
+        be free to ask again.
+        """
+        parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            # One unmeasurable round of 3, then the live helper answers.
+            _probe_unmeasurable(1) as calls,
+        ):
+            await asyncio.gather(*(
+                verify._report_ruff_config_escape(worktree) for _ in range(3)
+            ))
+            assert _escape_records(caplog) == [], 'reported without measuring'
+            assert len(calls) == 1, f'the reservation did not hold: {calls}'
+
+            await asyncio.gather(*(
+                verify._report_ruff_config_escape(worktree) for _ in range(3)
+            ))
+
+        assert len(calls) == 2, (
+            f'an in-flight reservation outlived its probe: {calls}'
+        )
+        records = _escape_records(caplog)
+        assert len(records) == 1, f'the real escape was never reported: {records}'
+        assert str(parent / 'pyproject.toml') in records[0].getMessage()
 
 
 class TestProbeTargetFallback:

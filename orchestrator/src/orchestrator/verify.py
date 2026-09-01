@@ -4019,6 +4019,26 @@ _RUFF_ESCAPE_REPORTED: set[_RuffEscapeLatchKey] = set()
 _RUFF_ESCAPE_PROBE_ATTEMPTS: dict[_RuffEscapeLatchKey, int] = {}
 _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS: int = 3
 
+# Keys whose probe is RUNNING right now.  A THIRD structure because neither of
+# the two above can express "asked but not yet answered": ``_report_ruff_config
+# _escape`` yields at ``await asyncio.to_thread`` and only records its outcome
+# after the probe returns, so a plain check-then-set would be a read of the two
+# structures separated from their write by a suspension point.  Production fans
+# the per-module ``run_verification`` calls out CONCURRENTLY
+# (``verify_all_modules``'s ``asyncio.gather``, and the merge lane's
+# ``merge_queue.py::_run_one``), so every concurrent lint leg on one worktree
+# would clear the latch check before ANY of them finished: N probes, N copies of
+# the multi-line WARNING, and an attempt counter that advances by one per ROUND
+# instead of per attempt — admitting ~N*_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS doomed
+# 20s-timeout subprocesses instead of the bounded 3.
+#
+# Reserved SYNCHRONOUSLY, in the same await-free block as the latch check, which
+# is what makes the reservation atomic under asyncio's single-threaded loop;
+# discarded in a ``finally`` so a losing leg re-asks on the NEXT lint leg rather
+# than being suppressed forever.  A concurrent loser returns silently instead of
+# waiting: the record is a diagnostic, and one copy of it is the whole point.
+_RUFF_ESCAPE_IN_FLIGHT: set[_RuffEscapeLatchKey] = set()
+
 
 async def _report_ruff_config_escape(worktree: Path) -> None:
     """Emit the ONE non-fatal diagnostic for a worktree whose ruff config escapes.
@@ -4043,23 +4063,41 @@ async def _report_ruff_config_escape(worktree: Path) -> None:
     ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` instead and is retried on the next lint leg,
     up to ``_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS``.
 
+    CONCURRENCY-SAFE by reservation, not by luck: the latch check and the
+    ``_RUFF_ESCAPE_IN_FLIGHT`` reserve happen in one await-free block, because
+    the concurrency this exists for is exactly the case where several lint legs
+    for ONE worktree are in flight at once (``asyncio.gather`` over per-module
+    ``run_verification`` calls).  A check-then-set spanning the ``await`` below
+    would dedupe nothing.
+
     Structurally non-fatal — nothing here propagates.
     """
     key = _ruff_escape_latch_key(Path(worktree))
+    # ---- BEGIN await-free reservation block ----------------------------------
+    # Everything from the check to the two writes below must stay free of ``await``:
+    # that is the ONLY thing making the reserve atomic against the concurrent
+    # lint legs described above ``_RUFF_ESCAPE_IN_FLIGHT``.  Do not introduce a
+    # suspension point here.
     if (
         key in _RUFF_ESCAPE_REPORTED
+        or key in _RUFF_ESCAPE_IN_FLIGHT
         or _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS
     ):
         return
+    _RUFF_ESCAPE_IN_FLIGHT.add(key)
+    # Counted HERE rather than on the unmeasured path, so the cap bounds ACTUAL
+    # probe spawns.  Popped again below the moment the key is measured, so a
+    # measured key never leaves a counter behind.
+    attempts = _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) + 1
+    _RUFF_ESCAPE_PROBE_ATTEMPTS[key] = attempts
+    # ---- END await-free reservation block ------------------------------------
     try:
         settings = await asyncio.to_thread(_ruff_settings_path, Path(worktree))
         if settings is None:
-            # UNMEASURED, which is not the same as "no escape": count the
-            # attempt and let the next lint leg ask again.  ``_ruff_settings_path``
-            # has already logged WHICH give-up reason fired; this logs the
-            # give-up on the KEY, once, as the cap is reached.
-            attempts = _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) + 1
-            _RUFF_ESCAPE_PROBE_ATTEMPTS[key] = attempts
+            # UNMEASURED, which is not the same as "no escape": the attempt is
+            # already counted, so just let the next lint leg ask again.
+            # ``_ruff_settings_path`` has already logged WHICH give-up reason
+            # fired; this logs the give-up on the KEY, once, as the cap is reached.
             if attempts >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS:
                 logger.debug(
                     'ruff config-escape probe gave up on %s: unmeasurable on '
@@ -4100,7 +4138,15 @@ async def _report_ruff_config_escape(worktree: Path) -> None:
         # Intentionally blind: a DIAGNOSTIC must never be able to red a verify,
         # so every failure mode degrades to a DEBUG line and silence. The
         # helpers above are already total; this is the belt-and-braces layer.
+        # The attempt reserved above is deliberately NOT refunded here: a raising
+        # probe is a spawn that happened and must count against the cap, or a
+        # deterministic raise would retry unboundedly for the life of the process.
         logger.debug('ruff config-escape probe failed; skipping', exc_info=True)
+    finally:
+        # Always released, so a key is only ever suppressed by an ANSWER
+        # (``_RUFF_ESCAPE_REPORTED``) or by the attempt cap — never by a probe
+        # that already finished.
+        _RUFF_ESCAPE_IN_FLIGHT.discard(key)
 
 
 @dataclass(frozen=True)
