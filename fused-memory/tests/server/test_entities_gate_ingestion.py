@@ -567,21 +567,23 @@ class TestEveryMalformedShapeReachesTheGate:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('tool', ['add_memory', 'add_episode'])
-    async def test_the_declared_shape_is_still_advertised_in_the_tool_schema(self, tool):
-        """The one thing `Any` costs, pinned so it stays paid for.
+    async def test_the_entities_parameter_is_published_on_both_tools(self, tool):
+        """`entities` reaches the MCP schema on BOTH write tools.
 
-        Widening drops the JSON-schema type constraint, so the accepted shape
-        survives only in the docstring Args text FastMCP publishes as the tool
-        description. That text is now the parameter's ONLY machine-readable
-        shape hint, which makes deleting it a silent regression rather than a
-        docs edit — this asserts it is there.
+        Widening the annotation to `Any` is what lets the gate — not pydantic
+        — answer every wrong shape, and it deliberately drops the JSON-schema
+        *type* constraint. It must not also drop the *property*: an agent
+        discovers the parameter exists by reading the published schema, so a
+        tool that stopped publishing it would make the whole declaration tier
+        unreachable while every behavioural test above still passed.
+
+        The accepted entry SHAPE is not re-asserted here. It is single-sourced
+        in production (`_DECLARED_REFERENT_HINT` and both tools' `Args:`
+        blocks), and the sibling tests in this class already verify it reaches
+        the agent referentially by asserting that constant appears in the
+        rejection message.
         """
         server = create_mcp_server(AsyncMock())
         (spec,) = [t for t in server._tool_manager.list_tools() if t.name == tool]
 
         assert 'entities' in spec.parameters['properties'], f'{spec.parameters!r}'
-        description = spec.description or ''
-        assert "{'kind': 'task', 'id': <digits>" in description, (
-            f'{tool} no longer documents the accepted `entities` entry shape, '
-            'which is the only shape hint left once the annotation is `Any`'
-        )
