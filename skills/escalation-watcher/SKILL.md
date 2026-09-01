@@ -1040,14 +1040,80 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 When the probe fires, the item's ask changes from "human must decide" to **"human must ratify and
 propagate"** — a much cheaper request. Present it that way, with the recovered ruling attached.
 
-**This check is REPORT-ONLY — it must never close anything on its own.** A record can be a
-deliberately-preserved PIN whose value is its *existence*, not its question: esc-3105-3 scores
-15/15 ruled members on this probe and must NOT be closed (it is the last hold on task 3105 /
-task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk close cascade on
-2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag). From the member chain alone, a
-pin and an answered question are indistinguishable. Until task 4377 lands `pin_declared_by` as the
-machine-readable opt-out, the only protection is reading the record and its companions before
-proposing any disposition.
+**This check is REPORT-ONLY — with exactly ONE carve-out (below), it must never close anything on
+its own.** A record can be a deliberately-preserved PIN whose value is its *existence*, not its
+question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be closed (it is the
+last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
+close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
+`root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
+question are indistinguishable. Until task 4377 lands `pin_declared_by` as the machine-readable
+opt-out, the only protection is reading the record and its companions before proposing any
+disposition.
+
+**Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
+permission a second time to do the bookkeeping on a decision he has already made and that has
+already been executed. When a session ruled a record, did the world-facing work, and then
+terminated without closing the record, closing it is **mechanical, not a new decision** — close it
+yourself and report afterwards. This is safe only because the checklist below demands positive
+documentary evidence of a *specific human ruling*, which a pin by construction never has: the
+report-only default exists because a pin and an answered question are indistinguishable FROM THE
+MEMBER CHAIN ALONE, and nothing here takes the member chain as its authority. esc-3105-3 /
+esc-3105-5 fails at item 5 and keeps working exactly as it does today.
+
+**All six gates must hold. Any miss ⇒ report-only, unchanged.**
+
+1. **The ruling is Leo's OWN and EXPLICIT — never inferred.** It must be attributable in writing:
+   a task description, a commit message, a fused-memory ruling record, or another escalation's
+   `resolution` text that names him ruling it. An agent's recommendation, a `triage_note`'s
+   conclusion, a `suggested_action`, or your own read that "this looks settled" does NOT qualify.
+2. **The ruling names THIS record** — by escalation id, or it unambiguously answers this record's
+   specific question. A ruling on an adjacent topic in the same programme does not qualify.
+3. **The ruling was EXECUTED, and that is verifiable NOW.** The world-facing change — task
+   retargeted or rewritten, dependencies wired, commit landed, config flipped — must be observable
+   at close time, not merely promised in the ruling text. Go look; never take the ruling's own word
+   for its own execution.
+4. **The originating session has TERMINATED.** Do not race a live session. Peer sessions are
+   enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
+   work landed hours ago with the record still open is terminated for this purpose. If it may still
+   be running, leave the record and note it.
+5. **The record is NOT a pin.** `pins_recovery` is empty, `root_cause` is not a
+   `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same task.
+   **This is the protection that must not be weakened** — if any of the three is unclear, treat the
+   record as a pin and stop.
+6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
+   task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
+   look sideways before moving on" under "Resolving Escalations" below).
+
+**When all six hold:**
+
+- Resolve with the appropriate C1 action — usually `resume`; `close_only` when the record is a
+  re-report of an already-ruled class and nothing about the task should change.
+- Write the recovered ruling into the `resolution` verbatim-in-substance, and **name where the
+  ruling lives** (briefing artifact id, commit sha, task id) so the next reader does not re-derive
+  it — and record which residual questions are owned by which tasks, rather than letting the close
+  imply those closed too.
+- **Report the action to Leo afterwards.** No permission needed; the close is never silent.
+
+Worked example — **esc-3881-3** (`design_concern`, `info`, task 3881) asked for sign-off on
+retargeting task 3881 away from a named consumer (`_split_cross_project_task_nodes`) that does not
+exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing (artifact
+`b9b4c172-6853-4a12-b242-1a139bd4bb50`) and the ruling was fully executed — task 3881's description
+now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
+briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
+— but that session ran out of context before closing the record, so the L2 sat pending with its
+question already answered. `pins_recovery` empty, `root_cause` the substantive
+`design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
+`esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
+
+**Expect orphans; they are not anomalies.** That same sitting's docs commit (`3057ffedfd`) recorded
+the esc-3673-1 / esc-3375-1 half of the ruling and never mentioned 3881 at all — which is exactly
+how the record got orphaned. A ruling's propagation is routinely PARTIAL, so a ruled-and-executed
+record left open is the expected residue of a large sitting, not a sign that something went wrong.
+
+**Everything that FAILS the checklist stays report-only**: the ask is still "human must ratify and
+propagate", and if you park it, park with a world-facing predicate naming where the candidate
+ruling lives — never a predicate about the record's own status (see "Reading a triage-ack
+annotation" above).
 
 **If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
 done by hand): before designating any survivor, run this check on the shared members. Never keep
