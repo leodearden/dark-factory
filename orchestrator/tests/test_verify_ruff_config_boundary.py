@@ -10,10 +10,13 @@ concurrently-verifying sibling worktree.
 
 The adopted fix has two halves, and this module guards both:
 
-* the CACHE half is FIXED — ``_run_cmd`` threads its ``cwd`` (the worktree
-  root, verbatim, for the lint leg) into ``_target_subprocess_env`` so every
-  verify spawn gets a worktree-local ``RUFF_CACHE_DIR``.  Measured rule-neutral
-  on ruff 0.15.9, hence applied unconditionally.
+* the CACHE half is FIXED — ``_run_cmd`` threads its ``cwd`` into
+  ``_target_subprocess_env`` so every verify spawn gets a worktree-local
+  ``RUFF_CACHE_DIR``.  Measured rule-neutral on ruff 0.15.9, hence applied
+  unconditionally.  The anchor is the SUBPROCESS cwd, which segmentation may
+  place in a subdirectory of the worktree rather than at its root — still
+  inside the boundary, which is the property that matters, and pinned below
+  by ``test_segmented_chain_anchors_each_segment_at_its_own_cwd``.
 * the CONFIG half is made LOUD, not fixed — see ``_settings_path_escapes``.  It
   cannot be fixed safely at the gate (a ``--config`` pin aimed at a rule-less
   pyproject silently falls back to ruff's built-in defaults) and it must not be
@@ -27,6 +30,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -39,6 +43,7 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_verification
+from orchestrator.verify_cmd import split_and_chain_segments
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +107,57 @@ class TestRunCmdThreadsWorktreeIntoRuffCache:
 
         assert rc == 0, out
         assert out.strip() == chosen
+
+    def test_segmented_chain_anchors_each_segment_at_its_own_cwd(self, tmp_path):
+        """The anchor is the SUBPROCESS cwd, which segmentation moves off the root.
+
+        The reviewer's finding this pins: the comment above the
+        ``_target_subprocess_env`` call used to claim the cwd is "the worktree
+        ROOT verbatim" for the lint leg.  That holds only for an UNSEGMENTED
+        command.  ``_run_segmented`` spawns each clause of a ``cd X && …`` chain
+        under ``worktree / segment.cwd_rel`` — and this repo's own root
+        test_command is exactly such a chain — so each segment anchors its cache
+        at its OWN directory.
+
+        Driven through the REAL splitter and the REAL ``_run_cmd`` rather than a
+        hand-passed subdirectory: the coupling under test is between
+        ``_run_segmented``'s cwd arithmetic and the env builder, and passing a
+        subdir by hand would prove only that the builder uses its argument.
+
+        Asserts the two properties that actually matter, and deliberately not
+        that all segments share one cache: every anchor stays INSIDE the
+        worktree (the task-3922 boundary property, which is what a shared
+        ``.ruff_cache`` in the parent checkout violated), and the per-segment
+        fragmentation is real rather than assumed away.
+        """
+        for pkg in ('pkg_a', 'pkg_b'):
+            (tmp_path / pkg).mkdir()
+
+        segments = split_and_chain_segments(
+            'cd pkg_a && echo "$RUFF_CACHE_DIR" && cd ../pkg_b && echo "$RUFF_CACHE_DIR"'
+        )
+        assert segments is not None, 'the chain must decompose, or the test proves nothing'
+        assert [s.cwd_rel for s in segments] == ['pkg_a', 'pkg_b']
+
+        async def run_one(cmd, cwd, timeout, label):
+            return await verify._run_cmd(cmd, cwd, timeout)
+
+        rc, out, timed_out, _entries = asyncio.run(
+            verify._run_segmented(
+                segments, run_one=run_one, worktree=tmp_path, budget_secs=60,
+            )
+        )
+
+        assert rc == 0, out
+        assert timed_out is False
+        # Fragmented per segment directory — the honest invariant.
+        assert str(tmp_path / 'pkg_a' / '.ruff_cache') in out
+        assert str(tmp_path / 'pkg_b' / '.ruff_cache') in out
+        # …and every anchor is still inside the worktree, which is the property
+        # task 3922 exists to guarantee.
+        for line in (ln.strip() for ln in out.splitlines()):
+            if line.endswith('.ruff_cache'):
+                assert Path(line).is_relative_to(tmp_path), line
 
 
 _RUFF_TABLE = """
@@ -406,9 +462,10 @@ class TestEscapeProbeIsGated:
 
     Both properties below are invisible to the tests above, because the latch
     collapses any number of extra probes into a single record: deleting the
-    ``label == 'lint' and 'ruff' in config_cmd`` gate, or re-scoping the latch
-    per attempt, leaves them green while the cost (one blocking subprocess per
-    extra leg / per retry) is real.  So these assert on the PROBE COUNT, via a
+    ``label == 'lint' and _command_invokes_ruff(config_cmd)`` gate, or re-scoping
+    the latch per attempt, leaves them green while the cost (one blocking
+    subprocess per extra leg / per retry) is real.  So these assert on the
+    PROBE COUNT, via a
     spy that delegates to the live helper rather than replacing it — the record
     the other tests read stays genuine.
     """
@@ -435,6 +492,113 @@ class TestEscapeProbeIsGated:
         assert result.passed is True
 
     @pytest.mark.asyncio
+    async def test_lint_command_merely_mentioning_ruff_never_probes(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        """A command whose TEXT contains 'ruff' but which never invokes it.
+
+        The gate used to be a bare substring test, so this exact shape — a
+        checker script with 'ruff' in its FILENAME — spent a 20s-timeout
+        subprocess and emitted an escape diagnostic attributing a ruff rule-set
+        caveat to a verdict ruff did not produce.  ``flake8 .`` (the sibling
+        test above) cannot catch that: it fails the substring test too, so it is
+        green against both implementations.
+        """
+        _parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(
+                worktree, tmp_path, lint_rc=0,
+                lint_command='python3 scripts/check_ruff_drift.py',
+                lint_marker='check_ruff_drift',
+            )
+
+        assert probe_spy == [], f'probed on a leg that never runs ruff: {probe_spy}'
+        assert _escape_records(caplog) == []
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_path_spelled_ruff_binary_still_probes(
+        self, geometry, tmp_path, caplog, probe_spy,
+    ):
+        """Narrowing the gate must not lose the spelling the probe itself uses.
+
+        ``_ruff_probe_binary`` prefers ``<worktree>/.venv/bin/ruff``, so a lint
+        command written the same way is not hypothetical.  A token-equality test
+        that forgot the path form would silence the diagnostic outright — the
+        failure direction that matters, since a missing WARNING is invisible
+        while a spurious one is merely noisy.
+        """
+        parent, worktree, _target = geometry
+        _write_project(worktree, 'wtproj', declares_ruff=False)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = await _verify_with_stubbed_spawn(
+                worktree, tmp_path, lint_rc=0,
+                lint_command='.venv/bin/ruff check scripts/',
+                lint_marker='ruff',
+            )
+
+        assert len(probe_spy) == 1, f'expected exactly one probe, got {probe_spy}'
+        records = _escape_records(caplog)
+        assert len(records) == 1, f'expected exactly one record, got {records}'
+        assert str(parent / 'pyproject.toml') in records[0].getMessage()
+        assert result.passed is True
+
+
+class TestCommandInvokesRuffGate:
+    """``_command_invokes_ruff`` — the gate's cheap half, unit-pinned.
+
+    Separate from the end-to-end gating tests above because those can only
+    afford a couple of commands each (every case drives a whole
+    ``run_verification``), while the property being asserted is a table.  The
+    end-to-end pair proves the helper is WIRED; this proves it is RIGHT.
+    """
+
+    @pytest.mark.parametrize('cmd', [
+        'ruff check .',
+        'uv run ruff check shared escalation fused-memory orchestrator dashboard',
+        'uv run --project shared ruff check',
+        '.venv/bin/ruff check scripts/',
+        '/usr/bin/ruff check .',
+        'python -m ruff check .',
+        'cd shared && ruff check . && cd ../escalation && ruff check .',
+    ])
+    def test_real_ruff_invocations_match(self, cmd):
+        assert verify._command_invokes_ruff(cmd) is True, cmd
+
+    @pytest.mark.parametrize('cmd', [
+        # The false positive the substring test admitted: 'ruff' in a FILENAME.
+        'python3 scripts/check_ruff_drift.py',
+        'pytest tests/test_ruff_config.py',
+        # Not ruff, merely prefixed/suffixed by it.
+        'ruffus --check',
+        'my-ruff-wrapper check .',
+        'flake8 .',
+        '',
+    ])
+    def test_non_invocations_do_not_match(self, cmd):
+        assert verify._command_invokes_ruff(cmd) is False, cmd
+
+    def test_unparseable_command_falls_back_to_the_substring_test(self):
+        """An unbalanced quote must not silently disable the diagnostic.
+
+        ``shlex.split`` raises ``ValueError`` here.  The fallback is deliberately
+        the OLD substring test rather than False: its failure mode is a wasted
+        probe, while False would drop the WARNING for a command that is in fact
+        running ruff.
+        """
+        unparseable = 'ruff check "unclosed'
+        with pytest.raises(ValueError):
+            shlex.split(unparseable)
+
+        assert verify._command_invokes_ruff(unparseable) is True
+        # …and the fallback stays a SUBSTRING test, so a non-ruff unparseable
+        # command still does not probe.
+        assert verify._command_invokes_ruff('flake8 "unclosed') is False
+
+    @pytest.mark.asyncio
     async def test_retries_do_not_respawn_the_probe(
         self, geometry, tmp_path, caplog, probe_spy,
     ):
@@ -457,9 +621,9 @@ class TestEscapeProbeIsGated:
     async def test_second_module_on_one_worktree_does_not_reprobe(
         self, geometry, tmp_path, caplog, probe_spy,
     ):
-        # ``verify_all_modules`` gathers one ``run_verification`` per module
-        # config against the SAME worktree. A latch scoped to a single call
-        # would emit the whole multi-line WARNING once per module.
+        # ``verify.py::run_full_verification`` gathers one ``run_verification``
+        # per module config against the SAME worktree. A latch scoped to a
+        # single call would emit the whole multi-line WARNING once per module.
         _parent, worktree, _target = geometry
         _write_project(worktree, 'wtproj', declares_ruff=False)
 
@@ -740,10 +904,12 @@ class TestLatchDedupesUnderCONCURRENTLintLegs:
     Every other latch test in this module awaits its verifications
     SEQUENTIALLY, so each one observes the previous one's completed write.  That
     shape cannot distinguish a correct latch from a check-then-set spanning the
-    ``await``, and production never has that shape: ``verify_all_modules`` fans
-    the per-module ``run_verification`` calls out with
+    ``await``, and production never has that shape:
+    ``verify.py::run_full_verification`` fans the per-module
+    ``run_verification`` calls out with
     ``asyncio.gather(*(run_verification(...) for mc in module_configs.values()))``
-    and the merge lane does the same in ``merge_queue.py::_run_one``.  So every
+    and the merge lane does the same in
+    ``merge_queue.py::_run_unscoped_typechecks``.  So every
     concurrent lint leg on one worktree reaches the latch check before ANY of
     them finishes its probe.
 
@@ -939,8 +1105,9 @@ class TestProbeBinaryResolution:
 class TestProbeDoesNotBlockTheEventLoop:
     """The probe is a blocking ``subprocess.run``; it must not run ON the loop.
 
-    ``verify_all_modules`` gathers one ``run_verification`` per module while
-    each verify leg is streaming subprocess output and being wall-clock-timed,
+    ``verify.py::run_full_verification`` gathers one ``run_verification`` per
+    module while each verify leg is streaming subprocess output and being
+    wall-clock-timed,
     so a probe executed inline would stall those reads for its whole duration
     (up to ``_RUFF_PROBE_TIMEOUT_S`` = 20s) and could push a concurrent leg over
     its timeout.  Every other potentially-blocking call in verify.py observes

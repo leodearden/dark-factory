@@ -3909,6 +3909,40 @@ def _settings_path_escapes(settings: Path | None, worktree: Path) -> bool:
         return False
 
 
+def _command_invokes_ruff(config_cmd: str) -> bool:
+    """True iff *config_cmd* actually invokes ruff, by TOKEN rather than substring.
+
+    The probe gate's cheap half.  A bare ``'ruff' in config_cmd`` was wrong in
+    the false-positive direction: any lint command whose text merely CONTAINS
+    those four characters matched, so ``python3 scripts/check_ruff_drift.py``
+    would spend a 20s-timeout subprocess and emit an escape diagnostic for a leg
+    that never ran ruff — a record attributing a rule-set caveat to a verdict
+    ruff did not produce, which is worse than the wasted spawn.
+
+    Matches a token that IS ruff (``ruff``) or a path ENDING in it
+    (``.venv/bin/ruff``), which are the two spellings the repo's own commands
+    and ``_ruff_probe_binary`` use.  ``shlex.split`` rather than ``str.split``
+    so a quoted argument cannot be shredded into a spurious token.
+
+    Falls back to the old substring test when ``shlex.split`` raises (an
+    unbalanced quote), and NOT to False: the fallback's failure mode is a
+    wasted probe, while False would silently drop the diagnostic for a command
+    that may well be running ruff.  Loud-over-silent, in the cheap direction.
+
+    RESIDUAL, stated rather than papered over: this is a lexical test, so a leg
+    that reaches ruff through a wrapper script or a make target never spelling
+    the name still reads as non-ruff and is not probed.  Narrowing the
+    false-positive direction does not touch that, and nothing short of
+    inspecting what the leg actually exec'd would — which is the cost the gate
+    exists to avoid.
+    """
+    try:
+        tokens = shlex.split(config_cmd)
+    except ValueError:
+        return 'ruff' in config_cmd
+    return any(tok == 'ruff' or tok.endswith('/ruff') for tok in tokens)
+
+
 # Stable, greppable token carried by the escape diagnostic, so an operator (and
 # the guard test) can key on the RECORD rather than on its prose.
 _RUFF_ESCAPE_MARKER = 'ruff-config-escapes-worktree'
@@ -3975,10 +4009,11 @@ def _ruff_escape_latch_key(worktree: Path) -> _RuffEscapeLatchKey:
 
 
 # One-record-per-(WORKTREE, BASE) latch, module-level on purpose.
-# ``verify_all_modules`` gathers one ``run_verification`` per module config (and
-# the merge lane fans out similarly), so a latch scoped to a single call would
-# still emit the same multi-line WARNING — and spawn the same probe — once per
-# module for one worktree.
+# ``verify.py::run_full_verification`` gathers one ``run_verification`` per
+# module config, and the merge lane fans out the same way in
+# ``merge_queue.py::_run_unscoped_typechecks``, so a latch scoped to a single
+# call would still emit the same multi-line WARNING — and spawn the same probe
+# — once per module for one worktree.
 #
 # The scope is process-lifetime, but the KEY is not the path alone: a worktree
 # PATH is recycled across different bases inside one process, by warm lanes
@@ -4014,8 +4049,22 @@ _RUFF_ESCAPE_REPORTED: set[_RuffEscapeLatchKey] = set()
 # PERSISTENT — ruff genuinely absent, or its output no longer formatting as
 # ``Settings path:`` — and an unbounded retry would spawn a doomed subprocess on
 # every lint leg of every module for the life of the process.  A key is dropped
-# from here the moment it IS measured, so the two structures never both hold it
-# and neither grows without bound.
+# from here the moment it IS measured, so the two structures never both hold the
+# same key.
+#
+# What is bounded is the PROBE COUNT per key (at
+# ``_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS``), NOT the ENTRY count — stated plainly
+# because the two are easy to conflate.  Every distinct (worktree, base) pair the
+# process sees retains exactly one entry for the process lifetime: in
+# ``_RUFF_ESCAPE_REPORTED`` once measured, or here at the cap if it never was.
+# Neither structure is ever swept, and the key deliberately CHANGES whenever a
+# recycled worktree's base changes (the whole point of the fingerprint above), so
+# a warm lane or the persistent merge worktree adds a NEW entry per task it
+# hosts.  ACCEPTED rather than bounded, and why: an entry is one path string plus
+# three hex digests (~250 B), the orchestrator process is torn down every fleet
+# redeploy (~8h), and any eviction policy trades that flat cost for a re-emitted
+# duplicate WARNING whenever it evicts a key whose base has NOT changed — the
+# exact noise the latch exists to suppress.
 _RUFF_ESCAPE_PROBE_ATTEMPTS: dict[_RuffEscapeLatchKey, int] = {}
 _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS: int = 3
 
@@ -4025,12 +4074,14 @@ _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS: int = 3
 # after the probe returns, so a plain check-then-set would be a read of the two
 # structures separated from their write by a suspension point.  Production fans
 # the per-module ``run_verification`` calls out CONCURRENTLY
-# (``verify_all_modules``'s ``asyncio.gather``, and the merge lane's
-# ``merge_queue.py::_run_one``), so every concurrent lint leg on one worktree
-# would clear the latch check before ANY of them finished: N probes, N copies of
-# the multi-line WARNING, and an attempt counter that advances by one per ROUND
-# instead of per attempt — admitting ~N*_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS doomed
-# 20s-timeout subprocesses instead of the bounded 3.
+# (``verify.py::run_full_verification``'s ``asyncio.gather`` over
+# ``module_configs.values()``, and the same fan-out in
+# ``merge_queue.py::_run_unscoped_typechecks``), so every concurrent lint leg on
+# one worktree would clear the latch check before ANY of them finished: N
+# probes, N copies of the multi-line WARNING, and an attempt counter that
+# advances by one per ROUND instead of per attempt — admitting
+# ~N*_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS doomed 20s-timeout subprocesses instead
+# of the bounded 3.
 #
 # Reserved SYNCHRONOUSLY, in the same await-free block as the latch check, which
 # is what makes the reservation atomic under asyncio's single-threaded loop;
@@ -4055,7 +4106,8 @@ async def _report_ruff_config_escape(worktree: Path) -> None:
     ASYNC because the probe is a blocking ``subprocess.run``: it runs on a
     worker thread via ``asyncio.to_thread`` so it cannot stall the event loop
     that is concurrently streaming and wall-clock-timing other verify legs
-    (``verify_all_modules`` gathers one ``run_verification`` per module).  Every
+    (``verify.py::run_full_verification`` gathers one ``run_verification`` per
+    module; ``merge_queue.py::_run_unscoped_typechecks`` does the same).  Every
     other potentially-blocking call in this module observes the same rule.
 
     The latch is OUTCOME-AWARE: a key is suppressed once it has been MEASURED,
@@ -4403,12 +4455,33 @@ async def _run_cmd(
     # venv/uv activation vars + the venv bin dir from PATH, sets
     # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
     # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
-    # `cwd` doubles as the ruff-cache anchor (task 3922): for the lint leg it is
-    # the worktree ROOT verbatim, so <cwd>/.ruff_cache terminates ruff's cache
-    # walk-up at the worktree boundary instead of letting it escape into the
-    # parent checkout's shared .ruff_cache.  Both spawn branches below read this
-    # same dict, so the one thread-through covers systemd-run --scope and the
-    # plain create_subprocess_shell path alike.
+    # `cwd` doubles as the ruff-cache anchor (task 3922): <cwd>/.ruff_cache
+    # terminates ruff's cache walk-up at the subprocess cwd instead of letting it
+    # escape into the parent checkout's shared .ruff_cache.  Both spawn branches
+    # below read this same dict, so the one thread-through covers systemd-run
+    # --scope and the plain create_subprocess_shell path alike.
+    #
+    # The anchor is the SUBPROCESS cwd, which is not always the worktree ROOT:
+    # `_run_segmented` spawns each segment of a `cd X && …` chain under
+    # `worktree / segment.cwd_rel`, so a segmented leg anchors the cache at that
+    # SUBDIRECTORY.  Said precisely rather than rounded off to "the worktree
+    # root", because the two differ exactly where this repo's own root
+    # test_command lives (`cd shared && … && cd ../escalation && …`).  What the
+    # difference does and does not cost, measured rather than assumed:
+    #   - The BOUNDARY property is unconditional either way — `verify_cmd` refuses
+    #     a chain whose accumulated cwd leaves the worktree, so a segment cwd is
+    #     always inside it and the cache can never reach the parent checkout.
+    #     That, not the exact directory, is what task 3922 is about.
+    #   - The cost is fragmentation: a segmented leg keeps one cache per segment
+    #     directory instead of one per worktree.  Segments lint DISJOINT package
+    #     directories, so there is little cross-segment reuse to lose.
+    #   - The stray dirs are inert: ruff writes a `.gitignore` containing `*` into
+    #     every cache dir it creates (verified — `.ruff_cache/.gitignore` in this
+    #     checkout), so a per-segment dir is self-ignoring and can never be staged
+    #     by the lane's `git add -A`.
+    # Pinned by test_verify_ruff_config_boundary.py::
+    # test_segmented_chain_anchors_each_segment_at_its_own_cwd — kept on one
+    # line so the name greps.
     subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
 
     proc = None
@@ -5808,14 +5881,20 @@ async def run_verification(
         # Ruff config-escape diagnostic (task 3922), sited alongside the
         # interpreter record below for the same reason: this is the single
         # post-_run_cmd path, so the record is structurally at-most-once.
-        # Gated to where it can be true at all — a ruff-bearing LINT leg, whose
-        # cwd is the worktree root verbatim. The GATE is load-bearing, not
-        # decorative: without it the probe would spawn on the test and type
-        # legs too, where its answer is meaningless (pinned by
+        # Gated to where it can be true at all — a ruff-bearing LINT leg. Note
+        # this passes `worktree`, the true worktree ROOT, NOT the leg's cwd:
+        # under `_run_segmented` the cwd is a SUBDIRECTORY (see the anchor note
+        # in `_run_cmd`), and the escape question is about the worktree
+        # boundary, so the root is the only correct thing to ask about. The GATE
+        # is load-bearing, not decorative: without it the probe would spawn on
+        # the test and type legs too, where its answer is meaningless, and it
+        # matches ruff by TOKEN rather than substring so a lint command that
+        # merely MENTIONS ruff in a filename does not spend a probe (both
+        # pinned by
         # test_verify_ruff_config_boundary.py::TestEscapeProbeIsGated). Fires
         # on green legs too: the escape is about which RULE SET ran, which is
         # exactly the question a green result cannot answer for itself.
-        if label == 'lint' and 'ruff' in config_cmd:
+        if label == 'lint' and _command_invokes_ruff(config_cmd):
             await _report_ruff_config_escape(worktree)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
