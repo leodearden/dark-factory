@@ -5107,6 +5107,159 @@ class TestSubmitResolveAdoptLock:
         )
 
 
+class TestPatchResolutionMetadataLock:
+    """patch_resolution_metadata must serialize its read-modify-write per id.
+
+    It is the LONE mutator in this module that did not take
+    ``escalation_id_lock`` — submit, resolve, park, submit_resolved,
+    add_members_to_l2, stamp_triage, attach_dedupe_child and
+    note_suppressed_refile all do.  Its read-modify-write is on the FULL record,
+    so an unlocked interleave with any of them drops the loser's change
+    wholesale: not just the two patched fields, but every field the loser's
+    in-memory copy carried.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        """Seed an ARCHIVED, resolved record.
+
+        patch_resolution_metadata returns None for anything still pending, so a
+        pending record would make these tests vacuous.
+        """
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_patch_resolution_metadata_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) The cheap direct assertion: a lock is acquired for the right id.
+
+        Paired with (b) on purpose — on its own this would pass even if the lock
+        wrapped nothing at all.
+        """
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)  # seed WITHOUT the spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.patch_resolution_metadata(
+                'esc-1-1', resolved_by='steward-patch', resolution_turns=5,
+            )
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    @pytest.mark.timeout(30)
+    def test_patch_holds_the_lock_across_its_whole_read_modify_write(self, tmp_path: Path, monkeypatch):
+        """(b) The SEMANTIC test — the lock must span read..write, not just exist.
+
+        Deliberately NOT the probabilistic two-process shape used by
+        TestAttachDedupeChildConcurrency, for a reason specific to this method:
+        both fields it patches are idempotent last-write-wins SETs, so a
+        patch-vs-patch race produces the correct final value either way and a
+        lost update is INVISIBLE.  The defect is observable only against a
+        mutator whose loss shows, so this races the patch against
+        note_suppressed_refile's ``refiles_suppressed`` INCREMENT.
+
+        Timing is then made deterministic by interposing on the instance's
+        _atomic_write_path, which launches the child BETWEEN the patch's read
+        and its write:
+
+        - WITHOUT the lock: the child finds the sidecar free, bumps 0->1 and
+          writes; the patch's real write then lands its stale in-memory copy and
+          the increment is LOST.  refiles_suppressed reads 0 EVERY time.
+        - WITH the lock: the child BLOCKS on the flock, the 3s wait times out,
+          the patch completes and releases, and the child then bumps on top of
+          the patched record.  refiles_suppressed reads 1 and resolved_by reads
+          'steward-patch' EVERY time.
+
+        The ~3s wait is paid only on the green path.  This shape is what
+        _suppressed_refile_child.py's own docstring records as the fix for a
+        MEASURED failure mode: two processes that never actually overlap make a
+        concurrency test pass even with the lock deleted.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Pre-create the go-file: the child is barrier-aware, and here we want it
+        # to run IMMEDIATELY on launch rather than park.  The ready-file path is
+        # required by its CLI but nothing waits on it.
+        go = tmp_path / 'go'
+        go.write_text('go')
+        ready = tmp_path / 'ready-child'
+
+        real_write = queue._atomic_write_path
+        launched: list[subprocess.Popen] = []
+
+        def interposing_write(path: Path, json_text: str, *, durable: bool = False) -> None:
+            # Fire once, on the patch's own write — between its read and its write.
+            if not launched:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir),
+                        'esc-1-1', '1', str(ready), str(go),
+                    ],
+                    env=env,
+                )
+                launched.append(proc)
+                try:
+                    # Returns fast when the sidecar is FREE (the unlocked bug);
+                    # times out when the patch is correctly holding it.
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            real_write(path, json_text, durable=durable)
+
+        monkeypatch.setattr(queue, '_atomic_write_path', interposing_write)
+
+        try:
+            queue.patch_resolution_metadata('esc-1-1', resolved_by='steward-patch')
+            assert launched, 'the interposing write never fired — the test is vacuous'
+            rc = launched[0].wait(timeout=15)
+        finally:
+            for proc in launched:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc == 0, f'child exited rc={rc} (rc=3 means the barrier wedged)'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 1, (
+            'the concurrent locked INCREMENT was clobbered by the unlocked patch: '
+            f'expected refiles_suppressed=1, got {record.refiles_suppressed}'
+        )
+        assert record.resolved_by == 'steward-patch', (
+            f"the patch's own write was lost: resolved_by={record.resolved_by!r}"
+        )
+
+        # No resurrection: the record stays where it lives, in exactly one place.
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'patching an archived record must not resurrect it into the queue root'
+        )
+        archived = list(queue.queue_dir.glob('archive/*/esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy, found {archived}'
+
+
 class TestArchiveListingMemoisation:
     """get() must memoise the archive listing so repeated calls scan at most once."""
 
