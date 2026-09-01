@@ -581,6 +581,126 @@ def test_apply_preserved_refuses_a_value_it_cannot_write_faithfully():
 
 
 # ---------------------------------------------------------------------------
+# The unit registry — one renderer, two units  (step-1 / step-2)
+# ---------------------------------------------------------------------------
+# Task 4796 generalised this renderer to a SECOND unit rather than forking a
+# near-copy of it: scripts/fused-memory.service.template carries the same
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__` line and setup-host.sh
+# installed it with the same truncating redirect. The preservation CORE was
+# already unit-neutral (`preserved_values`/`render_unit` take `names`;
+# --template/--output are already flags), so all that was unit-specific was the
+# log tag and the preserve set. Those two become a registry keyed by --unit.
+#
+# The fused-memory instance is the higher-stakes one, which is why it is pinned
+# here rather than left to the CLI tests alone: DASHBOARD_KNOWN_PROJECT_ROOTS on
+# THAT unit is what fused_memory/models/scope.py reads as KNOWN_PROJECT_ROOTS_ENV,
+# so collapsing it de-registers every other project from RECONCILIATION
+# (UnknownProjectError), not merely from a dashboard aggregation view.
+
+_FUSED_MEMORY = "fused-memory"
+_DASHBOARD = "dashboard"
+
+
+def _units():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.UNITS
+
+
+def _module():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit
+
+
+def test_units_registry_holds_exactly_the_two_installed_units():
+    """(a) Both units this renderer installs are registered, and nothing else.
+
+    Asserted as EQUALITY rather than containment: a third key appearing without
+    a corresponding setup-host.sh call site is a registry nobody renders from,
+    and — more to the point — every guard below (and the staleness guard in the
+    POLICY section) iterates this mapping, so a key added without its template
+    and preserve set would silently widen what those guards claim to cover.
+    """
+    assert set(_units()) == {_DASHBOARD, _FUSED_MEMORY}, (
+        f"UNITS registers {sorted(_units())}; expected exactly "
+        f"{sorted((_DASHBOARD, _FUSED_MEMORY))}."
+    )
+
+
+def test_every_unit_spec_exposes_a_tag_and_a_preserve_set():
+    """(b) The registry's shape, checked on every entry rather than on one."""
+    for key, spec in _units().items():
+        assert hasattr(spec, "log_tag"), f"UNITS[{key!r}] exposes no log_tag"
+        assert hasattr(spec, "host_local_environment"), (
+            f"UNITS[{key!r}] exposes no host_local_environment"
+        )
+        assert isinstance(spec.log_tag, str), f"UNITS[{key!r}].log_tag is not a str"
+        assert isinstance(spec.host_local_environment, tuple), (
+            f"UNITS[{key!r}].host_local_environment is not a tuple — the preserve "
+            "set is policy and must not be mutable per invocation."
+        )
+
+
+def test_unit_log_tags_are_distinct_and_non_empty():
+    """(c) The tag is the OPERATOR's only handle on this tool's report.
+
+    Both units are rendered by the same script in the same bring-up run, and
+    setup-host.sh routes an operator to a detailed report BY TAG (the convention
+    the check_*_unit_parity.py family states and this module's `_log` follows).
+    A shared tag would attribute the fused-memory unit's preserved/skipped lines
+    to the dashboard — on the unit whose DASHBOARD_KNOWN_PROJECT_ROOTS governs
+    reconciliation, so the one where mis-attribution costs the most.
+
+    The literals are pinned, not merely their distinctness: the tag is a
+    published operator-facing string, and setup-host.sh's section-4 and
+    section-8 prose names each one.
+    """
+    tags = {key: spec.log_tag for key, spec in _units().items()}
+
+    assert tags[_DASHBOARD] == "dashboard_unit_render", tags
+    assert tags[_FUSED_MEMORY] == "fused_memory_unit_render", tags
+    assert all(tag.strip() for tag in tags.values()), (
+        f"an empty log tag makes the report unroutable: {tags}"
+    )
+    assert len(set(tags.values())) == len(tags), (
+        f"two units share a log tag, so their reports are indistinguishable: {tags}"
+    )
+
+
+def test_dashboard_spec_is_the_modules_existing_public_surface():
+    """(d) BACK-COMPAT: the registry did not move the dashboard's constants.
+
+    LOG_TAG and HOST_LOCAL_ENVIRONMENT are module-level names that task 4793's
+    suite asserts on directly and that the dashboard call site in setup-host.sh
+    section 8 depends on behaviourally (it passes no --unit at all). Pinning the
+    identity here is what lets the registry be an ADDITION rather than a rename:
+    if these ever diverge, the dashboard unit would be rendered with one preserve
+    set and reported under another tag.
+    """
+    module = _module()
+    spec = _units()[_DASHBOARD]
+
+    assert spec.host_local_environment == module.HOST_LOCAL_ENVIRONMENT, (
+        f"UNITS['dashboard'].host_local_environment {spec.host_local_environment} "
+        f"!= HOST_LOCAL_ENVIRONMENT {module.HOST_LOCAL_ENVIRONMENT}"
+    )
+    assert module.LOG_TAG == spec.log_tag, (
+        f"LOG_TAG {module.LOG_TAG!r} != UNITS['dashboard'].log_tag {spec.log_tag!r}"
+    )
+
+
+def test_fused_memory_spec_preserves_the_known_project_roots():
+    """(e) The variable task 4796 exists for, on the unit that governs recon."""
+    assert _KNOWN_ROOTS in _units()[_FUSED_MEMORY].host_local_environment, (
+        f"UNITS['fused-memory'].host_local_environment is "
+        f"{_units()[_FUSED_MEMORY].host_local_environment}, which does not "
+        f"preserve {_KNOWN_ROOTS} — the render would collapse this host's "
+        "reconciliation scope to a single project root."
+    )
+
+
+# ---------------------------------------------------------------------------
 # HOST_LOCAL_ENVIRONMENT — the POLICY  (step-7 / step-8)
 # ---------------------------------------------------------------------------
 
