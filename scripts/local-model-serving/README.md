@@ -136,24 +136,51 @@ every arm measured so far). Inside the unit it drives exactly the steps above,
 **one arm at a time**: start / wait-ready / `--arm ... --output <part>` / stop.
 Each arm is stopped even when its probe fails, because `lms_ctl start` refuses
 rather than evicting — one arm left running would turn into six spurious
-refusals.
+refusals. For the same reason the sweep opens with `lms_ctl stop-all`: an arm
+left running by an *earlier* session would otherwise refuse all seven starts.
+That touches `lms-arm@` units only, so whisper-writer is unaffected — but if
+you have an arm up deliberately, the driver will stop it.
 
 It is **resumable**. Each arm's report lands in `--parts-dir` as
-`<arm_id>.json`, and a re-run skips any arm that already has a valid part, so
-a sweep that died at arm six re-measures one arm and not seven. `--force`
-re-measures everything regardless. Pass `--parts-dir` explicitly to resume into
-a directory from a previous run; the default lives under `$XDG_RUNTIME_DIR` and
-does not survive a reboot.
+`<arm_id>.json`, and a re-run skips any arm that already has a **passing**
+part, so a sweep that died at arm six re-measures one arm and not seven. A part
+whose row is a FAIL is *not* reused: the healthcheck writes its report before
+returning a non-zero exit, so a failed arm does leave a valid file behind, and
+reusing it would hand you a byte-identical artifact still carrying the stale
+FAIL row after you had fixed the arm. Fixing an arm and re-running therefore
+re-measures exactly the arms that failed. A part is also dropped when the
+manifest's `served_model_name` for that arm no longer matches the one in the
+part — but an `arms.yaml` edit that changes only `model_ref` or `quant` is
+invisible in a report row, so use `--force` after one. `--force` re-measures
+everything regardless. Pass `--parts-dir` explicitly to resume into a directory
+from a previous run; the default lives under `$XDG_RUNTIME_DIR` and does not
+survive a reboot.
 
 `--dry-run` prints the compliant command and runs nothing — useful for reading
-the exact invocation without a card. `--ready-timeout` forwards to
-`lms_ctl wait-ready` (default 900s).
+the exact invocation without a card. It is a submit-layer flag: combined with
+`--in-unit` it is rejected rather than ignored, since `--in-unit` *is* the
+sweep. `--ready-timeout` forwards to `lms_ctl wait-ready` (default 900s).
 
-The artifact is written by `lms_healthcheck --merge`, never by the driver, and
-that merge **refuses a partial slate**: an arm that failed leaves no part, and
-`merge_reports`' manifest-coverage check writes nothing rather than emit a
-short report that reads as a complete one. So a failed sweep leaves the
-previous artifact intact and says which arms are uncovered.
+The artifact is written by `lms_healthcheck --merge`, never by the driver.
+What that merge refuses is a slate **missing rows**, which is narrower than
+"a failed sweep": an arm that never started or never came ready leaves no part,
+`merge_reports`' manifest-coverage check then writes nothing and names the
+uncovered arms, and the previously committed artifact is left intact. An arm
+that came up and *failed its probe* is a different case — it leaves a part
+carrying a FAIL row, so the slate is covered, the merge succeeds, and
+`verification/health-report.json` is **overwritten with a red but complete
+artifact**. That is the intended outcome (a red slate is a measurement), but do
+not read a red sweep as one that cannot have touched the committed file.
+
+**A manifest carrying TBD placeholder arms cannot be swept**, and the driver
+refuses up front rather than discovering it 30 minutes in. Neither half of the
+slate works for such an arm: `lms_ctl start` refuses a placeholder (exit 4),
+and `lms_healthcheck --arm` cannot cover it either — the report needs the VRAM
+baseline that only `lms_ctl start` writes, so it exits 8 having written
+nothing — while the merge requires a row for every manifest arm. A hand-run
+`lms_healthcheck --all` hits the same wall. Resolve the PRD open question that
+owns the arm, or drop it from `arms.yaml`, before running the slate. All seven
+arms are non-placeholder today.
 
 ### One arm at a time
 
