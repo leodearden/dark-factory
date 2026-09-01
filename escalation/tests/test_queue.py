@@ -5022,6 +5022,97 @@ class TestConcurrentResolveExactlyOneArchive:
 # Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
 # ---------------------------------------------------------------------------
 
+class TestSubmitLogsIdTaskIdDivergence:
+    """submit() makes an id/task_id divergence OBSERVABLE — and never rejects it.
+
+    ``make_id``'s argument is an id-NAMESPACE key, not a task_id, so a record's
+    filename stem need not encode its stored ``task_id``.  Five production sites
+    diverge deliberately (curator_escalator.py x3 via ``make_id('curator')``
+    with ``task_id='task-curator'``; ticket_janitor.py x2 via
+    ``make_id('ticket-janitor')``).  Believing the false identity
+    ``stem.startswith(f'esc-{record.task_id}-')`` has already cost two design
+    cycles (task 3999's 2026-08-11 amendment and
+    plans/resume-charter-loss-remediation-prd.md, both withdrawn 2026-08-20 as
+    ruling esc-3999-2), so the divergence is logged where it is CREATED rather
+    than being rediscovered by the next failed design.
+    """
+
+    #: The stable fragment of the guard's message.  Asserting on this plus the
+    #: two interpolated values, rather than on the full sentence, keeps the
+    #: tests from pinning prose.
+    MARKER = 'does not encode its task_id'
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_divergent_stem_is_logged_with_both_values(self, tmp_path: Path, caplog):
+        """(a) The LIVE specimen is logged, showing BOTH halves of the divergence.
+
+        A reader who hits this line must be able to see the divergence itself,
+        not be told one half of it — so the id and the task_id are both on it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        matching = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.INFO
+            and 'esc-curator-1' in r.getMessage()
+            and 'task-curator' in r.getMessage()
+            and self.MARKER in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            'Expected exactly one escalation.queue record naming both the id and '
+            f'the task_id; got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_conforming_stem_logs_no_divergence_line(self, tmp_path: Path, caplog):
+        """(b) Silent on the conforming majority — 97 of 102 construction sites.
+
+        A guard that fired on every submit would be noise nobody reads.  Filters
+        on the marker rather than counting records, since submit already emits an
+        unconditional 'Escalation submitted: ...' INFO of its own.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-42-1', '42'))
+
+        divergence = [r for r in caplog.records if self.MARKER in r.getMessage()]
+        assert not divergence, (
+            'A conforming id must not log a divergence line; got: '
+            f'{[r.getMessage() for r in divergence]}'
+        )
+
+    def test_divergent_submit_is_still_written_and_retrievable(self, tmp_path: Path):
+        """(c) OBSERVABILITY ONLY — the guard must never reject and never raise.
+
+        The five divergent production sites are legitimate by design.  Turning
+        this into enforcement would break them, which is why the record must
+        still land and still be findable BY ITS STORED task_id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        assert queue.get('esc-curator-1') is not None, (
+            'the divergent record must still be written'
+        )
+        assert 'esc-curator-1' in {e.id for e in queue.get_by_task('task-curator')}, (
+            'the divergent record must still be retrievable by its STORED task_id'
+        )
+
+
 class TestSubmitResolveAdoptLock:
     """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
 
