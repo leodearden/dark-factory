@@ -498,8 +498,16 @@ def _submit(
     dry_run: bool,
     runner: Runner = subprocess.run,
 ) -> int:
-    """Echo the compliant command, then run it unless this is a dry run."""
-    print(' '.join(argv), flush=True)
+    """Echo the compliant command, then run it unless this is a dry run.
+
+    `shlex.join`, not `' '.join`.  The argv carries operator-supplied paths
+    (`--parts-dir`, `--output`) and a `--setenv=LMS_BASELINE_DIR=...` value; a
+    space or a shell metacharacter in any of them makes a space-joined line
+    something that does NOT reproduce this invocation when pasted back into a
+    shell -- which is the entire purpose of the `--dry-run` output.  The argv
+    itself is never handed to a shell: this is a rendering for a human.
+    """
+    print(shlex.join(argv), flush=True)
     if dry_run:
         # Deliberately NO `journalctl` follow hint here.  Pointing an operator
         # at a unit that was never created sends them to watch nothing,
@@ -528,7 +536,11 @@ def main(
              'unit\'s own payload; also the guard that stops a unit from '
              'recursively submitting another one.',
     )
-    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='print the transient-unit command and run nothing (submit layer '
+             'only; rejected with --in-unit)',
+    )
     parser.add_argument(
         '--force', action='store_true',
         help='re-measure every arm, even one that already has a valid part',
@@ -537,6 +549,20 @@ def main(
     parser.add_argument('--output', help='the slate artifact to assemble')
     parser.add_argument('--ready-timeout', type=float, default=DEFAULT_READY_TIMEOUT_S)
     args = parser.parse_args(argv)
+
+    if args.in_unit and args.dry_run:
+        # REJECTED, not ignored.  `--in-unit` is handled before the submit
+        # layer ever sees `dry_run`, so the combination used to run a live
+        # ~30-minute sweep that starts and stops arms on the card -- the exact
+        # opposite of what someone typing `--dry-run` to read the payload
+        # asked for.  Honouring it instead would mean inventing a second,
+        # separately-driftable rendering of the sweep; refusing costs the user
+        # one retype and cannot lie about what would run.
+        parser.error(
+            '--dry-run is a submit-layer flag: it prints the transient-unit '
+            'command instead of submitting it. --in-unit IS the sweep, so '
+            'there is nothing to print -- drop one of the two.'
+        )
 
     parts_dir = Path(args.parts_dir) if args.parts_dir else default_parts_dir()
     output = Path(args.output) if args.output else DEFAULT_ARTIFACT

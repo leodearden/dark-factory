@@ -1073,6 +1073,69 @@ def test_dry_run_prints_the_compliant_command_and_runs_nothing(
     assert lms_slate_run.SLATE_UNIT_NAME in out
 
 
+def test_dry_run_is_rejected_under_in_unit_rather_than_ignored(tmp_path, two_arms):
+    """`--in-unit` is handled before the submit layer ever sees `dry_run`, so
+    silently ignoring the flag means a live ~30 minute sweep that starts and
+    stops arms on the card -- the exact opposite of "prints the command and
+    runs nothing"."""
+    runner = _FakeRunner()
+
+    with pytest.raises(SystemExit) as exit_info:
+        lms_slate_run.main(
+            ['--in-unit', '--dry-run', '--parts-dir', str(tmp_path / 'parts'),
+             '--output', str(tmp_path / 'o.json')],
+            runner=runner,
+        )
+
+    assert exit_info.value.code == 2  # argparse usage error
+    assert runner.calls == []
+
+
+def test_the_dry_run_rejection_says_which_flag_to_drop(tmp_path, two_arms, capsys):
+    with pytest.raises(SystemExit):
+        lms_slate_run.main(['--in-unit', '--dry-run'], runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert '--dry-run' in err
+    assert '--in-unit' in err
+
+
+def test_the_echoed_command_pastes_back_into_a_shell(tmp_path, two_arms, capsys):
+    """The echo is the whole point of `--dry-run`, and `' '.join` breaks it:
+    an operator-supplied path with a space in it renders as two arguments, so
+    the printed "compliant command" does not reproduce the invocation."""
+    import shlex
+
+    parts = tmp_path / 'parts dir'
+    output = tmp_path / 'health report.json'
+
+    lms_slate_run.main(
+        ['--dry-run', '--parts-dir', str(parts), '--output', str(output)],
+        runner=_SubmitRecorder(),
+    )
+
+    printed = capsys.readouterr().out.strip()
+    assert shlex.split(printed) == lms_slate_run.slate_argv(
+        parts, output, ready_timeout=lms_slate_run.DEFAULT_READY_TIMEOUT_S,
+    )
+
+
+def test_a_metacharacter_in_a_propagated_value_is_quoted(tmp_path, capsys):
+    """`--setenv=LMS_BASELINE_DIR=...` carries a caller value verbatim; an
+    unquoted `;` or `$` in it would make the printed line do something other
+    than what ran."""
+    import shlex
+
+    argv = lms_slate_run.slate_argv(
+        tmp_path / 'parts', tmp_path / 'o.json',
+        env={'LMS_BASELINE_DIR': '/tmp/base; rm -rf $HOME'},
+    )
+
+    lms_slate_run._submit(argv, dry_run=True)
+
+    assert shlex.split(capsys.readouterr().out.strip()) == argv
+
+
 def test_dry_run_prints_no_follow_hint_for_a_unit_it_never_created(
     tmp_path, two_arms, capsys,
 ):
