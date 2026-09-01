@@ -205,22 +205,19 @@ def test_install_is_idempotent(tmp_path):
 # ── the committed unit files ────────────────────────────────────────────────
 
 
-def _unit(name):
-    return (TEMPLATES_DIR / name).read_text()
-
-
 def _directives(name) -> dict[str, list[tuple[str, str]]]:
     """Parse a systemd unit into `{section: [(key, value), ...]}`.
 
     WHY THIS EXISTS. A raw-substring check on a unit's text cannot tell a live
     DIRECTIVE from the COMMENT that explains it -- and these units comment
     heavily by design. The demonstrated case is `Persistent=true`, which
-    appears BOTH in prose at reify-closure-staleness-sweep.timer:16 and as the
-    real directive at :22, so deleting the directive left the substring
-    assertion here GREEN while the safeguard it names (catching up a night
-    missed to a sleeping/offline laptop) was gone. That is the class of
-    finding this closes (task 4305, ported from the `_directives` helper added
-    for the sibling census timer's tests, task 4006).
+    appears BOTH inside the `[Timer]` comment block explaining the stagger
+    ladder AND as the real directive, in `reify-closure-staleness-sweep.timer`,
+    so deleting the directive left the substring assertion here GREEN while
+    the safeguard it names (catching up a night missed to a sleeping/offline
+    laptop) was gone. That is the class of finding this closes (task 4305,
+    ported from the `_directives` helper added for the sibling census timer's
+    tests, task 4006).
 
     Every unit assertion in this file routes through here regardless of
     whether a given literal is currently shadowed, so the weaker and stronger
@@ -277,6 +274,29 @@ def test_timer_fires_at_the_next_free_nightly_slot():
         '*-*-* 04:30:00']
 
 
+def test_timer_does_not_collide_with_an_occupied_slot():
+    """Guards the ladder itself, not just this unit's own literal: a future
+    edit that re-cadences this job onto a taken slot fails here rather than
+    silently double-booking a third job.
+
+    Parsed on BOTH sides, so a commented-out slot in a sibling unit can
+    neither manufacture a phantom collision nor mask a real one. Ported from
+    the sibling census timer's test of the same name (task 4006) -- none of
+    the logic is specific to this unit's name.
+    """
+    ours = set(_values(_directives(TIMER_NAME), 'Timer', 'OnCalendar'))
+    assert ours, 'the timer declares no OnCalendar at all'
+    for other in sorted(TEMPLATES_DIR.glob('*.timer')):
+        if other.name == TIMER_NAME:
+            continue
+        clash = ours & set(_values(_directives(other), 'Timer', 'OnCalendar'))
+        if clash:
+            raise AssertionError(
+                f'{TIMER_NAME} shares {sorted(clash)!r} with {other.name} — '
+                f'pick a free slot and update the nightly ladder table in '
+                f'OPERATIONS.md')
+
+
 def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd():
     """A silently skipped night leaves stranded reify rows stranded for
     another day -- `Persistent=true` is what makes a night missed to a
@@ -303,6 +323,17 @@ def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
     assert _values(service, 'Service', 'ExecStart') == [
         f'{PRODUCTION_ROOT}/scripts/reify-closure-staleness-sweep.sh']
     assert _values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
+
+
+def test_service_sends_both_streams_to_the_journal():
+    """The wrapper this unit runs "always exits 0" (see the [Service] comment
+    above) so a failed sweep never surfaces as systemd `failed` state -- the
+    journal is therefore the ONLY place a failure is ever readable. Ported
+    from the sibling census timer's test of the same name (task 4006); this
+    unit needs the guard more, not less, for exactly the reason above."""
+    service = _directives(SERVICE_NAME)
+    assert _values(service, 'Service', 'StandardOutput') == ['journal']
+    assert _values(service, 'Service', 'StandardError') == ['journal']
 
 
 def test_service_execstart_points_at_a_real_executable_wrapper():
