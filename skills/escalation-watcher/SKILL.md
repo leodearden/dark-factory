@@ -1039,6 +1039,9 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 
 When the probe fires, the item's ask changes from "human must decide" to **"human must ratify and
 propagate"** — a much cheaper request. Present it that way, with the recovered ruling attached.
+Unless it clears the carve-out below, in which case the ask changes to NOTHING and you close it
+yourself: ratification is only needed for a ruling that is not already Leo's own, executed, and
+orphaned by a terminated session.
 
 **This check is REPORT-ONLY — with exactly ONE carve-out (below), it must never close anything on
 its own.** A record can be a deliberately-preserved PIN whose value is its *existence*, not its
