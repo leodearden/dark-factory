@@ -10,9 +10,10 @@ Every test here builds a SYNTHETIC SQLite DB in ``tmp_path`` with the real
 it is a ~10 GB file the running fused-memory server is writing to, and a test
 that opened it would be measuring a moving target under xdist.
 
-The script is loaded via importlib so it can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily.
+The script is loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so it can be tested without sys.path pollution: that
+helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  It is invoked lazily.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
 -------------------------------------------
@@ -29,11 +30,11 @@ from the merge lane too — see the same warning at
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -48,26 +49,51 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
 
-    mod_name = 'harvest_production_queries'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(SCRIPT_PATH, mod_name='harvest_production_queries')
 
 
 @functools.cache
 def _mod() -> types.ModuleType:
     return _load_module()
+
+
+class TestTheScriptIsLoadedOnceNotReExecuted:
+    """The local loader seam must DELEGATE to the shared helper rather than
+    re-execute the script.
+
+    Narrower than the bake-off module's version of this test, and
+    deliberately so: the hazard THAT one names —
+    ``scripts/read_transform_selection.py::_load_script`` serving
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check — cannot
+    reach this key at all, because that bootstrap is only ever called via
+    ``bake_off()`` with the name ``'bake_off_storage_shape'``.
+
+    What is real here is smaller: TWO test modules register
+    ``'harvest_production_queries'`` for the same file — this module's
+    ``_load_module()`` and ``test_read_transform_selection.py``'s
+    ``_load_script(HARVEST_PATH, ...)``.  An unconditional re-exec in either
+    mints a SECOND module object under that shared key and whichever loader
+    ran last wins; ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto
+    --dist loadgroup"``, so which one that is is not stable.  Both now route
+    through ``load_script_module``, which serves the already-loaded module
+    for the same path — so the two registrations cooperate instead of
+    racing.  This test is what holds that delegation in place.
+
+    The UNCACHED seam is what this calls: ``_mod()`` is ``functools.cache``d
+    and would pass vacuously.
+    """
+
+    def test_the_script_is_loaded_once_not_re_executed(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_module()
+        second = _load_module()
+        assert first is second
+        assert sys.modules['harvest_production_queries'] is first
 
 
 # ---------------------------------------------------------------------------
