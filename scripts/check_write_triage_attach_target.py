@@ -48,7 +48,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -74,6 +74,22 @@ _NEW_ENTRY = 'A new memory entry submitted for triage by this probe.'
 #: Both are tried, and whichever the implementation accepts is used for every
 #: subsequent render, so no calling convention is pinned.
 _SPELLINGS = ('id', 'object')
+
+#: Placeholders for a REQUIRED parameter that is not the target but has to be
+#: supplied anyway to reach it. Without them the probe could only reach a
+#: target parameter when every OTHER parameter beyond the first two was
+#: optional -- so a correct fix spelled ``build_judge_prompt(content,
+#: candidates, verdict_words, attach_target_id=None)`` raised TypeError on
+#: every attempt, fell through to ``verdict_words``, and was reported
+#: INDETERMINATE. That is the false-FAIL class this probe exists to remove,
+#: one signature shape down.
+#:
+#: A LADDER, not one value, because the placeholder itself can be rejected:
+#: ``None`` covers a parameter that is merely rendered, ``()`` one that is
+#: iterated, ``''`` one that is concatenated. Tried in that order, and the
+#: FIRST that renders wins -- the same value is then used for BOTH halves of
+#: the swap pair, so the comparison stays fair.
+_FILLERS: tuple[Any, ...] = (None, (), '')
 
 
 #: Two ids belonging to NO candidate in the slate. Rendering against them is
@@ -259,6 +275,25 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
     return slate, slate[index], index
 
 
+def _usable_parameters(fn: Any) -> list[Any]:
+    """*fn*'s parameters that can be supplied by position or by keyword.
+
+    ``*args``/``**kwargs`` are dropped, so every index used elsewhere in this
+    module -- ``_target_parameters``, ``_bind_arguments`` -- is an index into
+    THIS list and they cannot drift apart.
+    """
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return []
+    kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    return [p for p in params if p.kind in kinds]
+
+
 def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
     """Every ``(index, parameter)`` of *fn* beyond the first two.
 
@@ -275,17 +310,7 @@ def _target_parameters(fn: Any) -> list[tuple[int, Any]]:
     point is whether the renderer can be TOLD which candidate the attach will
     touch, not how the argument is spelled.
     """
-    try:
-        params = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        return []
-    kinds = (
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        inspect.Parameter.KEYWORD_ONLY,
-    )
-    usable = [p for p in params if p.kind in kinds]
-    beyond = list(enumerate(usable))[2:]
+    beyond = list(enumerate(_usable_parameters(fn)))[2:]
     # Target-NAMED parameters first, ties broken by position. A module can
     # carry both an echoing free-text parameter and a real marker; the search
     # takes the FIRST combination that holds, so the real one has to be
@@ -308,30 +333,99 @@ def _nonce_candidate(ident: str) -> _Candidate:
     return _Candidate(ident, 'a candidate that is not on the slate', {})
 
 
+def _filled_parameters(usable: list[Any], index: int) -> list[Any]:
+    """The parameters that must be supplied to REACH the one at *index*.
+
+    Two classes, and neither is the target itself:
+
+    * anything beyond the first two with no default. Omitting it raises
+      ``TypeError`` before the renderer runs a single line, wherever it sits
+      relative to the target -- a required keyword-only parameter declared
+      AFTER the target is just as fatal as one declared before it.
+    * an optional POSITIONAL-ONLY parameter before the target, which cannot be
+      skipped and still leave the target reachable by position.
+    """
+    filled: list[Any] = []
+    for position, param in enumerate(usable):
+        if position < 2 or position == index:
+            continue
+        required = param.default is inspect.Parameter.empty
+        blocking = (
+            param.kind is inspect.Parameter.POSITIONAL_ONLY and position < index
+        )
+        if required or blocking:
+            filled.append(param)
+    return filled
+
+
+def _fillers_for(usable: list[Any], index: int) -> tuple[Any, ...]:
+    """The placeholder ladder to try for parameter *index*, shortest first.
+
+    A single (unused) entry when nothing needs filling, so the ordinary case
+    costs exactly one render per (parameter x spelling) as before and the
+    failure report does not gain duplicate clauses.
+    """
+    return _FILLERS if _filled_parameters(usable, index) else _FILLERS[:1]
+
+
+def _bind_arguments(
+    usable: list[Any],
+    index: int,
+    slate: list[Any],
+    value: Any,
+    filler: Any,
+) -> tuple[tuple[list[Any], dict[str, Any]] | None, str | None]:
+    """``((args, kwargs), error)`` calling *fn* with *value* at *index*.
+
+    Everything that can be is passed BY KEYWORD, so a target parameter that is
+    not the third one still reaches the slot it was named for. Positional-only
+    parameters are passed positionally and therefore have to be CONTIGUOUS:
+    ``args`` covers ``usable[:position]`` exactly when ``len(args) ==
+    position``, and if a gap has opened the target is genuinely unreachable.
+    """
+    fill_names = {param.name for param in _filled_parameters(usable, index)}
+    args: list[Any] = [_NEW_ENTRY, slate]
+    kwargs: dict[str, Any] = {}
+    for position, param in enumerate(usable):
+        if position < 2:
+            continue
+        if position == index:
+            supplied = value
+        elif param.name in fill_names:
+            supplied = filler
+        else:
+            continue
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            if len(args) != position:
+                return None, (
+                    f'the positional-only parameter {param.name!r} sits at index '
+                    f'{position} with only {len(args)} arguments before it, so the '
+                    'target cannot be reached without guessing the ones in between'
+                )
+            args.append(supplied)
+        else:
+            kwargs[param.name] = supplied
+    return (args, kwargs), None
+
+
 def _render(
     fn: Any,
+    usable: list[Any],
     index: int,
-    param: Any,
     slate: list[Any],
     target: Any,
     spelling: str,
+    filler: Any,
 ) -> tuple[str | None, str | None]:
-    """``(rendering, error)`` — render *slate* naming *target* via *param*.
-
-    Passed BY KEYWORD wherever the parameter allows it, so a target parameter
-    that is not the third one still reaches the slot it was named for.
-    """
-    if param.kind is inspect.Parameter.POSITIONAL_ONLY and index != 2:
-        return None, (
-            'positional-only and not the third parameter, so it cannot be '
-            'reached without inventing values for the parameters before it'
-        )
-    value = _value_for(target, spelling)
+    """``(rendering, error)`` — render *slate* naming *target* at *index*."""
+    bound, error = _bind_arguments(
+        usable, index, slate, _value_for(target, spelling), filler,
+    )
+    if error is not None or bound is None:
+        return None, error
+    args, kwargs = bound
     try:
-        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
-            rendered = fn(_NEW_ENTRY, slate, value)
-        else:
-            rendered = fn(_NEW_ENTRY, slate, **{param.name: value})
+        rendered = fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001 - any render failure is inconclusive
         return None, f'raised: {exc!r}'
     if not isinstance(rendered, str):
@@ -341,10 +435,11 @@ def _render(
 
 def _echoes_argument(
     build: Any,
+    usable: list[Any],
     index: int,
-    param: Any,
     slate: list[Any],
     spelling: str,
+    filler: Any,
 ) -> str | None:
     """The CONTROL for the option-(b) swap test: is the argument just echoed?
 
@@ -380,7 +475,7 @@ def _echoes_argument(
     renders: list[tuple[str, str]] = []
     for nonce in _NONCE_IDS:
         rendered, error = _render(
-            build, index, param, slate, _nonce_candidate(nonce), spelling,
+            build, usable, index, slate, _nonce_candidate(nonce), spelling, filler,
         )
         if error is not None or rendered is None:
             return None
@@ -405,15 +500,29 @@ def _echoes_argument(
     return None
 
 
+class _Search(NamedTuple):
+    """The outcome of the option-(b) search over (parameter x spelling x filler).
+
+    ``target_named_rendered`` is what separates 'the invariant does not hold'
+    from 'nothing measured it'. A signature that carries a target-NAMED
+    parameter none of whose calls ever produced a pair of renderings has
+    asserted nothing about the attach target, however many OTHER parameters
+    rendered happily -- see ``_probe``.
+    """
+
+    winner: tuple[int, Any, str, bool] | None
+    attempts: list[str]
+    rendered_any: bool
+    target_named_rendered: bool
+
+
 def _search_option_b(
     build: Any,
     slate: list[Any],
     target: Any,
     other: Any,
-) -> tuple[tuple[int, Any, str, bool] | None, list[str], bool]:
-    """Search the (parameter x spelling) space for a combination that holds.
-
-    Returns ``(winner, attempts, rendered_any)``.
+) -> _Search:
+    """Search the (parameter x spelling x filler) space for a combination that holds.
 
     WHY A SEARCH RATHER THAN A CHOICE. The previous shape picked the third
     parameter, then picked the first spelling that did not RAISE. Both choices
@@ -437,37 +546,68 @@ def _search_option_b(
     first: a module can carry both an echoing free-text parameter and a real
     marker, and taking the first combination that holds would otherwise stop at
     whichever came earlier in the signature.
+
+    THE FILLER IS THE INNERMOST LOOP, and it stops at the first value that
+    RENDERS rather than at the first that passes: a combination that renders
+    has been measured, and re-measuring it with another placeholder would only
+    restate the same finding once per placeholder in a report whose window is
+    already contended.
     """
     attempts: list[str] = []
     rendered_any = False
+    target_named_rendered = False
+    usable = _usable_parameters(build)
     for index, param in _target_parameters(build):
+        named = _names_a_target(param)
+        fillers = _fillers_for(usable, index)
         for spelling in _SPELLINGS:
-            label = f'{param.name!r} (parameter {index}, candidate {spelling})'
-            rendered_target, error = _render(build, index, param, slate, target, spelling)
-            if error is not None:
-                attempts.append(f'{label} — {error}')
-                continue
-            rendered_other, error = _render(build, index, param, slate, other, spelling)
-            if error is not None:
-                attempts.append(f'{label} — {error}')
-                continue
-            rendered_any = True
-            assert rendered_target is not None and rendered_other is not None
-            reason = _swap_verdict(slate, target, other, rendered_target, rendered_other)
-            if reason is not None:
-                attempts.append(f'{label} — {reason}')
-                continue
-            # The CONTROL. The swap test cannot tell a parameter that MARKS the
-            # attach target from one that merely echoes whatever it is handed,
-            # because feeding a candidate id to an echoing parameter satisfies
-            # both swap conditions. Only a parameter NAMED for the target is
-            # forgiven an echo, and the report says so out loud.
-            echo = _echoes_argument(build, index, param, slate, spelling)
-            if echo is not None and not _names_a_target(param):
-                attempts.append(f'{label} — {echo}')
-                continue
-            return (index, param, spelling, echo is not None), attempts, rendered_any
-    return None, attempts, rendered_any
+            for filler in fillers:
+                label = (
+                    f'{param.name!r} (parameter {index}, candidate {spelling}'
+                    f'{_filler_note(fillers, filler)})'
+                )
+                rendered_target, error = _render(
+                    build, usable, index, slate, target, spelling, filler,
+                )
+                if error is not None:
+                    attempts.append(f'{label} — {error}')
+                    continue
+                rendered_other, error = _render(
+                    build, usable, index, slate, other, spelling, filler,
+                )
+                if error is not None:
+                    attempts.append(f'{label} — {error}')
+                    continue
+                rendered_any = True
+                target_named_rendered = target_named_rendered or named
+                assert rendered_target is not None and rendered_other is not None
+                reason = _swap_verdict(
+                    slate, target, other, rendered_target, rendered_other,
+                )
+                if reason is not None:
+                    attempts.append(f'{label} — {reason}')
+                    break
+                # The CONTROL. The swap test cannot tell a parameter that MARKS
+                # the attach target from one that merely echoes whatever it is
+                # handed, because feeding a candidate id to an echoing parameter
+                # satisfies both swap conditions. Only a parameter NAMED for the
+                # target is forgiven an echo, and the report says so out loud.
+                echo = _echoes_argument(build, usable, index, slate, spelling, filler)
+                if echo is not None and not named:
+                    attempts.append(f'{label} — {echo}')
+                    break
+                return _Search(
+                    (index, param, spelling, echo is not None),
+                    attempts,
+                    rendered_any,
+                    target_named_rendered,
+                )
+    return _Search(None, attempts, rendered_any, target_named_rendered)
+
+
+def _filler_note(fillers: tuple[Any, ...], filler: Any) -> str:
+    """How the report names the placeholder, and nothing at all when unused."""
+    return f', other required parameters={filler!r}' if len(fillers) > 1 else ''
 
 
 # --- option (a): the verdict names its own candidate --------------------------
@@ -1142,9 +1282,10 @@ def _probe(src_root: Path, out: list[str]) -> int:
         out.extend(_rescue_note(slate_ids, index))
         return EXIT_FAIL
 
-    winner, attempts, rendered_any = _search_option_b(build, slate, target, other)
-    if winner is None:
-        if not rendered_any:
+    search = _search_option_b(build, slate, target, other)
+    attempts = list(dict.fromkeys(search.attempts))
+    if search.winner is None:
+        if not search.rendered_any:
             # Not one combination produced a pair of renderings to compare, so
             # nothing was ever asserted about the invariant. Unverifiable, not
             # failed.
@@ -1152,12 +1293,31 @@ def _probe(src_root: Path, out: list[str]) -> int:
                 'build_judge_prompt could not be rendered with an attach target '
                 f'({_first_few(attempts)})',
             )
+        named = [
+            param.name
+            for _, param in _target_parameters(build)
+            if _names_a_target(param)
+        ]
+        if named and not search.target_named_rendered:
+            # SOME parameter rendered, so the branch above did not fire -- but
+            # not one that could have decided this. Reporting the attach target
+            # INDETERMINATE here would state a fact this run did not establish
+            # (and point the reader at a remedy that may already be present),
+            # so say what was actually measured. Still fails closed: an
+            # unverifiable invariant is not a satisfied one.
+            raise _Unverifiable(
+                f'build_judge_prompt takes {named!r}, named for the attach target, '
+                'but no call reached it — every attempt failed before a pair of '
+                'renderings existed to compare. Only parameters that do NOT name '
+                'the target rendered, so nothing here measured whether the '
+                f'rendering depends on the named candidate ({_first_few(attempts)})',
+            )
         out.append(f'option (b): {_first_few(attempts, limit=len(attempts))}')
         out.extend(_FAIL_NEITHER)
         out.extend(_rescue_note(slate_ids, index))
         return EXIT_FAIL
 
-    param_index, param, spelling, forgiven_echo = winner
+    param_index, param, spelling, forgiven_echo = search.winner
     out.append(
         f'option (b): satisfied — build_judge_prompt accepts an attach target via '
         f'{param.name!r} (parameter {param_index}, spelled as the candidate '
