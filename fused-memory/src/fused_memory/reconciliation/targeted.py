@@ -1,5 +1,6 @@
 """Targeted reconciliation — lightweight, triggered by task state transitions."""
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -1500,12 +1501,21 @@ class TargetedReconciler:
         * anything else (in-progress, deferred, review, ...) -> left alone.
 
         The ``blocked -> pending`` transition performed here is legal per
-        ``shared.task_transitions._UNION`` and survives the
-        ``ActorClass.RECONCILIATION`` restriction (which subtracts only
-        ``(in-progress, *)`` pairs) — no FSM change is required. It also needs
-        no recursion guard analogous to ``_PARENT_CANCELLED_REOPEN_PREFIX``:
-        ``TaskInterceptor.STATUS_TRIGGERS`` excludes ``'pending'``, so this
-        write fires no nested ``reconcile_task``.
+        ``shared/task_transitions.py::_UNION`` — no FSM change is required.
+        The write deliberately carries no ``agent_id``, so
+        ``shared/task_transitions.py::derive_actor_class`` classifies it
+        ``ActorClass.HUMAN`` (the header-less default) and the FULL union is
+        consulted: the narrower ``ActorClass.RECONCILIATION`` restriction,
+        which subtracts every ``(in-progress, *)`` pair, is NOT applied here.
+        A ``recon-stage-*`` actor id would instead be refused outright by
+        ``ReconWritePolicy`` Gate 2 whenever the project-wide orchestrator
+        lock is held (i.e. almost always), so the ``(in-progress, pending)``
+        edge that restriction would have rejected is closed by the live
+        status re-read in :meth:`_unblock_dependent` instead.
+
+        No recursion guard analogous to ``_PARENT_CANCELLED_REOPEN_PREFIX``
+        is needed: ``TaskInterceptor.STATUS_TRIGGERS`` excludes ``'pending'``,
+        so this write fires no nested ``reconcile_task``.
 
         Builds the ``{str(id): status}`` map once from the caller's single
         ``get_tasks`` snapshot instead of the old nested
@@ -1514,7 +1524,7 @@ class TargetedReconciler:
 
         A ``blocked`` dependent pinned by an open escalation, or one whose
         escalation store cannot be read, is vetoed rather than unblocked --
-        see :meth:`_escalation_queue_for` and :meth:`_unblock_dependent`.
+        see :meth:`_escalation_pin_index_for` and :meth:`_unblock_dependent`.
         """
         status_by_id: dict[str, str] = {
             str(t.get('id')): str(t.get('status') or '')
@@ -1522,16 +1532,24 @@ class TargetedReconciler:
             if isinstance(t, dict)
         }
 
-        # Tri-state lazy memo for the escalation-pin veto's EscalationQueue,
-        # mirroring the `live_status` lazy memo idiom used by
-        # _sweep_cancelled_descendants (:1203-1204 nearby). Built at most
-        # once per sweep -- and only when the FIRST blocked dependent is
-        # encountered -- via _escalation_queue_for, so a sweep with no
-        # blocked dependents never touches the escalation store, and a
-        # construction failure is remembered (not retried) for the rest of
-        # this sweep. Empty list = not yet attempted; single-element list
-        # holds the queue instance, or None if construction failed/unavailable.
+        # Two tri-state lazy memos, mirroring the `live_status` memo idiom
+        # in targeted.py::_sweep_cancelled_descendants. Each is populated at
+        # most once per sweep, and only when the FIRST blocked dependent
+        # reaches it -- so a sweep with no blocked dependents does no extra
+        # I/O at all -- and a failure is remembered, not retried, for the
+        # rest of the sweep. Empty list = not yet attempted; single-element
+        # list holds the value, or None/{} when it could not be built.
+        #
+        # queue_memo: {task_id: [escalation_id, ...]} over all PENDING
+        #   escalations, scanned ONCE (targeted.py::_escalation_pin_index_for)
+        #   instead of one get_by_task glob-and-parse per dependent, which
+        #   made the veto a D x E filesystem scan on the reconciliation hot
+        #   path for a task with D blocked dependents and E open escalations.
+        # live_memo: a fresh {task_id: status} re-read, used to confirm a
+        #   dependent is STILL 'blocked' at write time (see
+        #   targeted.py::_unblock_dependent).
         queue_memo: list[Any] = []
+        live_memo: list[dict[str, str]] = []
 
         actions: list[dict] = []
         for t in all_tasks:
@@ -1560,31 +1578,41 @@ class TargetedReconciler:
                     project_root=project_root,
                     run_id=run_id,
                     queue_memo=queue_memo,
+                    live_memo=live_memo,
                 ))
         return actions
 
-    def _escalation_queue_for(
+    async def _escalation_pin_index_for(
         self, project_root: ProjectRoot, queue_memo: list,
-    ) -> Any:
-        """Lazily construct the per-project ``EscalationQueue`` used by the
+    ) -> dict[str, list[str]] | None:
+        """Build the ``{task_id: [escalation_id, ...]}`` pin index used by the
         dependent-unblock veto, memoizing the result (success OR failure) in
-        *queue_memo* so it is built at most once per sweep.
+        *queue_memo* so the escalation store is scanned at most once per sweep.
 
-        Returns the queue instance, or ``None`` when unavailable -- either
-        because the ``escalation`` package isn't importable in this env
-        (mirrors the module's defensive import at :43-50), or because
-        construction raised (logged at warning with ``exc_info=True``, same
-        as the caller does for a subsequent ``get_by_task`` failure). Both
-        arms veto rather than flip: an unreadable/absent store cannot prove
-        "no open escalation" for a task, and a false negative there would
-        unblock a task the orchestrator (or a human) deliberately parked --
-        the same fail-safe direction ``scheduler.py``'s stranded-blocked
-        sweep states verbatim at :6499-6524 (the esc-3163 lesson).
+        Scans ONCE via ``escalation/queue.py::EscalationQueue.get_pending``
+        rather than calling ``get_by_task(dep_id, status='pending')`` per
+        dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
+        the same ``status == 'pending'`` filter, so one scan plus a dict
+        lookup is equivalent to D scans while turning a D x E parse into
+        1 x E. The scan runs in ``asyncio.to_thread`` because
+        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
+        coroutine runs on the shared fused-memory event loop.
+
+        Returns the index, or ``None`` when the store is unavailable -- the
+        ``escalation`` package isn't importable in this env (mirrors the
+        module's defensive import at the top of this file), construction
+        raised, or the scan itself raised (all logged at warning with
+        ``exc_info=True``). Every such arm vetoes rather than flips: a store
+        you cannot read cannot prove "no open escalation", and a false
+        negative would unblock a task the orchestrator (or a human)
+        deliberately parked -- the same fail-safe direction
+        ``scheduler.py::Scheduler._phase_redispatch_stranded_blocked`` states
+        verbatim (the esc-3163 lesson).
 
         ``EscalationQueue.__init__`` does ``mkdir(parents=True,
-        exist_ok=True)`` (escalation/queue.py:388-390), which is why this is
-        called lazily from :meth:`_unblock_dependent` rather than eagerly
-        from :meth:`_sweep_unblock_dependents` -- a sweep with no blocked
+        exist_ok=True)``, which is why this is called lazily from
+        :meth:`_unblock_dependent` rather than eagerly from
+        :meth:`_sweep_unblock_dependents` -- a sweep with no blocked
         dependents must not create ``data/escalations/`` as a side effect of
         an unrelated ``done`` transition.
         """
@@ -1593,18 +1621,24 @@ class TargetedReconciler:
         if not _HAS_ESCALATION or EscalationQueue is None:
             queue_memo.append(None)
             return None
+        index: dict[str, list[str]] | None
         try:
             queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            index = {}
+            for esc in await asyncio.to_thread(queue.get_pending):
+                pinned = str(getattr(esc, 'task_id', '') or '')
+                if pinned:
+                    index.setdefault(pinned, []).append(getattr(esc, 'id', None))
         except Exception:
             logger.warning(
-                'sweep: could not construct escalation queue for the '
+                'sweep: could not read the escalation store for the '
                 'dependent-unblock veto at project_root=%s',
                 project_root,
                 exc_info=True,
             )
-            queue = None
-        queue_memo.append(queue)
-        return queue
+            index = None
+        queue_memo.append(index)
+        return index
 
     async def _unblock_dependent(
         self,
@@ -1614,6 +1648,7 @@ class TargetedReconciler:
         project_root: ProjectRoot,
         run_id: str,
         queue_memo: list,
+        live_memo: list,
     ) -> dict:
         """Flip one 'blocked' dependent to 'pending' now its deps are done.
 
@@ -1624,17 +1659,33 @@ class TargetedReconciler:
 
         Checks run cheapest-first, before any write is attempted: the
         interceptor-wired guard (above) -> ``_unblock_veto_reason`` (pure,
-        no I/O) -> the escalation-pin veto (filesystem, via
-        :meth:`_escalation_queue_for`) -> the write itself.
+        no I/O) -> the escalation-pin veto (one memoized store scan per
+        sweep, via :meth:`_escalation_pin_index_for`) -> the live status
+        re-read (one memoized ``get_tasks`` per sweep) -> the write itself.
 
-        Everything past the interceptor guard — both veto checks, the write,
-        and classifying its response — runs inside one try/except so a
-        single dependent's I/O failure (a raised exception, not just a
+        The live re-read closes a TOCTOU window. The decision to flip comes
+        from the caller's ``get_tasks`` snapshot, but ``reconcile_task`` is
+        fire-and-forget background work that can be scheduled arbitrarily
+        late, and this helper does escalation I/O before writing. A dependent
+        that left ``blocked`` in that window (``blocked -> in-progress`` is a
+        legal edge -- a harness resume-at-verify) must not be flipped back to
+        ``pending``. Because the write carries no recon ``agent_id``, the
+        ``ActorClass.RECONCILIATION`` restriction that would reject
+        ``(in-progress, *)`` never runs against it (see
+        :meth:`_sweep_unblock_dependents`), so this re-read is the only thing
+        standing between a stale snapshot and a live task -- the same
+        staleness class ``targeted.py::_sweep_cancelled_descendants`` guards
+        with ``_live_status_map``. It is placed last, immediately before the
+        write, to keep the window as small as possible.
+
+        Everything past the interceptor guard — the veto checks, the re-read,
+        the write, and classifying its response — runs inside one try/except
+        so a single dependent's I/O failure (a raised exception, not just a
         rejection response) can never abandon the rest of the sweep; the
-        caller loops over every dependent unconditionally. The escalation
-        read has its own inner try/except so a read failure is classified as
-        a veto (``escalation_store_unavailable``) rather than falling through
-        to the generic ``dependent_unblock_failed`` outcome.
+        caller loops over every dependent unconditionally. A failed store
+        read is classified as its own outcome (``escalation_store_unavailable``
+        / ``live_status_unavailable``) rather than falling through to the
+        generic ``dependent_unblock_failed``.
         """
         dep_id = str(dependent.get('id') or '')
         if self.task_interceptor is None:
@@ -1664,9 +1715,11 @@ class TargetedReconciler:
             # Escalation-pin veto (task 4903): a task the orchestrator (or a
             # human) blocked *and* pinned with an open escalation must not be
             # unblocked here, or this sweep would immediately undo that park.
-            # See _escalation_queue_for for the fail-safe rationale.
-            queue = self._escalation_queue_for(project_root, queue_memo)
-            if queue is None:
+            # See _escalation_pin_index_for for the fail-safe rationale and
+            # for why only PENDING escalations are indexed (resolved and
+            # dismissed ones pin nothing).
+            pin_index = await self._escalation_pin_index_for(project_root, queue_memo)
+            if pin_index is None:
                 return {
                     'type': 'dependent_unblock_vetoed',
                     'task_id': dep_id,
@@ -1674,26 +1727,7 @@ class TargetedReconciler:
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_store_unavailable',
                 }
-            try:
-                # status='pending' explicitly: the fast path that scans the
-                # queue root only and skips the archive rglob entirely
-                # (escalation/queue.py:642-644) -- resolved/dismissed
-                # escalations don't pin anything.
-                open_escalations = queue.get_by_task(dep_id, status='pending')
-            except Exception:
-                logger.warning(
-                    'sweep: escalation store read failed for dependent-unblock '
-                    'veto on task %s (satisfied by %s)',
-                    dep_id, satisfied_by,
-                    exc_info=True,
-                )
-                return {
-                    'type': 'dependent_unblock_vetoed',
-                    'task_id': dep_id,
-                    'title': dependent.get('title'),
-                    'satisfied_by': satisfied_by,
-                    'reason': 'escalation_store_unavailable',
-                }
+            open_escalations = pin_index.get(dep_id) or []
             if open_escalations:
                 return {
                     'type': 'dependent_unblock_vetoed',
@@ -1701,7 +1735,38 @@ class TargetedReconciler:
                     'title': dependent.get('title'),
                     'satisfied_by': satisfied_by,
                     'reason': 'escalation_pinned',
-                    'escalation_ids': [e.id for e in open_escalations],
+                    'escalation_ids': list(open_escalations),
+                }
+
+            # Live status re-read -- the TOCTOU guard described in this
+            # method's docstring. Memoized per sweep: one get_tasks for the
+            # whole sweep, not one per dependent.
+            if not live_memo:
+                live_memo.append(await self._live_status_map(project_root))
+            live = live_memo[0]
+            if not live:
+                # _live_status_map fails open to {}, and an empty map cannot
+                # prove the dependent is still blocked. Same fail-safe
+                # direction as the escalation arm: leave it blocked.
+                # Under-unblocking is self-healing (the orchestrator's own
+                # stranded-blocked sweep still covers it); over-unblocking is
+                # the oscillation this sweep exists to end.
+                return {
+                    'type': 'dependent_unblock_skipped',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': 'live_status_unavailable',
+                }
+            live_status = live.get(dep_id)
+            if live_status != 'blocked':
+                return {
+                    'type': 'dependent_unblock_skipped',
+                    'task_id': dep_id,
+                    'title': dependent.get('title'),
+                    'satisfied_by': satisfied_by,
+                    'reason': 'status_changed',
+                    'live_status': live_status,
                 }
 
             resp = await self.task_interceptor.set_task_status(
@@ -1730,10 +1795,10 @@ class TargetedReconciler:
                 )
                 # Symmetric durable audit row for the rejection path -- mirrors
                 # the 'write' row emitted on success (below) and the
-                # hints_attached/hints_skipped convention at :1014-1042.
-                # 'skip' lets operators filter `WHERE action_type='skip'` to
-                # compute unblock-rejection cardinality without parsing detail
-                # JSON.
+                # hints_attached/hints_skipped convention in
+                # targeted.py::_on_task_blocked. 'skip' lets operators filter
+                # `WHERE action_type='skip'` to compute unblock-rejection
+                # cardinality without parsing detail JSON.
                 await self.journal.add_run_action(
                     run_id, 'skip', 'taskmaster', 'set_task_status',
                     {
@@ -1757,9 +1822,9 @@ class TargetedReconciler:
             # Durable 'write' audit row (task 4903): without this the flip is
             # auditably silent on the task row -- set_task_status only stamps
             # reopen_reason/reopen_from/reopen_at when old_status is terminal
-            # (done/cancelled; task_interceptor.py:1215-1238), and 'blocked'
-            # is not terminal. This is exactly how the defect stayed invisible
-            # through four manual resets.
+            # (done/cancelled; task_interceptor.py::TaskInterceptor.set_task_status),
+            # and 'blocked' is not terminal. This is exactly how the defect
+            # stayed invisible through four manual resets.
             await self.journal.add_run_action(
                 run_id, 'write', 'taskmaster', 'set_task_status',
                 {
@@ -1786,51 +1851,41 @@ class TargetedReconciler:
                 action['no_op'] = True
 
             # Second write: stamp the audit onto the dependent's own metadata,
-            # so the task row itself explains why it became pending (not just
-            # the journal). metadata_mode='merge' gives last-write-wins on
-            # scalar collision -- NOT append=True, whose additive semantics
-            # keep the OLD value on collision (sqlite_task_backend.py
-            # :3294-3295, :3325-3326, :3350-3351) and would freeze
-            # unblocked_by/unblocked_at at the first unblock forever, exactly
-            # the "silently re-blocks and nobody notices" failure this sweep
-            # exists to end. Never pass append alongside metadata_mode --
-            # append=False now raises TaskmasterError (task-2180 guard).
+            # so the task row itself explains why it became pending, not just
+            # the journal. Structural, not a workaround -- set_task_status
+            # writes only its fixed audit-field set, and the backend
+            # write-authority floor refuses a status write routed through
+            # update_task -- so this mirrors the two-write split in
+            # targeted.py::_sweep_block_orphan.
             #
-            # Structural, not a workaround: set_task_status only writes its
-            # fixed audit-field set, and the backend write-authority floor
-            # refuses any status write routed through update_task
-            # (StatusWriteAuthorityError). This mirrors _sweep_block_orphan's
-            # two-write split (:1357-1394) -- but NOT its append=True choice,
-            # and NOT its stale rationale citing
-            # feedback_set_task_status_replaces_metadata.md (a file that
-            # exists nowhere in the repo or its history): set_task_status
-            # merges rather than replaces metadata today, so that
-            # justification is not carried into this helper.
+            # metadata_mode='merge' (never append=True, whose additive
+            # semantics keep the OLD value on scalar collision -- see
+            # sqlite_task_backend.py::_resolve_metadata_mode) so a second
+            # unblock refreshes unblocked_by/unblocked_at instead of freezing
+            # the first forever; pinned by
+            # test_unblock_dependent_stamps_task_metadata.
             #
-            # Own try/except: the status flip already landed, so a
-            # metadata-stamp failure must not downgrade this action back to
-            # dependent_unblock_failed -- that would make the audit lie in
-            # the opposite direction. But try/except ALONE is not enough:
-            # update_task's gates do NOT raise. The _backlog_gate
-            # BacklogVerdict, the lock-charter rejection and the backend
-            # write-authority floor all return early with a rejection dict,
-            # so under a deep reconciliation backlog -- exactly the condition
-            # under which this sweep is most likely to run -- a bare
-            # try/except sees nothing and the stamp is silently dropped.
+            # Own try/except so a stamp failure never downgrades this action
+            # back to dependent_unblock_failed -- the status flip already
+            # landed, and downgrading would make the audit lie in the opposite
+            # direction. try/except ALONE is not enough, though: update_task's
+            # gates (backlog verdict, lock charter, write-authority floor)
+            # return a rejection dict rather than raising, so a bare
+            # try/except sees nothing and the stamp is silently dropped under
+            # exactly the deep-backlog conditions this sweep runs in.
             # interceptor_write_succeeded is the module's single sanctioned
-            # classifier for that ("Callers must use interceptor_write_succeeded
-            # to distinguish a successful write from a gate rejection"); do not
-            # hand-roll the check, since a happy-path response can legitimately
-            # carry no 'success' key while {} and non-dicts are failures.
+            # classifier ("Callers must use interceptor_write_succeeded to
+            # distinguish a successful write from a gate rejection"); do not
+            # hand-roll it, since a happy-path response can legitimately carry
+            # no 'success' key while {} and non-dicts are failures.
             #
             # Both audit rows use operation='update_task', never
             # 'set_task_status', so operator queries (and the step-9 journal
             # tests) that filter on the status write keep their cardinality.
-            # A rejection marks action['metadata_stamp']='rejected' and a raise
-            # marks 'failed' -- distinct on purpose, so a policy refusal is
-            # legible apart from an infrastructure fault. Absence of the key
-            # means the stamp landed (mirroring hints_attached, which carries
-            # no status field).
+            # 'rejected' (policy refusal, succeeds on retry) and 'failed'
+            # (unexpected raise) stay distinct because they need different
+            # operator remediation; absence of the key means the stamp landed,
+            # mirroring hints_attached.
             try:
                 resp_meta = await self.task_interceptor.update_task(
                     task_id=dep_id,
@@ -1844,7 +1899,8 @@ class TargetedReconciler:
                 )
                 if not interceptor_write_succeeded(resp_meta):
                     # Stable machine code first, rendered message second --
-                    # the same precedence used for hints_skipped (:1037-1039).
+                    # the same precedence used for hints_skipped in
+                    # targeted.py::_on_task_blocked.
                     error_code = (
                         (resp_meta.get('error_type') or resp_meta.get('error'))
                         if isinstance(resp_meta, dict) else 'unknown'
@@ -1934,6 +1990,21 @@ def _unblock_veto_reason(dependent: dict) -> str | None:
       dict/list: only ``Scheduler._apply_external_dep_policy`` can evaluate
       live cross-project statuses, so this reconciler must abstain rather
       than guess.
+    * ``'infra_hold'`` — ``metadata.infra_hold`` is truthy: an infra-hold
+      park, for which ``shared/task_claimant.py::is_stranded_blocked``
+      returns False unconditionally. The orchestrator's sibling sweep
+      (``scheduler.py::Scheduler._phase_redispatch_stranded_blocked``)
+      therefore never redispatches such a task, and neither may this one.
+    * ``'deterministic_owned'`` — ``metadata.task_kind == 'deterministic'``:
+      the same DESIGN-GAP carve-out that sibling sweep makes, and for the
+      same reason. A blocked deterministic task is owned exclusively by the
+      deterministic gate flow (born-at-L2 ``resolve_issue``) or the
+      deterministic-recon sweep (deploy strands); a generic unblock would
+      contest an owner this reconciler cannot see.
+
+    Both of the latter two are pure metadata reads deliberately evaluated
+    BEFORE the escalation-store I/O, exactly as that sibling sweep orders
+    them: a park that can be recognized for free must never cost a scan.
 
     Reads metadata defensively: a JSON-string metadata value (as stored by
     some callers) is tolerated the same way the rest of this module treats
@@ -1950,6 +2021,12 @@ def _unblock_veto_reason(dependent: dict) -> str | None:
 
     if metadata.get('parent_cancelled') or metadata.get('needs_recheck_against_main'):
         return 'parent_cancelled'
+
+    if metadata.get('infra_hold'):
+        return 'infra_hold'
+
+    if metadata.get('task_kind') == 'deterministic':
+        return 'deterministic_owned'
 
     external_deps = metadata.get('external_deps')
     if isinstance(external_deps, (dict, list)) and external_deps:

@@ -1,5 +1,6 @@
 """Tests for targeted reconciliation."""
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -4820,6 +4821,48 @@ def _dep_actions_for(result: dict, task_id: str) -> list[dict]:
             [], True, 'dependent_unblock_vetoed', 'external_deps',
             id='blocked_vetoed_external_deps',
         ),
+        # The shape _unblock_veto_reason's isinstance(metadata, str) ->
+        # json.loads branch exists for: every other case here hands it a
+        # dict, so dropping that branch would leave the table green while
+        # silently un-parking a parent_cancelled task.
+        pytest.param(
+            {'status': 'blocked', 'metadata': json.dumps({'parent_cancelled': '7'})},
+            [], True, 'dependent_unblock_vetoed', 'parent_cancelled',
+            id='blocked_vetoed_parent_cancelled_json_string_metadata',
+        ),
+        # ... and its unparseable fallback: treated as empty metadata (no
+        # veto), never as an error that fails the whole dependent.
+        pytest.param(
+            {'status': 'blocked', 'metadata': '{not json'},
+            [], True, 'dependent_unblock_applied', None,
+            id='blocked_unparseable_metadata_treated_as_empty',
+        ),
+        # Negative boundary of the external_deps veto: the key must be
+        # NON-EMPTY to veto. Pins `and external_deps` against a regression
+        # to a bare `'external_deps' in metadata` membership test.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'external_deps': {}}},
+            [], True, 'dependent_unblock_applied', None,
+            id='blocked_empty_external_deps_does_not_veto',
+        ),
+        # Park-protection parity with the orchestrator's sibling sweep
+        # (scheduler.py::Scheduler._phase_redispatch_stranded_blocked): an
+        # infra-hold park is never stranded-blocked
+        # (shared/task_claimant.py::is_stranded_blocked returns False for it
+        # unconditionally), so this sweep must not un-park it either.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'infra_hold': True}},
+            [], True, 'dependent_unblock_vetoed', 'infra_hold',
+            id='blocked_vetoed_infra_hold',
+        ),
+        # Same parity for that sweep's DESIGN-GAP carve-out: a blocked
+        # deterministic task is owned exclusively by the deterministic gate
+        # flow / deterministic-recon sweep.
+        pytest.param(
+            {'status': 'blocked', 'metadata': {'task_kind': 'deterministic'}},
+            [], True, 'dependent_unblock_vetoed', 'deterministic_owned',
+            id='blocked_vetoed_deterministic_owned',
+        ),
         pytest.param({'status': 'in-progress'}, [], True, None, None, id='in_progress_untouched'),
         pytest.param({'status': 'deferred'}, [], True, None, None, id='deferred_untouched'),
         pytest.param({'status': 'review'}, [], True, None, None, id='review_untouched'),
@@ -5223,6 +5266,184 @@ async def test_unblock_proceeds_when_no_open_escalation(
         f'Expected both dependents to be attempted, got '
         f'{wired_reconciler.task_interceptor.set_task_status.await_count} awaits'
     )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_vetoed_when_pending_scan_raises(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """A constructible queue whose SCAN raises is still an unreadable store.
+
+    Distinct from ``test_unblock_dependent_vetoed_when_escalation_store_unreadable``
+    (which fails at construction): once the veto reads the store through a
+    single memoized ``get_pending`` scan, a raise inside that scan is the
+    other way the index can come back unusable, and it must veto rather than
+    flip for the same esc-3163 reason.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation import targeted
+
+    class _ExplodingQueue(EscalationQueue):
+        def get_pending(self):
+            raise OSError('escalation store read failed')
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _ExplodingQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_vetoed', (
+        f'A failed escalation scan must veto (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'escalation_store_unavailable', (
+        f'Expected reason=escalation_store_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_scans_escalation_store_once_for_many_dependents(
+    wired_reconciler, mock_taskmaster, tmp_path, monkeypatch,
+):
+    """The escalation SCAN, not just the queue object, is memoized per sweep.
+
+    The per-dependent ``get_by_task(dep_id, status='pending')`` this replaced
+    re-globbed ``queue_dir/esc-*.json`` and re-parsed every pending record for
+    each blocked dependent -- a D x E filesystem scan (D dependents, E open
+    escalations) charged to the shared event loop on every ``done``
+    transition. One ``get_pending`` scan plus a dict lookup is equivalent
+    (same glob, same ``status == 'pending'`` filter) at 1 x E.
+
+    Also pins the live-status re-read's own per-sweep memo: two blocked
+    dependents must cost exactly two ``get_tasks`` calls (the caller's
+    snapshot + one shared re-read), not one re-read per dependent.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation import targeted
+
+    scans: list[int] = []
+
+    class _CountingQueue(EscalationQueue):
+        def get_pending(self):
+            scans.append(1)
+            return super().get_pending()
+
+    monkeypatch.setattr(targeted, 'EscalationQueue', _CountingQueue)
+
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        {'id': '2', 'title': 'Downstream Two', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '3', 'title': 'Downstream Three', 'status': 'blocked', 'dependencies': ['1']},
+        {'id': '4', 'title': 'Downstream Four', 'status': 'blocked', 'dependencies': ['1']},
+    ))
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    for tid in ('2', '3', '4'):
+        actions = _dep_actions_for(result, tid)
+        assert len(actions) == 1 and actions[0]['type'] == 'dependent_unblock_applied', (
+            f'Expected task {tid} unblocked, got: {actions}'
+        )
+
+    assert len(scans) == 1, (
+        f'Expected the pending-escalation store scanned exactly once per sweep '
+        f'(memoized index), got {len(scans)} scans for 3 blocked dependents'
+    )
+    assert mock_taskmaster.get_tasks.await_count == 2, (
+        f'Expected 2 get_tasks calls (caller snapshot + one memoized live '
+        f're-read), got {mock_taskmaster.get_tasks.await_count}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_skipped_when_live_status_left_blocked(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """TOCTOU guard: a dependent that left 'blocked' after the snapshot is
+    never flipped back to 'pending'.
+
+    ``reconcile_task`` is fire-and-forget background work and this sweep does
+    escalation I/O before writing, so the snapshot can be arbitrarily stale.
+    ``blocked -> in-progress`` is a legal edge (a harness resume-at-verify),
+    and because the write carries no recon ``agent_id`` the
+    ``ActorClass.RECONCILIATION`` restriction that forbids ``(in-progress,
+    *)`` never runs against it -- this live re-read is the only guard.
+    """
+    snapshot = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    )
+    live = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'in-progress', 'dependencies': ['1']},
+    )
+    mock_taskmaster.get_tasks = AsyncMock(side_effect=[snapshot, live])
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_skipped', (
+        f'A dependent that is no longer blocked must be skipped, got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'status_changed', (
+        f'Expected reason=status_changed, got: {actions[0]!r}'
+    )
+    assert actions[0].get('live_status') == 'in-progress', (
+        f'The action must name the status actually observed, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_skipped_when_live_reread_unavailable(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    """A failed live re-read cannot prove the dependent is still blocked, so
+    it skips rather than flips -- same fail-safe direction as the escalation
+    arm. Under-unblocking is self-healing (the orchestrator's own
+    stranded-blocked sweep still covers it); over-unblocking is the
+    oscillation this sweep exists to end.
+    """
+    snapshot = _dep_tasks(
+        {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']},
+    )
+    mock_taskmaster.get_tasks = AsyncMock(
+        side_effect=[snapshot, RuntimeError('taskmaster unavailable')],
+    )
+
+    result = await wired_reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+    assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_skipped', (
+        f'An unreadable live status must skip (never flip), got: {actions[0]!r}'
+    )
+    assert actions[0].get('reason') == 'live_status_unavailable', (
+        f'Expected reason=live_status_unavailable, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
 
 
 # ── task-4903: durable audit trail ──────────────────────────────────────────
