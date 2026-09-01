@@ -497,10 +497,43 @@ class EscalationQueue:
         during a merge-triggered service restart) could drop a just-filed
         born-at-L2 gate escalation while its durable seq counter and the
         orchestrator's ``gate_escalated_at`` stamp survived.
+
+        Divergence guard: when ``escalation.id`` does not start with
+        ``f'esc-{escalation.task_id}-'`` an INFO line records both values.  This
+        is OBSERVABILITY ONLY — it never rejects and never raises.  ``make_id``'s
+        argument is an id-namespace KEY rather than a task_id and five
+        production sites diverge deliberately, so a divergent submit is correct
+        and must land unchanged; the line exists only so the divergence is
+        visible where it is created.  See ``make_id`` for the full contract.
         """
         with escalation_id_lock(self.queue_dir, escalation.id):
             self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
+        # OBSERVABILITY ONLY — never rejects, never raises.  `make_id`'s argument
+        # is an id-NAMESPACE key, not a task_id, and five production sites
+        # diverge deliberately (curator_escalator.py x3, ticket_janitor.py x2),
+        # so this records the divergence where it is CREATED rather than leaving
+        # it to be rediscovered by the next failed design (it has already cost
+        # two design cycles — ruling esc-3999-2).  Adjacent to the line above so
+        # the two correlate in a log.
+        # Total over task_id: an f-string interpolation of None yields
+        # 'esc-None-' and simply does not match — no branch, no crash.
+        # INFO, not DEBUG: DEBUG is off in production, and a guard nobody's log
+        # level shows is not observability.  Emitted once PER DIVERGENT SUBMIT
+        # with NO module-level "already warned" memo — a memo keyed on ids would
+        # grow without bound over a long-lived server process, the identical
+        # defect task 4885 closes for `dedupe_children` two functions below, and
+        # the divergence is rare enough (42 of 2,972 corpus records, ~1.4%) that
+        # a second line on ~1 submit in 70 is proportionate.  Do not "optimise"
+        # a memo back in.
+        if not escalation.id.startswith(f'esc-{escalation.task_id}-'):
+            logger.info(
+                'submit: escalation id %r does not encode its task_id %r '
+                '(id-namespace key differs from the stored task_id); this is '
+                'legitimate — nothing may derive a task_id from a filename or '
+                'an escalation id',
+                escalation.id, escalation.task_id,
+            )
 
         if self._notify_callback:
             try:
