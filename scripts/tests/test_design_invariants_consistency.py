@@ -2551,7 +2551,7 @@ def test_citation_scan_files_ignores_untracked_files(tmp_path: Path) -> None:
     _write_scan_tree(
         tmp_path,
         ["docs/legibility/note.md"],
-        untracked=["data/escalations/afk-digest.md"],
+        untracked=("data/escalations/afk-digest.md",),
     )
     (tmp_path / "data" / "escalations" / "afk-digest.md").write_text(
         "Filed against `docs/legibility/design-invariants.md`'s citation guard:\n"
@@ -2640,7 +2640,7 @@ def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
     _write_scan_tree(
         tmp_path,
         ["docs/site.md"],
-        untracked=["data/digests/digest.md"],
+        untracked=("data/digests/digest.md",),
     )
     (tmp_path / "data" / "digests" / "digest.md").write_text(
         "Restates the family: `contracts-machine-checked`, "
