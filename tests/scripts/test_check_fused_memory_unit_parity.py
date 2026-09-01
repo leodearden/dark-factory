@@ -17,8 +17,10 @@ import types
 
 import pytest
 from setup_host_sections import (
+    enabled_units,
     run_section,
     slice_section,
+    systemctl_calls,
     usage_error_checker,
     write_checker,
 )
@@ -1159,3 +1161,209 @@ def test_a_required_known_project_roots_line_would_reclobber():
     # And the checker would then report the clobbered unit as being at parity,
     # which is what makes the loss invisible rather than merely bad.
     assert mod.find_drift(fixed, (*mod.REQUIRED_SERVICE_DIRECTIVES, single_root_line)) == []
+
+
+# ---------------------------------------------------------------------------
+# setup-host.sh SECTION 4 renders through the renderer, not a redirect (step-9)
+# ---------------------------------------------------------------------------
+#
+# ACCEPTANCE 1 and 2 at the INSTALLER layer, which is where the defect actually
+# lives. Section 4 used to install this unit with
+#
+#     sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" ... > "$UNIT_DIR/fused-memory.service"
+#
+# and the template renders DASHBOARD_KNOWN_PROJECT_ROOTS to a SINGLE root, so
+# every re-run of the sanctioned install path collapsed this host's registered
+# reconciliation scope — silently, because the post-install parity gate checks
+# only host-invariant safety directives and cannot see this variable's value.
+#
+# These tests live in THIS module rather than in test_render_dashboard_unit.py
+# because running a setup-host.sh slice needs subprocess and a stubbed PATH,
+# while that module's docstring pins "ALL FIXTURES ARE tmp_path OR IN-MEMORY
+# STRINGS" and it contains zero subprocess calls. Same split task 4793 used for
+# the dashboard's section-8 tests.
+#
+# Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
+# UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0 while
+# RECORDING its argv — which is how "was fused-memory enabled?" is OBSERVED
+# rather than assumed.
+
+# Anchored on the block's hoisted `_fm_render_script=` assignment — CODE, and
+# unique to this site — for the same reason _GATE_START is: a comment anchor
+# turns a reworded comment into a red CI run for no behavioural change. Mirrors
+# section 8's `_dash_render_script=`.
+_RENDER_START = "_fm_render_script="
+_RENDER_END = "\nfi\n"
+# The slice must run THROUGH the systemctl block, whose closing `fi` is not the
+# first one after the start (the render if/elif/else chain closes first). This
+# third anchor moves the end search past it — the same construct section 8's
+# slice uses.
+_RENDER_END_AFTER = 'if [ "$_fm_rendered"'
+
+_FM_SERVICE = "fused-memory.service"
+
+# A renderer that RAN and refused. Tagged the way the real one tags, so the
+# assertion that the section reported the failure is not satisfied by the stub
+# merely existing.
+_FAILING_FM_RENDERER = (
+    "import sys\n"
+    "sys.stderr.write('[fused_memory_unit_render] FAILED: cannot read template\\n')\n"
+    "sys.exit(1)\n"
+)
+
+
+def _section_4_repo(tmp_path: pathlib.Path, *, with_renderer: bool = True) -> pathlib.Path:
+    """A tmp repo holding the template and (optionally) the REAL renderer.
+
+    The renderer is copied from the repo rather than stubbed, so the slice
+    drives the real preservation logic and only the TREE is fake. It imports
+    systemd_unit_parity, so that sibling is copied too — the renderer's own
+    docstring explains why that dependency went DOWN into a shared module
+    instead of sideways into a checker.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "fused-memory.service.template").write_text(
+        TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    if with_renderer:
+        for name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+            (repo / "scripts" / name).write_text(
+                (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+    return repo
+
+
+def _run_section_4(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    """Run the section-4 slice. UV_PATH is assigned upstream in the real script."""
+    return run_section(
+        tmp_path,
+        slice_section(_RENDER_START, _RENDER_END, end_after=_RENDER_END_AFTER),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra={"UV_PATH": "/usr/bin/uv"},
+    )
+
+
+def _fm_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every systemctl call naming the fused-memory unit."""
+    return [
+        argv
+        for argv in systemctl_calls(tmp_path)
+        if any(tok.startswith("fused-memory") for tok in argv)
+    ]
+
+
+def test_section_4_never_redirects_into_the_unit_file():
+    """A redirect ANYWHERE in the block truncates the destination before python reads it.
+
+    `python3 render.py ... > "$UNIT_DIR/fused-memory.service"` is the same defect
+    one level up from the `sed >` it replaced: bash truncates the destination
+    before python ever opens it, so the installed value is gone before it can be
+    read and the tool preserves nothing while reporting success. The renderer
+    OWNS the destination via --output; the slice must contain no redirect into
+    it at all.
+    """
+    section = slice_section(_RENDER_START, _RENDER_END, end_after=_RENDER_END_AFTER)
+
+    assert f'> "$UNIT_DIR/{_FM_SERVICE}"' not in section, section
+    assert "--output" in section, (
+        "section 4 does not hand the renderer --output, so it is not the "
+        f"read-then-write path this task installs:\n{section}"
+    )
+
+
+def test_section_4_preserves_a_multi_root_installed_unit(tmp_path: pathlib.Path):
+    """(a) ACCEPTANCE 1 at the installer layer: the reconciliation scope survives."""
+    repo = _section_4_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    text = (unit_dir / _FM_SERVICE).read_text(encoding="utf-8")
+    assert _MULTI_ROOTS in text, (
+        f"the re-render collapsed this host's project roots:\n{text}"
+    )
+    for name in ("PROJECT_ROOT", "CONFIG_PATH", "TASKMASTER_DIR"):
+        prefix = f"Environment={name}="
+        line = next(
+            line for line in text.splitlines() if line.strip().startswith(prefix)
+        )
+        assert str(repo) in line, (
+            f"{line!r} was preserved from the OLD checkout instead of being "
+            f"re-derived at {repo}"
+        )
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text, text
+
+
+def test_section_4_greenfield_installs_and_enables(tmp_path: pathlib.Path):
+    """(b) ACCEPTANCE 2: a host with no installed unit gets the committed default."""
+    repo = _section_4_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path)
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    installed = unit_dir / _FM_SERVICE
+    assert installed.is_file(), f"{_FM_SERVICE} was not rendered into {unit_dir}"
+    text = installed.read_text(encoding="utf-8")
+    assert f"Environment={_PRESERVED_NAME}={repo}" in text, text
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text, text
+    assert "fused-memory" in enabled_units(tmp_path), enabled_units(tmp_path)
+
+
+def test_section_4_missing_renderer_leaves_the_unit_alone(tmp_path: pathlib.Path):
+    """(c) NO sed FALLBACK, and no systemctl on a unit that was not written.
+
+    Rendering "the old way" when the renderer is missing looks like graceful
+    degradation and is the opposite: it reinstates the exact truncating clobber
+    this task removes, on the one path where nothing is left watching for it.
+    Leaving the unit ALONE is the recoverable direction — stale-but-intact is
+    fixable on the next run; de-registered-from-reconciliation is not noticed
+    until projects start failing with UnknownProjectError.
+
+    The systemctl assertion is the other half. `fail` in setup-host.sh is a
+    printf, not an exit, so without the `_fm_rendered` flag the section would
+    still reach `enable` (targeting a unit that does not exist on a greenfield
+    host) and `restart` — bouncing the server that backs the orchestrators, the
+    dashboard and this session's own MCP tooling on the strength of an install
+    that did not happen.
+    """
+    repo = _section_4_repo(tmp_path, with_renderer=False)
+    unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))
+    before = (unit_dir / _FM_SERVICE).read_bytes()
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert (unit_dir / _FM_SERVICE).read_bytes() == before, (
+        "the missing-renderer path modified the installed unit"
+    )
+    assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
+    assert _fm_calls(tmp_path) == [], _fm_calls(tmp_path)
+
+
+def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
+    """(d) A renderer that RAN and refused must not fall through silently green.
+
+    The `elif ...; then ok` construct's blind spot: with no else branch a failing
+    render falls out of the chain with status 0 and the operator is told nothing
+    about the unit that did not get written.
+    """
+    repo = _section_4_repo(tmp_path)
+    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+        _FAILING_FM_RENDERER, encoding="utf-8"
+    )
+    unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))
+    before = (unit_dir / _FM_SERVICE).read_bytes()
+
+    result = _run_section_4(tmp_path, repo, unit_dir)
+
+    assert (unit_dir / _FM_SERVICE).read_bytes() == before, (
+        "a refused render modified the installed unit"
+    )
+    assert "FAIL" in result.stdout + result.stderr, result.stdout + result.stderr
+    assert _fm_calls(tmp_path) == [], _fm_calls(tmp_path)
