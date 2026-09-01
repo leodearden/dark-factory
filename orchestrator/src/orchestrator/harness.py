@@ -3537,7 +3537,16 @@ class Harness:
         return archived
 
     def _session_resume_reasons(
-        self, session: dict, config_dir: str | None
+        self,
+        # `object`, not `dict`, and deliberately so: a sidecar that parsed as
+        # JSON but is NOT an object is a STATED case of the I3 totality
+        # contract below, with its own guard and its own tests. An annotation
+        # of `dict` contradicts that contract — it makes the guard unreachable
+        # on paper and the tests that pin it a type error — so it must admit
+        # every input the method promises to survive. Narrowing it back to
+        # `dict` is a regression, not a tidy-up.
+        session: object,
+        config_dir: str | None,
     ) -> frozenset[str]:
         """Return EVERY reason a recovered session is ineligible (task β/3728).
 
