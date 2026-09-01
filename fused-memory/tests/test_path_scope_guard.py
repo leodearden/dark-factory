@@ -324,7 +324,7 @@ class TestFindPathsRightBoundary:
     def test_known_fail_open_residue_long_extension(self):
         """MISSED detection, never a false one — pinned so the gap stays visible.
 
-        The mechanism is the ``{1,6}`` extension-LENGTH cap, not the leading
+        The mechanism is the ``{2,6}`` extension-LENGTH cap, not the leading
         dot: an extension of 7+ chars fails the extension alternative whether
         or not the stem is empty.  ``test_extension_length_cap_boundary``
         below pins the cap itself; the contrast assertion here exists so a
@@ -338,11 +338,13 @@ class TestFindPathsRightBoundary:
         assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
     def test_extension_length_cap_boundary(self):
-        """Pin the ``{1,6}`` magic number itself, on both sides of the edge.
+        """Pin the ``{2,6}`` magic number itself, on both sides of both edges.
 
-        Without this, the cap could be changed to any other value and no test
-        would notice.
+        Without this, either bound could be changed to any other value and
+        no test would notice.
         """
+        assert find_paths('crates/x.a', ('crates/',)) == []  # 1 — out (new floor)
+        assert find_paths('crates/x.ab', ('crates/',)) == ['crates/']  # 2 — in
         assert find_paths('crates/x.abcdef', ('crates/',)) == ['crates/']  # 6 — in
         assert find_paths('crates/x.abcdefg', ('crates/',)) == []  # 7 — out
 
@@ -355,6 +357,130 @@ class TestFindPathsRightBoundary:
         ``project_for_path``.
         """
         assert find_paths('plans/*.md', ('plans/',)) == []
+
+    # ------------------------------------------------------------------
+    # KNOWN FALSE-POSITIVE residue — the opposite direction, deliberately
+    # not closed (task 4160)
+    # ------------------------------------------------------------------
+
+    def test_known_false_positive_residue_three_segment_slash(self):
+        """FALSE POSITIVE — the opposite direction from every other residue
+        entry in this class — pinned so the gap stays visible.
+
+        A ``>=3``-element English slash construction still satisfies the
+        ``_SEG/`` alternative (another '/' follows), so it lexes as a path
+        even though none is present.  Deliberately NOT closed: the only
+        mechanical fix — requiring the ``_SEG/`` chain to terminate in an
+        extension — would stop detecting genuine EXTENSIONLESS directory
+        paths ('fused-memory/src/fused_memory/middleware/', 'crates/reify/src'),
+        a strictly larger and more common real-prose class in this repo than
+        the English >=3-element slash shape it would close, so closing it
+        would be a net detection loss.
+
+        Live impact is bounded: the prose advisory this feeds
+        (:func:`check_text_for_scope` / :func:`check_candidate_for_scope`)
+        NEVER rejects a submission outright, and is suppressed entirely by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work — a false positive only reaches a
+        submission with no locally-attesting declared files.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('the client/server/db split', ('client/',)) == ['client/']
+        assert find_paths('a read/write/execute decision', ('read/',)) == ['read/']
+        # CONTRAST: the TWO-element shape task 3120 closed is still closed.
+        assert find_paths('not a backend/timeout error', ('backend/',)) == []
+
+    def test_known_false_positive_residue_multi_component_version_string(self):
+        """FALSE POSITIVE — a version-like string with an alphabetic final
+        component still lexes as a path, pinned so the gap stays visible.
+
+        Task 4160 closed the TWO-component version-string shape
+        ('backend/v1.2', 'corpus/0.5') by requiring the extension's LEADING
+        character to be alphabetic.  A THREE-OR-MORE-component version
+        string whose FINAL component happens to be alphabetic still
+        satisfies the extension alternative: the DOT-INCLUSIVE stem (needed
+        to keep 'gui/a.b.txt' matching, see :data:`_EXT`) backtracks past
+        the earlier dots and offers the trailing word as the "extension".
+        Deliberately NOT closed, for the same reason as the
+        three-segment-slash residue above: nothing in the regex
+        distinguishes this shape from the genuine multi-dot filename
+        'gui/a.b.txt' — both are a dot-inclusive stem followed by a 2-6
+        char alphabetic-led tail.  Live impact is bounded the same way: the
+        prose advisory never rejects and is suppressed by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('shipping backend/v1.2.final today', ('backend/',)) == [
+            'backend/'
+        ]
+        assert find_paths('see gui/1.0.beta notes', ('gui/',)) == ['gui/']
+        # CONTRAST: an all-numeric final component is still closed.
+        assert find_paths('backend/v1.2.3 changelog', ('backend/',)) == []
+
+    # ------------------------------------------------------------------
+    # task 4160: numeric/single-letter "extension" false positives
+    # ------------------------------------------------------------------
+
+    def test_numeric_extension_is_not_an_extension(self):
+        """Task 4160: an extension whose LEADING character is a digit no
+        longer lexes as a path.
+
+        The WIN fixtures below are MEASURED false positives from the
+        gatekeeper reproduction, not synthetic: ``[A-Za-z0-9]{1,6}`` let the
+        extension START with a digit, so a version string ('v1.2') or a
+        decimal ('0.5') satisfied the right-context extension alternative
+        and the registered prefix in front of it lexed as a path.  Only the
+        LEADING character is anchored to be alphabetic — a digit elsewhere
+        in the extension ('.mp3', '.h5') is unaffected, so those keep
+        matching rather than becoming new missed-detection residue.
+        """
+        # WIN — the reported false positives, now correctly rejected.
+        assert find_paths('upgrade backend/v1.2 protocol', ('backend/',)) == []
+        assert find_paths('threshold corpus/0.5 value', ('corpus/',)) == []
+        # generalisation: proves the LEADING character must be alphabetic —
+        # a length-only floor would accept '10' (2 chars) as an extension.
+        assert find_paths('backend/v1.10 protocol', ('backend/',)) == []
+
+        # RETENTION — a digit elsewhere in the extension is not banned;
+        # only a digit in the LEADING position is.
+        assert find_paths('crates/x.mp3', ('crates/',)) == ['crates/']
+        assert find_paths('crates/x.h5', ('crates/',)) == ['crates/']
+
+        # RETENTION companions — must stay matching through this change.
+        assert find_paths('gui/package.json', ('gui/',)) == ['gui/']
+        assert find_paths('crates/x.RS', ('crates/',)) == ['crates/']
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
+
+    def test_single_letter_extension_is_not_an_extension(self):
+        """Task 4160: a SINGLE-CHARACTER "extension" no longer lexes as a path.
+
+        The retention half of this test is the point of it: a naive ``{2,6}``
+        floor applied to the OLD dot-free stem class (``[A-Za-z0-9_\\-]*``)
+        would break the legitimate multi-dot filename 'gui/a.b.txt', because
+        the stem cannot reach past the first dot to expose 'txt' as the
+        extension — the matcher can only ever offer 'b', which then fails the
+        floor.  These retention assertions are what force the stem to widen
+        to a dot-inclusive class rather than a bare bound change.
+        """
+        # WIN — the reported dotted-initials false positive, plus its
+        # generalisation.
+        assert find_paths('not a backend/A.I. problem', ('backend/',)) == []
+        assert find_paths('backend/U.S. policy', ('backend/',)) == []
+
+        # COST: NEW missed-detection residue — a one-character extension is
+        # no longer an extension.  'crates/x.c' and 'backend/A.I.' are
+        # structurally identical, so no rule closes one and keeps the other
+        # — this is the accepted cost.
+        assert find_paths('crates/x.c', ('crates/',)) == []
+        assert find_paths('crates/x.h', ('crates/',)) == []
+
+        # RETENTION — the trap this test exists to catch.
+        assert find_paths('gui/a.b.txt', ('gui/',)) == ['gui/']
+        assert find_paths('see gui/package.json.', ('gui/',)) == [
+            'gui/'
+        ]  # sentence-final period
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
     # ------------------------------------------------------------------
     # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
