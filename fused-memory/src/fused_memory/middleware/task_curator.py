@@ -1750,6 +1750,11 @@ class TaskCurator:
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
+        # Conversely, a successful _call_llm_batch call resets the counter
+        # itself (see the success branch near its `return`, task 4143), so
+        # "consecutive" is measured across every real LLM success — batch
+        # and size-1 alike — not just the size-1 successes handled by
+        # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
             batch_breaker_now = time.monotonic()
             logger.warning(
@@ -2626,6 +2631,29 @@ class TaskCurator:
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
             )
+
+        # Success: a real LLM round-trip completed, so the service is not
+        # wedged — reset the consecutive-ZOT counter exactly as the
+        # single-item path does in task_curator.py::TaskCurator.curate.
+        # Without this, size-1 bisect ZOTs accumulate across arbitrarily
+        # many healthy BATCH calls in a batch-dominant deployment until
+        # threshold (default 2) trips the breaker and disables dedupe for
+        # the cooldown (default 600s) on a healthy service (task 4143).
+        # Keyed on agent_result.success, not on decision quality:
+        # _parse_batch_decisions degrades unparseable items to
+        # action='create' without raising, and a degraded decision is
+        # still evidence the CLI round-trip completed.
+        #
+        # This also closes an ALREADY-OPEN breaker/cooldown, not just the
+        # counter: _call_llm_batch_with_fallback's two bisect halves run
+        # concurrently under asyncio.gather, so a sibling half's size-1
+        # curate() ZOTs can open the breaker while this call is still in
+        # flight. A completed round-trip is still proof the backend isn't
+        # wedged, so letting it close an already-open cooldown early is a
+        # deliberate choice, not an oversight (see this task's plan design
+        # decision 3; pinned by
+        # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
+        self._reset_zero_output_breaker()
 
         return _parse_batch_decisions(
             agent_result,
