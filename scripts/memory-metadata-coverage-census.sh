@@ -196,8 +196,20 @@ else
     commit_out=$(git -C "$REPO" commit --only "${ARTIFACTS[@]}" \
         -m "$commit_msg" 2>&1)
     commit_rc=$?
+    # NEVER `printf '%s' "$commit_out" | grep -qi ...` here. `grep -q` exits
+    # the instant it matches, and the match is on line 1 of git's own error
+    # message; the `printf` writer can then die of SIGPIPE, `set -o pipefail`
+    # (line 68) promotes the pipeline's status to 141, and a TRUE predicate
+    # reads FALSE — silently skipping the retry below on the very first night
+    # this path is ever committed. Measured: 0.6% (25/4000) at git's natural
+    # ~270-byte message under fleet load, 100% once the message passes the
+    # ~64KB pipe buffer. `${commit_out,,}` is a pure parameter expansion: it
+    # forks nothing, so the predicate is a function of the message, not of how
+    # much of it a subprocess got to read before another one hung up on it.
+    # scripts/setup-host.sh::_parity_verdict already reached this same
+    # conclusion at a sibling site; this adopts its settled remedy.
     if [ "$commit_rc" -ne 0 ] && \
-       printf '%s' "$commit_out" | grep -qi 'did not match any file'; then
+       [[ "${commit_out,,}" == *'did not match any file'* ]]; then
         # First-ever run for a path git has never tracked — stage just those
         # paths and retry once.
         git -C "$REPO" add -- "${ARTIFACTS[@]}" >/dev/null 2>&1
