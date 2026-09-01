@@ -143,6 +143,32 @@ class _Unverifiable(Exception):
     """The invariant could not be evaluated. Fails closed, never passes."""
 
 
+class _ReportedWarnings(logging.Handler):
+    """Keeps WARNING+ records so the probe's own REPORT can carry them.
+
+    WHY NOT JUST STDERR. The gate used to run this probe with ``2>&1`` and
+    indent the lot into its report, so a ``logger.warning`` reached the
+    operator for free. It no longer does: the probe imports the REF's tree,
+    whose import-time chatter (measured: a multi-line
+    ``PydanticDeprecatedSince20`` from ``graphiti_core``) was competing for the
+    2000 characters of report an escalation actually forwards, so the gate now
+    captures stderr separately and quotes back only a bounded tail, only where
+    stdout carried no verdict. A warning that reaches stderr alone therefore
+    reaches nobody on a PASS -- which is precisely the run where
+    ``_echoes_payload``'s "the echo control was not exercised" note matters,
+    since a PASS authorises a production flag flip.
+
+    Records still propagate, so running the probe by hand prints them too.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
 class _Candidate:
     """A duck-typed ``MemoryResult`` stand-in.
 
@@ -1363,6 +1389,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    warnings = _ReportedWarnings()
+    logger.addHandler(warnings)
     out: list[str] = []
     try:
         rc = _probe(Path(args.src_root), out)
@@ -1399,6 +1427,9 @@ def main(argv: list[str] | None = None) -> int:
         out.append('      Failing closed — an unverifiable invariant is not a satisfied one.')
         out.extend('      ' + line for line in traceback.format_exc().splitlines())
         rc = EXIT_FAIL
+    # LAST, so they survive a tail-truncated report, and on STDOUT, so they
+    # survive the gate dropping stderr. See _ReportedWarnings.
+    out.extend(f'WARN  {message}' for message in warnings.messages)
     sys.stdout.write('\n'.join(out) + '\n')
     return rc
 

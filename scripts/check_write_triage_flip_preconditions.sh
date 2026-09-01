@@ -98,22 +98,36 @@ PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candida
 # -detectable channel, reported on item 1's own line AND in the report's tail.
 # Pinned from both ends by the hermetic tests, like PROBE_PASS_MARKER.
 PROBE_PENDING_MARKER='PASS-NEEDS-CONFIRMATION'
+#
+# COMMAND WORD LISTS, not strings. The env seam is documented to accept a
+# multi-word command, which is why the old spelling was interpolated unquoted
+# with SC2086 disabled -- and that split every OTHER word too, so a $REPO
+# containing a space silently tore the resolved interpreter path into pieces
+# and the gate reported UNVERIFIABLE on a judge that passes. An array splits
+# exactly where the author put a boundary and nowhere else.
 if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
-  PROBE_PY="$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
+  # The ONE place word splitting is still wanted: the seam may carry
+  # `uv run --frozen --project <dir> python`. A bare interpreter path (what the
+  # hermetic tests pass) comes through as a single word unchanged.
+  read -r -a PROBE_PY_CMD <<< "$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
 elif [ -x "$REPO/.venv/bin/python3" ]; then
-  PROBE_PY="$REPO/.venv/bin/python3"
+  PROBE_PY_CMD=("$REPO/.venv/bin/python3")
 else
-  PROBE_PY="uv run --frozen --project $REPO/fused-memory python"
+  PROBE_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
 fi
 
 # Bounded well inside the before_done predicate's own 120s budget. A host
 # without coreutils' `timeout` runs the probe unbounded rather than failing
 # every run on a missing binary.
 if command -v timeout >/dev/null 2>&1; then
-  PROBE_TIMEOUT='timeout 90'
+  PROBE_TIMEOUT_CMD=(timeout 90)
 else
-  PROBE_TIMEOUT=''
+  PROBE_TIMEOUT_CMD=()
 fi
+
+#: How much of the probe's STDERR is quoted back, and only where it is the
+#: only diagnostic there is -- see the invocation below.
+PROBE_STDERR_LINES=10
 
 fail=0
 report=''
@@ -190,10 +204,23 @@ else
     note "              Failing closed."
     record_fail 1
   else
-    # shellcheck disable=SC2086  # PROBE_TIMEOUT and PROBE_PY are command word lists.
-    probe_out="$($PROBE_TIMEOUT $PROBE_PY "$PROBE" \
-      --src-root "$PROBE_TMP/fused-memory/src" 2>&1)"
+    # STDERR IS CAPTURED SEPARATELY, not folded in with 2>&1. The probe imports
+    # the REF's tree, so anything that tree (or a transitive dependency) writes
+    # at import time lands here -- measured on this checkout: a multi-line
+    # PydanticDeprecatedSince20 warning from graphiti_core, above the probe's
+    # own first line. Indenting that into the report spends part of the 2000
+    # characters _default_run_script forwards to an operator on chatter from a
+    # tree this gate does not control. It is quoted back only on the branches
+    # where the gate could not read a verdict from stdout, and bounded even
+    # there. The probe carries its OWN warnings on stdout for this reason.
+    probe_err="$PROBE_TMP/probe.stderr"
+    probe_out="$(${PROBE_TIMEOUT_CMD[@]+"${PROBE_TIMEOUT_CMD[@]}"} \
+      "${PROBE_PY_CMD[@]}" "$PROBE" \
+      --src-root "$PROBE_TMP/fused-memory/src" 2>"$probe_err")"
     probe_rc=$?
+    # Set on the outcomes where stdout carried no verdict, so stderr is the
+    # only evidence of what went wrong.
+    show_probe_stderr=0
     # BELT AND BRACES: rc 0 alone is not a PASS. The probe EXECUTES the ref's
     # own judge module, so a SystemExit out of that code (a lazily-imported
     # dependency's import guard calling sys.exit()) used to terminate it with
@@ -217,6 +244,7 @@ else
       note "              Its report claims no verdict, so nothing was asserted about"
       note "              the invariant. Failing closed."
       record_fail 1
+      show_probe_stderr=1
     elif [ "$probe_rc" -eq 1 ]; then
       # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
       # candidates[0] warning are all stated by the probe's own report,
@@ -231,12 +259,18 @@ else
       record_fail 1
     else
       note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
-      note "              Interpreter: $PROBE_PY. Failing closed."
+      note "              Interpreter: ${PROBE_PY_CMD[*]}. Failing closed."
       record_fail 1
+      show_probe_stderr=1
     fi
     # The probe's own report, indented under the verdict. It carries the
     # measured slate and, on an unverifiable outcome, its own UNVERIFIABLE line.
     note "$(printf '%s\n' "$probe_out" | sed 's/^/              /')"
+    if [ "$show_probe_stderr" -ne 0 ] && [ -s "$probe_err" ]; then
+      note "              --- probe stderr, last $PROBE_STDERR_LINES lines ---"
+      note "$(tail -n "$PROBE_STDERR_LINES" "$probe_err" 2>/dev/null \
+        | sed 's/^/              /')"
+    fi
   fi
 fi
 

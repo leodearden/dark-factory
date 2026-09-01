@@ -32,6 +32,7 @@ prompt prose is the meta-test class this repo deletes (task 3128 steps 23-25).
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -645,6 +646,21 @@ def parse_judge_verdict(raw):
     return _parse_bare_str(raw)
 """
 
+# A valid option (b) whose module writes to stderr at IMPORT time. Measured on
+# the real checkout: importing the ref's tree emits a multi-line
+# PydanticDeprecatedSince20 warning from graphiti_core above the probe's own
+# first line. Folded into the report (the gate used to run the probe with
+# `2>&1`) that is unbounded chatter from a tree the gate does not control,
+# competing for the 2000 characters of escalation detail an operator sees.
+_VARIANT_TAILS['by_id_noisy_import'] = _VARIANT_TAILS['by_id'] + r"""
+
+import sys as _sys
+
+for _i in range(1, 21):
+    _sys.stderr.write('fixture-import-noise-line-%02d\n' % _i)
+"""
+
+
 # The winner-rescue APPEND is a MECHANISM, not the invariant. These two
 # variants redefine select_judge_candidates to plain top-n, shadowing the
 # preamble's, so the hoisted parent's evidence child never enters the slate.
@@ -1230,6 +1246,26 @@ class TestOptionAAcceptance:
         assert proc.returncode == 0, f'probe failed a strict option (a):\n{proc.stdout}\n{proc.stderr}'
         assert _OPTION_A_HELD in proc.stdout, proc.stdout
 
+    def test_the_probes_own_warnings_reach_its_stdout_report(self, tmp_path):
+        """A warning on stderr alone reaches nobody, so it must not live there.
+
+        The gate no longer folds the probe's stderr into its report (the ref's
+        tree writes unbounded import-time chatter there, competing for the
+        2000 characters of escalation detail an operator sees), and it drops it
+        entirely on a PASS. This fixture's parser REFUSES the echo control's
+        decoy payload, so the control never ran and the resulting PASS rests on
+        weaker evidence — exactly the note that must survive, since a PASS
+        authorises a production flag flip.
+        """
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='option_a_rejects_dangling',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'echo control not exercised' in proc.stdout, (
+            f'the probe kept its warning off the report:\n{proc.stdout}\n{proc.stderr}'
+        )
+
     def test_slate_validating_parser_passes_option_a(self, tmp_path):
         """The gate must not fail the very remedy its own text prescribed.
 
@@ -1468,7 +1504,13 @@ def publish(report_path):
 _CONFIG_YAML = 'write_triage:\n  enabled: false\n  judge_enabled: true\n'
 
 
-def _make_gate_repo(tmp_path: Path, *, judge: str = 'flat', eval_src: str = 'failing') -> Path:
+def _make_gate_repo(
+    tmp_path: Path,
+    *,
+    judge: str = 'flat',
+    eval_src: str = 'failing',
+    repo_name: str = 'gate-repo',
+) -> Path:
     """A throwaway git repo the gate script can be run from.
 
     The script derives ``REPO`` from ``BASH_SOURCE/..`` with no env override,
@@ -1476,7 +1518,7 @@ def _make_gate_repo(tmp_path: Path, *, judge: str = 'flat', eval_src: str = 'fai
     the fixture repo, rather than the real checkout, the thing item 1's
     ``git archive`` reads.
     """
-    repo = tmp_path / 'gate-repo'
+    repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
     for script in (_GATE_SCRIPT, _PROBE):
         dest = repo / 'scripts' / script.name
@@ -1503,11 +1545,28 @@ def _make_gate_repo(tmp_path: Path, *, judge: str = 'flat', eval_src: str = 'fai
     return repo
 
 
-def _run_gate(script: Path, *, ref: str, probe_py: str | None = None):
-    """Execute the gate script DIRECTLY, as DeterministicRunner does."""
+def _run_gate(
+    script: Path,
+    *,
+    ref: str,
+    probe_py: str | None = None,
+    resolve_interpreter: bool = False,
+):
+    """Execute the gate script DIRECTLY, as DeterministicRunner does.
+
+    ``resolve_interpreter=True`` UNSETS the env seam so the gate's own ladder
+    ($REPO/.venv/bin/python3, then `uv run --frozen --project ...`) decides. Those
+    are the branches that run in production; with the seam always set they were
+    never executed by any test, so a quoting regression there would ship green
+    and surface only as an `exit 127` UNVERIFIABLE on the real gate.
+    """
     full_env = dict(os.environ)
     full_env['WRITE_TRIAGE_GATE_REF'] = ref
-    full_env['CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY'] = probe_py or sys.executable
+    if resolve_interpreter:
+        assert probe_py is None, 'resolve_interpreter and probe_py are exclusive'
+        full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY', None)
+    else:
+        full_env['CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY'] = probe_py or sys.executable
     return subprocess.run(
         [str(script)],
         capture_output=True,
@@ -1515,6 +1574,24 @@ def _run_gate(script: Path, *, ref: str, probe_py: str | None = None):
         timeout=240,
         env=full_env,
     )
+
+
+def _install_venv_interpreter(repo: Path) -> Path:
+    """Put an executable stub where the gate's ladder looks FIRST.
+
+    Returns the path the stub creates when it runs, so a test can prove the
+    ladder resolved it rather than something else having quietly worked.
+    """
+    binary = repo / '.venv' / 'bin' / 'python3'
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    marker = repo / 'venv-interpreter-was-used'
+    binary.write_text(
+        '#!/bin/sh\n'
+        f': > {shlex.quote(str(marker))}\n'
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+    )
+    binary.chmod(0o755)
+    return marker
 
 
 def _assert_no_bare_grep_verdict(stdout: str) -> None:
@@ -1620,7 +1697,13 @@ class TestFlipPreconditionsScript:
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
         # Shrink the gate's own `timeout 90` so the test does not take 90s.
         gate = repo / 'scripts' / _GATE_SCRIPT.name
-        gate.write_text(gate.read_text().replace("timeout 90", "timeout 2"))
+        gate_src = gate.read_text()
+        # ASSERTED, not assumed: the bound is a tuning knob (its comment ties it
+        # to the predicate's 120s budget). Retuned, this replacement becomes a
+        # silent no-op — the test still passes, but only after the REAL timeout
+        # elapses, which fits inside _run_gate's 240s and so degrades invisibly.
+        assert 'timeout 90' in gate_src, 'the gate no longer spells `timeout 90`'
+        gate.write_text(gate_src.replace('timeout 90', 'timeout 2'))
         judge = (
             repo / 'fused-memory' / 'src' / 'fused_memory' / 'server'
             / 'write_triage_judge.py'
@@ -1668,6 +1751,86 @@ class TestFlipPreconditionsScript:
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert 'PASS  item 1' in proc.stdout, proc.stdout
         assert 'NEEDS CONFIRMATION' not in proc.stdout, proc.stdout
+
+    def test_the_gate_resolves_its_own_venv_interpreter(self, tmp_path):
+        """The interpreter ladder, which no test exercised before.
+
+        Every other test here sets CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY, so
+        neither `$REPO/.venv/bin/python3` nor the `uv run` fallback ever ran —
+        and those are the branches production uses under DeterministicRunner.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        marker = _install_venv_interpreter(repo)
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name,
+            ref=_FIXTURE_REF,
+            resolve_interpreter=True,
+        )
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert marker.exists(), (
+            'the gate did not run the interpreter its own ladder resolves first:\n'
+            f'{proc.stdout}\n{proc.stderr}'
+        )
+
+    def test_the_gate_runs_from_a_path_containing_spaces(self, tmp_path):
+        """$REPO is interpolated into a command word list, so it must be quoted.
+
+        The resolved interpreter is deliberately word-split (the seam may carry
+        a command LIST such as `uv run --frozen --project ... python`), which
+        used to break silently the moment $REPO contained a space — the
+        interpreter path split into pieces and the gate reported UNVERIFIABLE
+        on a judge that passes.
+        """
+        repo = _make_gate_repo(
+            tmp_path, judge='by_id', eval_src='fixed', repo_name='gate repo with spaces',
+        )
+        marker = _install_venv_interpreter(repo)
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name,
+            ref=_FIXTURE_REF,
+            resolve_interpreter=True,
+        )
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert marker.exists(), f'{proc.stdout}\n{proc.stderr}'
+
+    def test_import_time_stderr_is_dropped_from_a_passing_report(self, tmp_path):
+        """The ref's tree may write anything to stderr; a PASS carries none of it.
+
+        Reviewer-reported (cycle 5): the probe was invoked with `2>&1`, so a
+        multi-line deprecation warning from a transitive import of the ref's
+        own tree was indented into the report — and only the TRAILING 2000
+        characters of that report reach an operator's escalation detail.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id_noisy_import', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert 'fixture-import-noise' not in proc.stdout, proc.stdout
+
+    def test_stderr_tail_is_bounded_and_kept_where_it_is_diagnostic(self, tmp_path):
+        """On an outcome the gate could not read a verdict from, stderr is all
+        there is — but a BOUNDED tail of it, not the whole stream."""
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        noisy = tmp_path / 'noisy-mute-probe'
+        noisy.write_text(
+            '#!/bin/sh\n'
+            'i=1\n'
+            'while [ "$i" -le 20 ]; do\n'
+            '  printf "probe-stderr-line-%02d\\n" "$i" >&2\n'
+            '  i=$((i + 1))\n'
+            'done\n'
+            'exit 0\n',
+        )
+        noisy.chmod(0o755)
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF, probe_py=str(noisy),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'exited 0 without reporting a PASS' in proc.stdout, proc.stdout
+        assert 'probe-stderr-line-20' in proc.stdout, proc.stdout
+        assert 'probe-stderr-line-01' not in proc.stdout, proc.stdout
 
     def test_items_2_and_4_still_fail_on_their_patterns(self, tmp_path):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
