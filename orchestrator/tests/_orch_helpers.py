@@ -1327,6 +1327,97 @@ def assert_update_wire_mode(
     return arguments
 
 
+def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
+    """Assert *project_root* is a created directory strictly below *tmp_path*.
+
+    THE canonical spelling of the steward-scaffolding sandbox invariant, owned
+    here so it cannot drift again.  Consolidation lineage 3461 → 3514 → 3551 →
+    3647: task 3551 propagated the recipe by COPY to a second factory, and by
+    3647 the two inline assertion blocks had already diverged — the one in
+    ``test_conftest_helpers.py`` had lost the ``.is_dir()`` clause, and NEITHER
+    carried the strictness clause.  Both now call this instead; the recurrence
+    guard in ``test_steward_scaffolding_guards.py`` keeps it that way.
+
+    ``conftest.py``'s ``make_steward`` fixture is the PRODUCER that must keep
+    satisfying it: it builds ``tmp_path / 'project'`` and ``mkdir``s it.  It is
+    deliberately not self-checked there — the value is structurally guaranteed
+    two lines from where it is constructed, and a self-check would re-verify it
+    on every one of the suite's ~250 steward builds.  This helper is for the
+    SEPARATE factories that reproduce the recipe.
+
+    Four clauses, ordered so the message a reader sees is the most specific one
+    that failed:
+
+    1. **a real** ``Path``.  A ``MagicMock`` silently satisfies every ``/``-join
+       the steward performs without ever producing a directory, so a mock root
+       is never caught downstream.  This clause runs FIRST so a non-``Path``
+       raises ``AssertionError`` rather than an ``AttributeError`` from a later
+       clause — a sandbox escape must read as a test FAILURE, not an ERROR.
+       *project_root* is therefore deliberately UNANNOTATED: annotating it
+       ``Path`` would make this clause read as unreachable.
+    2. **created**.  The retired ``Path('/tmp/fake-project')`` literal was never
+       created by anything, and a dangling root is a latent ``cwd=`` failure the
+       moment a test stops patching the invoke seam.
+    3. **not** *tmp_path* **itself**.  ``Path.is_relative_to`` returns ``True``
+       for a path against itself, so clause 4 alone does not mean "strictly
+       below".  Same spelling as ``make_steward``'s worktree guard
+       (``resolved == root or not resolved.is_relative_to(root)``), and it
+       matters for the same reason: the steward derives its artifacts root as a
+       SIBLING of the directory it is given.
+    4. **strictly below** *tmp_path*.  The retired ``/tmp/project`` and
+       ``/tmp/fake-project`` literals pointed OUTSIDE the test sandbox, so
+       anything the steward wrote relative to ``config.project_root`` escaped
+       pytest's ``tmp_path`` retention sweep.
+
+    Clauses 3 and 4 compare RESOLVED paths on both sides, which is what makes a
+    symlink escape detectable: a link created *under* ``tmp_path`` that points
+    outside it is lexically contained but physically is not, and everything the
+    steward writes through it lands outside the retention sweep.  Dropping
+    either ``.resolve()`` would leave that case silently accepted, so clause 4's
+    message reports the resolved target alongside the value as given.
+
+    ONE sanctioned exception, recorded here so a reader who greps the invariant
+    finds it instead of "fixing" the site: ``test_out_of_band_routing.py``'s
+    ``_REVIEW_PROJECT_ROOT`` must NOT be sandboxed, because
+    ``ReviewCheckpoint._run_review`` raises ``ValueError`` on any
+    ``project_root`` containing ``/tmp/pytest`` — moving it under a pytest path
+    fails 5 tests in that module (measured, task 3551).
+
+    Raises:
+        AssertionError: naming both the offending value and the sandbox root it
+            was checked against, whenever any clause fails.
+    """
+    assert isinstance(project_root, Path), (
+        f'expected project_root to be a real Path, got '
+        f'{type(project_root).__name__!r} ({project_root!r}) — a MagicMock child '
+        f'silently satisfies every "/"-join the steward performs without ever '
+        f'producing a directory'
+    )
+    root = tmp_path.resolve()
+    resolved = project_root.resolve()
+
+    assert project_root.is_dir(), (
+        f'expected project_root {project_root} to be a CREATED directory (checked '
+        f'against tmp_path={tmp_path}); the retired /tmp/fake-project literal was '
+        f'never created by anything, so a dangling project_root is a latent cwd= '
+        f'failure the moment a test stops patching the invoke seam'
+    )
+    assert resolved != root, (
+        f'project_root must be strictly below tmp_path, got {project_root} == '
+        f'tmp_path={tmp_path}; the steward derives its artifacts root as a SIBLING '
+        f'of the directory it is given, so a root AT tmp_path lands it in '
+        f"tmp_path.parent — outside the directory pytest's retention sweep reclaims"
+    )
+    assert resolved.is_relative_to(root), (
+        f'expected project_root under tmp_path={tmp_path} (resolved to {root}), got '
+        f'{project_root} which resolves to {resolved} — both sides are resolved so a '
+        f'symlink created UNDER tmp_path but pointing outside it is caught here; the '
+        f"retired '/tmp/project' and '/tmp/fake-project' literals pointed OUTSIDE "
+        f'the test sandbox, so anything the steward wrote relative to '
+        f"config.project_root escaped pytest's tmp_path retention sweep"
+    )
+
+
 # ===========================================================================
 # Git repository isolation (esc-3072-3)
 # ===========================================================================
