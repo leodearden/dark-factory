@@ -490,6 +490,58 @@ class TestFindMergeSha:
               'Merge task/803: the real landing merge'], repo)
         assert driver.find_merge_sha(repo, '803') == _git(['rev-parse', 'HEAD'], repo)
 
+    def test_a_body_only_match_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # git's --grep applies ^/$ per LINE across the WHOLE message, so a BODY
+        # line reading 'Merge task/803: ...' matches an ^-anchored pattern just
+        # as a subject does. Two silent failures ride on that: a body-only
+        # match on a non-landing commit mints a fabricated reference plus a
+        # `{source:'landed', passed:true}` verify outcome, and a spurious
+        # SECOND match trips `len(shas) == 1` and downgrades a genuine
+        # reference to planRate-only. Both are asserted here: the decoy alone
+        # answers None, and the decoy does not shadow the real merge.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(
+            repo, 'b.txt', 'notes\n',
+            'docs: record the merge convention\n\n'
+            'Merge task/803: the colon spelling, quoted in a body line\n'
+            'Merge task/803 into main\n',
+        )
+        assert driver.find_merge_sha(repo, '803') is None
+
+        _git(['checkout', '-q', '-b', 'task/803'], repo)
+        _commit(repo, 'c.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803', '-m',
+              'Merge task/803: the real landing merge'], repo)
+        assert driver.find_merge_sha(repo, '803') == _git(['rev-parse', 'HEAD'], repo)
+
+    def test_a_merge_that_never_landed_on_main_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # A LANDING merge is by definition one that landed on main. A merge
+        # living only on a side branch would otherwise answer, and the caller
+        # would stamp `verify_outcome {source:'landed', passed:true}` plus
+        # `base_is_approximated: false` for a state of main that never existed.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'integration'], repo)
+        _git(['checkout', '-q', '-b', 'task/804'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'integration'], repo)
+        _git(['merge', '--no-ff', 'task/804', '-m',
+              'Merge task/804 into main'], repo)
+        side_merge = _git(['rev-parse', 'HEAD'], repo)
+        _git(['checkout', '-q', 'main'], repo)
+
+        assert driver.find_merge_sha(repo, '804') is None
+        # ... and it IS found once that same merge reaches main, so the test
+        # cannot pass by matching nothing at all.
+        _git(['merge', '--ff-only', 'integration'], repo)
+        assert driver.find_merge_sha(repo, '804') == side_merge
+
 
 # ---------------------------------------------------------------------------
 # _mint_one — a planRate-only fixture must not claim a landed verify outcome
@@ -607,6 +659,89 @@ class TestBaseApproximationMarking:
             flag = _mint(_planrate_row(baseline_source=source))[
                 'provenance']['base_is_approximated']
             assert isinstance(flag, bool), f'{source}: {flag!r} is not a bool'
+
+
+# ---------------------------------------------------------------------------
+# _mint_one, `referenced` branch — the landed claim is MEASURED, never assumed
+# ---------------------------------------------------------------------------
+
+def _landing_merge_repo(tmp_path: Path, task_id: str = '900') -> tuple[Path, str]:
+    """A repo whose ``main`` carries one landing merge; return ``(repo, M)``."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, 'a.txt', 'base\n', 'base')
+    _git(['checkout', '-q', '-b', f'task/{task_id}'], repo)
+    _commit(repo, 'b.txt', 'work\n', 'work')
+    _git(['checkout', '-q', 'main'], repo)
+    _git(['merge', '--no-ff', f'task/{task_id}', '-m',
+          f'Merge task/{task_id} into main'], repo)
+    return repo, _git(['rev-parse', 'HEAD'], repo)
+
+
+def _referenced_row(repo: Path, merge: str, **over: object) -> dict:
+    row = _planrate_row(
+        task_id='900', project_root=str(repo), status='done',
+        merge_sha=merge, mint_mode='referenced',
+        baseline_source='merge_first_parent',
+        baseline_sha=_git(['rev-parse', f'{merge}^1'], repo),
+    )
+    row.update(over)
+    return row
+
+
+class TestReferencedFixtureMeasuresItsLandedClaim:
+    """``build_fixture_record`` stamps ``{source:'landed', passed:True}`` on the
+    premise "the task merged to main => its gates passed at the post commit".
+    ``_mint_continuity_one`` already MEASURES that premise and refuses the
+    claim when it fails; the ``referenced`` path must not merely assume it."""
+
+    def test_records_that_the_post_commit_is_reachable_from_main(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, merge = _landing_merge_repo(tmp_path)
+        rec = _mint(_referenced_row(repo, merge))
+        assert rec['provenance']['post_commit_reachable_from_main'] is True
+        assert rec['verify_outcome']['source'] == 'landed'
+        assert rec['verify_outcome']['passed'] is True
+
+    def test_an_unreachable_post_commit_does_not_claim_passing_gates(
+        self, tmp_path: Path,
+    ) -> None:
+        # A merge living only on a side branch. `find_merge_sha` now scopes to
+        # `main` so it cannot produce this row, but the fixture is read on its
+        # own, far from that scoping detail — the landed claim must rest on a
+        # measurement recorded IN the fixture, not on a guarantee two
+        # functions away.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'integration'], repo)
+        _git(['checkout', '-q', '-b', 'task/900'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'integration'], repo)
+        _git(['merge', '--no-ff', 'task/900', '-m',
+              'Merge task/900 into main'], repo)
+        side_merge = _git(['rev-parse', 'HEAD'], repo)
+        _git(['checkout', '-q', 'main'], repo)
+
+        rec = _mint(_referenced_row(repo, side_merge))
+        assert rec['provenance']['post_commit_reachable_from_main'] is False
+        assert rec['verify_outcome']['source'] == 'landed_branch_tip'
+        assert rec['verify_outcome']['passed'] is None
+        assert side_merge in rec['verify_outcome']['reason']
+        # The reference itself is unaffected: it is captured from the pre/post
+        # SHAs directly, so only the GATE claim is withdrawn.
+        assert rec['reference']['post_task_commit'] == side_merge
+
+    def test_a_referenced_row_on_a_weaker_rung_is_refused(
+        self, tmp_path: Path,
+    ) -> None:
+        # `mint_mode: referenced` and `baseline_source: merge_first_parent` are
+        # one fact recorded twice. Were they to disagree, the fixture would
+        # ship a `pre` that IS the true branch point stamped
+        # `base_is_approximated: true` naming a rung it never used, and
+        # base_distance_rows would pick the wrong branch point for it.
+        repo, merge = _landing_merge_repo(tmp_path)
+        with pytest.raises(RuntimeError, match='merge_first_parent'):
+            _mint(_referenced_row(repo, merge, baseline_source='timestamp_walk'))
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1305,23 @@ class TestBaseDistanceReport:
         assert driver._first_parent_commit_distance(
             str(repo), head, 'f' * 40) is None
 
+    def test_the_summary_states_the_approximated_count_once(self) -> None:
+        # An earlier draft read '{approximated} ... of which {unmeasurable}
+        # have no landing merge', but both counts are the same set by
+        # construction (each is exactly `baseline_source !=
+        # merge_first_parent`), so it always printed N of N — a distinction
+        # the report cannot draw, inviting a reader to believe some
+        # approximated fixtures ARE measurable.
+        table = driver._render_distance_table(
+            driver.base_distance_rows(
+                _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES)),
+            driver.base_distance_rows(
+                _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES)),
+        )
+        assert 'of which' not in table
+        assert '1 still have an APPROXIMATED base' in table
+        assert 'UNMEASURABLE' in table
+
     def test_refuses_rows_that_do_not_line_up(self) -> None:
         # A before/after pair that disagrees on which fixtures it covers would
         # silently mis-attribute every distance in the table.
@@ -1201,6 +1353,29 @@ class TestRenderMode:
         assert out.read_text() == driver.render_curation_md(manifest)
         assert out.read_text() == committed
 
+    def test_the_base_section_derives_its_counts_from_the_manifest(
+        self,
+    ) -> None:
+        # CURATION.md's job is the CURRENT numbers; the rule and its rationale
+        # live once, in README.md. A second static copy of the prose here is
+        # exactly the two-hand-maintained-artifacts drift the availability
+        # block was consolidated to abolish.
+        import json as _json
+        manifest = _json.loads(driver.CURATION_JSON.read_text())
+        includes = [r for r in manifest['candidates']
+                    if r['decision'] == 'include']
+        merge_derived = sum(
+            1 for r in includes
+            if r['baseline_source'] == driver.MERGE_DERIVED_BASELINE_SOURCE)
+        md = driver.render_curation_md(manifest)
+        section = md.split(
+            '## Is the base a true branch point, or an approximation?', 1,
+        )[1].split('\n## ', 1)[0]
+        assert f'**{merge_derived}**' in section
+        assert f'**{len(includes) - merge_derived}**' in section
+        assert f'**{len(manifest["continuity"]["fixtures"])}**' in section
+        assert '`README.md`' in section
+
     def test_render_refuses_when_the_manifest_is_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1210,6 +1385,17 @@ class TestRenderMode:
         monkeypatch.setattr(driver, 'CURATION_MD', tmp_path / 'CURATION.md')
         with pytest.raises(RuntimeError, match='no manifest'):
             driver.run_render()
+
+    def test_base_distance_report_refuses_an_absent_before_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # --before-manifest is what keeps the measurement reproducible after
+        # the redrive has landed (a redriven manifest compared against itself
+        # necessarily shows no movement). A mistyped path must be named
+        # immediately — the check runs BEFORE the redrive, which walks three
+        # live checkouts, so this test needs none of them.
+        with pytest.raises(RuntimeError, match='--before-manifest'):
+            driver.run_base_distance_report(tmp_path / 'nope.json')
 
 
 # ---------------------------------------------------------------------------

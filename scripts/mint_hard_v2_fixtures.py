@@ -282,6 +282,18 @@ class BaselineUnresolved(RuntimeError):
     """
 
 
+def _runs_db(project_root: Path | str) -> Path:
+    """Return the orchestrator runs db inside *project_root*.
+
+    ONE spelling of the layout, shared by every caller (the census, the
+    duration stats, the ceilings guard's error message and the redrive
+    resolver), so relocating the db is a one-line change here rather than a
+    hunt through four literals — the same single-derivation discipline
+    ``_merge_subject_patterns`` applies to the landing-merge subjects.
+    """
+    return Path(project_root) / 'data' / 'orchestrator' / 'runs.db'
+
+
 def connect_ro(db_path: Path | str) -> sqlite3.Connection:
     """Open *db_path* read-only, so a live orchestrator db is never locked.
 
@@ -361,6 +373,12 @@ def _merge_subject_patterns(task_id: str) -> list[str]:
     reader can never silently drift. This driver only ever READS history, so
     it derives the accepted patterns rather than the written subject, but the
     property is the same: adding or amending a spelling happens here, once.
+
+    Each pattern is used TWICE by ``find_merge_sha`` — as a git
+    ``--extended-regexp`` ``--grep`` pre-filter and as a Python ``re`` re-test
+    against the subject alone — so a spelling added here must be valid in both
+    engines. The two currently differ only in constructs both accept (``^``,
+    ``$``, a literal ``:``, and whatever ``re.escape`` emits for a numeric id).
     """
     escaped = re.escape(task_id)
     return [s.format(escaped_id=escaped) for s in _MERGE_SUBJECT_SPELLINGS]
@@ -386,15 +404,54 @@ def find_merge_sha(repo_root: Path | str, task_id: str) -> str | None:
     ``--grep`` has no anchoring under ``--fixed-strings``. Hence ERE plus
     ``^``, which also makes the trailing space in the colon pattern
     load-bearing: ``Merge task/803:no-space`` is not the landing-merge shape.
+
+    Two scopings keep an answer from being a commit that never landed:
+
+    **Subject-only.** git's ``--grep`` applies ``^``/``$`` per LINE across the
+    WHOLE commit message, so a BODY line reading ``Merge task/4026: …`` — a
+    changelog entry, a quoted merge log, an escalation transcript — matches an
+    ``^``-anchored pattern just as a subject does. ``--grep`` is therefore used
+    only as a coarse PRE-filter (a sound superset: any subject match is
+    necessarily a message match) and each candidate's SUBJECT is re-tested
+    against the same pattern compiled as a Python ``re`` (no ``re.MULTILINE``,
+    so ``^`` anchors to the start of the string). This mirrors
+    ``git_ops.py::GitOps.find_task_citation_commit``, which defends the same
+    trap for the same reason (task 2675 FIX 2), and is why the pattern strings
+    must stay valid as BOTH an ERE and a Python ``re``. The exposure is
+    two-sided and both sides are silent: a body-only match on a non-landing
+    commit would mint a fabricated reference plus a ``{source:'landed',
+    passed:true}`` verify outcome, while a spurious SECOND match would trip
+    the ``len(shas) == 1`` rule and downgrade a genuine reference to
+    planRate-only.
+
+    **``main``, not ``--all``.** A LANDING merge is by definition a merge that
+    landed on main; searching every ref would let a merge living only on a
+    side or remote branch answer, and the caller then stamps a landed
+    ``verify_outcome`` and a ``base_is_approximated: false`` for a state of
+    main that never existed. Scoping the walk makes that unrepresentable
+    rather than merely unlikely, and matches how the rest of this module reads
+    history (``_autocommit_start_sha``, ``resolve_baseline`` rung 3).
+
+    Both are hardening, not corrections: measured over all 39 include rows in
+    the committed manifest, the any-line/``--all`` matcher, the subject-only
+    ``--all`` matcher and the subject-only ``main`` matcher agree on every row.
     """
     # git ORs multiple --grep args by default, so one invocation covers the
     # union and `len(shas) == 1` keeps its across-spellings ambiguity meaning.
-    greps = [f'--grep={pattern}' for pattern in _merge_subject_patterns(task_id)]
+    patterns = _merge_subject_patterns(task_id)
+    greps = [f'--grep={pattern}' for pattern in patterns]
     out = _git(
-        ['log', '--all', *greps, '--extended-regexp', '--pretty=%H'],
+        ['log', 'main', *greps, '--extended-regexp', '-z', '--format=%H%x1f%s'],
         repo_root,
     )
-    shas = [line.strip() for line in out.splitlines() if line.strip()]
+    compiled = [re.compile(pattern) for pattern in patterns]
+    shas: list[str] = []
+    for entry in out.split('\0'):
+        if not entry:
+            continue
+        sha, _sep, subject = entry.partition('\x1f')
+        if any(pattern.search(subject) for pattern in compiled):
+            shas.append(sha.strip())
     return shas[0] if len(shas) == 1 else None
 
 
@@ -604,7 +661,7 @@ def enrich_from_task_db(
 
 def collect_candidates(project: str, root: Path) -> list[Candidate]:
     """Census + enrich + resolve merge/baseline for one source checkout."""
-    runs_db = root / 'data' / 'orchestrator' / 'runs.db'
+    runs_db = _runs_db(root)
     candidates = [
         Candidate(task_id=tid, project=project, project_root=str(root))
         for tid in census_task_ids(runs_db)
@@ -649,7 +706,7 @@ def run_census(strict: bool = True) -> int:
             return 2
         cands = collect_candidates(project, root)
         counts[project] = len(cands)
-        durations.extend(census_durations_ms(root / 'data' / 'orchestrator' / 'runs.db'))
+        durations.extend(census_durations_ms(_runs_db(root)))
         all_candidates.extend(cands)
 
     header = (f'{"project":<14}{"task":<7}{"status":<12}{"brief":>6}  '
@@ -797,7 +854,7 @@ def _build_ceilings() -> dict:
     all_max_ms = 0
     all_n = 0
     for root_str in SOURCE_CHECKOUTS.values():
-        runs_db = Path(root_str) / 'data' / 'orchestrator' / 'runs.db'
+        runs_db = _runs_db(root_str)
         census_ms.extend(census_durations_ms(runs_db))
         root_max_ms, root_n = _all_architect_duration_stats(runs_db)
         all_max_ms = max(all_max_ms, root_max_ms)
@@ -820,7 +877,7 @@ def _build_ceilings() -> dict:
             f'{observed_max} min over n={len(minutes)} census invocation(s), '
             f'all-architect max {all_max} min over n={all_n} invocation(s). '
             f'Expected populated events.duration_ms in '
-            f'{[str(Path(r) / "data" / "orchestrator" / "runs.db") for r in SOURCE_CHECKOUTS.values()]}. '
+            f'{[str(_runs_db(r)) for r in SOURCE_CHECKOUTS.values()]}. '
             f'Refusing to emit a ceilings block whose headroom cannot be '
             f'computed: the threshold would then be a guess, which is exactly '
             f'what this derivation exists to prevent.'
@@ -1175,27 +1232,38 @@ def render_curation_md(manifest: dict) -> str:
         'mirroring `git_ops.py::_merge_subject`.')
     add('')
 
+    # A POINTER plus DERIVED counts, not a second copy of the prose. The rule
+    # itself — what makes a base a true branch point, why a weaker rung is
+    # unbounded, what a readout should do about it — is stated once, in
+    # README.md. An identically-titled block of static prose here would be a
+    # second hand-maintained copy of it, and this file's own
+    # `merge_sha_availability` block exists precisely because two
+    # hand-maintained artifacts drift silently. What CURATION.md adds that the
+    # README cannot is the CURRENT count, so that is all it carries.
+    ladder = [r for r in manifest['candidates'] if r['decision'] == 'include']
+    true_branch_point = sum(
+        1 for r in ladder
+        if r['baseline_source'] == MERGE_DERIVED_BASELINE_SOURCE)
     add('## Is the base a true branch point, or an approximation?')
     add('')
-    add('Every fixture carries a bool `provenance.base_is_approximated`, and '
-        'every approximated one carries a `base_approximation_reason` naming '
-        'what was measured. ONLY `baseline_source: merge_first_parent` is the '
-        'task\'s true branch point (`M^1` of its landing merge). Every weaker '
-        'rung is an approximation whose error is unbounded and — absent a '
-        'landing merge to measure against — unknowable, so a readout that '
-        'depends on the base being the real branch point should EXCLUDE those '
-        'fixtures rather than average them in. See '
-        '`mint_hard_v2_fixtures.py::base_approximation`, and '
-        '`--base-distance-report` for the measured per-fixture distances.')
+    add('Every fixture carries a bool `provenance.base_is_approximated`; the '
+        'rule, the rationale and what a readout should do about it are stated '
+        'once, in `README.md` under the same heading. Derived from the rows '
+        'in this manifest:')
     add('')
-    add('Continuity fixtures sit outside the rung table — their base is '
-        'inherited, not ladder-resolved — so '
-        '`mint_hard_v2_fixtures.py::_mint_continuity_one` MEASURES the flag '
-        'instead: does the inherited `pre_task_commit` equal `M^1` of the '
-        'task\'s landing merge? The merge it compared against is recorded in '
-        '`provenance.base_verified_against_merge` (`null` when none exists). '
-        'Their commits are carried verbatim regardless; the marking is '
-        'observational, never corrective.')
+    add(f'- ladder-resolved bases that ARE the true branch point '
+        f'(`baseline_source: {MERGE_DERIVED_BASELINE_SOURCE}`, i.e. `M^1` of '
+        f'the landing merge): **{true_branch_point}**')
+    add(f'- ladder-resolved bases that are an APPROXIMATION (any weaker rung): '
+        f'**{len(ladder) - true_branch_point}**')
+    add(f'- continuity fixtures, whose inherited base is outside the rung '
+        f'table and is MEASURED against the landing merge at mint time rather '
+        f'than read off a label: **{len(manifest["continuity"]["fixtures"])}** '
+        f'(see `provenance.base_verified_against_merge` in each fixture)')
+    add('')
+    add('Per-fixture distances from the true branch point: '
+        '`_meta/base-distance-report.md`, regenerable with '
+        '`--base-distance-report`.')
     add('')
 
     continuity = manifest['continuity']
@@ -1324,7 +1392,7 @@ def _production_redrive_resolver(row_project_root: str, task_id: str):
     """The real resolver: the dual-spelling matcher plus the baseline ladder."""
     merge_sha = find_merge_sha(row_project_root, task_id)
     ts = first_architect_invocation_ts(
-        Path(row_project_root) / 'data' / 'orchestrator' / 'runs.db', task_id,
+        _runs_db(row_project_root), task_id,
     )
     baseline_sha, baseline_source = resolve_baseline(
         row_project_root, task_id, ts,
@@ -1484,10 +1552,7 @@ def _render_distance_table(rows: list[dict], fp_rows: list[dict]) -> str:
         return ('n/a' if row['branch_point'] is None
                 else f'{"?" if d is None else d}/{"?" if fp is None else fp}')
 
-    unmeasurable = 0
     for row, fp_row in zip(rows, fp_rows, strict=True):
-        if row['branch_point'] is None:
-            unmeasurable += 1
         out.append(
             f'| `{row["fixture_id"]}` '
             f'| {row["before"]["baseline_source"]} '
@@ -1499,11 +1564,20 @@ def _render_distance_table(rows: list[dict], fp_rows: list[dict]) -> str:
         )
     out.append('')
     approximated = sum(1 for r in rows if r['after']['base_is_approximated'])
+    # ONE count, stated once. An earlier draft read "{approximated} ... of
+    # which {unmeasurable} have no landing merge", which always printed N of N:
+    # `base_is_approximated` and `branch_point is None` are both exactly
+    # `baseline_source != merge_first_parent`, so the "of which" drew a
+    # distinction this table cannot make and invited a reader to believe some
+    # approximated fixtures ARE measurable. Distinguishing "no landing merge"
+    # from "merge found but M^1 unresolved" would need a second measurement
+    # this report does not take.
     out.append(
         f'{len(rows)} fixture(s); {approximated} still have an APPROXIMATED '
-        f'base after the redrive, of which {unmeasurable} have no landing '
-        f'merge under either spelling and so no measurable distance at all '
-        f'(reported as `n/a`, never as 0). Distances are REPORTED, not '
+        f'base after the redrive. Approximated is exactly "did not resolve to '
+        f'`M^1` of a landing merge", so for every one of them the true branch '
+        f'point is not derivable from git and BOTH distances are UNMEASURABLE '
+        f'— reported as `n/a`, never as 0. Distances are REPORTED, not '
         f'asserted against a threshold.'
     )
     for row in rows:
@@ -1512,13 +1586,24 @@ def _render_distance_table(rows: list[dict], fp_rows: list[dict]) -> str:
     return '\n'.join(out) + '\n'
 
 
-def run_base_distance_report() -> int:
-    """Print the before/after base-distance table for the committed manifest.
+def run_base_distance_report(before_manifest: Path | str | None = None) -> int:
+    """Print the before/after base-distance table.
 
-    ``before`` is the manifest AS COMMITTED; ``after`` is what a redrive would
-    produce right now. Running this before and after ``--redrive`` therefore
-    gives the two halves of the record, and running it on an
-    already-redriven manifest correctly shows no movement.
+    ``after`` is always what a redrive would produce RIGHT NOW. ``before``
+    defaults to the committed manifest, so the mode is a "what would a redrive
+    move?" preview — run it BEFORE ``--redrive`` and the table carries the
+    measurement; run it after and it correctly shows no movement, because
+    before and after are then the same rows.
+
+    That is the trap this signature exists to escape: once the redrive has
+    landed, the committed state can no longer produce the evidence that
+    motivated it, and the measurement would survive only as prose. Pass
+    *before_manifest* (``--before-manifest``) to read the ``before`` side from
+    an EARLIER manifest — the pre-redrive one, extracted from git history —
+    so the artifact stays regenerable from the repo instead of being a
+    hand-transcribed number. That is how
+    ``_meta/base-distance-report.md`` is produced; the file's own header
+    carries the exact two commands.
     """
     if not CURATION_JSON.exists():
         raise RuntimeError(
@@ -1526,9 +1611,24 @@ def run_base_distance_report() -> int:
             f'there is nothing to measure.'
         )
     manifest = json.loads(CURATION_JSON.read_text())
+    # Validated BEFORE the redrive: the redrive walks three live checkouts,
+    # and a mistyped path should not cost a minute of git before it is named.
+    if before_manifest is None:
+        before_source = manifest
+    else:
+        before_path = Path(before_manifest)
+        if not before_path.exists():
+            raise RuntimeError(
+                f'run_base_distance_report: --before-manifest '
+                f'{before_path} does not exist. Extract an earlier manifest '
+                f'from git history first, e.g. `git show '
+                f'<rev>:{CURATION_JSON.relative_to(REPO_ROOT)} > {before_path}`.'
+            )
+        before_source = json.loads(before_path.read_text())
     redriven, _changes = redrive_provenance(
         manifest, _production_redrive_resolver)
-    before = [r for r in manifest['candidates'] if r['decision'] == 'include']
+    before = [r for r in before_source['candidates']
+              if r['decision'] == 'include']
     after = [r for r in redriven['candidates'] if r['decision'] == 'include']
     print(_render_distance_table(
         base_distance_rows(before, after, _commit_distance),
@@ -1830,6 +1930,28 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
     )
 
     if row['mint_mode'] == 'referenced':
+        # `mint_mode: referenced` means a landing merge resolved, and
+        # `resolve_baseline` returns `merge_first_parent` from that SAME merge
+        # — so the two are one fact recorded twice and can only disagree if
+        # `M^1` failed to resolve while `M` did. Were that to happen the row
+        # would ship a `pre` that IS the true branch point stamped
+        # `base_is_approximated: true` (the flag is read off `baseline_source`
+        # below), naming a ladder rung it never used, and `base_distance_rows`
+        # would pick the wrong branch point for it — an inconsistency visible
+        # nowhere but in a hand audit. Refuse it here, where the cause is
+        # known, rather than emit the incoherent stamp.
+        if row['baseline_source'] != MERGE_DERIVED_BASELINE_SOURCE:
+            raise RuntimeError(
+                f'_mint_one: include row {row["project"]}/{row["task_id"]} is '
+                f'mint_mode={row["mint_mode"]!r} (a landing merge '
+                f'{row["merge_sha"]!r} resolved) but carries '
+                f'baseline_source={row["baseline_source"]!r}, not '
+                f'{MERGE_DERIVED_BASELINE_SOURCE!r}. Its pre_task_commit would '
+                f'come from the merge (M^1, the true branch point) while '
+                f'base_is_approximated came from the rung label, so the '
+                f'fixture would contradict itself. Re-run --redrive to '
+                f're-derive both from one resolution.'
+            )
         pre, post = await sampler.resolve_task_commits_from_merge(
             cand.project_root, row['merge_sha'],
         )
@@ -1864,6 +1986,37 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
     record['provenance']['task_status'] = row['status']
 
     if row['mint_mode'] == 'referenced':
+        # `build_fixture_record` stamps `{source:'landed', passed:True}` on the
+        # documented premise "the task merged to main => its gates passed at
+        # the post commit". MEASURE that premise instead of inheriting it —
+        # the same refusal, the same field name and the same downgrade as
+        # `_mint_continuity_one`. `find_merge_sha` reads only `main`, so `post`
+        # (= the merge commit M itself) should always be reachable; but the
+        # fixture is read on its own, far from that scoping detail, and a
+        # `passed: true` resting on an unrecorded assumption is exactly the
+        # fabricated ground truth this pool exists to abolish. Recording the
+        # measurement makes the claim auditable from the JSON alone.
+        reachable = _is_ancestor_of_main(cand.project_root, cand.post_commit)
+        record['provenance']['post_commit_reachable_from_main'] = reachable
+        if not reachable:
+            record['verify_outcome'] = {
+                'source': 'landed_branch_tip',
+                'passed': None,
+                'commands': sampler.default_verify_commands(repo),
+                'reason': (
+                    f'post_task_commit {cand.post_commit} — the landing merge '
+                    f'{row["merge_sha"]} for task {row["task_id"]} — is NOT '
+                    f'reachable from main in {cand.project_root} (measured at '
+                    f'mint time with `git merge-base --is-ancestor`). The '
+                    f'"merged to main => gates passed at the post commit" '
+                    f'premise therefore cannot be established at this SHA, so '
+                    f'`passed` is recorded as unknown rather than asserted. '
+                    f'The reference diff is unaffected — it is captured from '
+                    f'the pre/post SHAs directly — so the fixture is still '
+                    f'scored on plan quality against it. The commands are '
+                    f'carried for provenance only.'
+                ),
+            }
         await _pin_or_record_failure(
             sampler, record, cand.project_root, cand.post_commit,
         )
@@ -2013,6 +2166,13 @@ def main(argv: list[str] | None = None) -> int:
                            'rows as a side effect. --redrive touches only '
                            'those four fields and cannot add or drop a '
                            'fixture')
+    parser.add_argument('--before-manifest', default=None,
+                        help='With --base-distance-report: read the BEFORE '
+                             'side from this manifest instead of the '
+                             'committed one. Extract a pre-redrive manifest '
+                             'from git history to reproduce the recorded '
+                             'measurement (a redriven manifest compared '
+                             'against itself necessarily shows no movement)')
     parser.add_argument('--census-date', default=None,
                         help='ISO date stamped into the manifest (required with '
                              '--author; passed in rather than read from the '
@@ -2039,7 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.redrive:
         return run_redrive()
     if args.base_distance_report:
-        return run_base_distance_report()
+        return run_base_distance_report(args.before_manifest)
     if args.mint:
         if not args.sampled_at:
             parser.error('--mint requires --sampled-at')
