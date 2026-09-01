@@ -1572,9 +1572,9 @@ class EscalationQueue:
     ) -> Escalation | None:
         """Append *child_id* to the pending parent's dedupe_children list.
 
-        **Concurrency contract (sidecar flock).**  All three mutations —
-        ``dedupe_count``, ``dedupe_children``, and ``severity`` — are serialized
-        per-id by ``escalation_id_lock``.  Concurrent attaches from multiple
+        **Concurrency contract (sidecar flock).**  All four mutations —
+        ``dedupe_count``, ``dedupe_children``, ``severity`` and ``updated_at`` —
+        are serialized per-id by ``escalation_id_lock``.  Concurrent attaches from multiple
         processes are therefore safe: no child is lost, no count is reverted,
         and no severity promotion is undone.  The lock target is the stable
         sidecar ``{parent_id}.json.lock`` (see ``escalation_id_lock`` for the
@@ -1591,6 +1591,12 @@ class EscalationQueue:
         - ``parent.dedupe_count`` is incremented by 1.
         - ``parent.severity`` is promoted via
           ``max_severity(parent.severity, child_severity)``; never demoted.
+        - ``parent.updated_at`` is stamped — the watcher's "changed since I
+          triaged it" signal.  A fold raises the recurrence count and can
+          promote severity, so a folded parent that still read
+          ``updated_at is None`` would make an L1/L2 rotation applying the
+          "newer than triaged_at" re-verify rule trust a stale triage note and
+          skip a record that has materially changed.
         - The updated parent is written back to disk via ``_rewrite()``.  Only
           this final file-replace step is atomic (``tempfile.mkstemp`` +
           ``os.rename``); the preceding in-memory mutations are not.
@@ -1625,6 +1631,17 @@ class EscalationQueue:
             parent.dedupe_children.append(child_id)
             parent.dedupe_count += 1
             parent.severity = max_severity(parent.severity, child_severity)
+            # Bump the "changed since triaged" signal — a fold is a substantive
+            # change (recurrence count up, possible severity promotion), which is
+            # exactly the re-assess trigger the watcher's stamp-then-skip
+            # protocol keys off (updated_at > triaged_at).
+            # UNCONDITIONAL, unlike add_members_to_l2's guarded bump: that
+            # function CAN be a genuine no-op (re-appending an already-present
+            # member id), this one cannot — every successful call appends a child
+            # and increments the count.  A "did anything change?" guard here could
+            # only ever evaluate true, while implying to a reader that a silent
+            # no-op path exists.
+            parent.updated_at = datetime.now(UTC).isoformat()
             self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
