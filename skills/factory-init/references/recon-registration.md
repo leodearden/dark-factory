@@ -33,7 +33,7 @@ python3 <DF>/scripts/render_dashboard_unit.py --unit fused-memory \
 # ...and --unit dashboard with dashboard.service.template / dark-factory-dashboard.service
 ```
 
-Re-running `<DF>/scripts/setup-host.sh` does exactly this for both units, so it is safe too. The surgical one-line edit below is still the normal registration route — it is narrower and needs no re-provision.
+`<DF>/scripts/setup-host.sh` does exactly this for both units, so re-running it no longer strips the extra roots either. **But do not reach for it here.** Section 4 of that script runs `systemctl --user restart fused-memory` whenever `<DF>/fused-memory/.env` exists — i.e. it performs, unprompted, the destructive restart that step 2 below gates on user confirmation, severing this session's MCP tools — and it re-provisions the whole host around it (docker compose up, `uv sync` of five projects, re-render and enable of every systemd unit this project installs). The two narrow paths are the surgical one-line edit below (the normal registration route) and the direct `render_dashboard_unit.py` invocation above; both leave *when* to restart to you.
 
 Append `,<TARGET>` with a **surgical one-line edit** to the single `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in **both** live units:
 - `~/.config/systemd/user/fused-memory.service` — governs **reconciliation** (the recon-storm hazard; this is the load-bearing one).
