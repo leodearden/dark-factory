@@ -923,6 +923,139 @@ class TestDeclaredBasenameFallbackWhenHopHasNoMatch:
 
 
 @pytest.mark.asyncio
+class TestTouchedSetBreaksTheCrossKeyTie:
+    """The hop key must NOT SHADOW the declared key: when BOTH keys yield a
+    unique candidate, the TOUCHED SET picks the winner.
+
+    ``TestDeclaredBasenameFallbackWhenHopHasNoMatch`` pins the easy case —
+    the hop key finds nothing, so the declared key is reached by simple
+    statement order.  The case pinned HERE is the one that order alone
+    gets WRONG: the hop key finds a unique but COINCIDENTAL, UNTOUCHED
+    file, while the declared key finds the file the branch actually
+    delivered.  Short-circuiting on the first unique hop match discards
+    the declared candidate before it is ever compared against the touched
+    set, blocking a branch that delivered exactly what was asked and
+    naming an unrelated file in ``resolved_renames`` — a confidently
+    WRONG audit trail on the very false-positive class this gate exists
+    to remove (reify-5196 / esc-5196-22 shape).
+
+    Only the CALLER holds the touched set, which is why
+    :func:`_resolve_renamed_plan_path` returns BOTH candidates in
+    preference order rather than electing a single winner on evidence it
+    does not have (task 4158 review).
+    """
+
+    async def test_untouched_hop_match_does_not_shadow_a_touched_declared_match(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Both keys resolve uniquely; only the DECLARED one is touched."""
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_e2e.rs'
+        unrelated = 'crates/other/topo_suite.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        # hop1 is deleted, and the REAL relocation lands at `final` under
+        # the ORIGINALLY DECLARED basename.
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+        # An unrelated file that coincidentally shares the DEAD HOP's
+        # basename.  Nothing on the branch touches it.
+        await _commit_on_main(
+            git_repo, {unrelated: 'fn other() {}\n'}, 'add unrelated file',
+        )
+
+        wt = (await git_ops.create_worktree('untouched-hop-no-shadow')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(4, 4); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='untouched-hop-no-shadow',
+            )
+
+        assert result.resolved_renames == {declared: final}, (
+            'the unique-but-UNTOUCHED hop candidate must not shadow the '
+            'declared candidate the branch actually delivered — the touched '
+            f'set is the tie-breaker; got {result.resolved_renames!r}'
+        )
+        assert result.not_touched == [], (
+            'the branch delivered against the declared file under its current '
+            'name; blocking here is the false positive this gate removes'
+        )
+        assert result.missing_from_tree == []
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'gate PASSES' in msg
+        assert final in msg
+        assert unrelated not in msg, (
+            'the audit trail must not name the coincidental hop match as the '
+            f'resolution; got: {msg!r}'
+        )
+
+    async def test_neither_candidate_touched_falls_back_to_hop_first_ordering(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+    ) -> None:
+        """When the touched set breaks NO tie, the resolver's own ordering
+        stands: the HOP candidate is recorded for the audit trail, and the
+        entry still BLOCKS (a resolution never passes the gate on its own).
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_suite.rs'
+        unrelated = 'crates/legacy/topo_e2e.rs'
+        noise = 'crates/other/noise.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+        await _commit_on_main(
+            git_repo, {unrelated: 'fn legacy() {}\n'}, 'add unrelated legacy topo_e2e',
+        )
+        await _commit_on_main(git_repo, {noise: 'fn noise() {}\n'}, 'add noise')
+
+        wt = (await git_ops.create_worktree('neither-candidate-touched')).path
+        base = await _head_of(wt)
+        # The branch touches NEITHER candidate.
+        (wt / noise).write_text('fn noise() { /* branch edit */ }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        result = await _check_plan_files_touched_in_branch(
+            [declared], base, head, git_ops, task_id='neither-candidate-touched',
+        )
+
+        assert result.resolved_renames == {declared: final}, (
+            'with no touched candidate the tie is unbreakable, so the '
+            "resolver's hop-first ordering stands for the audit trail"
+        )
+        assert result.not_touched == [declared], (
+            'a resolution never passes the gate on its own — the resolved '
+            'path must additionally be in the touched set'
+        )
+        assert result.missing_from_tree == [], (
+            'the entry RESOLVED, so it is not a phantom path'
+        )
+
+
+@pytest.mark.asyncio
 class TestHopBasenameAcceptedTradeoff:
     """Documents a KNOWN, ACCEPTED limitation of keying mechanism 2's
     basename lookup on ``current`` (the last resolved hop) rather than
