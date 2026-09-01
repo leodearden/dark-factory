@@ -828,8 +828,10 @@ def main(argv: list[str] | None = None) -> int:
     process always exits 0 so a nightly timer does not alarm on a routine
     per-worktree hiccup. ``--check`` never removes/commits. A ``git worktree
     prune`` runs after real (non-check) removals to clear any stale admin
-    entries — gated, like the sweep and every park-commit, on ``repo`` being the
-    VERIFIED root of the repository git resolves for it.
+    entries — gated on ``repo`` being the VERIFIED root of the repository git
+    resolves for it, reusing the verdict :func:`reclaim_worktrees` already
+    recorded on ``outcome.refused`` so the report and the prune can never
+    disagree about one decision.
 
     When that verify fails, nothing is swept, committed or pruned and the report
     carries ``refused_target: true`` — the machine-readable channel a
@@ -864,10 +866,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.check:
         # Conditioned on BOTH not-a-dry-run and a VERIFIED target: prune is the
-        # third destructive phase and self-guards like the other two, so a
-        # `--repo` git resolves to some other repository never has its admin
-        # entries rewritten.
-        if not is_git_toplevel(repo):
+        # third destructive phase, so a `--repo` that git resolves to some other
+        # repository never has its admin entries rewritten.
+        #
+        # The verdict is REUSED from `outcome.refused`, not re-probed here.
+        # `reclaim_worktrees` runs exactly this gate on this same `repo`
+        # unconditionally (dry-run included) and records the answer, so a second
+        # `is_git_toplevel(repo)` call would add nothing but a way for the two to
+        # DISAGREE: `_run_git` never raises, mapping a 120s timeout or a
+        # transient OSError to rc=1, so one probe can fail where the other
+        # succeeded. That would let the report say `refused_target: false` while
+        # the prune was silently skipped — or, worse, `refused_target: true`
+        # while the prune actually ran — which is precisely the report/behaviour
+        # ambiguity the `refused_target` channel exists to remove. One decision,
+        # one source of truth.
+        #
+        # The OTHER two gates remain INDEPENDENT in-function probes
+        # (:func:`reclaim_worktrees`, :func:`park_commit`): both are callable
+        # directly — the tests already call them that way — so each must carry
+        # its own guard rather than trust a caller. The prune is inline here and
+        # has no other caller, so there is no third caller to protect.
+        if outcome.refused:
             logger.warning(
                 '%s REFUSING the final `git worktree prune` — repo %s is not '
                 'the root of the repository git resolves for it',

@@ -1144,6 +1144,46 @@ def test_cli_refuses_unverified_repo_target_and_skips_the_prune(tmp_path):
     assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
 
 
+def test_prune_gate_reuses_the_sweep_verdict_instead_of_re_probing(tmp_path, capsys, monkeypatch):
+    """The report and the prune read ONE verdict, so they can never disagree.
+
+    ``_run_git`` never raises — a 120s timeout or a transient ``OSError`` is
+    mapped to rc=1 — so a SECOND ``is_git_toplevel(repo)`` probe in ``main``
+    could answer differently from the one ``reclaim_worktrees`` already recorded.
+    Simulated here with a probe that answers False once and truthfully after:
+    against a re-probing prune gate the report would claim ``refused_target:
+    true`` while the prune actually RAN (clearing the prunable entry) — exactly
+    the report/behaviour ambiguity ``refused_target`` exists to remove.
+
+    Driven in-process (not via ``_run_cli``) because monkeypatching cannot cross
+    the subprocess boundary.
+    """
+    repo, live, _stale = _cli_repo_with_live_and_prunable_parkings(tmp_path)
+    truthful = row.is_git_toplevel
+    repo_probes: list[Path] = []
+
+    def flaky(path):
+        if Path(path).resolve() == repo.resolve():
+            repo_probes.append(Path(path))
+            return len(repo_probes) > 1  # first answer False, then truthful
+        return truthful(path)
+
+    monkeypatch.setattr(row, "is_git_toplevel", flaky)
+
+    rc = row.main(
+        ["--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48"]
+    )
+
+    assert rc == 0  # a refusal is a missed sweep, never a wedged timer
+    report = json.loads(capsys.readouterr().out)
+    assert report["refused_target"] is True
+    # ...and the prune AGREES with that report: the stale entry survives.
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain").stdout
+    assert live.exists()
+    # One decision, one probe — the second source of truth is gone.
+    assert len(repo_probes) == 1
+
+
 def test_cli_verified_run_reports_not_refused_and_still_prunes(tmp_path):
     """NON-REGRESSION: an ordinary run reports ``refused_target`` false, still
     reclaims, and still clears the stale admin entry."""
