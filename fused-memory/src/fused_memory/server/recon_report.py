@@ -2847,13 +2847,67 @@ class ReconReportState:
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool classification (task 3878)
+# ---------------------------------------------------------------------------
+# REGISTERING A NEW @mcp.tool() BELOW MEANS CLASSIFYING IT INTO EXACTLY ONE OF
+# THREE BUCKETS. Two of them are declared here; the third is the derived
+# remainder, so most tools need no edit at all:
+#
+#   shared guidance  — every OTHER registered tool, i.e. the derived remainder
+#                      (`set(get_recon_report_tool_signatures()) -
+#                      HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS`).
+#                      These are rendered into the STAGE-AGNOSTIC guidance block
+#                      that reconciliation/prompts/__init__.py's
+#                      render_recon_report_tool_guidance() interpolates into ALL
+#                      THREE stage prompts. A new tool lands here by default and
+#                      is rendered automatically — that default is deliberate:
+#                      it is what makes silently omitting a tool from the
+#                      guidance structurally impossible.
+#   harness-called   — the harness calls it for the agent before the stage
+#                      begins, so a call example would be actively wrong.
+#                      start_report is the only one.
+#   stage-gated      — held by some stages but DENIED in others, so it must stay
+#                      out of the stage-agnostic block.
+#
+# Why stage-gated needs its own bucket rather than being swept into the shared
+# block: `--disallowed-tools` OMITS a denied tool rather than surfacing it and
+# rejecting the call (cli_stage_runner.py). So naming a denied tool in the
+# shared block does not produce a clean refusal — it tells Stage 1 and Stage 3
+# about an action they cannot take, and in write_entity_standing_decision's case
+# licenses a durable SQLite-ledger write from stages that are read-only with
+# respect to the ledger (repair_memory_citation is the same shape one level
+# over: denied in Stage 3 via DISALLOW_RECON_REPORT_JOURNAL_WRITES because it
+# writes the durable ReconciliationJournal, and Stage 3 is read-only by
+# contract). That is precisely the norm
+# render_escalation_boundary_note() codifies in reconciliation/prompts/__init__.py:
+# never tell a stage about an action it is not sanctioned to take, and never
+# license a durable write from a read-only stage.
+#
+# Counter-example, so the boundary is not over-applied: delete_finding is NOT
+# stage-gated. It writes only in-process ReconReportState, sits in no disallow
+# list, and cli_stage_runner.py's carve-out NOTE plus stage3.py's own
+# post-guidance NOTE sanction it in every stage — so it is a shared-guidance
+# tool and belongs in the block.
+#
+# tests/test_recon_report_guidance_drift.py fails loudly until a newly
+# registered tool is classified: TestReportToolClassificationPartitionsTheLiveToolSet
+# additionally cross-checks STAGE_GATED_REPORT_TOOLS against
+# DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+# (cli_stage_runner.py) — the lists that actually reach --disallowed-tools — so
+# these must move together.
+HARNESS_CALLED_REPORT_TOOLS: frozenset[str] = frozenset({'start_report'})
+STAGE_GATED_REPORT_TOOLS: frozenset[str] = frozenset(
+    {'write_entity_standing_decision', 'repair_memory_citation'}
+)
+
 RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory, cite_run,
-       repair_memory_citation.
+       write_entity_standing_decision, repair_memory_citation.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2895,8 +2949,42 @@ Citation tools (call after add_finding, before or after complete):
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
 
+Ledger write (Stage 2 ONLY):
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, [evidence])
+                  — record that a class of complaint about entity_uuid,
+                  identified by grounds (a closed-enum value), has been
+                  investigated and dismissed, so later stages can filter or
+                  annotate future recon flags instead of re-raising them.
+                  Stage-2 ONLY: blocked in Stage 1 and Stage 3 via
+                  DISALLOW_RECON_REPORT_LEDGER_WRITES
+                  (reconciliation/cli_stage_runner.py), because this is the
+                  first recon-report tool that writes past in-process
+                  ReconReportState — it upserts a row into the durable SQLite
+                  reconciliation ledger.  It takes NO run_id (the decision is
+                  about an entity, not scoped to a report entry) and NO
+                  authorized_by: the write is ALWAYS evidence-gated, and
+                  succeeds only if EITHER arm holds — arm 1: >=1 cited,
+                  locally-resolvable, human-authored mem0 evidence record;
+                  arm 2: >=3 investigation_outcome mem0 records for this
+                  entity with actionable=false and distinct run_ids.
+                  evidence is OPTIONAL (bracketed above, matching the
+                  generated guidance block's convention): a list of cited-ref
+                  dicts ({type, id, ...}), defaulting to none.  Omit it when
+                  relying on arm 2, which is satisfied by the mem0 record
+                  history alone and cites nothing — do NOT fabricate an
+                  evidence list to reach that path.  Supply it for arm 1: mem0
+                  refs are resolved for provenance, foreign refs
+                  (escalation/task ids) are recorded but never count toward a
+                  gate arm.  Returns {status: 'written', entity_uuid, grounds,
+                  edge_count_at_decision, expires_at, decided_at} on success,
+                  or a structured error dict: insufficient_evidence
+                  (unmet_arms + hint) when neither arm is satisfied,
+                  invalid_grounds when grounds is outside the enum, or
+                  service_not_configured when the memory service is
+                  unavailable.
+
 Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
-11. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
+12. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
                   replacement_memory_id=None) — re-point (or, with no
                   replacement, drop) a citation that no longer resolves, on a
                   finding owned by a PRIOR, ALREADY-COMPLETED run. The cite_*
