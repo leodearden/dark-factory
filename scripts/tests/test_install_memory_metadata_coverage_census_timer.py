@@ -1049,6 +1049,92 @@ def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     assert 'commit=0' in combined, combined
 
 
+def _done_line(output):
+    """The wrapper's own final `done (...)` narration line, or '' if absent."""
+    for line in output.splitlines():
+        if line.startswith('memory-metadata-coverage-census: done ('):
+            return line
+    return ''
+
+
+def _parse_commit_step(line):
+    """Pull the `commit-step=<token>` field out of one done(...) line, or None.
+
+    Parses the ISOLATED done-line only, never the whole combined output, so a
+    token appearing merely in earlier prose (or a stray substring match) can
+    never satisfy this.
+    """
+    marker = 'commit-step='
+    idx = line.find(marker)
+    if idx == -1:
+        return None
+    token = line[idx + len(marker):].split(')')[0].strip()
+    return token or None
+
+
+def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
+    """Of the wrapper's five commit-step outcomes, THREE narrate `commit=0` on
+    the final done(...) line -- which reads as success while nothing was
+    committed. In an unattended nightly whose journal is its only readable
+    surface, "declined" and "committed" being indistinguishable in the
+    summary line is exactly the silent-degradation shape CLAUDE.md's
+    loud-over-silent norm warns about.
+
+    Drives the REAL wrapper into all five branches with the harnesses already
+    established in this file (INV-10 `guards-exercise-behaviour`: no
+    source-text scanning) and asserts every done(...) line carries a
+    `commit-step=<token>` field, and that the five tokens are PAIRWISE
+    DISTINCT -- so a wrapper that emits one constant token, or omits the
+    field on some branches, fails here rather than passing by coincidence.
+    """
+    scenarios = {}
+
+    committed_repo = _git_repo_harness(tmp_path / 'committed')
+    scenarios['committed'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'committed', committed_repo)
+
+    no_drift_repo = _git_repo_harness(tmp_path / 'no-drift', dirty=False)
+    scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'no-drift', no_drift_repo)
+
+    # _wrapper_harness builds `<dir>/wbin` without `parents=True`, so (unlike
+    # the _git_repo_harness-backed scenarios above, whose own `parents=True`
+    # mkdir already creates their subdirectory) these two must create theirs
+    # first.
+    not_a_repo_dir = tmp_path / 'not-a-git-repo'
+    not_a_repo_dir.mkdir()
+    scenarios['skipped:not-a-git-repo'], _ = _run_wrapper(not_a_repo_dir)
+
+    outer_repo = _git_repo_harness(tmp_path / 'outer')
+    inner = outer_repo / 'plans'  # a real subdirectory, not the repo root
+    scenarios['refused:repo-not-toplevel'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'outer', inner)
+
+    disabled_dir = tmp_path / 'disabled'
+    disabled_dir.mkdir()
+    scenarios['skipped:disabled'], _ = _run_wrapper(
+        disabled_dir, extra_env={'CENSUS_COMMIT': '0'})
+
+    tokens = {}
+    for label, result in scenarios.items():
+        assert result.returncode == 0, (
+            f'{label}: rc={result.returncode} '
+            f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+        combined = result.stdout + result.stderr
+        line = _done_line(combined)
+        assert line, (
+            f'{label}: no done(...) narration line found; '
+            f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+        token = _parse_commit_step(line)
+        assert token is not None, (
+            f'{label}: done(...) line carries no commit-step= field: '
+            f'{line!r}')
+        tokens[label] = token
+
+    assert len(set(tokens.values())) == len(tokens), (
+        f'commit-step tokens must be pairwise distinct, one per branch: '
+        f'{tokens!r}')
+
 
 # The forbidden-git-verb guard, asserted on the argv the wrapper ACTUALLY
 # invokes.
