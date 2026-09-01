@@ -193,29 +193,37 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
-deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
-wired only into the ROOT conftest (covering ``tests/``) and
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Nine conftests
+import from this module; the git ceiling and the deploy-clock guard are in
+all nine.  ``_df_no_leaked_drain_processes`` was, from task 3798 through task
+3931, wired only into the ROOT conftest (covering ``tests/``) and
 ``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3799's
-``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-started on those same two and gained a THIRD in task 3951:
-``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
-rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
-the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
-own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
-the fleet-dir pair and the remaining six carry neither; none carries the
-drain-process guard, so the root conftest does not reach them: no token is
-stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
-those sessions report all-clear unconditionally rather than falsely.  That is a
-real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
-the drain script and its tests today only assert on config strings.  Widening
-the drain-process wiring is a mechanical edit to those seven files and is out of
-task 3798's locked scope; until then, read a green subproject run as
-"unmeasured", never as "no leak".
+script, and the two the incident came from.  Task 3932 closed that gap: the
+guard is now wired into all nine, including the seven subproject rootdirs
+(``cockpit``, ``dashboard``, ``escalation``, ``fused-memory``,
+``orchestrator``, ``sampler``, ``shared``) that run as their own pytest
+sessions from their own venvs, so the root conftest's binding no longer needs
+to reach them — each stamps its own token.  Before task 3932, none of those
+seven carried the guard, so no token was stamped there and
+``leaked_drain_processes`` failed CLOSED on an absent token: those sessions
+reported all-clear unconditionally rather than falsely, and a green run had
+to be read as "unmeasured", never as "no leak".  That interim reading no
+longer applies — a green run of any of the nine now means the guard actually
+checked.  ``orchestrator`` was the one to watch during the gap, since
+``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller
+of the drain script and its tests historically only asserted on config
+strings; it is covered now like the rest.
+
+Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+pair is a SEPARATE defence and unaffected by task 3932's wiring above.  It
+started on the same two original rootdirs (root ``tests/`` and
+``scripts/tests/``) and gained a THIRD in task 3951: ``orchestrator/tests/conftest.py``,
+which is the fleet heartbeat's PRODUCER rootdir rather than a drain-script
+spawner (see the next two paragraphs).  Of the seven subproject rootdirs
+above, ``orchestrator`` therefore carries the fleet-dir pair and the
+remaining six carry neither; that gap (unlike the drain-process one) is still
+open and is out of this module's scope to close, since none of those six
+subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
