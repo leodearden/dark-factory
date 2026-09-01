@@ -1207,6 +1207,42 @@ def test_the_forbidden_reason_helper_actually_fires():
         assert _forbidden_reason(argv) is None, f'{argv!r} false-positived'
 
 
+# MUST FAIL with a NameError until the GREEN step adds the module-level
+# `_commit_step` reader (next to `_forbidden_reason` above).
+def test_the_commit_step_reader_reports_a_decline_as_a_decline(tmp_path):
+    """Pin the reader before trusting it, in the shape this file already
+    established for `_forbidden_reason` just above:
+    `test_the_forbidden_reason_helper_actually_fires` pins the detector, and
+    the real test (`test_wrapper_never_invokes_a_forbidden_git_verb`, below)
+    supplies the subject. `_commit_step` gets the same treatment here.
+
+    Driven against REAL wrapper runs, not synthetic strings -- matching this
+    file's settled preference for recorded/observed behaviour over a text
+    scan (see the rationale at the top of the forbidden-git-verb guard).
+    """
+    committed_repo = _git_repo_harness(tmp_path / 'committed')
+    result, _ = _run_wrapper_in_git_repo(tmp_path / 'committed', committed_repo)
+    assert _commit_step(result) == 'committed', (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    outer = _git_repo_harness(tmp_path / 'outer')
+    inner = outer / 'plans'  # a real subdirectory, not the repo root
+    result, _ = _run_wrapper_in_git_repo(tmp_path / 'outer', inner)
+    assert _commit_step(result) == 'refused:repo-not-toplevel', (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    quiet_repo = _git_repo_harness(tmp_path / 'quiet', dirty=False)
+    result, _ = _run_wrapper_in_git_repo(tmp_path / 'quiet', quiet_repo)
+    assert _commit_step(result) == 'skipped:no-drift', (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # A non-wrapper input carrying no narration at all must degrade to the
+    # named sentinel instead of raising -- an IndexError here would make the
+    # guard's own failure unreadable.
+    stub = subprocess.CompletedProcess(args=['x'], returncode=0, stdout='', stderr='')
+    assert _commit_step(stub) == '<unreported>'
+
+
 def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     """CLAUDE.md's hardest prohibition, on a script that commits UNATTENDED
     into the machine-operated project_root checkout.
