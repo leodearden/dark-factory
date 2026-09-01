@@ -273,7 +273,7 @@ _GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
 def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """A copy of *environ* with every git-REDIRECTING name removed, ``LC_ALL=C``.
+    """A copy of *environ* with the git-REDIRECTING names removed, ``LC_ALL=C``.
 
     Pure: *environ* (in production ``os.environ``) is never mutated. Drops every
     name in :data:`_GIT_REDIRECT_ENV` and every name carrying a
@@ -283,6 +283,23 @@ def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
 
     A targeted removal, NOT a hermetic env rebuild — see the block comment above
     for which names retarget git and why the two preserved families do not.
+
+    KNOWN GAP, deliberately not closed here: ``GIT_CONFIG_PARAMETERS`` survives
+    this scrub. It is the same injection mechanism as the indexed
+    ``GIT_CONFIG_KEY_n``/``VALUE_n`` family — it is what git itself uses to
+    propagate ``-c`` to subprocesses — and it is read at startup with
+    command-line config precedence. MEASURED on git 2.43.0:
+    ``GIT_CONFIG_PARAMETERS="'core.hooksPath=/decoy/hooks'" git config
+    core.hooksPath`` prints ``/decoy/hooks``, and the name is confirmed present
+    in this function's output. So an ambient value reaches every git call in
+    this module, including the ``commit --no-verify`` in :func:`park_commit`.
+    It is NOT closed in this change because the name list is pinned to
+    ``df_pytest_isolation._GIT_REDIRECT_ENV`` by
+    ``test_scrubbed_git_env_matches_shared_redirect_classifier`` in BOTH
+    directions, so adding it here alone fails that pin — it is a SHARED gap
+    needing one coordinated change across both copies, filed as a follow-up.
+    Note this is config injection, not repository redirection: the
+    ``GIT_DIR``-class leak this guard exists for IS closed.
     """
     scrubbed = {
         key: value
