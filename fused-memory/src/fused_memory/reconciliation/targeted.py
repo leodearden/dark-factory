@@ -1810,9 +1810,29 @@ class TargetedReconciler:
             # Own try/except: the status flip already landed, so a
             # metadata-stamp failure must not downgrade this action back to
             # dependent_unblock_failed -- that would make the audit lie in
-            # the opposite direction.
+            # the opposite direction. But try/except ALONE is not enough:
+            # update_task's gates do NOT raise. The _backlog_gate
+            # BacklogVerdict, the lock-charter rejection and the backend
+            # write-authority floor all return early with a rejection dict,
+            # so under a deep reconciliation backlog -- exactly the condition
+            # under which this sweep is most likely to run -- a bare
+            # try/except sees nothing and the stamp is silently dropped.
+            # interceptor_write_succeeded is the module's single sanctioned
+            # classifier for that ("Callers must use interceptor_write_succeeded
+            # to distinguish a successful write from a gate rejection"); do not
+            # hand-roll the check, since a happy-path response can legitimately
+            # carry no 'success' key while {} and non-dicts are failures.
+            #
+            # Both audit rows use operation='update_task', never
+            # 'set_task_status', so operator queries (and the step-9 journal
+            # tests) that filter on the status write keep their cardinality.
+            # A rejection marks action['metadata_stamp']='rejected' and a raise
+            # marks 'failed' -- distinct on purpose, so a policy refusal is
+            # legible apart from an infrastructure fault. Absence of the key
+            # means the stamp landed (mirroring hints_attached, which carries
+            # no status field).
             try:
-                await self.task_interceptor.update_task(
+                resp_meta = await self.task_interceptor.update_task(
                     task_id=dep_id,
                     project_root=project_root,
                     metadata=json.dumps({
@@ -1822,11 +1842,55 @@ class TargetedReconciler:
                     }),
                     metadata_mode='merge',
                 )
+                if not interceptor_write_succeeded(resp_meta):
+                    # Stable machine code first, rendered message second --
+                    # the same precedence used for hints_skipped (:1037-1039).
+                    error_code = (
+                        (resp_meta.get('error_type') or resp_meta.get('error'))
+                        if isinstance(resp_meta, dict) else 'unknown'
+                    ) or 'unknown'
+                    logger.warning(
+                        'sweep: metadata stamp rejected for unblocked dependent %s '
+                        '(satisfied by %s): error=%r',
+                        dep_id, satisfied_by, error_code,
+                    )
+                    await self.journal.add_run_action(
+                        run_id, 'skip', 'taskmaster', 'update_task',
+                        {
+                            'task_id': dep_id,
+                            'satisfied_by': satisfied_by,
+                            'type': 'unblock_metadata_stamp',
+                            'error': error_code,
+                        },
+                        causation_id=run_id,
+                    )
+                    action['metadata_stamp'] = 'rejected'
+                else:
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'taskmaster', 'update_task',
+                        {
+                            'task_id': dep_id,
+                            'satisfied_by': satisfied_by,
+                            'type': 'unblock_metadata_stamp',
+                        },
+                        causation_id=run_id,
+                    )
             except Exception as e:
                 logger.warning(
                     'sweep: metadata stamp failed for unblocked dependent %s '
                     '(satisfied by %s): %s',
                     dep_id, satisfied_by, e,
+                )
+                action['metadata_stamp'] = 'failed'
+                await self.journal.add_run_action(
+                    run_id, 'skip', 'taskmaster', 'update_task',
+                    {
+                        'task_id': dep_id,
+                        'satisfied_by': satisfied_by,
+                        'type': 'unblock_metadata_stamp',
+                        'error': str(e)[:200],
+                    },
+                    causation_id=run_id,
                 )
             return action
         except Exception as e:
