@@ -685,8 +685,8 @@ def test_dashboard_spec_is_the_modules_existing_public_surface():
         f"UNITS['dashboard'].host_local_environment {spec.host_local_environment} "
         f"!= HOST_LOCAL_ENVIRONMENT {module.HOST_LOCAL_ENVIRONMENT}"
     )
-    assert module.LOG_TAG == spec.log_tag, (
-        f"LOG_TAG {module.LOG_TAG!r} != UNITS['dashboard'].log_tag {spec.log_tag!r}"
+    assert spec.log_tag == module.LOG_TAG, (
+        f"UNITS['dashboard'].log_tag {spec.log_tag!r} != LOG_TAG {module.LOG_TAG!r}"
     )
 
 

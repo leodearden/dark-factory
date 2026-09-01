@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Render dark-factory-dashboard.service, PRESERVING this host's local Environment= values.
+"""Render a systemd unit, PRESERVING this host's local Environment= values.
+
+TWO UNITS, ONE RENDERER, selected by ``--unit`` off the ``UNITS`` registry
+below: dark-factory-dashboard.service (task 4793) and fused-memory.service
+(task 4796). The preservation core here was already unit-neutral — only the
+operator-facing log tag and the preserve set were dashboard-specific — so the
+second unit is a registry entry rather than a forked near-copy.
+
+The file keeps its dashboard-era NAME on purpose. ``render_dashboard_unit`` is
+referenced at ~35 sites across 8 tracked files, two of which (in
+tests/scripts/test_check_dashboard_unit_parity.py) WRITE and UNLINK
+``scripts/render_dashboard_unit.py`` by literal path to build setup-host.sh's
+section-8 tmp repo; a rename is filed as separate follow-up work rather than
+smuggled into the task that fixes the defect. The half of that naming problem
+that actually costs anything at 3am is OPERATOR-facing — one shared tag would
+print ``[dashboard_unit_render]`` lines describing the fused-memory unit in a
+long bring-up log — and that half IS fixed here: the tag is per-unit.
 
 WHAT THIS EXISTS TO PREVENT, measured rather than hypothetical. setup-host.sh
 used to install the dashboard unit with a plain truncating redirect::
@@ -24,6 +40,18 @@ scripts/setup-host.sh — so following the gate's advice was what caused the los
 
 This renderer closes that: it reads the values off the unit that is already
 installed and puts the host-local ones back into the freshly rendered text.
+
+THE SECOND UNIT IS THE HIGHER-STAKES ONE (task 4796). Section 4 of the same
+script installed fused-memory.service the same truncating way, and
+scripts/fused-memory.service.template carries the same
+``Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`` line — but on THAT
+unit the variable is not a dashboard view setting. fused_memory/models/scope.py
+reads it as ``KNOWN_PROJECT_ROOTS_ENV``, and reconciliation/harness.py raises
+``UnknownProjectError`` for a project absent from the resulting set. Collapsing
+it therefore de-registers every other project from RECONCILIATION, and the loss
+is again invisible: the post-install gate (check_fused_memory_unit_parity.py)
+checks only host-invariant safety directives and is structurally incapable of
+saying anything about this variable's value.
 
 WHY A SEPARATE SCRIPT RATHER THAN A ``--fix`` ON THE PARITY CHECKER. That
 module's docstring argues at length for staying READ-ONLY, and names the
@@ -51,6 +79,7 @@ hard requirement for something setup-host.sh calls before any venv exists.
 
 import argparse
 import contextlib
+import dataclasses
 import os
 import pathlib
 import shlex
@@ -64,6 +93,11 @@ from collections.abc import Sequence
 # check_*_unit_parity.py family: setup-host.sh's parity gates believe no status
 # unless the checker's own tag appears in the output it produced, because an
 # exit code alone cannot distinguish "ran and reported" from "never ran".
+#
+# This is the DASHBOARD's tag and `_log`'s default. Since task 4796 the tag is
+# per-unit (UNITS below) and `main` threads the selected spec's tag through
+# `_log(..., log_tag=...)` explicitly. Kept as a module-level name because
+# task 4793's suite asserts on it and the dashboard call site passes no --unit.
 LOG_TAG = "dashboard_unit_render"
 
 # The bare sibling import resolves in both contexts this script runs in: as a
@@ -142,10 +176,97 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
 # registry has with setup-host.sh's _orch_units array.
 HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
 
-# The section every dashboard Environment= directive lives in. Named rather
+# The fused-memory unit's preserve set (task 4796). ONE NAME, and the exclusions
+# are the design rather than an oversight — "preserve the host's Environment=
+# values" is the wrong generalisation and would break the unit it is protecting.
+# scripts/fused-memory.service.template declares five other Environment= names,
+# every one of them deliberately absent from here:
+#
+#   * CONFIG_PATH, PROJECT_ROOT, TASKMASTER_DIR are RENDERED from __REPO_ROOT__.
+#     Preserving them across a re-render would pin the fused-memory server's
+#     config and project root at the OLD checkout while WorkingDirectory= moved
+#     to the new one — the identical hazard the DASHBOARD_PROJECT_ROOT paragraph
+#     above describes, and the reason that name is on the dashboard checker's
+#     DIVERGENCE_ALLOWLIST yet still not preserved.
+#   * MEM0_TELEMETRY=false is host-INVARIANT, and it is on
+#     check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES — which that
+#     checker exact-matches and --fix synthesizes. Preserving it would put a
+#     preserved name on the checker's exact-match list, the disjointness
+#     violation described in the WARNING below.
+#   * FUSED_MEMORY_PREDONE_HOOK_REIFY is the interesting near-miss: it carries a
+#     literal host path (/home/leo/.cargo/bin/reify-audit), which makes it LOOK
+#     host-local. But it is committed VERBATIM in the template with no sentinel,
+#     so a re-render reproduces it byte-identically and there is nothing to lose.
+#     Adding it would start pinning whatever a host happened to have — including
+#     a stale hook path — over the committed one: an unrequested behaviour
+#     change, not a safety improvement.
+#
+# WARNING — THE DISJOINTNESS INVARIANT, and the one edit that would invert it.
+# No name preserved here may ever appear as the variable of an exact
+# `Environment=<NAME>=...` entry in
+# check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES. That constant's own
+# comment invites the edit ("Extend this list to guard additional safety flags"),
+# and adding DASHBOARD_KNOWN_PROJECT_ROOTS there would make `find_drift` — which
+# tests exact WHOLE-LINE membership — report a correctly-preserved MULTI-root
+# line as missing, so `--fix` appends the single-root line after the last
+# [Service] line, where systemd's LAST-WINS silently beats the value this
+# renderer had just preserved. Invisibly, since the checker then exits 0.
+# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
+# test_preserved_names_are_disjoint_from_required_service_directives, with the
+# hazard demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
+FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitRenderSpec:
+    """Everything about rendering ONE unit that is not shared by both.
+
+    The preservation core (``render_template`` / ``preserved_values`` /
+    ``_environment_token`` / ``apply_preserved`` / ``render_unit``) is already
+    unit-neutral: it is parameterised by ``names``, and --template/--output are
+    CLI flags. Exactly two things were dashboard-specific, and they are the two
+    fields here. Adding a third unit is therefore a registry entry, not a fork.
+
+    FROZEN: the preserve set is POLICY, pinned by tests and reasoned about in the
+    comments above. A spec mutated per invocation would make "which names does
+    this host preserve?" depend on argument-parsing order.
+    """
+
+    log_tag: str
+    host_local_environment: tuple[str, ...]
+
+
+# The registry --unit selects from. Keys are the operator-facing unit NAMES as
+# setup-host.sh spells them on the command line.
+#
+# The "dashboard" entry is built FROM the module-level constants rather than
+# duplicating their values, so the registry is an ADDITION to this module's
+# public surface rather than a rename of it: task 4793's suite asserts on
+# LOG_TAG and HOST_LOCAL_ENVIRONMENT directly, and setup-host.sh section 8
+# passes no --unit at all. Identity is pinned by
+# tests/scripts/test_render_dashboard_unit.py::
+# test_dashboard_spec_is_the_modules_existing_public_surface.
+#
+# THE TAGS MUST STAY DISTINCT. Both units are rendered by this same script in
+# the same bring-up run, and setup-host.sh routes an operator to a report BY TAG
+# — a shared tag would attribute the fused-memory unit's preserved/skipped lines
+# to the dashboard, on the unit where mis-attribution costs the most.
+UNITS: "dict[str, UnitRenderSpec]" = {
+    "dashboard": UnitRenderSpec(
+        log_tag=LOG_TAG,
+        host_local_environment=HOST_LOCAL_ENVIRONMENT,
+    ),
+    "fused-memory": UnitRenderSpec(
+        log_tag="fused_memory_unit_render",
+        host_local_environment=FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT,
+    ),
+}
+
+# The section every Environment= directive of BOTH units lives in. Named rather
 # than searched: check_dashboard_unit_parity's UnitSpec pins the same
 # `environment_section="Service"`, and the two must agree or the installer
-# preserves out of a section the gate does not read.
+# preserves out of a section the gate does not read. The fused-memory template
+# puts its Environment= lines in [Service] too, so one constant still serves.
 _ENVIRONMENT_SECTION = "Service"
 
 # Reasons a name in the preserve set did NOT survive into the render. Both are
