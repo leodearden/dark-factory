@@ -70,11 +70,10 @@ async def _poll_ticket_resolved(
 
     NOTE: the `task_created` journal event is emitted *after* the terminal
     write (task_interceptor.py:3812 single path / 4190 batch path), so this
-    is NOT a barrier for journal assertions — pair it with
-    `_poll_journal_emitted` on the emission itself (see the two callers
-    that do), or — where the caller asserts an *exact* event count — with
-    `poll_until_stable` on the count, as
-    `test_worker_created_path_emits_journal_event` does.
+    is NOT a barrier for journal assertions — pair it with `poll_until_stable`
+    on the event count (settle=0.2), as every caller in this file that
+    asserts an *exact* event count now does (task 3697 introduced the
+    pattern; task 4307 swept the two remaining liveness-poll sites onto it).
 
     The 10s default is deliberately well inside the 60s pytest-timeout
     (pyproject.toml), whose thread method os._exit(1)s the whole xdist
@@ -90,35 +89,6 @@ async def _poll_ticket_resolved(
         message=f'worker did not resolve {what} ({ticket_id})',
     )
 
-
-async def _poll_journal_emitted(journal_calls, event_type, *, timeout: float = 2.0):
-    """Bounded wait for an *event_type* event to land in *journal_calls*.
-
-    Pairs with `_poll_ticket_resolved` as a second, short barrier: the
-    `task_created` journal event is emitted *after* the ticket's terminal
-    write (task_interceptor.py:3812 single path / 4190 batch path), with
-    `_persist_worker_terminal`'s awaits in between — so
-    `_poll_ticket_resolved` alone can observe a terminal ticket one
-    event-loop hop before `_journal` actually runs. This closes that
-    narrow window: a genuine regression (the event never emitted) still
-    fails fast, in ~`timeout` seconds rather than the row poll's full 10s
-    budget.
-
-    Filters on `event_type` explicitly, rather than bare truthiness of
-    `journal_calls`, so a differently-typed event journalled earlier on
-    the same path can't turn this into a silent no-op.
-
-    LIVENESS poll, not a settle barrier: it returns at the *first* matching
-    event, so it does not by itself close the window on a duplicate arriving
-    later. `test_worker_created_path_emits_journal_event` uses
-    `poll_until_stable` on the count instead for exactly that reason (task
-    3697); the two callers here retain the liveness form.
-    """
-    return await poll_until(
-        lambda: [e for e in journal_calls if getattr(e, 'type', None) == event_type],
-        timeout=timeout,
-        message='ticket resolved but no journal event was emitted',
-    )
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -1113,10 +1083,23 @@ async def test_worker_post_create_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # See _poll_journal_emitted's docstring for why this second, short
-        # poll is needed in addition to the row-terminality poll.
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
-        await _poll_journal_emitted(journal_calls, EventType.task_created)
+
+        # SETTLE barrier, not a liveness poll: the assertion below is an
+        # exact task_created count, and a liveness poll returns at the
+        # *first* event — so a duplicate arriving milliseconds later would
+        # be structurally invisible (task 3697; task 4307 closed the same
+        # gap here). See test_worker_created_path_emits_journal_event for
+        # the fuller rationale.
+        await poll_until_stable(
+            lambda: sum(
+                1 for e in journal_calls
+                if getattr(e, 'type', None) == EventType.task_created
+            ),
+            settle=0.2,
+            timeout=10.0,
+            message='worker did not journal a task_created event',
+        )
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -1192,10 +1175,23 @@ async def test_worker_record_task_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # See _poll_journal_emitted's docstring for why this second, short
-        # poll is needed in addition to the row-terminality poll.
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
-        await _poll_journal_emitted(journal_calls, EventType.task_created)
+
+        # SETTLE barrier, not a liveness poll: the assertion below is an
+        # exact task_created count, and a liveness poll returns at the
+        # *first* event — so a duplicate arriving milliseconds later would
+        # be structurally invisible (task 3697; task 4307 closed the same
+        # gap here). See test_worker_created_path_emits_journal_event for
+        # the fuller rationale.
+        await poll_until_stable(
+            lambda: sum(
+                1 for e in journal_calls
+                if getattr(e, 'type', None) == EventType.task_created
+            ),
+            settle=0.2,
+            timeout=10.0,
+            message='worker did not journal a task_created event',
+        )
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
