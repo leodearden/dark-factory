@@ -1780,7 +1780,23 @@ def _format_findings(findings: list[dict]) -> str:
 def _format_watermark(watermark: Watermark) -> str:
     if watermark.last_full_run_completed is None:
         return 'First run — no previous reconciliation.'
-    return (
+    lines = [
         f'Last full run: {watermark.last_full_run_id} '
         f'at {watermark.last_full_run_completed.isoformat()}'
-    )
+    ]
+    # Disclose the freshness cutoffs the episode/mem0 "new since last
+    # reconciliation" filters above actually compared against (task 4574).
+    # Previously invisible here — the payload showed a filtered COUNT
+    # ("New Episodes Since Last Reconciliation (N)") with no way to see
+    # what cursor N was computed against, which is why the 894fbe90
+    # incident survived three full cycles of re-investigation undiagnosed.
+    # Rendered via .isoformat() (never str(datetime), which uses a space
+    # separator — see _is_newer_than_watermark) and omitted entirely
+    # (rather than printed as the literal 'None') when unset, e.g. on a
+    # watermark that has a completed full run but has not yet recorded an
+    # episode or memory cutoff.
+    if watermark.last_episode_timestamp is not None:
+        lines.append(f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}')
+    if watermark.last_memory_timestamp is not None:
+        lines.append(f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}')
+    return '\n'.join(lines)
