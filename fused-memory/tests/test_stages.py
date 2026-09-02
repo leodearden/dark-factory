@@ -10187,12 +10187,16 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
 
         assert report.stats.get('stale_mem0_flag_for_stage2_markers_gc_swept') == 7
         assert mock_sweep.await_args is not None
+        # The gate is threaded through, not omitted (task 4375). Asserted
+        # against the CONCRETE expected value — the fixture's taskmaster
+        # resolves to [] — matching the mock_gc precedent above. It previously
+        # read the value back out of `mock_sweep.await_args.kwargs` and
+        # compared it to itself, which could never fail (amendment pass,
+        # reviewer finding test-quality).
         mock_sweep.assert_awaited_once_with(
             mock_deps['memory_service'], 'reify', 'test-run',
-            terminal_task_ids=mock_sweep.await_args.kwargs['terminal_task_ids'],
+            terminal_task_ids=[],
         )
-        # The gate is threaded through, not omitted (task 4375).
-        assert 'terminal_task_ids' in mock_sweep.await_args.kwargs
 
         # The sibling GC passes are independent and all run every cycle —
         # none overwrites another in report.stats.
@@ -15200,6 +15204,82 @@ class TestGcReconMarkers:
         assert result == 3
         ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
 
+    # --- Pre-resolved terminal_task_ids efficiency hoist (task 4375) --------
+    #
+    # The run()-level test asserts get_statuses is awaited exactly once, but it
+    # patches _gc_recon_markers OUT, so the real function's
+    # `if terminal_task_ids is None` branch never executes there and the whole
+    # justification for the parameter — skipping a duplicate bulk round-trip on
+    # the cycle's critical path — went unpinned (amendment pass, reviewer
+    # finding test-coverage). These two tests exercise the real function on
+    # both sides of that branch.
+
+    @pytest.mark.asyncio
+    async def test_supplied_terminal_task_ids_skips_the_internal_resolve(self):
+        """A pre-resolved list is used VERBATIM — no second get_statuses.
+
+        Also pins that the supplied list still goes through the marker_task_ids
+        bounding intersection: the hoist is an efficiency change only, and must
+        not smuggle an unbounded id list past the bound that keeps gc()'s
+        bind-parameter count tied to ledger occupancy.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        # 't-absent' is terminal but has no marker row: the bound must drop it.
+        ledger.marker_task_ids = AsyncMock(return_value={'t-done'})
+        ledger.gc = AsyncMock(return_value=2)
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        # Would resolve to something DIFFERENT if it were consulted, so a
+        # regression that re-resolves fails on the forwarded value too, not
+        # only on the await_count.
+        taskmaster.get_statuses = AsyncMock(return_value={'t-other': 'done'})
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+            terminal_task_ids=['t-done', 't-absent'],
+        )
+
+        assert result == 2
+        # The saved round-trip — the entire point of the parameter.
+        taskmaster.get_statuses.assert_not_awaited()
+        # The caller's list reached gc(), bounded by ledger occupancy.
+        ledger.gc.assert_awaited_once_with(scope.project_id, ANY, ['t-done'])
+
+    @pytest.mark.asyncio
+    async def test_none_terminal_task_ids_still_resolves_internally(self):
+        """The preserved default: None => this function resolves them itself.
+
+        Companion to the test above — together they pin BOTH arms of the
+        `if terminal_task_ids is None` branch, so dropping either one fails.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        ledger.marker_task_ids = AsyncMock(return_value={'t-done'})
+        ledger.gc = AsyncMock(return_value=1)
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'t-done': 'done', 't-open': 'pending'},
+        )
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert result == 1
+        taskmaster.get_statuses.assert_awaited_once()
+        # Terminal-only, and the open task never reaches gc().
+        ledger.gc.assert_awaited_once_with(scope.project_id, ANY, ['t-done'])
+
 
 class TestSweepStaleMem0PoolProtectsMirrorRecords:
     """_sweep_stale_mem0_pool never deletes a cycle_summary ledger mirror (task 3041).
@@ -15378,9 +15458,13 @@ class TestSweepStaleMem0PoolProtectsAuditRecords:
     pool. The discrimination therefore lives in the eligibility predicate at
     this one choke point, beside the task-3041 mirror guard.
 
-    Each guard keeps its OWN WARNING: a skipped audit record must never be
-    reported as a skipped cycle_summary mirror, or an operator reading the log
-    is sent to tighten the wrong thing.
+    Each guard keeps its OWN, distinguishable diagnostic: a skipped audit
+    record must never be reported as a skipped cycle_summary mirror, or an
+    operator reading the log is sent to tighten the wrong thing. The SHAPES
+    differ deliberately (amendment pass) — the mirror skip is a rare accident
+    and warns per member, the audit skip is the documented steady state of
+    this pool and is aggregated into one WARNING per sweep, with per-record
+    ids demoted to DEBUG.
     """
 
     # The exact live metadata shape measured on the surviving autopilot_video
@@ -15447,15 +15531,87 @@ class TestSweepStaleMem0PoolProtectsAuditRecords:
             r for r in caplog.records
             if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
         ]
+        # ONE aggregate line, not one per skipped member (amendment pass): this
+        # cohort is permanent and recurs every cycle, so a per-member WARNING
+        # would be a forever-firing signal with no operator action behind it.
         assert len(warnings) == 1
         message = warnings[0].getMessage()
-        assert 'audit-record' in message
+        assert 'RETAINED 1 protected audit record(s)' in message
+        # The distinct kinds are the actionable part — they name WHICH audit
+        # vocabulary this pool's filter collides with.
         assert 'cadence_check' in message
         assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
         # DISTINCT from the task-3041 mirror WARNING: misattributing this skip
         # as a cycle_summary mirror skip would send an operator to inspect the
         # wrong pool.
         assert 'cycle_summary' not in message
+        # The per-record identity is DEMOTED, not lost.
+        assert 'audit-record' not in message
+
+    @pytest.mark.asyncio
+    async def test_many_audit_records_yield_one_warning_and_per_record_debug(self, caplog):
+        """The audit-skip diagnostic does NOT scale with the cohort size.
+
+        Pins the amendment-pass shape directly: N protected audit records
+        produce exactly ONE WARNING carrying the count, and N DEBUG lines each
+        naming its own memory_id. Measured motivation — autopilot_video holds 7
+        live kind='cadence_check' records carrying flag_for_stage2=True
+        (2026-09-02), all permanent, so the per-member WARNING this replaces
+        would have fired 7 times per cycle forever with no operator action
+        behind it.
+
+        Also pins that a BRAND-NEW audit record is counted: the guard sits
+        before the age test by design (an over-broad filter must degrade to a
+        loud skip, not to collateral loss), so age is irrelevant to this branch
+        — which is precisely why aggregation, not re-ordering, is the fix.
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        fresh = (fixed_now - timedelta(hours=1)).isoformat()
+        members = [
+            {'id': f'audit-{n}', 'created_at': created,
+             'metadata': dict(self._LIVE_CADENCE_CHECK)}
+            for n, created in enumerate((stale, stale, fresh))
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert 'RETAINED 3 protected audit record(s)' in warnings[0].getMessage()
+        assert 'kinds=cadence_check' in warnings[0].getMessage()
+
+        debugs = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.DEBUG
+            and 'protected audit record' in r.getMessage()
+        ]
+        assert len(debugs) == 3
+        assert {r.__dict__['memory_id'] for r in debugs} == {
+            'audit-0', 'audit-1', 'audit-2',
+        }
 
     @pytest.mark.asyncio
     async def test_mirror_branch_message_unchanged_by_the_new_guard(self, caplog):

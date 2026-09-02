@@ -1316,7 +1316,31 @@ async def _sweep_stale_mem0_pool(
     pseudo-id. That is a KEEP-direction leak and it is deliberate — this
     module's documented posture is "uncertain => keep, never delete on
     partial/failed information", and bounded recoverable growth outranks
-    permanent loss. It is surfaced, not hidden: when the gate withholds at
+    permanent loss.
+
+    **The leak is SIZED, not merely asserted bounded** (amendment pass;
+    reviewer finding robustness/unbounded-growth, which correctly noted the
+    original census measured ``kind`` and ``source`` coverage but never
+    ``task_id``). Direct Qdrant scroll of every live ``flag_for_stage2`` pool,
+    2026-09-02: **56 live records across 5 projects, 41 (73%) carry a
+    non-empty ``task_id`` and 15 (27%) do not** — dark_factory 3/11, reify
+    12/24, autopilot_video 0/12, know_live 0/9, solar_challenge_platform 0
+    (pool empty). So the permanently-un-retireable cohort is a minority of the
+    pool, and the sweep still retires the ~73% majority once their cited task
+    closes; it does not degrade to retiring nothing. The 27% is real growth
+    and is why the aggregate WARNING below exists.
+
+    The matching HISTORICAL census — ``task_id`` coverage on the 289 records
+    this sweep already destroyed — is **unmeasurable, permanently**:
+    ``mem0_tombstone._VICTIM_IDENTITY_KEYS`` projects only
+    ``kind``/``record_type``/``source``/``recon_pool``/``run_id`` into a
+    tombstone payload, and the ledger row's own ``task_id`` column holds the
+    VICTIM'S MEMORY UUID (it is the tombstone's lookup key), not the task the
+    victim cited. Verified: ``json_extract(payload_json,'$.task_id') IS NOT
+    NULL`` matches 0 of 289 rows. Recorded here so a future reader does not
+    re-attempt the query and conclude the data is merely missing.
+
+    The leak is surfaced, not hidden: when the gate withholds at
     least one AGE-STALE member, ONE aggregate WARNING per sweep names the
     retained count, so a persistently growing number becomes visible as the
     signal that this pool needs a real closure path for task_id-less markers.
@@ -1582,6 +1606,17 @@ async def _sweep_stale_mem0_pool(
     # Count of age-stale members withheld by the terminal-closure gate, used
     # for the single aggregate WARNING after the loop (task 4375).
     retained_unclosed = 0
+    # Same, for members withheld by the protected-audit-record guard (task
+    # 4375 amendment pass). Aggregated for the SAME reason retained_unclosed
+    # is: this cohort is by definition permanent and expected — autopilot_video
+    # alone holds 7 live kind='cadence_check' records carrying
+    # flag_for_stage2=True (measured 2026-09-02) — so a per-member WARNING
+    # every cycle would be a forever-firing signal with no operator action
+    # behind it, which is exactly the "train an operator to ignore the one
+    # signal that matters" failure the retained-unclosed block below is shaped
+    # to avoid. The per-member detail is not lost, only demoted to DEBUG.
+    protected_audit = 0
+    protected_audit_kinds: set[str] = set()
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1613,17 +1648,29 @@ async def _sweep_stale_mem0_pool(
         # mirror guard and BEFORE the age test for the same reason: an
         # over-broad payload filter must degrade to a loud skip rather than
         # collateral loss of a record that is SUPPOSED to outlive the window
-        # in which its subject was interesting. Its own WARNING, deliberately
-        # not folded into the mirror branch's, so the skip stays attributable
-        # to the guard that caused it.
+        # in which its subject was interesting.
+        #
+        # Reported as ONE aggregate WARNING after the loop rather than one per
+        # member (amendment pass), unlike the mirror branch above. The two
+        # cases differ in expected frequency, not in importance: a matched
+        # MIRROR is a rare accident and its WARNING correctly says "tighten
+        # this filter", whereas a matched AUDIT RECORD is the documented
+        # steady state of this pool and recurs identically every cycle
+        # forever. The per-member identity still reaches an operator who wants
+        # it, at DEBUG. Attribution is preserved either way: the aggregate
+        # message and `log_name` keep it distinguishable from the mirror skip.
         if is_protected_audit_record(member_metadata):
             metadata = member_metadata if isinstance(member_metadata, dict) else {}
-            logger.warning(
+            kind = metadata.get('kind')
+            protected_audit += 1
+            if isinstance(kind, str) and kind:
+                protected_audit_kinds.add(kind)
+            logger.debug(
                 'reconciliation.%s: SKIPPING protected audit record memory_id=%s '
                 '(kind=%s) — this pool filter matched a deliberately-permanent '
                 'audit-log record it must never delete; it is retained regardless '
                 'of age (task 4375).',
-                log_name, mid, metadata.get('kind'),
+                log_name, mid, kind,
                 extra={
                     'project_id': project_id,
                     'memory_id': mid,
@@ -1675,6 +1722,39 @@ async def _sweep_stale_mem0_pool(
                     continue
 
             stale_members.append(member)
+
+    if protected_audit > 0:
+        # Protected-audit-record diagnostic (task 4375 amendment pass). Same
+        # shape and same fail-safe wrapper as the two other aggregate
+        # diagnostics in this function: emitted ONCE per sweep, purely
+        # informational, and it must never alter `members` or the returned
+        # count. The distinct kinds are carried because they are the actionable
+        # part — they say WHICH audit vocabulary this pool's filter is
+        # colliding with, which is what a filter fix would have to target.
+        try:
+            logger.warning(
+                'reconciliation.%s: RETAINED %d protected audit record(s) '
+                '(kinds=%s) matched by this %s pool filter — deliberately-'
+                'permanent audit-log records, kept regardless of age (task '
+                '4375). Expected and recurring: this pool filter is wide by '
+                'design, so a steady count here is healthy, not a failure. '
+                'Per-record ids are logged at DEBUG.',
+                log_name, protected_audit,
+                ','.join(sorted(protected_audit_kinds)) or '<none>', source,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: protected-audit-record diagnostic raised; '
+                'skipping (fail-safe, does not affect the sweep count).',
+                log_name,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction

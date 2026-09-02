@@ -1,11 +1,23 @@
 """Recon-initiated Mem0 deletion tombstones and the protected-record predicates
 (tasks 3041, 4375).
 
-Three independent units live here, all consumed by every recon path that
-deletes a Mem0 record — the marker-GC sweeps in
-``reconciliation.stages.task_knowledge_sync._sweep_stale_mem0_pool`` and the
-cycle_summary mirror pool trim in
-``reconciliation.summary_pool.enforce_summary_pool_cap``.
+Three units live here, with DIFFERENT consumers. They are attributed
+separately rather than lumped together because this module's whole value is
+that a reader can tell WHICH deletion paths are guarded without going and
+checking each one:
+
+- The tombstone writers (:func:`record_mem0_deletion_tombstone` and its
+  batched sibling :func:`record_mem0_deletion_tombstones`) are consumed by
+  every recon path that deletes a Mem0 record — the marker-GC sweeps in
+  ``reconciliation.stages.task_knowledge_sync._sweep_stale_mem0_pool`` AND
+  the cycle_summary mirror pool trim in
+  ``reconciliation.summary_pool.enforce_summary_pool_cap``.
+- The two protected-record predicates (:func:`is_protected_mirror_record`,
+  :func:`is_protected_audit_record`) are consumed at the
+  ``_sweep_stale_mem0_pool`` choke point ONLY. ``summary_pool`` calls
+  neither, and does not need to: it trims a pool it enumerated by
+  construction, so it is never at risk of matching a record belonging to
+  someone else. Its only mentions of these names are comments.
 
 Why this module exists
 ----------------------
