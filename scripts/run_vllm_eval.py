@@ -219,48 +219,33 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_eval_accounts_file() -> Path:
-    """Create a temp accounts YAML = shared accounts + eval-only account A.
-
-    RULING 2026-08-30 (task 4741): account A is reserved for INTERACTIVE use
-    only, not eval use — it is excluded from the shared
-    ``config/usage-accounts.yaml`` so orchestrators don't cap it, but evals
-    have no dedicated account of their own and are supposed to share the
-    fleet pool and tolerate cap/429 events. This function still appends A
-    below, which is exactly the stale behavior the ruling retires; fixing
-    it is tracked in the follow-up task filed from 4741, not done here.
-    """
-    import tempfile
-
-    import yaml
-
-    base_path = PROJECT_ROOT / "config" / "usage-accounts.yaml"
-    base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
-    accounts = list(base.get("accounts", []))
-
-    # Append A if not already present
-    if not any(a.get("name") == "max-a" for a in accounts):
-        accounts.append({
-            "name": "max-a",
-            "oauth_token_env": "CLAUDE_OAUTH_TOKEN_A",
-        })
-
-    fd, tmp_path = tempfile.mkstemp(prefix="eval-accounts-", suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        yaml.safe_dump({"accounts": accounts}, f)
-
-    log(f"Eval accounts file: {tmp_path} ({len(accounts)} accounts, +max-a)")
-    return Path(tmp_path)
-
-
 def build_eval_env() -> dict[str, str]:
     """Build the env dict passed to ``orchestrator eval`` subprocesses.
 
-    Loads ``.env`` for OAuth tokens. Generates a temp accounts file that
-    includes the shared pool + account A, and sets ``USAGE_ACCOUNTS_FILE``
-    so orchestrator configs pick it up. NOTE: per the 2026-08-30 ruling
-    (task 4741) A is not actually an "eval-only" account — see
-    ``_build_eval_accounts_file`` above.
+    Loads ``.env`` for OAuth tokens and points ``USAGE_ACCOUNTS_FILE`` at
+    this checkout's own shared ``config/usage-accounts.yaml``.
+
+    THE ROSTER. Evals have NO dedicated account. They draw on the same
+    shared fleet pool as every other invocation and tolerate cap/429
+    events via ``invoke_with_cap_retry``'s 48h patience plus session
+    ``--resume`` (see ``orchestrator.evals.runner``), rather than via a
+    private reserve. Account A is reserved for INTERACTIVE use only —
+    Leo's own sessions exhaust its weekly cap most weeks, so it never
+    could serve as that reserve (ruling 2026-08-30, tasks 4741/4945).
+
+    WHY THE VAR IS SET RATHER THAN LEFT UNSET. Unsetting it would also
+    resolve to the shared pool, since ``dark-factory-orchestrator.yaml``
+    declares ``accounts_file:
+    "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"``
+    — but that default is a hardcoded absolute path into the MAIN
+    checkout, so an eval launched from a worktree would silently roster
+    main's file instead of its own. Setting it explicitly from this
+    script's ``PROJECT_ROOT`` keeps a worktree run self-consistent. The
+    var is also the established cross-project seam for "which roster
+    does this run use" (``shared.config_models.UsageCapConfig`` and
+    reify's orchestrator config both read it), so it is kept, not
+    deleted. What was retired is APPENDING an account to the roster it
+    points at.
     """
     env = os.environ.copy()
     dotenv_path = PROJECT_ROOT / ".env"
@@ -278,9 +263,10 @@ def build_eval_env() -> dict[str, str]:
         log("WARNING: no CLAUDE_OAUTH_TOKEN found in .env")
     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
 
-    # Inject eval-specific accounts file (shared pool + account A)
-    eval_accounts = _build_eval_accounts_file()
-    env["USAGE_ACCOUNTS_FILE"] = str(eval_accounts)
+    # Roster the shared fleet pool verbatim — no injection, no tempfile.
+    accounts_file = PROJECT_ROOT / "config" / "usage-accounts.yaml"
+    env["USAGE_ACCOUNTS_FILE"] = str(accounts_file)
+    log(f"Eval accounts file: {accounts_file} (shared fleet pool)")
 
     return env
 
