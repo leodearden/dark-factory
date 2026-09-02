@@ -469,6 +469,42 @@ def parse_judge_verdict(raw, candidates):
         raise ValueError('verdict names a candidate outside the slate')
     return (verdict, candidate_id)
 ''',
+    # The BACKWARDS-COMPATIBLE option (a), and the shape a real fix is most
+    # likely to take: the slate is an OPTIONAL parameter, so `parse(raw)` still
+    # succeeds and still returns main's bare str for every existing caller,
+    # while `parse(raw, <slate>)` validates the id against the slate and
+    # returns the pair. Reviewer-reported false FAIL: `_option_a_verdict`
+    # returned on the FIRST convention that REACHED the parser, and
+    # `_parse_callers` deliberately orders the least-assuming `parse(raw)`
+    # first -- so a complete, correct option (a) was judged on its no-slate
+    # fallback, reported "returns a bare str", fell through to an option (b)
+    # this (correctly untouched) flat prompt cannot satisfy, and exited 1,
+    # leaving task 3169 permanently re-blocked. The sibling shape with a
+    # REQUIRED slate parameter is `option_a_validating`; only the optional one
+    # trips the early return, because only it gets a payload past `parse(raw)`.
+    'option_a_optional_slate': r'''
+
+def build_judge_prompt(content, candidates):
+    lines = ['NEW ENTRY:', str(content), '', 'EXISTING CANDIDATES:']
+    for candidate in candidates:
+        lines.extend(_render_candidate(candidate))
+    return '\n'.join(lines)
+
+
+def parse_judge_verdict(raw, candidates=None):
+    payload = json.loads(raw)
+    word = payload.get(VERDICT_KEY)
+    verdict = JUDGE_VERDICTS.get(str(word).strip().lower())
+    if verdict is None:
+        raise ValueError('not a judge verdict word')
+    if candidates is None:
+        return verdict
+    candidate_id = payload.get('candidate_id')
+    known = {getattr(c, 'id', c) for c in candidates}
+    if candidate_id not in known:
+        raise ValueError('verdict names a candidate outside the slate')
+    return (verdict, candidate_id)
+''',
     # An UNRELATED prompt-legibility change wearing a target-ish name. The band
     # canonical is interpolated into a header line; nothing binds any verdict to
     # any candidate, the candidate list stays flat and undifferentiated, and
@@ -1283,6 +1319,27 @@ class TestOptionAAcceptance:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, (
             f'probe failed a slate-validating option (a):\n{proc.stdout}\n{proc.stderr}'
+        )
+        assert _OPTION_A_HELD in proc.stdout, proc.stdout
+
+    def test_optional_slate_parser_passes_option_a(self, tmp_path):
+        """A backwards-compatible option (a) must not be judged on its fallback.
+
+        The likeliest real fix keeps every existing caller working: the slate
+        is an OPTIONAL parameter, so ``parse(raw)`` still returns main's bare
+        str and ``parse(raw, <slate>)`` returns the validated pair. Because
+        ``_parse_callers`` orders the least-assuming ``parse(raw)`` first and
+        the driver used to return on the FIRST convention that reached the
+        parser, the probe rendered its verdict on the no-slate fallback,
+        printed 'parse_judge_verdict returns a bare str', and exited 1 —
+        re-blocking task 3169 against a complete and correct option-(a) fix.
+        A negative verdict must not short-circuit the remaining conventions."""
+        src_root = _write_fake_judge(
+            tmp_path / 'src', variant='option_a_optional_slate',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, (
+            f'probe failed an optional-slate option (a):\n{proc.stdout}\n{proc.stderr}'
         )
         assert _OPTION_A_HELD in proc.stdout, proc.stdout
 

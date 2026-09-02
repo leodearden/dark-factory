@@ -883,7 +883,11 @@ def _parse_callers(parse: Any, slate: list[Any]) -> list[tuple[str, Any]]:
     parser that validates membership accepts them.
 
     Ordered least-assuming first: the single-argument call is tried before any
-    slate is supplied, so a parser that never wanted one is never handed one.
+    slate is supplied, so a parser that never wanted one is judged on the shape
+    it actually offers. Ordering is a PREFERENCE, not a cutoff — the driver
+    evaluates EVERY convention before reporting a failure, because a
+    backwards-compatible option (a) (optional slate, bare-str fallback) is
+    satisfied only by a LATER convention than the one it also answers.
     """
     ids = [str(getattr(candidate, 'id', candidate)) for candidate in slate]
     objects = list(slate)
@@ -926,6 +930,7 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
             'ids, so no two payloads differing only in the id can be built'
         )
     unreached: list[str] = []
+    refused: list[str] = []
     for label, caller in _parse_callers(parse, slate):
         outcome = _option_a_under(module, caller, key, first, last)
         if outcome is None:
@@ -936,11 +941,25 @@ def _option_a_verdict(module: Any, slate: list[Any]) -> tuple[bool, str]:
             continue
         holds, reason = outcome
         if holds:
+            # ONE satisfying convention is the whole invariant: the verdict can
+            # name its candidate. Report it immediately.
             return True, reason
-        # A convention that REACHED the parser rendered a real verdict on it.
-        # That finding is the actionable one, so it outranks every "the call
-        # signature did not match" note from the conventions that did not.
-        return False, reason
+        # A NEGATIVE verdict does NOT end the search. `_parse_callers` orders
+        # `parse(raw)` first deliberately (least-assuming), so returning here
+        # judged a BACKWARDS-COMPATIBLE option (a) — an optional slate
+        # parameter, bare-str fallback when it is omitted, validated pair when
+        # it is supplied — entirely on its fallback, and failed the gate closed
+        # against a complete and correct fix. Measured: the probe printed
+        # 'parse_judge_verdict returns a bare str' and exited 1 while
+        # `parse(raw, <slate ids>)` satisfied the branch outright. Every
+        # convention is now evaluated before any failure is reported.
+        refused.append(f'under {label}: {reason}')
+    if refused:
+        # The FIRST refusal leads, because `_parse_callers` is ordered
+        # least-assuming first and that convention's finding is the one a
+        # reader can act on (on main it is the only one). The rest follow so a
+        # convention-specific cause is never silently dropped.
+        return False, _first_few(refused)
     return False, (
         f'inconclusive — parse_judge_verdict accepted no probe payload under any '
         f'calling convention ({_first_few(unreached, limit=len(unreached))})'
