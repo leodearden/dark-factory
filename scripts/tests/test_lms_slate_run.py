@@ -234,18 +234,33 @@ class _FakeRunner:
 
     Stands in for `subprocess.run`, which is how every test in this file stays
     offline: no arm is started and no card is touched.
+
+    *writes* maps a stage key to the text that stage's `--output` file receives,
+    modelling the ONE thing the real producer does that a returncode cannot
+    express: `lms_healthcheck --arm X --output p` writes its report BEFORE
+    returning the verdict's exit code, so a stage can leave a file behind while
+    still exiting non-zero -- and, just as load-bearing, a stage that is NOT
+    listed here leaves the parts dir exactly as it found it (which is what
+    `EXIT_STALE_BASELINE` does: it exits 8 having written nothing).  Whether a
+    run left a file behind is the whole staleness question, so it cannot be
+    simulated by returncodes alone.
     """
 
-    def __init__(self, codes=None, raises=None):
+    def __init__(self, codes=None, raises=None, writes=None):
         self.calls: list[list[str]] = []
         self._codes = dict(codes or {})
         self._raises = dict(raises or {})
+        self._writes = dict(writes or {})
 
     def __call__(self, argv: list[str]) -> _FakeCompleted:
         self.calls.append(list(argv))
         key = _stage_key(argv)
         if key in self._raises:
             raise self._raises[key]
+        if key in self._writes:
+            out = Path(argv[argv.index('--output') + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(self._writes[key])
         return _FakeCompleted(self._codes.get(key, 0))
 
     def stages(self):
@@ -972,6 +987,155 @@ def test_a_failed_arm_makes_the_run_non_zero_even_when_the_merge_succeeds(
     code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
 
     assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# a stale part is never handed to the merge
+#
+# `existing_parts` selects by `Path.exists()` ALONE, so anything left in the
+# parts dir is handed to `--merge` regardless of which run put it there.  An
+# arm selected for RE-MEASUREMENT whose re-measure aborts before the probe
+# writes anything therefore leaves the PREVIOUS sweep's part exactly where it
+# was — and a merge handed a full manifest's worth of rows SUCCEEDS, silently
+# overwriting the committed artifact with a row of another vintage (old
+# `measured_at`, old verdict, possibly a served_model_name the manifest no
+# longer commissions) presented as part of this slate.  That is precisely the
+# mixed-vintage artifact `merge_reports`' coverage check and
+# `test_lms_verification_artifact.py` exist to prevent, arriving by the one
+# route neither of them can see: they judge the parts they are HANDED, and
+# nothing else knows when a part was written.
+#
+# The rule is by VINTAGE and never by verdict.  A part THIS sweep wrote stays,
+# even one carrying a FAIL row — a `part_is_complete`-style PASS filter applied
+# here would turn a genuinely red slate into a coverage refusal and throw away
+# the rows saying why it is red.
+# ---------------------------------------------------------------------------
+
+
+#: The three ways a re-measure aborts BEFORE anything is written for that arm,
+#: each reproduced on this branch as MERGED == [arm-one.json, arm-two.json].
+_ABORT_BEFORE_ANYTHING_IS_WRITTEN = {
+    # `lms_ctl start` is exclusive and refuses (exit 4) while a sibling holds
+    # the card; nothing is started, so nothing is probed.
+    'start': {('ctl', 'start', 'arm-two'): 4},
+    # the arm never came ready. Deliberately not probed — see
+    # `sweep_arms` — so no report is written for it at all.
+    'wait-ready': {('ctl', 'wait-ready', 'arm-two'): 1},
+    # `lms_healthcheck` EXIT_STALE_BASELINE: it reads the VRAM baseline BEFORE
+    # probing and raises, so it exits 8 having written NO file. The one abort
+    # that runs the producer and still leaves the old part untouched.
+    'healthcheck': {('healthcheck', 'arm-two'): 8},
+}
+
+
+def _merged_parts(runner):
+    argv = _merge_call(runner)
+    return argv[argv.index('--merge') + 1:argv.index('--output')]
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_an_aborted_re_measure_leaves_no_part_behind(tmp_path, two_arms, stage):
+    """arm-two's part is a FAIL row from a previous sweep, so it is correctly
+    re-measured — and the re-measure aborts. The old part must not survive the
+    decision to replace it."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    stale = _write_part(
+        parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json(),
+    )
+
+    lms_slate_run.sweep_arms(
+        parts_dir, runner=_FakeRunner(codes=_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage]),
+    )
+
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_a_stale_part_is_not_merged_into_this_slate(tmp_path, two_arms, stage):
+    """With the stale part gone the merge is handed a SHORT set, so
+    `merge_reports`' coverage check refuses by name and the committed artifact
+    is left intact — the behaviour the README, `run_slate`'s docstring and
+    `part_is_complete`'s "A FAIL ROW IS NOT A RESUME POINT" already promise."""
+    parts_dir = tmp_path / 'parts'
+    _write_part(parts_dir, 'arm-one')
+    _write_part(parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json())
+    runner = _FakeRunner(
+        codes={**_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage], ('merge',): 6},
+    )
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert _merged_parts(runner) == [str(parts_dir / 'arm-one.json')]
+    assert code != 0
+
+
+@pytest.mark.parametrize('stage', sorted(_ABORT_BEFORE_ANYTHING_IS_WRITTEN))
+def test_force_over_a_passing_part_has_the_identical_hole(tmp_path, two_arms, stage):
+    """`--force` re-measures an arm whose part is a perfectly good PASS, so the
+    same abort strands a PASSING row of the previous vintage in the merge.
+    `--force` means "measure everything NOW", and a slate assembled half from
+    this run and half from the last is exactly the laundered vintage it is
+    supposed to rule out."""
+    parts_dir = tmp_path / 'parts'
+    stale = _write_part(parts_dir, 'arm-two')
+    runner = _FakeRunner(
+        codes={**_ABORT_BEFORE_ANYTHING_IS_WRITTEN[stage], ('merge',): 6},
+        # arm-one is re-measured too and its probe SUCCEEDS, so it writes a
+        # part of this run's vintage — the control that keeps this test about
+        # arm-two's stale file rather than about `--force` emptying the dir.
+        writes={('healthcheck', 'arm-one'): _one_row_report('arm-one').model_dump_json()},
+    )
+
+    code = lms_slate_run.run_slate(
+        parts_dir, tmp_path / 'out.json', force=True, runner=runner,
+    )
+
+    assert not stale.exists()
+    assert _merged_parts(runner) == [str(parts_dir / 'arm-one.json')]
+    assert code != 0
+
+
+def test_a_skipped_arm_keeps_its_part_and_it_reaches_the_merge(tmp_path, two_arms):
+    """The positive control for the SKIP path. Removal belongs on the
+    re-measure path only: an arm skipped on a valid PASS part must keep it, or
+    resuming would delete the very rows it exists to preserve and every resume
+    would end in a coverage refusal."""
+    parts_dir = tmp_path / 'parts'
+    kept = _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner(
+        writes={('healthcheck', 'arm-two'): _one_row_report('arm-two').model_dump_json()},
+    )
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert kept.exists()
+    assert _merged_parts(runner) == [
+        str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json'),
+    ]
+    assert code == 0
+
+
+def test_a_fail_row_written_by_this_sweep_still_reaches_the_merge(tmp_path, two_arms):
+    """The positive control for VERDICT. `lms_healthcheck` writes its report
+    before returning the verdict's exit code, so a genuinely red arm leaves a
+    real, current row. Dropping it would turn a red slate into a coverage
+    refusal and lose the reason it is red — the artifact is allowed to say
+    FAIL, it is only forbidden to say it about a run that did not happen."""
+    parts_dir = tmp_path / 'parts'
+    runner = _FakeRunner(
+        codes={('healthcheck', 'arm-two'): 1},
+        writes={
+            ('healthcheck', 'arm-one'): _one_row_report('arm-one').model_dump_json(),
+            ('healthcheck', 'arm-two'): _failed_part('arm-two').model_dump_json(),
+        },
+    )
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert _merged_parts(runner) == [
+        str(parts_dir / 'arm-one.json'), str(parts_dir / 'arm-two.json'),
+    ]
 
 
 # ---------------------------------------------------------------------------
