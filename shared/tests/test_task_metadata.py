@@ -2407,6 +2407,70 @@ class TestParseMetadataFailurePolicy:
         assert model.model_dump()['related_tasks'] == ['1', '2']
 
     @pytest.mark.parametrize(
+        'value', [['1', '2'], 'task-1'], ids=['list_value', 'bare_str_value']
+    )
+    def test_related_tasks_accepts_heterogeneous_values_on_write(self, value):
+        """`related_tasks` must stay untyped: BOTH corpus value shapes survive a
+        strict write (task 4303).
+
+        THIS IS THE ASSERTION THE BLESS-NOT-TYPE RULING RESTS ON. §8's
+        "Promoting a convention" fork offers two ways to stop a key warning:
+        bless it into `_BLESSED_METADATA_KEYS`, or promote it to a typed
+        `TaskMetadata` field. Task 4303 chose bless, and the whole reason was a
+        measurement about VALUES, not about readers: of the 469 corpus carriers,
+        432 hold a list and 37 hold a BARE STR. A typed `list[str]` field would
+        raise on every metadata write to those 37 under
+        ``direction='write', enforce=True`` — permanently, because most are
+        terminal and unrepairable under the presence-only write-authority floor
+        that also blocks a retire sweep (326 of 469 carry `done_provenance`).
+
+        Without this leg that ruling is defended by PROSE ALONE. The blessing
+        test above exercises only ``direction='read'`` with a list, so a later
+        change that added ``related_tasks: list[str]`` to the model would land
+        GREEN across the whole file while silently breaking writes for the
+        bare-str carriers — the identical argument that decided `execution_class`
+        (task 3780), which is why it is pinned here rather than restated.
+
+        Two properties, and both matter:
+        - NEITHER SHAPE RAISES under the strictest setting the parser has.
+          `enforce=True` is what turns a warning into an exception, so this is
+          the mode a typed field would fail in.
+        - NEITHER SHAPE IS COERCED. Blessing suppresses the census LINE only; the
+          value stays an ``extra='allow'`` passenger, round-tripped verbatim. A
+          field that quietly wrapped ``'task-1'`` into ``['task-1']`` would keep
+          this test from raising while still rewriting 37 records' data.
+
+        Parametrized so a regression names WHICH shape broke: the bare-str leg
+        is the load-bearing one (a `list[str]` field passes the list leg).
+
+        MEASURED, NOT PREDICTED — this test is born GREEN (task 4303 blessed
+        rather than typed, so nothing raises today), which proves only that it
+        RUNS. It was therefore falsified by hand against the change it exists to
+        stop: adding ``related_tasks: list[str] | None = None`` to
+        :class:`TaskMetadata` failed exactly ONE case,
+        ``...on_write[bare_str_value]``, with
+        ``ValidationError: Input should be a valid list [input_value='task-1']``,
+        while ``[list_value]`` and the other five related_tasks cases stayed
+        green. That is precisely the asymmetry the parametrization is for, and it
+        confirms the 37 bare-str carriers would have become unwritable. The
+        typed field was not committed.
+        """
+        model, warnings = parse_metadata(
+            {'related_tasks': value}, direction='write', enforce=True
+        )
+
+        assert warnings == [], (
+            f'a strict write of related_tasks={value!r} must be silent — it is the '
+            f'canonical Tier-B spelling and Tier-A blessed; got: {warnings}'
+        )
+        assert model.model_dump()['related_tasks'] == value, (
+            f'related_tasks={value!r} was coerced on write. It is deliberately NOT a '
+            f'typed field: 37 of 469 corpus carriers hold a bare str, so any typing '
+            f'that normalises or rejects a non-list rewrites or breaks those records '
+            f'(task 4303, the bless-not-type ruling)'
+        )
+
+    @pytest.mark.parametrize(
         'alias', ['related_task', 'related_df_tasks', 'related_task_examples']
     )
     def test_related_tasks_aliases_still_warn(self, alias):

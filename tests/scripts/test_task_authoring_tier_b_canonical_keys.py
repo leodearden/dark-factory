@@ -131,6 +131,12 @@ def _table_rows(markdown_text):
     # Drop the header row (`| Canonical | Aliases to avoid |`) — it carries no
     # backticked names, so it contributes nothing, but dropping it explicitly
     # keeps the row count honest for the more-keys-than-rows assertion below.
+    #
+    # This filter matches a backtick ANYWHERE in the row, deliberately: it is a
+    # header discriminator, not the strictness. A row whose Aliases cell has
+    # backticks but whose Canonical cell does not survives here ON PURPOSE, so
+    # that `_canonical_keys` can reject it BY NAME rather than have it vanish
+    # into an unexplained row/key count mismatch.
     rows = [row for row in rows if _BACKTICKED.search(row)]
 
     assert rows, (
@@ -161,7 +167,25 @@ def _canonical_keys(markdown_text):
         # which is asserted as parser behaviour in
         # shared/tests/test_task_metadata.py, not here).
         cells = row.strip("|").split("|")
-        names.extend(_BACKTICKED.findall(cells[0]))
+        in_row = _BACKTICKED.findall(cells[0])
+        assert in_row, (
+            f"Tier-B row {row!r} in docs/task-authoring.md names no backticked "
+            f"canonical key — write the canonical spelling in backticks or this "
+            f"row is unpinned (task 4303).\n"
+            f"How this row got here: `_table_rows` keeps any row with a backtick "
+            f"ANYWHERE in it, so a row whose Aliases cell is backticked but whose "
+            f"Canonical cell is bare prose passes the row filter, contributes zero "
+            f"names, and would sail through the membership assertion below having "
+            f"pinned NOTHING — the same silent-under-coverage failure as the "
+            f"' + '-joined cell that `test_canonical_cell_with_two_keys_yields_both` "
+            f"guards against, and the exact failure mode this whole file exists to "
+            f"prevent.\n"
+            f"Remedy: backtick the canonical spelling in the first cell. If the row "
+            f"genuinely nominates no canonical key, it does not belong inside the "
+            f"{MARKER_BEGIN!r} span — move it below {MARKER_END!r} with the other "
+            f"deliberately-unpinned prose."
+        )
+        names.extend(in_row)
     return names
 
 
@@ -211,6 +235,17 @@ _INVERTED_MARKER_DOC = """\
 <!-- /tier-b-canonical-keys -->
 | `alpha` | `alfa` |
 <!-- tier-b-canonical-keys -->
+"""
+
+_BARE_CANONICAL_CELL_DOC = """\
+<!-- tier-b-canonical-keys -->
+
+| Canonical | Aliases to avoid |
+|---|---|
+| `alpha` | `alfa` |
+| the delta family | `dleta`, `delt` |
+
+<!-- /tier-b-canonical-keys -->
 """
 
 _EMPTY_TABLE_DOC = """\
@@ -273,6 +308,51 @@ def test_canonical_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
     """
     with pytest.raises(AssertionError):
         _canonical_keys(markdown_text)
+
+
+def test_canonical_keys_fails_loudly_on_a_row_naming_no_canonical_key():
+    """A row that survives the filter but yields NO canonical name must raise.
+
+    NOT a broken-marker case, which is why it is a sibling test rather than a
+    sixth parametrization above: the markers are intact, the span is populated,
+    and the extractor returns a perfectly plausible non-empty list. That is what
+    makes this the nastier failure of the two — the guard stays GREEN while one
+    Tier-B row is silently unpinned.
+
+    THE MECHANISM. ``_table_rows`` keeps a row if a backtick appears ANYWHERE in
+    it, but ``_canonical_keys`` reads names out of ``cells[0]`` only. A row whose
+    Aliases cell is backticked (as every Tier-B row's is) but whose Canonical
+    cell is written as bare prose therefore passes the filter, contributes zero
+    names, and never reaches ``_BLESSED_METADATA_KEYS`` — so §8 could nominate a
+    canonical spelling that is not blessed, this file's entire reason for
+    existing, and nothing would fail.
+
+    Same SHAPE as the ``' + '``-joined cell pinned by
+    ``test_canonical_cell_with_two_keys_yields_both``: a parsing detail that
+    quietly narrows coverage instead of erroring. That one loses one key of two;
+    this one loses a whole row.
+
+    ``_BARE_CANONICAL_CELL_DOC`` is deliberately MIXED — a well-formed ``alpha``
+    row plus the bare ``the delta family`` row — so the test cannot pass merely
+    because the span is empty; it must reject a row even while other rows parse.
+
+    MEASURED AGAINST THE LIVE DOCUMENT, not only the synthetic one, and measured
+    on BOTH sides of the fix. Rewriting the real ``| `invariants` | `inv` |`` row
+    as ``| the invariants key | `inv` |``:
+
+    - against the version of this file at commit ``631f88d940`` (before the
+      per-row assertion existed): **11 passed** — the `invariants` row simply
+      stopped contributing a name, ``set(documented) - _BLESSED_METADATA_KEYS``
+      only got smaller, and the suite reported success while §8's canonical
+      column had gone unpinned. That is the reviewer's gap, reproduced.
+    - against this version: **3 failed** — this test's message names the
+      offending row verbatim.
+
+    Neither edit was committed. So the assertion catches the real defect on the
+    real artifact, not merely its own fixture.
+    """
+    with pytest.raises(AssertionError, match="names no backticked canonical key"):
+        _canonical_keys(_BARE_CANONICAL_CELL_DOC)
 
 
 # --------------------------------------------------------------------------

@@ -190,6 +190,31 @@ extending that guard to the surrounding prose. Non-vacuity was measured by
 hand, since its own RED was scaffolding-shaped: removing `'related_tasks'` from
 the frozenset makes it fail naming the key.
 
+**Two coverage holes in that guard were then closed, both falsified by hand.**
+(1) The row filter keeps any row with a backtick *anywhere* in it, but names are
+read out of the first cell only — so a row whose Canonical cell was written as
+bare prose passed the filter, contributed zero names and was **silently
+unpinned**. Measured on the live document: rewriting the real ``| `invariants` |
+`inv` |`` row as `| the invariants key | `inv` |` left the guard reporting
+**11 passed**; with the new per-row assertion the same edit fails **3 tests**
+naming the offending row. That is the identical silent-narrowing shape as the
+`` ` + ` ``-joined cell the file already guards against — one loses a key, this
+lost a whole row. (2) The parser suite exercised only `direction='read'` with a
+list value, so the **bless-not-type** ruling — which rests entirely on 37 corpus
+carriers holding a bare `str` — was defended by prose alone. A parametrized
+write leg now pins both shapes under `direction='write', enforce=True`, asserting
+neither raises *and* neither is coerced. Falsified by adding
+`related_tasks: list[str]` to `TaskMetadata`: exactly one case failed,
+`[bare_str_value]`, with `Input should be a valid list [input_value='task-1']`,
+while `[list_value]` stayed green. Neither mutation was committed.
+
+**Deliberately deferred:** the marker-span extraction (`begin`/`end` counting,
+inversion check, slice) is now duplicated between this guard and
+`tests/scripts/test_task_authoring_blessed_keys_drift.py`. Extracting it to a
+shared helper is only worth doing if *both* callers migrate, and the task-3780
+guard is outside this task's lock set, so it is filed as follow-up rather than
+half-done here.
+
 The frozenset header comment's `related_task*` **wildcard** is narrowed to the
 three literal aliases. It went false the moment the key was blessed, and was
 independently hazardous: the glob sweeps in `related_task_ids`, a different key
