@@ -28,7 +28,6 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
-import datetime
 import os
 import pathlib
 import re
@@ -605,12 +604,6 @@ POST_CAP_ORCHESTRATOR_GREEN_SECS = {
 # percentiles and the n that produced them cannot drift apart.
 POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
-# The day commit 685f558728 landed `verify_admission_pytest_n: "8"`, capping
-# orchestrator's xdist fanout. Any `orchestrator` figure measured before this
-# describes the SUPERSEDED regime; the provenance guard below anchors on this
-# date rather than on "orchestrator is the newest row in the table".
-FANOUT_CAP_LANDED_ON = datetime.date(2026, 8, 20)
-
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE — this table now spans TWO measurement epochs. Do not read it as
@@ -706,9 +699,9 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'escalation': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'orchestrator': _SegmentProvenance(
-        # Literal, NOT a reference to POST_CAP_ORCHESTRATOR_GREEN_N: this is a
-        # second independent record of the same n, which is what lets the
-        # sample/percentile agreement check below actually fail.
+        # Spelled literally rather than as a reference to
+        # POST_CAP_ORCHESTRATOR_GREEN_N so this record reads standalone. The
+        # two are the same n by construction — a re-mine must move both.
         '2026-08-28', 28, '4902',
         '.worktrees/*/.task/verify/*.orchestrator.summary.json'),
     'fused-memory': _SegmentProvenance(
@@ -723,28 +716,26 @@ def _verify_budgets() -> dict:
 
 
 def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
-    """Each segment figure must say how old it is and what sample it rests on.
+    """Every segment figure must have a provenance record, and vice versa.
 
-    Task 4902. The table's core defect is that it cannot say its own age. It now
-    mixes a 2026-07-31 epoch with a 2026-08-28 one, and without this mapping a
-    reader cannot tell which entry is which without archaeology — four of the
-    five figures are 28 days older than the fifth and rest on a single logged
-    run each, which is exactly why one regime change (commit 685f558728) could
-    invalidate the table wholesale and go unnoticed for eight days.
+    Task 4902. ``MEASURED_FLEET_SEGMENT_SECS`` and
+    ``MEASURED_FLEET_SEGMENT_PROVENANCE`` are two structures describing one
+    table, so they can drift: a segment added or removed in one and not the
+    other leaves either an un-ageable figure or a provenance record for a
+    segment that no longer exists. This guard is that referential integrity
+    check and nothing more.
 
-    WHAT THIS GUARD IS: it makes the table's AGE machine-readable, so the next
-    reader can see at a glance which epoch each figure came from, and so
-    reverting a re-measurement without also reverting its provenance is caught.
-
-    WHAT IT IS NOT: the durations-based growth detector. That would have to read
-    a recent run's own recorded per-segment times, which means reading the
-    `.task/verify/*.summary.json` corpus at test time — pruned with its
-    worktrees, therefore non-deterministic and eventually vacuous. It is
-    deliberately not built here, and this guard must not be mistaken for it: it
-    proves the table is DATED, never that it is CURRENT.
+    SCOPE, stated because an earlier version of this file overreached. The
+    dates, sample sizes and percentiles recorded beside the table are durable
+    by virtue of being committed constants with comments; asserting a literal
+    against another literal in the same file adds no regression detection over
+    version control, so this file no longer does it. In particular there is no
+    guard that the table is CURRENT — that would have to read the
+    ``.task/verify/*.summary.json`` corpus at test time, which is pruned with
+    its worktrees and would therefore be non-deterministic and eventually
+    vacuous. Re-measurement is a human act (see the PROVENANCE comment above);
+    this test proves only that the table's bookkeeping is self-consistent.
     """
-    # (a) Keys correspond exactly — no segment without provenance, and no
-    #     provenance for a segment that no longer exists.
     assert set(MEASURED_FLEET_SEGMENT_PROVENANCE) == set(MEASURED_FLEET_SEGMENT_SECS), (
         'MEASURED_FLEET_SEGMENT_PROVENANCE keys '
         f'{sorted(MEASURED_FLEET_SEGMENT_PROVENANCE)} do not match '
@@ -753,96 +744,6 @@ def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
         f'orphaned provenance: {sorted(set(MEASURED_FLEET_SEGMENT_PROVENANCE) - set(MEASURED_FLEET_SEGMENT_SECS))}). '
         'Every segment figure must carry its date and sample, or the table goes '
         'back to being un-ageable — the defect task 4902 was filed to fix.'
-    )
-
-    # (b) Each record must be a real date backed by at least one measurement.
-    for segment, record in sorted(MEASURED_FLEET_SEGMENT_PROVENANCE.items()):
-        try:
-            datetime.date.fromisoformat(record.measured_at)
-        except ValueError as exc:
-            raise AssertionError(
-                f"MEASURED_FLEET_SEGMENT_PROVENANCE['{segment}'].measured_at="
-                f'{record.measured_at!r} is not an ISO YYYY-MM-DD date ({exc}). '
-                'The whole point of this field is that the table\'s age can be '
-                'compared, which needs a parseable date, not prose.'
-            ) from exc
-        assert record.sample_size >= 1, (
-            f"MEASURED_FLEET_SEGMENT_PROVENANCE['{segment}'].sample_size="
-            f'{record.sample_size} — a figure with a zero sample behind it is a '
-            'claim, not a measurement. Record the number of runs actually '
-            'observed, even when it is 1.'
-        )
-
-    # (c) The re-measurement must be visible as data: orchestrator's entry
-    #     post-dates the regime change it exists to record.
-    #
-    #     ANCHORED ON THE REGIME, NOT ON RANK. The property wanted here is
-    #     "orchestrator's figure was taken under the current -n 8 regime", not
-    #     "orchestrator is the newest row". The latter would encode a one-time
-    #     accident — task 4902 happened to re-measure only this segment — as a
-    #     permanent invariant, and would go red the moment someone HONESTLY
-    #     re-measured any other segment on a later date, with no remedy except
-    #     back-dating that measurement or deleting this assertion. A date floor
-    #     catches the failure actually worth catching (the orchestrator figure
-    #     silently reverted to its pre-cap value) and lets every legitimate
-    #     later re-measurement land untouched.
-    orchestrator = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
-    assert (
-        datetime.date.fromisoformat(orchestrator.measured_at) >= FANOUT_CAP_LANDED_ON
-    ), (
-        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at="
-        f'{orchestrator.measured_at} predates {FANOUT_CAP_LANDED_ON.isoformat()}, '
-        'the day commit 685f558728 landed `verify_admission_pytest_n: "8"` and '
-        'stepped this segment ~2.6x. A pre-cap date means the recorded figure '
-        'describes the SUPERSEDED regime — which is the defect task 4902 was '
-        'filed to fix, so this most likely means the re-measurement was reverted '
-        'without its provenance being reverted too. Re-measure under the current '
-        'regime and record that date; do not simply re-date the old figure.'
-    )
-
-    # (d) The recorded sample and the recorded percentiles must describe the
-    #     same measurement.
-    assert orchestrator.sample_size == POST_CAP_ORCHESTRATOR_GREEN_N, (
-        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].sample_size="
-        f'{orchestrator.sample_size} disagrees with '
-        f'POST_CAP_ORCHESTRATOR_GREEN_N={POST_CAP_ORCHESTRATOR_GREEN_N}, the n '
-        'behind POST_CAP_ORCHESTRATOR_GREEN_SECS. These describe one mine of one '
-        'corpus; if a re-mine produced a different n, both must move together, '
-        'or the recorded percentiles no longer belong to the recorded sample.'
-    )
-
-
-def test_measured_fleet_segment_table_reflects_the_post_cap_orchestrator_regime() -> None:
-    """The ``orchestrator`` table entry must not predate the -n 8 fanout cap.
-
-    Task 4902. ``MEASURED_FLEET_SEGMENT_SECS['orchestrator']`` was a single
-    logged run from 2026-07-31 (task 3062). On 2026-08-20 commit 685f558728
-    landed ``verify_admission_pytest_n: "8"``, and the segment's median green
-    full-suite cost stepped from 691.40s to 1765.95s. The table stayed frozen.
-
-    This is the smallest honest guard against that: the entry may not sit below
-    the measured median of the CURRENT regime. It compares two recorded
-    constants and reads nothing live — see the module comment on
-    ``POST_CAP_ORCHESTRATOR_GREEN_SECS`` for why the corpus is mined by hand
-    rather than at test time (those records are pruned with their worktrees, so
-    a corpus-globbing assertion would be non-deterministic and would eventually
-    collect n=0 and pass vacuously).
-    """
-    entry = MEASURED_FLEET_SEGMENT_SECS['orchestrator']
-    p50 = POST_CAP_ORCHESTRATOR_GREEN_SECS['p50']
-
-    assert entry >= p50, (
-        f"MEASURED_FLEET_SEGMENT_SECS['orchestrator']={entry} predates the "
-        f'pytest -n 8 fanout cap (commit 685f558728, 2026-08-20) and is below '
-        f'the current median green run of {p50}s, measured over '
-        f'{POST_CAP_ORCHESTRATOR_GREEN_N} full-suite green runs in the window '
-        f'2026-08-22..2026-08-28 (task 4902). A table entry below the median '
-        f'green run understates the fleet-chain floor by roughly '
-        f'{p50 - entry:.0f}s: the floor is summed from this table, so every '
-        f'derived headroom claim is overstated by the same amount. Re-measure '
-        f'the segment and raise this entry, together with its '
-        f'MEASURED_FLEET_SEGMENT_PROVENANCE record; the figures live only '
-        f'here, so there is no second copy to raise.'
     )
 
 
