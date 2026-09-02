@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+import yaml
 
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
@@ -2147,4 +2148,106 @@ class TestPyrightScopeParity:
             "narrowing the root config — removing `scripts` from root would "
             "achieve parity by deleting all type checking of this module "
             f"instead; resolved: {[str(p) for p in resolved]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_eval_env: the eval account roster
+# ---------------------------------------------------------------------------
+
+
+_SHARED_POOL_YAML = """\
+accounts:
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-g
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_G
+"""
+
+
+class TestBuildEvalEnvSharedPool:
+    """``build_eval_env`` must roster the SHARED fleet pool, unmodified.
+
+    Task 4945, discharging the follow-up filed from the 2026-08-30 ruling
+    (task 4741). Account A is Leo's INTERACTIVE account, not an eval
+    reserve: his own sessions exhaust its weekly cap most weeks, so it
+    cannot double as a private eval reserve. Evals have no dedicated
+    account — they draw on the same pool as the rest of the fleet and
+    tolerate cap/429 events via ``invoke_with_cap_retry``'s 48h patience
+    (``orchestrator.evals.runner``) instead.
+
+    The ``USAGE_ACCOUNTS_FILE`` override itself is NOT the defect and is
+    deliberately kept (see the plan's design decision): it is the
+    established cross-project seam for "which roster does this run use",
+    read by ``shared.config_models.UsageCapConfig`` and by reify's own
+    orchestrator config. What is retired is APPENDING max-a to the roster
+    it points at.
+    """
+
+    @staticmethod
+    def _fake_project_root(monkeypatch, tmp_path: Path) -> Path:
+        """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``."""
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
+        # Exercise the dotenv branch — it overwrites os.environ values into
+        # the returned dict, so the fixture must control it to keep the
+        # token assertions deterministic.
+        (tmp_path / ".env").write_text("CLAUDE_OAUTH_TOKEN_G=pool-token-from-dotenv\n")
+        monkeypatch.setattr(launcher, "PROJECT_ROOT", tmp_path)
+        return tmp_path
+
+    def test_usage_accounts_file_points_at_the_shared_config(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        shared = root / "config" / "usage-accounts.yaml"
+        assert env["USAGE_ACCOUNTS_FILE"] == str(shared), (
+            "build_eval_env must point USAGE_ACCOUNTS_FILE at the repo's own "
+            "shared config/usage-accounts.yaml, not at a generated tempfile "
+            f"(got {env['USAGE_ACCOUNTS_FILE']!r}). Task 4945: the temp-file "
+            "generator existed only to append account A to the roster, which "
+            "the 2026-08-30 ruling retires."
+        )
+
+    def test_roster_contains_no_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+        rostered = yaml.safe_load(
+            Path(env["USAGE_ACCOUNTS_FILE"]).read_text()
+        )["accounts"]
+
+        assert [a.get("name") for a in rostered] == ["max-b", "max-g"], (
+            "the eval roster must be the shared pool verbatim; got "
+            f"{[a.get('name') for a in rostered]!r}"
+        )
+        assert not any(a.get("name") == "max-a" for a in rostered), (
+            "account max-a is reserved for INTERACTIVE use and must never be "
+            f"rostered for an eval run (ruling 2026-08-30, task 4741): {rostered!r}"
+        )
+        assert not any(
+            a.get("oauth_token_env") == "CLAUDE_OAUTH_TOKEN_A" for a in rostered
+        ), (
+            "no eval-rostered account may reference the interactive account's "
+            f"token env var CLAUDE_OAUTH_TOKEN_A: {rostered!r}"
+        )
+
+    def test_shared_roster_file_is_passed_through_byte_identical(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        assert Path(env["USAGE_ACCOUNTS_FILE"]).read_bytes() == (
+            root / "config" / "usage-accounts.yaml"
+        ).read_bytes(), (
+            "the launcher must not rewrite, reorder or append to the shared "
+            "roster — pointing at it is the whole mechanism. Order matters: "
+            "UsageGate tries accounts in list order during failover."
         )
