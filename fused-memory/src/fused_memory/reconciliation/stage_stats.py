@@ -200,11 +200,26 @@ def _count_add_memory(op: dict) -> bool:
     are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
     An op that reached neither store with a returned ID is a no-op here.
 
+    Deliberately does NOT gate on ``write_ops.success``, for the same per-leg
+    reason ``_landed`` is not applied to this branch. On this row ``success`` is
+    ``not (_graphiti_error or _mem0_error)`` — an AND across BOTH legs of
+    ``services/memory_service.py::MemoryService.add_memory``, which mints one
+    ``write_op_id`` for a queued Graphiti leg and a synchronous Mem0 leg and
+    journals a single Layer-1 row under it. So ``success`` is a per-leg fact
+    wearing a per-op mask: a raised ``durable_queue.enqueue`` zeroes it on the
+    very row that also carries Mem0's returned ``memory_ids``.
+
+    A non-empty ``memory_ids`` is standalone proof the SYNCHRONOUS Mem0 write
+    persisted — the list starts empty and is extended only after ``mem0.add``
+    returns, and the queue worker has no path back to the caller for
+    server-assigned ids. Dropping the gate therefore cannot over-count: the
+    evidence exists only where the leg being counted succeeded, so ``success``
+    could only ever have suppressed a true positive. A both-legs-failed row has
+    no ids and is still rejected on the evidence alone.
+
     Answers only "what SHAPE of write was this". Whether the write LANDED is
     the orthogonal ``_landed`` gate, applied by the caller.
     """
-    if not op.get('success', 1):
-        return False
     rs = _parse_result_summary(op.get('result_summary'))
     memory_ids = rs.get('memory_ids')
     return bool(isinstance(memory_ids, list) and memory_ids)
