@@ -1142,6 +1142,19 @@ class EventBuffer:
         they are not returned, so they are not rolled up — they simply roll up
         on the later sweep that does delete them.
 
+        This "never both and never neither" guarantee, and the atomicity a
+        mid-sweep fault rolls back to, both assume no *other* ``_txn()``
+        commit lands on the shared connection while this sweep is in
+        flight — ``_txn()`` takes no lock of its own, and ``EventBuffer``'s
+        one aiosqlite connection is shared with the harness's concurrently
+        running per-project tasks, which commit their own ``push``/``drain``
+        transactions independently.  That assumption pre-dates this method,
+        but draining the RETURNING cursor via chunked ``fetchmany`` (below)
+        widens the window it must hold across: the fold now suspends once per
+        chunk (~101 times at N=1,000,000) rather than once after a single
+        ``fetchall()``.  Documented here as an assumption, not claimed as an
+        unconditional invariant.
+
         A row whose timestamp cannot be parsed is still DELETED; it is only
         left out of the rollup, with a structured warning naming it.  Bucketing
         raises ``ValueError`` on a malformed timestamp and this transaction is
