@@ -31,13 +31,17 @@ Covers here (steps 1/3/5 of the plan):
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     ORPHANED_ESCALATION_FLAG_CATEGORY,
@@ -50,6 +54,8 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     select_reapable_escalations,
     sweep_orphaned_recon_escalations,
 )
+from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
 GATE_BACKLOG = 'reconciliation_stale_gate_backlog'
 HUMAN_OPERATOR = 'reconciliation_stale_human_operator'
@@ -951,3 +957,184 @@ class TestSweepOrphanedReconEscalations:
         await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
 
         queue.resolve.assert_not_called()
+
+
+_STAT_KEYS = (
+    'orphaned_recon_escalations_scanned',
+    'orphaned_recon_escalations_terminal',
+    'orphaned_recon_escalations_missing',
+    'orphaned_recon_escalations_live',
+    'orphaned_recon_escalations_unresolvable',
+    'orphaned_recon_escalations_errors',
+    'orphaned_recon_escalations_flags_emitted',
+)
+
+
+def _make_consolidator(*, escalation_queue, taskmaster):
+    """Build a ``MemoryConsolidator`` wired for the sweep (mirrors test_stage1.py)."""
+    memory_mock = AsyncMock()
+    memory_mock.get_episodes = AsyncMock(return_value=[])
+    memory_mock.mem0 = AsyncMock()
+    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
+    memory_mock.get_status = AsyncMock(return_value={})
+
+    stage = MemoryConsolidator(
+        StageId.memory_consolidator,
+        memory_mock,
+        taskmaster,
+        AsyncMock(),  # journal
+        ReconciliationConfig(),
+        scope=ProjectScope(ProjectId('dark_factory'), ProjectRoot(DARK_ROOT)),
+        known_projects=dict(KNOWN_PROJECTS),
+    )
+    stage.episode_limit = 5
+    stage.memory_limit = 10
+    stage._escalation_queue = escalation_queue
+    return stage
+
+
+async def _run_stage(stage, *, base_flags=None, dedup_mock=None):
+    """Drive ``stage.run()`` with ``BaseStage.run``/``dedup_flags`` patched out."""
+    base_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=list(base_flags or []),
+        stats={},
+    )
+    if dedup_mock is None:
+        dedup_mock = AsyncMock(side_effect=lambda **kw: list(kw['flags']))
+    with (
+        patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+        patch(
+            'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+            new=dedup_mock,
+        ),
+    ):
+        report = await stage.run(
+            events=[],
+            watermark=Watermark(project_id='dark_factory'),
+            prior_reports=[],
+            run_id='run-3052',
+        )
+    return report, dedup_mock
+
+
+class TestMemoryConsolidatorOrphanedEscalationWiring:
+    """``MemoryConsolidator.run()`` must surface the sweep's flags and stats.
+
+    The seven stats are always present so a reader never needs a
+    ``.get(..., 0)`` fallback, and can tell a degraded cycle (``errors > 0``)
+    apart from a clean cycle that found nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_terminal_subject_flag_and_stats_reach_the_report(self):
+        """A full cycle appends the flag and publishes all seven counts."""
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
+
+        report, _ = await _run_stage(stage)
+
+        flags = [
+            f for f in report.items_flagged
+            if f.get('flag_type') == ORPHANED_ESCALATION_FLAG_TYPE
+        ]
+        assert len(flags) == 1
+        assert flags[0]['task_id'] == '650'
+        assert report.stats['orphaned_recon_escalations_scanned'] == 1
+        assert report.stats['orphaned_recon_escalations_terminal'] == 1
+        assert report.stats['orphaned_recon_escalations_missing'] == 0
+        assert report.stats['orphaned_recon_escalations_live'] == 0
+        assert report.stats['orphaned_recon_escalations_unresolvable'] == 0
+        assert report.stats['orphaned_recon_escalations_errors'] == 0
+        assert report.stats['orphaned_recon_escalations_flags_emitted'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_without_an_escalation_queue(self):
+        """No queue means no sweep — but the stat keys still exist and read 0."""
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+        stage = _make_consolidator(escalation_queue=None, taskmaster=taskmaster)
+
+        report, _ = await _run_stage(stage)
+
+        for key in _STAT_KEYS:
+            assert report.stats[key] == 0, f'{key} must be present and 0'
+        taskmaster.list_tags.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_without_a_taskmaster(self):
+        """No status oracle means no classification — same always-present contract."""
+        queue = make_queue([make_escalation(task_id='650')])
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=None)
+
+        report, _ = await _run_stage(stage)
+
+        for key in _STAT_KEYS:
+            assert report.stats[key] == 0, f'{key} must be present and 0'
+
+    @pytest.mark.asyncio
+    async def test_a_raising_sweep_is_swallowed_and_leaves_stats_at_zero(self):
+        """A whole-sweep failure must never abort the stage or half-mutate flags."""
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
+        pre_existing = {
+            'task_id': '100', 'flag_type': 'missing_deliverable',
+            'description': 'unrelated', 'category': 'other', 'severity': 'minor',
+        }
+
+        with patch(
+            'fused_memory.reconciliation.stages.memory_consolidator.'
+            'sweep_orphaned_recon_escalations',
+            new=AsyncMock(side_effect=RuntimeError('sweep exploded')),
+        ):
+            report, _ = await _run_stage(stage, base_flags=[pre_existing])
+
+        assert report.items_flagged == [pre_existing], (
+            'items_flagged must not be partially mutated by a failed sweep'
+        )
+        for key in _STAT_KEYS:
+            assert report.stats[key] == 0, f'{key} must stay 0 on a failed sweep'
+
+    @pytest.mark.asyncio
+    async def test_sweep_does_not_run_on_a_remediation_pass(self):
+        """Full cycles only — the same gate the curator-gate sweep uses.
+
+        A remediation pass re-enters ``run()`` to act on findings already
+        made; re-sweeping there would re-emit the same orphan flags mid-pass.
+        """
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
+        stage.remediation_findings = [{'description': 'fix something'}]
+
+        report, _ = await _run_stage(stage)
+
+        queue.get_pending.assert_not_called()
+        for key in _STAT_KEYS:
+            assert report.stats[key] == 0, (
+                f'{key} must be present and 0 on a remediation pass'
+            )
+
+    @pytest.mark.asyncio
+    async def test_flags_are_appended_above_dedup_flags(self):
+        """The flag reaches ``dedup_flags``, so it earns a ``stage1_flag_marker`` row.
+
+        Asserted behaviourally rather than by reading source order: appending
+        BELOW dedup would bypass dedup entirely, so the orphan would re-emit
+        unmarked every cycle with no recurrence history and no way for an
+        operator to suppress it.
+        """
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+        stage = _make_consolidator(escalation_queue=queue, taskmaster=taskmaster)
+
+        _, dedup_mock = await _run_stage(stage)
+
+        dedup_mock.assert_awaited_once()
+        seen = dedup_mock.await_args.kwargs['flags']
+        assert any(
+            f.get('flag_type') == ORPHANED_ESCALATION_FLAG_TYPE for f in seen
+        ), 'the sweep flag must be present in the list handed to dedup_flags'
