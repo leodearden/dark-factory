@@ -502,3 +502,279 @@ class TestEnsureEntityNodeToolGate:
 
         assert result.get('error_type') == 'EntityMintNonTaskName', result
         mock_service.ensure_entity_node.assert_not_called()
+
+
+class TestMintNameTaskVerification:
+    """Guard 4: the referent must name a task the live registry actually has.
+
+    The THREE-VALUED distinction this needs is exactly what
+    ``_claim_task_statuses`` cannot express — its documented contract is "an
+    ABSENT key is the unresolvable signal", so "no such task" and "could not
+    consult" collapse to the same absence. Guard 4 must refuse on the former
+    ONLY: refusing on the latter would make the tool unusable on any deployment
+    without the registry.
+    """
+
+    @staticmethod
+    def _server(mock_service, *, statuses=None, raises=False,
+                known_projects=None, task_interceptor=True):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fused_memory.server.tools import create_mcp_server
+
+        interceptor = None
+        if task_interceptor:
+            interceptor = MagicMock()
+            interceptor.get_statuses = AsyncMock(
+                side_effect=RuntimeError('taskmaster down') if raises else None,
+                return_value=None if raises else (statuses or {}),
+            )
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=known_projects if known_projects is not None
+            else {'dark_factory': '/tmp/df', 'reify': '/tmp/reify'},
+        )
+        return server, interceptor
+
+    @pytest.mark.asyncio
+    async def test_a_task_the_registry_has_dispatches(self):
+        """POSITIVE PRESENT."""
+        mock_service = _mock_service()
+        server, interceptor = self._server(
+            mock_service, statuses={'3222': 'done'},
+        )
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+        interceptor.get_statuses.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_successfully_consulted_registry_that_lacks_the_task_refuses(self):
+        """POSITIVE ABSENT — the registry ANSWERED, and the answer was 'no'.
+
+        This is the leg that distinguishes guard 4 from a probe that only
+        tolerates failure: a consulted-and-empty read is a real "no such task",
+        and minting a node for a task that does not exist is exactly the junk
+        node this gate exists to prevent.
+        """
+        mock_service = _mock_service()
+        server, interceptor = self._server(mock_service, statuses={})
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') == 'EntityMintUnknownTask', result
+        assert '3222' in (result.get('error') or ''), result
+        mock_service.ensure_entity_node.assert_not_called()
+        interceptor.get_statuses.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_dict_lacking_the_id_also_refuses(self):
+        """A batched read that answered about OTHER ids still answered 'no' here."""
+        mock_service = _mock_service()
+        server, _interceptor = self._server(
+            mock_service, statuses={'9999': 'done'},
+        )
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') == 'EntityMintUnknownTask', result
+        mock_service.ensure_entity_node.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_taskmaster_does_not_refuse(self):
+        """UNRESOLVABLE (1) — the tool must not require the registry to exist."""
+        mock_service = _mock_service()
+        server, _interceptor = self._server(mock_service, task_interceptor=False)
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_referent_project_does_not_refuse(self):
+        """UNRESOLVABLE (2) — no root for the referent's project, so no answer.
+
+        Note the WRITING project stays registered (`_known_project_gate` already
+        passed on it); it is the foreign qualifier that has no root.
+        """
+        mock_service = _mock_service()
+        server, interceptor = self._server(
+            mock_service, statuses={}, known_projects={'dark_factory': '/tmp/df'},
+        )
+
+        result = await _call_on(
+            server, name='reify:132', agent_id='curator-repair',
+        )
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+        interceptor.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_status_read_does_not_refuse(self):
+        """UNRESOLVABLE (3) — a registry outage must not become a mint refusal."""
+        mock_service = _mock_service()
+        server, _interceptor = self._server(mock_service, raises=True)
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_referent_probes_its_own_project_root(self):
+        """CROSS-PROJECT ROUTING — the claimed project adjudicates, not the writer.
+
+        Reading the writer's tree for 'does reify task 132 exist' answers a
+        question nobody asked, confidently and with the wrong tree — the same
+        esc-3085-1 mistake `_group_refs_by_project` exists to avoid.
+        """
+        mock_service = _mock_service()
+        server, interceptor = self._server(
+            mock_service, statuses={'132': 'done'},
+        )
+
+        result = await _call_on(
+            server, name='reify:132', agent_id='curator-repair',
+        )
+
+        assert result.get('error_type') is None, result
+        interceptor.get_statuses.assert_awaited_once()
+        kwargs = interceptor.get_statuses.call_args.kwargs
+        assert kwargs.get('project_root') == '/tmp/reify', (
+            "the probe must target the REFERENT's project root, not the "
+            f'writing project\'s; got {kwargs!r}'
+        )
+        assert sorted(kwargs.get('ids') or []) == ['132'], kwargs
+
+    @pytest.mark.asyncio
+    async def test_verification_runs_after_authz_and_the_name_guards(self):
+        """An unauthorized caller is never worth a registry round trip."""
+        mock_service = _mock_service()
+        server, interceptor = self._server(mock_service, statuses={})
+
+        result = await _call_on(server, agent_id='claude-interactive')
+
+        assert result.get('error_type') == 'EntityMintNotAuthorized', result
+        interceptor.get_statuses.assert_not_awaited()
+
+
+class TestClaimTaskStatusesIsUnchanged:
+    """REGRESSION: extracting `_batched_task_statuses` must not move the
+    completion-claim gate.
+
+    `_claim_task_statuses` keeps byte-identical external behaviour by DISCARDING
+    the new `consulted` set. These legs re-pin its contract through the public
+    ingestion path; `tests/server/test_completion_claim_gate_ingestion.py` and
+    `tests/test_completion_claim_gate.py` cover it in full and must pass
+    UNMODIFIED.
+    """
+
+    @staticmethod
+    def _episode_server(*, statuses=None, raises=False, known_projects=None,
+                        task_interceptor=True):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fused_memory.server.tools import create_mcp_server
+
+        mock_service = AsyncMock()
+        ep_result = MagicMock()
+        ep_result.model_dump.return_value = {'id': 'ep'}
+        mock_service.add_episode.return_value = ep_result
+
+        interceptor = None
+        if task_interceptor:
+            interceptor = MagicMock()
+            interceptor.get_statuses = AsyncMock(
+                side_effect=RuntimeError('taskmaster down') if raises else None,
+                return_value=None if raises else (statuses or {}),
+            )
+            interceptor.get_ticket_row = AsyncMock(return_value=None)
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=known_projects if known_projects is not None
+            else {'dark_factory': '/df-root', 'reify': '/reify-root'},
+        )
+        return server, mock_service, interceptor
+
+    @pytest.fixture(autouse=True)
+    def _no_real_escalations(self, monkeypatch):
+        """A tagged ingestion files into `<project_root>/data/escalations`."""
+        import fused_memory.server.tools as tools_mod
+
+        monkeypatch.setattr(
+            tools_mod, 'emit_unverified_claim_escalation', lambda *a, **k: None,
+        )
+
+    @staticmethod
+    async def _ingest(server, content, project_id='reify'):
+        return await server._tool_manager.call_tool('add_episode', {
+            'content': content,
+            'agent_id': 'claude-task-5638-implementer',
+            'project_id': project_id,
+        })
+
+    @pytest.mark.asyncio
+    async def test_one_batched_read_per_claimed_project(self):
+        server, _svc, interceptor = self._episode_server(
+            statuses={'3142': 'in-progress', '5638': 'in-progress'},
+        )
+
+        await self._ingest(
+            server,
+            'dark_factory task 3142 has landed. reify task 5638 has landed',
+        )
+
+        reads = {
+            call.kwargs.get('project_root'): sorted(call.kwargs.get('ids') or [])
+            for call in interceptor.get_statuses.await_args_list
+        }
+        assert reads == {'/df-root': ['3142'], '/reify-root': ['5638']}, reads
+
+    @pytest.mark.asyncio
+    async def test_a_raising_read_still_leaves_the_key_absent(self):
+        """Absent, not fabricated — the claim lands UNVERIFIABLE and is tagged."""
+        server, mock_service, _interceptor = self._episode_server(raises=True)
+
+        await self._ingest(server, 'reify task 5638 has landed')
+
+        kwargs = mock_service.add_episode.call_args.kwargs
+        assert kwargs.get('unverified_claim') is True, (
+            f'a raising status read must tag, never pass; got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_interceptor_still_leaves_the_key_absent(self):
+        server, mock_service, _interceptor = self._episode_server(
+            task_interceptor=False,
+        )
+
+        await self._ingest(server, 'reify task 5638 has landed')
+
+        kwargs = mock_service.add_episode.call_args.kwargs
+        assert kwargs.get('unverified_claim') is True, (
+            f'no interceptor must tag, never fabricate a permissive answer; '
+            f'got {kwargs!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_project_still_leaves_the_key_absent(self):
+        # An EMPTY registry, because `_known_project_gate` is permissive on a
+        # falsy one — that is the only shape where ingestion proceeds and the
+        # claimed project still resolves to no root. A non-empty registry
+        # missing the writer would be rejected before any claim was read.
+        server, mock_service, _interceptor = self._episode_server(
+            statuses={'5638': 'done'}, known_projects={},
+        )
+
+        await self._ingest(server, 'reify task 5638 has landed')
+
+        kwargs = mock_service.add_episode.call_args.kwargs
+        assert kwargs.get('unverified_claim') is True, (
+            f'an unregistered project must tag, never pass; got {kwargs!r}'
+        )
