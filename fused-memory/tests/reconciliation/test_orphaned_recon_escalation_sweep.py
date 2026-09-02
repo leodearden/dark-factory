@@ -1134,6 +1134,7 @@ class TestMemoryConsolidatorOrphanedEscalationWiring:
         _, dedup_mock = await _run_stage(stage)
 
         dedup_mock.assert_awaited_once()
+        assert dedup_mock.await_args is not None
         seen = dedup_mock.await_args.kwargs['flags']
         assert any(
             f.get('flag_type') == ORPHANED_ESCALATION_FLAG_TYPE for f in seen

@@ -147,7 +147,7 @@ async def run(
         resolved_by: The ``resolved_by`` tag stamped on closed records.
         taskmaster: A ``TaskBackendProtocol``.  When ``None`` a
             ``SqliteTaskBackend`` is built from the fused-memory config and
-            started/stopped around the derivation.
+            started/closed around the derivation.
 
     Returns:
         A JSON-serialisable report.  EVERY count key is present in BOTH modes
@@ -175,7 +175,7 @@ async def run(
         )
     finally:
         if owns_backend:
-            await taskmaster.stop()
+            await taskmaster.close()
 
 
 async def _derive(queue_dir, project_roots, taskmaster, *, apply, resolved_by) -> dict:
