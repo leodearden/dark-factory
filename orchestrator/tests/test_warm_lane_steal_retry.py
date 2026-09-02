@@ -416,3 +416,135 @@ class TestStealRetriesAnotherLane:
             f'the FREE-lane path must not be retried; saw {len(seen)} seed '
             f'attempts: {seen}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-07: exhausting the retries yields STEAL_FAILED, without manufacturing a
+#          false structural-exhaustion signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStealFailedSentinel:
+    """When every retryable steal attempt fails, the acquire must report a
+    DISTINCT requeue-class sentinel — and must not corrupt the pool-level
+    structural-exhaustion signal on the way there.
+    """
+
+    async def test_all_attempts_fault_returns_steal_failed(self, wl_git_repo: Path):
+        from orchestrator.git_ops import (
+            _WARM_LANE_STEAL_MAX_ATTEMPTS,
+            WarmLaneUnavailable,
+        )
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, lanes, start_ref = await _setup_pool(wl_git_repo, size=3)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        seen = _install_selective_seed_failure(git_ops, fail_lanes=set(lanes))
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.STEAL_FAILED, (
+            f'every stolen lane failing is a POOL-PRESSURE condition with its '
+            f'own requeue class, not a per-task FAULT; got {result!r}'
+        )
+        assert len(seen) == _WARM_LANE_STEAL_MAX_ATTEMPTS, (
+            f'expected exactly {_WARM_LANE_STEAL_MAX_ATTEMPTS} steal attempts, '
+            f'saw {len(seen)}: {seen}'
+        )
+        assert len(set(seen)) == _WARM_LANE_STEAL_MAX_ATTEMPTS, (
+            f'each attempt must steal a DIFFERENT lane; got {seen}'
+        )
+        # No ASSIGNED leak: every attempted lane is back to FREE and the thief
+        # holds nothing.
+        assert pool.assignment_for('Z') is None, (
+            'a failed acquire must not leave the thief holding an assignment'
+        )
+        for lane in lanes:
+            assert pool.state(lane) is LaneState.FREE, (
+                f'lane {lane} leaked as {pool.state(lane)!r} after a failed '
+                f'steal-retry; every attempted lane must be released'
+            )
+
+    async def test_no_further_victim_on_retry_returns_steal_failed_without_exhaustion_signal(
+        self, wl_git_repo: Path,
+    ):
+        """A retry that finds no further eligible victim is STEAL_FAILED — and
+        must NOT walk the census / _note_structural_exhaustion path.
+
+        Today one acquire reaches the reclaim-returned-None branch at most
+        once, so it bumps ``_consecutive_exhausted`` at most once. With up to
+        _WARM_LANE_STEAL_MAX_ATTEMPTS attempts per acquire, a single
+        hostile-lane event on a small or heavily-pinned pool would bump the
+        counter on every retry too, driving it toward the L2 threshold and
+        firing spurious born-at-L2 structural-exhaustion escalations — trading
+        the per-task L2s this task removes for pool-level L2s that are equally
+        wrong.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, lanes, start_ref = await _setup_pool(wl_git_repo, size=1)
+        fires: list = []
+        git_ops._on_structural_exhaustion = (
+            lambda count, census: fires.append((count, census))
+        )
+        git_ops._consecutive_exhausted = 0
+        seen = _install_selective_seed_failure(git_ops, fail_lanes=set(lanes))
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.STEAL_FAILED, (
+            f'a retry that finds no further victim is a steal failure, not '
+            f'structural exhaustion; got {result!r}'
+        )
+        assert len(seen) == 1, (
+            f'the sole lane can only be stolen once; saw {seen}'
+        )
+        assert fires == [], (
+            f'the retry must NOT fire the structural-exhaustion callback; '
+            f'fired {fires!r}'
+        )
+        assert git_ops._consecutive_exhausted == 0, (
+            f'the retry must NOT bump the consecutive-exhausted counter; it '
+            f'is {git_ops._consecutive_exhausted}'
+        )
+
+    async def test_first_attempt_no_victim_still_exhausted(
+        self, wl_git_repo: Path, caplog,
+    ):
+        """Regression: a genuine FIRST-attempt exhaustion is untouched.
+
+        With no eligible victim at all the steal path never fires, so the
+        existing backpressure signal — EXHAUSTED, the census WARNING, and the
+        _consecutive_exhausted bump — must survive the new retry loop intact.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, _lanes, start_ref = await _setup_pool(wl_git_repo, size=1)
+
+        async def _empty_provider(candidates):
+            return set()
+
+        git_ops.warm_lane_reclaim_candidate_provider = _empty_provider
+        fires: list = []
+        git_ops._on_structural_exhaustion = (
+            lambda count, census: fires.append((count, census))
+        )
+        git_ops._consecutive_exhausted = 0
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.EXHAUSTED, (
+            f'a genuine first-attempt exhaustion must still be EXHAUSTED; '
+            f'got {result!r}'
+        )
+        assert git_ops._consecutive_exhausted == 1, (
+            f'the existing backpressure counter must still increment; it is '
+            f'{git_ops._consecutive_exhausted}'
+        )
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            'warm-lane pool EXHAUSTED' in m for m in messages
+        ), f'the census WARNING must still be logged; got: {messages}'
