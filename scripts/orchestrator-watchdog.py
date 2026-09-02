@@ -318,9 +318,21 @@ try:
     FM_LIVENESS_STREAK_THRESHOLD = int(os.environ["FM_LIVENESS_STREAK_THRESHOLD"])
 except (KeyError, ValueError):
     FM_LIVENESS_STREAK_THRESHOLD = 3
-# CLAMPED, unlike the two knobs below, and the asymmetry is deliberate. Their
-# <=0 means "disable the cap" — a safe direction, since a disabled cap only
-# removes a restriction on an already-justified restart. Here <=0 would mean
+# CLAMPED, unlike the knobs below, and the asymmetry is deliberate. Their <=0
+# means "disable this restriction" — a safe direction, since a disabled cap
+# only removes a restriction on an already-justified restart. Concretely:
+# FM_LIVENESS_STREAK_MAX_AGE_SECS <=0 means "no age-based expiry" (a streak is
+# then invalidated only by a 'healthy' verdict or the instance boundary), and
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS /
+# FM_LIVENESS_PORT_DOWN_RESTART_MIN_INTERVAL_SECS <=0 each disable their own
+# revive cap without even reading a clock. That claim was FALSE for the max-age
+# knob until task 4131: the expiry compared `(now - prior_ts) > 0`, which is
+# true for essentially every prior entry, so EVERY streak expired, the count
+# was pinned at 1, and at the default threshold of 3 fused-memory could never
+# be revived at all. An operator who set it to 0 believing they were relaxing a
+# restriction had silently switched the whole mechanism off, so the BEHAVIOUR
+# was fixed to match this contract rather than the contract retreating to match
+# the behaviour. Here <=0 would mean
 # "disable the streak", and because _record_fm_liveness_failure always returns
 # >=1 the gate `streak < FM_LIVENESS_STREAK_THRESHOLD` would then never hold:
 # FM_LIVENESS_STREAK_THRESHOLD=0 silently restores the exact
@@ -338,6 +350,12 @@ FM_LIVENESS_STREAK_THRESHOLD = max(1, FM_LIVENESS_STREAK_THRESHOLD)
 # streak from hours ago masquerading as a fresh one — and it fails in the safe
 # direction: an unusually slow tick sequence expires the streak and SUPPRESSES
 # a restart rather than manufacturing one.
+# <=0 DISABLES the age expiry outright (task 4131): the count then survives any
+# gap, and continuity is enforced only by a 'healthy' verdict clearing the
+# streak and by the INSTANCE-BOUNDARY expiry — which is deliberately left in
+# force, and is what keeps <=0 in the "removes ONE restriction" family rather
+# than the "removes every defence" one, since evidence about a previous
+# fused-memory process still cannot count toward killing its successor.
 try:
     FM_LIVENESS_STREAK_MAX_AGE_SECS = int(os.environ["FM_LIVENESS_STREAK_MAX_AGE_SECS"])
 except (KeyError, ValueError):
@@ -1518,7 +1536,14 @@ def _record_fm_liveness_failure(
     incrementing it, so an hours-old streak (watchdog stopped, timer disabled,
     host suspended, unit disabled and re-enabled) can never masquerade as a
     fresh one. Ticks are ~60s apart, so a larger gap means several were missed
-    and the "consecutive" claim is no longer true.
+    and the "consecutive" claim is no longer true. The expiry is gated on the
+    knob being POSITIVE, so <=0 genuinely disables it (task 4131). Before that
+    gate, 0 compared ``(now - prior_ts) > 0`` — true for essentially every
+    entry — so EVERY streak expired, the count could never exceed 1, and at the
+    default threshold of 3 fused-memory was never revived: an operator relaxing
+    a restriction silently disabled the whole mechanism instead. The
+    INSTANCE-BOUNDARY expiry below is deliberately NOT gated on it, and is what
+    still applies when the age window is off.
 
     INSTANCE-BOUNDARY EXPIRY. *unit_elapsed_secs* is the caller's already-
     computed ``_unit_start_elapsed_secs(FUSED_MEMORY_UNIT)``. When it is known,
@@ -1555,7 +1580,10 @@ def _record_fm_liveness_failure(
     count = 1
     if prior is not None:
         prior_count, prior_ts = prior
-        if (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
+        if (
+            FM_LIVENESS_STREAK_MAX_AGE_SECS > 0
+            and (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS
+        ):
             pass  # expired: continuity is unprovable, start over at 1
         elif unit_elapsed_secs is not None and prior_ts < (now - unit_elapsed_secs):
             log(
