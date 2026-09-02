@@ -931,12 +931,15 @@ async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
 
     async def spy_fetchmany(self, size=None):
         rows = await orig_fetchmany(self, size)
-        calls.append(('fetchmany', size, len(rows)))
+        # list(): fetchmany() is typed Iterable[Row], which pyright rejects
+        # for len() (61ae0ee799) — safe here since aiosqlite/sqlite3 hand
+        # back a real list, so this doesn't consume anything.
+        calls.append(('fetchmany', size, len(list(rows))))
         return rows
 
     async def spy_fetchall(self):
         rows = await orig_fetchall(self)
-        calls.append(('fetchall', None, len(rows)))
+        calls.append(('fetchall', None, len(list(rows))))
         return rows
 
     monkeypatch.setattr(aiosqlite.Cursor, 'fetchmany', spy_fetchmany)

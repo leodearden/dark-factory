@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS event_arrival_hourly (
 # and permanently dropped (logged at ERROR).
 _MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 
+# Rows fetched per fetchmany() call when draining cleanup_drained's
+# DELETE ... RETURNING cursor.  Bounds peak memory at O(chunk) instead of
+# O(rows deleted) — see cleanup_drained's docstring for the measurement.
+_CLEANUP_FETCH_CHUNK: int = 10_000
+
 
 class EventBuffer:
     """SQLite-backed event buffer with cross-instance visibility and burst detection.
@@ -1155,6 +1160,8 @@ class EventBuffer:
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
+        counts: dict[tuple[str, str, str], int] = {}
+        deleted_count = 0
         async with self._txn() as db:
             async with db.execute(
                 """DELETE FROM event_buffer
@@ -1166,33 +1173,35 @@ class EventBuffer:
                    RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
             ) as cursor:
-                # Materialised eagerly: fetchall() is typed Iterable[Row], and
-                # these rows are both counted (len) and iterated below, AFTER
-                # the cursor context has exited.
-                deleted = list(await cursor.fetchall())
-
-            counts: dict[tuple[str, str, str], int] = {}
-            for row in deleted:
-                # Bucket by PARSING, never by a SQL comparison against a
-                # datetime('now') literal — see throughput's METHOD NOTE:
-                # event_buffer.timestamp carries an offset and is
-                # 'T'-separated, so string-comparing it against SQLite's
-                # space-separated render collapses a whole day into one bucket.
-                try:
-                    bucket = utc_hour_bucket(row['timestamp'])
-                except ValueError as exc:
-                    logger.warning(
-                        'event_buffer.rollup_unparseable_timestamp',
-                        extra={
-                            'project_id': row['project_id'],
-                            'event_type': row['event_type'],
-                            'timestamp': row['timestamp'],
-                            'error': str(exc),
-                        },
-                    )
-                    continue
-                key = (row['project_id'], bucket, row['event_type'])
-                counts[key] = counts.get(key, 0) + 1
+                while True:
+                    # list() bounds at _CLEANUP_FETCH_CHUNK: fetchmany() is
+                    # typed Iterable[Row] like fetchall(), so len() needs a
+                    # Sized (61ae0ee799).
+                    chunk = list(await cursor.fetchmany(_CLEANUP_FETCH_CHUNK))
+                    if not chunk:
+                        break
+                    deleted_count += len(chunk)
+                    for row in chunk:
+                        # Bucket by PARSING, never by a SQL comparison against a
+                        # datetime('now') literal — see throughput's METHOD NOTE:
+                        # event_buffer.timestamp carries an offset and is
+                        # 'T'-separated, so string-comparing it against SQLite's
+                        # space-separated render collapses a whole day into one bucket.
+                        try:
+                            bucket = utc_hour_bucket(row['timestamp'])
+                        except ValueError as exc:
+                            logger.warning(
+                                'event_buffer.rollup_unparseable_timestamp',
+                                extra={
+                                    'project_id': row['project_id'],
+                                    'event_type': row['event_type'],
+                                    'timestamp': row['timestamp'],
+                                    'error': str(exc),
+                                },
+                            )
+                            continue
+                        key = (row['project_id'], bucket, row['event_type'])
+                        counts[key] = counts.get(key, 0) + 1
 
             if counts:
                 await db.executemany(
@@ -1204,7 +1213,7 @@ class EventBuffer:
                     [(pid, bucket, etype, n) for (pid, bucket, etype), n in counts.items()],
                 )
 
-        return len(deleted)
+        return deleted_count
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.
