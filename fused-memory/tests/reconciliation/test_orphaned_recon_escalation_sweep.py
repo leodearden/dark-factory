@@ -31,8 +31,8 @@ Covers here (steps 1/3/5 of the plan):
 from __future__ import annotations
 
 import pytest
-
 from escalation.models import Escalation
+
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     REAPABLE_STALE_CATEGORIES,
     TERMINAL_TASK_STATUSES,
@@ -100,7 +100,7 @@ class TestSingleOwnerConstants:
         L1 filed per-subject-task by Stage 1 whose premise a terminal subject
         moots — and the watcher SKILL already treats the two rows identically.
         """
-        assert REAPABLE_STALE_CATEGORIES == frozenset({GATE_BACKLOG, HUMAN_OPERATOR}), (
+        assert frozenset({GATE_BACKLOG, HUMAN_OPERATOR}) == REAPABLE_STALE_CATEGORIES, (
             'reapable category set must name exactly the two recon stale '
             f'families; got {sorted(REAPABLE_STALE_CATEGORIES)!r}'
         )
@@ -112,7 +112,7 @@ class TestSingleOwnerConstants:
         ``blocked`` and re-qualify for selection, so reaping its record would
         re-arm the filing rule and reproduce the measured re-file churn.
         """
-        assert TERMINAL_TASK_STATUSES == frozenset({'done', 'cancelled'}), (
+        assert frozenset({'done', 'cancelled'}) == TERMINAL_TASK_STATUSES, (
             'terminal statuses must be exactly done/cancelled; got '
             f'{sorted(TERMINAL_TASK_STATUSES)!r}'
         )
