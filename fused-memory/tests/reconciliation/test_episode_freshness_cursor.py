@@ -14,13 +14,14 @@ time, so a same-day-earlier episode re-surfaced on every cycle forever.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, Watermark
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import (
     MemoryConsolidator,
     _is_newer_than_watermark,
@@ -334,4 +335,134 @@ class TestIsNewerThanWatermarkNaiveWatermarkSymmetry:
         )
         assert naive_result == _is_newer_than_watermark(raw_ts, aware_wm), (
             'Naive watermark must behave identically to its UTC-aware twin'
+        )
+
+
+class TestUndatableFreshnessRecords:
+    """Undatable records (missing/empty/unparseable timestamp) are excluded
+    from both 'new' lists AND counted/logged — never silently dropped, per
+    design invariant INV-2 ``structured-facts-at-failure``. An undatable
+    record must never become a permanent re-surfacer like 894fbe90."""
+
+    @pytest.mark.asyncio
+    async def test_undatable_episodes_and_memories_excluded_and_counted(self):
+        stage = _make_consolidator()
+        stage.memory.get_episodes = AsyncMock(
+            return_value=[
+                {'uuid': 'ep-none', 'created_at': None, 'content': 'x'},
+                {'uuid': 'ep-empty', 'created_at': '', 'content': 'x'},
+                {'uuid': 'ep-garbage', 'created_at': 'not-a-timestamp', 'content': 'x'},
+            ]
+        )
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {'id': 'mem-none', 'created_at': None, 'memory': 'x', 'metadata': {}},
+                    {'id': 'mem-empty', 'created_at': '', 'memory': 'x', 'metadata': {}},
+                    {'id': 'mem-garbage', 'created_at': 'not-a-timestamp', 'memory': 'x', 'metadata': {}},
+                ]
+            }
+        )
+        watermark = Watermark(
+            project_id='test_project',
+            last_episode_timestamp=WATERMARK_TS,
+            last_memory_timestamp=WATERMARK_TS,
+        )
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Episodes Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        assert '### New Mem0 Memories Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        for record_id in ('ep-none', 'ep-empty', 'ep-garbage', 'mem-none', 'mem-empty', 'mem-garbage'):
+            assert record_id not in result, f'{record_id} must not surface; got result:\n{result!r}'
+
+        assert stage._undatable_freshness_records == 6, (
+            f'Expected 6 undatable records (3 episodes + 3 memories), '
+            f'got {stage._undatable_freshness_records}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_copies_undatable_freshness_records_into_stats(self):
+        """Mirrors TestRunSurfacesSnapshotStrippedStat in
+        test_assemble_payload_snapshot_filter.py: run() must copy the
+        pre-set instance attr into report.stats."""
+        stage = _make_consolidator()
+        stage.scope = _scope('test_project', stage.scope.project_root)
+        stage._undatable_freshness_records = 4
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-undatable-stats',
+            )
+
+        assert report.stats.get('stage1_undatable_freshness_records') == 4, (
+            f'Expected report.stats["stage1_undatable_freshness_records"]=4, '
+            f'got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_present_and_zero_on_clean_run(self):
+        """The stat must be unconditionally present (no .get(..., 0) fallback
+        needed downstream), matching the file's stage1_flag_markers_acknowledged
+        / stage1_cycle_summary_ledger_written convention."""
+        stage = _make_consolidator()
+        stage.scope = _scope('test_project', stage.scope.project_root)
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-undatable-stats-clean',
+            )
+
+        assert 'stage1_undatable_freshness_records' in report.stats, (
+            f'Expected key always present; got stats={report.stats!r}'
+        )
+        assert report.stats['stage1_undatable_freshness_records'] == 0
+
+    @pytest.mark.asyncio
+    async def test_undatable_count_resets_per_call(self):
+        """Reusing one stage instance across two assemble_payload calls must
+        NOT accumulate the counter — mirrors the _fetch_degraded_sources
+        reset hazard already called out in assemble_payload."""
+        stage = _make_consolidator()
+        watermark = Watermark(project_id='test_project', last_episode_timestamp=WATERMARK_TS)
+
+        stage.memory.get_episodes = AsyncMock(
+            return_value=[{'uuid': 'ep-garbage', 'created_at': 'not-a-timestamp', 'content': 'x'}]
+        )
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert stage._undatable_freshness_records == 1
+
+        stage.memory.get_episodes = AsyncMock(
+            return_value=[{'uuid': 'ep-newer', 'created_at': '2026-08-21T03:00:00+00:00', 'content': 'y'}]
+        )
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+        assert stage._undatable_freshness_records == 0, (
+            f'Expected counter to reset per call, not accumulate; '
+            f'got {stage._undatable_freshness_records}'
         )
