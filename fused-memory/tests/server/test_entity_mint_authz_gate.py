@@ -18,6 +18,7 @@ before its leaf may be registered green-tier.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -273,7 +274,7 @@ class TestValidateMintName:
         decision = validate_mint_name('REIFY:132')
         assert decision.allowed is False
         assert decision.error_type == 'EntityMintNonCanonicalName', decision
-        assert 'reify:132' in decision.error, decision
+        assert 'reify:132' in (decision.error or ''), decision
 
     def test_non_ascii_digit_is_refused_as_a_non_task_name(self):
         """Pins the interaction with canonical_labels' \\d -> [0-9] narrowing:
@@ -422,7 +423,7 @@ class TestEnsureEntityNodeToolGate:
         denied = await _call_on(server, agent_id='recon-stage-1')
 
         assert denied.get('error_type') == 'EntityMintToolDisabled', denied
-        mock_service.ensure_entity_node.assert_awaited_once(), (
+        assert mock_service.ensure_entity_node.await_count == 1, (
             'only the first call may have dispatched'
         )
 
@@ -517,7 +518,7 @@ class TestMintNameTaskVerification:
 
     @staticmethod
     def _server(mock_service, *, statuses=None, raises=False,
-                known_projects=None, task_interceptor=True):
+                known_projects=None, task_interceptor=True) -> tuple[Any, Any]:
         from unittest.mock import AsyncMock, MagicMock
 
         from fused_memory.server.tools import create_mcp_server
@@ -676,7 +677,7 @@ class TestClaimTaskStatusesIsUnchanged:
 
     @staticmethod
     def _episode_server(*, statuses=None, raises=False, known_projects=None,
-                        task_interceptor=True):
+                        task_interceptor=True) -> tuple[Any, Any, Any]:
         from unittest.mock import AsyncMock, MagicMock
 
         from fused_memory.server.tools import create_mcp_server
