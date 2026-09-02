@@ -23,7 +23,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig
-from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
+from fused_memory.server.entity_mint_authz import (
+    resolve_entity_mint_authorization,
+    validate_mint_name,
+)
 
 
 def _service(**entity_mint_kwargs):
@@ -198,3 +201,91 @@ class TestDecisionShape:
         assert 'entity_mint.allowed_agent_prefixes' in message, (
             f'the message must name the config knob, got {message!r}'
         )
+
+
+class TestValidateMintName:
+    """Guard 3: only a CANONICALLY-SPELLED task-shaped name may be minted.
+
+    Every expected classification below was CONFIRMED by running
+    ``utils/canonical_labels.py::parse_node_name`` against the current tree —
+    none is guessed. That module is the single normative label vocabulary
+    (INV-5), so ``validate_mint_name`` calls it rather than carrying a second
+    copy of the pattern.
+    """
+
+    def test_canonical_task_name_is_accepted_carrying_the_referent(self):
+        decision = validate_mint_name('Task 3222')
+        assert decision.allowed is True
+        assert decision.error_type is None
+        assert decision.error is None
+        assert decision.referent is not None
+        assert decision.referent.number == '3222'
+        assert decision.referent.node_name == 'Task 3222', (
+            'the decision must carry the parsed referent so the caller need not '
+            're-parse the name'
+        )
+
+    @pytest.mark.parametrize('name', [
+        'task #3222', 'Task: 3222', 'tasks 3222', '  task 3222  ',
+    ])
+    def test_non_canonical_spellings_are_refused_naming_the_canonical_form(self, name):
+        """These all PARSE — to Referent(number='3222') — but do not round-trip.
+
+        Refusing them (rather than silently normalizing) is what makes the
+        variants converge on ONE node instead of splitting, exactly as leaf eta
+        already does; naming the canonical form is what lets the caller retry.
+        """
+        decision = validate_mint_name(name)
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintNonCanonicalName', decision
+        assert isinstance(decision.error, str)
+        assert 'Task 3222' in decision.error, (
+            f'the refusal must name the canonical retry form, got {decision.error!r}'
+        )
+
+    @pytest.mark.parametrize('name', [
+        'Postgres', 'Task 42 orchestrator', 'subtask 5', '',
+    ])
+    def test_non_task_names_are_refused(self, name):
+        """parse_node_name returns None for each of these. Refusing keeps this
+        from becoming a general junk-node minter."""
+        decision = validate_mint_name(name)
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintNonTaskName', decision
+        assert isinstance(decision.error, str) and decision.error
+        assert decision.referent is None
+
+    def test_project_qualified_name_is_accepted(self):
+        """The cross-project case ensure_entity_node was originally built for
+        (task 3335): LLM extraction discards the qualifier and collapses the
+        reference onto a bare 'Task N'. The qualifier is never normalized away,
+        because that collapse is the bug utils/cross_project_refs.py exists to
+        detect."""
+        decision = validate_mint_name('reify:132')
+        assert decision.allowed is True, decision
+        assert decision.referent is not None
+        assert decision.referent.project_id == 'reify'
+        assert decision.referent.node_name == 'reify:132'
+
+    def test_uppercase_qualifier_is_refused_as_non_canonical(self):
+        """'REIFY:132' parses, but canonicalizes its qualifier to lowercase, so
+        node_name != name — the NON-CANONICAL arm, not the None arm."""
+        decision = validate_mint_name('REIFY:132')
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintNonCanonicalName', decision
+        assert 'reify:132' in decision.error, decision
+
+    def test_non_ascii_digit_is_refused_as_a_non_task_name(self):
+        """Pins the interaction with canonical_labels' \\d -> [0-9] narrowing:
+        an Arabic-Indic digit now parses to None, so the mint tool can never
+        create a 'Task \u0663' node."""
+        decision = validate_mint_name('task \u0663')
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintNonTaskName', decision
+
+    @pytest.mark.parametrize('name', [None, 42, b'Task 3222', ['Task 3222'], {'a': 1}])
+    def test_non_str_input_returns_a_refusal_rather_than_raising(self, name):
+        decision = validate_mint_name(name)
+        assert decision.allowed is False, f'{name!r} must not pass'
+        assert isinstance(decision.error_type, str) and decision.error_type
+        assert isinstance(decision.error, str) and decision.error
