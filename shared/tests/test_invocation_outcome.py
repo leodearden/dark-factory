@@ -154,6 +154,13 @@ class TestAuthFailureReason:
         assert 'auth_failure_reason' in invocation_outcome_module.__all__
 
 
+# Reference "now" for the cases ported from the retired usage_gate.py fork
+# (task 4357). Distinct from TestParseResetsAt.FIXED_NOW so the pre-existing
+# cases keep their own measured expectations; mid-January and midday so that
+# both "already past this year" and "still ahead today" branches are reachable.
+_MID_JAN = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+
+
 class TestParseResetsAt:
     """_parse_resets_at: 7.1.a — None on parse failure, never a fabricated now+1h."""
 
@@ -247,6 +254,102 @@ class TestParseResetsAt:
         result = _parse_resets_at('resets in 1h')
         assert result is not None
 
+    # --- Ported from the retired usage_gate.py _parse_resets_at fork (task
+    # 4357). Every expectation below was previously pinned ONLY against that
+    # fork; the fork read the wall clock unconditionally, so its assertions
+    # were wall-clock windows. Here ``now`` is injected, so each is an exact
+    # equality instead. ---
+
+    def test_absolute_with_date_no_comma(self):
+        """'resets Mar 30 6pm (UTC)' — the comma after the day is optional
+        (`,?` in the with-date regex)."""
+        result = _parse_resets_at('resets Mar 30 6pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 18, 0, tzinfo=UTC)
+
+    def test_absolute_with_date_non_utc_timezone(self):
+        """A non-UTC tz is honoured, DST included: Mar 31 is inside BST
+        (UTC+1), so 2:30pm London is 13:30 UTC."""
+        result = _parse_resets_at('resets Mar 31, 2:30pm (Europe/London)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 31, 13, 30, tzinfo=UTC)
+
+    def test_relative_is_case_insensitive(self):
+        result = _parse_resets_at('RESETS IN 3H', now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=3)
+
+    def test_relative_zero_hours_is_now_exactly(self):
+        """The zero-delta boundary: 'resets in 0h' is a parse SUCCESS
+        returning `now` itself, not a fall-through to None."""
+        result = _parse_resets_at('resets in 0h', now=_MID_JAN)
+        assert result == _MID_JAN
+
+    def test_relative_embedded_in_longer_text(self):
+        text = "You've hit your limit. Your usage resets in 5h. Please wait."
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=5)
+
+    def test_absolute_with_date_embedded_in_longer_text(self):
+        text = "You've hit your limit - resets Mar 30, 6pm (Europe/London)"
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 17, 0, tzinfo=UTC)
+
+    def test_full_month_name(self):
+        """Full month names parse identically to their 3-letter
+        abbreviations. Regression: the month group was once `[A-Za-z]{3}`,
+        requiring EXACTLY 3 characters, so any 4+ char month name silently
+        fell through — on the old fork, to a fabricated `now + 1h`."""
+        result = _parse_resets_at('resets June 5, 7pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 6, 5, 19, 0, tzinfo=UTC)
+
+    def test_full_month_name_april_with_colon_minutes(self):
+        """Same `[A-Za-z]{3}`-once-required regression as above, with a
+        H:MM am time rather than a bare hour."""
+        result = _parse_resets_at('resets April 15, 9:30am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 4, 15, 9, 30, tzinfo=UTC)
+
+    def test_full_month_name_september_is_the_nine_char_upper_bound(self):
+        """'September' is the longest English month name (9 chars) — the
+        upper bound of the `[A-Za-z]{3,9}` month group. Same regression
+        note as the two cases above."""
+        result = _parse_resets_at('resets September 1, 6am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+
+    def test_midnight_and_next_year_bump(self):
+        """'12am' parses to hour 0 (not 12), and Jan 1 00:00 is already
+        behind a mid-January `now`, so the with-date branch bumps the
+        year."""
+        result = _parse_resets_at('resets Jan 1, 12am (UTC)', now=_MID_JAN)
+        assert result == datetime(2027, 1, 1, 0, 0, tzinfo=UTC)
+
+    # --- Fall-through arms of the two absolute branches. These were never
+    # covered on this copy in either form: the fork's tests could not pin
+    # them because the fork answered every one with a fabricated `now + 1h`
+    # rather than a distinguishable None. ---
+
+    def test_unknown_month_returns_none(self):
+        """The with-date regex matches but `_MONTH_ABBR` has no 'xyz', so
+        the branch raises into `except Exception: pass`; the no-date branch
+        then fails to match (a month word precedes the time), so the
+        function falls all the way through to None."""
+        assert _parse_resets_at('resets Xyz 30, 6pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unparseable_time_returns_none(self):
+        """The regex matches '99:99pm', but every strptime format fails, so
+        the `for/else` raises into `except Exception: pass` → None."""
+        assert _parse_resets_at('resets Mar 30, 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises on a non-existent key inside the with-date
+        branch's try → None."""
+        assert _parse_resets_at('resets Mar 30, 6pm (Fake/Zone)', now=_MID_JAN) is None
+
+    def test_no_date_unparseable_time_returns_none(self):
+        """The no-date branch's own `for/else: return None` arm."""
+        assert _parse_resets_at('resets 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_no_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises inside the no-date branch's try → None."""
+        assert _parse_resets_at('resets 6pm (Fake/Zone)', now=_MID_JAN) is None
+
 
 class TestExtractCapMessage:
     """_extract_cap_message: returns the sentence containing the matched prefix."""
@@ -263,6 +366,23 @@ class TestExtractCapMessage:
         text = "YOU'VE HIT YOUR usage limit. resets in 3h."
         message = _extract_cap_message(text, "you've hit your")
         assert message != ''
+
+    # --- Truncation, ported from the retired usage_gate.py fork (task 4357).
+    # The two bodies were byte-identical, so these pin behaviour that was
+    # always this copy's too — it simply had no test here. ---
+
+    def test_long_text_truncated_at_newline(self):
+        """A newline inside the 200-char window wins over the char bound:
+        the whole first line comes back, however long."""
+        line = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(line + '\nNext line', "You've hit your")
+        assert result == line.strip()
+
+    def test_no_newline_truncated_at_200_chars(self):
+        """With no newline the extract is capped at idx+200."""
+        text = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert len(result) == 200
 
 
 class TestSingleSourceOwnership:
