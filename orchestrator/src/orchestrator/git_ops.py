@@ -995,6 +995,18 @@ class WarmLaneUnavailable(Enum):
       holder is on THAT lane, so a different lane — or a later attempt —
       succeeds.  Distinct from ``DISK_PRESSURE``: exit-75 means disk, and a
       lock race implicates neither disk nor this task.
+    * ``STEAL_FAILED`` — the reclaim-on-exhaustion safety valve
+      (:meth:`GitOps._try_reclaim_lane_for`) stole one or more lanes for this
+      acquire and EVERY attempt failed to provision, or a retry attempt found
+      no further eligible victim (task 4930).  Each attempted lane has already
+      been released back to FREE — no ASSIGNED leak, and the thief holds
+      nothing.  A POOL-PRESSURE condition (requeue via
+      :class:`WarmLaneStealFailed`), never a per-task fault: nothing about the
+      requeued task caused it.  Deliberately NOT ``EXHAUSTED`` — reusing that
+      sentinel would corrupt both the :class:`WarmLanePoolCensus` line an
+      operator reads and the ``_consecutive_exhausted`` counter that fires the
+      structural-exhaustion escalation, mislabelling a hostile-lane event as
+      structural exhaustion.
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -1014,6 +1026,7 @@ class WarmLaneUnavailable(Enum):
     BASE_ABSENT = 'base_absent'
     RESEED_CONTAMINATED = 'reseed_contaminated'
     LANE_LOCK_TIMEOUT = 'lane_lock_timeout'
+    STEAL_FAILED = 'steal_failed'
     DISABLED = 'disabled'
 
 
@@ -6521,11 +6534,18 @@ class GitOps:
                     attempt, _WARM_LANE_STEAL_MAX_ATTEMPTS,
                 )
 
-        # Every attempt stole a lane and every one of them failed.  Returns the
-        # last attempt's sentinel for now; task 4930 step-8 replaces this with
-        # the dedicated STEAL_FAILED requeue class plus the operator-facing
-        # WARNING naming every attempted lane.
-        return attempted[-1][1]
+        # Every attempt stole a lane and every one of them failed to provision.
+        # This is the operator-facing signal that the pool is handing out
+        # hostile lanes — name each lane AND the sentinel it produced, so one
+        # journal line distinguishes a single recurring bad lane from a
+        # host-wide condition.
+        logger.warning(
+            'acquire_warm_lane: steal-retry EXHAUSTED for %r after %d attempts '
+            '— every stolen lane failed to provision: %s',
+            branch_name, _WARM_LANE_STEAL_MAX_ATTEMPTS,
+            ', '.join(f'{lane}={sentinel.value}' for lane, sentinel in attempted),
+        )
+        return WarmLaneUnavailable.STEAL_FAILED
 
     async def prewarm_pool(self, start_ref: str) -> PoolPrewarmResult:
         """Eagerly materialize every pool lane to its at-rest idle state (task 2879).
@@ -6966,6 +6986,26 @@ class GitOps:
                 branch_name, title=expected_title, branch=full_branch,
                 exclude=steal_excluded,
             )
+            if reclaimed is None and steal_excluded:
+                # Task 4930: this is a RETRY attempt within a single acquire
+                # (steal_excluded is non-empty exactly when this call has
+                # already stolen and failed at least once), and the valve found
+                # no further eligible victim.  Deliberately skips the census +
+                # _note_structural_exhaustion below: routing a retry through
+                # that counter would let the new loop bump it up to
+                # _WARM_LANE_STEAL_MAX_ATTEMPTS times per acquire, driving it
+                # toward warm_lane_structural_exhaustion_l2_threshold and
+                # manufacturing spurious deduped born-at-L2
+                # structural-exhaustion escalations for what is a SINGLE
+                # hostile-lane event.  The first-attempt path below keeps that
+                # behaviour byte-identically.
+                logger.warning(
+                    'acquire_warm_lane: steal-retry — no further eligible '
+                    'victim for %r after %d excluded lane(s); returning '
+                    'STEAL_FAILED (requeue, not structural exhaustion)',
+                    branch_name, len(steal_excluded),
+                )
+                return WarmLaneUnavailable.STEAL_FAILED
             if reclaimed is None:
                 # Task 2984 (PRD α): carry the typed census on the exhaustion
                 # path so an operator sees WHY the pool is full (free / held by
