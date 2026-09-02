@@ -4255,3 +4255,191 @@ def test_session_start_first_sight_still_captures_richly(tmp_path: Path) -> None
     assert record.transcript_path == sr.transcript_path_for_cwd(
         '/home/leo/src/dark-factory'
     )
+
+
+# ---------------------------------------------------------------------------
+# The UNREADABLE-snapshot fault lane must still honour the task-4193
+# launch-window withhold guard (task 4662, reviewer finding).
+#
+# MEASURED on task/4662 @ 38265c5462, same scenario both sides (LAUNCHING +
+# unbound spawn record, nested `claude` Notification, read_record raising on
+# call #1 then succeeding):
+#   main        -> status=launching,      question=None            (withheld)
+#   this branch -> status=awaiting-input, question='nested question'
+# i.e. the nested session's status and prompt land on the SPAWNING session's
+# record -- the ownership inversion tasks 4193/2511 exist to prevent.
+#
+# Before task 4662 the handler made TWO independent reads (the ownership
+# probe's AND _prior_record_or_none's), so a TRANSIENT fault on the first
+# left the second free to succeed and the guard still ran. One snapshot now
+# serves both, and one fault disarms it -- the fault lane never carried a
+# withhold evaluation of its own. The existing fault-lane tests
+# (test_run_stop_fail_soft_when_probe_read_raises,
+# test_session_start_fault_lane_parity) both use an ABSENT record, so neither
+# exercises the interaction; that gap is why this shipped.
+# ---------------------------------------------------------------------------
+
+
+def _boom_once_read(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Fault the FIRST ``read_record`` (the ownership probe's), then behave.
+
+    The suite's established ``_boom_once`` idiom, hoisted so the fault-lane
+    tests below share one definition of "transient fault on the probe read".
+    """
+    real_read = sr.read_record
+    calls: list[int] = []
+
+    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk on fire')
+        return real_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sr, 'read_record', _boom_once)
+    return calls
+
+
+def _spawn_launching_record(slug: str, root: Path) -> None:
+    """The body that makes the stake real: role/project/prompt/result_file.
+
+    This is the record spawn-claude.sh's ``finish()`` writes ``exited`` to,
+    so a nested inheritor rewriting it is not a cosmetic status lie.
+    """
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            role='session',
+            project='cockpit',
+            prompt='/spawn cockpit',
+            result_file='/tmp/spawn-4662.json',
+            launcher_pid=4662050,
+            start_ts=datetime.now(UTC).isoformat(),
+        ),
+        root=root,
+    )
+
+
+@pytest.mark.parametrize('handler', ['notification', 'stop'])
+def test_fault_lane_still_withholds_from_an_unbound_launching_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, handler: str
+) -> None:
+    """The direct mirror of test_refresh_path_does_not_bind_a_still_launching_
+    record / ..._withholds_a_question_during_the_unbound_launch_window, with a
+    transient fault injected into the ownership probe's read.
+
+    A fault on ONE read must not cost this event its withhold DECISION. The
+    record's provenance is still unknowable, so nothing this nested event
+    carries -- not the status, not the question -- may land on it.
+    """
+    slug = f'session-cockpit-466205{0 if handler == "notification" else 1}'
+    _spawn_launching_record(slug, tmp_path)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    calls = _boom_once_read(monkeypatch)
+
+    if handler == 'notification':
+        sh.run_notification({**hook_input, 'message': 'nested question'}, env, root=tmp_path)
+    else:
+        sh.run_stop(hook_input, env, root=tmp_path)
+
+    # The probe was consulted (and degraded) rather than skipped.
+    assert len(calls) >= 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.LAUNCHING
+    assert record.question is None
+    assert record.claude_session_id is None
+    # Withholding is not forking: the event lands on this slug and is then
+    # dropped -- it must not also mint a second, nested-owned row.
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_fault_lane_does_not_withhold_from_a_positively_identified_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PARITY IN THE OTHER DIRECTION, so the fix cannot be "always withhold
+    when the snapshot faulted".
+
+    The owner's own pre-SessionStart Notification (task 4193 L2 item 4-iii):
+    CLAUDE_SPAWN_OWNER_PPID positively identifies this event, so its status
+    and question belong on the record whether or not the read faulted.
+    """
+    slug = 'session-cockpit-4662052'
+    _spawn_launching_record(slug, tmp_path)
+    env = _owner_ppid_env(slug, 4193500)
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
+    calls = _boom_once_read(monkeypatch)
+
+    sh.run_notification(
+        {
+            'session_id': 'uuid-owner',
+            'cwd': '/home/leo/src/dark-factory',
+            'message': 'may I proceed?',
+        },
+        env,
+        root=tmp_path,
+    )
+
+    assert len(calls) >= 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.AWAITING_INPUT
+    assert record.question is not None and record.question.text == 'may I proceed?'
+    # The spawn record's own payload survives the refresh untouched.
+    assert record.prompt == '/spawn cockpit'
+    assert record.result_file == '/tmp/spawn-4662.json'
+
+
+def test_fault_lane_reads_the_written_slug_at_most_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE STRUCTURAL BOUND: the faulted probe read plus ONE retry.
+
+    Restoring the withhold decision must not degrade into an unbounded or
+    third re-read of the record. The outcome is asserted alongside the count
+    so the bound cannot be met by skipping the retry.
+    """
+    slug = 'session-cockpit-4662053'
+    _spawn_launching_record(slug, tmp_path)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    reads: list[str] = []
+    real_read = sr.read_record
+
+    def _counting_boom_once(slug_arg: str, *args: object, **kwargs: object) -> sr.SessionRecord:
+        reads.append(slug_arg)
+        if len(reads) == 1:
+            raise OSError('disk on fire')
+        return real_read(slug_arg, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sr, 'read_record', _counting_boom_once)
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert reads.count(slug) <= 2
+    # OUTCOME, so the bound cannot be satisfied by skipping the retry: the
+    # retry is what supplies the observation the withhold decision needs.
+    assert sr.read_record(slug, root=tmp_path).status is sr.Status.LAUNCHING
+
+
+def test_fault_lane_propagates_a_persistently_corrupt_body(tmp_path: Path) -> None:
+    """STRENGTHENS test_refresh_never_overwrites_a_corrupt_body.
+
+    That test suppresses CorruptSessionRecord, so it would also pass if the
+    handler silently no-op'd. A body that is corrupt on EVERY read must still
+    PROPAGATE to main()'s blanket except -- refresh_record's "a *corrupt*
+    existing body is NOT treated as absent" contract -- and leave the bytes
+    exactly as it found them.
+    """
+    slug = 'session-cockpit-4662054'
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('not-json{{{')
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+
+    with pytest.raises(sr.CorruptSessionRecord):
+        sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert record_path.read_text() == 'not-json{{{'
