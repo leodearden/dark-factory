@@ -8756,6 +8756,119 @@ def test_record_fm_liveness_failure_persists_across_module_instances(
 
 
 # ---------------------------------------------------------------------------
+# Part D: FM_LIVENESS_STREAK_MAX_AGE_SECS <= 0 disables the expiry (task 4131)
+#
+# The comment above FM_LIVENESS_STREAK_THRESHOLD's clamp explains why THAT knob
+# is clamped "unlike the two knobs below": their "<=0 means 'disable the cap' —
+# a safe direction, since a disabled cap only removes a restriction on an
+# already-justified restart". That claim held for
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (_within_min_interval returns False on
+# secs<=0 without even reading the clock) and was FALSE for the max-age knob:
+# _record_fm_liveness_failure tests `(now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS`,
+# so at 0 the comparison is true for essentially every prior entry, EVERY streak
+# expired, the count could never exceed 1, and at the default threshold of 3
+# fused-memory could NEVER be revived. Setting the knob to 0 therefore did not
+# remove a restriction — it silently switched the entire revive mechanism off,
+# with no journal evidence: the exact silent degradation the surrounding
+# comments forbid. Task 4131 fixes the BEHAVIOUR to match the documented
+# contract rather than retreating to a doc-only correction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("disabled", [0, -1])
+def test_record_fm_liveness_failure_max_age_disabled_keeps_accumulating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, disabled: int
+) -> None:
+    """(a) <=0 means NO age expiry, so an hours-old entry still INCREMENTS.
+
+    The unit-level pin. Before task 4131 this returned 1 for both values,
+    because `(now - prior_ts) > 0` (and `> -1`) is true for every entry whose
+    ts is even microseconds old — so the count was pinned at 1 forever.
+    """
+    wdog = _load_watchdog()
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", disabled)
+    prior_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 1, "verdict": "wedged", "ts": prior_ts}))
+    # Hours later — far outside the DEFAULT window, which is the point: with the
+    # window disabled, age must not matter at all.
+    monkeypatch.setattr(wdog.time, "time", lambda: prior_ts + 7200.0)
+
+    assert wdog._record_fm_liveness_failure("wedged", None) == 2, (
+        f"FM_LIVENESS_STREAK_MAX_AGE_SECS={disabled} must disable the age expiry, "
+        "not expire every entry"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 2, (
+        "the disabled-expiry count must PERSIST, not just be returned"
+    )
+
+
+def test_liveness_pass_max_age_disabled_still_revives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(b) BEHAVIOURAL: with the age window off, three ticks an HOUR apart revive fm.
+
+    The user-observable consequence of the defect. Ticks are advanced by 3600s
+    — ten times the DEFAULT 300s window — so every entry would expire under the
+    default and the count would never leave 1. With the window disabled the
+    "consecutive non-healthy verdicts" claim is enforced by the 'healthy'-clears
+    rule and the instance boundary alone, exactly as the corrected contract
+    says, and the threshold is still reached.
+
+    Before task 4131 this asserted zero revives, ever: an operator who set the
+    knob to 0 believing they were relaxing a restriction had silently disabled
+    fused-memory's revive entirely.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 0)
+    streak_file = tmp_path / "streak.json"
+    restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    counts = []
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+        if streak_file.exists():
+            counts.append(json.loads(streak_file.read_text())["count"])
+        now[0] += 3600.0  # an hour between ticks: 12x the default max age
+
+    assert counts == [1, 2], (
+        f"the count must climb across hour-wide gaps when the expiry is off: {counts}"
+    )
+    assert restarted == ["fused-memory.service"], (
+        f"a disabled age window must not disable the revive itself; got {restarted}"
+    )
+    assert not streak_file.exists(), "the consumed streak must be cleared by the revive"
+
+
+def test_record_fm_liveness_failure_default_max_age_still_expires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """(c) REGRESSION PIN: the DEFAULT 300s window still expires an hours-old streak.
+
+    Guards against reading the fix as "delete the expiry". The default is
+    asserted from a freshly loaded module (no env override) rather than
+    monkeypatched in, so a change to the constant itself is caught here too.
+    """
+    monkeypatch.delenv("FM_LIVENESS_STREAK_MAX_AGE_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_LIVENESS_STREAK_MAX_AGE_SECS == 300
+    streak_file = tmp_path / "streak.json"
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(streak_file))
+    prior_ts = 1783000000.0
+    streak_file.write_text(json.dumps({"count": 3, "verdict": "wedged", "ts": prior_ts}))
+    monkeypatch.setattr(wdog.time, "time", lambda: prior_ts + 7200.0)
+
+    assert wdog._record_fm_liveness_failure("wedged", None) == 1, (
+        "the default window must keep expiring an hours-old streak back to 1"
+    )
+    assert json.loads(streak_file.read_text())["count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Part D: fm-liveness restart clock trio (task 3764)
 #
 # Line-for-line siblings of the Part C fm deploy-clock trio above, reading the
