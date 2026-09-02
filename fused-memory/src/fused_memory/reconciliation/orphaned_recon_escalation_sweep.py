@@ -73,6 +73,7 @@ Design decisions (captured in plan.json):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -349,3 +350,221 @@ def build_orphaned_escalation_flag(
             'a live record re-arms the filing rule.'
         ),
     }
+
+
+async def _project_status_census(taskmaster, project_root, *, log = logger):
+    """Return a CROSS-TAG-COMPLETE ``{id: status}`` census for *project_root*.
+
+    ``taskmaster.get_statuses_fresh`` defaults to a SINGLE tag when none is
+    given — stated in
+    ``backends/task_backend_protocol.py::list_tags``: "a caller that needs a
+    cross-tag-complete view ... must enumerate every tag first via this
+    method".  A single untagged read would therefore report a subject living
+    in another tag as having no row at all, which ``classify_orphan`` renders
+    as ``'missing'`` and this sweep hands to the sole closer as a reap
+    instruction — for a task that may still be legitimately ``blocked``.  That
+    is the exact false positive the whole design exists to prevent, so the
+    tags are enumerated even though every store inspected on 2026-09-02 had
+    exactly one (``master``; dark_factory 4958 tasks, reify 7150).
+
+    We deliberately depart here from ``citation_verifier.py``'s "Out of scope"
+    note and from ``harness.py::_fetch_task_count_census``'s untagged read:
+    for those a missed row merely weakens a check, whereas here it drives an
+    IRREVERSIBLE queue mutation by a downstream closer.  Asymmetric cost,
+    asymmetric rigour.
+
+    ``ids=`` is never passed, so "absent from the returned map" is an
+    unambiguous no-row signal rather than a backend's missing-id convention.
+    ``get_statuses_fresh`` is chosen over ``get_statuses`` for the task-2388
+    reason ``harness.py::_fetch_task_count_census`` gives: it opens its own
+    short-lived autocommit connection per call and so can never be pinned to
+    a stale WAL read-snapshot.
+
+    Returns ``None`` when any read failed — the caller must then classify
+    NOTHING for that project.  An empty-but-successful tag list falls back to
+    one untagged read (the shape a backend with a ``list_tags`` stub
+    presents); a ``list_tags`` FAILURE is an error, not a fallback, because
+    falling back would perform precisely the single-tag read this helper
+    exists to avoid.
+
+    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate
+    unchanged.
+    """
+    try:
+        tags = await taskmaster.list_tags(project_root)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'orphaned_recon_escalation_sweep: list_tags failed for '
+            'project_root=%s — classifying nothing for this project '
+            '(a single-tag fallback could reap a live record)',
+            project_root,
+        )
+        return None
+
+    census: dict[str, str] = {}
+    try:
+        if not tags:
+            census.update(await taskmaster.get_statuses_fresh(project_root))
+        else:
+            for tag in tags:
+                census.update(
+                    await taskmaster.get_statuses_fresh(project_root, tag=tag),
+                )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'orphaned_recon_escalation_sweep: get_statuses_fresh failed for '
+            'project_root=%s (tags=%r) — classifying nothing for this project',
+            project_root, tags,
+        )
+        return None
+
+    return census
+
+
+async def sweep_orphaned_recon_escalations(
+    escalation_queue,
+    taskmaster,
+    known_projects,
+    *,
+    log = logger,
+):
+    """Flag every pending recon stale record whose subject went terminal or vanished.
+
+    DETECTION ONLY.  This function never calls ``escalation_queue.resolve()``:
+    the A7b contract above
+    ``reconciliation/harness.py::_RECON_DEDUP_CONFIG`` makes the port-8103
+    watcher session the sole closer of recon escalations.  The emitted flags
+    reach that closer through ``skills/recon-escalation-watcher/SKILL.md``;
+    an operator can also re-derive and close the same set on demand with
+    ``fused-memory/scripts/derive_orphaned_recon_escalations.py --apply``.
+
+    Flow: ``get_pending()`` -> ``select_reapable_escalations`` -> group by
+    ``escalation_project_id`` -> one cross-tag-complete census per resolvable
+    project -> ``classify_orphan`` per record -> a flag for ``'terminal'`` and
+    ``'missing'`` only.
+
+    Args:
+        escalation_queue: An ``EscalationQueue`` over the RECON queue dir.
+            Only ``get_pending()`` (sync) is called — the queue root, which
+            correctly excludes already-archived closed records.
+        taskmaster: A ``TaskBackendProtocol`` providing ``list_tags`` and
+            ``get_statuses_fresh``.
+        known_projects: ``{project_id: project_root}``, i.e.
+            ``BaseStage.known_projects``.  A record naming a project absent
+            from this map is ``unresolvable``, never an orphan.
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        dict with ``flags`` (Stage-1 flag dicts to append to
+        ``report.items_flagged``) and int counts ``scanned`` (reapable records
+        considered), ``terminal``, ``missing``, ``live``, ``unresolvable``,
+        ``errors``.  Every key is always present, so a caller never needs a
+        ``.get(..., 0)`` fallback and can read the degraded-cycle signature
+        (``errors > 0``) apart from the clean-but-empty one directly.
+
+    Best-effort, and fail-SAFE in ONE direction: a queue-read or census-read
+    failure is caught, logged, tallied into ``errors``, and NEVER classified
+    as ``terminal`` or ``missing``.  The asymmetry matters more here than in
+    the sibling sweeps: a false ``terminal`` tells the sole closer to resolve
+    a record whose subject is still ``blocked``, re-arming the filing rule and
+    producing the measured re-file churn the watcher playbook documents
+    (``esc-650-1`` -> ``esc-650-2`` in ~4h), whereas a missed detection is
+    simply re-checked next cycle.
+    ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit`` are
+    re-raised unchanged.
+
+    The per-record loop is sequential rather than an ``asyncio.gather`` so
+    per-record error attribution stays exact, mirroring
+    ``curator_gate_resolution_sweep.py::sweep_resolved_curator_gates``.
+    """
+    stats = {
+        'flags': [],
+        'scanned': 0,
+        'terminal': 0,
+        'missing': 0,
+        'live': 0,
+        'unresolvable': 0,
+        'errors': 0,
+    }
+
+    try:
+        pending = escalation_queue.get_pending()
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'orphaned_recon_escalation_sweep: get_pending failed — '
+            'no records classified this cycle',
+        )
+        stats['errors'] += 1
+        return stats
+
+    reapable = select_reapable_escalations(pending)
+    if not reapable:
+        return stats
+
+    # Census cache keyed by project_id.  A project whose census read failed is
+    # cached as None so a second record for the same project neither retries
+    # the failing backend nor is silently classified against a partial map.
+    censuses: dict[str, dict[str, str] | None] = {}
+    unresolved_project_ids: set[str] = set()
+
+    for esc in reapable:
+        stats['scanned'] += 1
+
+        project_id = escalation_project_id(esc)
+        if project_id is None or project_id not in known_projects:
+            # Never an orphan: the subject's own store was never consulted.
+            # Folding this into `missing` would reap records on no evidence.
+            stats['unresolvable'] += 1
+            unresolved_project_ids.add(
+                project_id if project_id is not None else '<unparseable>',
+            )
+            continue
+
+        if project_id not in censuses:
+            censuses[project_id] = await _project_status_census(
+                taskmaster, known_projects[project_id], log=log,
+            )
+        census = censuses[project_id]
+        if census is None:
+            stats['errors'] += 1
+            continue
+
+        classification = classify_orphan(esc, census)
+        if classification == 'live':
+            stats['live'] += 1
+            continue
+
+        stats[classification] += 1
+        stats['flags'].append(
+            build_orphaned_escalation_flag(
+                esc,
+                classification,
+                subject_project_id=project_id,
+                subject_status=census.get(str(esc.task_id)),
+            ),
+        )
+
+    if stats['scanned'] and stats['unresolvable']:
+        # Registry-gap canary, mirroring sweep_resolved_curator_gates' zero-
+        # recall canary.  An unresolvable record is silently invisible to the
+        # reaper — its subject is never checked — so a growing bucket is
+        # shrinking recall, not a clean result.  The deployed
+        # DASHBOARD_KNOWN_PROJECT_ROOTS covers all seven projects present in
+        # the live queue and 0 of 124 records fail the detail parse, so a
+        # non-empty bucket is a real signal worth grepping for.
+        log.warning(
+            'orphaned_recon_escalation_sweep: %d of %d reapable record(s) could '
+            'not be scoped to a known project and were NOT classified '
+            '(project_ids: %s) — a known_projects registry gap or a detail-block '
+            'format drift silently shrinks this sweep\'s recall',
+            stats['unresolvable'], stats['scanned'],
+            ', '.join(sorted(unresolved_project_ids)),
+        )
+
+    return stats
