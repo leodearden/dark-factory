@@ -2639,12 +2639,20 @@ def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailabl
 ) -> None:
     """A non-repo root must RAISE, actionably — never fall back to a filesystem walk.
 
-    `tmp_path` is deliberately never made into a git repo here. Verified
-    `git -C <non-repo> ls-files` exits non-zero with `fatal: not a git
-    repository` and does not walk up to a parent repo, so this is a real
-    failure mode (a stray root, a not-yet-initialised checkout), not a
-    contrived one. A silent filesystem fall-back here would restore the exact
-    incident this task fixes, and do so precisely where nobody is watching —
+    `tmp_path` is deliberately never made into a git repo here. Git does NOT
+    refuse to look outside `cwd`: it resolves the enclosing repo by walking UP
+    from `cwd`, ceiling-less by default — verified: from a `deep/nested`
+    directory below an initialised repo, `git ls-files` still finds that repo
+    and exits 0. So this test's hermeticity was never about git declining to
+    walk up; it depends on pytest's default `tmp_path` base
+    (`/tmp/pytest-of-*`) happening to sit outside any repo. Guarded explicitly
+    below rather than assumed, because a `--basetemp` or `TMPDIR` pointed
+    inside a checkout would otherwise make `_walk_repo_files` silently return
+    `[]` instead of raising, under nothing but ambient test-runner
+    configuration.
+
+    A silent filesystem fall-back here would restore the exact incident this
+    task fixes, and do so precisely where nobody is watching —
     `no-silent-fail-soft` is a canonical slug in the family this module
     enforces. Asserts on the STRUCTURED facts a reader needs to act (the
     offending root, and that the scan sources from tracked files), never on
@@ -2653,6 +2661,18 @@ def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailabl
     against step-2/step-4, where `check=True` surfaces a bare
     `subprocess.CalledProcessError` naming neither.
     """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+    if probe.returncode == 0:
+        pytest.skip(
+            f"{tmp_path} resolves inside a git repository via git's ceiling-less "
+            f"upward search from cwd, so this environment cannot exercise the "
+            f"non-repo failure mode hermetically."
+        )
+
     with pytest.raises(Exception) as excinfo:
         _walk_repo_files(tmp_path, (".py", ".md"))
 
