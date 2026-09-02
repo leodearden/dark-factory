@@ -33,14 +33,25 @@ CREATE TABLE IF NOT EXISTS write_ops (
     -- terminal_* (task 3582): the durable queue's TERMINAL outcome for this
     -- write, written back by DurableWriteQueue's on_terminal hook.
     --
-    -- TWO DIFFERENT FACTS, both kept. `success` above means "the enqueue was
-    -- ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits,
-    -- which is genuinely useful for a caller that got a 200 back. These
-    -- columns mean "the write LANDED". Before they existed, a row for a write
-    -- with a 0% landing rate was byte-for-byte indistinguishable from a row
-    -- for a write that landed. `success`'s existing readers
-    -- (reconciliation/stage_stats.py, which gates on op.get('success', 1)) are
-    -- deliberately unchanged rather than silently redefined under them.
+    -- TWO DIFFERENT FACTS, both kept. `success` above means "this operation's
+    -- write was ACCEPTED" — for a queued op it is stamped the instant
+    -- durable_queue.enqueue() commits, which is genuinely useful for a caller
+    -- that got a 200 back. These columns mean "the write LANDED". Before they
+    -- existed, a row for a write with a 0% landing rate was byte-for-byte
+    -- indistinguishable from a row for a write that landed. terminal_* was
+    -- added as a SECOND fact rather than silently redefining `success` under
+    -- readers who never asked.
+    --
+    -- `success` IS NOT PER-LEG (task 4322). "The enqueue was accepted" is
+    -- exact only for a single-leg op. MemoryService.add_memory is the sole
+    -- dual-leg one: it mints ONE write_op_id for a queued Graphiti leg AND a
+    -- synchronous Mem0 leg, then journals a single row here with
+    -- success = not (_graphiti_error or _mem0_error) — an AND, so either leg's
+    -- failure zeroes it. Its reader reconciliation/stage_stats.py therefore
+    -- gates on `success` only for single-leg operations, and reads the row's
+    -- per-leg evidence (result_summary's `memory_ids` for the Mem0 leg,
+    -- `stores` for the Graphiti one) for the add_memory counters. Read
+    -- `success` as a whole-op summary, never as one leg's verdict.
     --
     -- terminal_status domain:
     --   NULL        no terminal outcome recorded — either still in flight, or
@@ -662,11 +673,16 @@ class WriteJournal:
         ``terminal_status`` is ``'completed'`` or ``'dead'``. Returns whether
         the outcome was durably recorded.
 
-        ``success`` is deliberately LEFT UNTOUCHED: it means "the enqueue was
-        accepted", and its readers (``reconciliation/stage_stats.py``, which
-        gates on ``op.get('success', 1)``) keep their current meaning. This
-        method records a second, different fact — "the write landed" — rather
-        than redefining the first one under readers who never asked.
+        ``success`` is deliberately LEFT UNTOUCHED: it means "this operation's
+        write was accepted", and its reader
+        (``reconciliation/stage_stats.py::derive_stage_stats``) keeps its
+        current meaning. This method records a second, different fact — "the
+        write landed" — rather than redefining the first one under readers who
+        never asked. That reader gates on ``success`` for single-leg operations
+        and on per-leg evidence for the dual-leg ``add_memory`` row, whose
+        ``success`` is an AND across both legs (see the ``write_ops`` schema
+        comment in ``SCHEMA_SQL``); this method's non-interference holds either
+        way.
 
         All three terminal fields are always written, so a replayed dead-letter
         that later lands clears its stale ``terminal_error`` (last-write-wins).
