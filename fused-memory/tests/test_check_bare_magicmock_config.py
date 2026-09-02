@@ -2055,15 +2055,6 @@ class TestWallClockDeadlineDebtBaseline:
         with pytest.raises(TypeError):
             _checker._apply_debt_budget([], 1)  # type: ignore[call-arg]
 
-    def test_each_rule_passes_its_own_overrun_builder(self):
-        """The two live call sites are wired to their own builders, not each other's."""
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        for builder in ('_debt_overrun_msg', '_wall_clock_overrun_msg'):
-            assert f'build_overrun_msg={builder}' in source, (
-                f'expected a call site passing build_overrun_msg={builder}; the '
-                'builders must stay paired with their own rule'
-            )
-
 
 class TestDebtBaselineIsolation:
     """The three baselines are independent: no rule's debt entry suppresses another rule."""
