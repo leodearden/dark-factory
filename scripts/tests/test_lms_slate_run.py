@@ -1139,6 +1139,135 @@ def test_a_fail_row_written_by_this_sweep_still_reaches_the_merge(tmp_path, two_
 
 
 # ---------------------------------------------------------------------------
+# ...and when the removal ITSELF fails, the driver stops instead of merging
+#
+# Removing the old part is a filesystem mutation, and a filesystem mutation can
+# fail: a read-only mount, an immutable attribute, the path having become a
+# directory.  On failure the stale part survives and `existing_parts` hands it
+# straight back to `--merge` with full manifest coverage — reintroducing the
+# overwrite the removal exists to make impossible.  So the driver must refuse
+# to merge at all when it cannot vouch for an input's VINTAGE.
+#
+# `Path.unlink` is MONKEYPATCHED rather than the file made unwritable by
+# `chmod`: a root-owned test runner ignores permission bits entirely, and the
+# test would silently stop testing anything while still passing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unremovable_arm_two_part(monkeypatch, tmp_path):
+    """arm-two holds a part from a previous sweep whose removal always fails."""
+    parts_dir = tmp_path / 'parts'
+    stale = _write_part(
+        parts_dir, 'arm-two', text=_failed_part('arm-two').model_dump_json(),
+    )
+    real_unlink = Path.unlink
+
+    def refusing_unlink(self, *args, **kwargs):
+        if self == stale:
+            raise OSError(30, 'Read-only file system')
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', refusing_unlink)
+    return parts_dir, stale
+
+
+def test_an_unremovable_part_is_reported_under_a_stage_that_names_the_removal(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """Not `start`, not `healthcheck`. Blaming a probe stage would send an
+    operator to debug a model that was never loaded, for a fault that is
+    entirely in the parts directory."""
+    parts_dir, stale = unremovable_arm_two_part
+
+    failures = lms_slate_run.sweep_arms(parts_dir, runner=_FakeRunner())
+
+    assert ('arm-two', lms_slate_run.STALE_PART_STAGE, 1) in failures
+    assert lms_slate_run.STALE_PART_STAGE not in ('start', 'wait-ready', 'healthcheck')
+    assert stale.exists()
+
+
+def test_an_arm_whose_part_cannot_be_removed_is_never_started(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """There is nothing to gain from ~4 minutes of model load for a result that
+    cannot be written into a directory already holding a file hostage."""
+    parts_dir, _ = unremovable_arm_two_part
+    runner = _FakeRunner()
+
+    lms_slate_run.sweep_arms(parts_dir, runner=runner)
+
+    stages = runner.stages()
+    assert ('ctl', 'start', 'arm-two') not in stages
+    assert ('ctl', 'wait-ready', 'arm-two') not in stages
+    assert ('healthcheck', 'arm-two') not in stages
+    # the rest of the sweep is unaffected — one hostage part is not a reason
+    # to stop measuring the arms whose parts are fine.
+    assert ('ctl', 'start', 'arm-one') in stages
+
+
+def test_an_unremovable_part_stops_the_run_before_the_merge(
+    tmp_path, two_arms, unremovable_arm_two_part,
+):
+    """The one case where the driver refuses to merge at all: it cannot vouch
+    for the vintage of a file it would hand `--merge`, and handing it over
+    anyway lets a stale row land in the committed artifact under a merge that
+    reports SUCCESS."""
+    parts_dir, _ = unremovable_arm_two_part
+    _write_part(parts_dir, 'arm-one')
+    runner = _FakeRunner()
+
+    code = lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) not in runner.stages()
+    assert code != 0
+
+
+def test_the_pre_merge_refusal_names_the_arm_and_the_part(
+    tmp_path, two_arms, unremovable_arm_two_part, capsys,
+):
+    """The part is a file a human has to go and deal with, so the refusal has
+    to say which one — an operator who has to grep the journal for the path is
+    being asked to re-derive what the driver already knew."""
+    parts_dir, stale = unremovable_arm_two_part
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=_FakeRunner())
+
+    err = capsys.readouterr().err
+    assert 'arm-two' in err
+    assert str(stale) in err
+
+
+@pytest.mark.parametrize('prewritten, failing_starts, merged', [
+    # zero parts — every arm refused its start, nothing on disk
+    ((), ('arm-one', 'arm-two'), []),
+    # a partial set — arm-one resumes off a valid part, arm-two never starts
+    (('arm-one',), ('arm-two',), ['arm-one.json']),
+])
+def test_the_refusal_keys_on_vintage_and_never_on_completeness(
+    tmp_path, two_arms, prewritten, failing_starts, merged,
+):
+    """The narrowness that stops this becoming a second coverage check. With no
+    removal failure, BOTH an empty and a partial set still reach the merge —
+    the existing `test_zero_parts_still_reaches_the_merge` and
+    `test_a_partial_set_still_reaches_the_merge_rather_than_being_pre_empted`
+    invariants — because those paths still record a refusal, in
+    `merge_reports`' own words and naming the uncovered arms. An unremovable
+    part is the only case that records one ONLY if the driver stops."""
+    parts_dir = tmp_path / 'parts'
+    for arm_id in prewritten:
+        _write_part(parts_dir, arm_id)
+    runner = _FakeRunner(
+        codes={('ctl', 'start', a): 4 for a in failing_starts} | {('merge',): 6},
+    )
+
+    lms_slate_run.run_slate(parts_dir, tmp_path / 'out.json', runner=runner)
+
+    assert ('merge',) in runner.stages()
+    assert _merged_parts(runner) == [str(parts_dir / name) for name in merged]
+
+
+# ---------------------------------------------------------------------------
 # a manifest carrying TBD placeholders is refused UP FRONT
 #
 # Measured on this branch, not assumed.  `lms_ctl start` refuses a placeholder
