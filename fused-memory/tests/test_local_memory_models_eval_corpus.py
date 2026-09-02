@@ -2965,6 +2965,95 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
         assert str(out) not in err
 
 
+class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
+    """build_corpus.py must USE ``shared.cli_boundary``, not carry its own copy.
+
+    Asserted BEHAVIOURALLY rather than by introspection: an ``import``-scanning
+    or ``hasattr``-based test would pass against a module that imported the
+    helper and then went on using its own private duplicate, which is the exact
+    regression this class exists to catch (INV-5).
+
+    The lever is the shared module's per-run state. If build_corpus is really
+    the consumer, then a run of ITS CLI spends the SHARED once-only budget and
+    installs its manifest detail on the SHARED reporter — both observable from
+    here by calling into ``shared.cli_boundary`` directly afterwards. If it
+    kept a private copy, the shared reporter is untouched and still armed.
+
+    The five spec classes above are deliberately NOT modified: their unchanged
+    passing is the evidence that this hoist preserved behaviour, and rewriting
+    them would destroy it at the moment it is needed.
+    """
+
+    def test_the_corpus_cli_spends_the_shared_reporters_once_only_budget(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """One ``error: ...`` line per run — counted across the MODULE boundary.
+
+        After the CLI has reported its line, a direct call into the shared
+        reporter must return the code and stay silent, because the run already
+        spent that budget. With a private duplicate flag the shared reporter is
+        still armed and prints a second line.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with _closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert len([line for line in err.splitlines() if line.strip()]) == 1
+
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert capsys.readouterr().err == '', 'the run had already spent the shared budget'
+
+    def test_the_manifest_detail_is_installed_on_the_shared_reporter(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """``main()`` installs the corpus's detail callback on the SHARED module.
+
+        The sentence stays with the caller that knows the artifact; the shared
+        reporter supplies only the parenthesised suffix. Driven through
+        ``main`` rather than ``_cli`` because ``main`` is where the install
+        must happen — it runs first, and it is the seam an in-process caller
+        drives.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert out.exists(), 'premise: the run landed a manifest to name'
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) in capsys.readouterr().err
+
+    def test_a_later_run_that_wrote_nothing_clears_the_shared_detail(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL, guarding the reset seam across the move to another module.
+
+        The cross-run staleness hazard ``test_a_run_that_wrote_nothing_does_
+        not_claim_a_manifest`` already guards must survive the state living in
+        ``shared.cli_boundary`` rather than here: a stale path reported as this
+        run's output is a worse lie than the bare exit code.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        out.unlink()
+
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run')
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) not in capsys.readouterr().err
+
+
 class _StdoutWithAFailingFlush(io.StringIO):
     """A stdout that accepts every write and fails on flush — ENOSPC, not a closed reader.
 
