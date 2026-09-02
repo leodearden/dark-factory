@@ -156,6 +156,34 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # this allowlist as if they were green-tier.
     'mem0_update.storm_threshold',
     'mem0_update.storm_window_seconds',
+    # ensure_entity_node authorization (task 4932). Read live per tool call by
+    # resolve_entity_mint_enabled (server/entity_mint_authz.py) off the shared
+    # memory_service.config.entity_mint object -- the resolver captures nothing
+    # at import or construction, so an in-place reload denies the very next
+    # call. Same must-be-green-tier argument as mem0_update.enabled above: this
+    # is what an operator flips to stop a runaway minter, and a restart-only
+    # kill switch is no kill switch.
+    'entity_mint.enabled',
+    # Read live per tool call by resolve_entity_mint_allowed_prefixes, same
+    # live-read path as the kill switch above. Widening this list on a running
+    # server is the supported way to admit a new repair flow without a restart.
+    # NOTE the bar gates on a SELF-REPORTED agent_id, so it deters misuse by
+    # cooperating callers rather than enforcing a security boundary.
+    'entity_mint.allowed_agent_prefixes',
+    # Bound on the wait for the per-group_id write-time-identity lock, read live
+    # off the shared config by MemoryService.ensure_entity_node and passed as
+    # the timeout ARGUMENT to asyncio.wait_for on every call. That per-call
+    # argument is the non-obvious part -- a timeout captured at construction
+    # could not observe an in-place mutation, which would make this leaf
+    # restart-only while sitting in this allowlist as if it were green-tier.
+    'entity_mint.lock_timeout_seconds',
+    # Mint-path storm-alarm knobs, read live off the shared config by
+    # MemoryService.ensure_entity_node and passed INTO StormCounter.record() on
+    # every call, for exactly the reason spelled out for the mem0_update storm
+    # leaves above: the shared StormCounter (server/storm_counter.py)
+    # deliberately does NOT capture threshold/window in __init__.
+    'entity_mint.storm_threshold',
+    'entity_mint.storm_window_seconds',
 })
 
 
