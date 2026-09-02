@@ -1191,10 +1191,18 @@ class MemoryConsolidator(BaseStage):
 
         new_memories = mem0_memories
         if watermark.last_memory_timestamp:
-            wm_str = str(watermark.last_memory_timestamp)
+            # Same str(watermark) lexical-compare defect as the episode filter
+            # above (task 4574) — Mem0 created_at/updated_at values are also
+            # ISO-with-'T' and, unlike episodes, are not normalized by
+            # _created_at_to_utc_iso, so they can carry non-UTC offsets too.
+            # Keep the `or` (not `if/else`) so an empty-string created_at
+            # still falls through to updated_at, matching prior behavior.
             new_memories = [
                 m for m in mem0_memories
-                if (m.get('created_at') or m.get('updated_at') or '') > wm_str
+                if _is_newer_than_watermark(
+                    m.get('created_at') or m.get('updated_at'),
+                    watermark.last_memory_timestamp,
+                )
             ]
 
         # 3. Store stats
