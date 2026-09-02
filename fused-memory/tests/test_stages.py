@@ -9742,6 +9742,11 @@ class TestReconMarkersGcSweptStat:
         mock_gc.assert_awaited_once_with(
             mock_deps['memory_service'], mock_deps['taskmaster'],
             _scope('reify', '/home/leo/src/reify'), 'test-run',
+            # run() now hoists terminal-id resolution once per cycle and shares
+            # the list with the Mem0 flag_for_stage2 sweep (task 4375). The
+            # fixture's taskmaster resolves to [], and _gc_recon_markers'
+            # None-default still self-resolves for every other caller.
+            terminal_task_ids=[],
         )
         for retired_key in (
             'stale_fixc_markers_swept',

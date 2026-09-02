@@ -1079,6 +1079,7 @@ async def _gc_recon_markers(
     run_id: str,
     *,
     now: datetime | None = None,
+    terminal_task_ids: list[str] | None = None,
 ) -> int:
     """Garbage-collect ``recon_ledger`` marker rows for *scope* in ONE DELETE pass.
 
@@ -1146,6 +1147,24 @@ async def _gc_recon_markers(
             helper — the marker write is not factored out), so the
             ledger's lexicographic TEXT comparison against stored
             ``expires_at`` values is correct.
+        terminal_task_ids: Optionally PRE-RESOLVED terminal task ids (task
+            4375). ``None`` (the default) preserves the original behaviour
+            exactly — this function resolves them itself via
+            :func:`_resolve_terminal_task_ids` — so every existing caller and
+            test is unaffected. When supplied, the internal resolve is skipped
+            and the caller's list is used verbatim.
+
+            This is purely an EFFICIENCY hoist, which is why a default is safe
+            here and deliberately is NOT on
+            :func:`_sweep_stale_mem0_flag_for_stage2_markers`: there the
+            argument is a correctness gate, so a forgotten argument must be a
+            loud ``TypeError`` rather than a silent fallback.
+            :meth:`TaskKnowledgeSync.run` supplies it so ONE bulk
+            ``get_statuses`` read serves both this pass and the Mem0
+            ``flag_for_stage2`` sweep, which additionally guarantees both see
+            the SAME view of terminality within a cycle. The bounding
+            intersection with ``marker_task_ids`` below still applies either
+            way.
 
     Returns:
         Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
@@ -1156,7 +1175,12 @@ async def _gc_recon_markers(
         return 0
 
     now_iso = _assume_utc(now or datetime.now(UTC)).isoformat()
-    terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+    # A pre-resolved list from run() skips this pass's own bulk get_statuses
+    # round-trip (task 4375); None keeps the original self-resolving path.
+    if terminal_task_ids is None:
+        terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+    else:
+        terminal_task_ids = list(terminal_task_ids)
 
     if terminal_task_ids:
         try:
@@ -3616,8 +3640,26 @@ class TaskKnowledgeSync(BaseStage):
         # sweep. Runs unconditionally on both full and remediation paths so
         # the pool is bounded every cycle. Explicit zero so downstream
         # consumers never need a .get(..., 0) fallback.
+        #
+        # Terminal-task ids are resolved ONCE here (task 4375) and shared by
+        # both consumers below: the ledger GC pass and the Mem0
+        # flag_for_stage2 sweep. _resolve_terminal_task_ids issues a bulk
+        # taskmaster.get_statuses() over the whole task tree, so a second
+        # independent resolve would be a pure duplicate round-trip on the
+        # cycle's critical path, every cycle, for every project — the same
+        # efficiency argument that made it a single bulk read instead of a
+        # per-marker get_task loop in the first place. Sharing ONE list also
+        # buys a correctness property: both passes necessarily see the SAME
+        # view of terminality within a cycle, so a task that transitions
+        # mid-cycle cannot be terminal for the ledger arm and still open for
+        # the Mem0 arm. It is fail-safe to [] (see that helper), which the
+        # Mem0 sweep reads as "gate active, nothing terminal" => full KEEP.
+        terminal_task_ids = await _resolve_terminal_task_ids(
+            self.taskmaster, self.scope, run_id,
+        )
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
+            terminal_task_ids=terminal_task_ids,
         )
 
         # stage2_persistence_marker (task 2095) is GC'd separately from Mem0,
@@ -3664,9 +3706,20 @@ class TaskKnowledgeSync(BaseStage):
         # gap as stage2_persistence_marker above). Runs unconditionally every
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
+        #
+        # Retirement here is COMPOSITE, not age-only (task 4375): a marker is
+        # deleted only when it is past the 14-day cutoff AND is not a
+        # protected cycle_summary mirror AND its kind is not in
+        # PROTECTED_AUDIT_KINDS AND its task_id is confirmed terminal in the
+        # list hoisted above. The terminal gate is the primary arm — it was
+        # added because 40 kind='cadence_check' audit records in
+        # autopilot_video were destroyed by the age-only sweep, all citing a
+        # task that is merely 'deferred'. The two sibling Mem0 sweeps above
+        # are deliberately age-only and are NOT gated.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
             await _sweep_stale_mem0_flag_for_stage2_markers(
                 self.memory, self.project_id, run_id,
+                terminal_task_ids=terminal_task_ids,
             )
         )
 
