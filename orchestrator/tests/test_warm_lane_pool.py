@@ -793,6 +793,43 @@ class TestSeedRcToUnavailable:
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
 
+    def test_124_is_lane_lock_timeout(self):
+        """Task 4930: rc=124 is flock's --conflict-exit-code for the bounded
+        ``<lane_dir>.lock`` wait — a TRANSIENT contention signal (a concurrent
+        GC reseed / thin / another seed still holds the lock), not a per-task
+        fault.  Before 4930 it fell through to FAULT, which is the one
+        warm-lane discriminant that is not a WarmLaneRequeue, so a lost lock
+        race hard-BLOCKed the task with agent_invocations=0.
+
+        Pinned via the module constant, not a bare 124 literal, so a retune of
+        the sentinel moves the test with it.
+        """
+        from orchestrator.git_ops import (
+            _SEED_WARM_LANE_LOCK_TIMEOUT_RC,
+            _seed_rc_to_unavailable,
+        )
+        assert _SEED_WARM_LANE_LOCK_TIMEOUT_RC == 124, (
+            'the flock --conflict-exit-code sentinel is expected to stay at '
+            "timeout(1)'s well-known 124 convention"
+        )
+        assert (
+            _seed_rc_to_unavailable(_SEED_WARM_LANE_LOCK_TIMEOUT_RC)
+            is WarmLaneUnavailable.LANE_LOCK_TIMEOUT
+        )
+
+    def test_existing_rc_mappings_unchanged(self):
+        """The new 124 branch must not swallow a neighbouring rc.
+
+        Re-asserts every other documented row in one place so a future edit to
+        the discriminant cannot quietly widen the lock-timeout branch (e.g. a
+        ``rc >= 124`` comparison) past its single cell.
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+
 
 class TestWarmLaneBaseResolvable:
     """GitOps._warm_lane_base_resolvable() — tri-state warm-base health probe.
