@@ -332,26 +332,28 @@ def _parse_resets_at_call_sites() -> list[str]:
     return sorted(sites)
 
 
-class TestFabricatingForkHasNoProductionCallers:
-    """`usage_gate._parse_resets_at` (the fabricating fork) must stay caller-free.
+class TestSingleResetsParserOwnership:
+    """`shared.invocation_outcome` is the SINGLE owner of `_parse_resets_at`
+    and `_extract_cap_message` — nothing else may define, re-export or call
+    the bare names.
 
-    Task 4042 moved the fork's ONE live call site — `_handle_auth_failure` —
-    onto the non-fabricating `shared.invocation_outcome` copy, because
-    restoring the 401/403 body snippet re-armed the `'resets' in reason.lower()`
-    branch: a body merely CONTAINING the substring "resets" without a parseable
-    phrase would otherwise persist an invented `now + 1h` recovery time onto a
-    revoked token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
+    Task 4042 moved the fabricating `usage_gate._parse_resets_at` fork's ONE
+    live call site — `_handle_auth_failure` — onto the non-fabricating
+    `shared.invocation_outcome` copy, because restoring the 401/403 body
+    snippet re-armed the `'resets' in reason.lower()` branch: a body merely
+    CONTAINING the substring "resets" without a parseable phrase would
+    otherwise persist an invented `now + 1h` recovery time onto a revoked
+    token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
 
-    DELETING the fork was deliberately out of scope: ~20 tests across `shared`
-    and `orchestrator` pin its `now + 1h` fallback contract, and
-    `orchestrator/src/orchestrator/usage_gate.py` re-exports it. So it stays
-    importable, and "do not wire new callers onto it" lived only as prose in a
-    docstring. This is the mechanical enforcement of that sentence: it fails
-    the moment production code calls the bare name anywhere outside the module
-    that DEFINES the strict copy.
+    Task 4357 then retired the fork itself, along with its caller-free
+    `_extract_cap_message` twin and the orchestrator re-export that kept both
+    importable. This class is what keeps the tree converged: with the fork
+    gone, the failure mode that would restore the fabrication regression is
+    RE-forking — someone re-adding a module-local parser, or re-exporting one
+    — and nothing else in the tree catches that.
 
-    If this fails because the fork was legitimately retired, delete the fork's
-    definition and this class together — do not relax the assertion.
+    Do not relax any assertion here. If a second copy is genuinely wanted,
+    that is a design change: argue it, don't let a guard erode.
     """
 
     def test_scan_finds_the_known_strict_call_site(self):
@@ -371,19 +373,67 @@ class TestFabricatingForkHasNoProductionCallers:
         ]
         assert offenders == [], (
             'new production caller(s) of the bare `_parse_resets_at` name: '
-            f'{offenders}. Outside {_STRICT_PARSE_OWNER} this resolves to the '
-            'FABRICATING fork in shared/src/shared/usage_gate.py (or its '
-            'orchestrator re-export), which invents `now + 1h` on parse '
-            'failure. Import the strict copy as `_parse_resets_at_strict` '
-            'instead — see TestAuthFailedPersistsResetsAt for why.'
+            f'{offenders}. Outside {_STRICT_PARSE_OWNER} the bare name resolves '
+            'to nothing at all (NameError) — unless a module-local fork has '
+            'been re-introduced, which is the regression this guards: the '
+            'retired fork invented `now + 1h` on parse failure. Import the '
+            'strict copy as `_parse_resets_at_strict` instead — see '
+            'TestAuthFailedPersistsResetsAt for why.'
         )
 
-    def test_handle_auth_failure_does_not_import_the_fork(self):
+    def test_handle_auth_failure_uses_the_single_parser(self):
         # Belt-and-braces on the specific regression: the module that owns
         # _handle_auth_failure must reach the strict copy under its alias.
         import shared.usage_gate as usage_gate_module
 
         assert usage_gate_module._parse_resets_at_strict is invocation_outcome._parse_resets_at
+
+    def test_usage_gate_defines_no_local_copy(self):
+        """`usage_gate.py` must not DEFINE either function.
+
+        An AST `FunctionDef` scan rather than `hasattr`/`vars()`: the module
+        legitimately imports the strict parser under an alias, and a name
+        bound by `import ... as _parse_resets_at_strict` must not be mistaken
+        for a local definition. Scanning defs also catches a re-fork that is
+        never imported anywhere — i.e. before it has a caller for
+        `test_only_the_strict_copy_owner_calls_the_bare_name` to find.
+        """
+        path = _REPO_ROOT / 'shared/src/shared/usage_gate.py'
+        assert path.is_file(), f'usage_gate.py missing: {path}'
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        module_level_defs = {
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        refork = module_level_defs & {'_parse_resets_at', '_extract_cap_message'}
+        assert refork == set(), (
+            f'shared/src/shared/usage_gate.py re-defines {sorted(refork)}. Both '
+            f'live ONLY in {_STRICT_PARSE_OWNER}; a second copy is exactly the '
+            'un-guarded drift surface task 4357 removed, and the copy that '
+            'used to live here fabricated `now + 1h` on parse failure.'
+        )
+
+    def test_orchestrator_shim_does_not_reexport_the_retired_names(self):
+        """The orchestrator shim is public-surface-only.
+
+        `shared.usage_gate.__all__` lists no underscore names, so the star
+        import cannot reintroduce these — only an explicit re-export tuple
+        could, which is how they used to survive there.
+        """
+        import orchestrator.usage_gate as orch_usage_gate
+
+        leaked = [
+            name
+            for name in ('_parse_resets_at', '_extract_cap_message')
+            if hasattr(orch_usage_gate, name)
+        ]
+        assert leaked == [], (
+            f'orchestrator/src/orchestrator/usage_gate.py re-exports {leaked}. '
+            f'Both live ONLY in {_STRICT_PARSE_OWNER}; re-exporting them from a '
+            'second module is what let the retired fabricating fork stay '
+            'importable.'
+        )
 
 
 @pytest.mark.asyncio
