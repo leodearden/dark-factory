@@ -19,6 +19,7 @@ the same funnel with a real config and a real ``LocalRunner``.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,7 +41,7 @@ from test_verify_merge_flake_suppression import (
     _module_config,
 )
 
-from orchestrator import flake_recorder, verify
+from orchestrator import chronic_flake, flake_recorder, verify
 from orchestrator.event_store import EventType
 from orchestrator.flake_ledger import (
     FlakeCallSite,
@@ -50,8 +51,17 @@ from orchestrator.flake_ledger import (
     list_open_debt,
     read_occurrences,
 )
+from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_queue import _run_post_merge_verify
+from orchestrator.merge_queue import (
+    GroupMergeRequest,
+    MergeOutcome,
+    QueuedBranch,
+    RealMergeItem,
+    SpeculativeMergeWorker,
+    _do_train_merge,
+    _run_post_merge_verify,
+)
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
 
@@ -647,3 +657,228 @@ class TestDispatcherOpensDebt:
         assert len(_rows(tmp_path)) == 1
         assert len(_suppression_events(store)) == 1, store.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+# ---------------------------------------------------------------------------
+# The CONSTRUCTION seam (PRD task ζ, §5.9): the worker builds the task client,
+# and both of its readers actually hand it to `_run_post_merge_verify`.
+#
+# Cited from `merge_queue.py::SpeculativeMergeWorker.__init__` at the
+# `self._flake_task_client` assignment.
+# ---------------------------------------------------------------------------
+
+
+def _worker(git_ops, *, scheduler=None) -> SpeculativeMergeWorker:
+    """A bare worker over *git_ops*, wired with *scheduler* (or not).
+
+    Only the two ctor arguments that decide ``_flake_task_client`` are varied;
+    everything else is the same bare-harness construction the rest of the merge
+    suite uses (``git_ops`` + an empty queue).
+    """
+    return SpeculativeMergeWorker(
+        git_ops=git_ops, queue=asyncio.Queue(), scheduler=scheduler,
+    )
+
+
+def _group_req(tmp_path: Path, config, *, task_id: str = 'train-tip'):
+    """A minimal ``GroupMergeRequest`` whose members all report merge-deferred.
+
+    Shaped after ``test_atomic_train_merge.build_group_merge_request`` — a
+    single-member train, which is all ``_do_train_merge`` needs to reach its
+    ``_run_post_merge_verify`` call: the status pre-check passes, the rebase and
+    the merge are stubbed green on ``git_ops``.
+    """
+    return GroupMergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        worktree=tmp_path,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        train_id='train-1',
+        member_task_ids=[task_id],
+        tip_branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        tip_task_id=task_id,
+        status_check=AsyncMock(return_value={task_id: 'merge-deferred'}),
+        mark_member_done=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+class TestWorkerBuildsTheFlakeTaskClient:
+    """The worker CONSTRUCTS the ζ flake task client, and BOTH readers supply it.
+
+    ``TestDispatcherOpensDebt`` above proves the *parameter* is honoured: hand
+    ``_run_post_merge_verify`` a client and a suppressed red becomes an owned debt
+    row.  That is a different claim from "the production callers actually hand it
+    one", and this class pins the second.
+
+    The distinction matters because this seam's failure mode is SILENT.  A caller
+    that stops supplying the client — a typo'd ``getattr`` name in
+    ``_do_train_merge``, a ctor refactor that drops the ``scheduler`` argument, a
+    ``project_root`` that stops resolving — degrades exactly into the well-tested
+    "nothing wired" configuration: the merge still lands, the occurrence row and
+    the structured fact and the INV-4 streak are all still written, and §5.9 simply
+    stops being enforced with nothing anywhere going red.  Only an assertion that
+    the handle ARRIVES at the boundary can catch that, so each forwarding test also
+    asserts the handle is not None — ``None is None`` would pass for the exact
+    regression these tests exist to detect.
+
+    Construction is conditional on both a scheduler and a project_root because the
+    alternative is an UNOWNED debt row (see
+    ``flake_recorder.py::record_merge_flake_suppression``), so the None cases are
+    pinned as deliberate behaviour rather than tolerated slack.
+    """
+
+    # -- (a) construction ----------------------------------------------------
+
+    async def test_scheduler_and_project_root_build_a_bound_client(
+        self, tmp_path: Path,
+    ) -> None:
+        """Both ingredients present → a ``SchedulerChronicFlakeTaskClient`` bound to
+        THIS scheduler and THIS project root.
+
+        The binding is asserted, not just the type: a client built over some other
+        root would file its de-flake tasks against the wrong project, which is
+        indistinguishable from "filed correctly" at every other seam.
+        """
+        scheduler = MagicMock()
+        worker = _worker(_make_git_ops(tmp_path), scheduler=scheduler)
+
+        client = worker._flake_task_client
+        assert isinstance(client, chronic_flake.SchedulerChronicFlakeTaskClient), (
+            f'§5.9 needs a real adapter here, got {client!r}'
+        )
+        assert client._scheduler is scheduler, (
+            'the client must dispatch through the worker\'s own scheduler'
+        )
+        assert client._project_root == str(tmp_path), (
+            f'client bound to {client._project_root!r}, expected {str(tmp_path)!r}'
+        )
+
+    async def test_no_scheduler_yields_no_client(self, tmp_path: Path) -> None:
+        """A bare-harness worker (no scheduler) gets None — the recorder then opens
+        no debt row at all, rather than one nobody can own."""
+        worker = _worker(_make_git_ops(tmp_path))
+
+        assert worker._flake_task_client is None, (
+            f'no scheduler must mean no client, got {worker._flake_task_client!r}'
+        )
+
+    async def test_git_ops_without_project_root_yields_no_client(self) -> None:
+        """A mock ``git_ops`` carrying no usable ``project_root`` gets None too.
+
+        ``MagicMock(spec=GitOps)`` has no ``project_root`` attribute at all (it is
+        an instance attribute, not a class one), which is precisely the bare-mock
+        shape most of the merge suite constructs — the same None-safety
+        ``_shadow_state_path`` is built with one line above.
+        """
+        worker = _worker(MagicMock(spec=GitOps), scheduler=MagicMock())
+
+        assert worker._flake_task_client is None, (
+            f'no project_root must mean no client, got {worker._flake_task_client!r}'
+        )
+
+    # -- (b) read site 1: SpeculativeMergeWorker._run_inflight_verify --------
+
+    async def test_run_inflight_verify_supplies_the_client(
+        self, tmp_path: Path,
+    ) -> None:
+        """The speculative worker's own verify dispatch passes ``_flake_task_client``.
+
+        Driven exactly as ``test_merge_queue_depth_telemetry.py``'s
+        ``TestRunInflightVerifyDepthWiring`` drives the same method — a real
+        ``RealMergeItem`` + ``HostLease`` with ``_run_post_merge_verify`` patched to
+        capture its kwargs.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        config = _make_config(tmp_path)
+        req = _make_req('inflight-tip', tmp_path, config)
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit=_MERGE_SHA, merge_worktree=tmp_path,
+            ),
+            merge_wt=tmp_path,
+            base_sha='a' * 40,
+            speculative=True,
+        )
+        lease = HostLease(name='remote-1', runner=MagicMock(), is_local=False)
+
+        captured: dict = {}
+
+        async def _capture(*_args, **kwargs):
+            captured.update(kwargs)
+            return None  # verify passed; nothing else in the method matters here
+
+        worker = _worker(_make_git_ops(tmp_path), scheduler=MagicMock())
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _capture):
+            await worker._run_inflight_verify(item, lease, depth=0)
+
+        assert 'task_client' in captured, (
+            f'_run_inflight_verify supplied no task_client at all: {sorted(captured)}'
+        )
+        assert worker._flake_task_client is not None, (
+            'guard: the worker was built WITH a scheduler and a project_root, so a '
+            'None here would make the identity assertion below vacuous'
+        )
+        assert captured['task_client'] is worker._flake_task_client, (
+            f'expected the worker\'s own client, got {captured["task_client"]!r}'
+        )
+
+    # -- (c) read site 2: module-level _do_train_merge ------------------------
+
+    async def test_do_train_merge_supplies_the_client(self, tmp_path: Path) -> None:
+        """The train pipeline passes the same handle off the worker it is given.
+
+        This site reads the attribute by NAME through ``getattr`` (the narrow
+        ``_TrainMergeHost`` Protocol declares neither flake handle), so a typo in
+        that string silently degrades to the ``None`` default with every other
+        train assertion in the suite still green.  Only an identity check here
+        catches it.
+
+        A train's masked red is no less debt than a single-branch one, which is why
+        the train path must supply a client at all.
+        """
+        config = _make_config(tmp_path)
+        req = _group_req(tmp_path, config)
+
+        git_ops = _make_git_ops(tmp_path)
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)
+        git_ops.merge_to_main = AsyncMock(return_value=MergeResult(
+            success=True, merge_commit=_MERGE_SHA, merge_worktree=tmp_path,
+        ))
+
+        worker = _worker(git_ops, scheduler=MagicMock())
+
+        captured: dict = {}
+
+        async def _capture(*_args, **kwargs):
+            captured.update(kwargs)
+            # A non-None outcome short-circuits _do_train_merge right here, so the
+            # test never reaches the CAS-advance / finalize machinery it is not
+            # about.  failure_category='' keeps it off the interaction-candidate
+            # tagging branch.
+            return MergeOutcome('blocked', reason='verify red (test short-circuit)')
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _capture):
+            outcome = await _do_train_merge(worker, req)
+
+        assert outcome.status == 'blocked', (
+            f'guard: the patched verify must have been reached; got {outcome!r}'
+        )
+        assert 'task_client' in captured, (
+            f'_do_train_merge supplied no task_client at all: {sorted(captured)}'
+        )
+        assert worker._flake_task_client is not None, (
+            'guard: built WITH a scheduler and a project_root, so the identity '
+            'assertion below is not None-is-None'
+        )
+        assert captured['task_client'] is worker._flake_task_client, (
+            f'expected the worker\'s own client (is the getattr name right?), '
+            f'got {captured["task_client"]!r}'
+        )

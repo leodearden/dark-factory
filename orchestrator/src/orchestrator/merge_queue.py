@@ -9531,8 +9531,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # opens no debt row at all rather than an unowned one — see
         # `orchestrator/src/orchestrator/flake_recorder.py::record_merge_flake_suppression`.
         #
-        # Read at TWO sites: `_verify_and_advance`'s `_run_post_merge_verify` dispatch,
-        # and `_do_train_merge`'s (via `getattr`, since it takes the narrow
+        # Read at TWO sites: `_run_inflight_verify`'s `_run_post_merge_verify`
+        # dispatch (the VERIFY HALF of `_verify_and_advance` — grep the former, it
+        # is the name that exists), and `_do_train_merge`'s (via `getattr`, since it takes the narrow
         # `_TrainMergeHost` Protocol).  Both are covered by
         # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
         # — this construction is the one seam whose failure mode is SILENT (a site that
