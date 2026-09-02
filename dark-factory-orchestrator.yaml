@@ -574,22 +574,38 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # The "full warm verify here is ~2 min" premise these were originally sized
 # against is STALE by an order of magnitude — it predates the monorepo growing
 # to 9 chained suites. It is deleted rather than softened, because a stale
-# justification is worse than none. MEASURED per-segment durations (task 3062
-# attempt-2, .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run
-# started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
-# escalation esc-3062-3):
+# justification is worse than none.
 #
-#     shared         120.21   (2582 passed)
-#     escalation     123.29   (898 passed)
-#     orchestrator  1366.23   (13398 passed, zero failures)
-#     fused-memory   123.87   (8658 passed)
-#     tests/scripts  105.00   (lowest of four independent runs, 105-127s)
-#                   -------
-#                   1838.60s   <- five of eight segments; already > the old 1800
+# MEASURED per-segment durations. These span TWO measurement epochs, separated
+# by a regime change — do not read the table as one run:
+#
+#   shared / escalation / fused-memory / tests/scripts — task 3062 attempt-2,
+#     .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run started
+#     2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
+#     escalation esc-3062-3. One logged run each (tests/scripts: lowest of four).
+#   orchestrator — RE-MEASURED 2026-08-28 by task 4902 from the per-module
+#     verify corpus (`.worktrees/*/.task/verify/*.orchestrator.summary.json`),
+#     FULL-SUITE GREEN runs only, n=28.
+#
+# THE REGIME CHANGE between them: commit 685f558728 (2026-08-20) set
+# `verify_admission_pytest_n: "8"`, capping orchestrator's xdist fanout. Its
+# median green full-suite cost stepped from 691.40s to 1765.95s — ~2.6x. The
+# four 2026-07-31 figures were NOT re-measured and are 28 days older.
+#
+# NO PER-SEGMENT FIGURE IS RESTATED HERE, deliberately (task 4902). Each
+# segment's value, its measurement date, its sample size and — for
+# orchestrator — its percentile spread live ONCE, in
+# MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and
+# POST_CAP_ORCHESTRATOR_GREEN_SECS in tests/scripts/
+# test_fallback_verify_config.py. Read them there: a number copied into this
+# comment would be one more copy to raise in lockstep — the same reason the
+# per-module budgets below are not copied here either.
 #
 # dashboard, sampler and cockpit are absent because the run timed out at
-# 1800.66s before dashboard even started, so 1838.60 is a hard measured LOWER
-# BOUND, not an estimate. The old 1800s ceiling was provably below it: a healthy
+# 1800.66s before dashboard even started, so 2238.32 is a measured LOWER BOUND
+# on the MEDIAN green chain — five of eight segments, each a representative
+# green run — not an estimate, and not a bound on an individual run (see the
+# measured spread below). The old 1800s ceiling was provably below it: a healthy
 # run could not clear it, so it surfaced no hangs — it manufactured infra_timeout
 # on the honest green path, after already passing 25,536 tests with zero
 # failures. A structural overrun, not a hang.
@@ -598,7 +614,8 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # measured plus the three unmeasured ones estimated rather than silently costed
 # at zero:
 #
-#     measured floor (five segments, above)       1838.60
+#     measured floor (five segments, summed from
+#                   MEASURED_FLEET_SEGMENT_SECS)  2238.32
 #     + scripts/tests (task 3384, lowest of local
 #                   runs, 1184 passed)                ~113
 #     + dashboard  1393 collected @ ~0.137 s/test  ~190
@@ -608,21 +625,69 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 #                   costs 0 on a checkout where cockpit is absent — but it IS
 #                   present here, so budget for it)
 #                                                 -------
-#     honest green path                            ~2246
+#     honest green path (at orchestrator p50)      ~2645
 #
 # The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
 # and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.6x headroom over that path, covering the load
-# variance the two same-day orchestrator measurements demonstrate (1157.62s vs
-# 1366.23s, ~18%) plus scripts/tests' own load sensitivity (task 3384 measured
+# comment). 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
+# the 4902 re-measurement, and the margin has since collapsed.
+#
+# THE LOAD VARIANCE THAT HEADROOM HAS TO COVER is far wider than this comment
+# used to claim. It cited the two same-day 2026-07-31 orchestrator measurements
+# (1157.62s vs 1366.23s, ~18% apart) as the spread to budget for. The 4902
+# corpus of 28 green full-suite runs shows 864.83s to 3310.50s — a 3.8x spread,
+# with 14 of the 28 above 1800s. The ~18% figure is not a soft under-estimate to
+# be padded; it is no longer true, and is replaced rather than softened. Add to
+# it scripts/tests' own load sensitivity (task 3384 measured
 # it between ~113s idle and, combined with tests/scripts/, up to ~505s wall
 # under contention — see the task-3384 comment above and project memory for
 # the combined-directories figures). Cold gets 5400s because it additionally
 # pays the ~180s `uv sync --all-packages` preprovision plus uv sync across 6
 # subprojects.
 #
-# It also un-starves the `orchestrator` module's OWN verify, which at 1366.23s
-# was consuming 76% of the old per-command ceiling.
+# THE FINDING OF THE 4902 RE-MEASUREMENT, stated plainly because the numbers
+# above no longer speak for themselves. The path is green at the MEDIAN and
+# tight or over everywhere above it:
+#
+#     at orchestrator p50 1765.95  ->  honest green path ~2645   1.36x under 3600
+#     at orchestrator p90 2552.09  ->  honest green path ~3431   1.05x under 3600
+#     at observed max     3310.50  ->  honest green path ~4190   OVER 3600
+#
+# That last row is not hypothetical. At the time of the 4902 mine one run had
+# already consumed the full 3600s ceiling and been recorded as a false
+# infra_timeout: timed_out true, rc 1, duration 3600.649s, started
+# 2026-08-28T17:25:05Z, observed at
+# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json.
+#
+# THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT. A
+# `.task/verify/*.summary.json` is a TRANSIENT, per-attempt artifact — it is
+# OVERWRITTEN by the next attempt in the same worktree and PRUNED with the
+# worktree itself. The numbers are copied here precisely because that is the
+# only durable form this observation has: the path records where it was read,
+# not where it can be re-read. Re-checked 2026-08-30, two days later: that
+# exact path had already been rewritten by a later, unrelated attempt (rc 1,
+# timed_out FALSE, 2884.15s, started 2026-08-30T08:49:51Z) and no longer holds
+# the record above, while a different worktree's attempt showed the same
+# ceiling hit (timed_out true, 3605.06s) that same day. So do NOT re-point
+# these numbers at whatever that path currently contains, and do NOT read a
+# non-matching path as the claim having been false. To re-establish the
+# phenomenon, re-mine the corpus glob
+# (`.worktrees/*/.task/verify/*.orchestrator.summary.json`) — never one path.
+#
+# That is the same failure MODE the 1800s ceiling produced and this raise was
+# meant to end; the -n 8 cap moved the suite back up into it.
+#
+# The remedies — exempting the `orchestrator` prefix from the -n cap, giving
+# orchestrator/orchestrator.yaml its own budget above 3600, or task 3589's
+# controlled fixed-CPUQuota A/B — are the PINNED OPERATOR DECISION on task
+# 3353's L1. Task 4902 deliberately took none of them: it re-measured and
+# recorded, and changed no budget, no -n cap and no per-module yaml. The
+# evidence the decision needs is written down; only the action is deferred.
+#
+# It also un-starves the `orchestrator` module's OWN verify. At the 2026-07-31
+# figure of 1366.23s that segment was consuming 76% of the old 1800s ceiling;
+# re-measured at 1765.95s it is 49% of this 3600s one — but at its observed
+# green maximum of 3310.50s it is 92%, which is the row above restated.
 #
 # WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
 # each subproject's own orchestrator.yaml — not on starving the whole-fleet
@@ -649,9 +714,11 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # (verify._resolve_verify_timeout does not "inherit-ish" — an unset module knob
 # is a HARD fall-through to this value). Closing it is task 3353's scope, not
 # 3473's. That is not mere deference: 3353 has since been rewritten to split or
-# shard the orchestrator suite, so a budget sized now against today's unsharded
-# 1366.23s figure would be invalidated by 3353's own change rather than refined
-# by it. It is carried as the single documented entry in MODULE_BUDGET_EXCLUSIONS
+# shard the orchestrator suite, so a budget sized now against the unsharded
+# figure would be invalidated by 3353's own change rather than refined by it.
+# The 4902 re-measurement makes that deferral MORE justified, not less — the
+# unsharded figure is a moving target, having gone 1366.23s (2026-07-31, n=1)
+# -> 1765.95s median with a 864.83..3310.50s spread (2026-08-28, n=28). It is carried as the single documented entry in MODULE_BUDGET_EXCLUSIONS
 # with a stated deletion condition — once orchestrator/orchestrator.yaml declares
 # its own verify_command_timeout_secs, delete that entry and the coverage guard
 # picks it up with no further edit.
@@ -673,22 +740,46 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # BE PRECISE ABOUT WHAT THAT FLEET-CHAIN-FLOOR GUARD DOES, because overclaiming
 # it would repeat this comment's own original sin. It asserts the measured floor
 # rather than pinning a value, so it catches anyone LOWERING this budget below
-# 1838.60s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
-# frozen literal table, so if the orchestrator segment doubles tomorrow the
-# table still reads 1366.23, the floor still reads 1838.60, and the guard stays
-# green while the budget is once again provably below the honest green path.
-# Detecting that requires RE-MEASUREMENT — the table has no way to measure
-# itself. So the numbers above are a dated snapshot (2026-07-31), not a
-# self-maintaining invariant: when a verify run's own recorded durations diverge
-# from the table, re-measure and update BOTH the table and this derivation. (A
-# durations-based growth check would need to read a recent run's recorded
+# 2238.32s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
+# frozen literal table.
+#
+# THAT PREDICTION CAME TRUE VERBATIM, so record it rather than re-issue it. This
+# paragraph used to read "if the orchestrator segment doubles tomorrow the table
+# still reads 1366.23, the floor still reads 1838.60, and the guard stays green
+# while the budget is once again provably below the honest green path." The
+# segment roughly doubled (commit 685f558728, 2026-08-20), the table did stay at
+# 1366.23, and the guard did stay green — for eight days, until task 4902
+# re-measured the segment BY HAND on 2026-08-28.
+#
+# So the table still cannot measure itself, and 4902 built no detector that
+# would let it. What changed is only this: nothing performs the re-measurement
+# AUTOMATICALLY, task 4902 performed it once by hand, and the two copies of the
+# table can no longer drift apart because there is no longer a second copy —
+# 4902 first tried to POLICE the duplicate with a guard that parsed this
+# comment block, then deleted the duplicate instead, which is the remedy the
+# per-module budgets above already use. Each entry's age and sample now live in
+# MEASURED_FLEET_SEGMENT_PROVENANCE beside the table, so which epoch a figure
+# came from is readable without archaeology.
+#
+# TO REPEAT THE MEASUREMENT rather than re-derive it: mine
+# `.worktrees/*/.task/verify/*.orchestrator.summary.json` for `test`-label
+# commands, keep only FULL-SUITE runs (the positional pytest target is bare
+# `tests/` — file-scoped rescopes measure a diff's blast radius, not a segment)
+# and only GREEN ones (rc 0 and not timed_out), then split on the regime change.
+# The full rules, both arms and the percentile conventions are recorded at
+# POST_CAP_ORCHESTRATOR_GREEN_SECS in that same test file. Note the corpus is
+# PRUNED with its worktrees, so it shrinks over time and no test may read it.
+# (A durations-based growth check would need to read a recent run's recorded
 # per-segment times rather than a literal; that is deliberately not built here —
 # the point is that nothing currently performs it, so a human must.)
 #
-# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite
-# alone grew to 1366s; if it keeps growing, the answer is scoping verify to the
-# task's declared modules — which is what tests/scripts/orchestrator.yaml now
-# does for this very fallback path (task 3350) — not raising this number again.
+# NOTE: this buys headroom, it does not fix the trend — and the trend has since
+# been observed continuing. orchestrator's suite alone went from 1366s
+# (2026-07-31) to a 1765.95s median with runs to 3310.50s (2026-08-28, task
+# 4902), consuming most of the headroom this raise bought. If it keeps growing,
+# the answer is scoping verify to the task's declared modules — which is what
+# tests/scripts/orchestrator.yaml now does for this very fallback path (task
+# 3350) — or sharding the suite (task 3353), not raising this number again.
 verify_command_timeout_secs: 3600
 verify_cold_command_timeout_secs: 5400
 
