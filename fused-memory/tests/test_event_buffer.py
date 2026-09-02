@@ -993,6 +993,136 @@ async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
         await buf.close()
 
 
+@pytest.mark.asyncio
+async def test_cleanup_drained_poison_timestamp_does_not_truncate_a_multi_chunk_sweep(
+    tmp_path, monkeypatch
+):
+    """One malformed timestamp must not truncate a sweep spanning multiple chunks.
+
+    test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp already
+    pins this at 2 rows in a single chunk. This is the multi-chunk variant:
+    with _CLEANUP_FETCH_CHUNK monkeypatched to 2, a 7-row sweep spans four
+    chunks and SQLite gives no ordering guarantee for RETURNING output, so
+    the poison row can land in any of them — the assertions below hold for
+    every placement, by construction, so this is order-independent.
+
+    A break-on-ValueError variant of cleanup_drained would pass this at 1
+    chunk but fail here: it would return fewer than 7 while the DELETE still
+    removed all 7 rows (SQLite stages RETURNING output before the DELETE
+    completes — see the cleanup_drained docstring), permanently losing the
+    un-rolled-up rows from event_arrival_hourly.
+    """
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 2)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_poison.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        for _ in range(7):
+            await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        # Corrupt one drained row's timestamp behind the buffer's back — same
+        # recipe as test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp:
+        # the value both fails to parse AND sorts below the cutoff, so the
+        # DELETE genuinely reaches it.
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT id FROM event_buffer WHERE status = 'drained' LIMIT 1"
+        ) as cursor:
+            victim = await cursor.fetchone()
+        assert victim is not None
+        await db.execute(
+            'UPDATE event_buffer SET timestamp = ? WHERE id = ?',
+            ('0001-01-01 not a timestamp', victim['id']),
+        )
+        await db.commit()
+
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+        assert deleted == 7
+
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            remaining = await cursor.fetchone()
+        assert remaining is not None
+        assert remaining['cnt'] == 0
+
+        # Only the six well-formed rows reached the aggregate.
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 6,
+        }
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_mid_stream_fault_rolls_the_whole_sweep_back(
+    tmp_path, monkeypatch
+):
+    """A fault raised partway through a chunked sweep rolls back atomically.
+
+    _txn() rolls back on any BaseException and re-raises, and _safe_rollback
+    suppresses every exception from the rollback itself — so a rollback that
+    silently failed would strand the writer lock. This pins that it does not:
+    after the fault, the buffer is still usable and a fresh sweep recovers
+    the full rollup, not just that the exception propagates.
+    """
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 2)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_fault.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        for _ in range(7):
+            await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        # event_buffer.py does `from ...throughput import utc_hour_bucket`,
+        # rebinding the name into event_buffer's own module namespace — so
+        # that (not throughput.utc_hour_bucket) is what must be patched.
+        real_bucket = event_buffer_mod.utc_hour_bucket
+        call_count = 0
+
+        def faulty_bucket(ts):
+            nonlocal call_count
+            call_count += 1
+            # Calls 1-3 succeed (first chunk of 2 plus one row of the
+            # second), call 4 faults — genuinely mid-cursor, not on the
+            # first or last chunk. RuntimeError, deliberately not a
+            # ValueError, so it is NOT swallowed by cleanup_drained's
+            # per-row except ValueError handler.
+            if call_count > 3:
+                raise RuntimeError('injected mid-stream fault')
+            return real_bucket(ts)
+
+        monkeypatch.setattr(event_buffer_mod, 'utc_hour_bucket', faulty_bucket)
+
+        with pytest.raises(RuntimeError, match='injected mid-stream fault'):
+            await buf.cleanup_drained(max_age_seconds=0)
+
+        # Atomic: nothing from the aborted sweep took effect.
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['cnt'] == 7
+        assert await _arrival_rollup(buf) == {}
+
+        # Not wedged: restore the real bucketer and confirm a fresh sweep —
+        # and the writer lock it needs — still works.
+        monkeypatch.undo()
+
+        assert await buf.cleanup_drained(max_age_seconds=0) == 7
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 7,
+        }
+    finally:
+        await buf.close()
+
+
 # ── Deferred writes (cycle fence) ────────────────────────────────────
 
 
