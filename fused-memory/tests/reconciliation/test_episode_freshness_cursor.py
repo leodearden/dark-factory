@@ -128,3 +128,117 @@ class TestEpisodeFreshnessCursor:
             f'Expected header (0); got result:\n{result!r}'
         )
         assert 'older-episode' not in result
+
+
+class TestMem0FreshnessCursor:
+    """The Mem0 ``new_memories`` filter carries the IDENTICAL string-compare
+    defect as the episode filter, on a separate code path. Mem0 ``created_at``
+    values are ISO-with-``T`` but — unlike episodes — are NOT normalized by
+    ``_created_at_to_utc_iso``, so they can also carry non-UTC offsets."""
+
+    @pytest.mark.asyncio
+    async def test_same_day_earlier_memory_excluded(self):
+        """A memory from earlier the SAME calendar day as the watermark must
+        be excluded, not re-surfaced forever (mirrors the episode incident)."""
+        stage = _make_consolidator()
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {
+                        'id': 'same-day-earlier-mem',
+                        'created_at': '2026-08-20T02:00:00+00:00',
+                        'memory': 'same-day-earlier content',
+                        'metadata': {'category': 'temporal_facts'},
+                    }
+                ]
+            }
+        )
+        watermark = Watermark(project_id='test_project', last_memory_timestamp=WATERMARK_TS)
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Mem0 Memories Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        assert 'same-day-earlier-mem' not in result, (
+            f'Same-day-earlier memory must not re-surface; got result:\n{result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuinely_newer_memory_included(self):
+        """A memory from the NEXT calendar day must still be surfaced."""
+        stage = _make_consolidator()
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {
+                        'id': 'newer-mem',
+                        'created_at': '2026-08-21T03:00:00+00:00',
+                        'memory': 'genuinely newer content',
+                        'metadata': {'category': 'temporal_facts'},
+                    }
+                ]
+            }
+        )
+        watermark = Watermark(project_id='test_project', last_memory_timestamp=WATERMARK_TS)
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Mem0 Memories Since Last Reconciliation (1)' in result, (
+            f'Expected header (1); got result:\n{result!r}'
+        )
+        assert 'newer-mem' in result
+
+    @pytest.mark.asyncio
+    async def test_updated_at_fallback_newer_included(self):
+        """No created_at, but a genuinely-newer updated_at: the existing
+        created_at -> updated_at fallback must still surface the memory."""
+        stage = _make_consolidator()
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {
+                        'id': 'fallback-newer-mem',
+                        'updated_at': '2026-08-21T03:00:00+00:00',
+                        'memory': 'fallback newer content',
+                        'metadata': {'category': 'temporal_facts'},
+                    }
+                ]
+            }
+        )
+        watermark = Watermark(project_id='test_project', last_memory_timestamp=WATERMARK_TS)
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Mem0 Memories Since Last Reconciliation (1)' in result, (
+            f'Expected header (1); got result:\n{result!r}'
+        )
+        assert 'fallback-newer-mem' in result
+
+    @pytest.mark.asyncio
+    async def test_updated_at_fallback_same_day_earlier_excluded(self):
+        """No created_at, and a same-day-earlier updated_at: the fallback
+        value must go through the same instant comparison and be excluded."""
+        stage = _make_consolidator()
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {
+                        'id': 'fallback-earlier-mem',
+                        'updated_at': '2026-08-20T02:00:00+00:00',
+                        'memory': 'fallback earlier content',
+                        'metadata': {'category': 'temporal_facts'},
+                    }
+                ]
+            }
+        )
+        watermark = Watermark(project_id='test_project', last_memory_timestamp=WATERMARK_TS)
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Mem0 Memories Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        assert 'fallback-earlier-mem' not in result, (
+            f'Same-day-earlier fallback memory must not re-surface; got result:\n{result!r}'
+        )
