@@ -41,6 +41,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.utils.canonical_labels import Referent, parse_node_name
+
 # Fail-CLOSED module defaults, used whenever a config hop is missing, None, or
 # the wrong type. Deny, never permit — see the module docstring's inversion note.
 _DEFAULT_ENABLED: bool = False
@@ -65,6 +67,22 @@ class EntityMintAuthzDecision:
     """
 
     allowed: bool
+    error_type: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class EntityMintNameDecision:
+    """The canonical-name verdict — a value, never an exception (INV-1).
+
+    Carries the parsed :class:`~fused_memory.utils.canonical_labels.Referent` on
+    the allowed branch so the caller need not re-parse the name, and so the
+    task-store verification downstream can route on ``referent.project_id``
+    without re-deriving it.
+    """
+
+    allowed: bool
+    referent: Referent | None = None
     error_type: str | None = None
     error: str | None = None
 
@@ -163,3 +181,79 @@ def resolve_entity_mint_authorization(
         )
 
     return EntityMintAuthzDecision(allowed=True)
+
+
+def validate_mint_name(name: Any) -> EntityMintNameDecision:
+    """Decide whether *name* is a mintable, CANONICALLY-SPELLED node name.
+
+    Delegates to :func:`fused_memory.utils.canonical_labels.parse_node_name` and
+    adds NO second copy of the label pattern: that module is the single
+    normative task-label vocabulary (INV-5), and its own docstring forbids a
+    second copy — the drift a duplicate introduces is invisible until a
+    destructive consumer acts on the stale half.
+
+    Three outcomes, all returned as VALUES:
+
+    * ``parse_node_name`` returns ``None`` → ``EntityMintNonTaskName``. A name
+      that does not parse is a NON-TASK name, and admitting it would make this a
+      general junk-node minter. Since ``canonical_labels`` narrowed its digit
+      classes from ``\\d`` to ``[0-9]``, this branch also absorbs non-ASCII
+      Unicode digits (``'task \u0663'``), so no ``'Task \u0663'`` node is
+      mintable.
+    * ``name != referent.node_name`` → ``EntityMintNonCanonicalName``, naming
+      ``referent.node_name`` as the form to retry with. REFUSING rather than
+      silently normalizing is what makes ``'task #3222'``, ``'Task: 3222'`` and
+      ``'Task 3222'`` converge on ONE node instead of splitting — the same rule
+      leaf eta already applies.
+    * otherwise allowed, carrying the referent.
+
+    BOTH spellings round-trip through ``Referent.node_name``: the bare local
+    form (``'Task 3222'``) and the project-QUALIFIED foreign form
+    (``'reify:132'``), so one comparison covers them with no extra branch.
+    Admitting the qualified form is not a widening — it is the exact case
+    ``ensure_entity_node`` was originally built for (task 3335: LLM extraction
+    discards the qualifier and collapses the reference onto a bare ``Task N``).
+    The qualifier is never normalized away here, because that collapse is
+    precisely the bug :mod:`fused_memory.utils.cross_project_refs` exists to
+    detect. Note ``'REIFY:132'`` parses but canonicalizes its qualifier to
+    lowercase, so it correctly lands in the NON-CANONICAL arm rather than the
+    ``None`` arm.
+    """
+    if not isinstance(name, str) or not name:
+        return EntityMintNameDecision(
+            allowed=False,
+            error_type='EntityMintNonTaskName',
+            error=(
+                f'ensure_entity_node name must be a non-empty string, got '
+                f'{name!r}. Only task-shaped names are mintable in v1.'
+            ),
+        )
+
+    referent = parse_node_name(name)
+    if referent is None:
+        return EntityMintNameDecision(
+            allowed=False,
+            error_type='EntityMintNonTaskName',
+            error=(
+                f'{name!r} is not a task-shaped node name, so it cannot be '
+                'minted. Only names that parse as a task referent (the bare '
+                "'Task N' form or the project-qualified 'project:N' form) are "
+                'mintable in v1 — admitting anything else would turn this tool '
+                'into a general junk-node minter, and nothing sweeps orphan '
+                'minted nodes.'
+            ),
+        )
+
+    if name != referent.node_name:
+        return EntityMintNameDecision(
+            allowed=False,
+            error_type='EntityMintNonCanonicalName',
+            error=(
+                f'{name!r} is not the canonical spelling of the referent it '
+                f'names. Retry with {referent.node_name!r}. Minting the variant '
+                'as written would SPLIT the referent into a second node instead '
+                'of converging on the one that already represents it.'
+            ),
+        )
+
+    return EntityMintNameDecision(allowed=True, referent=referent)
