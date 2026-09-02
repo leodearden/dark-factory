@@ -102,8 +102,29 @@ def test_count_graphiti_queued_false_when_mem0_only():
     assert _count_graphiti_queued(op) is False
 
 
-def test_count_graphiti_queued_false_when_failed():
+def test_count_graphiti_queued_counts_when_mem0_leg_failed():
+    """The mirror of the ``_count_add_memory`` case: ``success=0``, Graphiti fine.
+
+    ``'graphiti'`` is appended to ``stores`` only AFTER
+    ``durable_queue.enqueue`` returns (see
+    ``services/memory_service.py::MemoryService.add_memory``), so its presence
+    is per-leg proof the enqueue was ACCEPTED and the write is durably
+    persisted in the queue's SQLite. ``success`` on this row is the AND across
+    both legs, so a failed Mem0 leg zeroes it while saying nothing at all about
+    the queued leg this counter counts.
+    """
     op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_count_graphiti_queued_false_when_enqueue_itself_failed():
+    """Boundary pin: dropping the ``success`` gate cannot over-count.
+
+    When the ENQUEUE is what raised, ``stores`` never gains ``'graphiti'``, so
+    the evidence gate rejects the row without needing ``success`` - the gate
+    was redundant in exactly the case it looked like it was protecting.
+    """
+    op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': []}}
     assert _count_graphiti_queued(op) is False
 
 
@@ -780,6 +801,58 @@ async def test_derive_stage_stats_counts_mem0_leg_when_graphiti_enqueue_failed(j
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed == _expected(memories_added=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_counts_graphiti_enqueue_when_mem0_leg_failed(journal):
+    """End-to-end mirror: a dual_write whose SYNCHRONOUS Mem0 leg raised.
+
+    ``memory_ids`` stays empty (``mem0.add`` never returned) while ``stores``
+    carries ``'graphiti'`` because the enqueue was accepted first. The write is
+    durably persisted in the queue, so ``graphiti_writes_queued`` is 1 even
+    though ``success`` is 0.
+    """
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+        success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_mem0_failed_and_graphiti_leg_died_reports_dead_not_queued(
+    journal,
+):
+    """The dropped ``success`` gate composes with task 3648's ``_landed`` gate.
+
+    Same row as the test above, but the accepted queue item then DIED. The two
+    gates answer different questions and both still apply: ``success`` no
+    longer masks the accepted enqueue, yet ``graphiti_writes_queued`` stays 0
+    because the branch remains ``_landed``-gated and that write never reached
+    the backend. The outcome is reported, not silent - ``writes_dead_lettered``
+    is 1.
+
+    This pins that this task removes only the ``success`` mask; it does not
+    strip ``_landed`` from the branch whose subject genuinely IS the queued leg.
+    """
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+        success=False,
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(writes_dead_lettered=1)
 
 
 @pytest.mark.asyncio
