@@ -451,9 +451,11 @@ class TestArgparseHelpCannotVanishDownAFailedStdout:
         :func:`run_cli` decide. ``SystemExit(0)`` never being reached IS the
         assertion.
         """
-        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
-            with pytest.raises(BrokenPipeError):
-                self._parser().parse_args(['--help'])
+        with (
+            _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False),
+            pytest.raises(BrokenPipeError),
+        ):
+            self._parser().parse_args(['--help'])
         monkeypatch.undo()
 
     def test_help_onto_a_full_disk_escapes_as_a_plain_oserror(self, monkeypatch):

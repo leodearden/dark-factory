@@ -46,15 +46,13 @@ import sys
 from collections.abc import Callable
 from typing import IO
 
-#: Grown as each name lands (``run_cli`` follows), so every commit stays
-#: lint-clean rather than carrying an F822 for a symbol that does not exist
-#: yet. The finished surface is these six names.
 __all__ = [
     'EXIT_STDOUT_FAILED',
     'LoudArgumentParser',
     'report_broken_pipe',
     'report_stdout_failure',
     'reset_stdout_failure_state',
+    'run_cli',
 ]
 
 EXIT_STDOUT_FAILED = 1
@@ -285,3 +283,113 @@ class LoudArgumentParser(argparse.ArgumentParser):
 
     def print_help(self, file: IO[str] | None = None) -> None:
         (file or sys.stdout).write(self.format_help())
+
+
+def run_cli(main: Callable[[], int]) -> int:
+    """Process-boundary wrapper: run *main* and force stdout out while it can fail usefully.
+
+    USAGE — the whole adoption shape for a sibling script::
+
+        from shared.cli_boundary import LoudArgumentParser, run_cli
+
+        def _build_parser():
+            parser = LoudArgumentParser(...)
+            ...
+
+        def main(argv: list[str] | None = None) -> int:
+            ...
+
+        if __name__ == '__main__':
+            sys.exit(run_cli(main))
+
+    A closed stdout pipe (``cmd | head``) fails in two measurably different
+    ways, and only one of them ever reaches ``main()``'s own
+    ``except BrokenPipeError``:
+
+    * LARGE write — the report overflows stdout's buffer, so ``print`` flushes
+      mid-run, the ``write()`` fails, and the error is raised in-band.
+      ``main()`` catches it.
+    * SHORT write — a one-line verdict stays in the buffer, so the run raises
+      NOTHING. ``main()`` returns its ordinary code and the failure surfaces
+      only when the interpreter flushes ``sys.stdout`` during finalization,
+      where no ``except`` can intervene and the returned status is overridden.
+
+    The explicit flush is what converts the second case into the first. It is
+    NOT redundant with the interpreter's own shutdown flush and must not be
+    "simplified" away: its entire purpose is to attempt the buffered write
+    *earlier*, while a handler is still on the stack, so a deferred and
+    uncatchable failure becomes the same documented :data:`EXIT_STDOUT_FAILED`
+    plus single ``error: ...`` line every other failure produces.
+
+    Kept OUT of ``main()`` deliberately. ``main(argv) -> int`` is the seam a
+    test suite drives and its contract is "parse and run, return a code";
+    interpreter-lifecycle concerns — flushing what is left, and redirecting fd
+    1 so finalization cannot fail on it — belong at the process boundary, which
+    is this function and the ``__main__`` guard that calls it.
+
+    ``argparse`` accounts for the other two handlers, in complementary
+    buffering regimes that are not reachable by each other's:
+
+    * BLOCK-buffered — ``--help`` and an unrecognized flag leave ``parse_args``
+      via ``SystemExit``, which happens inside ``main()`` but BEFORE its
+      ``try``, with their text still buffered. The flush in that handler is
+      what surfaces it.
+    * UNBUFFERED (``PYTHONUNBUFFERED=1``, ``python -u``, a tty) — the write
+      reaches fd 1 during ``parse_args`` and fails there, inside the
+      ``except OSError: pass`` argparse wraps its own message writes in,
+      leaving nothing for a later flush to find. :class:`LoudArgumentParser`
+      re-raises it, and it arrives at one of the two stdout handlers below.
+
+    A closed reader is not the only way stdout fails, so the arms below are a
+    PAIR, and their order is the mechanism rather than a style choice:
+
+    * ``except BrokenPipeError`` — the ``| head`` shape, which gets its own
+      message because "the reader went away" has its own remedy.
+    * ``except OSError`` — every other stdout failure raised IN-BAND: a full
+      disk or quota on a report ``print``, a disconnected tty,
+      ``print_help``'s re-raise onto anything that is not a pipe. It must stay
+      SECOND, because ``BrokenPipeError`` is an ``OSError`` and a wide arm
+      first would swallow the closed-pipe case and its distinct message.
+
+    That second arm is safe HERE and would not be inside ``main()``, which is
+    the distinction task 3757 turned on: a consumer converts every non-stdout
+    ``OSError`` at the seam that knows what it means — the store read, the
+    artifact write — so what is still an ``OSError`` by the time it reaches
+    this frame is stdout-shaped by construction. ``main``'s ``try`` wraps the
+    WHOLE run, so the same arm there would mis-attribute a store or filesystem
+    failure to stdout. It belongs at the process boundary and nowhere else.
+
+    The ``SystemExit`` handler RE-RAISES on a successful flush rather than
+    returning a normalised code: ``SystemExit.code`` may be ``None`` or a
+    non-int, and re-raising delegates every one of those shapes back to the
+    interpreter that defines them instead of re-implementing the mapping here.
+    So ``--help`` still exits 0 and a bad flag still exits 2, unchanged.
+
+    ``SystemExit`` specifically, never a bare ``except BaseException``: that
+    would swallow ``KeyboardInterrupt`` and genuine bugs behind a tidy
+    message — a silent fail-soft, which is the inversion of this module's
+    entire purpose (INV-11).
+
+    :func:`reset_stdout_failure_state` at entry deliberately installs NO
+    detail. A consumer that wants one installs it from its own ``main()``,
+    which runs first and is also the seam an in-process test drives.
+    """
+    reset_stdout_failure_state()
+    try:
+        code = main()
+    except BrokenPipeError:
+        # Only reachable from LoudArgumentParser's re-raise, which happens in
+        # parse_args — outside main()'s own try.
+        return _handle_broken_pipe()
+    except OSError as exc:
+        # MUST stay below the BrokenPipeError arm: BrokenPipeError IS an
+        # OSError, so the wide arm first would swallow the closed-pipe case and
+        # lose its distinct message. Ordering is the whole mechanism here.
+        return _handle_stdout_error(exc)
+    except SystemExit:
+        failed = _flush_stdout()
+        if failed is not None:
+            return failed
+        raise
+    failed = _flush_stdout()
+    return code if failed is None else failed
