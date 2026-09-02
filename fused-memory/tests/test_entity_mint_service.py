@@ -328,3 +328,272 @@ class TestWriteJournal:
             'a leaked identity lock would wedge every subsequent write to this '
             'group_id, including the episode-ingest path'
         )
+
+
+class _FakeClock:
+    """Advanceable clock — the 3600s window without sleeping.
+
+    Copies ``tests/test_memory_service.py::_FakeClock``, the idiom the sibling
+    ``mem0_update`` storm alarm is tested with.
+    """
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestEntityMintStormAlarm:
+    """Guard 7: the MINT-path burst alarm (INV-4 storm escape).
+
+    Minting is the one branch of this tool that CREATES something, and nothing
+    sweeps orphan minted nodes — so a caller stuck in a mint loop leaves a
+    growing pile of junk identity nodes and no other signal. This counter is
+    that signal.
+
+    A monitoring alarm, NEVER a rate limiter: crossing the threshold must not
+    fail the mint that crossed it, or a legitimate repair batch would break
+    mid-run over its own success count.
+
+    The emitter is monkeypatched at the ``services.memory_service`` module
+    symbol rather than asserted through a real escalation file: the
+    ``escalation`` package is a DEFENSIVE OPTIONAL import and is absent in
+    minimal envs, so a test that filed for real would be environment-coupled and
+    would fail for a reason that has nothing to do with this alarm.
+    """
+
+    @pytest.fixture
+    def stormy(self, service, monkeypatch):
+        """Service + fake clock + stubbed emitter."""
+        clock = _FakeClock()
+        service._entity_mint_storm_time_provider = clock
+        # The escalator resolves project_root from `_known_projects` and
+        # escalates NOTHING when it cannot (never guessing at cwd), so the
+        # registry has to be populated or every leg here would pass vacuously.
+        service.set_known_projects({_PROJECT: '/tmp/df-root'})
+        emitter = MagicMock(return_value='esc-entity-mint-storm-1')
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.emit_entity_mint_storm_escalation',
+            emitter,
+        )
+        return service, clock, emitter
+
+    @staticmethod
+    async def _mint(service, agent_id: str | None = 'curator-x'):
+        return await service.ensure_entity_node(
+            name=_NAME, project_id=_PROJECT, agent_id=agent_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_burst_of_mints_fires_the_emitter_exactly_once(self, stormy):
+        service, _clock, emitter = stormy
+        threshold = service.config.entity_mint.storm_threshold
+
+        for _ in range(threshold - 1):
+            await self._mint(service)
+        assert emitter.call_count == 0, (
+            f'{threshold - 1} mints is BELOW the bar; firing here would page an '
+            'operator for a batch that never breached'
+        )
+
+        await self._mint(service)
+
+        emitter.assert_called_once()
+        kwargs = emitter.call_args.kwargs
+        assert kwargs['agent_id'] == 'curator-x'
+        assert kwargs['project_id'] == _PROJECT
+        assert kwargs['count'] == threshold
+        assert kwargs['threshold'] == threshold
+        assert kwargs['window_seconds'] == service.config.entity_mint.storm_window_seconds
+
+        # A sustained storm keeps minting but does not keep paging.
+        for _ in range(threshold):
+            await self._mint(service)
+        emitter.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_project_root_is_the_referents_own_project(self, stormy):
+        """Filed into the project's OWN queue, never the server cwd."""
+        service, _clock, emitter = stormy
+
+        for _ in range(service.config.entity_mint.storm_threshold):
+            await self._mint(service)
+
+        emitter.assert_called_once()
+        args, kwargs = emitter.call_args
+        assert (args[0] if args else kwargs.get('project_root')) == '/tmp/df-root'
+
+    @pytest.mark.asyncio
+    async def test_resolves_never_count(self, stormy):
+        """Only MINTS count. A resolve creates nothing to sweep."""
+        service, _clock, emitter = stormy
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[_node('uuid-existing')],
+        )
+
+        for _ in range(service.config.entity_mint.storm_threshold * 2):
+            await self._mint(service)
+
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_refusals_never_count(self, stormy):
+        service, _clock, emitter = stormy
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[_node('uuid-a'), _node('uuid-b')],
+        )
+
+        for _ in range(service.config.entity_mint.storm_threshold * 2):
+            await self._mint(service)
+
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lock_busy_refusals_never_count(self, stormy):
+        """A refused mint minted nothing, so it is not evidence of a mint storm."""
+        service, _clock, emitter = stormy
+        service.config.entity_mint.lock_timeout_seconds = 0.01
+        lock = service.graphiti._identity_lock_for(_PROJECT)
+        await lock.acquire()
+        try:
+            for _ in range(service.config.entity_mint.storm_threshold * 2):
+                busy = await self._mint(service)
+                assert busy['error_type'] == 'EntityMintLockBusy'
+        finally:
+            lock.release()
+
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_threshold_and_window_are_read_live(self, stormy):
+        """What EARNS the green-tier classification of both leaves.
+
+        A threshold captured at construction could not observe this in-place
+        mutation, which would leave `entity_mint.storm_threshold` restart-only
+        while sitting in RELOADABLE_FIELDS as if it were hot-reloadable.
+        """
+        service, _clock, emitter = stormy
+
+        await self._mint(service)
+        await self._mint(service)
+        emitter.assert_not_called()
+
+        # reload_config mutates the shared config object IN PLACE, exactly so.
+        service.config.entity_mint.storm_threshold = 3
+        service.config.entity_mint.storm_window_seconds = 60.0
+
+        await self._mint(service)
+
+        emitter.assert_called_once()
+        kwargs = emitter.call_args.kwargs
+        assert kwargs['threshold'] == 3, 'the NEW threshold must be what decided'
+        assert kwargs['count'] == 3
+        assert kwargs['window_seconds'] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_mints_outside_the_window_are_evicted(self, stormy):
+        """A slow steady trickle never trips it — the window is a real window."""
+        service, clock, emitter = stormy
+        threshold = service.config.entity_mint.storm_threshold
+        window = service.config.entity_mint.storm_window_seconds
+
+        for _ in range(threshold * 3):
+            await self._mint(service)
+            clock.advance(window)
+
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_emitter_that_raises_never_breaks_the_mint(self, stormy):
+        """The mint has ALREADY landed by the time the alarm runs.
+
+        Turning a completed mint into an exception because the COMPLAINT about
+        it failed would be strictly worse than losing the signal.
+        """
+        service, _clock, emitter = stormy
+        emitter.side_effect = RuntimeError('escalation queue down')
+        threshold = service.config.entity_mint.storm_threshold
+
+        result = None
+        for _ in range(threshold):
+            result = await self._mint(service)
+
+        assert result is not None
+        assert result['minted'] is True, result
+        assert result['status'] == 'minted'
+        assert service.graphiti.ensure_entity_node.await_count == threshold
+
+    @pytest.mark.asyncio
+    async def test_a_non_numeric_threshold_skips_the_alarm_without_raising(
+        self, stormy,
+    ):
+        """A corrupt config leaf costs the alarm, never the write."""
+        service, _clock, emitter = stormy
+        service.config.entity_mint.storm_threshold = 'ten'
+
+        result = await self._mint(service)
+
+        assert result['minted'] is True, result
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_non_numeric_window_skips_the_alarm_without_raising(self, stormy):
+        service, _clock, emitter = stormy
+        service.config.entity_mint.storm_window_seconds = None
+
+        result = await self._mint(service)
+
+        assert result['minted'] is True, result
+        emitter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_counters_are_keyed_per_agent(self, stormy):
+        """Two independently-busy agents must not sum into a false alarm."""
+        service, _clock, emitter = stormy
+        threshold = service.config.entity_mint.storm_threshold
+
+        # (threshold - 1) each: individually innocent, jointly well past the
+        # bar. A shared counter would page here.
+        for i in range((threshold - 1) * 2):
+            await self._mint(service, agent_id=f'curator-{i % 2}')
+
+        emitter.assert_not_called()
+        assert set(service._entity_mint_storm_counters) == {'curator-0', 'curator-1'}
+
+    @pytest.mark.asyncio
+    async def test_an_unattributed_mint_labels_as_unattributed(self, stormy):
+        """A missing agent_id still counts — there is simply nothing to name it."""
+        service, _clock, emitter = stormy
+
+        for _ in range(service.config.entity_mint.storm_threshold):
+            await self._mint(service, agent_id=None)
+
+        emitter.assert_called_once()
+        assert emitter.call_args.kwargs['agent_id'] == '<unattributed>'
+        assert set(service._entity_mint_storm_counters) == {'<unattributed>'}
+
+    @pytest.mark.asyncio
+    async def test_dormant_counters_are_evicted(self, stormy):
+        """agent_id is caller-supplied and unbounded in cardinality.
+
+        Each counter self-prunes its own deque, but nothing would drop the
+        counter OBJECT — so a server running for weeks between restarts would
+        accumulate one dead counter per agent it ever saw.
+        """
+        service, clock, _emitter = stormy
+        window = service.config.entity_mint.storm_window_seconds
+
+        await self._mint(service, agent_id='curator-gone')
+        assert 'curator-gone' in service._entity_mint_storm_counters
+
+        clock.advance(window * 2)
+        await self._mint(service, agent_id='curator-live')
+
+        assert set(service._entity_mint_storm_counters) == {'curator-live'}, (
+            'a counter whose window has gone empty must be dropped, not merely '
+            'self-pruned'
+        )
