@@ -502,3 +502,214 @@ class TestArgparseHelpCannotVanishDownAFailedStdout:
         captured = capsys.readouterr()
         assert 'unrecognized' in captured.err
         assert 'unrecognized' not in captured.out
+
+
+class TestRunCliConvertsEveryStdoutFailureIntoOneDocumentedOutcome:
+    """The boundary itself, driven against synthetic ``main`` callables.
+
+    Each ``main`` here is three lines, defined inline, so a failure names
+    :func:`~shared.cli_boundary.run_cli` rather than some consumer's build
+    logic. The end-to-end wiring of a real CLI is the subject of the corpus
+    tests in ``fused-memory/tests/``, not of this class.
+
+    Every arm is covered, including the ones a "simplification" would collapse:
+    the pass-through controls (a boundary that returned
+    ``EXIT_STDOUT_FAILED`` unconditionally, or ate the output, goes red), the
+    ``SystemExit`` re-raise (``--help`` still 0, a bad flag still 2), and the
+    exceptions that must PROPAGATE rather than be tidied into an exit code.
+    """
+
+    def test_a_healthy_run_passes_its_output_and_its_code_straight_through(self, capsys):
+        """CONTROL, and the one that catches an over-eager fix."""
+
+        def main() -> int:
+            print('the ordinary report')
+            return 0
+
+        assert cli_boundary.run_cli(main) == 0
+        assert 'the ordinary report' in capsys.readouterr().out
+
+    def test_a_nonzero_code_from_main_is_returned_unchanged(self):
+        """CONTROL: the boundary is not an exit-code table of its own."""
+        assert cli_boundary.run_cli(lambda: 3) == 3
+
+    def test_a_short_buffered_write_into_a_closed_pipe_is_a_failure_not_a_success(
+        self, monkeypatch, capsys
+    ):
+        """THE HEADLINE SHAPE. Without the explicit flush this returns 0.
+
+        A short write stays in the block buffer, so ``main`` raises nothing and
+        returns its ordinary success code — and the failure would surface only
+        at interpreter finalization, where no ``except`` can intervene. That is
+        a success the caller never received.
+
+        ``quiet_close=True`` is the second half of the assertion: the boundary
+        redirected fd 1, so the interpreter's later flush cannot fail on the
+        buffer this one left behind.
+        """
+
+        def main() -> int:
+            print('short')
+            return 0
+
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            code = cli_boundary.run_cli(main)
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'closed the output pipe' in reported[0]
+
+    def test_a_line_buffered_write_raises_in_band_and_lands_on_the_same_outcome(
+        self, monkeypatch, capsys
+    ):
+        """The other regime: the BrokenPipeError escapes ``main`` itself.
+
+        Different frame, same code and same message — a reader comparing this
+        with the test above should see the failure site differ and nothing else.
+        """
+
+        def main() -> int:
+            print('short')
+            return 0
+
+        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=True):
+            code = cli_boundary.run_cli(main)
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'closed the output pipe' in reported[0]
+
+    def test_an_in_band_oserror_that_is_not_a_broken_pipe_keeps_its_own_message(
+        self, monkeypatch, capsys
+    ):
+        """ARM ORDER, pinned at the boundary.
+
+        ``BrokenPipeError`` IS an ``OSError``. If the wide arm were placed
+        first it would swallow the closed-pipe case and print this message for
+        it too; if the wide arm were missing, this ENOSPC would escape as a raw
+        traceback. Only the documented order satisfies both this test and the
+        closed-pipe tests above.
+        """
+
+        def main() -> int:
+            print('x' * 500)
+            return 0
+
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            _StdoutWithAFailingWrite(
+                OSError(errno.ENOSPC, 'No space left on device'), min_length=200
+            ),
+        )
+        capsys.readouterr()
+        code = cli_boundary.run_cli(main)
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'No space left on device' in reported[0]
+        assert 'closed the output pipe' not in reported[0]
+
+    @pytest.mark.parametrize('code', [0, 2, None, 'a message'], ids=['zero', 'two', 'none', 'str'])
+    def test_a_system_exit_on_a_healthy_stdout_propagates_unchanged(self, code):
+        """RE-RAISED, not normalised — which is what keeps ``--help`` at 0 and a bad flag at 2.
+
+        ``SystemExit.code`` may be ``None`` or a non-int, and re-raising
+        delegates every one of those shapes back to the interpreter that
+        defines them instead of re-implementing the mapping here. The ``none``
+        and ``str`` ids exist because a handler that returned ``exc.code`` from
+        an ``int``-returning function would pass the first two and silently
+        change the process's status for the other two.
+        """
+
+        def main() -> int:
+            raise SystemExit(code)
+
+        with pytest.raises(SystemExit) as excinfo:
+            cli_boundary.run_cli(main)
+        assert excinfo.value.code == code
+
+    def test_a_system_exit_with_output_stuck_in_a_closed_pipe_becomes_a_failure(
+        self, monkeypatch, capsys
+    ):
+        """The argparse BLOCK-buffered leg: ``SystemExit(0)`` with the text still buffered.
+
+        ``parse_args`` leaves via ``SystemExit`` from INSIDE ``main`` but
+        before its own ``try``, so nothing is raised in-band and the pipe
+        handlers never fire. The flush in this arm is what surfaces it — and a
+        run whose entire output went nowhere is not a success, so the code is
+        replaced rather than re-raised.
+        """
+
+        def main() -> int:
+            print('the help text')
+            raise SystemExit(0)
+
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            code = cli_boundary.run_cli(main)
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        assert 'closed the output pipe' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('exc', [KeyboardInterrupt, RuntimeError], ids=['sigint', 'bug'])
+    def test_anything_that_is_not_a_stdout_failure_propagates(self, exc):
+        """NO SILENT FAIL-SOFT (INV-11). ``except SystemExit``, never a bare BaseException.
+
+        A wide arm here would satisfy the "one error: line" promise while
+        swallowing Ctrl-C and genuine bugs behind a tidy message, turning a
+        loud crash into a silent one — the exact inversion this whole module
+        exists to prevent.
+        """
+
+        def main() -> int:
+            raise exc('not a stdout failure')
+
+        with pytest.raises(exc):
+            cli_boundary.run_cli(main)
+
+    def test_two_consecutive_runs_each_report_their_own_error_line(self, monkeypatch, capsys):
+        """PER-RUN RESET at entry, so a long-lived process does not go silent on run two.
+
+        This covers a consumer whose ``main`` knows nothing about this module
+        and therefore never resets anything itself.
+        """
+
+        def main() -> int:
+            print('short')
+            return 0
+
+        for _ in range(2):
+            with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+                assert cli_boundary.run_cli(main) == cli_boundary.EXIT_STDOUT_FAILED
+            monkeypatch.undo()
+            reported = _reported_lines(capsys.readouterr().err)
+            assert len(reported) == 1
+            assert 'closed the output pipe' in reported[0]
+
+    def test_the_entry_reset_installs_no_detail_of_its_own(self, monkeypatch, capsys):
+        """A detail belongs to the consumer's ``main``, which runs first.
+
+        ``run_cli``'s reset deliberately clears the callback rather than
+        installing one: it has no idea what the run produced. Pinned here
+        because the alternative — ``run_cli(main, *, detail=...)`` — would put
+        the installation in two places for any consumer whose ``main`` must
+        install it anyway to serve in-process callers.
+        """
+        cli_boundary.reset_stdout_failure_state(detail=lambda: 'a stale artifact path')
+
+        def main() -> int:
+            print('short')
+            return 0
+
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            assert cli_boundary.run_cli(main) == cli_boundary.EXIT_STDOUT_FAILED
+        monkeypatch.undo()
+
+        assert 'a stale artifact path' not in capsys.readouterr().err
