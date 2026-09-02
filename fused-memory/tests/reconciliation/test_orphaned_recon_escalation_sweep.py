@@ -30,9 +30,14 @@ Covers here (steps 1/3/5 of the plan):
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     ORPHANED_ESCALATION_FLAG_CATEGORY,
@@ -43,6 +48,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
     escalation_project_id,
     select_reapable_escalations,
+    sweep_orphaned_recon_escalations,
 )
 
 GATE_BACKLOG = 'reconciliation_stale_gate_backlog'
@@ -531,3 +537,417 @@ class TestBuildOrphanedEscalationFlag:
                 subject_project_id='dark_factory',
                 subject_status='blocked',
             )
+
+
+DARK_ROOT = '/srv/dark-factory'
+REIFY_ROOT = '/srv/reify'
+KNOWN_PROJECTS = {'dark_factory': DARK_ROOT, 'reify': REIFY_ROOT}
+
+
+def make_queue(pending, *, get_pending_error: BaseException | None = None):
+    """An ``EscalationQueue`` double whose ``get_pending`` is SYNC, as the real one is."""
+    queue = MagicMock(spec=EscalationQueue)
+    if get_pending_error is not None:
+        queue.get_pending.side_effect = get_pending_error
+    else:
+        queue.get_pending.return_value = list(pending)
+    return queue
+
+
+def make_taskmaster(
+    censuses_by_root,
+    *,
+    tags_by_root=None,
+    list_tags_error_roots=None,
+    statuses_error_roots=None,
+):
+    """A ``TaskBackendProtocol`` double with per-root, per-tag censuses.
+
+    Args:
+        censuses_by_root: ``{project_root: {tag: {task_id: status}}}``.
+        tags_by_root: optional ``{project_root: [tag, ...]}`` overriding the
+            tag list derived from *censuses_by_root* (used to pin the
+            empty-tag-list fallback).
+        list_tags_error_roots: roots whose ``list_tags`` raises.
+        statuses_error_roots: roots whose ``get_statuses_fresh`` raises.
+    """
+    list_tags_error_roots = set(list_tags_error_roots or ())
+    statuses_error_roots = set(statuses_error_roots or ())
+
+    async def _list_tags(project_root):
+        if project_root in list_tags_error_roots:
+            raise RuntimeError(f'list_tags exploded for {project_root}')
+        if tags_by_root is not None:
+            return list(tags_by_root.get(project_root, []))
+        return list(censuses_by_root.get(project_root, {}))
+
+    async def _get_statuses_fresh(project_root, ids=None, tag=None):
+        if project_root in statuses_error_roots:
+            raise RuntimeError(f'get_statuses_fresh exploded for {project_root}')
+        by_tag = censuses_by_root.get(project_root, {})
+        if tag is None:
+            merged: dict[str, str] = {}
+            for per_tag in by_tag.values():
+                merged.update(per_tag)
+            return merged
+        return dict(by_tag.get(tag, {}))
+
+    taskmaster = MagicMock(spec=TaskBackendProtocol)
+    taskmaster.list_tags = AsyncMock(side_effect=_list_tags)
+    taskmaster.get_statuses_fresh = AsyncMock(side_effect=_get_statuses_fresh)
+    return taskmaster
+
+
+class TestSweepOrphanedReconEscalations:
+    """The best-effort async orchestrator over the pending recon queue.
+
+    Detection only: it never calls ``queue.resolve()`` — the A7b contract
+    reserves closure for the port-8103 watcher session.
+    """
+
+    @pytest.mark.asyncio
+    async def test_terminal_subjects_produce_one_flag_each(self):
+        """A ``done`` and a ``cancelled`` subject each yield exactly one flag."""
+        done_rec = make_escalation(task_id='650', esc_id='esc-650-1')
+        cancelled_rec = make_escalation(task_id='651', esc_id='esc-651-1')
+        queue = make_queue([done_rec, cancelled_rec])
+        taskmaster = make_taskmaster(
+            {DARK_ROOT: {'master': {'650': 'done', '651': 'cancelled'}}},
+        )
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert len(stats['flags']) == 2
+        assert stats['scanned'] == 2
+        assert stats['terminal'] == 2
+        assert stats['missing'] == 0
+        assert stats['live'] == 0
+        assert stats['unresolvable'] == 0
+        assert stats['errors'] == 0
+        assert {f['task_id'] for f in stats['flags']} == {'650', '651'}
+
+    @pytest.mark.asyncio
+    async def test_blocked_subject_is_never_flagged(self):
+        """THE ANTI-CHURN INVARIANT — the single most important case in this file.
+
+        A still-``blocked`` subject re-qualifies for re-selection, so closing
+        its record re-arms the filing rule and produces the measured re-file
+        churn (``esc-650-1`` -> ``esc-650-2`` in ~4h).  It must be counted
+        ``live`` and never reach the closer.
+        """
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'blocked'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['flags'] == []
+        assert stats['live'] == 1
+        assert stats['terminal'] == 0
+        assert stats['missing'] == 0
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_subject_absent_from_every_tag_produces_a_missing_flag(self):
+        """No row anywhere in its own project's store is a reapable orphan."""
+        queue = make_queue([make_escalation(task_id='650', esc_id='esc-650-1')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'999': 'blocked'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['missing'] == 1
+        assert len(stats['flags']) == 1
+        assert "no row in dark_factory's task store" in stats['flags'][0]['description']
+
+    @pytest.mark.asyncio
+    async def test_census_is_cross_tag_complete(self):
+        """A subject blocked in a NON-default tag classifies live, not missing.
+
+        ``get_statuses_fresh`` defaults to a single tag
+        (``backends/task_backend_protocol.py::list_tags``), so a single
+        untagged read would report this subject as having "no row in the task
+        store" and drive an irreversible reap of a live record.  This is the
+        assertion that prevents that false positive.
+        """
+        blocked_elsewhere = make_escalation(task_id='777', esc_id='esc-777-1')
+        done_in_master = make_escalation(task_id='650', esc_id='esc-650-1')
+        queue = make_queue([blocked_elsewhere, done_in_master])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {
+                'master': {'650': 'done'},
+                'feature-x': {'777': 'blocked'},
+            },
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['live'] == 1, 'the non-default-tag subject must be live'
+        assert stats['missing'] == 0, 'a live subject must never read as missing'
+        assert stats['terminal'] == 1
+        assert {f['task_id'] for f in stats['flags']} == {'650'}, (
+            'only the genuinely terminal subject may be flagged'
+        )
+
+        taskmaster.list_tags.assert_awaited_once_with(DARK_ROOT)
+        calls = taskmaster.get_statuses_fresh.await_args_list
+        assert len(calls) == 2, 'one census read per tag'
+        assert {c.kwargs['tag'] for c in calls} == {'master', 'feature-x'}
+        for call in calls:
+            assert call.args == (DARK_ROOT,)
+            assert 'ids' not in call.kwargs, (
+                "ids= must never be passed — 'absent from the map' has to be an "
+                "unambiguous no-row signal, not a backend's missing-id convention"
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_tag_list_falls_back_to_one_untagged_read(self):
+        """A backend reporting no tags still gets exactly one census read.
+
+        The fallback keeps the sweep working against a backend whose
+        ``list_tags`` is a stub, without ever treating an empty list as "no
+        tasks exist" (which would classify every subject ``missing``).
+        """
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster(
+            {DARK_ROOT: {'master': {'650': 'done'}}}, tags_by_root={DARK_ROOT: []},
+        )
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['terminal'] == 1
+        taskmaster.get_statuses_fresh.assert_awaited_once_with(DARK_ROOT)
+
+    @pytest.mark.asyncio
+    async def test_each_record_is_classified_against_its_own_project(self):
+        """Cross-project scoping: project B's blocked subject is not reaped.
+
+        Classifying a foreign record against the querying project's census is
+        exactly the conflation that turns a live record into a reap
+        instruction; each record is checked against ITS OWN project's store.
+        """
+        dark_done = make_escalation(task_id='650', project_id='dark_factory')
+        reify_blocked = make_escalation(task_id='5943', project_id='reify')
+        reify_missing = make_escalation(task_id='5944', project_id='reify')
+        queue = make_queue([dark_done, reify_blocked, reify_missing])
+        taskmaster = make_taskmaster({
+            DARK_ROOT: {'master': {'650': 'done'}},
+            REIFY_ROOT: {'master': {'5943': 'blocked'}},
+        })
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['terminal'] == 1
+        assert stats['live'] == 1, "reify's blocked subject must stay live"
+        assert stats['missing'] == 1
+        assert {c.args[0] for c in taskmaster.list_tags.await_args_list} == {
+            DARK_ROOT, REIFY_ROOT,
+        }
+        flagged = {f['task_id'] for f in stats['flags']}
+        assert flagged == {'650', '5944'}
+        assert '5943' not in flagged, (
+            "task 650 being done in dark_factory says nothing about reify's 5943"
+        )
+
+    @pytest.mark.asyncio
+    async def test_census_is_fetched_at_most_once_per_project(self):
+        """Backend calls must not scale with record count.
+
+        The live queue holds 124 records across seven projects; a per-record
+        census read would be ~124 round trips per cycle instead of seven.
+        """
+        records = [make_escalation(task_id=str(i)) for i in range(20)]
+        queue = make_queue(records)
+        taskmaster = make_taskmaster(
+            {DARK_ROOT: {'master': {str(i): 'blocked' for i in range(20)}}},
+        )
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['scanned'] == 20
+        assert taskmaster.list_tags.await_count == 1
+        assert taskmaster.get_statuses_fresh.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unparseable_project_id_is_unresolvable_not_missing(self):
+        """A record with no ``project_id:`` line is never claimed as an orphan.
+
+        Folding it into ``missing`` would silently reap records whose subject
+        was never checked at all.
+        """
+        queue = make_queue([make_escalation(task_id='650', detail='run_id: abc')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['unresolvable'] == 1
+        assert stats['missing'] == 0
+        assert stats['flags'] == []
+        taskmaster.list_tags.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_project_absent_from_known_projects_is_unresolvable(self):
+        """A registry gap is surfaced as its own bucket, not silent recall loss."""
+        queue = make_queue([make_escalation(task_id='650', project_id='pump_web_ui')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['unresolvable'] == 1
+        assert stats['missing'] == 0
+        assert stats['flags'] == []
+
+    @pytest.mark.asyncio
+    async def test_get_pending_failure_returns_all_zero_stats(self):
+        """A queue read failure degrades to a no-op cycle, never a partial one."""
+        queue = make_queue([], get_pending_error=OSError('queue dir vanished'))
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats == {
+            'flags': [], 'scanned': 0, 'terminal': 0, 'missing': 0,
+            'live': 0, 'unresolvable': 0, 'errors': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_census_failure_is_fail_safe_and_scoped_to_that_project(self):
+        """An errored census NEVER yields terminal/missing, and never blocks siblings.
+
+        The asymmetry is load-bearing: a false ``terminal`` tells the sole
+        closer to resolve a live record, whereas a missed detection is
+        re-checked next cycle.
+        """
+        broken = make_escalation(task_id='5943', project_id='reify')
+        healthy = make_escalation(task_id='650', project_id='dark_factory')
+        queue = make_queue([broken, healthy])
+        taskmaster = make_taskmaster(
+            {DARK_ROOT: {'master': {'650': 'done'}}, REIFY_ROOT: {'master': {}}},
+            statuses_error_roots={REIFY_ROOT},
+        )
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['missing'] == 0, 'an errored census is not evidence of absence'
+        assert stats['terminal'] == 1, "the healthy project is still classified"
+        assert {f['task_id'] for f in stats['flags']} == {'650'}
+
+    @pytest.mark.asyncio
+    async def test_list_tags_failure_is_fail_safe(self):
+        """A ``list_tags`` failure is an ERROR, not a fall back to one tag.
+
+        Falling back would read only the default tag, which is precisely the
+        single-tag read whose false ``missing`` this design exists to prevent.
+        """
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster(
+            {DARK_ROOT: {'master': {}}}, list_tags_error_roots={DARK_ROOT},
+        )
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['missing'] == 0
+        assert stats['terminal'] == 0
+        assert stats['flags'] == []
+        taskmaster.get_statuses_fresh.assert_not_awaited()
+
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_from_get_pending(self, exc):
+        """Cancellation is never swallowed as a best-effort error."""
+        queue = make_queue([], get_pending_error=exc())
+        taskmaster = make_taskmaster({})
+
+        with pytest.raises(exc):
+            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_from_list_tags(self, exc):
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
+        taskmaster.list_tags = AsyncMock(side_effect=exc())
+
+        with pytest.raises(exc):
+            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_from_get_statuses_fresh(self, exc):
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {}}})
+        taskmaster.get_statuses_fresh = AsyncMock(side_effect=exc())
+
+        with pytest.raises(exc):
+            await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+
+    @pytest.mark.asyncio
+    async def test_human_operator_record_is_swept_and_names_its_own_category(self):
+        """The sibling category is covered, and its flag routes to its own row.
+
+        Zero pending records carry this category today (live census
+        2026-09-02), so this is future-proofing — which is exactly why the
+        category has to be named in the flag rather than assumed.
+        """
+        queue = make_queue([
+            make_escalation(task_id='650', esc_id='esc-650-1', category=HUMAN_OPERATOR),
+        ])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats['terminal'] == 1
+        assert HUMAN_OPERATOR in stats['flags'][0]['description']
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_short_circuits_with_no_backend_calls(self):
+        """Nothing reapable means no census reads at all."""
+        queue = make_queue([make_escalation(task_id='9', category='recon_integrity_issue')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'9': 'done'}}})
+
+        stats = await sweep_orphaned_recon_escalations(
+            queue, taskmaster, KNOWN_PROJECTS,
+        )
+
+        assert stats == {
+            'flags': [], 'scanned': 0, 'terminal': 0, 'missing': 0,
+            'live': 0, 'unresolvable': 0, 'errors': 0,
+        }
+        taskmaster.list_tags.assert_not_awaited()
+        taskmaster.get_statuses_fresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_never_closes_a_record(self):
+        """Detection only — the A7b contract makes the watcher the sole closer."""
+        queue = make_queue([make_escalation(task_id='650')])
+        taskmaster = make_taskmaster({DARK_ROOT: {'master': {'650': 'done'}}})
+
+        await sweep_orphaned_recon_escalations(queue, taskmaster, KNOWN_PROJECTS)
+
+        queue.resolve.assert_not_called()
