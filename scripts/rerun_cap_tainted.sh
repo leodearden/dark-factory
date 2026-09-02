@@ -1,5 +1,6 @@
 #!/bin/bash
-# Rerun all cap-tainted final-run eval pairs.
+# Rerun cap-tainted final-run eval pairs. A FALLBACK, not part of the
+# normal campaign loop.
 #
 # Identified 2026-04-14: every result below had $0 cost, 0 tokens, and
 # sub-10s workflow duration — pure cap starvation, no real inference.
@@ -8,15 +9,25 @@
 #   1. Cloud baselines (Opus/Sonnet) — run via orchestrator eval directly
 #   2. vLLM on RunPod — run via run_vllm_eval.py (creates pods)
 #
-# The USAGE_ACCOUNTS_FILE mechanism (d33db0c) ensures eval runs get
-# account A in addition to the shared pool.
+# WHY A CAP-TAINTED RERUN SHOULD NOW BE RARE. An eval run no longer dies
+# on the first cap it meets: run_architect_eval routes every invocation
+# through invoke_with_cap_retry with 48h of patience, resuming the capped
+# session via --resume on whichever account frees up first, so banked
+# spend survives the failover. A trial reaching this script means that
+# tolerance was exhausted, not merely tested. Reach for it when a campaign
+# actually recorded cap_tainted trials — not as a routine second pass.
 #
-# RULING 2026-08-30 (task 4741): account A is reserved for INTERACTIVE use
-# only — it is not an eval account. Evals have no dedicated account and
-# must be robust to sharing the fleet pool's cap/429 events instead of
-# assuming a private reserve. The account-A injection below is the stale
-# behavior the ruling retires; the follow-up task filed from 4741 tracks
-# fixing it, not this comment.
+# THE ROSTER. Eval runs draw on the SHARED fleet pool
+# (config/usage-accounts.yaml), the same seven accounts as every other
+# invocation, and get their cap tolerance from the retry-plus-resume path
+# above rather than from a private reserve. This script used to synthesise
+# its own roster of "shared pool + max-a"; account A is reserved for
+# INTERACTIVE use only — Leo's own sessions exhaust its weekly cap most
+# weeks, so it never was the uncapped reserve that injection assumed
+# (ruling 2026-08-30, tasks 4741/4945). USAGE_ACCOUNTS_FILE is still
+# exported below: the override is how a run selects its roster, and the
+# orchestrator config's own default is a hardcoded absolute path into the
+# main checkout. What was retired is what it pointed AT.
 
 set -uo pipefail
 
@@ -45,25 +56,11 @@ CONCURRENCY=5
 
 echo "[$(date +%H:%M:%S)] === Cloud baseline reruns ==="
 
-# Generate an eval accounts file that includes account A. NOTE: per the
-# 2026-08-30 ruling A is not actually "eval-only" — it's Leo's interactive
-# account, not a private eval reserve (see note above). This mirrors what
-# run_vllm_eval.py's build_eval_env() does, stale premise included.
-EVAL_ACCOUNTS_FILE=$(python3 -c "
-import yaml, tempfile, os
-base = '/home/leo/src/dark-factory/config/usage-accounts.yaml'
-with open(base) as f:
-    data = yaml.safe_load(f)
-accounts = list(data.get('accounts', []))
-# Add max-a via env var reference (oauth_token_env, not direct oauth_token)
-# to match the Pydantic schema that requires the oauth_token_env field.
-if not any(a.get('name') == 'max-a' for a in accounts):
-    accounts.append({'name': 'max-a', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_A'})
-fd, path = tempfile.mkstemp(suffix='.yaml', prefix='eval-accounts-')
-with os.fdopen(fd, 'w') as f:
-    yaml.safe_dump({'accounts': accounts}, f)
-print(path)
-")
+# Point at the shared fleet pool verbatim — no synthesised roster. This
+# mirrors run_vllm_eval.py's build_eval_env(), which was corrected in the
+# same change (task 4945). The variable name is kept so the per-invocation
+# override further down needs no restructuring.
+EVAL_ACCOUNTS_FILE=/home/leo/src/dark-factory/config/usage-accounts.yaml
 export USAGE_ACCOUNTS_FILE="$EVAL_ACCOUNTS_FILE"
 echo "[$(date +%H:%M:%S)] Eval accounts file: $EVAL_ACCOUNTS_FILE"
 

@@ -107,8 +107,63 @@ def _py_string_constants(path: pathlib.Path) -> list[str]:
     ]
 
 
+def _resolve_shell_value(raw: str, shell_code: str, *, hops: int = 4) -> str:
+    """Resolve a shell RHS to a literal, following simple variable indirection.
+
+    ``export USAGE_ACCOUNTS_FILE="$EVAL_ACCOUNTS_FILE"`` must be accepted:
+    the script assigns that variable once and reuses it for the
+    per-invocation override further down, so demanding the literal at the
+    export site would force the path to be spelled twice and invite the two
+    copies to drift. Following the reference is therefore the FAITHFUL
+    check, not a weakened one — and it is still strictly stronger than a
+    substring match, because a value produced by a command substitution
+    (a roster GENERATOR, which is the retired mechanism) has no literal
+    assignment to follow and fails below rather than resolving.
+    """
+    value = raw.strip().strip('"').strip("'")
+    for _ in range(hops):
+        assert "$(" not in value and "`" not in value, (
+            f"{SHELL_LAUNCHER.name} resolves USAGE_ACCOUNTS_FILE to "
+            f"{value!r}, a command substitution: the script is still "
+            "GENERATING a roster rather than naming the shared one. That "
+            "generator was the shell copy of the retired account-A injection "
+            "(task 4945), and its output is a tempfile no reader of this "
+            "script can inspect."
+        )
+        ref = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", value)
+        if ref is None:
+            return value
+        name = ref.group(1)
+        assignments = re.findall(
+            rf"^\s*(?:export\s+)?{name}=(.+)$", shell_code, flags=re.MULTILINE
+        )
+        literals = [
+            a.strip().strip('"').strip("'")
+            for a in assignments
+            if a.strip().strip('"').strip("'") != value
+        ]
+        assert literals, (
+            f"{SHELL_LAUNCHER.name} resolves USAGE_ACCOUNTS_FILE through "
+            f"${name}, which has no assignment in the script "
+            f"({assignments!r}) — so the roster an eval run gets is inherited "
+            "from the ambient environment and cannot be determined by reading "
+            "the script"
+        )
+        assert len(set(literals)) == 1, (
+            f"{SHELL_LAUNCHER.name} assigns ${name} more than one distinct "
+            f"value ({sorted(set(literals))!r}), so which roster an eval run "
+            "gets depends on where in the script it is read"
+        )
+        value = literals[0]
+    raise AssertionError(
+        f"{SHELL_LAUNCHER.name}: USAGE_ACCOUNTS_FILE still unresolved after "
+        f"{hops} hops (last value {value!r}) — the roster it names cannot be "
+        "determined by reading the script"
+    )
+
+
 def _exported_usage_accounts_file(shell_code: str) -> str:
-    """The value of the script's ``export USAGE_ACCOUNTS_FILE=...`` line."""
+    """The roster path the script's ``export USAGE_ACCOUNTS_FILE=`` selects."""
     matches = re.findall(
         r"^\s*export\s+USAGE_ACCOUNTS_FILE=(.+)$", shell_code, flags=re.MULTILINE
     )
@@ -120,7 +175,7 @@ def _exported_usage_accounts_file(shell_code: str) -> str:
         "into the MAIN checkout and therefore wrong for a worktree-launched "
         "run, and more than one makes the effective roster order-dependent."
     )
-    return matches[0].strip().strip('"').strip("'")
+    return _resolve_shell_value(matches[0], shell_code)
 
 
 class TestShellLauncherRostersTheSharedPool:
@@ -261,6 +316,20 @@ class TestGuardReadsExecutableCodeOnly:
             "an inline roster append is executable code and must survive "
             "stripping — otherwise the shell guard is blind to the defect"
         )
+
+    def test_variable_indirection_resolves_but_generation_does_not(self) -> None:
+        """One hop through a variable is fine; a generator is not."""
+        indirect = (
+            "F=/repo/config/usage-accounts.yaml\n"
+            'export USAGE_ACCOUNTS_FILE="$F"\n'
+        )
+        assert (
+            _exported_usage_accounts_file(indirect) == "/repo/config/usage-accounts.yaml"
+        ), "a single literal-assignment hop must resolve"
+
+        generated = 'F=$(python3 -c "print(1)")\nexport USAGE_ACCOUNTS_FILE="$F"\n'
+        with pytest.raises(AssertionError, match="GENERATING a roster"):
+            _exported_usage_accounts_file(generated)
 
     def test_py_docstrings_are_tolerated_but_code_is_not(self, tmp_path) -> None:
         module = tmp_path / "m.py"
