@@ -988,8 +988,10 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # `related_tasks` aliases — `related_task`, `related_df_tasks`,
 # `related_task_examples`) and Tier-C ad-hoc/timestamped one-off keys are
 # deliberately NOT included here — they keep emitting unknown_key as a
-# greppable drift signal; see CLAUDE.md "Task metadata vocabulary &
-# census" for the documented consolidation convention.
+# greppable drift signal; see docs/task-authoring.md §8 "Task metadata
+# vocabulary & census" for the documented consolidation convention. (That
+# section moved out of CLAUDE.md, which now only points at it; the newer
+# entries below already cite the new home.)
 #
 # That alias list is spelled key-exact rather than globbed. It carried a
 # `related_task*` wildcard until task 4303, which went false the moment
