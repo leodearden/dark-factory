@@ -274,7 +274,8 @@ async def test_steal_failed_returns_requeued(tmp_path: Path):
     wf.git_ops.create_worktree = AsyncMock(
         side_effect=WarmLaneStealFailed(
             "warm-lane reclaim-on-exhaustion steal failed for branch '1859': "
-            'all 3 attempted lanes failed to provision; requeue'
+            'every stolen lane failed to provision, or no further eligible '
+            'victim remained (at most 3 attempts per acquire); requeue'
         )
     )
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
