@@ -654,7 +654,7 @@ class TestNoStillPoisonedValueEverEscapes:
             (obs.tool_use_id, obs.policy, obs.param)
             for obs in _all(replay)
             if isinstance((obs.repaired_call or {}).get(obs.param), str)
-            and detect(obs.repaired_call[obs.param]) is not None
+            and detect((obs.repaired_call or {})[obs.param]) is not None
         ]
         assert not poisoned, poisoned[:5]
 
