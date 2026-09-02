@@ -182,6 +182,13 @@ class TestIsProtectedAuditRecord:
             object(),
             {'kind': 123},
             {'kind': None},
+            # UNHASHABLE kind. A naive ``metadata.get('kind') in frozenset``
+            # raises TypeError here, which would break the module's documented
+            # never-raises contract from inside the guard that exists to make
+            # the sweep safer. Mem0 metadata is JSON-shaped and nothing at the
+            # add_memory boundary constrains ``kind`` to a scalar.
+            {'kind': []},
+            {'kind': {}},
         ],
     )
     def test_malformed_input_returns_false_without_raising(self, metadata):
