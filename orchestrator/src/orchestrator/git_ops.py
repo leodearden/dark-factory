@@ -951,6 +951,17 @@ class WarmLaneUnavailable(Enum):
       reseed-consistency defect — :meth:`create_worktree` maps it to
       :class:`WarmLaneReseedContaminated` so the task requeues to re-acquire a
       DIFFERENT lane rather than dispatch onto the stale tree (task 2854).
+    * ``LANE_LOCK_TIMEOUT`` — :meth:`GitOps._seed_warm_lane` timed out waiting
+      for ``<lane_dir>.lock`` (seed rc ``124`` =
+      ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``, flock's ``--conflict-exit-code``
+      for the bounded ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` wait) against a
+      LIVE-but-wedged holder — a concurrent GC reseed, a thin, or another
+      seed.  The seed script never ran, so the lane was left untouched, and
+      the lane has already been released back to FREE.  TRANSIENT contention
+      (requeue via :class:`WarmLaneLockTimeout`), never a per-task fault: the
+      holder is on THAT lane, so a different lane — or a later attempt —
+      succeeds.  Distinct from ``DISK_PRESSURE``: exit-75 means disk, and a
+      lock race implicates neither disk nor this task.
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -969,6 +980,7 @@ class WarmLaneUnavailable(Enum):
     SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
     RESEED_CONTAMINATED = 'reseed_contaminated'
+    LANE_LOCK_TIMEOUT = 'lane_lock_timeout'
     DISABLED = 'disabled'
 
 
@@ -983,6 +995,18 @@ def _seed_rc_to_unavailable(rc: int) -> WarmLaneUnavailable:
       **DORMANT**: no shipped seed-warm-lane.sh emits 76 today: this branch
       is inert until a future reify version adopts the exit-76 convention. It
       is harmless meanwhile (no script exits 76, so it is simply never hit).
+    * ``124`` (``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) → ``LANE_LOCK_TIMEOUT`` —
+      the bounded ``<lane_dir>.lock`` wait expired against a live holder
+      (task 4930).  Unlike 76 this branch is anything but dormant: the reify
+      ``reify-warm-lane-gc.timer`` fires every 15 min while a GC pass takes
+      ~30 min, so passes OVERLAP, and a measured GC lock hold runs 25--88s
+      (median ~34s) against the 30s ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` wait.
+      A 124 here is therefore EXPECTED under normal GC overlap, not exotic —
+      which is exactly why it must classify as transient contention
+      (requeue) rather than falling through to the per-task-blocking FAULT
+      below.  The wait itself deliberately stays at 30s: waiting longer buys
+      nothing that trying a DIFFERENT lane does not buy instantly, while
+      adding dead latency on the acquisition hot path.
     * anything else (including ``127``, the absent-script / unexpected-
       exception sentinel) → ``FAULT`` — generic infra fault.
     """
@@ -990,6 +1014,8 @@ def _seed_rc_to_unavailable(rc: int) -> WarmLaneUnavailable:
         return WarmLaneUnavailable.DISK_PRESSURE
     if rc == 76:
         return WarmLaneUnavailable.BASE_ABSENT
+    if rc == _SEED_WARM_LANE_LOCK_TIMEOUT_RC:
+        return WarmLaneUnavailable.LANE_LOCK_TIMEOUT
     return WarmLaneUnavailable.FAULT
 
 
