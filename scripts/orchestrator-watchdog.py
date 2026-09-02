@@ -1643,6 +1643,19 @@ def fused_memory_liveness_pass() -> None:
     (FM_LIVENESS_RESTART_CLOCK_PATH). The two layers are complementary: the
     streak makes a wrong verdict RARE, the cap makes a wrong verdict HARMLESS.
 
+    THE BOOKKEEPING RUNS ON THE RAISING PATH TOO (task 4131). The cap is armed
+    and the streak consumed in a ``finally``, so a restart_unit that RAISES —
+    it catches only subprocess.TimeoutExpired, leaving a fork/exec
+    OSError(EAGAIN|ENOMEM), a PermissionError or a mid-tick systemctl swap to
+    propagate — still bounds the next attempt. Otherwise the cap stayed unarmed
+    while the streak stayed at/above threshold, and (since the streak is
+    recorded BEFORE the cap check) the pass re-attempted the restart on every
+    60s tick, unbounded. Arming after a failed restart is consistent with the
+    already-shipped behaviour rather than a new policy: restart_unit uses
+    ``check=False``, so a non-zero systemctl exit arms the cap today. The
+    exception still propagates to the outer handler below, so the failure stays
+    LOUD instead of being made indistinguishable from a clean revive.
+
     EVIDENCE. The pass previously restarted on a SINGLE non-healthy verdict,
     uncapped. A controlled experiment (2026-08-06 07:14-09:14Z, kill path
     disconnected) recorded six /health stalls >=8s, four >15s, three past a 25s
@@ -1741,23 +1754,46 @@ def fused_memory_liveness_pass() -> None:
             f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
             f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
         )
-        restart_unit(FUSED_MEMORY_UNIT)
-        log(f"{FUSED_MEMORY_UNIT} restart issued")
-        # Arm the cap immediately after the restart is issued, so it holds even
-        # if the streak clear below fails. The stamp is fail-SOFT but not
-        # fail-safe: an unarmed cap makes the revive unbounded (a revive every
-        # ~N ticks), so its failure gets its own high-signal line rather than
-        # disappearing into _atomic_write_json's routine one.
-        if not _stamp_fm_liveness_restart_clock():
-            log(
-                f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
-                f"further revives are unbounded until "
-                f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
-            )
-        # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
-        # pass would degrade back to one-verdict-per-kill immediately after
-        # the first restart.
-        _clear_fm_liveness_streak()
+        try:
+            restart_unit(FUSED_MEMORY_UNIT)
+            log(f"{FUSED_MEMORY_UNIT} restart issued")
+        finally:
+            # THE BOOKKEEPING MUST RUN EVEN IF THE RESTART RAISED (task 4131).
+            # restart_unit catches only subprocess.TimeoutExpired, so a
+            # fork/exec OSError(EAGAIN|ENOMEM), a PermissionError, or a
+            # FileNotFoundError from a mid-tick systemctl swap escapes it.
+            # Without this `finally` the cap stayed unarmed AND the streak
+            # stayed at/above threshold — and because the streak is recorded
+            # BEFORE the cap check, the very next tick re-attempted the
+            # restart, degrading the pass to one attempt per 60s tick,
+            # unbounded: both task-3764 layers defeated at once.
+            #
+            # Arming on a raise is CONSISTENT with existing semantics, not a
+            # new departure: restart_unit uses check=False, so a systemctl that
+            # exits NON-ZERO is already indistinguishable from success and arms
+            # the cap today. This only makes the raising path agree with it.
+            #
+            # The exception is deliberately NOT caught here — it propagates to
+            # this pass's outer `except Exception`, which already logs it, so a
+            # genuine fork/exec failure stays distinguishable from a clean
+            # revive in the journal.
+            #
+            # Arm the cap immediately after the restart is issued, so it holds
+            # even if the streak clear below fails. The stamp is fail-SOFT but
+            # not fail-safe: an unarmed cap makes the revive unbounded (a
+            # revive every ~N ticks), so its failure gets its own high-signal
+            # line rather than disappearing into _atomic_write_json's routine
+            # one.
+            if not _stamp_fm_liveness_restart_clock():
+                log(
+                    f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
+                    f"further revives are unbounded until "
+                    f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
+                )
+            # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
+            # pass would degrade back to one-verdict-per-kill immediately after
+            # the first restart.
+            _clear_fm_liveness_streak()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
 
