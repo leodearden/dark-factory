@@ -941,6 +941,18 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # a {'source': ...} filter — it is enumerated by the boolean payload key
 # {'flag_for_stage2': True} instead (Qdrant payload filters are
 # type-sensitive; the stored value is boolean True, not the string 'true').
+#
+# THIS FILTER IS INTENTIONALLY WIDE — do not "fix" it by narrowing (task
+# 4375). Adding a positive kind/source discriminator here was evaluated
+# against the tombstone ledger and rejected on measurement: of the 288 records
+# this sweep has destroyed, 165 carried NO 'kind' key at all and 248 no
+# 'source', so a positive allowlist would enumerate ~0 records and silently
+# reinstate the unbounded leak this sweep exists to prevent. Qdrant payload
+# filters are exact-equality and AND-only with no key-existence operator, so
+# the genuine relay pool is not expressible as a filter. ALL discrimination
+# therefore lives in _sweep_stale_mem0_pool's per-member eligibility
+# predicate — see _sweep_stale_mem0_flag_for_stage2_markers' docstring for
+# the full four-part composite rule.
 # A marker Stage 2 hasn't consumed in 14+ days can never be "current" per
 # _query_stage2_flags' run_id/run-window semantics (run_ids are per-cycle;
 # Stage 2 runs many times/day) — so it is definitionally unconsumed dead
@@ -1962,11 +1974,14 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     project_id: str,
     run_id: str,
     *,
+    terminal_task_ids: Collection[str],
     max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     now: datetime | None = None,
     scroll_limit: int = 1000,
 ) -> int:
-    """Age-GC the Mem0-only ``flag_for_stage2`` relay pool (task 2966).
+    """Composite-gated GC for the Mem0-only ``flag_for_stage2`` relay pool.
+
+    Tasks 2966 (the sweep) and 4375 (the composite eligibility rule).
 
     ``flag_for_stage2`` markers are the Stage-1 -> Stage-2 relay channel:
     written ONLY to Mem0 by the Stage-1 flag_dedup/LLM ``add_memory`` path
@@ -1991,12 +2006,46 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     dark_factory Mem0 confirmed this shape). See
     :func:`_sweep_stale_mem0_pool`'s docstring for the fail-safe posture.
 
-    That boolean-only filter has NO ``kind``/``source``/``record_type``
-    discriminator, so on its own it matches any record an LLM writer happened
-    to stamp ``flag_for_stage2=True`` on — including a cycle_summary mirror.
-    This sweep is therefore the concrete motivating case for the skeleton's
-    protected-mirror invariant (task 3041), which makes that over-breadth
-    degrade to a loud skip instead of collateral mirror loss.
+    **The pool filter is deliberately WIDE, and retirement is decided by a
+    composite rule instead (task 4375).** That boolean-only filter has NO
+    ``kind``/``source``/``record_type`` discriminator, so on its own it
+    matches any record an LLM writer happened to stamp ``flag_for_stage2=True``
+    on — a cycle_summary mirror, or a permanent audit-log record. Both harms
+    are measured, not hypothetical: this sweep destroyed 288 records, 40 of
+    them ``kind='cadence_check'`` audit records in autopilot_video, every one
+    at exactly ``max_age_days`` old.
+
+    Narrowing the filter is NOT the fix and cannot be. Of those 288 victims,
+    165 (57%, across 5 of 6 projects) carried no ``kind`` key at all and 248
+    (86%) carried no ``source``; the kinds that do appear are a ~37-value long
+    tail of free-form LLM-authored strings. Qdrant payload filters are
+    exact-equality and AND-only within one dict with no key-existence
+    operator, so neither "has a flag_type" nor "kind in {...}" is expressible
+    as a pool filter at all. A positive allowlist would enumerate ~0 records
+    and silently reinstate the unbounded leak this sweep exists to prevent.
+    So the filter stays wide and ALL discrimination lives in the eligibility
+    predicate. A future reader should not "fix" ``_FLAG_FOR_STAGE2_ENUM_FILTERS``
+    by narrowing it.
+
+    A marker is retired only when ALL of the following hold:
+
+    1. ``created_at`` is older than ``max_age_days`` (task 2966).
+    2. It is not a protected cycle_summary mirror (task 3041).
+    3. Its ``kind`` is not in ``mem0_tombstone.PROTECTED_AUDIT_KINDS`` (task
+       4375, Part B).
+    4. Its ``task_id`` is confirmed TERMINAL via *terminal_task_ids* (task
+       4375, Part A).
+
+    Gate 4 is the PRIMARY defence and gate 3 is defence in depth for the
+    residual intersection, not the other way round: every one of the 40
+    destroyed ``cadence_check`` records cites autopilot_video task 452, whose
+    status is ``deferred`` — not in ``TERMINAL_STATUSES`` — so gate 4 alone
+    would have preserved all of them. Gate 4 is also structurally opt-IN,
+    demanding positive evidence of closure, so an audit-log kind nobody
+    remembered to register in ``PROTECTED_AUDIT_KINDS`` is still protected
+    while its cited task stays open. See :func:`_sweep_stale_mem0_pool` for
+    the gate's ``None``-vs-``[]`` sentinel and its deliberate KEEP-direction
+    consequences.
 
     Passes ``count_short_circuit=True``: unlike ``stage2_persistence_marker``
     (written nearly every cycle that has surviving flags), Stage-1 writes a
@@ -2022,6 +2071,17 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         project_id: Project scope for enumeration and delete calls.
         run_id: Current reconciliation run identifier used as ``causation_id``
             in the audit journal.
+        terminal_task_ids: Task ids confirmed terminal this cycle, forwarded
+            verbatim to :func:`_sweep_stale_mem0_pool`'s closure gate.
+            REQUIRED and deliberately given NO default (task 4375): a caller
+            who forgets it must get a loud ``TypeError`` at call time rather
+            than silently reverting to unconditional age-only deletion
+            (permanent loss, visible only weeks later as missing records) or
+            silently disabling the sweep (an unbounded pool). Resolved ONCE
+            per cycle in :meth:`TaskKnowledgeSync.run` via
+            :func:`_resolve_terminal_task_ids` and shared with
+            :func:`_gc_recon_markers`, so both passes see the same view of
+            terminality within a cycle.
         max_age_days: Staleness cutoff in days (default
             ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 14).
         now: Reference "current time" for the cutoff calculation. Defaults to
@@ -2044,6 +2104,7 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
         enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        terminal_task_ids=terminal_task_ids,
     )
     # Diagnostic-only; never affects the returned sweep count (task 2966
     # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).

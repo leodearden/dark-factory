@@ -8712,6 +8712,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
         that retires, which is what proves the sweep is not merely disabled.
         """
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
             _sweep_stale_mem0_flag_for_stage2_markers,
         )
 
