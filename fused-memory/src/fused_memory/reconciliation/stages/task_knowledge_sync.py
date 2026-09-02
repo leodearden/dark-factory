@@ -43,6 +43,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_phantom_task_creation_flags,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
@@ -1222,17 +1223,31 @@ async def _sweep_stale_mem0_pool(
     silently refilling the pool this sweep just drained (task 3915 step-8;
     never raises, never alters the member list or returned count).
 
-    **Protected-mirror invariant (task 3041): this skeleton NEVER deletes a
-    ``kind='cycle_summary'`` / ``record_type='ledger_stamp'`` record**, no
-    matter which pool filter selected it. Every enumerated member is tested
-    against
-    :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
-    BEFORE the age check; a match is skipped with a WARNING naming the
-    memory_id, its kind/record_type and *log_name*, and is excluded from the
-    returned count. An over-broad payload filter therefore degrades to a LOUD
-    skip rather than collateral mirror loss.
+    **Protected-record invariant (tasks 3041, 4375): this skeleton NEVER
+    deletes a protected record**, no matter which pool filter selected it.
+    Every enumerated member is tested against TWO independent predicates
+    BEFORE the age check, each with its OWN attributable WARNING naming the
+    memory_id and *log_name*, and each skip excluded from the returned count:
 
-    The guard lives HERE rather than in each caller's payload filter because
+    - :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
+      (task 3041) — a ``kind='cycle_summary'`` / ``record_type='ledger_stamp'``
+      ledger mirror.
+    - :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_audit_record`
+      (task 4375) — a DELIBERATELY-PERMANENT audit-log record whose ``kind`` is
+      in ``PROTECTED_AUDIT_KINDS``. The motivating case is measured: 40
+      ``kind='cadence_check'`` records in autopilot_video were destroyed by
+      this skeleton's ``flag_for_stage2`` caller, every one at exactly
+      ``max_age_days`` old — pure age-GC. They carried the full Stage-1 relay
+      contract and so were indistinguishable from genuine relay markers by
+      every field except ``kind``.
+
+    The two predicates are deliberately SEPARATE rather than one widened
+    predicate, so a skipped audit record is never logged as a skipped mirror
+    (which would send an operator to tighten the wrong thing). An over-broad
+    payload filter therefore degrades to a LOUD, correctly-attributed skip
+    rather than collateral loss.
+
+    The guards live HERE rather than in each caller's payload filter because
     filter-tightening cannot guarantee precision:
     :data:`_FLAG_FOR_STAGE2_ENUM_FILTERS` is ``{'flag_for_stage2': True}``
     with no ``kind``/``source``/``record_type`` discriminator at all, and
@@ -1485,6 +1500,30 @@ async def _sweep_stale_mem0_pool(
                 'record it must never delete; the enumeration filter is over-broad '
                 'for this pool and should be tightened (task 3041).',
                 log_name, mid, metadata.get('kind'), metadata.get('record_type'),
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
+        # Protected-audit-record exclusion (task 4375), checked alongside the
+        # mirror guard and BEFORE the age test for the same reason: an
+        # over-broad payload filter must degrade to a loud skip rather than
+        # collateral loss of a record that is SUPPOSED to outlive the window
+        # in which its subject was interesting. Its own WARNING, deliberately
+        # not folded into the mirror branch's, so the skip stays attributable
+        # to the guard that caused it.
+        if is_protected_audit_record(member_metadata):
+            metadata = member_metadata if isinstance(member_metadata, dict) else {}
+            logger.warning(
+                'reconciliation.%s: SKIPPING protected audit record memory_id=%s '
+                '(kind=%s) — this pool filter matched a deliberately-permanent '
+                'audit-log record it must never delete; it is retained regardless '
+                'of age (task 4375).',
+                log_name, mid, metadata.get('kind'),
                 extra={
                     'project_id': project_id,
                     'memory_id': mid,
