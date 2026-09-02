@@ -8714,6 +8714,27 @@ class MemoryService:
         path; the 1-match case short-circuits to a pure resolve with no backend
         call at all; and >=2 returns a structured refusal that merges NOTHING.
 
+        THE MINT BRANCH THEREFORE READS THE NAME TWICE, DELIBERATELY. The
+        pre-read above runs, and then ``graphiti.ensure_entity_node`` calls
+        ``_resolve_or_create_entity``, which issues the SAME
+        ``get_nodes_by_exact_name`` query with the same arguments — two
+        identical Cypher round trips inside the very lock guard 1 exists to keep
+        short. This is a known, accepted cost, not an oversight:
+
+        * Only the MINT branch pays it. A resolve (the common case once the
+          graph is populated) short-circuits above with no backend call at all,
+          and both refusals return before the backend is reached.
+        * The mint already makes a far more expensive embedding round trip
+          inside the same lock, so a second read-only exact-name query is not
+          what sets the hold time.
+        * Removing it means a new backend entry point that accepts the
+          already-read node list (a ``_mint_entity_node`` primitive this wrapper
+          could call directly, leaving ``_resolve_or_create_entity`` untouched
+          for its other callers). That is a change to
+          ``backends/graphiti_client.py``, which task 4932 held no lock on, so
+          it was recorded here and filed as an agent-followup ticket against
+          that module rather than done inline.
+
         Refusals are VALUES, never raises, so an MCP caller gets machine-readable
         data — an ambiguous-name refusal must hand back the conflicting uuids so
         an operator can adjudicate them, which an exception string cannot carry.

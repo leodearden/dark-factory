@@ -22,12 +22,17 @@ index evidence.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import install_identity_mocks
 
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.memory_service import (
+    _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS,
+    MemoryService,
+)
 
 _PROJECT = 'dark_factory'
 _NAME = 'Task 3222'
@@ -189,6 +194,48 @@ class TestIdentityLock:
         assert isinstance(result.get('error'), str) and result['error']
         service.graphiti.ensure_entity_node.assert_not_awaited()
 
+    @pytest.mark.parametrize('corrupt', [None, 'x', 0, 0.0, -1.0, True, False])
+    @pytest.mark.asyncio
+    async def test_a_corrupt_lock_timeout_falls_back_to_the_module_default(
+        self, service, monkeypatch, corrupt,
+    ):
+        """A missing / non-numeric / bool / non-positive leaf must not become an
+        UNBOUNDED wait, and must not crash the mint either.
+
+        The equivalent corrupt-leaf branches for ``storm_threshold`` and
+        ``storm_window_seconds`` are already pinned below; without this one the
+        omission is asymmetric — and this is the leaf whose failure mode is the
+        worst of the three, because losing the BOUND (rather than losing an
+        alarm) is what hangs an MCP request behind the episode-ingest path's
+        multi-second hold.
+
+        ``True`` is load-bearing among the parameters: ``isinstance(True, int)``
+        is True and ``True > 0``, so a naive numeric check would accept it and
+        bound the acquire at one second on a config typo.
+        """
+        object.__setattr__(
+            service.config.entity_mint, 'lock_timeout_seconds', corrupt,
+        )
+        captured: dict = {}
+        real_wait_for = asyncio.wait_for
+
+        async def _spy(awaitable, timeout):
+            captured['timeout'] = timeout
+            return await real_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, 'wait_for', _spy)
+
+        result = await service.ensure_entity_node(
+            name=_NAME, project_id=_PROJECT, agent_id='curator-x',
+        )
+
+        assert result['minted'] is True, result
+        assert captured['timeout'] == _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS
+        assert _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS == 5.0, (
+            'the fallback is anchored to the schema default; if one moves the '
+            'other must, or a corrupt leaf silently changes the bound'
+        )
+
     @pytest.mark.asyncio
     async def test_the_lock_timeout_is_read_live_per_call(self, service):
         """Proving the leaf is green-tier rather than restart-only in disguise:
@@ -309,6 +356,10 @@ class TestWriteJournal:
             name=_NAME, project_id=_PROJECT, agent_id='curator-x',
         )
 
+        # Without this the leg is VACUOUS: if a refactor ever moved the journal
+        # call behind a condition that stopped matching, the failing-journal
+        # path would go unexercised and this test would still be green.
+        journal.log_write_op.assert_awaited_once()
         assert result['minted'] is True, (
             'the journal is best-effort — a journal failure must not turn a '
             'landed mint into an error'
@@ -522,10 +573,54 @@ class TestEntityMintStormAlarm:
         for _ in range(threshold):
             result = await self._mint(service)
 
+        # Without this the leg is VACUOUS: none of the assertions below depend
+        # on the emitter ever being called, so a silently-dead alarm (a bad
+        # threshold read, an absent project_root, a counter that never records)
+        # would leave this green while proving nothing about the swallow.
+        emitter.assert_called_once()
         assert result is not None
         assert result['minted'] is True, result
         assert result['status'] == 'minted'
         assert service.graphiti.ensure_entity_node.await_count == threshold
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_project_escalates_nothing_and_says_so(
+        self, stormy, caplog,
+    ):
+        """NO FALLBACK: a silent misfile is strictly worse than a logged refusal.
+
+        The escalator files into the affected project's OWN
+        ``data/escalations`` queue, resolved from ``_known_projects``. There is
+        deliberately no fall back to ``config.taskmaster.project_root``, which
+        defaults to ``'.'`` — that would file into the server's cwd, where no
+        operator watches, and report success doing it, destroying the evidence
+        that the alarm ever fired.
+
+        The ``stormy`` fixture always populates the registry, so this branch
+        would otherwise never be exercised.
+        """
+        service, _clock, emitter = stormy
+        service.set_known_projects({})
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service',
+        ):
+            result = None
+            for _ in range(service.config.entity_mint.storm_threshold):
+                result = await self._mint(service)
+
+        assert result is not None
+        assert result['minted'] is True, (
+            'the alarm is additive to the write — an unresolvable project_root '
+            'must cost the SIGNAL, never the mint that already landed'
+        )
+        emitter.assert_not_called()
+        text = caplog.text
+        assert _PROJECT in text, f'the WARN must name the project, got {text!r}'
+        assert 'curator-x' in text, f'the WARN must name the agent, got {text!r}'
+        assert '_known_projects' in text, (
+            f'the WARN must name what to wire to restore the alarm, got {text!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_non_numeric_threshold_skips_the_alarm_without_raising(
