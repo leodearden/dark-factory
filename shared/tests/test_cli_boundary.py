@@ -411,3 +411,94 @@ class TestTheFlushIsWhatSurfacesADeferredStdoutFailure:
             assert cli_boundary._handle_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
         monkeypatch.undo()
         assert 'closed the output pipe' in capsys.readouterr().err
+
+
+class TestArgparseHelpCannotVanishDownAFailedStdout:
+    """``--help | head`` must not exit 0 with its output discarded.
+
+    ``argparse`` writes its messages inside a suppressed ``except OSError``, so
+    a stock ``ArgumentParser`` swallows both the ``BrokenPipeError`` from a
+    closed reader and the ``ENOSPC`` from a full disk, then leaves via
+    ``SystemExit(0)`` — a success status for a run whose entire output went
+    nowhere. :class:`~shared.cli_boundary.LoudArgumentParser` re-raises instead.
+
+    Only reachable when stdout is UNBUFFERED or line-buffered
+    (``PYTHONUNBUFFERED=1``, ``python -u``, a tty), where the write hits fd 1
+    during ``parse_args``. Block-buffered, the help text is still in the buffer
+    at that point and the failure surfaces later at :func:`run_cli`'s explicit
+    flush instead — which is why both regimes are tested, here and in the
+    subprocess suite below.
+
+    The CONTROLS carry as much weight as the headline. The override must keep
+    EMITTING the full help text, and must leave argparse's error path,
+    formatting and exit codes untouched — a "fix" that merely stopped
+    swallowing, or that routed every ``SystemExit`` through the pipe handler,
+    would satisfy the headline and break the ordinary contract.
+    """
+
+    @staticmethod
+    def _parser() -> cli_boundary.LoudArgumentParser:
+        parser = cli_boundary.LoudArgumentParser(prog='synthetic')
+        parser.add_argument('--alpha', help='the first flag')
+        parser.add_argument('--beta', action='store_true', help='the second flag')
+        return parser
+
+    def test_help_into_a_closed_pipe_raises_rather_than_exiting_zero(self, monkeypatch):
+        """LINE-buffered, so the write reaches fd 1 inside ``parse_args``.
+
+        ``quiet_close=False``: ``parse_args`` is not the process boundary and
+        must not take over the caller's fd — it re-raises and lets
+        :func:`run_cli` decide. ``SystemExit(0)`` never being reached IS the
+        assertion.
+        """
+        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
+            with pytest.raises(BrokenPipeError):
+                self._parser().parse_args(['--help'])
+        monkeypatch.undo()
+
+    def test_help_onto_a_full_disk_escapes_as_a_plain_oserror(self, monkeypatch):
+        """The non-pipe half: a closed pipe can only ever produce EPIPE.
+
+        ``/dev/full``'s ``ENOSPC`` is what separates "the pipe handler catches
+        it" from "any stdout failure is handled", and it must escape as a plain
+        ``OSError`` so :func:`run_cli`'s second arm can see it.
+        """
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            _StdoutWithAFailingWrite(
+                OSError(errno.ENOSPC, 'No space left on device'), min_length=1
+            ),
+        )
+        with pytest.raises(OSError) as excinfo:
+            self._parser().parse_args(['--help'])
+        monkeypatch.undo()
+
+        assert not isinstance(excinfo.value, BrokenPipeError)
+        assert excinfo.value.errno == errno.ENOSPC
+
+    def test_help_on_a_healthy_stdout_still_prints_everything_and_exits_zero(self, capsys):
+        """CONTROL: pins the override to keep EMITTING, in full, not merely to re-raise."""
+        with pytest.raises(SystemExit) as excinfo:
+            self._parser().parse_args(['--help'])
+
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert 'usage:' in out
+        # The whole document, not a truncated first line — format_help() output
+        # routed through the override unchanged.
+        assert '--alpha' in out and '--beta' in out
+
+    def test_an_unrecognized_flag_still_reports_to_stderr_and_exits_two(self, capsys):
+        """CONTROL: the override touches stdout routing only.
+
+        argparse's error path writes to STDERR and exits 2. Both must survive
+        untouched, or the class has replaced a narrow defect with a wide one.
+        """
+        with pytest.raises(SystemExit) as excinfo:
+            self._parser().parse_args(['--definitely-not-a-flag'])
+
+        assert excinfo.value.code == 2
+        captured = capsys.readouterr()
+        assert 'unrecognized' in captured.err
+        assert 'unrecognized' not in captured.out
