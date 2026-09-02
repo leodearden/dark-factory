@@ -48,10 +48,14 @@ CREATE TABLE IF NOT EXISTS write_ops (
     -- synchronous Mem0 leg, then journals a single row here with
     -- success = not (_graphiti_error or _mem0_error) — an AND, so either leg's
     -- failure zeroes it. Its reader reconciliation/stage_stats.py therefore
-    -- gates on `success` only for single-leg operations, and reads the row's
-    -- per-leg evidence (result_summary's `memory_ids` for the Mem0 leg,
-    -- `stores` for the Graphiti one) for the add_memory counters. Read
-    -- `success` as a whole-op summary, never as one leg's verdict.
+    -- gates on `success` only for single-leg writes, and reads per-leg
+    -- evidence (result_summary's `memory_ids` for the Mem0 leg, `stores` for
+    -- the Graphiti one) for THAT row. Scope this to the producer, not to the
+    -- operation name: _execute_mem0_write (source='durable_queue') and
+    -- _execute_mem0_classify_and_add (provenance='derived') also journal
+    -- operation='add_memory' but are single-leg, so their `success` IS exact
+    -- and stage_stats keeps gating on it. Read `success` as a whole-op
+    -- summary, never as one leg's verdict.
     --
     -- terminal_status domain:
     --   NULL        no terminal outcome recorded — either still in flight, or

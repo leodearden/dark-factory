@@ -54,9 +54,9 @@ write); ``_COMPUTED_STAT_KEYS`` documents why that is deliberate.
 ``success`` is ALSO a per-leg fact wearing a per-op mask, for the same reason
 ``terminal_status`` is, and the same rule governs both columns: a counter may
 be gated on a column only when that column's subject is the very leg the
-counter counts. For every single-leg operation the two coincide — ``success``
-is per-op and per-leg at once — but ``add_memory``, the journal's sole
-dual-leg operation, journals ``success`` as
+counter counts. For every single-leg write the two coincide — ``success`` is
+per-op and per-leg at once — but the row ``MemoryService.add_memory`` journals
+is the sole dual-leg one, recording ``success`` as
 ``not (_graphiti_error or _mem0_error)``: an AND across a queued Graphiti leg
 and a synchronous Mem0 leg sharing one ``write_op_id``. Either leg's failure
 zeroes it, including for the counter that speaks about the OTHER leg.
@@ -68,9 +68,16 @@ populated only by its own leg's success: ``memory_ids`` (extended only after
 ``graphiti_writes_queued``. Because the evidence exists only where that leg
 succeeded, reading it instead of ``success`` cannot over-count — the gate
 could only ever have suppressed a true positive — and a both-legs-failed row,
-carrying neither ids nor stores, is still rejected on the evidence alone. The
-gate stays on ``_count_update_edge`` and the generic branch, where the
-operation is single-leg and ``success`` is exact.
+carrying neither ids nor stores, is still rejected on the evidence alone.
+
+Note the scope carefully: ``add_memory`` is an operation NAME, not a single
+producer. Three code paths journal it, and only ``MemoryService.add_memory``'s
+is dual-leg — ``_execute_mem0_write`` (``source='durable_queue'``) and
+``_execute_mem0_classify_and_add`` (``provenance='derived'``) are single-leg
+Mem0 writes whose ``success`` is exact. So ``_count_add_memory`` drops the gate
+only for rows that are NOT ``source='durable_queue'``; see its docstring for
+the per-producer breakdown. The gate likewise stays on ``_count_update_edge``
+and the generic branch, where the operation is single-leg.
 """
 
 from __future__ import annotations
@@ -221,26 +228,51 @@ def _count_add_memory(op: dict) -> bool:
     are tracked separately under ``graphiti_writes_queued`` via ``_count_graphiti_queued``.
     An op that reached neither store with a returned ID is a no-op here.
 
-    Deliberately does NOT gate on ``write_ops.success``, for the same per-leg
-    reason ``_landed`` is not applied to this branch. On this row ``success`` is
-    ``not (_graphiti_error or _mem0_error)`` — an AND across BOTH legs of
-    ``services/memory_service.py::MemoryService.add_memory``, which mints one
-    ``write_op_id`` for a queued Graphiti leg and a synchronous Mem0 leg and
-    journals a single Layer-1 row under it. So ``success`` is a per-leg fact
-    wearing a per-op mask: a raised ``durable_queue.enqueue`` zeroes it on the
-    very row that also carries Mem0's returned ``memory_ids``.
+    Gates on ``write_ops.success`` ONLY for rows whose ``source`` is
+    ``'durable_queue'``, and never for the rest — because THREE producers
+    journal ``operation='add_memory'`` and only one of them is dual-leg:
+
+    * ``services/memory_service.py::MemoryService.add_memory``
+      (``source='dual_write'``/``'mcp_tool'``) mints ONE ``write_op_id`` for a
+      queued Graphiti leg AND a synchronous Mem0 leg, journalling a single
+      Layer-1 row whose ``success`` is ``not (_graphiti_error or _mem0_error)``
+      — an AND across BOTH legs. On that row ``success`` is a per-leg fact
+      wearing a per-op mask: a raised ``durable_queue.enqueue`` zeroes it on the
+      very row that also carries Mem0's returned ``memory_ids``. It is the ONLY
+      row the per-leg argument below describes, which is why the ungated path
+      is scoped by ``source`` rather than applied to every ``add_memory`` row.
+    * ``services/memory_service.py::MemoryService._execute_mem0_write``
+      (``source='durable_queue'``) is a SINGLE-leg Mem0 write draining the
+      queue, so its ``success`` is exact and the gate is RETAINED — a failed or
+      dead-lettered drain must not count. This branch is not ``_landed``-gated
+      either, so ``success`` is the only signal that would catch it.
+    * ``services/memory_service.py::MemoryService._execute_mem0_classify_and_add``
+      (``provenance='derived'``) is also single-leg, but journals
+      ``success=True`` unconditionally, so no gate can bear on it.
+
+    Both single-leg producers journal ``result_summary=str(result)[:500]`` — a
+    Python repr, which ``_parse_result_summary`` cannot decode — so today they
+    fail the evidence gate anyway, and the raw Mem0 payload carries no
+    ``memory_ids`` key even if it did parse. The ``source`` gate exists because
+    that is an incidental of an unrelated code path rather than an invariant
+    this helper should lean on: it keeps the exclusion true if that
+    ``result_summary`` is ever normalised to a dict.
 
     A non-empty ``memory_ids`` is standalone proof the SYNCHRONOUS Mem0 write
     persisted — the list starts empty and is extended only after ``mem0.add``
     returns, and the queue worker has no path back to the caller for
-    server-assigned ids. Dropping the gate therefore cannot over-count: the
-    evidence exists only where the leg being counted succeeded, so ``success``
-    could only ever have suppressed a true positive. A both-legs-failed row has
-    no ids and is still rejected on the evidence alone.
+    server-assigned ids. Dropping the gate ON THAT ROW therefore cannot
+    over-count: the evidence exists only where the leg being counted succeeded,
+    so ``success`` could only ever have suppressed a true positive. A
+    both-legs-failed row has no ids and is still rejected on the evidence alone.
 
     Answers only "what SHAPE of write was this". Whether the write LANDED is
     the orthogonal ``_landed`` gate, applied by the caller.
     """
+    if op.get('source') == 'durable_queue' and not op.get('success', 1):
+        # Single-leg Mem0 queue drain (_execute_mem0_write): `success` is that
+        # one leg's exact verdict, not the dual-leg AND, so it is kept.
+        return False
     rs = _parse_result_summary(op.get('result_summary'))
     memory_ids = rs.get('memory_ids')
     return bool(isinstance(memory_ids, list) and memory_ids)
@@ -257,7 +289,13 @@ def _count_graphiti_queued(op: dict) -> bool:
     to avoid inflating the memories count.
 
     That evidence is per-leg, which is why ``write_ops.success`` is NOT also
-    consulted — the mirror of the rule in ``_count_add_memory``.
+    consulted — the mirror of the rule in ``_count_add_memory``. The reasoning
+    is about the row journalled by
+    ``services/memory_service.py::MemoryService.add_memory`` itself; the other
+    two ``add_memory`` producers are single-leg MEM0 writes that can never
+    reach this branch, since a Mem0-only result never puts ``'graphiti'`` in
+    ``stores``. That is why no ``source`` carve-out is needed here, unlike in
+    ``_count_add_memory``.
     ``services/memory_service.py::MemoryService.add_memory`` appends
     ``'graphiti'`` to ``stores`` only AFTER ``durable_queue.enqueue`` returns,
     so its presence is standalone proof the enqueue was accepted and the write
@@ -307,10 +345,13 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
     gated.
 
     ``write_ops.success`` splits the same way, so neither ``add_memory`` branch
-    consults it: on that dual-leg row it is the AND across both legs, and both
-    branches read their own leg's evidence instead (see the module docstring).
-    The generic branch and ``_count_update_edge`` keep the ``success`` gate,
-    because their operations are single-leg and the column is exact for them —
+    consults it for the DUAL-LEG row: there it is the AND across both legs, and
+    both branches read their own leg's evidence instead (see the module
+    docstring). ``add_memory`` rows from the two single-leg producers keep the
+    gate — ``_count_add_memory`` reapplies it for ``source='durable_queue'``,
+    and ``_count_graphiti_queued`` cannot see them at all. The generic branch
+    and ``_count_update_edge`` keep the ``success`` gate too, because their
+    operations are single-leg and the column is exact for them —
     ``add_episode``'s ``success`` tracks exactly one ``enqueue`` call, and
     ``update_edge`` never touches the queue at all.
 

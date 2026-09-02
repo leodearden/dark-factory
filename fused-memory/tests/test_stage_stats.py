@@ -83,6 +83,61 @@ def test_count_add_memory_handles_json_string_result_summary():
     assert _count_add_memory(op) is True
 
 
+def test_count_add_memory_keeps_success_gate_for_durable_queue_rows():
+    """A FAILED single-leg Mem0 queue drain must still be excluded.
+
+    ``operation='add_memory'`` is an operation NAME with three producers, and
+    only ``MemoryService.add_memory``'s row is dual-leg. A row from
+    ``services/memory_service.py::MemoryService._execute_mem0_write`` carries
+    ``source='durable_queue'`` and ``success=error_msg is None`` — one leg's
+    EXACT verdict, not an AND — so for it ``success`` is a correct signal
+    rather than a per-op mask, and dropping the gate would let a failed or
+    dead-lettered drain count toward ``memories_added`` (a branch ``_landed``
+    does not gate either).
+
+    That producer journals ``result_summary=str(result)[:500]``, an
+    undecodable Python repr, so today the evidence gate rejects it anyway. This
+    pin is what keeps the exclusion true if that shape is ever normalised to a
+    dict — the hypothetical parseable row is written out explicitly here.
+    """
+    op = {
+        'source': 'durable_queue',
+        'success': 0,
+        'result_summary': {'memory_ids': ['m1'], 'stores': ['mem0']},
+    }
+    assert _count_add_memory(op) is False
+
+
+def test_count_add_memory_counts_successful_durable_queue_row():
+    """The ``source`` carve-out gates on FAILURE only, never on provenance.
+
+    A queue drain that succeeded is a real persisted memory and must still
+    count on its evidence, exactly like any other row.
+    """
+    op = {
+        'source': 'durable_queue',
+        'success': 1,
+        'result_summary': {'memory_ids': ['m1'], 'stores': ['mem0']},
+    }
+    assert _count_add_memory(op) is True
+
+
+def test_count_add_memory_dual_leg_row_still_ungated_when_source_present():
+    """The carve-out is scoped to ``'durable_queue'`` and nothing else.
+
+    ``MemoryService.add_memory`` journals ``source='dual_write'`` (or
+    ``'mcp_tool'``), so an explicit ``source`` on the dual-leg row must not
+    reintroduce the AND-mask this task removed.
+    """
+    for source in ('dual_write', 'mcp_tool'):
+        op = {
+            'source': source,
+            'success': 0,
+            'result_summary': {'memory_ids': ['m1'], 'stores': ['mem0']},
+        }
+        assert _count_add_memory(op) is True, source
+
+
 # ── _count_graphiti_queued ──────────────────────────────────────────────
 
 
@@ -161,18 +216,24 @@ async def _log_write(
     agent_id: str = _STAGE_AGENT_ID,
     result_summary: dict | str | None = None,
     success: bool = True,
+    source: str = 'mcp_tool',
 ) -> str:
     """Journal one Layer-1 write_op and return its ``write_op_id``.
 
     The id is returned (rather than discarded inline) so a test can hand it to
     :func:`_stamp_terminal` afterwards. Keyword-only signature and defaults are
     unchanged, so existing call sites that ignore the return value still work.
+
+    ``source`` defaults to ``'mcp_tool'`` — one of the two values
+    ``MemoryService.add_memory`` journals for its DUAL-LEG row. Override it to
+    ``'durable_queue'`` to reproduce a single-leg Mem0 queue drain, which
+    ``_count_add_memory`` treats differently.
     """
     write_op_id = str(uuid.uuid4())
     await journal.log_write_op(
         write_op_id=write_op_id,
         causation_id=causation_id,
-        source='mcp_tool',
+        source=source,
         operation=operation,
         project_id='test',
         agent_id=agent_id,
@@ -768,6 +829,62 @@ async def test_derive_stage_stats_excludes_failed_ops(journal):
     await _log_write(
         journal, causation_id=run_id, operation='delete_memory',
         result_summary={'status': 'deleted'}, success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_update_edge_excluded_when_op_failed(journal):
+    """``_count_update_edge`` keeps its ``success`` gate — deliberately.
+
+    Task 4322 removed that gate from the ``add_memory`` counters because their
+    row is dual-leg. ``update_edge`` is not: ``MemoryService.update_edge``
+    makes a single Graphiti call and never touches the durable queue, so
+    ``success`` is per-op and per-leg at once and the gate is exact.
+
+    Without this pin the natural over-application of that task — dropping the
+    gate from ``_count_update_edge`` too, which sits three lines above
+    ``_count_add_memory`` and reads identically — would leave the whole suite
+    green while counting an edge whose save RAISED but whose stale
+    ``verified=True`` was still journalled.
+    """
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='update_edge',
+        result_summary={'verified': True, 'status': 'updated'}, success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_excludes_failed_durable_queue_add_memory(journal):
+    """End-to-end: a FAILED single-leg Mem0 queue drain must not count.
+
+    ``services/memory_service.py::MemoryService._execute_mem0_write`` journals
+    ``operation='add_memory'`` with ``source='durable_queue'`` from a
+    ``finally``, on the failure path as well as the success one, and preserves
+    the caller's ``agent_id`` — so such a row genuinely can land in a stage's
+    op set. Its ``success`` is one leg's exact verdict, so ``_count_add_memory``
+    reapplies the gate for this ``source`` and ``memories_added`` stays 0.
+
+    The real row's ``result_summary`` is an undecodable ``str(result)`` repr,
+    which would fail the evidence gate on its own; this test supplies the
+    parseable dict that shape could become, so the exclusion is pinned to the
+    ``source`` rule rather than to that incidental.
+    """
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+        success=False, source='durable_queue',
     )
 
     ops = await journal.get_ops_by_causation(run_id)
