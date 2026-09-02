@@ -6182,6 +6182,7 @@ class GitOps:
         *,
         title: str | None = None,
         branch: str | None = None,
+        exclude: Collection[Path] | None = None,
     ) -> Path | None:
         """Attempt to steal a non-dispatched non-terminal lane for *branch_name*.
 
@@ -6200,6 +6201,28 @@ class GitOps:
         - ``not is_dispatched(victim)`` — re-checked atomically under the pool
           lock (TOCTOU guard; see design note in task 1933).
         - ``lane state == ASSIGNED`` — only steal a live assignment.
+        - ``lane not in exclude`` — filtered HERE, by this method (task 4930).
+
+        *exclude* is the set of lanes the calling acquire has ALREADY
+        stole-and-failed on, and it is load-bearing rather than cosmetic: a
+        failed steal unwinds through :meth:`_abort_lane_acquisition`, whose
+        final act is ``pool.release(lane)`` — returning the hostile lane to
+        FREE, where it is the lowest-index candidate ``acquire_for`` would hand
+        straight back.  Without this filter (and its paired veto-and-release in
+        :meth:`_acquire_warm_lane_impl`, which is what forces control back onto
+        this method at all) the steal-path retry loop would be a silent no-op.
+        The filter runs BEFORE the async candidate provider and
+        :meth:`WarmLanePool.reclaim_victim` are consulted, so an excluded lane
+        is never re-keyed and then discarded — a victim whose only eligible
+        lane is excluded is left entirely undisturbed.
+
+        Comparison is by lane ``Path`` — what the caller actually knows —
+        never by victim branch name, which changes between attempts (the
+        previous attempt's steal re-keyed that lane to the thief, and the
+        subsequent release dropped the entry altogether).
+
+        ``exclude=None`` (the default) skips the filter entirely, keeping all
+        existing call shapes byte-identical.
 
         Before routing the stolen lane into the reset, commits any uncommitted
         *tracked* WIP onto the victim's still-checked-out branch so 1912
@@ -6222,7 +6245,17 @@ class GitOps:
             return None
 
         pool = self.warm_lane_pool
-        candidates = list(pool.assignments_snapshot().keys())
+        assignments = pool.assignments_snapshot()
+        candidates = list(assignments.keys())
+        if exclude:
+            # Task 4930: drop every victim whose lane this acquire already
+            # stole-and-failed on, BEFORE the async provider or reclaim_victim
+            # are consulted — see the docstring's exclusion rationale.
+            excluded = set(exclude)
+            candidates = [
+                victim for victim, lane in assignments.items()
+                if lane not in excluded
+            ]
         if not candidates:
             return None
 
