@@ -1558,6 +1558,11 @@ class WarmLaneRequeue(Exception):
         WarmLaneReseedContaminated — fresh reseed failed verification: the
             lane still carries a prior occupant's commits (task 2854,
             data-integrity); requeue to re-acquire a DIFFERENT lane.
+        WarmLaneLockTimeout — the bounded <lane_dir>.lock wait expired
+            against a live holder (seed rc=124, task 4930); transient
+            shared-resource contention.
+        WarmLaneStealFailed — every reclaim-on-exhaustion steal this acquire
+            attempted failed to provision (task 4930); pool pressure.
     """
 
 
@@ -1649,6 +1654,69 @@ class WarmLaneReseedContaminated(WarmLaneRequeue):
     contamination eventually trips the requeue-cap escalation — a loud human
     signal — instead of requeuing forever silently.
     """
+
+
+class WarmLaneLockTimeout(WarmLaneRequeue):
+    """:meth:`GitOps._seed_warm_lane` lost the bounded ``<lane_dir>.lock``
+    wait to a live holder — seed rc ``124``
+    (``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``, flock's ``--conflict-exit-code`` for
+    the ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` wait).  Task 4930.
+
+    **What produced it**: a concurrent GC reseed, a thin, or another seed
+    already held that lane's lock for longer than the 30s wait.  The measured
+    GC hold runs 25--88s (median ~34s) and ``reify-warm-lane-gc.timer`` fires
+    every 15 min while a pass takes ~30 min, so passes overlap — this is an
+    EXPECTED contention outcome under normal GC cadence, not an exotic one.
+
+    **Lane state on exit**: untouched.  The seed script never ran (the lock
+    guards its whole body), and :meth:`GitOps.acquire_warm_lane` has already
+    released the lane back to FREE.
+
+    **Why it requeues rather than blocks**: nothing about the requeued task
+    caused a lock race, and the condition clears on its own the moment the
+    holder finishes — the same shape as its
+    :class:`WarmLaneDiskPressure` / :class:`WarmLaneSoftPressure` neighbours,
+    so its disposition-table row likewise sets
+    ``counts_against_requeue_cap=False``.  Before task 4930 rc=124 fell through
+    to ``FAULT``, the one warm-lane discriminant that is not a
+    :class:`WarmLaneRequeue`, so a lost lock race hard-BLOCKed the task at
+    ``agent_invocations=0``.  Deliberately NOT :class:`WarmLaneDiskPressure`:
+    exit-75 means disk, and a lock race implicates neither disk nor this task.
+    """
+
+
+class WarmLaneStealFailed(WarmLaneRequeue):
+    """Every reclaim-on-exhaustion steal this acquire attempted failed to
+    provision — or a retry attempt found no further eligible victim.
+    Task 4930.
+
+    **What produced it**: :meth:`GitOps.acquire_warm_lane`'s bounded
+    steal-path retry stole up to ``_WARM_LANE_STEAL_MAX_ATTEMPTS`` DIFFERENT
+    lanes via :meth:`GitOps._try_reclaim_lane_for` and each one failed with a
+    lane-scoped sentinel (``FAULT`` / ``LANE_LOCK_TIMEOUT``).  The valve is the
+    one acquisition route that hands out a lane WITHOUT validating its state:
+    it takes whatever :meth:`WarmLanePool.reclaim_victim` re-keys — a
+    quarantined lane with a conflicted index, a lane whose branch is already
+    checked out at another worktree, a lane mid-GC-reseed.
+
+    **Lane state on exit**: every attempted lane has already been released back
+    to FREE by :meth:`GitOps._abort_lane_acquisition`, and the thief holds no
+    assignment — no ASSIGNED leak.
+
+    **Why it requeues rather than blocks**: this is the disposition the
+    2026-08-29 incident's three born-at-L2 escalations (tasks 5711 / 5747 /
+    6362) should have received.  All three were hostile-lane events on the
+    steal path, and each stranded a task at BLOCKED + L1 with
+    ``agent_invocations=0`` — a per-task escalation for a pool-level
+    condition the task had no part in.
+
+    Unlike the transient :class:`WarmLaneDiskPressure` /
+    :class:`WarmLanePoolHardDown` / :class:`WarmLaneSoftPressure` rows, its
+    disposition-table row sets ``counts_against_requeue_cap=True``: chronic
+    pool pressure keeps producing hostile lanes, so this condition does NOT
+    self-clear, and counting it preserves a bounded loud path (the requeue-cap
+    escalation) in place of the per-task BLOCKED+L1 being removed — the task
+    must not go from "always escalates" to "requeues forever in silence"."""
 
 
 class WorktreeConflictError(RuntimeError):
@@ -4298,13 +4366,70 @@ class GitOps:
                     f"(lane retained a prior occupant's commits beyond base); "
                     f'requeue to re-acquire a different lane (task 2854)'
                 )
-            # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
-            # DISABLED is a programming error (caller bypassed the pool-enabled
-            # guard); it is treated as a fault here so blocked+L1 surfaces the
-            # bug rather than silently requeueing forever.
+            if pool_info is WarmLaneUnavailable.LANE_LOCK_TIMEOUT:
+                # Transient shared-resource contention (task 4930): the seed
+                # lost the bounded <lane_dir>.lock wait to a live holder
+                # (rc=124), so the script never ran and the lane is untouched.
+                raise WarmLaneLockTimeout(
+                    f'warm-lane seed lost the {_SEED_WARM_LANE_LOCK_WAIT_SECS}s '
+                    f'<lane>.lock wait (rc={_SEED_WARM_LANE_LOCK_TIMEOUT_RC}) for '
+                    f'branch {branch_name!r} — a concurrent GC reseed / thin / '
+                    f'seed still holds it; requeue (transient contention)'
+                )
+            if pool_info is WarmLaneUnavailable.STEAL_FAILED:
+                # Pool pressure (task 4930): the reclaim-on-exhaustion safety
+                # valve stole up to _WARM_LANE_STEAL_MAX_ATTEMPTS DIFFERENT
+                # lanes and every one failed to provision (or no further
+                # eligible victim remained). Carry the SAME typed census the
+                # EXHAUSTED row above appends, via the single shared render(),
+                # so an operator sees the pinned/free counts that drove the
+                # steal pressure in the same line.
+                census = self._assemble_warm_lane_census()
+                raise WarmLaneStealFailed(
+                    f'warm-lane reclaim-on-exhaustion steal failed for branch '
+                    f'{branch_name!r}: all {_WARM_LANE_STEAL_MAX_ATTEMPTS} '
+                    f'attempted lanes failed to provision (or no further '
+                    f'eligible victim remained); requeue — {census.render()}'
+                )
+            if pool_info is WarmLaneUnavailable.DISABLED:
+                # A PROGRAMMING ERROR, not an infra fault: the caller reached
+                # acquire_warm_lane without first checking
+                # `self.warm_lane_pool is not None`. Split out of the
+                # fall-through below (task 4930) so the message names the bug
+                # instead of borrowing seed/worktree-add wording that cannot
+                # apply — DISABLED short-circuits before any lane is touched.
+                # Still a RuntimeError, so blocked+L1 surfaces the bug rather
+                # than requeueing forever against a pool that is switched off.
+                raise RuntimeError(
+                    f'warm-lane acquire returned DISABLED for branch '
+                    f'{branch_name!r} — programming error: the caller invoked '
+                    f'acquire_warm_lane without checking `warm_lane_pool is '
+                    f'not None` first. No lane was touched.'
+                )
+            # Residual FAULT → RuntimeError reuses existing blocked+L1 plumbing:
+            # an unclassified infra fault genuinely is a per-task block.
+            #
+            # Task 4930 rewrote this message. It used to claim "seed/worktree-add
+            # failure, absent seed script, or pool disabled" — two thirds of
+            # which FAULT cannot produce: an absent CoW base is BASE_ABSENT
+            # (WarmLanePoolHardDown) and a disabled pool is DISABLED, handled
+            # just above. That left an operator with a three-cause guess for a
+            # condition whose real root cause was already in the journal.
             raise RuntimeError(
-                f'warm-lane acquire fault for branch {branch_name!r} '
-                f'(seed/worktree-add failure, absent seed script, or pool disabled)'
+                f'warm-lane acquire fault for branch {branch_name!r}: the pool '
+                f'could not provision a lane and the failure matched none of '
+                f'the typed requeue classes (WarmLanePoolExhausted, '
+                f'WarmLaneDiskPressure, WarmLaneSoftPressure, '
+                f'WarmLanePoolHardDown, WarmLaneReseedContaminated, '
+                f'WarmLaneLockTimeout, WarmLaneStealFailed). Actual producers: '
+                f'a `git worktree add` failure; a seed script fault (including '
+                f'rc=127, script absent from the lane); a lane-reset fault that '
+                f'persisted across the in-process retry; or an unexpected '
+                f'exception during provisioning, such as a conflicted index on '
+                f'a recycled lane or a branch already checked out in another '
+                f'worktree. The root cause is in the preceding '
+                f'`acquire_warm_lane:` WARNING and its traceback — read that, '
+                f'not this message.'
             )
 
         # If worktree already exists, reuse it (common after requeue) —
