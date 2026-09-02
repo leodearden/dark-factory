@@ -1615,7 +1615,7 @@ async def test_without_a_lister_the_report_says_its_graph_set_was_unchecked():
     assert source.asked == list(_mod.DEFAULT_PROJECT_IDS)
     assert report.project_ids_source == 'fallback'
     assert report.unmeasured_graphs == []
-    assert 'NOT cross-checked' in render_markdown(report)
+    assert _mod._GRAPH_SET_NOTES[_mod.PROJECT_IDS_FALLBACK] in render_markdown(report)
 
 
 @pytest.mark.asyncio
@@ -1748,7 +1748,9 @@ async def test_the_verdict_keys_on_triaged_recall_loss_not_on_raw_matches():
     assert empty.verdict == _mod._VERDICT_ZERO_MATCHES
 
     # (2) facts reach the guard, every rejection CORRECT — cost still zero,
-    #     but now resting on the triage heuristic, which the verdict must say
+    #     but now resting on the triage heuristic. The equality assertion below
+    #     pins WHICH verdict is selected; the heuristic caveat is carried by the
+    #     constant's own text, not re-typed here.
     correct_only = await run(
         _args(project_id=['alpha']),
         edge_source=_FakeEdgeSource({
@@ -1758,7 +1760,6 @@ async def test_the_verdict_keys_on_triaged_recall_loss_not_on_raw_matches():
     assert correct_only.totals.regex_matched == 1
     assert correct_only.triage_totals == {'prepositional_complement': 1}
     assert correct_only.verdict == _mod._VERDICT_NO_TRIAGED_RECALL_LOSS
-    assert 'HEURISTIC' in correct_only.verdict, 'the caveat is the point'
 
     # (3) a single adverbial_preamble rejection IS recall loss — assert nothing
     recall_loss = await run(

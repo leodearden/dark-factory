@@ -338,7 +338,16 @@ async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
     # median / 0.28s worst of 10 (re-measured at host load ~362/32 cores), so 5.0s
     # was already a 27-66x margin — and it still flaked under full-suite xdist
     # load, dead-lettering 5 of 50 with 'shutdown flush window (5.0s) elapsed'.
-    # 60.0s restores a ~300x margin against that measured cost.
+    # 20.0s restores a ~70x margin against that measured cost.
+    #
+    # The window must stay WELL under the suite-wide pytest-timeout cap
+    # (fused-memory/pyproject.toml: timeout = 60, timeout_method = "thread").
+    # EventQueue.close() awaits asyncio.wait_for(queue.join(), shutdown_flush),
+    # so on a genuine drainer stall this test blocks for the whole window; at
+    # 60.0s the setup time ahead of close() pushes the total past the cap, and
+    # the thread handler's os._exit(1) would kill the xdist worker instead of
+    # letting the assertions below report a clean failure. 20.0s keeps the
+    # stall path inside the cap while still being far above any jitter.
     #
     # This does NOT weaken the test: both assertions below stay exactly as strong,
     # so a drainer that genuinely fails to flush still fails here, just not on
@@ -350,7 +359,7 @@ async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
         maxsize=100,
         retry_initial_seconds=0.01,
         retry_max_seconds=0.1,
-        shutdown_flush_seconds=60.0,
+        shutdown_flush_seconds=20.0,
     )
     await q.start()
     for _ in range(50):
