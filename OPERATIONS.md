@@ -1076,7 +1076,10 @@ restart:
   `orchestrator_restart_force_fire_after_secs` config field below, despite
   the near-identical name — one bounds a per-unit drain wait inside the
   script, the other bounds how long the coordinator stays pending before
-  it force-fires.
+  it force-fires. Separately, the backstop holds a 30-minute head start
+  AFTER the 8h window opens before it will act, so the event-driven
+  coordinator gets first refusal at each boundary (task 4754). Neither
+  force-fire setting above is that head start.
 - **Coordinator = the polite, event-driven trigger for that same deploy.**
   It fires on a clean idle window, or force-fires after
   `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min) of
@@ -1101,10 +1104,16 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   other tier's min-interval check then legitimately passes. With one unit stuck
   reporting `merge_idle:false`, sweeps ran ~81 minutes and the fleet was
   redeployed twice per window — dark_factory runs of 1.26h / 0.92h / 1.33h.
-  Tasks **4754** (head-start reference point) and **4755** (in-flight lease,
-  which also stops a liveness probe from cancelling the sweep's own restart
-  jobs) close this; until they land, treat "one deploy per 8h" as the intent,
-  not a guarantee, and read the clock file's timestamp rather than assuming it.
+  Task **4754** has since landed the head-start half: both staleness tiers now
+  hold their 30-minute head start until *after* their own min-interval
+  expires, so the backstop no longer wins the boundary race purely on poll
+  cadence. That does NOT make the window collision-free. The residual case is
+  **4755**'s (in-flight lease, which also stops a liveness probe from
+  cancelling the sweep's own restart jobs): a sweep still stamps the clock
+  only on completion, so a long sweep can let the other tier's min-interval
+  check pass mid-sweep. Until 4755 lands, treat "one deploy per 8h" as the
+  intent, not a guarantee, and read the clock file's timestamp rather than
+  assuming it.
 
 ### Reading `--report`
 
