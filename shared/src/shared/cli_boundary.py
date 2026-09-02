@@ -321,6 +321,19 @@ def run_cli(main: Callable[[], int]) -> int:
     uncatchable failure becomes the same documented :data:`EXIT_STDOUT_FAILED`
     plus single ``error: ...`` line every other failure produces.
 
+    WHERE THAT IS OBSERVABLE, which is worth stating because it is not
+    obvious from any in-process test. The status override happens during
+    interpreter FINALIZATION, so nothing running inside the process can see
+    it: a test suite's interpreter never finalizes mid-suite, and an
+    in-process test can only assert on the value ``run_cli`` returned — which
+    is precisely the value CPython is free to discard. A REAL CHILD PROCESS is
+    the only shape that observes the status the OS actually reports. That
+    regime is covered by the ``_spawn`` tests in
+    ``shared/tests/test_cli_boundary.py``, across both buffering regimes,
+    including the ``2>&1 | head`` shape where BOTH streams are the closed pipe
+    and the exit status is the only remaining observable. A change here that
+    still passes every in-process test can regress that, so run those too.
+
     Kept OUT of ``main()`` deliberately. ``main(argv) -> int`` is the seam a
     test suite drives and its contract is "parse and run, return a code";
     interpreter-lifecycle concerns — flushing what is left, and redirecting fd
