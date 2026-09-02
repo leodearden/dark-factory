@@ -2040,6 +2040,56 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
     )
 
 
+def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+    """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
+
+    291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
+    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
+    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
+    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
+    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
+    None) are distinguishable from the failure message alone -- exactly the
+    signal an incident needs. It shipped with no test (task 4312).
+
+    Deterministic per the task-4014 precedent above: ``_probe_children``
+    always reports no children and ``timeout=0`` so the poll body never
+    executes a single tick -- the timeout branch fires immediately, with
+    zero real timing.  What IS real is *proc*: an actually-spawned,
+    already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
+    KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
+    CONTENT rather than merely the presence of the words "rc"/"stderr" --
+    the vacuous-guard trap this repo has hit before: a message reporting
+    nothing (e.g. ``rc=None; stderr tail:\n``) would also contain those
+    labels.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stderr.write("SENTINEL-XYZ\\n"); sys.exit(3)'],
+        stderr=subprocess.PIPE,
+    )
+    proc.wait()
+    assert proc.returncode == 3  # sanity: the known rc actually landed
+
+    with pytest.raises(AssertionError) as exc_info:
+        wait_subtree_live(
+            1234,
+            proc=proc,
+            proc_label='leader',
+            timeout=0,
+            interval=0,
+            _probe_children=lambda _pid: set(),
+            _ppid_map=lambda: {},
+        )
+
+    message = str(exc_info.value)
+    assert 'rc=3' in message, (
+        f'expected the leader\'s actual returncode (3) in the timeout message; got: {message!r}'
+    )
+    assert 'SENTINEL-XYZ' in message, (
+        f'expected the leader\'s actual stderr tail content in the timeout message; '
+        f'got: {message!r}'
+    )
+
+
 #: A child that stays alive but is never waited on -- killed by the test that
 #: spawns it.  ``sys.executable`` rather than ``sleep`` so nothing depends on
 #: PATH; the probe only needs the fork, not a finished exec.
