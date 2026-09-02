@@ -15030,6 +15030,144 @@ class TestSweepStaleMem0PoolProtectsMirrorRecords:
         assert result == 1
 
 
+class TestSweepStaleMem0PoolProtectsAuditRecords:
+    """_sweep_stale_mem0_pool never deletes a permanent audit record (task 4375).
+
+    MEASURED harm, not hypothetical: 40 ``kind='cadence_check'`` Mem0 records in
+    autopilot_video were destroyed by ``flag_for_stage2_gc_sweep``, every one
+    with deleted_at minus created_at of exactly 14 days — i.e. pure age-GC,
+    nothing about the record itself. Their surviving siblings carry the ENTIRE
+    Stage-1 relay contract (flag_for_stage2, flag_type, run_id, source,
+    task_id), so they are indistinguishable from a genuine relay marker by
+    every field except ``kind``. Narrowing the payload filter cannot help: of
+    the 288 records this sweep destroyed, 165 carried no ``kind`` key at all
+    and 248 no ``source``, so no positive allowlist can enumerate the genuine
+    pool. The discrimination therefore lives in the eligibility predicate at
+    this one choke point, beside the task-3041 mirror guard.
+
+    Each guard keeps its OWN WARNING: a skipped audit record must never be
+    reported as a skipped cycle_summary mirror, or an operator reading the log
+    is sent to tighten the wrong thing.
+    """
+
+    # The exact live metadata shape measured on the surviving autopilot_video
+    # records — full relay contract, distinguishable only by ``kind``.
+    _LIVE_CADENCE_CHECK = {
+        'kind': 'cadence_check',
+        'flag_for_stage2': True,
+        'flag_type': 'task452_cadence_check_reminder',
+        'run_id': 'r-victim',
+        'source': 'recon-stage-memory_consolidator',
+        'task_id': '452',
+    }
+
+    @pytest.mark.asyncio
+    async def test_audit_record_skipped_genuine_relay_marker_still_deleted(self, caplog):
+        """Both directions in ONE test, so a disabled sweep cannot pass it."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {'id': 'audit-record', 'created_at': stale,
+             'metadata': dict(self._LIVE_CADENCE_CHECK)},
+            # The 57%-majority genuine-relay shape: no ``kind`` key at all.
+            {'id': 'genuine-relay', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't1',
+                          'flag_type': 'y', 'run_id': 'r1'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone, caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        deleted_ids = [
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        ]
+        assert deleted_ids == ['genuine-relay']
+        assert memory_service.delete_memory.await_count == 1
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        # A tombstone must never claim a live record.
+        assert tombstone.await_count == 1
+        victims = tombstone.await_args.args[2]
+        assert [v['id'] for v in victims] == ['genuine-relay']
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'audit-record' in message
+        assert 'cadence_check' in message
+        assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
+        # DISTINCT from the task-3041 mirror WARNING: misattributing this skip
+        # as a cycle_summary mirror skip would send an operator to inspect the
+        # wrong pool.
+        assert 'cycle_summary' not in message
+
+    @pytest.mark.asyncio
+    async def test_mirror_branch_message_unchanged_by_the_new_guard(self, caplog):
+        """No task-3041 regression: a mirror still takes the MIRROR branch."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'protected-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                             'flag_for_stage2': True},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=fixed_now,
+                enum_filters={'flag_for_stage2': True},
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'SKIPPING protected cycle_summary mirror' in message
+        assert 'ledger_stamp' in message
+        assert 'task 3041' in message
+
+
 class TestSweepStaleMem0PoolTombstones:
     """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
 
