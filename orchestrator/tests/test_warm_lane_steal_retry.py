@@ -29,6 +29,7 @@ convention ``test_warm_lane_structural_exhaustion.py`` follows (see its
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -163,3 +164,97 @@ async def _setup_pool(
 
     return git_ops, lanes, start_ref
 
+
+
+# ---------------------------------------------------------------------------
+# step-03: _try_reclaim_lane_for(exclude=...)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReclaimExclude:
+    """``GitOps._try_reclaim_lane_for`` must skip lanes this acquire already
+    stole-and-failed on.
+
+    Half of a two-part exclusion (the other half is the veto-and-release in
+    ``_acquire_warm_lane_impl``): without it the steal-path retry is a silent
+    no-op, because a failed attempt unwinds through ``_abort_lane_acquisition``
+    whose final ``pool.release(lane)`` returns the hostile lane to FREE — where
+    it is the lowest-index candidate ``acquire_for`` hands straight back.
+    """
+
+    async def test_excluded_lane_is_never_stolen(self, wl_git_repo: Path):
+        """With _lane-0 excluded, the valve must steal _lane-1 instead."""
+        git_ops, lanes, _start_ref = await _setup_pool(wl_git_repo, size=2)
+        lane0, lane1 = lanes
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        stolen = await git_ops._try_reclaim_lane_for(
+            'Z', exclude=frozenset({lane0}),
+        )
+
+        assert stolen == lane1, (
+            f'Excluded lane {lane0} must never be stolen; expected {lane1}, '
+            f'got {stolen!r}'
+        )
+        assert pool.assignment_for('Z') == lane1, (
+            'the thief must be re-keyed onto the non-excluded lane'
+        )
+
+    async def test_all_candidates_excluded_returns_none(self, wl_git_repo: Path):
+        """Excluding every lane returns None WITHOUT disturbing any victim.
+
+        The filter must short-circuit BEFORE ``reclaim_victim`` re-keys
+        anything — a valve that steals and then discovers the lane is excluded
+        would strand the victim's assignment.
+        """
+        git_ops, lanes, _start_ref = await _setup_pool(wl_git_repo, size=2)
+        lane0, lane1 = lanes
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        stolen = await git_ops._try_reclaim_lane_for(
+            'Z', exclude=frozenset({lane0, lane1}),
+        )
+
+        assert stolen is None, f'expected None with every lane excluded, got {stolen!r}'
+        assert pool.assignment_for('Z') is None, (
+            'no assignment may be created when nothing is eligible'
+        )
+        assert pool.assignment_for('V0') == lane0, (
+            'victim V0 must be left untouched — the filter short-circuits '
+            'before reclaim_victim re-keys anything'
+        )
+        assert pool.assignment_for('V1') == lane1, (
+            'victim V1 must be left untouched'
+        )
+
+    async def test_exclude_omitted_is_byte_identical(
+        self, wl_git_repo: Path, caplog,
+    ):
+        """Calling with no ``exclude`` kwarg at all is unchanged behaviour.
+
+        Pins that all four existing call shapes are unaffected by the new
+        keyword-only parameter's default.
+        """
+        git_ops, lanes, _start_ref = await _setup_pool(wl_git_repo, size=2)
+        lane0 = lanes[0]
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            stolen = await git_ops._try_reclaim_lane_for('Z')
+
+        assert stolen == lane0, (
+            f'with no exclusion the valve still steals the lowest-index '
+            f'eligible lane {lane0}; got {stolen!r}'
+        )
+        assert pool.assignment_for('Z') == lane0
+        assert any(
+            'reclaim-on-exhaustion — stole lane' in r.getMessage()
+            for r in caplog.records
+        ), (
+            f'the existing steal WARNING must still fire; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
