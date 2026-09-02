@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import signal
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -91,6 +92,19 @@ CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 # promptly (self-correcting). Deliberately a small internal responsiveness
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
+
+# How often a FULLY-CAPPED park re-announces itself (task 4945). The park
+# below used to log once at INFO and then block on a bare `_open.wait()`
+# with no further output for as long as the freeze lasted, which made a
+# frozen pool indistinguishable from a hung run — the gap
+# orchestrator/evals/runner.py names, where cap_wait_sanity_secs bounds
+# only the post-invocation cap-RETRY branch and cannot see this wait at
+# all. 600s matches `cli_invoke._CAP_WAIT_LOG_INTERVAL_SECS`, whose
+# `cap_wait` heartbeat this one deliberately mirrors: a park is measured
+# in hours, so ~10 min is frequent enough to prove liveness and rare
+# enough not to bury the signal. Deliberately an internal observability
+# constant, not an operator knob.
+_ALL_CAPPED_PARK_LOG_INTERVAL_SECS = 600.0
 
 # Consecutive spawn failures on ONE account before the gate latches
 # `probe_infra_fault` (task 4512). Greater than 1 so a single transient spawn
@@ -658,6 +672,34 @@ class UsageGate:
     PRD §7.3 (task W4-γ) for the full transition table.
     """
 
+    # All-capped park heartbeat state (task 4945).
+    #
+    # INSTANCE-SCOPED, not local to `_wait_for_any_account_to_reopen`: the
+    # selection loop RE-ENTERS that helper on every wakeup, so per-call state
+    # would restart the clock each time — pinning elapsed_s at ~0 forever and
+    # emitting one warning per wakeup, i.e. destroying both halves of the
+    # signal. Shared across concurrent callers on purpose too: a frozen pool
+    # should announce itself once per interval, not once per waiter. Cleared
+    # in `before_invoke` when a lease is finally served — the moment the park
+    # actually ends — so elapsed_s measures how long the pool has been unable
+    # to serve ANYONE.
+    #
+    # DECLARED ON THE CLASS RATHER THAN IN `__init__`, deliberately.
+    # `orchestrator/tests/_orch_helpers.py::build_usage_gate` — the canonical
+    # helper behind every orchestrator gate test — constructs a UsageGate via
+    # `__new__` and assigns the private attributes it knows about directly,
+    # bypassing `__init__` entirely. An `__init__`-only attribute is therefore
+    # missing on those instances and raises AttributeError from the park path
+    # (measured: 7 failures across test_usage_gate.py and
+    # test_reify_multi_account.py). A class-level default makes the attribute
+    # resolvable however the instance was built, which is the more robust
+    # arrangement regardless of that helper: nothing about a park heartbeat
+    # should depend on which constructor a caller used. Both values are
+    # immutable (`float | None`), so a shared class default cannot leak state
+    # between instances the way a mutable one would.
+    _park_started_at: float | None = None
+    _park_last_logged_at: float | None = None
+
     def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
         self._config: UsageCapConfig = config
         self._open = asyncio.Event()
@@ -1050,6 +1092,9 @@ class UsageGate:
                                 )
                         else:
                             scope_last[scope] = acct.name
+                    # The park (if any) is over the moment someone is served.
+                    self._park_started_at = None
+                    self._park_last_logged_at = None
                     return AccountLease(
                         name=acct.name,
                         token=acct.token,
@@ -1133,7 +1178,92 @@ class UsageGate:
             # how _open drifted.
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
-            await self._open.wait()
+            await self._wait_for_any_account_to_reopen()
+
+    async def _wait_for_any_account_to_reopen(self) -> None:
+        """Block until ``_open`` is set, announcing the park as it waits.
+
+        SEMANTICS ARE THOSE OF ``await self._open.wait()``, unchanged: this
+        returns only once an account reopens, and every ``TimeoutError`` is
+        suppressed and retried. The heartbeat is PURELY ADDITIVE — it alters
+        neither what ``before_invoke`` returns nor when it unblocks.
+
+        WHY THE PARK NEEDS A VOICE. Before task 4945 the caller logged one
+        INFO line and then blocked here with no further output for however
+        long the pool stayed frozen, so a parked campaign and a hung process
+        produced identical logs. ``orchestrator/evals/runner.py`` names this
+        gap explicitly: its ``cap_wait_sanity_secs`` bound is consulted only
+        in the cap-RETRY branch, AFTER an invocation returned, and so cannot
+        see this wait at all. Evals now share the fleet pool rather than
+        holding a private reserve (ruling 2026-08-30, tasks 4741/4945),
+        which makes a fully-capped park a routine outcome rather than an
+        exotic one.
+
+        NEVER TIGHT-SPINS. Each iteration waits on the event with a strictly
+        positive timeout — the same
+        ``asyncio.wait_for`` + ``contextlib.suppress(TimeoutError)`` shape
+        the scoped park above uses — so a frozen pool costs one wakeup per
+        interval, not a burned core.
+
+        THE THROTTLE IS SEPARATE FROM THE WAIT PERIOD, and both are needed.
+        The wait period alone would bound the log rate only while wakeups
+        come from the timeout; ``_open`` can also be set while the fleet is
+        still frozen (the caller's own comment above records that the
+        retained legacy phase setters mutate state without going through
+        ``_transition``'s ``_open`` recompute), and each such set wakes this
+        wait early. Gating on ``_park_last_logged_at`` keeps the rate bounded
+        by the interval however often that happens.
+
+        THE CLOCK IS INSTANCE STATE, NOT A LOCAL, and that is what makes the
+        paragraph above true rather than merely intended. An early draft kept
+        both timestamps as locals here and was caught by
+        ``test_usage_gate_park_visibility.py::
+        test_the_heartbeat_is_throttled_under_repeated_wakeups``: the caller
+        RE-ENTERS this helper on every wakeup, so per-call state reset the
+        throttle each time — one warning per wakeup, with ``elapsed_s``
+        pinned at 0.0 forever, i.e. both halves of the signal destroyed by
+        the same defect. ``before_invoke`` clears the pair when it finally
+        serves a lease, so ``elapsed_s`` measures how long the pool has been
+        unable to serve ANYONE.
+
+        ``default=str`` on the dump is load-bearing, not decoration: it
+        mirrors ``cli_invoke._check_cap_wait``, where a non-serialisable
+        ``soonest_resets_at`` once raised ``TypeError`` out of
+        ``json.dumps`` and aborted the caller
+        (``test_cap_retry.py::test_cap_wait_log_survives_non_serializable_
+        soonest_resets_at``). Here the blast radius would be worse — the
+        raise would escape ``before_invoke`` itself, turning an
+        observability line into a hard failure on the fleet's hottest path.
+        """
+        while not self._open.is_set():
+            now = time.monotonic()
+            if self._park_started_at is None:
+                self._park_started_at = now
+            if (
+                self._park_last_logged_at is None
+                or now - self._park_last_logged_at >= _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+            ):
+                logger.warning(
+                    json.dumps(
+                        {
+                            'event': 'all_capped_park',
+                            'elapsed_s': round(now - self._park_started_at, 1),
+                            'account_count': self.account_count,
+                            'soonest_open_at': (
+                                self.soonest_resets_at.isoformat()
+                                if self.soonest_resets_at
+                                else None
+                            ),
+                        },
+                        default=str,
+                    )
+                )
+                self._park_last_logged_at = now
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._open.wait(),
+                    timeout=_ALL_CAPPED_PARK_LOG_INTERVAL_SECS,
+                )
 
     @contextlib.asynccontextmanager
     async def invoke_slot(self, scope: str | None = None):
