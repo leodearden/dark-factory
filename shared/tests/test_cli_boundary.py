@@ -159,6 +159,68 @@ class TestTheReporterPrintsOneErrorLineAndTouchesNoFileDescriptor:
         assert len(reported) == 1
         assert '(' not in reported[0]
 
+    def test_a_detail_callback_that_raises_costs_its_parentheses_and_nothing_else(
+        self, capsys
+    ):
+        """The one hook handed to arbitrary consumers must not be able to break the guard.
+
+        Every other step on this path is already best-effort — the fd dance
+        swallows ``OSError``/``ValueError``, the stderr write is wrapped — but
+        the detail callback is consumer code running on the failure path. A
+        consumer that formats a lazily-computed path, dereferences something
+        torn down at shutdown, or does its own I/O would otherwise propagate
+        out of ``report_stdout_failure``, out of ``_handle_broken_pipe``, out
+        of ``run_cli``'s ``except BrokenPipeError`` arm and out of
+        ``sys.exit(run_cli(main))`` as a chained traceback under an
+        unhandled-exception status — the exact pair of outcomes (no single
+        ``error:`` line, not ``EXIT_STDOUT_FAILED``) this module exists to
+        eliminate, produced by the module's own extension point.
+
+        So the contract is: a broken detail costs its parenthesised suffix, and
+        the line and the code survive intact.
+        """
+
+        def _detail_that_raises() -> str | None:
+            raise RuntimeError('the consumer\'s detail callback is broken')
+
+        cli_boundary.reset_stdout_failure_state(detail=_detail_that_raises)
+
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert reported[0].startswith('error: ')
+        assert 'closed the output pipe' in reported[0]
+        assert '(' not in reported[0]
+
+    def test_a_raising_detail_callback_still_reaches_the_boundary_as_a_clean_exit_code(
+        self, monkeypatch, capsys
+    ):
+        """The same failure driven END TO END, which is where it would actually bite.
+
+        The test above pins the reporter; this one pins that nothing between it
+        and ``sys.exit(run_cli(main))`` re-raises. A regression that moved the
+        callback out from under its guard — or that guarded only the reporter
+        while some later frame re-entered it — turns a documented exit 1 into a
+        traceback, and only this shape would notice.
+        """
+
+        def _detail_that_raises() -> str | None:
+            raise RuntimeError('the consumer\'s detail callback is broken')
+
+        def _main() -> int:
+            cli_boundary.reset_stdout_failure_state(detail=_detail_that_raises)
+            print('a short line that stays in the block buffer')
+            return 0
+
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            code = cli_boundary.run_cli(_main)
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert reported[0].startswith('error: ')
+        assert '(' not in reported[0]
+
     def test_reporting_does_not_touch_the_stdout_file_descriptor(self, monkeypatch, capsys):
         """The layering assertion, made by DELIVERY rather than by introspection.
 

@@ -150,6 +150,19 @@ def report_stdout_failure(detail: str) -> int:
       :data:`EXIT_STDOUT_FAILED` says the run could not complete. The
       parentheses are this module's convention; the sentence inside them
       belongs to the caller that knows the artifact.
+
+      That callback is the ONE hook this module hands to arbitrary consumers,
+      and it runs on the failure path — so it is called inside a deliberately
+      WIDE ``except Exception``, the only such arm in the module. A consumer
+      that formats a lazily-computed path, touches an object already torn down
+      at shutdown, or does any I/O of its own would otherwise raise straight
+      out through :func:`_handle_broken_pipe` and :func:`run_cli` as a chained
+      traceback under an unhandled-exception status — precisely the two
+      outcomes (no single ``error:`` line, no :data:`EXIT_STDOUT_FAILED`) this
+      module exists to eliminate. A detail is a nicety; the line is the
+      contract, so a broken detail costs its parentheses and nothing else.
+      The width is safe HERE and nowhere else in the module: the arm spans one
+      call whose only job is to produce a string.
     * At most one line per run (:data:`_STDOUT_FAILURE_REPORTED`), because the
       same failure is legitimately caught twice on the way out.
 
@@ -165,7 +178,10 @@ def report_stdout_failure(detail: str) -> int:
     if _STDOUT_FAILURE_REPORTED:
         return EXIT_STDOUT_FAILED
     _STDOUT_FAILURE_REPORTED = True
-    extra = _DETAIL() if _DETAIL is not None else None
+    try:
+        extra = _DETAIL() if _DETAIL is not None else None
+    except Exception:  # deliberately wide: see the docstring's best-effort note
+        extra = None
     if extra is not None:
         detail = f'{detail} ({extra})'
     try:
