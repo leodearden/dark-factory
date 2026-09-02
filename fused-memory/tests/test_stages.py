@@ -8525,6 +8525,9 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
             memory_service, 'reify', run_id='r1', now=fixed_now,
+            # Every fixture task_id is terminal, so the AGE CUTOFF remains the
+            # only discriminator and this test keeps its original meaning.
+            terminal_task_ids={'t1', 't2', 't3'},
         )
 
         assert result == 2
@@ -8574,7 +8577,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
         memory_service.delete_memory = AsyncMock(return_value=None)
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
-            memory_service, 'reify', run_id='r1',
+            memory_service, 'reify', run_id='r1', terminal_task_ids={'t1'},
         )
 
         assert result == 0
@@ -8613,6 +8616,9 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
             memory_service, 'reify', run_id='r1', now=fixed_now,
+            # 't1' is the fixture member's task_id: the gate must not be what
+            # keeps it, or this test would pass for the wrong reason.
+            terminal_task_ids={'t1'},
         )
 
         assert result == 1
@@ -8650,7 +8656,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
             logger=_TKS_LOGGER,
         ):
             result = await _sweep_stale_mem0_flag_for_stage2_markers(
-                memory_service, 'reify', run_id='r1',
+                memory_service, 'reify', run_id='r1', terminal_task_ids={'t1'},
             )
 
         # Diagnostic-only: the drift warning must never affect the sweep's
@@ -8668,6 +8674,183 @@ class TestSweepStaleMem0FlagForStage2Markers:
             f'{[(r.levelno, r.message) for r in caplog.records]}'
         )
         assert '5' in drift_records[0].getMessage()
+
+    # --- Composite AND contract (task 4375) ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_ids_is_a_required_keyword(self):
+        """A caller who forgets the gate must fail LOUDLY, never silently.
+
+        Any default would be wrong in a dangerous direction: None would revert
+        to exactly the unconditional age-only deletion this task exists to
+        remove (permanent, unrecoverable loss that surfaces only as missing
+        records weeks later), and [] would silently disable the sweep and hide
+        an unbounded pool. A missing argument is therefore a TypeError at call
+        time — the loud-over-silent-degradation invariant applied to an API
+        boundary rather than to a log line.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        with pytest.raises(TypeError):
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'reify', 'r1',
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_four_cell_matrix_proves_AND_not_OR(self):
+        """Retirement requires BOTH gates to allow it; either one alone keeps.
+
+        Cell 2 is the measured incident: all 40 destroyed cadence_check records
+        had exactly this shape from the sweep's point of view — full relay
+        contract, task 452 non-terminal ('deferred'). Cell 4 is the only cell
+        that retires, which is what proves the sweep is not merely disabled.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            # 1. audit kind + terminal task => KEPT by Part B alone (the
+            #    residual intersection Part B exists to cover).
+            {'id': 'audit-terminal', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-done', 'flag_type': 'x', 'run_id': 'r'}},
+            # 2. relay shape + open task => KEPT by Part A alone.
+            {'id': 'relay-open', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-open',
+                          'flag_type': 'x', 'run_id': 'r'}},
+            # 3. audit kind + open task => KEPT by both.
+            {'id': 'audit-open', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-open', 'flag_type': 'x', 'run_id': 'r'}},
+            # 4. relay shape + terminal task => the ONLY cell that retires.
+            {'id': 'relay-terminal', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-done',
+                          'flag_type': 'x', 'run_id': 'r'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'autopilot_video', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'relay-terminal'}
+        assert result == 1
+        # The delete audit tag is unchanged by the new gating.
+        for call in memory_service.delete_memory.call_args_list:
+            assert call.kwargs.get('_source') == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_mirror_still_protected_even_when_it_clears_the_terminal_gate(self):
+        """Verification requirement 2: no task-3041 regression.
+
+        A cycle_summary mirror citing a TERMINAL task passes the Part A gate,
+        so only the mirror guard can save it. It must.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {'id': 'mirror-terminal',
+             'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                          'flag_for_stage2': True, 'task_id': 't-done'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_type_drift_probe_still_runs_after_the_gated_sweep(self):
+        """_warn_on_flag_for_stage2_type_drift still runs, still cannot affect
+        the count — including when the gate withheld every member."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {'id': 'relay-open',
+             'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-open'}},
+        ]
+
+        async def _count_side_effect(*, project_id, filters):
+            return 7 if filters == {'flag_for_stage2': 'true'} else 1
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_side_effect)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        assert result == 0
+        # The string-variant drift probe ran despite the gate withholding all.
+        drift_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': 'true'} in drift_filters
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_for_the_one_real_victim(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {'id': 'relay-terminal', 'created_at': stale,
+             'metadata': {'flag_for_stage2': True, 'task_id': 't-done'}},
+            {'id': 'audit-terminal', 'created_at': stale,
+             'metadata': {'kind': 'cadence_check', 'flag_for_stage2': True,
+                          'task_id': 't-done'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'autopilot_video', run_id='r1', now=fixed_now,
+                terminal_task_ids={'t-done'},
+            )
+
+        assert result == 1
+        assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
 
 
 class TestWarnOnFlagForStage2TypeDrift:
@@ -15020,6 +15203,10 @@ class TestSweepStaleMem0PoolProtectsMirrorRecords:
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
             memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+            # The relay marker's task_id, so the terminal gate is NOT what
+            # spares the mirror — the task-3041 guard is, which is the whole
+            # point of this test.
+            terminal_task_ids={'t1'},
         )
 
         deleted_ids = {
