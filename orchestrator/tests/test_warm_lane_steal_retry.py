@@ -548,3 +548,127 @@ class TestStealFailedSentinel:
         assert any(
             'warm-lane pool EXHAUSTED' in m for m in messages
         ), f'the census WARNING must still be logged; got: {messages}'
+
+
+# ---------------------------------------------------------------------------
+# step-09: create_worktree maps the two new sentinels, and its fall-through
+#          message stops naming causes it cannot produce
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeMapping:
+    """``create_worktree`` must route every warm-lane discriminant to a typed
+    signal, and the residual FAULT/DISABLED text must be honest about what it
+    actually covers.
+
+    Drives ``create_worktree`` with ``acquire_warm_lane`` monkeypatched to
+    return a chosen sentinel, mirroring how the neighbouring BASE_ABSENT row is
+    exercised (``test_warm_lane_pool.py::TestCreateWorktreeWarmLanePoolHardDown``).
+    """
+
+    async def _git_ops_for(self, repo: Path, sentinel) -> GitOps:
+        await _add_warm_lane_scripts(repo)
+        git_ops = GitOps(_warm_config(), repo, warm_lane_pool_size=1)
+
+        async def _acquire(branch_name, start_ref, *, expected_title=None):
+            return sentinel
+
+        git_ops.acquire_warm_lane = _acquire  # type: ignore[method-assign]
+        return git_ops
+
+    async def test_lane_lock_timeout_raises_typed_requeue(self, wl_git_repo: Path):
+        from orchestrator.git_ops import (
+            WarmLaneLockTimeout,
+            WarmLaneRequeue,
+            WarmLaneUnavailable,
+        )
+
+        git_ops = await self._git_ops_for(
+            wl_git_repo, WarmLaneUnavailable.LANE_LOCK_TIMEOUT,
+        )
+
+        with pytest.raises(WarmLaneLockTimeout) as exc_info:
+            await git_ops.create_worktree('A')
+
+        assert isinstance(exc_info.value, WarmLaneRequeue), (
+            'a lost lock race is transient contention — it must requeue '
+            'through the shared WarmLaneRequeue handler, never block + L1'
+        )
+
+    async def test_steal_failed_raises_typed_requeue(self, wl_git_repo: Path):
+        from orchestrator.git_ops import (
+            WarmLaneRequeue,
+            WarmLaneStealFailed,
+            WarmLaneUnavailable,
+        )
+
+        git_ops = await self._git_ops_for(
+            wl_git_repo, WarmLaneUnavailable.STEAL_FAILED,
+        )
+
+        with pytest.raises(WarmLaneStealFailed) as exc_info:
+            await git_ops.create_worktree('A')
+
+        assert isinstance(exc_info.value, WarmLaneRequeue), (
+            'an exhausted steal-retry is pool pressure — it must requeue'
+        )
+
+    async def test_disabled_has_its_own_programming_error_message(
+        self, wl_git_repo: Path,
+    ):
+        """DISABLED is a caller bug (it bypassed the ``warm_lane_pool is not
+        None`` guard), not an infra fault — it must say so, and must not
+        borrow the seed/worktree-add wording that cannot apply to it."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops = await self._git_ops_for(wl_git_repo, WarmLaneUnavailable.DISABLED)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.create_worktree('A')
+
+        msg = str(exc_info.value)
+        assert 'programming error' in msg.lower(), (
+            f'the DISABLED message must name it a programming error: {msg!r}'
+        )
+        assert 'seed' not in msg.lower(), (
+            f'DISABLED never reaches the seed — the message must not mention '
+            f'it: {msg!r}'
+        )
+        assert 'worktree-add' not in msg.lower(), (
+            f'DISABLED never reaches worktree-add — the message must not '
+            f'mention it: {msg!r}'
+        )
+
+    async def test_fault_message_names_only_causes_it_can_produce(
+        self, wl_git_repo: Path,
+    ):
+        """FAULT still blocks + L1 (a genuine unclassified infra fault), but
+        its message must stop naming three causes that are each separately
+        typed, and must point at the log line carrying the real root cause.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops = await self._git_ops_for(wl_git_repo, WarmLaneUnavailable.FAULT)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await git_ops.create_worktree('A')
+
+        msg = str(exc_info.value)
+        assert 'absent seed script' not in msg, (
+            f'BASE_ABSENT is separately typed (WarmLanePoolHardDown); the '
+            f'FAULT message must not claim it: {msg!r}'
+        )
+        assert 'pool disabled' not in msg, (
+            f'DISABLED now has its own message; the FAULT message must not '
+            f'claim it: {msg!r}'
+        )
+        assert 'acquire_warm_lane:' in msg, (
+            f'the FAULT message must direct the reader to the preceding '
+            f'acquire_warm_lane: WARNING that carries the real root cause: '
+            f'{msg!r}'
+        )
+        assert 'traceback' in msg.lower(), (
+            f'the FAULT message must name the traceback as the root-cause '
+            f'carrier: {msg!r}'
+        )
