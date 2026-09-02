@@ -152,7 +152,10 @@ re-measures exactly the arms that failed. A part is also dropped when the
 manifest's `served_model_name` for that arm no longer matches the one in the
 part — but an `arms.yaml` edit that changes only `model_ref` or `quant` is
 invisible in a report row, so use `--force` after one. `--force` re-measures
-everything regardless. Pass `--parts-dir` explicitly to resume into a directory
+everything regardless. A re-measured arm's old part is **removed first**, so a
+re-measure that fails leaves no part at all and the merge refuses by name
+rather than quietly folding the previous run's row into this slate. Pass
+`--parts-dir` explicitly to resume into a directory
 from a previous run; the default lives under `$XDG_RUNTIME_DIR` and does not
 survive a reboot.
 

@@ -283,7 +283,9 @@ def sweep_arms(
 
     RESUMABLE: an arm that already has a valid PASSING part on disk is skipped
     entirely, so a sweep killed at arm six re-measures one arm and not seven.
-    *force* re-measures every arm regardless.
+    *force* re-measures every arm regardless.  An arm that is RE-MEASURED loses
+    its old part first -- see the comment on the `unlink` below for why a part
+    the driver has decided to replace must not survive to be merged.
 
     THE CARD IS RELEASED BEFORE THE FIRST ARM.  `lms_ctl start` is exclusive
     and REFUSES (exit 4) while any `lms-arm@` unit is active; it never evicts.
@@ -321,6 +323,33 @@ def sweep_arms(
             # identical to one that measured everything.
             print(f'\n=== {arm.arm_id} === SKIPPED, reusing {existing}', flush=True)
             continue
+
+        # THE MOMENT AN ARM IS SELECTED FOR RE-MEASUREMENT, ITS OLD PART GOES.
+        # The position is load-bearing -- after the skip check so a resumed
+        # arm keeps the part it is being resumed FROM, and before `start` so
+        # the removal cannot be skipped by an abort.  `existing_parts` selects
+        # by `Path.exists()` alone, so anything still on disk is handed to
+        # `--merge`: a re-measure that aborts at `start` (exit 4), at
+        # `wait-ready`, or in a healthcheck that exits 8 having written
+        # nothing would otherwise leave the PREVIOUS sweep's row in the merge.
+        # With that row present the merge has full manifest coverage, so it
+        # SUCCEEDS and overwrites the committed `verification/health-report.json`
+        # with a stale row -- old `measured_at`, old verdict and detail,
+        # possibly a served_model_name the manifest no longer commissions --
+        # presented as part of this slate.  That is exactly the mixed-vintage
+        # artifact `merge_reports` and `test_lms_verification_artifact.py`
+        # exist to prevent, arriving by the one route neither can see: both
+        # judge the parts they are HANDED, and neither knows when one was
+        # written.
+        #
+        # The trade is cheap in both directions.  A part rejected by
+        # `part_is_complete` was never a resume point anyway (it rejects a FAIL
+        # row and a wrong served_model_name), so its only remaining effect was
+        # to poison the merge.  And under `--force` even a good PASS part goes,
+        # because `--force` means "measure everything NOW" -- a slate assembled
+        # half from this run and half from the last is precisely the laundered
+        # vintage it is meant to rule out.
+        existing.unlink(missing_ok=True)
 
         print(f'\n=== {arm.arm_id} ===', flush=True)
         try:
