@@ -2099,7 +2099,9 @@ def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
             f'message; got: {message!r}'
         )
     finally:
-        proc.stderr.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
 
 
 def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
@@ -2163,7 +2165,9 @@ def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_l
     finally:
         proc.kill()
         proc.wait()
-        proc.stderr.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
 
 
 #: A child that stays alive but is never waited on -- killed by the test that
