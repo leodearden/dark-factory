@@ -355,6 +355,13 @@ def build_orphaned_escalation_flag(
 async def _project_status_census(taskmaster, project_root, *, log = logger):
     """Return a CROSS-TAG-COMPLETE ``{id: status}`` census for *project_root*.
 
+    Underscore-prefixed but deliberately SHARED with
+    ``fused-memory/scripts/derive_orphaned_recon_escalations.py``: the
+    cross-tag rule below is the same soundness requirement in both call sites,
+    and a second copy could drift so that the in-cycle flag and the operator
+    reap disagree about which records are safe to close. The name stays
+    private because it is not part of the module's Stage-1-facing surface.
+
     ``taskmaster.get_statuses_fresh`` defaults to a SINGLE tag when none is
     given — stated in
     ``backends/task_backend_protocol.py::list_tags``: "a caller that needs a
