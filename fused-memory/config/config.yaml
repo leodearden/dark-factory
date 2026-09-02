@@ -380,8 +380,16 @@ summary_rebuild:
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
 # CREATES a Graphiti Entity node so a dangling referent has something to point
-# at. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
-# every value below is the shipped default, shown so the knobs are discoverable
+# at. All five leaves are green-tier hot-reloadable: they are registered in
+# `config/reload.py::RELOADABLE_FIELDS`, which is the authoritative list, and
+# `mcp__escalation__reload_config` applies a change to any of them to a RUNNING
+# server with no restart. During a runaway-mint incident the knob you want is
+# `entity_mint.enabled: false` immediately below — it denies every caller on the
+# very next call. (Deliberately not cross-referenced to OPERATIONS.md §6: that
+# section's fused-memory enumeration is explicitly non-exhaustive and does not
+# yet name these leaves, so pointing an operator at it during an incident would
+# send them somewhere that answers "no such knob".)
+# Every value below is the shipped default, shown so the knobs are discoverable
 # without reading the schema. Uncomment to change one.
 # entity_mint:
 #   # Kill switch. false denies EVERY caller on the very next call, allowlisted
