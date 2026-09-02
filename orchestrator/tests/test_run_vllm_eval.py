@@ -2185,16 +2185,26 @@ class TestBuildEvalEnvSharedPool:
     """
 
     @staticmethod
-    def _fake_project_root(monkeypatch, tmp_path: Path) -> Path:
+    def _fake_project_root(
+        monkeypatch, tmp_path: Path, dotenv: str = "RUNPOD_API_KEY=rpa_test_fake_key\n"
+    ) -> Path:
         """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``."""
         (tmp_path / "config").mkdir()
         (tmp_path / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
-        # Exercise the dotenv branch — it overwrites os.environ values into
-        # the returned dict, so the fixture must control it to keep the
-        # token assertions deterministic.
-        (tmp_path / ".env").write_text("CLAUDE_OAUTH_TOKEN_G=pool-token-from-dotenv\n")
+        # Exercise the dotenv branch. It overwrites os.environ values into
+        # the returned dict, so the fixture must control its content to keep
+        # the token assertions deterministic; the default body deliberately
+        # sets no CLAUDE_OAUTH_TOKEN_*, leaving monkeypatch.setenv in charge.
+        (tmp_path / ".env").write_text(dotenv)
         monkeypatch.setattr(launcher, "PROJECT_ROOT", tmp_path)
         return tmp_path
+
+    @staticmethod
+    def _clear_oauth_tokens(monkeypatch) -> None:
+        """Drop every ambient ``CLAUDE_OAUTH_TOKEN_*`` so a case is closed."""
+        for letter in "ABCDEFGH":
+            monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
     def test_usage_accounts_file_points_at_the_shared_config(
         self, monkeypatch, tmp_path
@@ -2250,4 +2260,52 @@ class TestBuildEvalEnvSharedPool:
             "the launcher must not rewrite, reorder or append to the shared "
             "roster — pointing at it is the whole mechanism. Order matters: "
             "UsageGate tries accounts in list order during failover."
+        )
+
+    def test_seed_oauth_token_does_not_prefer_the_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The bootstrap seed must be a POOL credential, never account A.
+
+        ``CLAUDE_CODE_OAUTH_TOKEN`` is only the BOOTSTRAP credential — per
+        invocation account selection is UsageGate's job, driven by the
+        roster in ``USAGE_ACCOUNTS_FILE``. But seeding it from A still
+        spends A on an eval, which is exactly what the 2026-08-30 ruling
+        forbids: A is interactive-only.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        env = launcher.build_eval_env()
+
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "SENTINEL-POOL-G", (
+            "an eval run must bootstrap from a shared-pool credential; got "
+            f"{env['CLAUDE_CODE_OAUTH_TOKEN']!r}. Account A is reserved for "
+            "INTERACTIVE use only (ruling 2026-08-30, task 4741) — Leo's own "
+            "sessions exhaust its weekly cap most weeks, so spending it on an "
+            "eval costs him the account it was held back for."
+        )
+
+    def test_a_alone_does_not_silently_seed_the_run(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """With no pool token, fail LOUD rather than falling back to A."""
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+
+        env = launcher.build_eval_env()
+
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "", (
+            "with no pool token available the seed must stay empty so the "
+            "missing credential surfaces; falling back to the interactive "
+            "account A would silently reintroduce the retired behaviour "
+            f"(got {env['CLAUDE_CODE_OAUTH_TOKEN']!r})"
+        )
+        assert "no CLAUDE_OAUTH_TOKEN found" in capsys.readouterr().out, (
+            "a missing pool credential must still be announced — the warning "
+            "is what turns an empty seed from a silent misconfiguration into "
+            "a legible one"
         )
