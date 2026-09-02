@@ -966,9 +966,13 @@ async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
         # The memory bound, expressed deterministically: the whole result set
         # is never materialised in one go.
         assert not [c for c in sweep if c[0] == 'fetchall']
-        assert [c[0] for c in sweep] == ['fetchmany'] * len(sweep)
+        # Every fetch requested exactly the configured chunk size. (Not
+        # separately asserting "every call was fetchmany" or "every chunk
+        # length <= 3": only fetchmany/fetchall are spied, so the preceding
+        # no-fetchall assertion already implies the former, and DB-API
+        # semantics — fetchmany(n) never returns more than n rows — already
+        # imply the latter given this assertion; amendment review, task 4348.)
         assert {c[1] for c in sweep} == {3}
-        assert all(c[2] <= 3 for c in sweep)
         # 7 rows at chunk 3 is 3 + 3 + 1 + 0.
         assert len(sweep) == 4
         # LOAD-BEARING: the loop must terminate on an *empty* chunk, not a
@@ -1112,8 +1116,13 @@ async def test_cleanup_drained_mid_stream_fault_rolls_the_whole_sweep_back(
         assert await _arrival_rollup(buf) == {}
 
         # Not wedged: restore the real bucketer and confirm a fresh sweep —
-        # and the writer lock it needs — still works.
-        monkeypatch.undo()
+        # and the writer lock it needs — still works. A targeted restore
+        # (not monkeypatch.undo(), which would also revert
+        # _CLEANUP_FETCH_CHUNK to the shipped 10_000 and silently collapse
+        # the recovery sweep to a single chunk) keeps the recovery sweep
+        # chunked at 2, so it actually exercises multi-chunk recovery as
+        # this test's name claims — amendment review, task 4348.
+        monkeypatch.setattr(event_buffer_mod, 'utc_hour_bucket', real_bucket)
 
         assert await buf.cleanup_drained(max_age_seconds=0) == 7
         assert await _arrival_rollup(buf) == {
