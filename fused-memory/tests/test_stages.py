@@ -10181,7 +10181,10 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
         assert report.stats.get('stale_mem0_flag_for_stage2_markers_gc_swept') == 7
         mock_sweep.assert_awaited_once_with(
             mock_deps['memory_service'], 'reify', 'test-run',
+            terminal_task_ids=mock_sweep.await_args.kwargs['terminal_task_ids'],
         )
+        # The gate is threaded through, not omitted (task 4375).
+        assert 'terminal_task_ids' in mock_sweep.await_args.kwargs
 
         # The sibling GC passes are independent and all run every cycle —
         # none overwrites another in report.stats.
@@ -10246,6 +10249,137 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
 
         assert 'stale_mem0_flag_for_stage2_markers_gc_swept' in report.stats
         assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
+
+    # --- Shared once-per-cycle terminal-id resolution (task 4375) -----------
+
+    @staticmethod
+    def _stage(mock_deps):
+        from datetime import UTC, datetime
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', '/home/leo/src/reify')
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[], stats={}, llm_calls=0, tokens_used=0,
+        )
+        return stage, base_report
+
+    @pytest.mark.asyncio
+    async def test_terminal_ids_resolved_once_and_shared_with_both_consumers(
+        self, mock_deps,
+    ):
+        """ONE bulk get_statuses read serves the ledger GC pass AND the Mem0 sweep.
+
+        _resolve_terminal_task_ids is left UNPATCHED so the single-call
+        assertion is meaningful — the assertion is on the get_statuses mock,
+        which is the actual round-trip being saved. Sharing one list also
+        guarantees both passes see the same view of terminality within a
+        cycle, so a task transitioning mid-cycle cannot be terminal for the
+        ledger arm and open for the Mem0 arm.
+        """
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage, base_report = self._stage(mock_deps)
+        mock_deps['taskmaster'].get_statuses = AM(return_value={
+            't-done': 'done', 't-open': 'pending', 't-cancelled': 'cancelled',
+        })
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ) as mock_gc,
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        # Sorted, terminal-only — i.e. it really came from
+        # _resolve_terminal_task_ids and was not re-derived or hard-coded.
+        assert mock_sweep.await_args.kwargs['terminal_task_ids'] == [
+            't-cancelled', 't-done',
+        ]
+        # ONE bulk read for the whole GC block, not one per pass.
+        assert mock_deps['taskmaster'].get_statuses.await_count == 1
+        # _gc_recon_markers receives the SAME pre-resolved list, so the two
+        # passes cannot drift onto different views of terminality.
+        assert mock_gc.await_args.kwargs['terminal_task_ids'] == [
+            't-cancelled', 't-done',
+        ]
+        assert (
+            mock_gc.await_args.kwargs['terminal_task_ids']
+            == mock_sweep.await_args.kwargs['terminal_task_ids']
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_failure_degrades_to_a_full_keep_cycle(self, mock_deps):
+        """FAIL-SAFE end-to-end: run() completes, the stat is still recorded,
+        and the sweep receives [] — gate active, nothing terminal."""
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage, base_report = self._stage(mock_deps)
+        mock_deps['taskmaster'].get_statuses = AM(
+            side_effect=RuntimeError('taskmaster down'),
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='test-run',
+            )
+
+        assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
+        assert mock_sweep.await_args.kwargs['terminal_task_ids'] == []
 
 
 class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
