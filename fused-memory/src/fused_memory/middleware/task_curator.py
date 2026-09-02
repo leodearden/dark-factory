@@ -1003,7 +1003,10 @@ class TaskCurator:
 
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
-        - The registry file is missing, unreadable, or unparseable (one WARNING logged).
+        - The registry file is missing, unreadable, or unparseable, or the
+          offloaded load raised — for example a registry file that is not
+          valid UTF-8 (one WARNING logged; the guard then stays disabled for
+          this TaskCurator instance rather than retrying per call).
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
@@ -1054,9 +1057,33 @@ class TaskCurator:
                     raw_path = Path(cfg_path)
                     if not raw_path.is_absolute():
                         raw_path = self._cwd / raw_path
-                    self._premise_registry = await asyncio.to_thread(
-                        load_premise_registry, raw_path,
-                    )
+                    try:
+                        self._premise_registry = await asyncio.to_thread(
+                            load_premise_registry, raw_path,
+                        )
+                    except Exception as exc:
+                        # load_premise_registry documents "never raises", but it
+                        # only catches FileNotFoundError/OSError on read_text and
+                        # yaml.YAMLError on parse — a registry that is not valid
+                        # UTF-8 raises UnicodeDecodeError (a ValueError, not an
+                        # OSError). asyncio.to_thread adds a further raise path
+                        # the guard module's internal excepts cannot cover. Fail
+                        # OPEN (guard disabled) rather than escaping into
+                        # curate()/curate_batch_prepared, which call this
+                        # unguarded — an escape fails the whole task submission.
+                        logger.warning(
+                            'task_curator: recon-premise registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            raw_path, exc,
+                        )
+                        self._premise_registry = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it bypasses
+                    # the except above, and latching in a `finally` would
+                    # permanently disable the guard because an unrelated caller
+                    # was cancelled mid-load. Leaving the flag clear on
+                    # cancellation lets the next call retry.
                     self._premise_registry_load_attempted = True
 
         entries = self._premise_registry
