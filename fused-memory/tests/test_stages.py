@@ -8698,7 +8698,8 @@ class TestSweepStaleMem0FlagForStage2Markers:
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
 
         with pytest.raises(TypeError):
-            await _sweep_stale_mem0_flag_for_stage2_markers(
+            # The omitted keyword IS the assertion — the type error is expected.
+            await _sweep_stale_mem0_flag_for_stage2_markers(  # type: ignore[call-arg]
                 memory_service, 'reify', 'r1',
             )
 
@@ -8851,6 +8852,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
             )
 
         assert result == 1
+        assert tombstone.await_args is not None
         assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
 
 
@@ -10184,6 +10186,7 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
             )
 
         assert report.stats.get('stale_mem0_flag_for_stage2_markers_gc_swept') == 7
+        assert mock_sweep.await_args is not None
         mock_sweep.assert_awaited_once_with(
             mock_deps['memory_service'], 'reify', 'test-run',
             terminal_task_ids=mock_sweep.await_args.kwargs['terminal_task_ids'],
@@ -10327,6 +10330,8 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
 
         # Sorted, terminal-only — i.e. it really came from
         # _resolve_terminal_task_ids and was not re-derived or hard-coded.
+        assert mock_sweep.await_args is not None
+        assert mock_gc.await_args is not None
         assert mock_sweep.await_args.kwargs['terminal_task_ids'] == [
             't-cancelled', 't-done',
         ]
@@ -10384,6 +10389,7 @@ class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
             )
 
         assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
+        assert mock_sweep.await_args is not None
         assert mock_sweep.await_args.kwargs['terminal_task_ids'] == []
 
 
@@ -15433,6 +15439,7 @@ class TestSweepStaleMem0PoolProtectsAuditRecords:
 
         # A tombstone must never claim a live record.
         assert tombstone.await_count == 1
+        assert tombstone.await_args is not None
         victims = tombstone.await_args.args[2]
         assert [v['id'] for v in victims] == ['genuine-relay']
 
@@ -15588,6 +15595,7 @@ class TestSweepStaleMem0PoolTerminalClosureGate:
         assert self._deleted(memory_service) == {'terminal'}
         assert result == 1
         # Withheld members must never reach the tombstone writer.
+        assert tombstone.await_args is not None
         assert [v['id'] for v in tombstone.await_args.args[2]] == ['terminal']
 
     @pytest.mark.asyncio
