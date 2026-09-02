@@ -779,3 +779,76 @@ class TestClaimTaskStatusesIsUnchanged:
         assert kwargs.get('unverified_claim') is True, (
             f'an unregistered project must tag, never pass; got {kwargs!r}'
         )
+
+
+class TestDisallowListForEnsureEntityNode:
+    """ensure_entity_node is a memory write: it must be in
+    DISALLOW_MEMORY_WRITES (blocked in Stage 3 read-only) but NOT in
+    STAGE1_DISALLOWED or STAGE2_DISALLOWED (Stage 1 and the curator are the
+    sanctioned callers).
+
+    This per-tool pin is the ONLY mechanism holding the classification: every
+    sibling entity write tool carries its own pin in its own test file
+    (``test_reassign_edge.py``, ``test_refresh_entity_summary.py``,
+    ``test_merge_entities.py``, ``test_delete_entity.py``,
+    ``test_rename_entity.py``, ``test_set_entity_summary.py``) and NO central
+    census test enumerates the MCP write surface — which is precisely why
+    ``update_memory`` (esc-3623-3) shipped unclassified, in no disallow list at
+    all. Shaped after ``tests/test_reassign_edge.py::TestDisallowListForReassignEdge``,
+    including its import-inside-each-test-body idiom.
+    """
+
+    def test_ensure_entity_node_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__ensure_entity_node' must be in
+        DISALLOW_MEMORY_WRITES so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__ensure_entity_node' in DISALLOW_MEMORY_WRITES
+
+    def test_ensure_entity_node_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call ensure_entity_node (in
+        STAGE3_DISALLOWED, which folds DISALLOW_MEMORY_WRITES). Stage 3 is the
+        read-only integrity check by contract."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__ensure_entity_node' in STAGE3_DISALLOWED
+
+    def test_ensure_entity_node_not_in_stage1_disallowed(self):
+        """Stage 1 must be able to call ensure_entity_node (not in
+        STAGE1_DISALLOWED, which does not fold DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__ensure_entity_node' not in STAGE1_DISALLOWED
+
+    def test_ensure_entity_node_not_in_stage2_disallowed(self):
+        """Stage 2 keeps full memory write access; STAGE2_DISALLOWED does not
+        fold DISALLOW_MEMORY_WRITES either."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE2_DISALLOWED
+        assert 'mcp__fused-memory__ensure_entity_node' not in STAGE2_DISALLOWED
+
+    def test_the_authz_gate_alone_does_not_turn_stage3_away(self):
+        """The load-bearing WHY leg — do NOT delete the disallow entry as
+        redundant with the allowlist.
+
+        The shipped ``entity_mint.allowed_agent_prefixes`` contains
+        ``'recon-stage-'``, which admits every reconciliation stage's canonical
+        ``f'recon-stage-{stage_id}'`` agent_id — Stage 3 included. So
+        ``resolve_entity_mint_authorization`` ALONE says yes to Stage 3, and the
+        tool-level denial pinned above is the only thing that says no. That is
+        the same two-layer gap the update_memory incident (esc-3623-3) records:
+        a write primitive in no disallow list AND admitted by an allowlist whose
+        default covers every recon stage.
+        """
+        shipped = EntityMintConfig()
+        assert 'recon-stage-' in shipped.allowed_agent_prefixes, (
+            'the shipped default bar admits every recon stage; if this ever '
+            'changes, re-derive whether the disallow entry is still the only '
+            'thing denying Stage 3 before touching it'
+        )
+
+        # `_service()` rebuilds the section explicitly rather than inheriting
+        # cwd's config.yaml — a bare FusedMemoryConfig() is a BaseSettings.
+        decision = resolve_entity_mint_authorization(
+            _service(), agent_id='recon-stage-3',
+        )
+        assert decision.allowed is True, (
+            'the authz gate does not deny Stage 3, so the DISALLOW_MEMORY_WRITES '
+            'entry is load-bearing, not redundant'
+        )
