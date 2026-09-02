@@ -86,6 +86,10 @@ from fused_memory.server.consolidation import (
     build_consolidation_result,
     validate_consolidate_args,
 )
+from fused_memory.server.entity_mint_authz import (
+    resolve_entity_mint_authorization,
+    validate_mint_name,
+)
 from fused_memory.server.grouped_read import (
     # The landed single home for the child-record wire names (task 3195/3197,
     # PRD leaf delta). Grouping is strictly `metadata.parent_id` + the child
@@ -6735,6 +6739,125 @@ def create_mcp_server(
             entity_uuid=entity_uuid,
             project_id=project_id,
             force=force,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def ensure_entity_node(
+        name: str,
+        project_id: str,
+        summary: str = '',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        The write-time-identity primitive the other entity tools presuppose:
+        ``reassign_edge`` can only re-point an edge onto a node that ALREADY
+        exists, so a dangling referent — a task the graph mentions but has no
+        node for — is unrepairable without this.
+
+        GATED, unlike its four siblings. Minting SPLITS a referent when it lands
+        under the wrong name, and nothing sweeps orphan minted nodes, so the
+        tool ships behind a narrow allowlist of ``agent_id`` prefixes
+        (``entity_mint.allowed_agent_prefixes``, default ``recon-stage-`` and
+        ``curator-``). NOTE the honest caveat: **agent_id is SELF-REPORTED**.
+        This is a misuse deterrent for cooperating callers, NOT a security
+        boundary — a caller that wants to bypass it need only claim a different
+        agent_id. ``entity_mint.enabled=false`` is the operator KILL SWITCH; it
+        denies every caller on the very next call, with no restart.
+
+        NAMES ARE CANONICAL-ONLY in v1. ``'Task 3222'`` is accepted; the
+        variants ``'task #3222'`` / ``'Task: 3222'`` are REFUSED naming the
+        canonical form to retry with, so spellings converge on one node instead
+        of splitting across several. A name that is not task-shaped at all is
+        refused outright — this is not a general junk-node minter. The
+        project-qualified foreign form ``'reify:132'`` is accepted and mints
+        into the WRITING project's graph under that qualified name.
+
+        AMBIGUITY IS REFUSED, NOT RESOLVED. When two or more nodes already carry
+        the name, this returns a structured refusal naming the conflicting
+        uuids and merges NOTHING. The underlying identity primitive has a
+        duplicate-COLLAPSE arm; it is irreversible, and it is deliberately kept
+        unreachable from here — adjudicate duplicates by hand.
+
+        Args:
+            name: The canonical node name, e.g. ``'Task 3222'`` or ``'reify:132'``
+            project_id: Project scope (required)
+            summary: Optional summary for a newly minted node
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+
+        Returns:
+            ``{'status': 'minted'|'resolved', 'uuid': ..., 'minted': bool}`` on
+            success, or an ``{'error', 'error_type'}`` envelope on a refusal.
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (2) Authorization immediately next, BEFORE project canonicalization
+        # and before the name is even parsed. Minting is the one entity
+        # primitive that CREATES an identity node, so this gate is the whole
+        # point of the tool: an unauthorized caller is turned away before any
+        # work is done on its behalf, and learns nothing about the validity of
+        # its other arguments. Same ordering rationale `update_memory` and
+        # `add_system_record` record for their own gates — note `update_memory`
+        # has an extra arm-PRESENCE check between identity and authz, which is
+        # specific to its multi-arm shape and has no analogue here.
+        decision = resolve_entity_mint_authorization(memory_service, agent_id=agent_id)
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) `reassign_edge`'s prologue verbatim, INCLUDING `_known_project_gate`
+        # — which is load-bearing here rather than decorative: `_graph_for(group_id)`
+        # creates a graph ON DEMAND, so a typo'd project_id would mint into a
+        # brand-new graph nobody is watching. Of the four existing entity tools
+        # only `reassign_edge` calls this gate; `rename_entity`, `merge_entities`
+        # and `delete_entity` all stop at `validate_project_id`. Wiring it here
+        # is a deliberate correction to that prevailing local pattern, not a
+        # restatement of it — those three can only act on a uuid that already
+        # exists, whereas this one creates.
+        #
+        # NO `_backlog_gate`: that gate is for tools creating new task-backlog
+        # pressure (add_memory, add_system_record). This one touches the
+        # identity graph and creates none — the same reason `update_memory`
+        # omits it.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) The name must be canonical and task-shaped. Returns the parsed
+        # referent so nothing downstream re-parses it.
+        name_decision = validate_mint_name(name)
+        if not name_decision.allowed:
+            return {
+                'error': name_decision.error,
+                'error_type': name_decision.error_type,
+                'name': name,
+            }
+
+        # (5) Task-store verification is wired in here (task 4932 step-16).
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.ensure_entity_node(
+            name=name,
+            project_id=project_id,
+            summary=summary,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,
