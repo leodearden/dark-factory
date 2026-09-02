@@ -22,6 +22,20 @@ from fused_memory.reconciliation.recon_self_model import (
     render_source_completion_section,
     render_suppression_schema_section,
 )
+from fused_memory.reconciliation.stage1_stall_detector import (
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+)
+
+_STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS // 3600
+)
+"""Stall threshold in whole hours, for the Escalation-Probe Precondition below.
+
+Derived from ``stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS``
+rather than restated, so the detector stays the single owner of the number and a
+future change to it cannot leave stale prompt text behind.  Pinned by
+``tests/test_recon_escalation_probe_precondition.py``.
+"""
 
 #: The cluster-fold execution section's title and heading (task 3134), exported
 #: so a rename moves the prompt and the wiring pins in
@@ -285,6 +299,43 @@ and does not violate the Stage 1 / Stage 2 separation.**
 
 Skipping this check risks persisting temporal facts that contradict Taskmaster's live \
 state, which misleads Stage 2 task reconciliation.
+
+## Escalation-Probe Precondition (task 3052)
+A STANDING PRECONDITION on a whole class of finding, in the same shape as the \
+Terminal-State Pre-Check above: it names the check you must pass before you are \
+entitled to write the claim at all.
+
+**PROHIBITION — never file an escalation-missing finding.** Do not write a memory, a \
+finding, or a flagged item asserting that no escalation was filed for some task, that \
+the escalation channel is dead, that a filing path yields zero records, or any \
+equivalent "the record does not exist" claim. The reason — stated as a reason, not as \
+an invitation to go looking — is that all four escalation READ tools \
+(`get_pending_escalations`, `get_escalation`, `get_task_escalations`, \
+`get_task_escalation_history`) are DENIED to you here, via \
+`cli_stage_runner.py::STAGE1_DISALLOWED` -> `DISALLOW_ESCALATION_READS`. You are \
+structurally blind to the escalation queue and can never hold evidence for such a \
+claim; an absence you cannot observe is not an absence you may report. If the \
+condition nevertheless looks real, emit an ORDINARY flag for Stage 2 describing only \
+what you did observe, rather than asserting the channel is dead.
+
+Two facts recorded here for a downstream reader who DOES hold the tools, so the \
+historical findings are not re-derived by someone able to run the probe:
+
+1. Reconciliation-filed gate escalations are born at **level 1**. A probe filtered to \
+   `level=2` structurally cannot see them, and returns an empty result for reasons \
+   that have nothing to do with whether the record exists. (Verified live 2026-09-02: \
+   124 of 124 pending `reconciliation_stale_gate_backlog` records were `level=1`.)
+2. An existence check must be ARCHIVE-AWARE. Resolving a record moves it out of the \
+   queue root, and `queue.py::EscalationQueue.get_pending` globs the root only — so a \
+   record that was written and then closed reads as "never filed" to a root-only \
+   lookup.
+
+**The one clause you CAN execute.** Before describing a human-decision gate as \
+"stalled", read the task record and confirm that `metadata.gate_escalated_at` is \
+genuinely older than the {_STAGE1_GATE_STALL_THRESHOLD_HOURS}h stall threshold \
+(`stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`). A gate stamped \
+more recently than that is NOT stalled and must not be reported as such. This check \
+needs no escalation read at all: the stamp lives on the task record, which you do hold.
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
