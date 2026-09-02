@@ -393,7 +393,7 @@ class TestStewardInvokeWithCapRetryWiring:
         # TestStewardCapHitBackoff against the real cap-retry loop.
         assert kwargs['invoke_fn'] == steward._invoke_agent_counted
         assert kwargs['max_cap_retries'] == _MAX_CAP_RETRIES
-        assert kwargs['backend'] == 'claude'
+        assert kwargs['backend'] == mock_config.backends.steward
         assert kwargs['config_dir'] == steward._config_dir
         assert callable(kwargs['rebuild_prompt'])
         assert asyncio.iscoroutinefunction(kwargs['rebuild_prompt'])
