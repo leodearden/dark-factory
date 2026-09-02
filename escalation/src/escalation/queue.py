@@ -1605,9 +1605,13 @@ class EscalationQueue:
         ``triaged_by``/``triage_note`` supplied) is a harmless freshness bump
         that refreshes ``triaged_at`` without silently wiping a
         previously-recorded predicate/probe. Does NOT touch ``updated_at``:
-        an annotation must not masquerade as a content change (see
-        ``add_members_to_l2`` for the one mutation that does bump
-        ``updated_at``).
+        an annotation must not masquerade as a content change.  The mutations
+        that DO bump ``updated_at`` — and therefore DO re-trigger the watcher's
+        "changed since I triaged it" re-assess rule — are
+        ``add_members_to_l2`` (a real member append, severity promotion or
+        recorded amendment; guarded, since a true no-op must not bump) and
+        ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
+        successful call appends a child and increments ``dedupe_count``).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending

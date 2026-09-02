@@ -2846,6 +2846,12 @@ class TestAttachDedupeChildGrowthBound:
     #: per-attach in steady state, so K attaches past the cap shed exactly K.
     K = 5
 
+    #: How far OVER the cap a record is seeded straight onto disk (bypassing
+    #: attach_dedupe_child) in the bulk-shed case.  Must be > 1: that is the
+    #: whole point — it forces `shed > 1`, the multi-element `del` slice that
+    #: the steady-state cases can never reach.
+    OVER_CAP_SEED = 30
+
     def _make_infra_esc(self, esc_id: str, task_id: str = '1', severity: str = 'blocking') -> Escalation:
         return Escalation(
             id=esc_id,
@@ -2863,8 +2869,14 @@ class TestAttachDedupeChildGrowthBound:
             queue.attach_dedupe_child(parent_id, child_id)
         return order
 
-    def test_below_the_cap_nothing_is_shed(self, tmp_path: Path):
-        """(a) Exactly at the cap: every id is still present, in order, nothing counted."""
+    def test_at_the_cap_nothing_is_shed(self, tmp_path: Path):
+        """(a) Exactly at the cap: every id is still present, in order, nothing counted.
+
+        Named for what it ASSERTS (``_MAX_DEDUPE_CHILDREN`` attaches — the
+        boundary itself), not for the strictly-below case it does not exercise:
+        the cap fires on ``>``, so the last non-shedding attach IS the one at
+        the cap, and that is the edge worth pinning.
+        """
         from escalation.queue import _MAX_DEDUPE_CHILDREN
 
         queue = EscalationQueue(tmp_path / 'esc')
@@ -2916,6 +2928,80 @@ class TestAttachDedupeChildGrowthBound:
         # The true-provenance-total identity: the loss is assertable FROM THE
         # RECORD, never log-only (INV-8).
         assert len(kept) + from_disk.dedupe_children_truncated == _MAX_DEDUPE_CHILDREN + self.K
+
+    def test_an_over_cap_record_seeded_on_disk_sheds_the_whole_excess_in_one_fold(
+        self, tmp_path: Path,
+    ):
+        """(b2) A record that arrives ALREADY over the cap sheds the entire
+        excess on its first fold — `shed > 1`, the multi-element `del` slice.
+
+        The steady-state cases above can only ever produce ``shed == 1``,
+        because they grow the list one attach at a time.  That branch is NOT
+        the only reachable one: ``attach_dedupe_child`` is not the sole writer
+        of ``dedupe_children``.  `fused-memory/scripts/backfill_recon_escalations.py`
+        assigns ``canonical.dedupe_children = list(collapse.child_ids)``
+        wholesale and persists it with ``queue.submit()``, which writes the
+        record verbatim and enforces no cap — so an arbitrarily long list can
+        legitimately exist on disk, and the FIRST subsequent fold must shed
+        ``len - cap + 1`` ids in one `del`, crediting every one of them to
+        ``dedupe_children_truncated``.
+
+        Seeded through ``submit`` rather than ``_rewrite`` precisely because
+        ``submit`` is the production path that creates this shape.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        seeded_total = _MAX_DEDUPE_CHILDREN + self.OVER_CAP_SEED
+        seeded = [f'esc-seed-{i}' for i in range(seeded_total)]
+
+        esc = self._make_infra_esc('esc-1-1')
+        esc.dedupe_children = list(seeded)
+        esc.dedupe_count = seeded_total
+        queue.submit(esc)
+
+        # Precondition: submit really does persist an over-cap list untouched.
+        pre = queue.get('esc-1-1')
+        assert pre is not None
+        assert len(pre.dedupe_children) == seeded_total, (
+            'submit must write dedupe_children verbatim — if it ever starts '
+            'capping, this test is no longer exercising the bulk-shed path'
+        )
+        assert pre.dedupe_children_truncated == 0
+
+        queue.attach_dedupe_child('esc-1-1', 'esc-late-1')
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        # One fold, many ids shed: the excess plus the id just appended.
+        expected_shed = self.OVER_CAP_SEED + 1
+        assert expected_shed > 1, 'OVER_CAP_SEED must force the multi-element del slice'
+        assert len(kept) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children_truncated == expected_shed, (
+            f'A single fold on an over-cap record must credit ALL {expected_shed} '
+            f'dropped ids, got {from_disk.dedupe_children_truncated}'
+        )
+
+        # Head retention survives a bulk shed exactly as it does a single one.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == seeded[:_MAX_DEDUPE_CHILDREN_HEAD]
+
+        # Tail: the most recent ids, ending with the id just attached.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        expected_tail = (seeded + ['esc-late-1'])[-tail_len:]
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == expected_tail
+        assert kept[-1] == 'esc-late-1', 'the id just folded in must survive'
+
+        # Exactly the oldest NON-head ids were shed — contiguously, in one slice.
+        shed = seeded[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + expected_shed]
+        assert len(shed) == expected_shed
+        assert set(shed).isdisjoint(kept)
+
+        # The true-provenance-total identity holds across a bulk shed too.
+        assert len(kept) + from_disk.dedupe_children_truncated == seeded_total + 1
+        # And the recurrence signal is untouched by a bulk shed.
+        assert from_disk.dedupe_count == seeded_total + 1
 
     def test_the_cap_never_touches_dedupe_count_or_severity(self, tmp_path: Path):
         """(c) The cap bounds PROVENANCE only.
