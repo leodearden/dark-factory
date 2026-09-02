@@ -51,10 +51,14 @@ CONTRIBUTING.md's existing ``lint-command-mirror`` block.
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
-synced verify worktree. This module is stdlib-only (``re``, ``subprocess``,
-``pathlib``) plus ``pytest``. Both scans shell out to the ``git`` binary (task
-4971) for their tracked-file oracle — see ``_walk_repo_files`` — which is
-guaranteed present in any git worktree this module runs inside.
+synced verify worktree. This module is stdlib-only (``os``, ``re``,
+``subprocess``, ``pathlib``) plus ``pytest``. Both scans shell out to the
+``git`` binary (task 4971) for their tracked-file oracle — see
+``_walk_repo_files``. This module always runs inside a git worktree, so the
+REPOSITORY half of that oracle is guaranteed; the ``git`` EXECUTABLE's
+presence on ``PATH`` is not (a verify subprocess's ``PATH`` is rewritten by
+``orchestrator/src/orchestrator/verify.py::_target_subprocess_env``), which is
+why ``_walk_repo_files`` raises an actionable error rather than assuming it.
 
 EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
 naming its ``source`` rather than returning an empty list. An extractor that
@@ -66,6 +70,7 @@ edit; the live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -479,6 +484,32 @@ def _scan_label(path: Path) -> str:
 _THIS_MODULE = Path(__file__).resolve()
 
 
+def _scrubbed_git_env() -> dict[str, str]:
+    """``os.environ`` with every ``GIT_*`` override removed.
+
+    ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE`` and
+    ``GIT_CEILING_DIRECTORIES`` are all inherited from ``os.environ`` by
+    default, and any one of them can silently retarget a git invocation at a
+    different repository or index than its ``cwd`` implies — undermining the
+    exact ambient-state independence task 4971 exists to give this module's
+    scans.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``git`` *args* against *cwd*, with `_scrubbed_git_env()`.
+
+    Shared by `_walk_repo_files` and the test fixtures' `_write_scan_tree` so
+    the two call sites cannot drift on the env-scrubbing.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd, capture_output=True, text=True, check=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+
+
 def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
     """Every TRACKED file under *root* ending in one of *suffixes*, filtered.
 
@@ -500,30 +531,39 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
     excluded trees (``docs/prds/``, ``.claude/``) are themselves TRACKED and
     gitignore says nothing about them (measured: the bare tracked list would
     add 339 such files back).
+
+    COST, not just benefit: a file that has been written but not yet
+    ``git add``ed is invisible to both scans, same as an untracked one — an
+    author who writes a new doc restating four canonical slugs and runs this
+    module locally before staging it gets a GREEN verdict on content the old
+    filesystem walk would have flagged. Acceptable rather than a defect: every
+    dispatched agent commits before verify runs, and pre-commit sees staged
+    content — but stage a new file before trusting a green run of this module.
     """
     pathspecs = [f"*{suffix}" for suffix in suffixes]
     try:
-        listing = subprocess.run(
-            ["git", "ls-files", "-z", "--", *pathspecs],
-            cwd=root, capture_output=True, text=True, check=True, timeout=60,
-        ).stdout
-    except subprocess.CalledProcessError as exc:
+        listing = _run_git(["ls-files", "-z", "--", *pathspecs], cwd=root).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         # No filesystem-walk fallback here, ever (task 4971): this walker's
         # entire purpose is that a scan's verdict comes from TRACKED files
         # only, never from local working-tree state — falling back to
         # `os.walk` on a failed oracle would silently restore the exact
         # incident this task fixed, in precisely the situation nobody is
-        # watching for it (`no-silent-fail-soft`). A bare
-        # `CalledProcessError` is not enough either: it carries git's terse
-        # stderr but names neither the root nor the contract
-        # (`structured-facts-at-failure`).
+        # watching for it (`no-silent-fail-soft`). A bare exception is not
+        # enough either: none of `CalledProcessError` (git exited non-zero,
+        # e.g. *root* is not a repo), `TimeoutExpired` (the 60s budget above)
+        # or `OSError` (no `git` on PATH, or *root* does not exist) names the
+        # root or the contract on its own (`structured-facts-at-failure`).
+        returncode = getattr(exc, "returncode", None)
+        stderr = getattr(exc, "stderr", None)
+        detail = stderr.strip() if stderr else str(exc)
+        outcome = f"exited {returncode}" if returncode is not None else "could not be run"
         raise RuntimeError(
             f"the tracked-file scan of {root} failed (task 4971): `git ls-files -z "
-            f"-- {' '.join(pathspecs)}` exited {exc.returncode} — "
-            f"{exc.stderr.strip() if exc.stderr else '(no stderr)'}. This walker "
+            f"-- {' '.join(pathspecs)}` {outcome} — {detail}. This walker "
             f"sources every scan from TRACKED files only, by design, so {root} must "
-            f"be a git repository (or a subdirectory of one) for the scan to run at "
-            f"all — there is no filesystem-walk fallback."
+            f"be a git repository (or a subdirectory of one), with `git` on PATH, "
+            f"for the scan to run at all — there is no filesystem-walk fallback."
         ) from exc
 
     found: list[Path] = []
@@ -546,7 +586,12 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
         if not path.is_file():
             continue
         found.append(path)
-    return sorted(found)
+    # `git ls-files` lists an UNMERGED path once per merge stage — a
+    # conflicted worktree can yield the same path 2-3x (verified: 3x after a
+    # conflicting `git merge`). Both callers treat this walker's result as
+    # set-like (no duplicates), so dedupe here rather than let a conflicted
+    # tree triplicate every drift entry downstream.
+    return sorted(set(found))
 
 
 def _enumeration_scan_files() -> list[Path]:
@@ -566,10 +611,12 @@ def _citation_scan_files(root: Path = REPO_ROOT) -> list[Path]:
     ``shared/tests/fixtures/toolcall_markup_corpus.jsonl`` structurally out of
     reach: it carries the phantom slug, but it is a CAPTURED replay corpus
     regenerated only by ``shared/tests/toolcall_markup_corpus_extract.py``, so a
-    report against it would invite a hand-edit that corrupts the fixture. The
-    same filter also drops the ``graphiti``/``mem0`` submodule gitlink entries
-    that the tracked-file walk (task 4971) returns instead of descending into:
-    they are vendored upstream code, not this repo's authored content.
+    report against it would invite a hand-edit that corrupts the fixture.
+    Vendored upstream content (the ``graphiti``/``mem0`` submodules) is out of
+    reach for a different reason, by construction rather than by this filter:
+    ``git ls-files`` reports a submodule as an extensionless gitlink entry and
+    never descends into its tree, so the ``-- '*.py' '*.md'`` pathspecs passed
+    to ``_walk_repo_files`` cannot match it in the first place.
     """
     found = [path for path in _walk_repo_files(root, (".py", ".md")) if path != _THIS_MODULE]
     assert found, (
@@ -2429,7 +2476,9 @@ def _write_scan_tree(
     than asserted by reading the code — the same reasoning `_in_excluded_tree`'s
     docstring gives for taking `root` from the caller. No commit and no
     `user.email`/`user.name` config is needed: `git ls-files` reads the index,
-    not history.
+    not history. Both git calls go through `_run_git`, which scrubs ambient
+    `GIT_*` overrides — an ambient `GIT_DIR` would otherwise silently retarget
+    `git init`/`git add` at a different repository than *root*.
     """
     for relative in relative_paths:
         path = root / relative
@@ -2437,10 +2486,7 @@ def _write_scan_tree(
         path.write_text("", encoding="utf-8")
 
     for args in (("init", "-q"), ("add", "-A", "-f")):
-        subprocess.run(
-            ["git", *args],
-            cwd=root, capture_output=True, text=True, check=True, timeout=60,
-        )
+        _run_git(list(args), cwd=root)
 
     for relative in untracked:
         path = root / relative
