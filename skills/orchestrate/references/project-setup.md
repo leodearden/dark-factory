@@ -158,11 +158,20 @@ Example — a Rust subproject with hot crates that should serialize:
 max_per_module: 1
 module_overrides:
   crates/reify-core: 1           # always serialize — conflicts everywhere
-  crates/reify-core/tests: 2     # tests are mostly independent
   crates/reify-util: 2           # medium activity
 ```
 
-When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it first normalizes the path to `lock_depth` components (`normalize_lock`; default `lock_depth=2` gives `crates/reify-core`, *not* the first path component `crates`), then resolves the `ModuleConfig` whose registered prefix is the deepest match for that normalized path (`OrchestratorConfig.for_module`, which walks candidate prefixes inward from the full path and returns the most specific one — e.g. it would prefer a config registered at `crates/reify-core` over one at `crates`). It then checks the resolved module's `module_overrides` for an entry keyed by the full depth-`lock_depth` path (`crates/reify-core`), falling through a four-level ladder if that lookup misses: the resolved config's own `module_overrides[module]`, then the top-level config's `module_overrides[module]`, then the resolved config's `max_per_module`, then the top-level config's `max_per_module`. Because `for_module` only ever sees paths pre-truncated to `lock_depth`, a module config registered at a prefix *deeper* than `lock_depth` is unreachable from this lookup — `load_config` warns when it detects that mismatch, so keep module config prefixes at or above `lock_depth`.
+When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it first normalizes the path to `lock_depth` components (`normalize_lock`; default `lock_depth=2` gives `crates/reify-core`, *not* the first path component `crates`), then resolves the `ModuleConfig` whose registered prefix is the deepest match for that normalized path (`OrchestratorConfig.for_module`, which walks candidate prefixes inward from the full path and returns the most specific one — e.g. it would prefer a config registered at `crates/reify-core` over one at `crates`). It then looks up that same normalized, depth-`lock_depth` path (`crates/reify-core`) in a four-level fallback ladder, using the first hit:
+
+1. the resolved module's own `module_overrides[module]`
+2. the top-level config's `module_overrides[module]`
+3. the resolved module's `max_per_module`
+4. the top-level config's `max_per_module`
+
+Two depth traps follow from the path being normalized *before* either lookup runs:
+
+- A `module_overrides` key with *more* than `lock_depth` components (e.g. a hypothetical `crates/reify-core/tests` entry under the default `lock_depth=2`) can never match: the lookup key is always truncated to `lock_depth` components first, so a task touching `crates/reify-core/tests/foo.rs` normalizes to `crates/reify-core` and never probes the longer key. This is silent — nothing warns you, so an override pasted in with the wrong number of path components just does nothing (see `analyze_modules.py`'s `# a clipped lock key is not a key` comment).
+- A module *config* (an `orchestrator.yaml`) registered at a prefix deeper than `lock_depth` is likewise unreachable through this scheduler path, but here `load_config` *does* warn when it detects the mismatch. Keep module config prefixes at a depth no greater than `lock_depth`.
 
 ### Picking values: the `analyze_modules` helper
 
