@@ -26,10 +26,29 @@ task 4345 removes.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 from _escalation_http import capability_headers, escalation_http_call
 
 from escalation.models import Escalation
+
+# The capability headers whose construction must live in exactly one module.
+_CAPABILITY_HEADER_NAMES = frozenset({'X-Escalation-Levels', 'X-Escalation-Identity'})
+
+# This module is exempt from its own scan -- the ONE exemption, and it is not a
+# loophole. ``TestCapabilityHeaders`` asserts exact equality against dict
+# literals naming both headers (``== {'X-Escalation-Levels': '0,1'}``), which
+# the AST scan cannot distinguish from construction. Those literals are the PIN,
+# not a drift risk: they are the deliberate INDEPENDENT restatement of the wire
+# contract. Rewriting them to reference the helper's own output to satisfy the
+# scan would make the test follow a rename anywhere and go green on a break --
+# exactly the failure ``_escalation_http``'s docstring refuses when it keeps the
+# header names as literals rather than importing the server constants. So the
+# guard's own expectations are exempt, and every module that could actually
+# carry a drifting SECOND COPY is still scanned.
+_THIS_MODULE = Path(__file__).name
 
 # ---------------------------------------------------------------------------
 # Pure seam: capability_headers
@@ -206,3 +225,71 @@ class TestHeaderReachesServer:
         reread = queue.get(esc.id)
         assert reread is not None
         assert reread.triaged_by == 'from-tool-arg'
+
+
+# ---------------------------------------------------------------------------
+# INV-5: exactly one module constructs the capability headers
+# ---------------------------------------------------------------------------
+
+
+def _constructs_capability_headers(source: str) -> bool:
+    """True iff *source* CONSTRUCTS a capability header (never merely reads one).
+
+    Two node shapes count, and both are checked so the guard stays honest
+    against the obvious refactor (someone replacing the two
+    ``headers[...] = ...`` lines with a single dict literal):
+
+    * ``ast.Assign`` onto an ``ast.Subscript`` with a constant string slice —
+      the ``headers['X-Escalation-Levels'] = levels`` form.
+    * ``ast.Dict`` with a constant key — the ``{'X-Escalation-Levels': ...}``
+      literal form.
+
+    Both are Store-context / literal construction, which is what makes this an
+    AST scan rather than a text grep. The header names appear ~50 times across
+    this suite as docstring prose describing the seven boundary scenarios and as
+    ``_WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']`` READ subscripts; a
+    grep would flag every one of them and so could never assert "exactly one
+    place", while excluding them by substring would turn a structural invariant
+    into a prose pin that goes red on any docstring edit.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value in _CAPABILITY_HEADER_NAMES
+                ):
+                    return True
+        elif isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value in _CAPABILITY_HEADER_NAMES:
+                    return True
+    return False
+
+
+def test_exactly_one_module_constructs_the_capability_headers() -> None:
+    """INV-5: ``_escalation_http.py`` is the only construction site in this suite.
+
+    The point of folding the two ``_call_over_http`` copies together is that the
+    ``X-Escalation-Levels`` / ``X-Escalation-Identity`` wire protocol cannot
+    drift between them. That property is only durable if it is asserted — a
+    second copy reintroduced later would otherwise pass every existing test,
+    since both copies would be individually correct on the day they were
+    written. This is the assertion.
+    """
+    tests_dir = Path(__file__).parent
+    sites = sorted(
+        path.name
+        for path in tests_dir.glob('*.py')
+        if path.name != _THIS_MODULE
+        and _constructs_capability_headers(path.read_text(encoding='utf-8'))
+    )
+
+    assert set(sites) == {'_escalation_http.py'}, (
+        f'Expected exactly one module in {tests_dir.name}/ to construct the '
+        f'capability headers ({sorted(_CAPABILITY_HEADER_NAMES)}), found: {sites}.\n'
+        'Put the construction in _escalation_http.capability_headers and call it '
+        '(via escalation_http_call, or directly) instead of building the header '
+        'dict locally — that is the INV-5 property this task established.'
+    )
