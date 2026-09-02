@@ -1143,20 +1143,23 @@ class ReconReportState:
         silently defaulting to ``actionable=True``), which is the exact bug
         class this default exists to close. As of this writing,
         ``'cross_project_routing'`` is the only production category
-        matching the prefix — filed with an explicit ``actionable=False``
-        by ``autopilot_video.py`` and the Stage 2 prompt template. The
-        Stage 3 prompt template also omits ``actionable`` for its
-        ``cross_project_routing`` example, so it likewise inherits this
-        computed default — but that example (``severity='serious'``,
-        "get_task returned task from project X, expected Y") is a
-        wrong-``project_root`` data-integrity signal, not an
-        informational routing note, so this docstring does not assert
-        that relying on the default there is correct; combined with the
-        read-time-suppression ripple below, such a finding is a candidate
-        to silently vanish from ``flagged_items`` if its citations happen
-        to trace exclusively to Stage 1. Whether the Stage 3 template
-        should instead pass ``actionable=True`` explicitly is tracked as
-        a follow-up rather than fixed in this docstring-only pass.
+        matching the prefix, and every one of its filers now passes
+        ``actionable`` EXPLICITLY rather than relying on this computed
+        default. ``autopilot_video.py`` and the Stage 2 prompt template
+        pass ``actionable=False``: those findings are informational
+        routing notes ("this work belongs to another project, please
+        route"). The Stage 3 prompt template passes ``actionable=True``:
+        its example (``severity='serious'``, "get_task returned task from
+        project X, expected Y") is a wrong-``project_root``
+        data-integrity signal, not a routing note, and must never become
+        a candidate for the read-time suppression described below — which
+        the computed default would have made it whenever its citations
+        traced exclusively to Stage 1 (task 4347). Same category,
+        opposite actionability, which is exactly why neither filer may
+        rely on a single computed value here. The Stage 3 template's
+        kwarg is machine-checked by
+        ``tests/test_stage3_cross_project_routing_actionable.py``; this
+        paragraph is not the source of truth for it.
 
         Prefix breadth is local to *this* default only: downstream
         consumers that also branch on the ``cross_project_routing``
