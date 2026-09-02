@@ -149,7 +149,13 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
+
+from shared.cli_boundary import (
+    LoudArgumentParser,
+    report_broken_pipe,
+    reset_stdout_failure_state,
+    run_cli,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1105,25 +1111,19 @@ _WRITTEN_MANIFEST: str | None = None
 """The manifest this run landed on disk, or ``None`` if it wrote nothing.
 
 Module state rather than a parameter because of WHERE it is read: a closed
-stdout pipe can surface at :func:`_cli`'s flush, after :func:`main` has already
-returned, so there is no call frame left to thread it through. It exists to
+stdout pipe can surface at the boundary's flush
+(``shared/src/shared/cli_boundary.py::run_cli``), after :func:`main` has
+already returned, so there is no call frame left to thread it through. It exists to
 keep one specific lie out of the failure message — exit 1 means "the run could
 not complete", and an operator who reads that after the artifact was already
 written may rebuild, or treat a good artifact as absent.
 
-Reset per run by :func:`main`, so an in-process caller that runs the CLI twice
-never reports the previous run's path as this one's output.
+Reset per run by :func:`main`, alongside the shared reporter's own per-run
+state, so an in-process caller that runs the CLI twice never reports the
+previous run's path as this one's output. Read through
+:func:`_manifest_detail`, which :func:`main` installs on
+``shared/src/shared/cli_boundary.py::reset_stdout_failure_state``.
 """
-
-_STDOUT_FAILURE_REPORTED = False
-"""Whether this run already printed its one ``error: ...`` line about stdout.
-
-The same failure is legitimately seen twice — in-band by :func:`main`, then
-again by :func:`_cli`'s flush of the buffer that write left behind — and
-reporting it twice would break the single-line convention every other failure
-in this CLI follows. Reset per run alongside :data:`_WRITTEN_MANIFEST`.
-"""
-
 
 @dataclass(frozen=True)
 class VerifyReport:
@@ -1555,39 +1555,6 @@ def render_report(manifest: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-class _LoudArgumentParser(argparse.ArgumentParser):
-    """An ``ArgumentParser`` whose help text cannot vanish down a failed stdout.
-
-    ``argparse`` writes its messages inside a suppressed ``except OSError`` — so
-    on ``--help | head`` (``BrokenPipeError``, an ``OSError``) or
-    ``--help > /full/disk`` (``ENOSPC``) it discards the help text and exits 0
-    anyway: a success status for a run whose entire output went nowhere.
-
-    Only reachable when stdout is UNBUFFERED or line-buffered
-    (``PYTHONUNBUFFERED=1``, ``python -u``, a tty), where the write hits fd 1
-    during ``parse_args``. Block-buffered, the help text is still in the buffer
-    at that point and the failure surfaces later at :func:`_cli`'s explicit
-    flush instead — which is why this hid behind the rest of the closed-pipe
-    work, and why the tests run both regimes.
-
-    Overrides the PUBLIC :meth:`print_help` rather than argparse's private
-    message writer: stdout is the only stream help goes to, so this needs no
-    private API and leaves argparse's routing, formatting and exit codes
-    untouched — an unrecognized flag still reports to stderr and still exits 2.
-
-    The re-raised exception leaves ``parse_args`` — which runs before
-    :func:`main`'s own ``try`` — and lands in :func:`_cli`'s stdout handlers:
-    ``except BrokenPipeError`` for a closed reader, ``except OSError`` for
-    every other way the write can fail. So a broken stdout gets ONE outcome
-    across BOTH buffering regimes AND both failure kinds:
-    :data:`EXIT_RUN_FAILED` plus a single ``error: ...`` line naming which of
-    the two it was.
-    """
-
-    def print_help(self, file: IO[str] | None = None) -> None:
-        (file or sys.stdout).write(self.format_help())
-
-
 def _build_parser() -> argparse.ArgumentParser:
     """The CLI: flat mode flags, no subcommands.
 
@@ -1596,7 +1563,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ``--apply`` — and a test pins this flag set by EQUALITY so one cannot be
     added without a test saying so out loud.
     """
-    parser = _LoudArgumentParser(
+    parser = LoudArgumentParser(
         # The module docstring carries RST tables that argparse's formatter
         # reflows into rubble (the memory_eval_retrieval_probe treatment); the
         # first line plus the two guarantees is what an operator needs here.
@@ -1817,162 +1784,34 @@ def _store_error_types() -> tuple[type[BaseException], ...]:
     return (OSError, RedisError)
 
 
-def _silence_stream_fd(stream: IO[str]) -> None:
-    """Point *stream*'s file descriptor at ``os.devnull``.
+def _manifest_detail() -> str | None:
+    """The corpus-specific suffix for a stdout-failure line, or ``None``.
 
-    The dup2 dance from the interpreter docs' "Note on SIGPIPE". Python flushes
-    ``sys.stdout`` and ``sys.stderr`` during finalization; if the fd still
-    points at a closed pipe and the stream still holds the bytes an earlier
-    write could not deliver, that flush fails where no ``except`` can reach it,
-    printing "Exception ignored ..." and overriding the exit status this module
-    documents. Redirecting the fd first means the later flush lands on a device
-    that always accepts the write.
-
-    Every step is best-effort: a stream with no real fd (a replaced
-    ``sys.stdout``, a captured one under a test runner) raises from
-    ``fileno()``, and this is called from the very handlers meant to keep a
-    traceback off the screen — so a failure here degrades to "the message may
-    be noisier", never to a second crash.
+    Installed on the shared reporter by :func:`main`. The sentence stays HERE,
+    with the caller that knows what artifact this CLI produces;
+    ``shared.cli_boundary`` supplies only the parenthesised "extra context"
+    shape. See :data:`_WRITTEN_MANIFEST` for why that context matters at all.
     """
-    try:
-        fd = stream.fileno()
-    except (OSError, ValueError):  # io.UnsupportedOperation subclasses both
-        return
-    try:
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    except OSError:
-        return
-    try:
-        os.dup2(devnull_fd, fd)
-    except OSError:
-        pass
-    finally:
-        os.close(devnull_fd)
-
-
-def _report_stdout_failure(detail: str) -> int:
-    """Print ONE ``error: <detail>`` line about a failed stdout write; return the code.
-
-    Reports only — it does not touch any file descriptor, so it is safe to call
-    from :func:`main`, whose contract is "parse and run, return a code" rather
-    than "own this process's streams".
-
-    Two things the bare exit code cannot say are folded in here, because the
-    message is the only channel left once the code has been spent:
-
-    * :data:`_WRITTEN_MANIFEST` — the artifact IS on disk when the pipe broke
-      on the trailing ``manifest: ...`` line, and exit 1 alone says the run
-      could not complete.
-    * At most one line per run (:data:`_STDOUT_FAILURE_REPORTED`), because the
-      same failure is legitimately caught twice on the way out.
-
-    The write to stderr is best-effort. On the ordinary ``| head`` shape only
-    stdout is the closed pipe, so it succeeds and looks like every other exit-1
-    message; on ``2>&1 | head`` stderr is that same pipe, and the failed write
-    leaves bytes in ITS buffer for the interpreter to choke on at shutdown —
-    measured as an overridden exit status, so stderr gets the same treatment as
-    stdout rather than being left to raise out of the one function whose job is
-    to report failure quietly.
-    """
-    global _STDOUT_FAILURE_REPORTED  # noqa: PLW0603
-    if _STDOUT_FAILURE_REPORTED:
-        return EXIT_RUN_FAILED
-    _STDOUT_FAILURE_REPORTED = True
-    if _WRITTEN_MANIFEST is not None:
-        detail = f'{detail} (the manifest was written to {_WRITTEN_MANIFEST})'
-    try:
-        print(f'error: {detail}', file=sys.stderr)
-    except OSError:
-        _silence_stream_fd(sys.stderr)
-    return EXIT_RUN_FAILED
-
-
-def _report_broken_pipe() -> int:
-    """A downstream reader (``| head``) closed stdout: report it, change nothing else.
-
-    Every ``print`` in the CLI path — the report in :func:`_run_build`, the
-    verdict and diff in :func:`_emit_verdict` — writes to ``sys.stdout`` with
-    no protection of its own. When the reader on the other end has already
-    closed the pipe, that write raises :class:`BrokenPipeError`, which is not a
-    store condition and not a builder bug: it is the same "the run never
-    reached a verdict" situation :data:`EXIT_RUN_FAILED` already documents,
-    triggered by nothing being there to read the output. Left uncaught it
-    surfaces as a raw traceback where every other failure here prints a single
-    ``error: ...`` line.
-    """
-    return _report_stdout_failure(
-        'downstream reader closed the output pipe before the run finished'
-    )
-
-
-def _handle_broken_pipe() -> int:
-    """:func:`_report_broken_pipe` plus ownership of fd 1 — the PROCESS-boundary half.
-
-    Called only from :func:`_cli`. Redirecting a process-global file descriptor
-    is legitimate at the boundary that is about to exit, and out of place in
-    :func:`main`, which owes an in-process caller nothing but an exit code.
-    """
-    _silence_stream_fd(sys.stdout)
-    return _report_broken_pipe()
-
-
-def _handle_stdout_error(exc: OSError) -> int:
-    """As :func:`_handle_broken_pipe`, for a stdout write that failed some OTHER way.
-
-    A closed reader is not the only way ``> file`` or ``| cmd`` ends badly: a
-    full disk or quota (``ENOSPC``/``EDQUOT``) and a disconnected terminal
-    (``EIO``) fail the same write, and are at least as likely for a builder
-    whose report is routinely redirected. Reported through the same single
-    ``error: ...`` line, with the errno text kept so the remedy is visible —
-    "no space left on device" and "closed the output pipe" are different jobs.
-
-    Serves BOTH frames such a failure can surface in, because a handler on one
-    is not a handler on the other:
-
-    * DEFERRED — every write is buffered and :func:`_flush_stdout`'s flush is
-      what reaches the device.
-    * IN-BAND — the write itself reaches the device and raises mid-run, from
-      ``print`` in :func:`_run_build` or from
-      :class:`_LoudArgumentParser`'s re-raise during ``parse_args``. Neither is
-      inside a flush; both arrive at :func:`_cli`'s ``except OSError``.
-
-    One handler for both, so a full disk produces the same line and the same
-    :data:`EXIT_RUN_FAILED` whichever frame it was noticed in.
-    """
-    _silence_stream_fd(sys.stdout)
-    return _report_stdout_failure(f'cannot write to stdout: {exc}')
-
-
-def _flush_stdout() -> int | None:
-    """Flush stdout; return an exit code if that write failed, else ``None``.
-
-    Deliberately narrow. Only the flush is inside the ``try``, so the widened
-    ``except OSError`` cannot reach anything else in the run and mis-attribute
-    a store or filesystem failure to stdout — the mis-attribution hazard task
-    3757 fixed by moving the store handler down to its own seam.
-    """
-    try:
-        sys.stdout.flush()
-    except BrokenPipeError:
-        return _handle_broken_pipe()
-    except OSError as exc:
-        return _handle_stdout_error(exc)
-    return None
+    return None if _WRITTEN_MANIFEST is None else f'the manifest was written to {_WRITTEN_MANIFEST}'
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
-    global _WRITTEN_MANIFEST, _STDOUT_FAILURE_REPORTED  # noqa: PLW0603
+    global _WRITTEN_MANIFEST  # noqa: PLW0603
+    # FIRST, before parse_args: LoudArgumentParser re-raises a failed help
+    # write from inside parse_args, so the reporter must already be armed and
+    # carrying this run's detail by then.
     _WRITTEN_MANIFEST = None
-    _STDOUT_FAILURE_REPORTED = False
+    reset_stdout_failure_state(detail=_manifest_detail)
     args = _build_parser().parse_args(argv)
     try:
         return _run_verify(args) if args.verify else _run_build(args)
     except BrokenPipeError:
         # Reports, and stops there: neutralising the process's stdout fd is the
-        # boundary's job (:func:`_handle_broken_pipe`), not something to do
-        # behind the back of a caller that asked only for an exit code.
-        return _report_broken_pipe()
+        # boundary's job (shared/src/shared/cli_boundary.py::_handle_broken_pipe),
+        # not something to do behind the back of a caller that asked only for
+        # an exit code — hence the report-only form.
+        return report_broken_pipe()
     except CorpusBuildError as exc:
         # A typed build/read failure, reported as a message plus a documented
         # code rather than a traceback plus exit 1-by-accident. Distinct from
@@ -1991,96 +1830,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cli() -> int:
-    """Process-boundary wrapper: run :func:`main` and force stdout out while it can fail usefully.
+    """Process-boundary wrapper: :func:`run_cli` around :func:`main`.
 
-    A closed stdout pipe (``--verify | head``) fails in two measurably
-    different ways, and only one of them ever reaches ``main()``'s
-    ``except BrokenPipeError``:
+    A one-line delegator by design. The rationale for everything it does —
+    why the explicit flush is not redundant with the interpreter's shutdown
+    flush, why the ``except OSError`` arm must stay below the
+    ``BrokenPipeError`` one, why ``SystemExit`` is re-raised rather than
+    normalised — lives at its new home,
+    ``shared/src/shared/cli_boundary.py::run_cli``, and is not restated here.
 
-    * LARGE write — the report from :func:`_run_build` overflows stdout's
-      buffer, so ``print`` flushes mid-run, the ``write()`` fails, and the
-      error is raised in-band. ``main()`` catches it.
-    * SHORT write — the one-line verdict from :func:`_emit_verdict` stays in
-      the buffer, so the run raises NOTHING. ``main()`` returns its ordinary
-      verdict code and the failure surfaces only when the interpreter flushes
-      ``sys.stdout`` during finalization, where no ``except`` can intervene and
-      the returned status is overridden.
-
-    The explicit flush is what converts the second case into the first. It is
-    NOT redundant with the interpreter's own shutdown flush and must not be
-    "simplified" away: its entire purpose is to attempt the buffered write
-    *earlier*, while a handler is still on the stack, so a deferred and
-    uncatchable failure becomes the same documented ``EXIT_RUN_FAILED`` plus
-    single ``error: ...`` line every other failure in this CLI produces.
-
-    Kept OUT of ``main()`` deliberately. ``main(argv) -> int`` is the seam the
-    test suite drives and its contract is "parse and run, return a code";
-    interpreter-lifecycle concerns — flushing what is left, and redirecting fd
-    1 so finalization cannot fail on it — belong at the process boundary, which
-    is this function and the ``__main__`` guard that calls it.
-
-    ``argparse`` accounts for the other two handlers, in complementary
-    buffering regimes that are not reachable by each other's:
-
-    * BLOCK-buffered — ``--help`` and an unrecognized flag leave ``parse_args``
-      via ``SystemExit``, which happens inside ``main()`` but BEFORE its
-      ``try``, with their text still buffered. The flush in that handler is
-      what surfaces it.
-    * UNBUFFERED (``PYTHONUNBUFFERED=1``, ``python -u``, a tty) — the write
-      reaches fd 1 during ``parse_args`` and fails there, inside the
-      ``except OSError: pass`` argparse wraps its own message writes in,
-      leaving nothing for a later flush to find. :class:`_LoudArgumentParser`
-      re-raises it, and it arrives at one of the two stdout handlers below.
-
-    A closed reader is not the only way stdout fails, so the arms below are a
-    PAIR, and their order is the mechanism rather than a style choice:
-
-    * ``except BrokenPipeError`` — the ``| head`` shape, which gets its own
-      message because "the reader went away" has its own remedy.
-    * ``except OSError`` — every other stdout failure raised IN-BAND: a full
-      disk or quota on ``print(render_report(...))``, a disconnected tty,
-      ``print_help``'s re-raise onto anything that is not a pipe. It must stay
-      SECOND, because ``BrokenPipeError`` is an ``OSError`` and a wide arm
-      first would swallow the closed-pipe case and its distinct message.
-
-    That second arm is safe HERE and would not be inside ``main()``, which is
-    the distinction task 3757 turned on: every non-stdout ``OSError`` in the
-    run is already converted at the seam that knows what it means — the store
-    at :func:`_fetch_population`, the manifest write at :func:`_run_build`, the
-    manifest read at :func:`_run_verify` — so what is still an ``OSError`` by
-    the time it reaches this frame is stdout-shaped by construction. ``main``'s
-    ``try`` wraps the WHOLE run, so the same arm there would go back to
-    mis-attributing a store or filesystem failure to stdout. It belongs at the
-    process boundary and nowhere else.
-
-    The ``SystemExit`` handler RE-RAISES on a successful flush rather than
-    returning a normalised code: ``SystemExit.code`` may be ``None`` or a
-    non-int, and re-raising delegates every one of those shapes back to the
-    interpreter that defines them instead of re-implementing the mapping here.
-    So ``--help`` still exits 0 and a bad flag still exits 2, unchanged.
-
-    ``SystemExit`` specifically, never a bare ``except BaseException``: that
-    would swallow ``KeyboardInterrupt`` and genuine builder bugs behind a tidy
-    message — the same silent fail-soft ``main()``'s own comment argues against.
+    The NAME is kept because this module's tests drive the boundary through
+    it (``_run_cli(..., entry=_mod._cli)``); the ``__main__`` guard below
+    could call ``run_cli(main)`` directly, but that would churn the very tests
+    whose unchanged passing is the evidence this hoist preserved behaviour.
     """
-    try:
-        code = main()
-    except BrokenPipeError:
-        # Only reachable from _LoudArgumentParser's re-raise, which happens in
-        # parse_args — outside main()'s own try.
-        return _handle_broken_pipe()
-    except OSError as exc:
-        # MUST stay below the BrokenPipeError arm: BrokenPipeError IS an
-        # OSError, so the wide arm first would swallow the closed-pipe case and
-        # lose its distinct message. Ordering is the whole mechanism here.
-        return _handle_stdout_error(exc)
-    except SystemExit:
-        failed = _flush_stdout()
-        if failed is not None:
-            return failed
-        raise
-    failed = _flush_stdout()
-    return code if failed is None else failed
+    return run_cli(main)
 
 
 if __name__ == '__main__':
