@@ -40,16 +40,18 @@ private handlers it calls.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from collections.abc import Callable
 from typing import IO
 
-#: Grown as each name lands (``LoudArgumentParser`` and ``run_cli`` follow),
-#: so every commit stays lint-clean rather than carrying an F822 for a symbol
-#: that does not exist yet. The finished surface is these six names.
+#: Grown as each name lands (``run_cli`` follows), so every commit stays
+#: lint-clean rather than carrying an F822 for a symbol that does not exist
+#: yet. The finished surface is these six names.
 __all__ = [
     'EXIT_STDOUT_FAILED',
+    'LoudArgumentParser',
     'report_broken_pipe',
     'report_stdout_failure',
     'reset_stdout_failure_state',
@@ -250,3 +252,36 @@ def _flush_stdout() -> int | None:
     except OSError as exc:
         return _handle_stdout_error(exc)
     return None
+
+
+class LoudArgumentParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` whose help text cannot vanish down a failed stdout.
+
+    ``argparse`` writes its messages inside a suppressed ``except OSError`` — so
+    on ``--help | head`` (``BrokenPipeError``, an ``OSError``) or
+    ``--help > /full/disk`` (``ENOSPC``) it discards the help text and exits 0
+    anyway: a success status for a run whose entire output went nowhere.
+
+    Only reachable when stdout is UNBUFFERED or line-buffered
+    (``PYTHONUNBUFFERED=1``, ``python -u``, a tty), where the write hits fd 1
+    during ``parse_args``. Block-buffered, the help text is still in the buffer
+    at that point and the failure surfaces later at :func:`run_cli`'s explicit
+    flush instead — which is why this hid behind the rest of the closed-pipe
+    work, and why the tests run both regimes.
+
+    Overrides the PUBLIC :meth:`print_help` rather than argparse's private
+    message writer: stdout is the only stream help goes to, so this needs no
+    private API and leaves argparse's routing, formatting and exit codes
+    untouched — an unrecognized flag still reports to stderr and still exits 2.
+
+    The re-raised exception leaves ``parse_args`` — which runs before a CLI's
+    ``main`` body, and outside its own ``try`` — and lands in :func:`run_cli`'s
+    stdout handlers: ``except BrokenPipeError`` for a closed reader,
+    ``except OSError`` for every other way the write can fail. So a broken
+    stdout gets ONE outcome across BOTH buffering regimes AND both failure
+    kinds: :data:`EXIT_STDOUT_FAILED` plus a single ``error: ...`` line naming
+    which of the two it was.
+    """
+
+    def print_help(self, file: IO[str] | None = None) -> None:
+        (file or sys.stdout).write(self.format_help())
