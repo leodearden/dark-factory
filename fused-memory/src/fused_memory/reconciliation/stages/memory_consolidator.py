@@ -1482,7 +1482,29 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 
 
 def _is_newer_than_watermark(raw_ts: str | None, watermark: datetime) -> bool:
-    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*."""
+    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*.
+
+    Both sides are compared as instants, never as strings: *raw_ts* is
+    parsed with ``datetime.fromisoformat`` and *watermark* is taken as
+    given, then each is coerced to a tz-aware UTC datetime — naive
+    (tzinfo-less) values on EITHER side are assumed to already be UTC
+    rather than raising on naive-vs-aware comparison, mirroring
+    ``backends/graphiti_client.py::_as_sortable_utc`` — before comparing
+    with ``>`` (strictly after, not ``>=``, so an instant exactly equal to
+    *watermark* is not re-surfaced). A non-UTC offset is therefore compared
+    correctly by its true instant, not by its printed digits.
+
+    Comparing these values as STRINGS is wrong: ``str(datetime)`` renders
+    with a space separator (``'2026-08-20 12:00:00+00:00'``) while
+    ``created_at`` values produced by
+    ``services/memory_service.py::_created_at_to_utc_iso`` use ``T``
+    (``'2026-08-20T01:52:27+00:00'``) — a lexical ``>`` then short-circuits
+    at the separator and degenerates to date-granularity (task 4574).
+
+    *raw_ts* that is missing, empty, or unparseable returns False — an
+    undatable record cannot be shown to be newer than the watermark, so it
+    is treated as not-newer rather than raising.
+    """
     if not raw_ts:
         return False
     try:
