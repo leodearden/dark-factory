@@ -1001,12 +1001,33 @@ class TaskCurator:
         pattern already used by :meth:`_maybe_flag_unverified_claims` and
         the claim-verification block in :meth:`curate_batch_prepared`.
 
+        This bounds the loop stall for THIS guard only. The two sibling
+        one-shot lazy loads invoked earlier in the same :meth:`curate` /
+        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
+        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
+        :meth:`_maybe_route_deterministic` loading
+        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
+        guard's own 11 KB registry) — still run synchronously on the loop, so
+        the first-submission loop stall under the per-project curator write
+        lock is reduced by this change, not bounded by it. Left as-is here
+        (task 4201 scope); tracked as a follow-up to either extend the
+        offload to those two sites or fold all three into one shared
+        lazy-load helper so the idiom exists once.
+
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable, or the
           offloaded load raised — for example a registry file that is not
           valid UTF-8 (one WARNING logged; the guard then stays disabled for
-          this TaskCurator instance rather than retrying per call).
+          this TaskCurator instance rather than retrying per call). This is
+          deliberate even for a cause that is transient in principle (a
+          partially-written file observed mid-deploy, a momentary worker
+          thread I/O error): the load's ``except Exception`` below does not
+          distinguish exception type, so any raise latches the same as a
+          permanently-malformed file, and a process restart is the recovery
+          path. Only ``asyncio.CancelledError`` is excluded from the latch
+          (see the comment on that except block) — every other exception is
+          treated as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
