@@ -1150,10 +1150,21 @@ class MemoryConsolidator(BaseStage):
             self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
-            wm_str = str(watermark.last_episode_timestamp)
+            # WHY _is_newer_than_watermark and not `str(watermark...) > str(...)`:
+            # str(datetime) renders with a space separator
+            # ('2026-08-20 12:00:00+00:00'), while e['created_at'] here comes
+            # from services/memory_service.py::_created_at_to_utc_iso as
+            # ISO-8601 with a 'T' separator ('2026-08-20T01:52:27+00:00'). A
+            # lexical `>` between the two short-circuits at index 10 ('T'
+            # 0x54 > ' ' 0x20) and degenerates to date-granularity, so any
+            # episode from the watermark's own calendar day compares as
+            # "newer" regardless of its actual time (task 4574). Task 2055
+            # fixed retrieve_episodes' ordering and its follow-up 2079 added
+            # _created_at_to_utc_iso to normalize the producer side, but left
+            # this consumer comparing strings — do not reintroduce that.
             new_episodes = [
                 e for e in episodes
-                if (e.get('created_at') or '') > wm_str
+                if _is_newer_than_watermark(e.get('created_at'), watermark.last_episode_timestamp)
             ]
 
         # 2. Mem0 memories (recent)
@@ -1460,6 +1471,20 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
+
+
+def _is_newer_than_watermark(raw_ts: str | None, watermark: datetime) -> bool:
+    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*."""
+    if not raw_ts:
+        return False
+    try:
+        ts = datetime.fromisoformat(raw_ts)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    wm = watermark if watermark.tzinfo is not None else watermark.replace(tzinfo=UTC)
+    return ts.astimezone(UTC) > wm.astimezone(UTC)
 
 
 def _format_events(events: list[ReconciliationEvent]) -> str:
