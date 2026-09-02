@@ -1539,9 +1539,14 @@ def _run_status_refresh_and_retitle(
     # the body written below both derive from THIS one snapshot, so they can
     # never disagree. status=None makes the refresh a pure heartbeat bump,
     # leaving the spawn-created record's status untouched.
-    # (_in_unbound_launch_window already answers False for prior is None.)
-    in_launch_window = _in_unbound_launch_window(prior) and _withhold_from_launching(
-        prior, env, probes=probes
+    # The `prior is not None` leg is redundant at runtime --
+    # _in_unbound_launch_window already answers False for None -- but it is
+    # what narrows the Optional for the type checker before
+    # _withhold_from_launching, which takes a record, not a maybe-record.
+    in_launch_window = (
+        prior is not None
+        and _in_unbound_launch_window(prior)
+        and _withhold_from_launching(prior, env, probes=probes)
     )
     record = session_registry.apply_refresh(
         slug, prior, status=None if in_launch_window else status
