@@ -33,9 +33,13 @@ from __future__ import annotations
 import pytest
 from escalation.models import Escalation
 
+from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
+    ORPHANED_ESCALATION_FLAG_CATEGORY,
+    ORPHANED_ESCALATION_FLAG_TYPE,
     REAPABLE_STALE_CATEGORIES,
     TERMINAL_TASK_STATUSES,
+    build_orphaned_escalation_flag,
     classify_orphan,
     escalation_project_id,
     select_reapable_escalations,
@@ -315,3 +319,215 @@ class TestClassifyOrphan:
         int_keyed.task_id = 650  # type: ignore[assignment]
         assert classify_orphan(int_keyed, {'650': 'done'}) == 'terminal'
         assert classify_orphan(esc, {650: 'done'}) == 'terminal'  # type: ignore[dict-item]
+
+
+def assert_conforms_to_finding_schema(flag: dict) -> None:
+    """Assert *flag* satisfies ``FINDING_ITEM_SCHEMA`` (cli_stage_runner.py).
+
+    Derived from the live schema object rather than restating its rules, so a
+    future schema change (a new required key, a narrowed enum) breaks this
+    helper instead of leaving it asserting a stale contract.  ``jsonschema``
+    is only a transitive dependency of this package, so the check is written
+    against the schema dict directly rather than importing a validator.
+    """
+    props = FINDING_ITEM_SCHEMA['properties']
+    for required in FINDING_ITEM_SCHEMA['required']:
+        assert required in flag, (
+            f'{required!r} is required by FINDING_ITEM_SCHEMA but missing from the flag'
+        )
+    py_types = {'string': str, 'boolean': bool, 'array': list, 'object': dict}
+    for key, value in flag.items():
+        assert key in props, f'{key!r} is not a FINDING_ITEM_SCHEMA property'
+        declared = props[key]['type']
+        allowed = declared if isinstance(declared, list) else [declared]
+        assert any(
+            value is None if t == 'null' else isinstance(value, py_types[t])
+            for t in allowed
+        ), f'{key!r} = {value!r} does not match declared type {declared!r}'
+        if 'enum' in props[key]:
+            assert value in props[key]['enum'], (
+                f'{key!r} = {value!r} is not in the schema enum {props[key]["enum"]!r}'
+            )
+
+
+class TestBuildOrphanedEscalationFlag:
+    """``build_orphaned_escalation_flag`` emits the Stage-1 flag for one orphan.
+
+    Stage 1 cannot close the record (the A7b invariant reserves that for the
+    port-8103 watcher session), so the flag has to carry enough evidence for
+    the closer to re-derive the finding independently, and has to route to the
+    watcher playbook's existing "Resolve only when..." branch rather than its
+    PARK default.
+    """
+
+    def test_conforms_to_the_finding_item_schema(self):
+        """Every emitted key is a schema property of the declared type."""
+        flag = build_orphaned_escalation_flag(
+            make_escalation(task_id='650'),
+            'terminal',
+            subject_project_id='dark_factory',
+            subject_status='done',
+        )
+
+        assert_conforms_to_finding_schema(flag)
+
+    def test_pins_the_flag_type_and_category_dedup_key(self):
+        """flag_type/category are the module constants, so the dedup key is stable.
+
+        ``flag_dedup.compute_flag_signature`` keys on
+        ``(task_id, flag_type, category)``; if either constant drifted between
+        cycles the same orphan would re-emit as a brand-new finding every
+        cycle, with no ``stage1_flag_marker`` recurrence row and no way for an
+        operator to suppress it.
+        """
+        flag = build_orphaned_escalation_flag(
+            make_escalation(task_id='650'),
+            'terminal',
+            subject_project_id='dark_factory',
+            subject_status='cancelled',
+        )
+
+        assert flag['flag_type'] == ORPHANED_ESCALATION_FLAG_TYPE
+        assert flag['category'] == ORPHANED_ESCALATION_FLAG_CATEGORY
+        assert flag['category'] == 'cross_store_inconsistency', (
+            'category names a store-vs-store disagreement; task_memory_mismatch '
+            'would falsely imply a memory is involved'
+        )
+
+    def test_task_id_is_the_subject_task_not_the_escalation_id(self):
+        """The recurrence row is keyed on the SUBJECT task, str-coerced.
+
+        Keying on the escalation id instead would make each re-file of the
+        same subject look like a distinct finding, defeating dedup entirely.
+        """
+        esc = make_escalation(task_id='650', esc_id='esc-650-1')
+        flag = build_orphaned_escalation_flag(
+            esc, 'terminal', subject_project_id='dark_factory', subject_status='done',
+        )
+
+        assert flag['task_id'] == '650' and isinstance(flag['task_id'], str)
+        assert flag['task_id'] != esc.id
+
+    def test_int_subject_task_id_is_coerced_to_str(self):
+        """An int-typed task_id must not produce a non-str dedup key."""
+        esc = make_escalation(task_id='650')
+        esc.task_id = 650  # type: ignore[assignment]
+        flag = build_orphaned_escalation_flag(
+            esc, 'terminal', subject_project_id='dark_factory', subject_status='done',
+        )
+
+        assert flag['task_id'] == '650' and isinstance(flag['task_id'], str)
+
+    def test_terminal_description_names_id_category_project_and_status(self):
+        """A closer can re-derive the finding from the description alone."""
+        esc = make_escalation(task_id='650', esc_id='esc-650-1')
+        flag = build_orphaned_escalation_flag(
+            esc, 'terminal', subject_project_id='dark_factory', subject_status='done',
+        )
+
+        assert 'esc-650-1' in flag['description']
+        assert GATE_BACKLOG in flag['description']
+        assert 'dark_factory' in flag['description']
+        assert 'done' in flag['description']
+
+    def test_missing_description_says_no_row_in_that_projects_task_store(self):
+        """The 'missing' branch states the absence explicitly and names the project.
+
+        This is the branch whose evidence is easiest to get wrong: 'absent'
+        is only meaningful relative to a specific, cross-tag-complete census,
+        so the description names the project whose store was read rather than
+        implying the task does not exist anywhere.
+        """
+        esc = make_escalation(task_id='5943', esc_id='esc-5943-1', project_id='reify')
+        flag = build_orphaned_escalation_flag(
+            esc, 'missing', subject_project_id='reify', subject_status=None,
+        )
+
+        assert 'esc-5943-1' in flag['description']
+        assert "no row in reify's task store" in flag['description']
+
+    def test_description_never_claims_the_record_is_or_will_be_closed(self):
+        """State only what was OBSERVED — the close is the watcher's action.
+
+        The record is still pending when this flag is written, and this stage
+        has no authority to close it, so an over-claiming description would
+        put a false statement into the recurrence ledger.
+        """
+        for classification, status in (('terminal', 'done'), ('missing', None)):
+            flag = build_orphaned_escalation_flag(
+                make_escalation(task_id='650'),
+                classification,
+                subject_project_id='dark_factory',
+                subject_status=status,
+            )
+            lowered = flag['description'].lower()
+            for claim in (
+                'has been closed', 'was closed', 'will be closed',
+                'has been resolved', 'was resolved', 'auto-closed',
+            ):
+                assert claim not in lowered, (
+                    f'description must not claim closure; found {claim!r} in '
+                    f'{flag["description"]!r}'
+                )
+
+    def test_suggested_action_routes_to_the_watcher_resolve_branch(self):
+        """Names the sole closer, the resolution_class, and the no-churn argument.
+
+        Without the no-churn argument the watcher's PARK default is the
+        correct read of its own playbook, so the flag would be ignored; the
+        argument is what moves this record into the row's existing
+        "Resolve only when the underlying task will genuinely stop qualifying
+        for re-selection" branch.
+        """
+        flag = build_orphaned_escalation_flag(
+            make_escalation(task_id='650'),
+            'terminal',
+            subject_project_id='dark_factory',
+            subject_status='done',
+        )
+        action = flag['suggested_action']
+
+        assert '8103' in action, 'must name the port-8103 watcher as the closer'
+        assert "resolution_class='moot-terminal-subject'" in action
+        assert "'blocked'" in action, (
+            'must carry the no-churn argument: selection requires blocked'
+        )
+        assert 're-file' in action or 're-select' in action
+
+    def test_suggested_action_offers_a_verify_or_dismiss_branch(self):
+        """A closer must be told what to do if the subject is not actually terminal."""
+        flag = build_orphaned_escalation_flag(
+            make_escalation(task_id='650'),
+            'missing',
+            subject_project_id='dark_factory',
+            subject_status=None,
+        )
+
+        assert 'dismiss' in flag['suggested_action'].lower()
+
+    def test_human_operator_category_is_named_in_the_description(self):
+        """The sibling category routes the watcher to its OWN playbook row."""
+        esc = make_escalation(task_id='777', esc_id='esc-777-1', category=HUMAN_OPERATOR)
+        flag = build_orphaned_escalation_flag(
+            esc, 'terminal', subject_project_id='dark_factory', subject_status='cancelled',
+        )
+
+        assert HUMAN_OPERATOR in flag['description']
+        assert GATE_BACKLOG not in flag['description']
+
+    @pytest.mark.parametrize('classification', ['live', 'unresolvable', '', None, 'terminal '])
+    def test_non_flaggable_classification_raises_value_error(self, classification):
+        """Only 'terminal'/'missing' are flaggable — a wiring mistake must be loud.
+
+        ``'live'`` is the case that matters: handing a still-``blocked``
+        subject's record to the sole closer re-arms the filing rule and
+        reproduces the measured re-file churn.  Raising here means such a bug
+        can never reach the watcher silently.
+        """
+        with pytest.raises(ValueError):
+            build_orphaned_escalation_flag(
+                make_escalation(task_id='650'),
+                classification,
+                subject_project_id='dark_factory',
+                subject_status='blocked',
+            )
